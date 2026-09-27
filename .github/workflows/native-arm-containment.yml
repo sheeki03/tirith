@@ -12,15 +12,22 @@ on:
       - '.github/scripts/*native*'
       - '.github/workflows/native-arm-containment.yml'
   workflow_dispatch:
+    inputs:
+      remaining_qualification:
+        description: 'Qualify remaining controls for pinned product e282d038 in an isolated ARM job'
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
 concurrency:
-  group: native-arm-containment-${{ github.ref }}
-  cancel-in-progress: true
+  group: native-arm-containment-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification && github.run_id || 'standard' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.remaining_qualification) }}
 
 jobs:
   native-artifact:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.remaining_qualification }}
     name: Native ARM (${{ matrix.target }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -84,4 +91,58 @@ jobs:
             ${{ runner.temp }}/native-arm/evidence/*.json
             ${{ runner.temp }}/native-arm/evidence/*.txt
           if-no-files-found: warn
+          retention-days: 14
+
+  remaining-qualification:
+    name: Remaining native ARM controls (pinned product e282d038)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    steps:
+      - name: Create partial-failure evidence before checkout
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-remaining'
+          root.mkdir(mode=0o700, exist_ok=False)
+          (root / 'dispatch-context.json').write_text(json.dumps({
+              'controller_event_commit': os.environ['GITHUB_SHA'],
+              'product_commit': 'e282d038519848caa8328cf32aa05a05daa502d2',
+              'product_tree': '71c7f346aefa9de9044c3b358252ab0cfc03dae1',
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'runner_machine': platform.machine(),
+              'qualification_started': False
+          }, indent=2) + '\n')
+          PY
+      - name: Check out the reviewed controller revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the exact product revision independently
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: e282d038519848caa8328cf32aa05a05daa502d2
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Admit isolated resources and qualify the pinned source
+        run: |
+          set -euo pipefail
+          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-qualification.py" \
+            --source-root "$GITHUB_WORKSPACE/product" \
+            --output "$RUNNER_TEMP/native-arm-remaining/run" \
+            --manifest-sha256 7af7860f95c319fd3a1d88a9216254d7e0c0549ab2af332c518d3e425d313e33 \
+            --driver-sha256 b26099100902528a244d4d867e8776849a5fd9aefb72b1feef5080d517435ef6
+      - name: Preserve complete bounded evidence, including partial failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-arm-remaining-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-arm-remaining/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14

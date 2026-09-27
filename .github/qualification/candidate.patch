@@ -1,0 +1,3283 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 83cbff053ba21de7a8e515e0fce0383f09e36ab8..257a8ad61c60ab41b8cd1b76e92aa5be29e634c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ - Versioned personal protection profiles, explicit shell/profile setup, scoped expiring trust grants, and shared reviewed operations with status, cancellation and owned undo.
+ - Authenticated loopback controls for protection settings, history, project review, support selection, retained audit segments and supported lifecycle changes.
++- Optional `tirith menu` navigation for terminal inspections and previews, with direct command guidance for changes and explicit refusal in redirected sessions.
++- Shared field-specific policy sources and personal-authority explanations in CLI/browser previews, managed-control disabling, and fresh effective readback after browser apply and undo.
+ - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
+ - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.
+ - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
+@@ -24,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Apply fresh privacy rules to npm operation output while preserving review handles and historical stderr behavior. Preserve private checkpoint data during unexpected unwinding, and check receipt-signing keys before package execution can start.
+ - Bind npm approvals to the complete private review, including policy and file generations. Older materialization reviews remain readable but cannot authorize changes; unstarted work requires a new review.
+ - Bound recent history and tuning reads, preserve all contributing blockers in previews, and report expectation labels without inferring safety or automatic approval.
++- Keep large effective-policy responses usable with explicit field-summary limits, and prevent inherited nonblocking sockets from truncating local dashboard responses or timing out requests prematurely.
+ - Preserve exact audit history through reviewed rotation and recovery; retained segment deletion requires an irreversible acknowledgement and never offers a false undo.
+ - Recognize literal bracket conditions, bounded numeric shell arithmetic, and simple Python data pipelines without hiding executable substitutions or unresolved variable commands (#260, #264).
+ - Correct Android clipboard and errno portability, refuse incompatible release installation on Android, and document the remaining native qualification limits (#261, based on #262).
++- Preserve the interactive fish shell's umask during private capture, including helper failures and Ctrl-C. Capture files retain their private permissions (#265).
++- Ignore phantom policy and repository-marker directories reported by Unix virtual filesystems only when bounded directory enumeration proves the names absent. Genuine policy errors and filesystem name aliases retain conservative handling (#266).
+ - Preserve the exact release libc/ABI during update selection. Linux installation and npm launch refuse incompatible or unidentified runtimes before selecting a GNU executable.
+ 
+ ## [0.4.2] - 2026-09-11
+diff --git a/crates/tirith-core/src/artifact/npm_install_execution.rs b/crates/tirith-core/src/artifact/npm_install_execution.rs
+index 4be48277489b1809422bfdcbfc8a0dfff4c55d0f..1e7081c8521e288d8fc0c632bfca5365ff152efb 100644
+--- a/crates/tirith-core/src/artifact/npm_install_execution.rs
++++ b/crates/tirith-core/src/artifact/npm_install_execution.rs
+@@ -626,7 +626,18 @@ fn expected_hidden_lock(
+     let sources = bind_artifact_operands(&expected_hashes, artifact_operands, target_operand)?;
+     let mut packages = serde_json::Map::new();
+     for artifact in artifacts {
+-        let installed = target.join("node_modules").join(&artifact.leaf.name);
++        // This is the launcher's lexical POSIX layout even when the pure
++        // metadata verifier runs on Windows. Native Path::join would inject
++        // host separators into the expected npm lockfile key.
++        let target = target
++            .to_str()
++            .filter(|path| path.starts_with('/'))
++            .ok_or(NpmInstallRefusal::ExecutionLayoutUnsupported)?;
++        let installed = std::path::PathBuf::from(format!(
++            "{}/node_modules/{}",
++            target.trim_end_matches('/'),
++            artifact.leaf.name
++        ));
+         let source = sources
+             .get(artifact.sha256())
+             .ok_or(NpmInstallRefusal::ExecutionLayoutUnsupported)?;
+diff --git a/crates/tirith-core/src/artifact/npm_install_recovery.rs b/crates/tirith-core/src/artifact/npm_install_recovery.rs
+index 59506232f1d536d0c5a3fa2474fcd9f627bd3159..d307281bc20743f086f34815a66b7da7975dc156 100644
+--- a/crates/tirith-core/src/artifact/npm_install_recovery.rs
++++ b/crates/tirith-core/src/artifact/npm_install_recovery.rs
+@@ -299,62 +299,6 @@ impl VerifiedNpmTree {
+     }
+ }
+ 
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use std::os::unix::fs::{symlink, PermissionsExt};
+-    #[test]
+-    fn complete_observation_changes_for_bytes_metadata_extra_and_replaced_inode() {
+-        let temp = tempfile::tempdir().unwrap();
+-        let root = temp.path().join("root");
+-        std::fs::create_dir(&root).unwrap();
+-        let file = root.join("package.json");
+-        std::fs::write(&file, b"aaaa").unwrap();
+-        let first = observe_npm_recovery_tree(&root).unwrap();
+-        assert_eq!(
+-            first.observation(),
+-            observe_npm_recovery_tree(&root).unwrap().observation()
+-        );
+-        std::fs::write(&file, b"bbbb").unwrap();
+-        assert_ne!(
+-            first.observation(),
+-            observe_npm_recovery_tree(&root).unwrap().observation()
+-        );
+-        let second = observe_npm_recovery_tree(&root).unwrap();
+-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+-        assert_ne!(
+-            second.observation(),
+-            observe_npm_recovery_tree(&root).unwrap().observation()
+-        );
+-        let third = observe_npm_recovery_tree(&root).unwrap();
+-        std::fs::write(root.join("extra"), b"x").unwrap();
+-        assert_ne!(
+-            third.observation(),
+-            observe_npm_recovery_tree(&root).unwrap().observation()
+-        );
+-        std::fs::rename(&file, root.join("old")).unwrap();
+-        std::fs::write(&file, b"bbbb").unwrap();
+-        assert_ne!(
+-            third.observation(),
+-            observe_npm_recovery_tree(&root).unwrap().observation()
+-        );
+-    }
+-    #[test]
+-    fn links_special_entries_and_alias_roots_are_refused() {
+-        let temp = tempfile::tempdir().unwrap();
+-        let root = temp.path().join("root");
+-        std::fs::create_dir(&root).unwrap();
+-        std::fs::write(root.join("a"), b"x").unwrap();
+-        symlink("a", root.join("b")).unwrap();
+-        assert!(observe_npm_recovery_tree(&root).is_err());
+-        std::fs::remove_file(root.join("b")).unwrap();
+-        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+-        assert!(observe_npm_recovery_tree(&root).is_err());
+-        symlink(&root, temp.path().join("alias")).unwrap();
+-        assert!(observe_npm_recovery_tree(&temp.path().join("alias")).is_err());
+-    }
+-}
+-
+ /// Fresh policy/static/source assessment of an already published exact tree.
+ /// It has no install, mutation, deletion, or replay method.
+ pub struct NpmPublishedRecovery<'a> {
+@@ -467,3 +411,59 @@ impl<'a> NpmPublishedRecovery<'a> {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{symlink, PermissionsExt};
++    #[test]
++    fn complete_observation_changes_for_bytes_metadata_extra_and_replaced_inode() {
++        let temp = tempfile::tempdir().unwrap();
++        let root = temp.path().join("root");
++        std::fs::create_dir(&root).unwrap();
++        let file = root.join("package.json");
++        std::fs::write(&file, b"aaaa").unwrap();
++        let first = observe_npm_recovery_tree(&root).unwrap();
++        assert_eq!(
++            first.observation(),
++            observe_npm_recovery_tree(&root).unwrap().observation()
++        );
++        std::fs::write(&file, b"bbbb").unwrap();
++        assert_ne!(
++            first.observation(),
++            observe_npm_recovery_tree(&root).unwrap().observation()
++        );
++        let second = observe_npm_recovery_tree(&root).unwrap();
++        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
++        assert_ne!(
++            second.observation(),
++            observe_npm_recovery_tree(&root).unwrap().observation()
++        );
++        let third = observe_npm_recovery_tree(&root).unwrap();
++        std::fs::write(root.join("extra"), b"x").unwrap();
++        assert_ne!(
++            third.observation(),
++            observe_npm_recovery_tree(&root).unwrap().observation()
++        );
++        std::fs::rename(&file, root.join("old")).unwrap();
++        std::fs::write(&file, b"bbbb").unwrap();
++        assert_ne!(
++            third.observation(),
++            observe_npm_recovery_tree(&root).unwrap().observation()
++        );
++    }
++    #[test]
++    fn links_special_entries_and_alias_roots_are_refused() {
++        let temp = tempfile::tempdir().unwrap();
++        let root = temp.path().join("root");
++        std::fs::create_dir(&root).unwrap();
++        std::fs::write(root.join("a"), b"x").unwrap();
++        symlink("a", root.join("b")).unwrap();
++        assert!(observe_npm_recovery_tree(&root).is_err());
++        std::fs::remove_file(root.join("b")).unwrap();
++        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
++        assert!(observe_npm_recovery_tree(&root).is_err());
++        symlink(&root, temp.path().join("alias")).unwrap();
++        assert!(observe_npm_recovery_tree(&temp.path().join("alias")).is_err());
++    }
++}
+diff --git a/crates/tirith-core/src/lib.rs b/crates/tirith-core/src/lib.rs
+index 17de2618e69ceea4b53a604cd0cc00db079dc78a..ecc19909157cbcea597937979c572c57cc3deafd 100644
+--- a/crates/tirith-core/src/lib.rs
++++ b/crates/tirith-core/src/lib.rs
+@@ -70,6 +70,7 @@ pub mod pending;
+ pub mod persistence;
+ pub mod policy;
+ pub mod policy_client;
++mod policy_discovery;
+ mod policy_ignored;
+ pub mod policy_migrations;
+ pub mod policy_rollout;
+diff --git a/crates/tirith-core/src/policy.rs b/crates/tirith-core/src/policy.rs
+index 30efd77512cbe0a52a80e873c3255f58610f4500..c69babbbf922e6936f416a3f1150c2dba42defc8 100644
+--- a/crates/tirith-core/src/policy.rs
++++ b/crates/tirith-core/src/policy.rs
+@@ -229,7 +229,7 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
+     // `Path::exists` follows the final symlink and therefore treats a dangling
+     // named policy as absent. Retain the directory entry so the scoped loader
+     // can diagnose it and fail closed instead of silently using defaults.
+-    let yaml_exists = std::fs::symlink_metadata(&yaml).is_ok();
++    let yaml_exists = crate::policy_discovery::entry_exists(&yaml, false);
+     snapshot::observe_discovery(&yaml, false, yaml_exists);
+     if yaml_exists && !snapshot::is_capturing() {
+         return Some(yaml);
+@@ -239,7 +239,7 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
+     // discovery witness from a multi-step operation's external-input guard.
+     // This observes only entry presence; an unselected document is not read.
+     let yml = dir.join("policy.yml");
+-    let yml_exists = std::fs::symlink_metadata(&yml).is_ok();
++    let yml_exists = crate::policy_discovery::entry_exists(&yml, false);
+     snapshot::observe_discovery(&yml, false, yml_exists);
+     if yaml_exists {
+         return Some(yaml);
+@@ -3490,7 +3490,7 @@ impl Policy {
+             let org_dir = repo_root.join(".tirith");
+             // F9 — repo allowlist (suppression) is intentionally NOT loaded.
+             let allowlist_path = org_dir.join("allowlist");
+-            let allowlist_exists = allowlist_path.exists();
++            let allowlist_exists = crate::policy_discovery::entry_exists(&allowlist_path, true);
+             snapshot::observe_discovery(&allowlist_path, true, allowlist_exists);
+             if allowlist_exists {
+                 snapshot::observe_neutralized(
+@@ -4045,9 +4045,10 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
+             return Some(candidate);
+         }
+ 
+-        // `.git` may be a dir or a file (worktrees); `.exists()` handles both.
++        // `.git` may be a directory or a worktree file. Directory-shaped
++        // lookups must name real entries, not virtual filesystem phantoms.
+         let git_dir = current.join(".git");
+-        let git_exists = git_dir.exists();
++        let git_exists = crate::policy_discovery::entry_exists(&git_dir, true);
+         snapshot::observe_discovery(&git_dir, true, git_exists);
+         if git_exists {
+             return None;
+@@ -4116,7 +4117,7 @@ pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
+     let mut current = start.as_path();
+     loop {
+         let git = current.join(".git");
+-        let git_exists = git.exists();
++        let git_exists = crate::policy_discovery::entry_exists(&git, true);
+         snapshot::observe_discovery(&git, true, git_exists);
+         if git_exists {
+             return Some(current.to_path_buf());
+@@ -5594,6 +5595,167 @@ custom_rules:
+         );
+     }
+ 
++    #[cfg(not(windows))]
++    #[test]
++    fn phantom_directory_discovery_preserves_user_policy_and_snapshot() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        state.after_restore(crate::incident::invalidate_cache);
++        crate::incident::invalidate_cache();
++        let config = config_dir().unwrap();
++        std::fs::create_dir_all(&config).unwrap();
++        let user_policy = config.join("policy.yaml");
++        std::fs::write(&user_policy, "fail_mode: open\n").unwrap();
++        let cwd = &state.roots().cwd;
++
++        std::fs::create_dir(cwd.join("写真")).unwrap();
++        std::fs::write(cwd.join("résumé.txt"), "search result").unwrap();
++        crate::policy_discovery::with_directory_lookups(cwd, || {
++            assert_eq!(find_repo_root(cwd.to_str()), None);
++            assert_eq!(repo_context_labels_path(cwd.to_str()), None);
++            assert_eq!(repo_ssh_host_labels_path(cwd.to_str()), None);
++            assert_eq!(
++                discover_local_policy_path_scoped(cwd.to_str()),
++                Some((user_policy.clone(), PolicyScope::User))
++            );
++            let snapshot = snapshot::EffectivePolicySnapshot::resolve(
++                cwd.to_str(),
++                snapshot::ResolutionMode::Runtime,
++            );
++            assert_eq!(snapshot.policy.scope, PolicyScope::User);
++            assert_eq!(snapshot.policy.path.as_deref(), user_policy.to_str());
++            assert_eq!(snapshot.policy.fail_mode, FailMode::Open);
++            assert!(snapshot.revalidate_inputs().is_ok());
++
++            // A genuine entry appearing after discovery must invalidate the
++            // snapshot, even though stat already claimed it was present.
++            std::fs::create_dir_all(cwd.join(".tirith/policy.yaml")).unwrap();
++            assert!(snapshot.revalidate_inputs().is_err());
++            assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
++        });
++    }
++
++    #[cfg(not(windows))]
++    #[test]
++    fn phantom_git_directory_does_not_hide_real_ancestor_policy() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let repo = &state.roots().cwd;
++        std::fs::create_dir_all(repo.join(".git")).unwrap();
++        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
++        let policy = repo.join(".tirith/policy.yml");
++        std::fs::write(&policy, "paranoia: 4\n").unwrap();
++        let virtual_dir = repo.join("search-results");
++        std::fs::create_dir(&virtual_dir).unwrap();
++        crate::policy_discovery::with_directory_lookups(&virtual_dir, || {
++            assert_eq!(find_repo_root(virtual_dir.to_str()), Some(repo.clone()));
++            assert_eq!(discover_policy_path(virtual_dir.to_str()), Some(policy));
++            assert_eq!(
++                Policy::discover_local_only(virtual_dir.to_str()).paranoia,
++                4
++            );
++        });
++    }
++
++    #[test]
++    fn real_directory_policy_still_closes_without_a_git_marker() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".tirith/policy.yaml")).unwrap();
++        // The invalid YAML candidate must not fall through to the valid YML.
++        std::fs::write(cwd.join(".tirith/policy.yml"), "fail_mode: open\n").unwrap();
++        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
++    }
++
++    #[test]
++    fn regular_worktree_marker_remains_a_discovery_boundary() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
++        std::fs::write(cwd.join(".tirith/policy.yaml"), "paranoia: 4\n").unwrap();
++        let worktree = cwd.join("worktree");
++        std::fs::create_dir_all(&worktree).unwrap();
++        std::fs::write(worktree.join(".git"), "gitdir: ../elsewhere\n").unwrap();
++        assert_eq!(find_repo_root(worktree.to_str()), Some(worktree.clone()));
++        assert_eq!(discover_policy_path(worktree.to_str()), None);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn broken_git_marker_does_not_hide_ancestor_policy() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let repo = &state.roots().cwd;
++        std::fs::create_dir_all(repo.join(".git")).unwrap();
++        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
++        let policy = repo.join(".tirith/policy.yaml");
++        std::fs::write(&policy, "paranoia: 4\n").unwrap();
++        let child = repo.join("child");
++        std::fs::create_dir(&child).unwrap();
++        std::os::unix::fs::symlink(".git", child.join(".git")).unwrap();
++        assert_eq!(find_repo_root(child.to_str()), Some(repo.clone()));
++        assert_eq!(discover_policy_path(child.to_str()), Some(policy));
++    }
++
++    #[test]
++    fn policy_directory_case_alias_still_closes_when_native_lookup_resolves_it() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".tirith/POLICY.YAML")).unwrap();
++        // Exercise real case-insensitive filesystem lookup when supported;
++        // the platform-independent alias matrix is tested in policy_discovery.
++        if cwd.join(".tirith/policy.yaml").is_dir() {
++            assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
++        }
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn dangling_policy_symlink_still_closes() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
++        std::os::unix::fs::symlink("missing", cwd.join(".tirith/policy.yaml")).unwrap();
++        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn fifo_policy_still_closes_without_blocking() {
++        use std::os::unix::ffi::OsStrExt;
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
++        let path =
++            std::ffi::CString::new(cwd.join(".tirith/policy.yaml").as_os_str().as_bytes()).unwrap();
++        // SAFETY: the CString is a valid NUL-terminated path in this test's
++        // isolated directory; mkfifo retains no pointer after returning.
++        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
++        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn unsearchable_policy_directory_still_closes() {
++        use std::os::unix::fs::PermissionsExt;
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let cwd = &state.roots().cwd;
++        let policy_dir = cwd.join(".tirith");
++        std::fs::create_dir(&policy_dir).unwrap();
++        std::fs::write(policy_dir.join("policy.yaml"), "task_gate: [").unwrap();
++        std::fs::set_permissions(&policy_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
++        let policy = Policy::discover_local_only(cwd.to_str());
++        std::fs::set_permissions(&policy_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
++        // Also passes as root, where the malformed bytes remain readable.
++        assert_task_boundaries_fail_closed(&policy);
++    }
++
+     #[test]
+     fn malformed_repo_policy_closes_every_task_boundary() {
+         let mut global = tirith_test_support::GlobalStateGuard::new()
+diff --git a/crates/tirith-core/src/policy_discovery.rs b/crates/tirith-core/src/policy_discovery.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5eab845cd657e61890f4c278f6f6b2078110c4dd
+--- /dev/null
++++ b/crates/tirith-core/src/policy_discovery.rs
+@@ -0,0 +1,276 @@
++//! Policy discovery must distinguish named entries from virtual filesystems
++//! which synthesize directories for arbitrary lookups (for example kio-fuse).
++
++use std::path::Path;
++
++// Discovery runs on every intercepted command. A huge or unreadable listing
++// is inconclusive, never evidence that a policy can safely be ignored.
++const MAX_DISCOVERY_ENTRIES: usize = 4096;
++
++pub(crate) fn entry_exists(path: &Path, follow: bool) -> bool {
++    let metadata = if follow {
++        std::fs::metadata(path)
++    } else {
++        std::fs::symlink_metadata(path)
++    }
++    .map(|metadata| metadata.is_dir());
++    #[cfg(all(test, not(windows)))]
++    let metadata = DIRECTORY_LOOKUPS.with(|root| {
++        if root
++            .borrow()
++            .as_ref()
++            .is_some_and(|root| path.starts_with(root))
++        {
++            Ok(true)
++        } else {
++            metadata
++        }
++    });
++    // Preserve marker/allowlist lookup semantics: an inaccessible or broken
++    // `.git` is not a new boundary which could hide an ancestor policy.
++    if follow && metadata.is_err() {
++        return false;
++    }
++    // Win32 lookup may resolve an arbitrary 8.3 alternate name which read_dir
++    // does not expose. Preserve its existing directory behavior rather than
++    // risking absence based only on long names. kio-fuse is a Unix filesystem.
++    #[cfg(windows)]
++    if matches!(&metadata, Ok(true)) {
++        return true;
++    }
++    entry_exists_with(path, metadata, listed_entry)
++}
++
++fn entry_exists_with(
++    path: &Path,
++    metadata: std::io::Result<bool>,
++    mut listed: impl FnMut(&Path) -> Option<bool>,
++) -> bool {
++    match metadata {
++        // Keep named files, symlinks (including dangling ones), FIFOs, etc.
++        // Their safety and readability belong to the existing scoped reader.
++        Ok(false) => true,
++        Ok(true) => match listed(path) {
++            Some(present) => present,
++            // A synthetic `.tirith/` may not itself be enumerable. Its absence
++            // in the real parent listing also disproves the policy candidate.
++            None => path.parent().and_then(listed) != Some(false),
++        },
++        Err(error) => !matches!(
++            error.kind(),
++            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
++        ),
++    }
++}
++
++/// None means enumeration failed or exceeded its bound. Only a complete,
++/// successful listing can prove absence; an actual directory policy still
++/// reaches the reader and fails closed as a non-regular file.
++fn listed_entry(path: &Path) -> Option<bool> {
++    let name = path.file_name()?;
++    let parent = path.parent()?;
++    let parent = if parent.as_os_str().is_empty() {
++        Path::new(".")
++    } else {
++        parent
++    };
++    let entries = std::fs::read_dir(parent).ok()?;
++    listed_name(
++        name,
++        entries.map(|entry| entry.map(|entry| entry.file_name())),
++    )
++}
++
++fn listed_name(
++    name: &std::ffi::OsStr,
++    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
++) -> Option<bool> {
++    // All automatic policy/marker names are ASCII. An unfamiliar parent
++    // name may have filesystem-specific normalization, so do not use it to
++    // prove absence when the candidate's own listing was inconclusive.
++    if !name.as_encoded_bytes().is_ascii() {
++        return None;
++    }
++    for (index, entry) in entries.enumerate() {
++        if index >= MAX_DISCOVERY_ENTRIES {
++            return None;
++        }
++        if names_may_alias(name, &entry.ok()?) {
++            return Some(true);
++        }
++    }
++    Some(false)
++}
++
++// Filesystem lookup can fold case, normalize Unicode, ignore format characters,
++// or trim trailing ASCII dots/spaces. Over-admitting a possible alias retains
++// the scoped reader's fail-closed behavior; under-admitting one could skip a
++// real directory policy. Normalize only the listed name, never the read path.
++fn names_may_alias(name: &std::ffi::OsStr, entry: &std::ffi::OsStr) -> bool {
++    use unicode_normalization::UnicodeNormalization;
++    let Some(entry) = entry.to_str() else {
++        return false;
++    };
++    let matches = |entry: &str| {
++        entry
++            .trim_end_matches(['.', ' '])
++            .as_bytes()
++            .eq_ignore_ascii_case(name.as_encoded_bytes())
++    };
++    if entry.is_ascii() {
++        return matches(entry);
++    }
++    static IGNORABLE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
++        regex::Regex::new(r"\p{Default_Ignorable_Code_Point}")
++            .expect("valid Unicode property for filesystem aliases")
++    });
++    let folded: String = entry.nfkc().flat_map(char::to_uppercase).collect();
++    matches(&IGNORABLE.replace_all(&folded, ""))
++}
++
++#[cfg(all(test, not(windows)))]
++thread_local! {
++    static DIRECTORY_LOOKUPS: std::cell::RefCell<Option<std::path::PathBuf>> = const {
++        std::cell::RefCell::new(None)
++    };
++}
++
++/// Model the reported virtual filesystem's stat behavior while retaining real
++/// directory listings. Scoped to this thread; never compiled into production.
++#[cfg(all(test, not(windows)))]
++pub(crate) fn with_directory_lookups<T>(root: &Path, run: impl FnOnce() -> T) -> T {
++    struct Restore(Option<std::path::PathBuf>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            DIRECTORY_LOOKUPS.with(|root| *root.borrow_mut() = self.0.take());
++        }
++    }
++    let _restore = Restore(DIRECTORY_LOOKUPS.with(|value| value.replace(Some(root.into()))));
++    run()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::ffi::{OsStr, OsString};
++    use std::io::{Error, ErrorKind};
++
++    #[test]
++    fn directory_shaped_candidate_requires_an_actual_name() {
++        let path = Path::new("repo/.tirith/policy.yaml");
++        assert!(!entry_exists_with(path, Ok(true), |_| Some(false)));
++        assert!(entry_exists_with(path, Ok(true), |_| Some(true)));
++        assert!(entry_exists_with(path, Ok(true), |_| None));
++    }
++
++    #[test]
++    fn unenumerable_phantom_parent_must_be_proven_absent() {
++        let path = Path::new("repo/.tirith/policy.yaml");
++        for parent in [Some(true), None, Some(false)] {
++            let present = entry_exists_with(path, Ok(true), |candidate| {
++                if candidate == path {
++                    None
++                } else {
++                    parent
++                }
++            });
++            assert_eq!(present, parent != Some(false));
++        }
++    }
++
++    #[test]
++    fn files_and_symlinks_are_never_rejected_by_enumeration() {
++        assert!(entry_exists_with(
++            Path::new("policy.yaml"),
++            Ok(false),
++            |_| { panic!("must preserve non-directory entries without enumeration") }
++        ));
++    }
++
++    #[test]
++    fn metadata_errors_are_not_silently_downgraded_to_absence() {
++        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
++            assert!(entry_exists_with(
++                Path::new("policy.yaml"),
++                Err(Error::from(kind)),
++                |_| None
++            ));
++        }
++        for kind in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
++            assert!(!entry_exists_with(
++                Path::new("policy.yaml"),
++                Err(Error::from(kind)),
++                |_| None
++            ));
++        }
++    }
++
++    #[test]
++    fn filesystem_name_aliases_do_not_hide_real_directory_policies() {
++        for alias in [
++            "POLICY.YAML",
++            "polıcy.yaml",
++            "pol\u{200d}icy.yaml",
++            "ｐｏｌｉｃｙ.yaml",
++            "policy.yaml. ",
++        ] {
++            assert!(
++                names_may_alias(OsStr::new("policy.yaml"), OsStr::new(alias)),
++                "{alias}"
++            );
++        }
++        assert!(names_may_alias(
++            OsStr::new("allowlist"),
++            OsStr::new("allowliſt")
++        ));
++        for unrelated in ["résultat", "結果", "policy.yaml.backup"] {
++            assert!(!names_may_alias(
++                OsStr::new("policy.yaml"),
++                OsStr::new(unrelated)
++            ));
++        }
++    }
++
++    #[test]
++    fn enumeration_is_exact_bounded_and_errors_are_inconclusive() {
++        let name = OsStr::new(".git");
++        assert_eq!(
++            listed_name(
++                name,
++                [Ok(OsString::from("résultat")), Ok(OsString::from("結果"))].into_iter()
++            ),
++            Some(false)
++        );
++        assert_eq!(
++            listed_name(name, [Ok(OsString::from(".GIT"))].into_iter()),
++            Some(true)
++        );
++        assert_eq!(listed_name(OsStr::new("répo"), std::iter::empty()), None);
++        assert_eq!(
++            listed_name(name, [Ok(OsString::from(".git-other"))].into_iter()),
++            Some(false)
++        );
++        assert_eq!(
++            listed_name(name, [Ok(OsString::from(".git"))].into_iter()),
++            Some(true)
++        );
++        assert_eq!(
++            listed_name(
++                name,
++                [Err(Error::from(ErrorKind::PermissionDenied))].into_iter()
++            ),
++            None
++        );
++        assert_eq!(
++            listed_name(name, (0..MAX_DISCOVERY_ENTRIES).map(|_| Ok("other".into()))),
++            Some(false)
++        );
++        assert_eq!(
++            listed_name(
++                name,
++                (0..=MAX_DISCOVERY_ENTRIES).map(|_| Ok("other".into()))
++            ),
++            None
++        );
++    }
++}
+diff --git a/crates/tirith-core/src/policy_snapshot.rs b/crates/tirith-core/src/policy_snapshot.rs
+index 3ec6130b0602d162d6d088a5ec3db4f79141d83b..2a39dbcae68cf6c4f7c2ad232f58162966d845d7 100644
+--- a/crates/tirith-core/src/policy_snapshot.rs
++++ b/crates/tirith-core/src/policy_snapshot.rs
+@@ -711,11 +711,7 @@ impl InputWitness {
+                 ReadWitness::from_result(&read_input(path, *reader)) == *expected
+             }
+             WitnessKind::Discovery(path, follow, existed) => {
+-                (if *follow {
+-                    path.exists()
+-                } else {
+-                    std::fs::symlink_metadata(path).is_ok()
+-                }) == *existed
++                crate::policy_discovery::entry_exists(path, *follow) == *existed
+             }
+             WitnessKind::NamedDestination(path, expected) => {
+                 *expected != InputState::Unreadable && named_destination_state(path) == *expected
+diff --git a/crates/tirith/assets/shell/lib/fish-hook.fish b/crates/tirith/assets/shell/lib/fish-hook.fish
+index 904455f3b1f8f5831ec72d5935c04573144c7e0a..340829fe34b99a89e3831717938ef7bae486c01c 100644
+--- a/crates/tirith/assets/shell/lib/fish-hook.fish
++++ b/crates/tirith/assets/shell/lib/fish-hook.fish
+@@ -80,9 +80,9 @@ end
+ # a hook that discards every command. Runtime capture failures still block.
+ if status is-interactive
+     and begin
+-        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"
++        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"; or test -z "$_TIRITH_SH_BIN"
+     end
+-    builtin printf '%s\n' 'tirith: mktemp or rm unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
++    builtin printf '%s\n' 'tirith: mktemp, rm or sh unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
+     set -g TIRITH_STATUS off
+     set -e _TIRITH_FISH_LOADED
+     return 0
+@@ -248,10 +248,13 @@ end
+ 
+ function _tirith_v3_new_capture_file
+     if not string match -q '/*' -- "$_TIRITH_MKTEMP_BIN"; or \
+-            not string match -q '/*' -- "$_TIRITH_RM_BIN"
++            not string match -q '/*' -- "$_TIRITH_RM_BIN"; or \
++            not string match -q '/*' -- "$_TIRITH_SH_BIN"
+         return 1
+     end
+-    set -l file (umask 077; command "$_TIRITH_MKTEMP_BIN")
++    # Fish command substitutions run in this shell. Apply the private mask in
++    # a child so failures or Ctrl-C cannot change the interactive shell's mask.
++    set -l file (command "$_TIRITH_SH_BIN" -c 'command umask 077 || exit 1; exec "$1"' tirith-capture "$_TIRITH_MKTEMP_BIN")
+     set -l create_status $status
+     if test $create_status -ne 0; or test -z "$file"; or not test -f "$file"; or test -L "$file"; or not test -O "$file"
+         if test -n "$file"
+diff --git a/crates/tirith/src/cli/capsule.rs b/crates/tirith/src/cli/capsule.rs
+index e0381a3d797ccdd3bab8a9e20e88d365c06a32e2..3851fea5276de9d4bebe996435a377ad3a97dd6d 100644
+--- a/crates/tirith/src/cli/capsule.rs
++++ b/crates/tirith/src/cli/capsule.rs
+@@ -318,6 +318,7 @@ pub enum CapsuleTerminationKind {
+     Presentation,
+     CleanupFailure,
+     /// The contained target reached a nonzero or signaled exit.
++    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+     UnsuccessfulExit,
+ }
+ 
+@@ -689,6 +690,15 @@ impl HeldEphemeralDirectory {
+ #[cfg(target_os = "linux")]
+ impl Drop for HeldEphemeralDirectory {
+     fn drop(&mut self) {
++        if std::thread::panicking() {
++            // An unexpected unwind does not prove owned-child quiescence. Keep
++            // the directory and disarm TempDir's recursive pathname destructor
++            // before its fields drop; explicit ordinary cleanup is unchanged.
++            if let Some(guard) = self.guard.take() {
++                let _ = guard.keep();
++            }
++            return;
++        }
+         if let Err(error) = self.cleanup_with_hook(|| {}) {
+             eprintln!(
+                 "tirith capsule: capability-relative ephemeral-directory cleanup failed; preserving residue: {error}"
+@@ -7780,6 +7790,47 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn held_ephemeral_directory_unwind_preserves_root_and_contents() {
++        use std::os::unix::fs::MetadataExt as _;
++
++        let parent = tempfile::tempdir().expect("ephemeral parent");
++        let directory = tempfile::Builder::new()
++            .prefix("tirith-held-unwind-")
++            .tempdir_in(parent.path())
++            .expect("held directory");
++        let path = directory.path().to_path_buf();
++        let cache = path.join("cache");
++        std::fs::create_dir(&cache).expect("create cache");
++        std::fs::write(cache.join("retained"), b"ambiguous cache state")
++            .expect("write retained cache bytes");
++        let identity = std::fs::symlink_metadata(&path).expect("root identity");
++        let held = HeldEphemeralDirectory::from_tempdir(
++            directory,
++            "landlock-seccomp",
++            "test ephemeral directory",
++        )
++        .expect("retain directory capability");
++
++        // Exercise the real destructor during unwinding. No child is launched
++        // and this preservation observation says nothing about child cleanup.
++        let unwind = std::panic::catch_unwind(move || {
++            let _held = held;
++            panic!("simulate unexpected unwind after a possible child launch");
++        });
++        assert!(unwind.is_err());
++        let retained = std::fs::symlink_metadata(&path).expect("preserved root");
++        assert_eq!(
++            (retained.dev(), retained.ino(), retained.mode()),
++            (identity.dev(), identity.ino(), identity.mode())
++        );
++        assert_eq!(
++            std::fs::read(cache.join("retained")).expect("preserved cache contents"),
++            b"ambiguous cache state"
++        );
++    }
++
+     #[cfg(target_os = "linux")]
+     #[test]
+     fn held_ephemeral_directory_preserve_is_one_shot_and_non_panicking() {
+diff --git a/crates/tirith/src/cli/control/api.rs b/crates/tirith/src/cli/control/api.rs
+index e48037fd8e9cdf2f7d06aa6059ec2265410bf029..3bb4416c11ff2fec9be976cf05c9769eb3d5a869 100644
+--- a/crates/tirith/src/cli/control/api.rs
++++ b/crates/tirith/src/cli/control/api.rs
+@@ -170,6 +170,9 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
+     match result {
+         Ok(mut value) => {
+             merge_diagnostics(&mut value, diagnostics, &compiled);
++            if request.method == "GET" && request.target == "/api/policy" {
++                bound_policy_control_inventory(&mut value);
++            }
+             (200, value)
+         }
+         Err(error) => (
+@@ -180,6 +183,16 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
+     }
+ }
+ 
++fn bound_policy_control_inventory(value: &mut Value) {
++    if serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() > http::MAX_RESPONSE) {
++        if let Some(object) = value.as_object_mut() {
++            if object.remove("personal_controls").is_some() {
++                object.insert("personal_controls_omitted".into(), true.into());
++            }
++        }
++    }
++}
++
+ fn merge_diagnostics(
+     value: &mut Value,
+     diagnostics: Vec<String>,
+@@ -833,6 +846,40 @@ fn admission<'a>(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn oversized_policy_control_inventory_preserves_policy_and_diagnostics() {
++        let mut value = json!({"policy":{"allowlist":["x".repeat(450 * 1024)]},
++            "resolution":{"policy_posture_sha256":"captured"},
++            "personal_controls":{"strict_warn":{"effective_value":false,"reason":"y".repeat(80 * 1024)}}});
++        let compiled = CompiledCustomPatterns::new_silent(&[]);
++        merge_diagnostics(&mut value, vec!["captured diagnostic".into()], &compiled);
++        let mut expected = value.clone();
++        expected
++            .as_object_mut()
++            .unwrap()
++            .remove("personal_controls");
++        bound_policy_control_inventory(&mut value);
++        assert_eq!(value["personal_controls_omitted"], true);
++        assert!(value.get("personal_controls").is_none());
++        assert!(serde_json::to_vec(&value).unwrap().len() <= http::MAX_RESPONSE);
++        value
++            .as_object_mut()
++            .unwrap()
++            .remove("personal_controls_omitted");
++        assert_eq!(value, expected);
++
++        let mut small =
++            json!({"policy":{},"personal_controls":{"strict_warn":{"effective_value":false}}});
++        let expected = small.clone();
++        bound_policy_control_inventory(&mut small);
++        assert_eq!(small, expected);
++
++        let mut too_large =
++            json!({"policy":{"allowlist":["x".repeat(http::MAX_RESPONSE)]},"personal_controls":{}});
++        bound_policy_control_inventory(&mut too_large);
++        assert!(serde_json::to_vec(&too_large).unwrap().len() > http::MAX_RESPONSE);
++    }
++
+     #[test]
+     fn dispatch_preserves_route_diagnostics_and_bounds_combined_output() {
+         let mut value = json!({"kind":"npm_inspection", "diagnostics":["route diagnostic EARLIER_SECRET"], "omitted_diagnostics":2});
+diff --git a/crates/tirith/src/cli/control/assets/app.css b/crates/tirith/src/cli/control/assets/app.css
+index afe51d4780225bc731f80b9ed58ac721c3915747..e9348f68c7661b9c13b664e96536daa00aa2acf0 100644
+--- a/crates/tirith/src/cli/control/assets/app.css
++++ b/crates/tirith/src/cli/control/assets/app.css
+@@ -1,2 +1,11 @@
+ :root{color-scheme:light;--paper:#fff;--ground:#f5f7fc;--ink:#17243b;--muted:#596780;--blue:#315cdf;--border:#dde3ef;--amber:#8a5400;--radius:8px;--space:24px;font-family:Aptos,"Helvetica Neue",Arial,sans-serif;font-size:16px;color:var(--ink);background:var(--ground)}*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}button{border:1px solid var(--border);background:var(--paper);padding:10px 15px;border-radius:6px;color:var(--ink);cursor:pointer}button:hover{border-color:var(--blue)}button:disabled{cursor:wait;opacity:.6}.primary{background:var(--blue);border-color:var(--blue);color:white}.danger{color:#9c2727}.secondary{background:transparent}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #91adff;outline-offset:3px}a{color:var(--blue)}.skip{position:fixed;left:16px;top:-80px;padding:14px;background:white;z-index:9}.skip:focus{top:16px}.workbench{min-height:100vh;display:grid;grid-template-columns:220px minmax(0,1fr)}aside{background:var(--paper);padding:32px 20px;border-right:1px solid var(--border);display:flex;flex-direction:column}.brand{display:flex;gap:10px;align-items:center;font-size:22px;font-weight:700;text-decoration:none;color:var(--ink);margin:0 4px 44px}.brand small{font-size:10px;letter-spacing:1px;color:var(--muted)}.mark{display:grid;place-items:center;border:2px solid var(--ink);width:28px;height:32px;font-size:19px;border-radius:3px 3px 12px 12px}nav{display:flex;flex-direction:column;gap:6px}nav button{text-align:left;border-color:transparent;background:transparent;font-size:16px;padding:13px 16px}nav button[aria-current=page]{color:var(--blue);background:#edf1ff;font-weight:600}.local-note{margin:auto 12px 0;padding-top:60px;color:var(--muted);line-height:1.7;font-size:12px}main{padding:44px clamp(24px,4vw,64px);max-width:1500px;min-width:0}header{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:34px}.eyebrow{letter-spacing:1.5px;font-size:11px;font-weight:700;color:var(--muted);margin:0 0 12px}h1{font-size:32px;letter-spacing:-.7px;margin:0 0 10px;font-weight:600}h2{font-size:20px;letter-spacing:-.2px;margin:0 0 18px}h3{font-size:16px;margin:0 0 12px}p{line-height:1.55}#subtitle{color:var(--muted);margin:0;max-width:75ch}section{margin-bottom:30px}.panel{background:var(--paper);border:1px solid var(--border);border-radius:var(--radius);padding:26px}.hero{padding:32px;margin-bottom:28px;border-left:4px solid var(--blue)}.hero h2{font-size:36px;line-height:1.2;letter-spacing:-.8px;margin:14px 0}.hero p{max-width:75ch;color:var(--muted)}.eyebrow+.hero-title{margin-top:0}.badge{display:inline-block;font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:4px;padding:4px 8px;background:var(--ground)}.warning{color:var(--amber);background:#fff8e9;border-color:#ebd2a6}.rows{display:grid;gap:0}.row{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;padding:17px 0;border-bottom:1px solid var(--border)}.row:last-child{border:0}.row small,.muted{display:block;color:var(--muted);line-height:1.55;font-size:14px}.row strong{display:block;font-weight:600;margin-bottom:6px}.row .actions{flex-shrink:0;align-self:center}.actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 0}.actions button{font-size:14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.profile{padding:22px;background:white;border:1px solid var(--border);border-radius:var(--radius)}.profile p{font-size:14px;color:var(--muted);min-height:70px}.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:0 0 24px}.toolbar label{min-width:150px;flex:1}label{display:block;font-size:14px;font-weight:600;line-height:1.5;margin-bottom:16px}label small{font-weight:400;color:var(--muted);display:block}input,select,textarea{display:block;width:100%;padding:11px 12px;color:var(--ink);background:white;border:1px solid #b8c4d8;border-radius:5px;margin-top:7px;font-weight:400}input[type=checkbox]{display:inline;width:auto;margin:0 8px 0 0}textarea{min-height:80px;resize:vertical}.two-column{display:grid;grid-template-columns:minmax(0,1fr) minmax(240px,.65fr);gap:24px}.empty{padding:28px;border:1px dashed #b8c4d8;color:var(--muted);line-height:1.6}.notice,#notice{background:#fff8e9;border:1px solid #ebd2a6;padding:16px 20px;border-radius:6px;margin-bottom:24px;line-height:1.5}#notice[hidden]{display:none}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--ground);padding:16px;border-radius:6px;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;max-height:380px;overflow:auto}code{font:13px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}details{margin-top:12px}summary{cursor:pointer;font-size:14px;color:var(--blue);padding:8px 0}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px}th{font-size:12px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);padding:12px 8px}td{padding:14px 8px;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:anywhere}td:first-child{white-space:nowrap}.table-scroll{overflow:auto}footer{display:flex;justify-content:space-between;gap:20px;border-top:1px solid var(--border);padding-top:20px;margin-top:40px;font-size:12px;color:var(--muted)}dialog{max-width:720px;width:calc(100% - 32px);border:1px solid var(--border);border-radius:10px;padding:28px;color:var(--ink);max-height:90vh;overflow:auto}dialog::backdrop{background:rgb(23 36 59 / .35)}.dialog-head{display:flex;justify-content:space-between;align-items:baseline;gap:16px}dialog h2{font-size:24px}.form-error{color:#9c2727;font-size:14px}#content[aria-busy=true]{opacity:.65}@media(max-width:1050px){.workbench{grid-template-columns:180px minmax(0,1fr)}aside{padding:28px 12px}.grid{grid-template-columns:1fr}.profile p{min-height:0}.two-column{grid-template-columns:1fr}main{padding:32px 24px}}@media(max-width:650px){.workbench{display:block}aside{padding:18px 16px;border-right:0;border-bottom:1px solid var(--border)}.brand{margin:0 0 18px}nav{flex-direction:row;flex-wrap:wrap;gap:4px}nav button{font-size:14px;padding:8px 10px}.local-note{display:none}main{padding:28px 18px}header{align-items:flex-start}h1{font-size:28px}.hero h2{font-size:28px}.panel,.hero{padding:22px}.row{flex-direction:column;gap:6px}.row .actions{align-self:flex-start}.toolbar{align-items:stretch}.toolbar label{min-width:100%}footer{flex-direction:column;gap:8px}.dialog-head{align-items:flex-start}.grid{gap:12px}}
+ .row>div{min-width:0;max-width:100%}.row small,.row strong{overflow-wrap:anywhere}
++p{overflow-wrap:anywhere}.policy-field-control .badge{overflow-wrap:anywhere;max-width:100%}
++.profile-diff{table-layout:fixed}.profile-diff td:first-child{white-space:normal}.profile-diff th:first-child{width:24%}.profile-diff th:nth-child(2),.profile-diff th:nth-child(3){width:15%}.profile-diff .row{flex-direction:column;gap:6px}.profile-diff .notice{padding:12px}.profile-diff p{font-size:13px}
++@media(max-width:650px){
++  .profile-diff,.profile-diff tbody,.profile-diff tr,.profile-diff td{display:block;width:100%}
++  .profile-diff thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
++  .profile-diff tr{padding:16px 0;border-bottom:1px solid var(--border)}
++  .profile-diff td{padding:6px 0;border:0}.profile-diff td:first-child{font-weight:600}
++  .profile-diff td::before{content:attr(data-label);display:block;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:600}
++}
+diff --git a/crates/tirith/src/cli/control/assets/app.js b/crates/tirith/src/cli/control/assets/app.js
+index af272d0ddb625505e8996da6ce3e32ecb23808cb..9f386a28f973c9ecef0bcc150fcc542c6225c692 100644
+--- a/crates/tirith/src/cli/control/assets/app.js
++++ b/crates/tirith/src/cli/control/assets/app.js
+@@ -24,7 +24,7 @@
+   function rawDetails(title, value) { const node = element('details'); node.append(element('summary', title), element('pre', JSON.stringify(value, null, 2))); return node; }
+   function row(title, detail, status, actions = []) { const node = element('div', undefined, 'row'); const copy = element('div'); copy.append(element('strong', title), element('small', detail)); node.append(copy); if (status) node.append(badge(status)); if (actions.length) { const group = element('div', undefined, 'actions'); group.append(...actions); node.append(group); } return node; }
+   function showError(error) { notice.textContent = error.message || String(error); notice.hidden = false; }
+-  async function api(path, body) {
++  async function api(path, body, showDiagnostics = true) {
+     const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 35000);
+     try {
+       const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
+@@ -32,7 +32,7 @@
+         ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+       const value = await response.json();
+       if (!response.ok) { if (response.status === 401) document.querySelector('#session-state').textContent = 'Session expired — reopen with tirith dashboard'; throw new Error(value.error || 'Local request failed'); }
+-      if (value.diagnostics?.length) showError(new Error(value.diagnostics.join('\n')));
++      if (showDiagnostics && value.diagnostics?.length) showError(new Error(value.diagnostics.join('\n')));
+       return value;
+     } catch (error) { if (error.name === 'AbortError') throw new Error('The response timed out. A submitted operation may still be running; inspect its stored ID before retrying.'); throw error; }
+     finally { clearTimeout(timer); }
+@@ -197,33 +197,81 @@
+   }
+   function advancedSettings(effective) {
+     const section = panel('Advanced personal settings'); const form = element('form');
++    if (effective.personal_controls_omitted) section.append(paragraph('Field summaries are unavailable because this policy response is large. The effective policy details remain available, and profile previews can still show their specific fields.', 'notice'));
+     const setting = select('Setting', [['strict_warn', 'Require acknowledgement for warnings'], ['allow_bypass_env', 'Permit explicit interactive bypass'], ['allow_bypass_env_noninteractive', 'Permit explicit noninteractive bypass'], ['scan_require_complete', 'Require complete scan coverage'], ['env_guard_enabled', 'Environment guard'], ['context_guard_enabled', 'Context guard'], ['exec_guard_enabled', 'Executable guard'], ['hooks_guard_enabled', 'Repository hooks guard'], ['baseline_enabled', 'Baseline checks'], ['mcp_redact_injection', 'Redact injection in MCP output'], ['fail_mode', 'Behavior on internal check failure'], ['paranoia', 'Heuristic sensitivity'], ['rule_severity', 'Specific rule severity']]);
+-    const value = select('Personal value', []); const rule = field('Rule to customize', 'text', '', 'Exact rule ID'); const current = paragraph('', 'muted');
++    const value = select('Personal value', []); const rule = field('Rule to customize', 'text', '', 'Exact rule ID'); const current = element('div');
++    rule.input.maxLength = 128;
++    const submit = element('button','Compare personal change','primary'); submit.type='submit';
++    function showControl() {
++      const selected = setting.input.value;
++      const canonical = selected === 'scan_require_complete' ? 'scan.require_complete' : selected === 'rule_severity' ? `severity_overrides.${rule.input.value.trim()}` : selected;
++      const control = effective.personal_controls?.[canonical];
++      current.replaceChildren(policyFieldControl(control));
++      const overridden = control?.personal_authority?.state === 'overridden';
++      value.input.disabled = !control || overridden; submit.disabled = !control || overridden;
++    }
+     function choices() {
+       value.input.replaceChildren();
+       const options = setting.input.value === 'fail_mode' ? [['open', 'Open'], ['closed', 'Closed']] : setting.input.value === 'paranoia' ? [1,2,3,4].map(n => [String(n), String(n)]) : setting.input.value === 'rule_severity' ? [['LOW','Low'],['MEDIUM','Medium'],['HIGH','High'],['CRITICAL','Critical']] : [['true','Enabled'],['false','Disabled']];
+       for (const [key, title] of [['reset', 'Remove personal override'], ...options]) { const option = element('option', title); option.value = key; value.input.append(option); }
+       rule.label.hidden = setting.input.value !== 'rule_severity'; rule.input.required = !rule.label.hidden;
+-      const path = setting.input.value === 'scan_require_complete' ? ['scan','require_complete'] : [setting.input.value];
+-      const effectiveValue = path.reduce((part, key) => part?.[key], effective.policy);
+-      current.textContent = `Current effective value: ${effectiveValue === undefined ? 'inspect the rule in effective settings below' : JSON.stringify(effectiveValue)}. Stronger policy sources may override your personal choice.`;
++      showControl();
+     }
+     setting.input.addEventListener('change', choices); choices();
+-    const submit = element('button','Compare personal change','primary'); submit.type='submit';
++    rule.input.addEventListener('input', showControl);
+     form.append(setting.label, value.label, rule.label, current, submit);
+     form.addEventListener('submit', event => { event.preventDefault(); const selected = value.input.value;
+       const change = {setting:setting.input.value, value:selected === 'reset' ? null : selected === 'true' ? true : selected === 'false' ? false : setting.input.value === 'paranoia' ? Number(selected) : selected};
+       if (setting.input.value === 'rule_severity') change.rule = rule.input.value.trim();
+-      requestDialog(() => api('/api/settings/preview', change), preview => { showDialog('Review personal setting', preview); operationActions.append(button('Create change plan', () => plan({kind:'personal_setting',change}), 'primary')); }).catch(showError);
++      requestDialog(() => api('/api/settings/preview', change), preview => { showDialog('Review personal setting', preview); personalPlanButton(preview, () => plan({kind:'personal_setting',change})); }).catch(showError);
+     });
+     section.append(paragraph('These changes apply to your personal policy. Profile changes and resets preserve explicit overrides. Removal restores the value inherited from other policy sources.'), form); return section;
+   }
+   async function previewProfile(profile) {
+     return requestDialog(() => api('/api/profile/preview', {profile}), value => {
+       showDialog('Review personal profile', value);
+-      operationActions.append(button('Create change plan', () => plan({kind:'profile', profile}), 'primary'));
++      personalPlanButton(value, () => plan({kind:'profile', profile}));
+     });
+   }
++  function policyValue(value) { return value === undefined ? 'Unavailable' : value === null ? 'No policy override' : JSON.stringify(value); }
++  function policySource(source) {
++    const names = {default:'Built-in defaults', user:'Personal policy', org:'Organization policy', repo:'Repository policy', remote:'Remote policy', remote_cache:'Cached remote policy', incident:'Incident policy', not_set:'No policy override'};
++    const name = names[source?.kind] || (source?.kind ? String(source.kind).replace(/[_-]/g, ' ') : 'Source unavailable');
++    return source?.path ? `${name}: ${source.path}` : name;
++  }
++  function policyFieldControl(control) {
++    const node = element('div', undefined, 'policy-field-control');
++    if (!control) { node.append(paragraph('Field authority is unavailable. Review the current policy before changing this setting.', 'notice')); return node; }
++    node.append(row('Current effective value', policySource(control.effective_source), control.effective_value_omitted ? 'Value too large to display here' : policyValue(control.effective_value)));
++    if (control.effective_value_omitted) node.append(paragraph('The current value is omitted from this field summary. Inspect the effective policy details for the full redacted value.', 'muted'));
++    const authority = control.personal_authority;
++    if (authority?.state === 'overridden') {
++      node.append(paragraph(`Managed by ${policySource(authority.governing_source)}. A personal change cannot change the effective value. Use the managing policy or contact its owner.`, 'notice'));
++    } else if (authority?.state === 'effective') {
++      node.append(paragraph('Your personal policy can affect this setting. Repository and incident constraints still apply.', 'muted'));
++    } else {
++      node.append(paragraph('Whether a personal change can affect this setting is unknown. The change will be checked again before apply.', 'notice'));
++    }
++    if (authority?.reason) node.append(paragraph(authority.reason, 'muted'));
++    if (control.contributions?.length) {
++      const details = element('details'); details.append(element('summary', 'Captured policy contributions'));
++      for (const contribution of control.contributions.slice(0, 8)) details.append(paragraph(`${policySource(contribution.source)}: ${contribution.reason}`));
++      details.append(paragraph('Contributions include earlier and unchanged declarations; they do not each establish a current lock.', 'muted'));
++      node.append(details);
++    }
++    if (control.contributions?.length > 8 || control.contributions_omitted) node.append(paragraph('Additional contributions are omitted from this view.', 'muted'));
++    if (control.neutralized_settings?.length) node.append(paragraph('Rejected repository preferences are recorded in the details. They do not lock your personal setting.', 'muted'));
++    if (control.neutralized_settings_omitted) node.append(paragraph('Additional rejected repository preferences are omitted from this view.', 'muted'));
++    if (control.source_paths_omitted) node.append(paragraph('Some source paths are omitted to keep this response bounded.', 'muted'));
++    return node;
++  }
++  function personalPlanButton(preview, create) {
++    const controls = preview.control ? [preview.control] : (preview.field_changes || []).map(change => change.control);
++    const overridden = controls.some(control => control?.personal_authority?.state === 'overridden');
++    const action = button('Create change plan', create, 'primary'); action.disabled = overridden;
++    operationActions.append(action);
++    if (overridden) operationContent.append(paragraph('This personal policy is overridden by a managing authority. No personal change plan is available here.', 'notice'));
++  }
+   function field(title, type = 'text', value = '', placeholder = '') { const label = element('label', title); const input = element('input'); input.type = type; input.value = value; input.placeholder = placeholder; if (type === 'checkbox') label.replaceChildren(input, document.createTextNode(title)); else label.append(input); return { label, input }; }
+   function select(title, options) { const label = element('label', title); const input = element('select'); input.setAttribute('aria-label', title); for (const [value, text] of options) { const option = element('option', text); option.value = value; input.append(option); } label.append(input); return { label, input }; }
+   async function exceptions() {
+@@ -572,12 +620,19 @@
+     if (value.kind === 'profile_preview') {
+       operationContent.append(paragraph(`Personal profile: ${value.selection?.name || 'reset owned settings'}`), paragraph(`Destination: ${value.target}`, 'muted'), paragraph('Organization, project, remote, and incident restrictions still apply. No settings have changed yet.'));
+       if (value.definition) operationContent.append(paragraph(value.definition.presentation));
+-      const table = element('table'); const head = element('tr'); for (const title of ['Setting', 'Before', 'After']) head.append(element('th', title)); table.append(head);
+-      for (const change of value.field_changes || []) { const row = element('tr'); row.append(element('td', change.field), element('td', change.before === null ? 'Not set' : JSON.stringify(change.before)), element('td', change.after === null ? 'Not set' : JSON.stringify(change.after))); table.append(row); }
++      const table = element('table', undefined, 'profile-diff'); const titles = ['Setting', 'Personal before', 'Personal after', 'Effective now and source'];
++      const head = element('tr'); for (const title of titles) head.append(element('th', title));
++      const heading = element('thead'); heading.append(head); table.append(heading); const body = element('tbody'); table.append(body);
++      for (const change of value.field_changes || []) {
++        const entry = element('tr'); const effective = element('td'); effective.append(policyFieldControl(change.control));
++        const cells = [element('td', change.field), element('td', policyValue(change.before)), element('td', policyValue(change.after)), effective];
++        cells.forEach((cell, index) => { cell.dataset.label = titles[index]; entry.append(cell); }); body.append(entry);
++      }
+       const scroll = element('div', undefined, 'table-scroll'); scroll.append(table); operationContent.append(scroll);
++      operationContent.append(paragraph('The proposed values are personal preferences. The effective result remains unverified until the change is applied and the resolver reads it back.', 'notice'));
+       if (value.custom_overrides?.length) operationContent.append(paragraph(`Preserved custom settings: ${value.custom_overrides.join(', ')}`, 'notice'));
+     } else if (value.kind === 'personal_setting_preview') {
+-      operationContent.append(paragraph(`Personal setting: ${value.field}`), paragraph(`Destination: ${value.target}`, 'muted'), row('Current personal value', 'Before this change', JSON.stringify(value.before)), row('Proposed personal value', 'Null removes the personal override', JSON.stringify(value.after)), paragraph(value.constraints), paragraph('Refresh Protection after applying to inspect the effective result.'));
++      operationContent.append(paragraph(`Personal setting: ${value.field}`), paragraph(`Destination: ${value.target}`, 'muted'), row('Current personal value', 'Before this change', policyValue(value.before)), row('Proposed personal value', 'Removing an override restores inherited behavior', policyValue(value.after)), policyFieldControl(value.control), paragraph('The effective result will be read back after apply; a saved personal value does not prove it took effect.', 'notice'));
+     } else if (value.semantics === 'trust_eligibility_only') {
+       operationContent.append(paragraph('This explains whether an exception is eligible. Independent command blockers can remain; no command was evaluated.'));
+     } else if (value.detail || value.error) {
+@@ -618,7 +673,7 @@
+           value.operation.impact_review = value.impact;
+           value.operation.impact_observation = value.live?.impact_observation;
+         }
+-        displayOperation(value.operation);
++        displayOperation(value.operation, value.preview);
+         if (value.kind === 'audit_rotation_plan' && value.preview) operationContent.prepend(paragraph(`Retain ${value.preview.retained_records} records (${value.preview.retained_bytes} bytes). ${value.preview.signed_segment ? 'The signed segment was verified.' : 'This segment has no signed-chain proof.'} Undo is available only before additional records are appended.`, 'notice'));
+       }
+     } catch (error) {
+@@ -653,8 +708,10 @@
+     node.append(paragraph(relations[history.setup_state] || relations.unknown, 'muted'));
+     return node;
+   }
+-  function displayOperation(operation) {
++  function displayOperation(operation, preview) {
+     const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
++    context.readbackSequence = (context.readbackSequence || 0) + 1;
++    if (preview) context.policyFields = preview.field ? [preview.field] : (preview.field_changes || []).map(change => change.field);
+     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
+     operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
+     if (operation.setup_activation) operationContent.append(activationHistoryPanel(operation.setup_activation));
+@@ -680,12 +737,35 @@
+     }
+     for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, step.state));
+     operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${context.id}`, 'muted'));
++    if (['set-profile','set-managed-profile','set-personal-setting','recommended-setup','import-policy'].includes(operation.kind) && ['completed','completed-with-recovery','undone','undone-with-recovery'].includes(operation.state)) {
++      const readback = panel('Current effective readback'); readback.append(paragraph('Reading current policy…', 'muted')); operationContent.append(readback);
++      readEffectivePolicy(context, context.readbackSequence, readback);
++    }
+     if (!operation.no_op && !operation.presentation_incomplete && operation.state === 'planned') operationActions.append(button('Apply reviewed change', () => act(context, 'apply'), 'primary'));
+     if (['planned','running','waiting','queued','cancel-requested'].includes(operation.state)) operationActions.append(button('Request cancellation', () => act(context, 'cancel')));
+     if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && ['completed','completed-with-recovery'].includes(operation.state)) operationActions.append(button('Undo owned change', () => act(context, 'undo')));
+     operationActions.append(button('Refresh stored status', () => act(context, 'status')));
+     if (['running','waiting','queued','cancel-requested'].includes(operation.state)) pollTimer = setTimeout(() => act(context, 'status').catch(showError), 1500);
+   }
++  async function readEffectivePolicy(context, sequence, target) {
++    const actionSequence = context.sequence;
++    try {
++      const effective = await api('/api/policy', undefined, false);
++      if (!currentOperation(context) || context.sequence !== actionSequence || context.readbackSequence !== sequence || !target.isConnected) return;
++      target.replaceChildren(element('h2', 'Current effective readback'), paragraph('These are the resolver’s current values. Other policy changes may have occurred since this operation.', 'muted'));
++      if (effective.diagnostics?.length) target.append(paragraph(effective.diagnostics.join('\n'), 'notice'));
++      if (effective.personal_controls_omitted) target.append(paragraph('Field summaries are unavailable because this policy response is large. Inspect the current effective policy details below.', 'notice'));
++      const fields = context.policyFields?.length ? context.policyFields : ['strict_warn','allow_bypass_env','fail_mode','paranoia','scan.require_complete'];
++      for (const field of [...new Set(fields)].slice(0, 32)) {
++        const control = effective.personal_controls?.[field];
++        target.append(element('h3', field), policyFieldControl(control));
++      }
++      target.append(rawDetails('Inspect current effective policy and sources', effective));
++    } catch (error) {
++      if (!currentOperation(context) || context.sequence !== actionSequence || context.readbackSequence !== sequence || !target.isConnected) return;
++      target.replaceChildren(element('h2', 'Current effective readback'), paragraph(`Current effective state is unavailable: ${error.message}. The stored operation result is unchanged.`, 'notice'));
++    }
++  }
+   async function act(context, action) {
+     if (!currentOperation(context)) return;
+     clearTimeout(pollTimer);
+diff --git a/crates/tirith/src/cli/control/http.rs b/crates/tirith/src/cli/control/http.rs
+index 6e6af3322342caaf1cce639fd9be3e233150452d..0d47b3781918d7622ea6846bbb34c9532cd0a524 100644
+--- a/crates/tirith/src/cli/control/http.rs
++++ b/crates/tirith/src/cli/control/http.rs
+@@ -7,6 +7,7 @@ use std::net::TcpStream;
+ use std::time::{Duration, Instant};
+ 
+ pub(super) const MAX_BODY: usize = 16 * 1024;
++pub(super) const MAX_RESPONSE: usize = 512 * 1024;
+ const MAX_HEADERS: usize = 8 * 1024;
+ const READ_DEADLINE: Duration = Duration::from_secs(3);
+ 
+@@ -65,6 +66,12 @@ pub(super) fn read(
+     }
+     #[cfg(not(windows))]
+     {
++        // Accepted sockets can inherit the listener's nonblocking mode (for
++        // example on macOS). SO_RCVTIMEO only bounds blocking reads; otherwise
++        // a temporarily empty receive buffer becomes an immediate HTTP 408.
++        stream
++            .set_nonblocking(false)
++            .map_err(|_| error(400, "cannot configure request deadline"))?;
+         read_request(stream, authorize)
+     }
+ }
+@@ -309,13 +316,17 @@ pub(super) fn respond(
+     content_type: &str,
+     bytes: &[u8],
+ ) -> std::io::Result<()> {
+-    if bytes.len() > 512 * 1024 {
++    if bytes.len() > MAX_RESPONSE {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+             "control response exceeds limit",
+         ));
+     }
+     let started = Instant::now();
++    // Some errors are returned before read() normalizes the accepted socket.
++    // SO_SNDTIMEO must apply to blocking writes so ordinary backpressure does
++    // not truncate a response while its absolute deadline still has time left.
++    stream.set_nonblocking(false)?;
+     let reason = match status {
+         200 => "OK",
+         202 => "Accepted",
+@@ -360,7 +371,7 @@ pub(super) fn respond(
+ mod tests {
+     use super::*;
+ 
+-    #[cfg(windows)]
++    #[cfg(any(unix, windows))]
+     #[test]
+     fn receive_deadline_keeps_the_socket_usable_for_http_408() {
+         for (request, initially_nonblocking) in [
+@@ -383,6 +394,7 @@ mod tests {
+             let started = Instant::now();
+             let result = read(&mut stream, |_| Ok(()));
+             let elapsed = started.elapsed();
++            #[cfg(windows)]
+             let read_timeout = stream.read_timeout();
+             let status = result.as_ref().err().map(|error| error.status);
+             let written = respond(&mut stream, status.unwrap_or(500), "text/plain", b"deadline");
+@@ -390,6 +402,7 @@ mod tests {
+             let (response, received) = client.join().expect("join bounded deadline client");
+             assert_eq!(status, Some(408));
+             assert!(elapsed >= READ_DEADLINE && elapsed < Duration::from_secs(8));
++            #[cfg(windows)]
+             assert_eq!(read_timeout.unwrap(), None, "must not use Winsock SO_RCVTIMEO");
+             assert!(written.is_ok(), "deadline response write: {written:?}");
+             assert!(received.is_ok(), "deadline response read: {received:?}");
+@@ -398,6 +411,62 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn nonblocking_accepted_socket_sends_the_complete_response_under_backpressure() {
++        use std::os::fd::AsRawFd;
++
++        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        client
++            .set_read_timeout(Some(Duration::from_secs(8)))
++            .unwrap();
++        let (mut stream, _) = listener.accept().unwrap();
++        // Linux does not inherit this flag from the listener; exercise the
++        // macOS accepted-socket behavior on every Unix test host.
++        stream.set_nonblocking(true).unwrap();
++        let send_buffer: libc::c_int = 4096;
++        // SAFETY: the socket and pointer remain valid for this call, and the
++        // option length matches the initialized integer's size.
++        let configured = unsafe {
++            libc::setsockopt(
++                stream.as_raw_fd(),
++                libc::SOL_SOCKET,
++                libc::SO_SNDBUF,
++                (&send_buffer as *const libc::c_int).cast(),
++                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
++            )
++        };
++        assert_eq!(configured, 0, "{}", std::io::Error::last_os_error());
++        let receiver = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(150));
++            let mut response = Vec::new();
++            let result = client.read_to_end(&mut response);
++            (response, result)
++        });
++        let body = vec![b'x'; MAX_RESPONSE];
++        let started = Instant::now();
++        let written = respond(&mut stream, 200, "application/json", &body);
++        let elapsed = started.elapsed();
++        drop(stream);
++        let (response, received) = receiver.join().expect("join bounded response client");
++        assert!(written.is_ok(), "response write: {written:?}");
++        assert!(received.is_ok(), "response read: {received:?}");
++        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
++        let header_end = response
++            .windows(4)
++            .position(|bytes| bytes == b"\r\n\r\n")
++            .expect("complete response headers")
++            + 4;
++        let headers = std::str::from_utf8(&response[..header_end]).unwrap();
++        assert!(headers.starts_with(&format!(
++            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
++            body.len()
++        )));
++        assert_eq!(&response[header_end..], body.as_slice());
++    }
++
+     fn get(headers: &str) -> Request {
+         parse_headers(format!("GET /api/state HTTP/1.1\r\n{headers}\r\n\r\n").as_bytes())
+             .unwrap()
+diff --git a/crates/tirith/src/cli/control/mod.rs b/crates/tirith/src/cli/control/mod.rs
+index 2b8f1afd8c3a63a41ad53fdb18f3c1813d2b4108..24a154061a21983aa1b747aaf3334f0ebf4024e8 100644
+--- a/crates/tirith/src/cli/control/mod.rs
++++ b/crates/tirith/src/cli/control/mod.rs
+@@ -96,7 +96,7 @@ impl Service {
+         let (status, result) = api::dispatch(self, &request);
+         let bytes = serde_json::to_vec(&result)
+             .unwrap_or_else(|_| b"{\"error\":\"response encoding failed\"}".to_vec());
+-        if bytes.len() > 512 * 1024 {
++        if bytes.len() > http::MAX_RESPONSE {
+             let _ = http::respond(
+                 &mut stream,
+                 413,
+diff --git a/crates/tirith/src/cli/menu.rs b/crates/tirith/src/cli/menu.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f6519b9c9524408fcc1ab15ff1c1d2715978d44
+--- /dev/null
++++ b/crates/tirith/src/cli/menu.rs
+@@ -0,0 +1,540 @@
++//! Optional, one-command terminal navigation over the existing typed CLI.
++//! No shell command parsing, process spawning, configuration writes, or raw mode.
++
++use std::io::{self, BufRead, IsTerminal, Read, Write};
++
++use crate::{AuditAction, Commands, PolicyAction, TrustAction, TrustQueryScope};
++
++const MAX_INPUT_BYTES: usize = 64;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Page {
++    Home,
++    Protection,
++    Profiles,
++    Activity,
++    Exceptions,
++    Integrations,
++    Maintenance,
++}
++
++impl Page {
++    fn text(self) -> &'static str {
++        match self {
++            Self::Home => {
++                "Tirith menu\n\
++                Choose a category, then one inspection or preview.\n\
++                Selected commands run once and keep their normal exit status.\n\
++                Changes use the explicit direct CLI workflows shown under g.\n\n\
++                Policy-aware inspections may read configured remote policy.\n\n\
++                1  Protection\n2  Profiles\n3  Activity and recent blocks\n\
++                4  Exceptions\n5  Integrations\n6  Maintenance\n"
++            }
++            Self::Protection => {
++                "Protection\n\
++                1  Show protection status\n\
++                2  Show instructions to verify blocking in this shell\n"
++            }
++            Self::Profiles => {
++                "Profiles\n\
++                1  Show local policy diagnostics (offline; excludes overlays)\n\
++                2  Resolve runtime policy (may refresh configured remote policy)\n\
++                Profile previews may resolve configured remote policy:\n\
++                3  Preview Comfortable\n4  Preview Balanced\n5  Preview Strict\n"
++            }
++            Self::Activity => {
++                "Activity and recent blocks\n\
++                Recorded checks do not prove execution or attacks prevented.\n\
++                1  Show up to 25 recent blocked checks\n\
++                2  Show up to 25 recent checks of all outcomes\n\
++                3  Explain the last triggered rule\n\
++                4  Review bounded tuning suggestions (no policy changes)\n"
++            }
++            Self::Exceptions => {
++                "Exceptions\n\
++                1  List current grants and their effective state\n\
++                2  List grants including expired entries\n\
++                An exception may leave other blockers or broader grants in place.\n"
++            }
++            Self::Integrations => {
++                "Integrations\n\
++                1  Show current protection and integration evidence\n\
++                2  Preview recommended shell setup with Balanced protection\n\
++                3  Show instructions to verify the calling shell\n\
++                Setup preview may resolve configured remote policy.\n\
++                Configured integrations still require fresh activation evidence.\n"
++            }
++            Self::Maintenance => {
++                "Maintenance\n\
++                1  Show installed version and offline provenance\n\
++                2  Preview a redacted diagnostic bundle (no file or upload)\n"
++            }
++        }
++    }
++
++    fn guidance(self) -> &'static str {
++        match self {
++            Self::Home => "Choose a numbered category. Direct commands support scripts and JSON; see tirith --help.\n",
++            Self::Protection => "Review status with tirith status; require fresh blocking evidence with tirith status --require-verified-blocking.\n\
++                tirith doctor --verify-shell prints the commands to run in the actual shell.\n",
++            Self::Profiles => "Compare a profile against your own commands with tirith policy rollout prepare --help.\n\
++                Inspect the saved review with tirith policy rollout show OPERATION_ID.\n\
++                Activate deliberately with tirith policy rollout activate OPERATION_ID; undo uses tirith policy rollout undo OPERATION_ID.\n",
++            Self::Activity => "Filter recorded checks with tirith audit recent --help.\n\
++                Explain a finding with tirith explain --help; record an expectation with tirith audit feedback --help.\n\
++                Feedback is a review signal and does not grant trust.\n",
++            Self::Exceptions => "Inspect a target with tirith trust explain TARGET.\n\
++                Review narrow target, rule, expiry, and reason options in tirith trust add --help.\n\
++                Revoke a reviewed grant with tirith trust revoke GRANT_ID; inspect the reported remaining permissions.\n",
++            Self::Integrations => "Customize shell/profile/agent selection with tirith setup recommended --help.\n\
++                Save a review with tirith setup recommended --plan-only.\n\
++                Inspect it with tirith policy operation OPERATION_ID; deliberately apply it with tirith policy operation OPERATION_ID --action apply.\n\
++                Open a fresh terminal when requested, then verify the actual shell.\n",
++            Self::Maintenance => "Review update behavior with tirith update --dry-run (network access); tirith update starts the existing confirmed workflow.\n\
++                Save a reviewed support bundle with tirith doctor --bundle. Nothing is uploaded.\n\
++                tirith audit rotate saves a retention plan; tirith audit rotate --operation-id OPERATION_ID --apply explicitly applies it.\n\
++                Preview shell-hook removal with tirith setup shell --remove --dry-run; tirith setup shell --remove applies removal.\n",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Action {
++    Status,
++    VerifyShellInstructions,
++    EffectivePolicy { runtime: bool },
++    PreviewProfile(&'static str),
++    Recent { blocked: bool },
++    Why,
++    Tune,
++    ListGrants { expired: bool },
++    PreviewSetup,
++    Version,
++    PreviewBundle,
++}
++
++impl Action {
++    fn command(self) -> Commands {
++        match self {
++            Self::Status => Commands::Status {
++                json: false,
++                require_verified_blocking: false,
++            },
++            Self::EffectivePolicy { runtime } => Commands::Policy {
++                action: PolicyAction::Effective {
++                    runtime,
++                    local_only: !runtime,
++                    format: None,
++                    json: false,
++                },
++            },
++            Self::PreviewProfile(name) => Commands::Policy {
++                action: PolicyAction::Profile {
++                    name: name.into(),
++                    dry_run: true,
++                    json: false,
++                },
++            },
++            Self::Recent { blocked } => Commands::Audit {
++                action: AuditAction::Recent {
++                    limit: 25,
++                    since: None,
++                    until: None,
++                    action: blocked.then(|| "block".into()),
++                    rule: None,
++                    json: false,
++                },
++            },
++            Self::Why => Commands::Why {
++                format: None,
++                json: false,
++            },
++            Self::Tune => Commands::Policy {
++                action: PolicyAction::Tune {
++                    from_audit: true,
++                    format: None,
++                    json: false,
++                },
++            },
++            Self::ListGrants { expired } => Commands::Trust {
++                action: TrustAction::List {
++                    rule: None,
++                    format: None,
++                    json: false,
++                    expired,
++                    scope: TrustQueryScope::All,
++                },
++            },
++            Self::PreviewSetup => Commands::Setup {
++                tool: "recommended".into(),
++                profile: Some("balanced".into()),
++                agents: Vec::new(),
++                plan_only: false,
++                operation_id: None,
++                json: false,
++                shell: None,
++                scope: None,
++                with_mcp: false,
++                install_zshenv: false,
++                dry_run: true,
++                remove: false,
++                force: false,
++                update_configs: false,
++            },
++            Self::Version => Commands::Version {
++                provenance: true,
++                format: None,
++                json: false,
++            },
++            Self::VerifyShellInstructions | Self::PreviewBundle => Commands::Doctor {
++                format: None,
++                json: false,
++                verify_shell: self == Self::VerifyShellInstructions,
++                reset_bash_safe_mode: false,
++                fix: false,
++                yes: false,
++                simulate_enter: false,
++                compat: false,
++                bundle: self == Self::PreviewBundle,
++                bundle_preview: self == Self::PreviewBundle,
++                bundle_operation: Vec::new(),
++                bundle_incident: Vec::new(),
++                quick: false,
++            },
++        }
++    }
++}
++
++fn action(page: Page, choice: &str) -> Option<Action> {
++    Some(match (page, choice) {
++        (Page::Protection | Page::Integrations, "1") => Action::Status,
++        (Page::Protection, "2") | (Page::Integrations, "3") => Action::VerifyShellInstructions,
++        (Page::Profiles, "1") => Action::EffectivePolicy { runtime: false },
++        (Page::Profiles, "2") => Action::EffectivePolicy { runtime: true },
++        (Page::Profiles, "3") => Action::PreviewProfile("comfortable"),
++        (Page::Profiles, "4") => Action::PreviewProfile("balanced"),
++        (Page::Profiles, "5") => Action::PreviewProfile("strict"),
++        (Page::Activity, "1") => Action::Recent { blocked: true },
++        (Page::Activity, "2") => Action::Recent { blocked: false },
++        (Page::Activity, "3") => Action::Why,
++        (Page::Activity, "4") => Action::Tune,
++        (Page::Exceptions, "1") => Action::ListGrants { expired: false },
++        (Page::Exceptions, "2") => Action::ListGrants { expired: true },
++        (Page::Integrations, "2") => Action::PreviewSetup,
++        (Page::Maintenance, "1") => Action::Version,
++        (Page::Maintenance, "2") => Action::PreviewBundle,
++        _ => return None,
++    })
++}
++
++/// EOF cancels even a partial line. Limit reads before allocating or waiting for
++/// the rest of an oversized line; never reinterpret its suffix as another choice.
++fn read_choice(input: &mut impl BufRead) -> io::Result<Option<String>> {
++    let mut bytes = Vec::with_capacity(MAX_INPUT_BYTES + 1);
++    input
++        .take((MAX_INPUT_BYTES + 1) as u64)
++        .read_until(b'\n', &mut bytes)?;
++    if bytes.len() > MAX_INPUT_BYTES {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "selection exceeds 64 bytes; menu cancelled",
++        ));
++    }
++    if bytes.last() != Some(&b'\n') {
++        return Ok(None);
++    }
++    let text = std::str::from_utf8(&bytes).unwrap_or("");
++    Ok(Some(text.trim_matches([' ', '\t', '\r', '\n']).into()))
++}
++
++pub(crate) fn select_command() -> io::Result<Option<Commands>> {
++    let input = io::stdin();
++    let output = io::stdout();
++    select_with(
++        &mut input.lock(),
++        &mut output.lock(),
++        input.is_terminal(),
++        output.is_terminal(),
++    )
++    .map(|selected| selected.map(Action::command))
++}
++
++fn select_with(
++    input: &mut impl BufRead,
++    output: &mut impl Write,
++    input_terminal: bool,
++    output_terminal: bool,
++) -> io::Result<Option<Action>> {
++    if !input_terminal || !output_terminal {
++        return Err(io::Error::new(
++            io::ErrorKind::NotConnected,
++            "requires terminal input and output; use direct commands such as tirith status --json or tirith audit recent --json",
++        ));
++    }
++    let mut page = Page::Home;
++    loop {
++        writeln!(output, "\n{}", page.text())?;
++        writeln!(output, "g  Workflow guidance   b  Back   q  Quit")?;
++        write!(output, "Select: ")?;
++        output.flush()?;
++        let Some(choice) = read_choice(input)? else {
++            writeln!(output, "\nMenu cancelled.")?;
++            return Ok(None);
++        };
++        match choice.as_str() {
++            "q" | "Q" => return Ok(None),
++            "b" | "B" => page = Page::Home,
++            "g" | "G" => writeln!(output, "\n{}", page.guidance())?,
++            _ if page == Page::Home => {
++                page = match choice.as_str() {
++                    "1" => Page::Protection,
++                    "2" => Page::Profiles,
++                    "3" => Page::Activity,
++                    "4" => Page::Exceptions,
++                    "5" => Page::Integrations,
++                    "6" => Page::Maintenance,
++                    _ => {
++                        writeln!(output, "Choose a listed number, g, b, or q.")?;
++                        continue;
++                    }
++                };
++            }
++            _ => match action(page, &choice) {
++                Some(selected) => {
++                    writeln!(output)?;
++                    output.flush()?;
++                    return Ok(Some(selected));
++                }
++                None => writeln!(output, "Choose a listed number, g, b, or q.")?,
++            },
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    #[test]
++    fn menu_is_explicit_and_has_no_machine_output_mode() {
++        // Building the complete clap tree needs the same larger stack as the
++        // other CLI registration tests; no user configuration is inspected.
++        std::thread::Builder::new()
++            .stack_size(16 * 1024 * 1024)
++            .spawn(|| {
++                use clap::Parser;
++                assert!(matches!(
++                    crate::Cli::try_parse_from(["tirith", "menu"])
++                        .unwrap()
++                        .command,
++                    Commands::Menu
++                ));
++                assert!(crate::Cli::try_parse_from(["tirith"]).is_err());
++                assert!(crate::Cli::try_parse_from(["tirith", "menu", "--json"]).is_err());
++                assert!(matches!(
++                    crate::Cli::try_parse_from(["tirith", "status", "--json"])
++                        .unwrap()
++                        .command,
++                    Commands::Status { json: true, .. }
++                ));
++                let help = crate::Cli::try_parse_from(["tirith", "menu", "--help"])
++                    .err()
++                    .expect("help should exit before menu selection");
++                assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
++                assert!(help.to_string().contains("machine-readable"));
++            })
++            .unwrap()
++            .join()
++            .unwrap();
++    }
++
++    #[test]
++    fn noninteractive_refusal_does_not_read_or_print_a_prompt() {
++        for (stdin_tty, stdout_tty) in [(false, false), (false, true), (true, false)] {
++            let mut input = Cursor::new(b"1\n1\n");
++            let mut output = Vec::new();
++            let error = select_with(&mut input, &mut output, stdin_tty, stdout_tty).unwrap_err();
++            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
++            assert_eq!(input.position(), 0);
++            assert!(output.is_empty());
++        }
++    }
++
++    #[test]
++    fn input_limit_stops_before_consuming_or_dispatching_a_suffix() {
++        let mut input = Cursor::new(format!("{}\n1\n1\n", "x".repeat(4096)));
++        let error = select_with(&mut input, &mut Vec::new(), true, true).unwrap_err();
++        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++        assert_eq!(input.position(), (MAX_INPUT_BYTES + 1) as u64);
++        let mut boundary = Cursor::new(format!("{}q\n", " ".repeat(MAX_INPUT_BYTES - 2)));
++        assert_eq!(read_choice(&mut boundary).unwrap().as_deref(), Some("q"));
++    }
++
++    #[test]
++    fn eof_quit_back_and_guidance_never_select_an_action() {
++        for bytes in ["", "1", "1\n", "q\n", "1\nq\n", "2\ng\nb\nq\n"] {
++            assert_eq!(
++                select_with(&mut Cursor::new(bytes), &mut Vec::new(), true, true).unwrap(),
++                None
++            );
++        }
++    }
++
++    #[test]
++    fn unlisted_commands_and_terminal_controls_are_not_echoed_or_dispatched() {
++        let mut output = Vec::new();
++        assert_eq!(
++            select_with(
++                &mut Cursor::new(b"2\n\napply\n!sh\n\x1b[2J\n\xff\nq\n"),
++                &mut output,
++                true,
++                true
++            )
++            .unwrap(),
++            None
++        );
++        assert!(!output.contains(&0x1b));
++        let display = String::from_utf8(output).unwrap();
++        assert!(!display.contains("!sh"));
++        assert!(!display.contains("Select: apply"));
++    }
++
++    #[test]
++    fn navigation_selects_only_one_command_and_leaves_following_input_unread() {
++        let mut input = Cursor::new(b"3\n1\nq\n");
++        let selected = select_with(&mut input, &mut Vec::new(), true, true).unwrap();
++        assert_eq!(selected, Some(Action::Recent { blocked: true }));
++        assert_eq!(input.position(), 4);
++        assert!(matches!(
++            selected.unwrap().command(),
++            Commands::Audit { action: AuditAction::Recent { limit: 25, action: Some(filter), since: None, until: None, rule: None, json: false } }
++                if filter == "block"
++        ));
++    }
++
++    #[test]
++    fn every_selectable_command_is_an_inspection_or_preview() {
++        let pages = [
++            Page::Home,
++            Page::Protection,
++            Page::Profiles,
++            Page::Activity,
++            Page::Exceptions,
++            Page::Integrations,
++            Page::Maintenance,
++        ];
++        let mut count = 0;
++        for page in pages {
++            for number in 0..=9 {
++                let Some(selected) = action(page, &number.to_string()) else {
++                    continue;
++                };
++                count += 1;
++                match selected.command() {
++                    Commands::Status {
++                        require_verified_blocking: false,
++                        json: false,
++                    }
++                    | Commands::Why {
++                        format: None,
++                        json: false,
++                    }
++                    | Commands::Version {
++                        provenance: true,
++                        format: None,
++                        json: false,
++                    } => {}
++                    Commands::Policy {
++                        action:
++                            PolicyAction::Effective {
++                                runtime,
++                                local_only,
++                                format: None,
++                                json: false,
++                            },
++                    } => assert_ne!(runtime, local_only),
++                    Commands::Policy {
++                        action:
++                            PolicyAction::Profile {
++                                name,
++                                dry_run: true,
++                                json: false,
++                            },
++                    } => assert!(["comfortable", "balanced", "strict"].contains(&name.as_str())),
++                    Commands::Policy {
++                        action:
++                            PolicyAction::Tune {
++                                from_audit: true,
++                                format: None,
++                                json: false,
++                            },
++                    } => {}
++                    Commands::Audit {
++                        action:
++                            AuditAction::Recent {
++                                limit: 25,
++                                since: None,
++                                until: None,
++                                rule: None,
++                                json: false,
++                                action,
++                            },
++                    } => assert!(action.is_none() || action.as_deref() == Some("block")),
++                    Commands::Trust {
++                        action:
++                            TrustAction::List {
++                                rule: None,
++                                format: None,
++                                json: false,
++                                scope: TrustQueryScope::All,
++                                ..
++                            },
++                    } => {}
++                    Commands::Setup {
++                        tool,
++                        profile,
++                        agents,
++                        dry_run: true,
++                        plan_only: false,
++                        operation_id: None,
++                        json: false,
++                        shell: None,
++                        scope: None,
++                        with_mcp: false,
++                        install_zshenv: false,
++                        remove: false,
++                        force: false,
++                        update_configs: false,
++                    } => {
++                        assert_eq!(tool, "recommended");
++                        assert_eq!(profile.as_deref(), Some("balanced"));
++                        assert!(agents.is_empty());
++                    }
++                    Commands::Doctor {
++                        verify_shell,
++                        bundle,
++                        bundle_preview,
++                        format: None,
++                        json: false,
++                        fix: false,
++                        yes: false,
++                        reset_bash_safe_mode: false,
++                        simulate_enter: false,
++                        compat: false,
++                        quick: false,
++                        bundle_operation,
++                        bundle_incident,
++                    } => {
++                        assert!(verify_shell ^ (bundle && bundle_preview));
++                        assert!(bundle_operation.is_empty() && bundle_incident.is_empty());
++                    }
++                    _ => panic!(
++                        "menu selected a command outside its read-only contract: {selected:?}"
++                    ),
++                }
++            }
++        }
++        assert_eq!(count, 18);
++    }
++}
+diff --git a/crates/tirith/src/cli/mod.rs b/crates/tirith/src/cli/mod.rs
+index 7c64f601d3fac4cb9675a4b491f3f11477cad46c..94e1499d7b93f3e30cdc315af24becb0fc95a239 100644
+--- a/crates/tirith/src/cli/mod.rs
++++ b/crates/tirith/src/cli/mod.rs
+@@ -4,6 +4,7 @@ pub(crate) mod audit_health;
+ pub mod audit_retention;
+ pub(crate) mod automatic_deadline;
+ pub mod feedback;
++pub(crate) mod menu;
+ pub(crate) mod npm_install;
+ pub(crate) mod npm_install_recovery;
+ #[cfg(target_os = "linux")]
+diff --git a/crates/tirith/src/cli/npm_install_transaction.rs b/crates/tirith/src/cli/npm_install_transaction.rs
+index 5871df558946b7a30fef90d89d0c1a3b51403535..fb58b1a3835e0a694e88384b9759118bfdd37b5f 100644
+--- a/crates/tirith/src/cli/npm_install_transaction.rs
++++ b/crates/tirith/src/cli/npm_install_transaction.rs
+@@ -222,7 +222,7 @@ pub(super) fn execute(
+             plan.summary().threat_db_sequence,
+             CapsuleReceipt {
+                 backend_id: outcome.backend_id.into(),
+-                coverage: outcome.coverage.clone(),
++                coverage: outcome.coverage,
+             },
+             evidence,
+             plan.verdict_summary().clone(),
+diff --git a/crates/tirith/src/cli/npm_materialize.rs b/crates/tirith/src/cli/npm_materialize.rs
+index fd40f8e5f8a021ed890ce272172c5e072e4f17c5..032d7a67f3915b7b68e89c86d556778240bf4543 100644
+--- a/crates/tirith/src/cli/npm_materialize.rs
++++ b/crates/tirith/src/cli/npm_materialize.rs
+@@ -1490,7 +1490,9 @@ mod linux {
+         }
+ 
+         fn stored_bytes(scope: &GlobalStateGuard) -> std::collections::BTreeMap<String, Vec<u8>> {
+-            std::fs::read_dir(scope.roots().tirith_state.join("materialization-intents"))
++            // Match OperationStore's XDG state root, not the separate setup-lock root.
++            let state = scope.roots().xdg_state.join("tirith");
++            std::fs::read_dir(state.join("materialization-intents"))
+                 .unwrap()
+                 .map(|entry| {
+                     let entry = entry.unwrap();
+diff --git a/crates/tirith/src/cli/policy.rs b/crates/tirith/src/cli/policy.rs
+index a395c48ee04dac4baf66063339f1c20114516ec3..5bbfbebffaaf79ed69529a1828773e164b89f14c 100644
+--- a/crates/tirith/src/cli/policy.rs
++++ b/crates/tirith/src/cli/policy.rs
+@@ -1000,7 +1000,7 @@ pub(crate) fn effective_snapshot_display(
+             remote[key] = project(value).into();
+         }
+     }
+-    Ok(serde_json::json!({
++    let mut display = serde_json::json!({
+         "schema_version": 1,
+         "source_path": source,
+         "scope": scope_label(snapshot.policy.scope),
+@@ -1029,7 +1029,270 @@ pub(crate) fn effective_snapshot_display(
+             "effective_allow_bypass_env_noninteractive": snapshot.policy.allow_bypass_env_noninteractive,
+             "policy_is_redacted_display": true
+         }
+-    }))
++    });
++    if snapshot.resolution_mode == ResolutionMode::Runtime {
++        display["personal_controls"] = PersonalControlDisplay::new(snapshot, compiled).all();
++    }
++    Ok(display)
++}
++
++/// Field-specific display evidence from one captured resolver result. This is
++/// neither a writable-field allowlist nor authority to apply a change. In
++/// particular, a repository or incident contribution does not disable the
++/// operator's personal preference; the mutation service revalidates authority.
++pub(crate) struct PersonalControlDisplay<'a> {
++    snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
++    compiled: &'a tirith_core::redact::CompiledCustomPatterns,
++    policy: serde_json::Value,
++    authority: serde_json::Value,
++}
++
++const PERSONAL_CONTROL_FIELDS: &[&str] = &[
++    "strict_warn",
++    "allow_bypass_env",
++    "allow_bypass_env_noninteractive",
++    "scan.require_complete",
++    "env_guard_enabled",
++    "context_guard_enabled",
++    "exec_guard_enabled",
++    "hooks_guard_enabled",
++    "baseline_enabled",
++    "mcp_redact_injection",
++    "fail_mode",
++    "paranoia",
++];
++
++impl<'a> PersonalControlDisplay<'a> {
++    pub(crate) fn new(
++        snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
++        compiled: &'a tirith_core::redact::CompiledCustomPatterns,
++    ) -> Self {
++        let mut display = Self {
++            snapshot,
++            compiled,
++            // Serialize once for all fields. Only selected typed values or
++            // freshly redacted display content can leave this private value.
++            policy: serde_json::to_value(&snapshot.policy).unwrap_or_default(),
++            authority: serde_json::Value::Null,
++        };
++        display.authority = display.project_authority();
++        display
++    }
++
++    fn text(&self, value: &str, limit: usize) -> String {
++        let redacted = tirith_core::redact::redact_sanitize_redact_with_compiled(
++            &project_policy_cli_text(value),
++            self.compiled,
++        );
++        let flattened = super::sanitize_for_human_output(&redacted, false);
++        // Removing row breaks can reconstitute a protected value. Reapply the
++        // frozen DLP plan to the exact flattened text before bounding it.
++        let safe =
++            tirith_core::redact::redact_sanitize_redact_with_compiled(&flattened, self.compiled);
++        if safe.chars().count() <= limit {
++            return safe;
++        }
++        let mut bounded = safe.chars().take(limit).collect::<String>();
++        bounded.push('…');
++        bounded
++    }
++
++    fn source(&self, source: &tirith_core::policy_snapshot::PolicySource) -> serde_json::Value {
++        serde_json::json!({"kind":source.kind,
++            "path":source.path.as_deref().map(|path|self.text(path, 160))})
++    }
++
++    fn project_authority(&self) -> serde_json::Value {
++        use tirith_core::policy::PolicyScope;
++        use tirith_core::policy_snapshot::ResolutionMode;
++        let target = self
++            .snapshot
++            .operator_targets
++            .iter()
++            .find(|target| target.scope == "user");
++        let (state, source, reason) = if self.snapshot.resolution_mode != ResolutionMode::Runtime {
++            (
++                "unknown",
++                serde_json::Value::Null,
++                "This diagnostic does not establish the current runtime authority.",
++            )
++        } else if self.snapshot.policy.path.as_deref() == Some("fail-closed") {
++            ("unknown", serde_json::Value::Null,
++                "The configured effective policy could not be validated; inspect its failure evidence.")
++        } else if let Some(target) = target {
++            if target.effective {
++                ("effective", serde_json::Value::Null, target.reason.as_str())
++            } else if self.snapshot.policy.scope == PolicyScope::Remote {
++                // Actual remote replacement, not merely a configured server
++                // or a failed fetch that fell back to the personal baseline.
++                let source = self.snapshot.field_provenance.values().find_map(|field| {
++                    std::iter::once(&field.effective_source)
++                        .chain(field.contributions.iter().rev().map(|part| &part.source))
++                        .find(|source| matches!(source.kind.as_str(), "remote" | "remote_cache"))
++                });
++                (
++                    "overridden",
++                    source
++                        .map(|source| self.source(source))
++                        .unwrap_or_else(|| serde_json::json!({"kind":"remote","path":null})),
++                    target.reason.as_str(),
++                )
++            } else if let Some(org) = self
++                .snapshot
++                .operator_targets
++                .iter()
++                .find(|target| target.scope == "org" && target.effective)
++            {
++                // An omitted organization field can have a default source;
++                // the selected organization authority still replaces personal
++                // preferences for that field.
++                (
++                    "overridden",
++                    serde_json::json!({"kind":"org","path":self.text(&org.path,160)}),
++                    target.reason.as_str(),
++                )
++            } else {
++                ("unknown", serde_json::Value::Null,
++                    "The personal destination is ineffective, but its governing authority is unavailable.")
++            }
++        } else {
++            (
++                "unknown",
++                serde_json::Value::Null,
++                "The resolver did not establish a personal policy destination.",
++            )
++        };
++        serde_json::json!({"state":state,"governing_source":source,"reason":self.text(reason,160)})
++    }
++
++    pub(crate) fn field(&self, field: &str) -> serde_json::Value {
++        let rule_field = ["severity_overrides.", "action_overrides."]
++            .iter()
++            .find_map(|prefix| {
++                field.strip_prefix(*prefix).and_then(|id| {
++                    serde_json::from_value::<tirith_core::verdict::RuleId>(serde_json::json!(id))
++                        .ok()
++                        .map(|rule| (*prefix, rule))
++                })
++            });
++        let canonical = PERSONAL_CONTROL_FIELDS.contains(&field)
++            || rule_field.is_some()
++            || field == "approval_rules";
++        let mut effective = field
++            .split('.')
++            .try_fold(&self.policy, |value, key| value.get(key))
++            .cloned()
++            .unwrap_or_default();
++        if !PERSONAL_CONTROL_FIELDS.contains(&field) && rule_field.is_none() {
++            // Profile-owned compound values can include sensitive rule text.
++            project_policy_cli_json(&mut effective);
++            tirith_core::redact::redact_json_strings(&mut effective, self.compiled);
++        }
++        let effective_value_omitted =
++            serde_json::to_vec(&effective).map_or(true, |bytes| bytes.len() > 16 * 1024);
++        if effective_value_omitted {
++            effective = serde_json::Value::Null;
++        }
++        let provenance = self.snapshot.field_provenance.get(field);
++        let effective_source = provenance.map(|value|self.source(&value.effective_source))
++            .unwrap_or_else(||serde_json::json!({"kind":if rule_field.is_some() && effective.is_null() {"not_set"} else {"unknown"},"path":null}));
++        let mut contributions: Vec<_> = provenance.into_iter()
++            .flat_map(|value|value.contributions.iter())
++            .map(|value|serde_json::json!({"source":self.source(&value.source),
++                "reason":self.text(&value.reason,160),"changed_effective_value":value.changed_effective_value}))
++            .collect();
++        let mut neutralized: Vec<_> = self
++            .snapshot
++            .neutralized_settings
++            .iter()
++            .filter(|value| {
++                value.field == field
++                    || field
++                        .strip_prefix(value.field.as_str())
++                        .is_some_and(|suffix| suffix.starts_with('.'))
++            })
++            .map(|value| {
++                serde_json::json!({"field":self.text(&value.field,128),
++                "source":self.source(&value.source),"reason":self.text(&value.reason,160)})
++            })
++            .collect();
++        let mut contributions_omitted = contributions.len().saturating_sub(4);
++        if contributions_omitted > 0 {
++            contributions.drain(..contributions_omitted);
++        }
++        let mut neutralized_omitted = neutralized.len().saturating_sub(2);
++        neutralized.truncate(2);
++        let mut value = serde_json::json!({"field":if canonical {field.to_owned()} else {self.text(field,128)},
++            "effective_value":effective,"effective_source":effective_source,
++            "personal_authority":self.authority,"contributions":contributions,
++            "neutralized_settings":neutralized,"contributions_omitted":contributions_omitted,
++            "neutralized_settings_omitted":neutralized_omitted,
++            "effective_after":{"availability":"unavailable","reason":"requires_apply_and_fresh_readback"}});
++        if effective_value_omitted {
++            value["effective_value_omitted"] = true.into();
++        }
++        // Keep the all-rule control inventory bounded independently of policy
++        // size. Omitted history remains explicitly counted; newest evidence is
++        // retained first. Compound profile values have a separate 16 KiB bound
++        // so the full approval list cannot be duplicated in every policy read.
++        if PERSONAL_CONTROL_FIELDS.contains(&field) || rule_field.is_some() {
++            while serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() > 1024) {
++                if let Some(items) = value["contributions"]
++                    .as_array_mut()
++                    .filter(|items| !items.is_empty())
++                {
++                    items.remove(0);
++                    contributions_omitted += 1;
++                    value["contributions_omitted"] = contributions_omitted.into();
++                } else if let Some(items) = value["neutralized_settings"]
++                    .as_array_mut()
++                    .filter(|items| !items.is_empty())
++                {
++                    items.pop();
++                    neutralized_omitted += 1;
++                    value["neutralized_settings_omitted"] = neutralized_omitted.into();
++                } else {
++                    // Escaping can expand even bounded hostile source names.
++                    // Preserve source kinds without an unbounded path copy.
++                    value["effective_source"]["path"] = serde_json::Value::Null;
++                    if !value["personal_authority"]["governing_source"].is_null() {
++                        value["personal_authority"]["governing_source"]["path"] =
++                            serde_json::Value::Null;
++                    }
++                    value["source_paths_omitted"] = true.into();
++                    break;
++                }
++            }
++        }
++        value
++    }
++
++    fn all(&self) -> serde_json::Value {
++        let mut fields = serde_json::Map::new();
++        for field in PERSONAL_CONTROL_FIELDS {
++            fields.insert((*field).into(), self.field(field));
++        }
++        // The generated explanation inventory is checked against RuleId at
++        // build time. Unset known rules report no policy override, never an
++        // invented default rule severity or provenance.
++        for rule in tirith_core::rule_explanations::list_all() {
++            let field = format!("severity_overrides.{}", rule.id);
++            fields.insert(field.clone(), self.field(&field));
++        }
++        // Profile changes also own compound approval rules and selected action
++        // overrides. Keep their apply/undo readback as complete as the preview.
++        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
++        for profile in ProtectionProfile::ALL {
++            if let Ok(definition) = definition(profile, PROFILE_VERSION) {
++                for field in definition.settings.keys() {
++                    fields
++                        .entry(field.clone())
++                        .or_insert_with(|| self.field(field));
++                }
++            }
++        }
++        fields.into()
++    }
+ }
+ 
+ /// Project only owned human content. Opaque revisions, source kinds, status
+@@ -1402,6 +1665,248 @@ mod tests {
+     use super::*;
+     use tirith_core::policy_validate::{self, IssueLevel};
+ 
++    fn control_snapshot(
++        state: &tirith_test_support::GlobalStateGuard,
++    ) -> tirith_core::policy_snapshot::EffectivePolicySnapshot {
++        tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
++            state.roots().cwd.to_str(),
++            tirith_core::policy_snapshot::ResolutionMode::Runtime,
++        )
++    }
++
++    #[test]
++    fn personal_control_org_omitted_field_is_overridden_even_with_default_source() {
++        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        let org = state.roots().policy.join(".tirith");
++        std::fs::create_dir_all(&org).unwrap();
++        std::fs::write(org.join("policy.yaml"), "paranoia: 2\n").unwrap();
++        let snapshot = control_snapshot(&state);
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
++        assert_eq!(value["effective_source"]["kind"], "default");
++        assert_eq!(value["personal_authority"]["state"], "overridden");
++        assert_eq!(
++            value["personal_authority"]["governing_source"]["kind"],
++            "org"
++        );
++        assert_eq!(value["effective_after"]["availability"], "unavailable");
++        assert!(value["personal_authority"]["governing_source"]["path"]
++            .as_str()
++            .unwrap()
++            .ends_with("policy.yaml"));
++    }
++
++    #[test]
++    fn personal_control_repository_evidence_does_not_lock_personal_authority() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let config = tirith_core::policy::config_dir().unwrap();
++        std::fs::create_dir_all(&config).unwrap();
++        std::fs::write(
++            config.join("policy.yaml"),
++            "paranoia: 2\nstrict_warn: true\n",
++        )
++        .unwrap();
++        let cwd = &state.roots().cwd;
++        std::fs::create_dir_all(cwd.join(".git")).unwrap();
++        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
++        std::fs::write(
++            cwd.join(".tirith/policy.yaml"),
++            "paranoia: 4\nstrict_warn: true\nallow_bypass_env_noninteractive: true\n",
++        )
++        .unwrap();
++        let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
++            cwd.to_str(),
++            tirith_core::policy_snapshot::ResolutionMode::Runtime,
++        );
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
++        let paranoia = controls.field("paranoia");
++        assert_eq!(paranoia["effective_value"], 4);
++        assert_eq!(paranoia["effective_source"]["kind"], "repo");
++        assert_eq!(paranoia["personal_authority"]["state"], "effective");
++        let warning = controls.field("strict_warn");
++        assert_eq!(warning["effective_source"]["kind"], "user");
++        assert_eq!(warning["personal_authority"]["state"], "effective");
++        assert!(warning["contributions"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(
++                |item| item["source"]["kind"] == "repo" && item["changed_effective_value"] == false
++            ));
++        let unrelated = controls.field("env_guard_enabled");
++        assert_eq!(unrelated["personal_authority"]["state"], "effective");
++        assert!(!unrelated["contributions"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|item| item["source"]["kind"] == "repo"));
++        let bypass = controls.field("allow_bypass_env_noninteractive");
++        assert_eq!(bypass["personal_authority"]["state"], "effective");
++        assert!(bypass["neutralized_settings"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|item| item["source"]["kind"] == "repo"));
++    }
++
++    #[test]
++    fn personal_control_incident_constraints_are_field_specific_and_not_authority() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        tirith_core::incident::invalidate_cache();
++        tirith_core::incident::start("personal control fixture").unwrap();
++        let snapshot = control_snapshot(&state);
++        tirith_core::incident::stop().unwrap();
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
++        let bypass = controls.field("allow_bypass_env");
++        assert_eq!(bypass["effective_value"], false);
++        assert_eq!(bypass["personal_authority"]["state"], "effective");
++        assert!(bypass["contributions"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|item| item["source"]["kind"] == "incident"));
++        let unrelated = controls.field("env_guard_enabled");
++        assert!(!unrelated["contributions"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|item| item["source"]["kind"] == "incident"));
++    }
++
++    #[test]
++    fn personal_control_remote_local_fallback_is_not_a_managed_lock() {
++        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        state.remove_env("TIRITH_POLICY_ROOT");
++        let config = tirith_core::policy::config_dir().unwrap();
++        std::fs::create_dir_all(&config).unwrap();
++        std::fs::write(
++            config.join("policy.yaml"),
++            "policy_fetch_fail_mode: open\nparanoia: 2\n",
++        )
++        .unwrap();
++        // Transport validation refuses this URL without opening a connection.
++        state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
++        state.set_env("TIRITH_API_KEY", "fixture-key");
++        let snapshot = control_snapshot(&state);
++        assert_eq!(snapshot.remote.fallback.as_deref(), Some("local"));
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("paranoia");
++        assert_eq!(value["effective_value"], 2);
++        assert_eq!(value["personal_authority"]["state"], "effective");
++        assert!(value["personal_authority"]["governing_source"].is_null());
++    }
++
++    #[test]
++    fn personal_control_source_redacts_custom_values_after_row_flattening() {
++        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        let mut snapshot = control_snapshot(&state);
++        let compiled =
++            tirith_core::redact::CompiledCustomPatterns::new_silent(&["project-private".into()]);
++        for separator in ["\n", "\r\n", "\x1b[0m\n"] {
++            snapshot
++                .field_provenance
++                .get_mut("strict_warn")
++                .unwrap()
++                .effective_source
++                .path = Some(format!("/workspace/project-{separator}private/policy.yaml"));
++            let control = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
++            let path = control["effective_source"]["path"].as_str().unwrap();
++            assert!(!path.contains("project-private"));
++            assert!(!path.chars().any(char::is_control));
++            assert!(path.ends_with("/policy.yaml"));
++            assert!(path.contains("REDACTED"));
++        }
++    }
++
++    #[test]
++    fn personal_control_rule_inventory_and_dlp_preserve_typed_identity_with_bounded_output() {
++        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        let org = state.roots().policy.join(".tirith");
++        std::fs::create_dir_all(&org).unwrap();
++        std::fs::write(
++            org.join("policy.yaml"),
++            "severity_overrides:\n  non_standard_port: HIGH\n",
++        )
++        .unwrap();
++        let snapshot = control_snapshot(&state);
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[".+".into()]);
++        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
++        let controls = &value["personal_controls"];
++        let selected = &controls["severity_overrides.non_standard_port"];
++        assert_eq!(selected["field"], "severity_overrides.non_standard_port");
++        assert_eq!(selected["effective_value"], "HIGH");
++        assert_eq!(selected["effective_source"]["kind"], "org");
++        assert_eq!(selected["personal_authority"]["state"], "overridden");
++        assert!(!value.to_string().contains(&org.display().to_string()));
++        assert_eq!(controls["fail_mode"]["effective_value"], "open");
++        for rule in tirith_core::rule_explanations::list_all() {
++            let key = format!("severity_overrides.{}", rule.id);
++            let control = &controls[&key];
++            assert_eq!(control["field"], key);
++            assert!(serde_json::to_vec(control).unwrap().len() <= 1024);
++        }
++        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
++        let display = PersonalControlDisplay::new(&snapshot, &compiled);
++        for profile in ProtectionProfile::ALL {
++            for field in definition(profile, PROFILE_VERSION)
++                .unwrap()
++                .settings
++                .keys()
++            {
++                assert_eq!(controls[field]["field"], *field);
++                assert_eq!(controls[field], display.field(field));
++            }
++        }
++        let unset = &controls["severity_overrides.curl_pipe_shell"];
++        assert!(unset["effective_value"].is_null());
++        assert_eq!(unset["effective_source"]["kind"], "not_set");
++        assert!(unset["contributions"].as_array().unwrap().is_empty());
++        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
++        let unredacted = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        assert!(
++            serde_json::to_vec(&effective_snapshot_display(&snapshot, &unredacted).unwrap())
++                .unwrap()
++                .len()
++                < 512 * 1024
++        );
++    }
++
++    #[test]
++    fn personal_control_large_approval_list_is_not_duplicated_into_policy_response() {
++        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
++        let mut snapshot = control_snapshot(&state);
++        snapshot.policy.approval_rules = vec![
++            tirith_core::policy::ApprovalRule {
++                rule_ids: vec!["credential_in_command".into()],
++                timeout_secs: 30,
++                fallback: "block".into(),
++            };
++            3600
++        ];
++        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
++        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
++        let policy_bytes = serde_json::to_vec(&value["policy"]).unwrap().len();
++        assert!(policy_bytes > 256 * 1024 && policy_bytes < 360 * 1024);
++        assert_eq!(
++            value["policy"]["approval_rules"].as_array().unwrap().len(),
++            3600
++        );
++        let control = &value["personal_controls"]["approval_rules"];
++        assert_eq!(control["effective_value_omitted"], true);
++        assert!(control["effective_value"].is_null());
++        assert_eq!(control["field"], "approval_rules");
++        assert!(serde_json::to_vec(control).unwrap().len() < 4096);
++        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
++        snapshot.policy.approval_rules.truncate(1);
++        let small = PersonalControlDisplay::new(&snapshot, &compiled).field("approval_rules");
++        assert!(small.get("effective_value_omitted").is_none());
++        assert_eq!(small["effective_value"].as_array().unwrap().len(), 1);
++    }
++
+     #[test]
+     fn effective_projection_uses_captured_snapshot_and_explicit_privacy_union() {
+         let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+diff --git a/crates/tirith/src/cli/profile_service.rs b/crates/tirith/src/cli/profile_service.rs
+index 61d66dac94ef4cce5cf762663ccd59052bceb178..ebc62ae26226968c0524fb24e78f4d6baa015b1c 100644
+--- a/crates/tirith/src/cli/profile_service.rs
++++ b/crates/tirith/src/cli/profile_service.rs
+@@ -137,6 +137,7 @@ impl PreparedProfile {
+     }
+ 
+     pub fn projection(&self) -> serde_json::Value {
++        let controls = super::policy::PersonalControlDisplay::new(&self.snapshot, &self.compiled);
+         let changes: Vec<_> = self
+             .preview
+             .changes
+@@ -154,7 +155,8 @@ impl PreparedProfile {
+                     value
+                 };
+                 serde_json::json!({"field": change.field, "operation": change.operation,
+-                "before": display(&self.original), "after": display(self.preview.document())})
++                "before": display(&self.original), "after": display(self.preview.document()),
++                "control":controls.field(&change.field)})
+             })
+             .collect();
+         let definition = self.preview.selection.as_ref().and_then(|selection| {
+@@ -652,6 +654,7 @@ impl PreparedSetting {
+         tirith_core::redact::redact_json_strings(&mut effective, &self.base.compiled);
+         serde_json::json!({"schema_version":1,"kind":"personal_setting_preview", "applied":false,
+             "scope":"user", "field":self.field, "before":before, "after":self.after,
++            "control":super::policy::PersonalControlDisplay::new(&self.base.snapshot,&self.base.compiled).field(&self.field),
+             "effective_before":effective,"effective_after":"requires_apply_and_fresh_readback",
+             "target":tirith_core::redact::redact_sanitize_redact_with_compiled(&self.base.path.display().to_string(),&self.base.compiled),
+             "policy_identity":self.base.snapshot.identity, "profile_owns_this_setting_after":false,
+diff --git a/crates/tirith/src/cli/status.rs b/crates/tirith/src/cli/status.rs
+index ee2eb8a6bddf6116ba5a78659a8049142a43641d..e0a3a111c5eaac8786cb365e53dc50822f5b9746 100644
+--- a/crates/tirith/src/cli/status.rs
++++ b/crates/tirith/src/cli/status.rs
+@@ -160,7 +160,8 @@ impl StatusResult {
+                 "NOT configured"
+             }
+         );
+-        match (&quick.policy_path_used, &self.snapshot.scope) {
++        let policy_path = quick.policy_path_used.as_deref().map(human_policy_path);
++        match (&policy_path, &self.snapshot.scope) {
+             (Some(p), Some(s)) => println!("  policy:      {p} (scope: {s})"),
+             (Some(p), None) => println!("  policy:      {p}"),
+             (None, _) => println!("  policy:      (none found)"),
+@@ -192,6 +193,15 @@ impl StatusResult {
+     }
+ }
+ 
++/// Keep the typed status path intact; only the human terminal projection needs
++/// escaping/redaction. Reuse any DLP plan already frozen by the caller without
++/// adding policy resolution or network activity to this cheap status command.
++fn human_policy_path(path: &str) -> String {
++    let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
++    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
++    tirith_core::output::sanitize_human_field_with_compiled(path, &compiled)
++}
++
+ /// Build the `status --json` envelope. A pure seam (no env, no I/O) so the
+ /// JSON shape — the contract a CI step or the VS Code extension parses — is unit
+ /// testable. Field values mirror the human path exactly; `threat_db.error`
+@@ -263,6 +273,36 @@ mod tests {
+     use super::*;
+     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+ 
++    #[test]
++    fn human_policy_path_neutralizes_terminal_controls_and_row_forgery() {
++        let display = human_policy_path(
++            "/repo/\x1b[2J\x1b]8;;https://example.com\x07label\x1b]8;;\x07\u{202e}\n  protection: guarded\t/policy.yaml",
++        );
++        assert!(!display.chars().any(char::is_control));
++        assert!(!display.contains('\u{202e}'));
++        assert!(display.contains("\\n"));
++        assert!(display.ends_with("/policy.yaml"));
++        assert_eq!(
++            human_policy_path("/repo/.tirith/policy.yaml"),
++            "/repo/.tirith/policy.yaml"
++        );
++    }
++
++    #[test]
++    fn human_policy_path_reuses_frozen_dlp_after_escape_removal() {
++        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
++        tirith_core::policy::freeze_captured_policy_dlp_patterns(&["private-project".into()]);
++        for path in [
++            "/private-project/policy.yaml",
++            "/private-\x1b[0mproject/policy.yaml",
++        ] {
++            let display = human_policy_path(path);
++            assert!(!display.contains("private-project"));
++            assert!(!display.contains('\x1b'));
++            assert!(display.ends_with("/policy.yaml"));
++        }
++    }
++
+     #[test]
+     fn canonical_strict_exit_never_accepts_configuration_as_observation() {
+         for health in [
+diff --git a/crates/tirith/src/main.rs b/crates/tirith/src/main.rs
+index 16ffbd0166997d4b84c52192d6de706fbf0766cc..e208fe096275cd070d45ace8434b123bdcb95b9c 100644
+--- a/crates/tirith/src/main.rs
++++ b/crates/tirith/src/main.rs
+@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
+ const COMMANDS_BY_CATEGORY: &str = "\
+ COMMANDS BY CATEGORY:
+   Scan & Analyze:   check paste run score diff fetch fix scan review view preview watch temp-run capsule taint intend task lab explain why visual-audit
+-  Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
++  Status & Health:  status doctor prompt-status dashboard menu warnings receipt logs baseline
+   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
+   Policy & Trust:   policy trust rule output
+   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
+@@ -226,6 +226,23 @@ enum ExecutionReceiptAction {
+ 
+ #[derive(Subcommand)]
+ enum Commands {
++    /// Open an optional terminal menu for inspections and change previews
++    #[command(after_help = "\
++Requires terminal input and output. Choose protection, profiles, activity,
++exceptions, integrations, or maintenance, then select one inspection or preview.
++The selected direct command runs once with its usual output and exit status.
++The menu does not apply changes; each page links to explicit CLI workflows.
++Enter q or use Ctrl-C to quit; EOF cancels. No browser or extra runtime is needed.
++
++For scripts, CI, redirected input/output, and machine-readable results, use the
++direct commands instead. Start the menu explicitly with tirith menu.
++
++Examples:
++  tirith menu
++  tirith status --json
++  tirith audit recent --limit 25 --action block --json")]
++    Menu,
++
+     /// Explicit read-only review of selected dependency, hook, AI and MCP files
+     Review {
+         /// Replace known-surface discovery with project-relative files
+@@ -8200,7 +8217,23 @@ fn run() {
+     cli::init_quiet(cli.quiet);
+     cli::audit_health::install_sink();
+ 
+-    let exit_code = match cli.command {
++    let command = match cli.command {
++        Commands::Menu => match cli::menu::select_command() {
++            Ok(Some(command)) => command,
++            Ok(None) => return,
++            Err(error) => {
++                eprintln!(
++                    "tirith menu: {}",
++                    cli::sanitize_for_human_output(&error.to_string(), false)
++                );
++                std::process::exit(2);
++            }
++        },
++        command => command,
++    };
++    let exit_code = match command {
++        // The menu returns only the closed set of direct inspection actions.
++        Commands::Menu => unreachable!("menu selection cannot select the menu itself"),
+         Commands::Review { paths, json } => cli::project_review::run(paths, json),
+         Commands::ShellVerificationInternal {
+             action,
+diff --git a/crates/tirith/tests/profile_lifecycle.rs b/crates/tirith/tests/profile_lifecycle.rs
+index 2521e956940e9c1229addce16dfe8b44ada19e01..4d6fa92a873f4f36c0f6da52fddedb9afedcc591 100644
+--- a/crates/tirith/tests/profile_lifecycle.rs
++++ b/crates/tirith/tests/profile_lifecycle.rs
+@@ -247,6 +247,83 @@ fn explicit_equal_profile_setting_survives_later_profile_reset() {
+     assert!(document.get("protection_profile").is_none());
+ }
+ 
++#[test]
++fn preview_controls_match_effective_snapshot_without_writing_policy() {
++    let mut state = state();
++    let org_root = state.roots().policy.clone();
++    state.set_env("TIRITH_POLICY_ROOT", &org_root);
++    let org = org_root.join(".tirith");
++    std::fs::create_dir_all(&org).unwrap();
++    std::fs::write(org.join("policy.yaml"), "paranoia: 2\n").unwrap();
++    let personal = tirith_core::policy::config_dir()
++        .unwrap()
++        .join("policy.yaml");
++    let effective = success(run(&state, &["policy", "effective", "--runtime", "--json"]));
++    let setting = success(run(
++        &state,
++        &[
++            "policy",
++            "setting",
++            "strict_warn",
++            "true",
++            "--dry-run",
++            "--json",
++        ],
++    ));
++    assert_eq!(
++        setting["control"],
++        effective["personal_controls"]["strict_warn"]
++    );
++    assert_eq!(setting["control"]["effective_source"]["kind"], "default");
++    assert_eq!(
++        setting["control"]["personal_authority"]["state"],
++        "overridden"
++    );
++    assert_eq!(
++        setting["effective_after"],
++        "requires_apply_and_fresh_readback"
++    );
++    let profile = success(run(
++        &state,
++        &["policy", "profile", "strict", "--dry-run", "--json"],
++    ));
++    for change in profile["field_changes"].as_array().unwrap() {
++        let field = change["field"].as_str().unwrap();
++        assert_eq!(change["control"]["field"], field);
++        assert_eq!(
++            change["control"]["personal_authority"]["state"],
++            "overridden"
++        );
++        let control = effective["personal_controls"]
++            .get(field)
++            .expect("each changed profile field needs effective readback");
++        assert_eq!(&change["control"], control);
++    }
++    assert!(
++        !personal.exists(),
++        "display previews must not write personal policy"
++    );
++    let unset = success(run(
++        &state,
++        &[
++            "policy",
++            "setting",
++            "rule_severity",
++            "HIGH",
++            "--rule",
++            "curl_pipe_shell",
++            "--dry-run",
++            "--json",
++        ],
++    ));
++    assert_eq!(
++        unset["control"],
++        effective["personal_controls"]["severity_overrides.curl_pipe_shell"]
++    );
++    assert!(unset["control"]["effective_value"].is_null());
++    assert_eq!(unset["control"]["effective_source"]["kind"], "not_set");
++}
++
+ #[test]
+ fn personal_setting_undo_preserves_unrelated_changes_and_typed_limits() {
+     let state = state();
+diff --git a/docs/next-cycle/README.md b/docs/next-cycle/README.md
+index 5aed274dfbeb941f3f918a19f6950eef902f01af..29cbaa856b672df5a3bd7efdb22bb2bdc5ad8354 100644
+--- a/docs/next-cycle/README.md
++++ b/docs/next-cycle/README.md
+@@ -23,11 +23,11 @@ changes or substituted with simulated success.
+ | WP07 | Stable scoped/expiring grants, retained project identities, legacy migration, CLI lifecycle and typed browser preparation implemented. Five actual 0.4.2/new-client compatibility assertions passed; native/copy/move/expiry and final-candidate evidence remain. |
+ | WP08 | Existing one-operation receipts retained; recovery uses the actual shell bypass parser and distinguishes unsupported syntax/hard blocks. Native recovery journeys remain. |
+ | WP09 | Frozen simulation and private reversible expectation labels passed earlier tests. Bounded CLI/browser tuning now reads selected annotations and redacted examples, without replay or automatic approval. Selected CLI and complete browser tuning/annotation/impact workflows passed; final candidate recertification remains. |
+-| WP10 | Combined personal profile/shell setup is registered through `setup recommended` and browser plans; the complete browser run passed profile/shell apply and undo. Narrow macOS ARM Claude setup is integrated; actual combined publication, all nine native hook cases, MCP-only control and retained-host reload observations passed on 39f6acc. Other selected agents remain unavailable until qualified. Three actual fresh macOS Zsh sessions also pass automatic verification on the retained September 21 release product. Multi-host and final-candidate qualification remain. |
++| WP10 | Combined personal profile/shell setup is registered through `setup recommended` and browser plans; the complete browser run passed profile/shell apply and undo. Narrow macOS ARM Claude setup is integrated; actual combined publication, all nine native hook cases, MCP-only control and retained-host reload observations passed on 39f6acc. Other selected agents remain unavailable until qualified. Three actual fresh macOS Zsh sessions also pass automatic verification on the retained September 21 release product. The optional TTY menu routes protection, profiles, recent blocks, exceptions, integrations and maintenance to existing typed inspections/previews; seven menu cases pass. Multi-host and final-candidate qualification remain. |
+ | WP11 | Packaged-byte runner passed all 32 native Bash/Zsh/Fish checks on the September 21 retained macOS ARM release product, with original process-group/session cleanup and actual pipe EOF observed; earlier debug and four additional terminal/npm-launcher checks remain separately recorded. Nine actual Claude configured-hook and boundary controls passed on the later a70b8eba candidate. Other native installed packages/hosts and final candidate recertification remain. |
+ | WP12 | Bounded history and incremental aggregates preserve attribution, limits and invalidation. Same-inode retention passed core/CLI/browser tests and six signed/unsigned native mixed-version cases, including a real 0.4.2 descriptor held across rotation. Exact export, irreversible deletion and append-failure reporting are registered; wider crash/storage-fault and final release verification remain. |
+ | WP13 | Embedded local service, strict HTTP/auth/origin/CSRF bounds, typed routes, exact-version discovery, identity guards and quiesce implemented. Real transport checks and eighteen complete browser workflows passed on retained candidates. Final native security/lifecycle qualification remains. |
+-| WP14 | Six embedded pages expose typed shell/profile/settings/exception plans, saved jobs, feedback, support preview/download, retention, impact reviews and lifecycle actions. Eighteen complete real-browser workflows and five separate delayed-response cases passed again on retained candidate 39f6acc, including busy-history paging, combined setup, archive controls and stale-dialog isolation. Final release recertification remains. |
++| WP14 | Six embedded pages expose typed shell/profile/settings/exception plans, saved jobs, feedback, support preview/download, retention, impact reviews and lifecycle actions. Shared per-field authority, source and apply/undo readback include scalar, severity and profile-owned fields. Managed controls are disabled with reasons; repository constraints remain visible. The September 28 combined browser candidate passes 24 recorded full-journey checks and eight response-order/ownership checks, including large policies, narrow layouts and stale readback. Both verify owned-service cleanup. Strict Clippy, five HTTP cases, four frozen-reader groups and nine profile cases pass; final platform/release recertification remains. |
+ | WP15 | Channel/privilege guidance, exact signed compatibility, candidate binding, rollback receipts and a durable lifecycle store/retained worker handshake are registered. An actual macOS ARM same-version fixture-key replacement and rollback passes with preserved configuration and exact byte readback. Official release, numeric upgrade, crash/reopen, loaded-host and removal evidence remains. |
+ | WP16 | Signed source evidence, freshness dimensions, publication/parser guards, transient recovery and incident records implemented. Publication validation now checks duplicate/type/identity disagreements before retrying propagation lag; reports preserve partial-upload and later-failure uncertainty. Final compiled and real publication-path verification remains. |
+ | WP17 | Bounded CLI/CPU/RSS/service sampling and instrumented allocation counting are implemented. Three independent Apple M1 (Virtual) baselines pass on 415565d3, with identical allocation counts and bounded RSS spread. All six later native control/growth pairs qualify their byte detectors on that same historical source; the earlier five CPU-mismatched pairs remain refused. Draft thresholds received independent review; limits remain disabled pending final-source measurements and compatibility review. The retained September 21 macOS release product also passes 600 measured native Zsh allow/block frames across one- and two-terminal workloads, beyond the prior receipt limit. Final-source baselines, detector qualification and wider host workloads remain. |
+@@ -39,7 +39,7 @@ changes or substituted with simulated success.
+ | WP23 | npm comparison and CLI bind hashes and qualify analyzer/coverage differences; eight core comparisons and two combined CLI tests passed previously. Explicit project-scoped browser comparison is now registered; the complete browser comparison passed on the retained candidate; final G2 evidence remains. |
+ | WP24 | Conservative pip/Cargo command-family models are registered with explicit incomplete dynamic effects and new fixtures. All six combined task-family integration cases pass, including mixed known effects and unknown siblings. Final native capability qualification remains. |
+ | WP25 | Optional bring-your-own server, authenticated authority/client protocol, explicit local enrollment, reviewed CLI/browser publication and bounded rollback are implemented. Thirty-five real HTTPS/browser cases cover exact-intent lost-response recovery, stale reports, partial adoption and offline withdrawal. Linux client/server tests pass on 5aa893e6; the Windows workspace and standard-account dashboard suite pass on 415565d3. Final-candidate and real deployment evidence remain; publication never proves fleet adoption. |
+-| WP26 | LocalLeafMaterializeV1 implements bounded local dependency-free/script-free npm artifact materialization, fresh signed threat/policy/task checks, immutable review journals and explicit recovery/undo. Native Linux core and CLI writer/recovery tests pass on 5aa893e6. Install preparation captures actual signed threat data, requires a complete artifact Allow decision and retains its authority for revalidation; 45 focused core tests pass. The working tree registers immutable review intents, a descriptor-based native launcher, a publication coordinator and signed completion milestones for fresh reconfirmation of an unchanged published tree. The auditable sealed bootstrap and its pure controls pass. Actual integrated native launch, publication and interruption behavior still require qualification; private undo across a restart lacks retained ownership authority and remains refused. A genuine signed v2 threat feed is also required. No package code executes through materialization, and npm/Python package execution remains disabled. These are implementation and external-evidence gaps as well as native qualification work. |
++| WP26 | LocalLeafMaterializeV1 implements bounded local dependency-free/script-free npm artifact materialization, fresh signed threat/policy/task checks, immutable review journals and explicit recovery/undo. Native Linux core and CLI writer/recovery tests pass on 5aa893e6. Install preparation captures actual signed threat data, requires a complete artifact Allow decision and retains its authority for revalidation; 45 focused core tests pass. Separate installation review registers immutable review intents, a descriptor-based native launcher, a publication coordinator and signed completion milestones for fresh reconfirmation of an unchanged published tree. The auditable sealed bootstrap and its pure controls pass. Actual integrated native launch, publication and interruption behavior still require qualification; private undo across a restart lacks retained ownership authority and remains refused. A genuine signed v2 threat feed is also required. No package code executes through materialization, and npm/Python package execution remains disabled. These are implementation and external-evidence gaps as well as native qualification work. |
+ | WP27 | Native Linux aarch64 deny-all filter is registered; native primitive/filter probes passed. Both GNU and musl launchers built with Rust 1.83 and each passed sixteen native unprivileged containment/runtime/interruption cases. Native ARM GNU/musl CI checks also passed on 13e18ca8. Final integrated release-artifact qualification remains. |
+ 
+ The focused privilege changes are reviewed separately in
+@@ -67,9 +67,16 @@ information makes the actual CLI harness exceed the unchanged 512 MiB binary
+ identity bound. Corrections use declared receipt readers and line-table
+ test debug information. All five workflows pass on `87c0fdee`, including Linux,
+ macOS, Windows and Rust 1.83 CI, six release target builds, native ARM, fuzzing
+-and benchmarks. The newer npm integration requires its own checks. These are source/debug
+-and PR package results, not official release or interactive Windows shell
+-certification. See [verification](verification.md) for retained evidence.
++and benchmarks. The later `2cde4cee` passes release builds, native ARM, fuzz and benchmark
++workflows. Its CI fails three lints, two Linux legacy state-path fixtures and a
++Windows POSIX metadata fixture; local corrections are prepared and new CI is
++required. The Windows standard-account dashboard cases pass separately.
++September 27 also integrates the fish parent-umask fix for #265 (153 native
++fixture cases passed) and conservative Unix virtual-filesystem discovery for
++#266 (405 policy-selected tests passed). Neither result qualifies a final
++release. These are source/debug and PR package results, not official release or
++interactive Windows shell certification. See [verification](verification.md) for
++retained evidence.
+ 
+ Contracts and evidence:
+ 
+diff --git a/docs/next-cycle/acceptance-matrix.md b/docs/next-cycle/acceptance-matrix.md
+index 29f52bfbfdde3b0b3ea7b3d2ede668f8c6cbf10e..1f2b8e9aa19ac5a80ad57668ab3f486eadad8f5d 100644
+--- a/docs/next-cycle/acceptance-matrix.md
++++ b/docs/next-cycle/acceptance-matrix.md
+@@ -61,7 +61,7 @@ workflows.
+ | PowerShell 5.1/7, Unix PowerShell | Native Unix PowerShell 7.6.6 passed 22 cases using hook bytes extracted from retained `39f6acc9`; later Linux CI also passes its native PowerShell step; see [verification](verification.md) | Unix hook evidence does not qualify Windows terminals or automatic receipt adapters; native Windows target/interception and final package evidence remain |
+ | Nushell | Hook/config source; ignored PTY follow-up stub | No next-cycle native blocking certification |
+ | Real agents and MCP clients | Actual macOS ARM Claude Code 2.1.268 dispatch passes configured-hook/boundary controls on retained candidates; recommended setup, all nine hook/failure cases, MCP-only and retained-host/fresh-host observations pass on release product `cc5558cd…ab5437`; see [Claude evidence](claude-native-evidence.md) and [verification](verification.md) | Qualified evidence is specific to the recorded host, interpreter, settings and candidate; unmatched tools, shortened host deadlines and disabled hooks remain explicit limits. Other hosts, later candidates and beginner/final release journeys remain |
+-| Workspace/platform CI | All five workflows pass on `87c0fdee`, including Linux, macOS, Windows and Rust 1.83 CI, six release target builds, native ARM, fuzzing and benchmarks; see [platform CI](verification.md#platform-ci-and-corrective-checks-2026-09-21) | The later npm integration and materialization schema migration require matching native and platform checks. Prior CI does not certify these changes or close final release acceptance |
++| Workspace/platform CI | All five workflows pass on `87c0fdee`. The later `2cde4cee` passes release, native ARM, fuzz and benchmark workflows, while CI identifies lint and Linux/Windows fixture failures. Nine Windows standard-account dashboard cases pass separately; see [verification](verification.md) | Corrections are prepared locally. New combined-source CI, native qualification and final release acceptance remain required |
+ | Linux containment | Native ARM GNU and musl local archives each pass all 16 cases from source manifest `7d9788bf…5d317`; independent GNU/musl CI archives at `71070bbb` also pass all 16, including supervisor/guard interruption | These are distinct exact-source and exact-commit proofs. Final tag-produced release artifacts and later npm boundary changes require separate qualification; see containment-aarch64.md |
+ 
+ ## Reproducible starting commands
+diff --git a/docs/next-cycle/personal-settings.md b/docs/next-cycle/personal-settings.md
+index 6ebc6dc8e26cdbbbe74a1d538a4a8f16929c50af..ca5dc7f71db44a701499230710bb5e7bf4898b83 100644
+--- a/docs/next-cycle/personal-settings.md
++++ b/docs/next-cycle/personal-settings.md
+@@ -29,12 +29,33 @@ ownership marker. Changing or resetting the profile subsequently preserves the
+ explicit preference. Resetting the individual setting removes the personal
+ value; the resolver determines the resulting inherited value.
+ 
+-The preview shows the personal before/after values and current effective value.
+-It does not claim to have simulated every stronger source. Organization, remote,
+-repository and incident restrictions retain authority, and a saved preference
+-can be overridden. After applying, refresh the effective policy view to see what
+-actually takes effect. Warning presentation never becomes an approval for an
+-independent hard block.
++The preview shows personal before/after values, the current effective value and
++its source, and whether personal policy can affect that field. A selected
++organization or remote policy can replace personal policy even when that source
++omits the field and the effective value comes from built-in defaults. The browser
++disables those managed personal controls and explains where to make the change.
++Repository and incident constraints are shown separately; they do not imply that
++personal policy has lost authority. Rejected repository preferences and omitted
++provenance details remain explicit.
++
++Known rules without a severity override show “No policy override”; that is not
++a claim about the rule's built-in severity. The shared CLI/API `control` display
++and runtime `personal_controls` inventory preserve canonical setting and rule
++identities while redacting source paths and explanations.
++Compound values above 16 KiB are explicitly omitted from field summaries; the
++effective policy details retain the full redacted value within the normal
++response limit. An omitted value is never presented as an unset override.
++If field summaries would make a browser policy response exceed its total limit,
++the response omits that inventory and says so. Advanced controls then remain
++unavailable; full policy details and field-specific profile previews stay
++accessible. CLI effective-policy output retains its inventory.
++
++The proposed personal values do not predict the final effective result. After
++apply or undo, the browser reads current policy again and shows the resolver's
++values and sources. A later operation or closed dialog discards an older
++readback. Other policy changes may have occurred in the meantime. For the CLI,
++run `tirith policy effective --runtime --json` after the operation. Warning
++presentation never becomes approval for an independent hard block.
+ 
+ Every change has a saved operation ID. `tirith policy operation ID --action undo`
+ and Settings → Saved changes and recovery use the shared journal. Undo checks
+diff --git a/docs/next-cycle/user-journeys.md b/docs/next-cycle/user-journeys.md
+index 21c4e0735b33af6aa489526d3b8fb21f271d915f..ab9b7d6ccd33fc12a8b1066c0980f51660665752 100644
+--- a/docs/next-cycle/user-journeys.md
++++ b/docs/next-cycle/user-journeys.md
+@@ -4,6 +4,15 @@ These commands describe the unreleased cycle candidate based on 0.4.2. Use
+ `tirith version --provenance` to identify the binary being tested. Native
+ certification and release acceptance are tracked in [verification](verification.md).
+ 
++For guided terminal navigation, run `tirith menu`. Choose protection, profiles,
++activity, exceptions, integrations or maintenance, then select one inspection or
++preview. The selected command runs once and keeps its usual exit status. Each
++page's `g` option explains the direct commands for changes; the menu does not
++apply them. Policy-aware inspections may refresh configured remote policy.
++Use `b` to return, `q` to quit, or Ctrl-C to cancel. The menu requires terminal
++input and output. Scripts and redirected sessions use the direct CLI, such as
++`tirith status --json` or `tirith audit recent --limit 25 --json`.
++
+ ## Protect a terminal
+ 
+ Install Tirith through your chosen channel, then run personal setup as the
+diff --git a/docs/next-cycle/verification.md b/docs/next-cycle/verification.md
+index 337b8793ca1c35fb51afb8da077e89e0f6886980..6b47fc8b31c481ec764c6024e941994091b8b124 100644
+--- a/docs/next-cycle/verification.md
++++ b/docs/next-cycle/verification.md
+@@ -1,6 +1,171 @@
+ # Implementation verification
+ 
+-## September 22: passing CI and integrated npm review route
++## September 28: combined controls and remaining native checks
++
++The combined browser candidate
++`d57b2fe07410182708f6b20e86ec5ad9127e3ac41478275f28ae62d959e74893`
++passes all 24 recorded full-journey checks and eight response-order/ownership
++checks. Both runs use the embedded assets, report no browser errors, retain
++unchanged binary/harness identities and verify owned-service cleanup. The
++large-policy journey exercises 3,600-rule compound omission and 5,500-rule
++inventory omission through the actual service. Wide and narrow layouts remain
++usable; the corrected socket delivers the complete response.
++
++Complete-crate HTTP tests pass all five cases. The initial workspace run passes
++2,112 main CLI tests (four ignored) and subsequent integration selections, then
++stops at the frozen reader test because default local-only policy JSON acquired
++a new field. The product correction preserves that legacy shape; the fixture is
++unchanged. Explicit runtime CLI output and browser reads retain the new controls.
++All four frozen-reader groups and nine profile lifecycle cases then pass, as do
++strict workspace/all-target Clippy and the combined build. A new complete
++workspace/platform run remains required; the earlier interrupted run is not a
++complete pass.
++
++Native ARM capture v16 passes combined typechecking and seven CLI selections:
++7 descriptor, 1 completion-binding, 18 checkpoint, 1 unwind, 20 intent/recovery,
++16 materialization and 8 output-privacy tests. It then receives SIGKILL while
++compiling the core test executable. One OOM kill is observed, with peak cgroup
++memory 5,353,238,528 bytes under the configured 5,368,709,120-byte cap. The
++`max` and `oom` counters remain zero, so the record does not attribute the event
++to that cap specifically. Core policy/npm execution, actual signed-v1 refusal
++and native Clippy were not reached. All 105 owned command records have verified
++cleanup; the exact container is removed, and all 657 frozen inputs and 20 result
++logs rehash successfully. Report SHA-256:
++`4e4858cb28c778c3a42b2cbb22b6d71149c5e4ae34fb7df656e158e03a3dbdd5`.
++These results apply to v16, before the later HTTP and local-only display fixes.
++Remaining native checks are being separated to reduce accumulated compiler
++artifacts; unrelated host containers are not modified.
++
++## September 27: resumed field readback and issue verification
++
++The final field-control review catches an unbounded duplicate of compound
++approval rules and a total response-budget regression. Compound summaries now
++omit values above 16 KiB explicitly. If the complete browser response, including
++diagnostics, still exceeds 512 KiB, only the optional field inventory is omitted;
++legacy policy/provenance remains intact, missing controls stay unavailable, and
++precise profile previews remain usable. Seven field-control tests and the
++aggregate-budget regression pass, followed by strict workspace/all-target Clippy
++and a combined build. The new browser fixture uses actual organization policies
++with 3,600 and 5,500 approval rules. The first combined-source browser run
++passes the compound display case, then finds a truncated 5,500-rule response on
++macOS: the accepted socket inherits nonblocking mode and a filled send buffer
++terminates the write. The failure and successful owned-service cleanup are
++retained. Six delayed-response cases separately pass on the same binary
++`b6dfd9c6be03b868d5092709decdf3af409491f3e9ecbed16b44e250fe7146a3`.
++The blocking-socket correction preserves both three-second production deadlines.
++A standalone native harness using the exact transport module fails two cases
++before the correction and passes all five afterward, including a 4 KiB send
++buffer, delayed reader, complete 512 KiB response and partial-request 408s.
++That harness stubs the unrelated authentication sibling; complete-crate and
++browser checks remain separate. Independent source review finds no further
++product defect. The optional menu also passes an actual PTY category/back/quit smoke
++check with exit zero; that smoke does not execute the selected inspection commands.
++
++
++The September 22 follow-up's strict workspace/all-target Clippy and development
++build both finish successfully. The corrected POSIX npm metadata test also
++passes on macOS. These local results do not establish the Windows regression
++fix; a new Windows CI run remains required.
++
++The retained v13 native ARM check passes combined test typechecking and five
++focused groups (7, 1, 18, 1 and 20 passing tests). The materialization group then
++reports 14 passed and two failed: the previously identified test helper reads
++the wrong state root. The driver stops there, so later privacy, core, signed-v1
++refusal and Clippy selections were not attempted. All 90 owned Docker command
++records have clean termination; exact container removal and absence, plus final
++source/tool hashes, are verified. Peak cgroup memory is 4,941,623,296 bytes under
++the 5 GiB cap, with zero `max`, `oom` and `oom_kill` events. Retained report SHA:
++`9051f34648979730f34f46ab0514436bcb70b37c6bc06aed1aacd976b080369d`.
++
++Final source review finds that approval rules and Strict's action overrides
++appear in profile previews but are absent from the field-level effective
++readback inventory. The inventory now includes every current profile definition
++field, and the browser displays unavailable fields explicitly rather than
++silently omitting them. All six field-control unit tests and nine profile
++lifecycle tests pass. The complete browser journey passes 23 recorded checks
++on debug binary
++`051aef692e193515b1b27d114e8559eb1f111ae83a2a13ddf61d2ef417fad151`.
++This includes every profile field's readback, managed-control refusal,
++repository constraints, redacted paths, apply/undo and narrow layout. The first
++actual browser attempt finds narrow-screen overflow; responsive field rows and
++path wrapping correct it, and wide/narrow screenshots are inspected. Six
++delayed-response cases separately pass on the preceding binary
++`930a52598c19eb1c981c2fbebc4428c31cf897fc763db748113ff2e735a1ceef`,
++including late apply readback after undo. Both runs verify owned service cleanup.
++These binaries precede the two subsequently integrated issue fixes below.
++
++Issue #265 is fixed by applying the private capture mask in the existing pinned
++shell child. A save/restore implementation first fails a real fish Ctrl-C probe;
++the child implementation preserves both incoming `027` and `777` in fish and
++its next child. All 153 native privacy/permission cases pass on fish 4.8.1,
++Bash 3.2/5.3.15 and Zsh 5.9, covering startup, command and paste paths, failed
++helpers and ordinary child file/directory modes. Capture files remain `0600`.
++These fixtures use inert command endpoints; they do not establish interception
++or receipt authority. Source and embedded hook copies match.
++
++Issue #266 uses one discovery predicate for resolution and snapshot rechecks.
++Directory-shaped lookups need bounded listing evidence; permission errors,
++inconclusive listings and genuine invalid policies remain conservative. Case,
++Unicode and ignorable-character aliases are retained. Windows keeps its prior
++directory behavior because enumeration cannot disprove arbitrary NTFS 8.3
++alternate names. All 405 policy-selected core tests pass, including 15 new
++discovery, alias, revalidation and failure cases; the integrated four source
++files match the tested scratch bytes except a subsequent octal spelling fix
++required by Clippy in a test permission literal. Test log SHA-256:
++`fba0cd3804aedd4cdc22707873587f28a18d7315ccaba17c26a0d81a0875cffa`.
++Independent review finds no remaining blocking defect in this Unix fix.
++The virtual-stat seam models kio-fuse; a native KDE mount was not available.
++
++The refreshed September 27 published feed has digest
++`47b867e2b686ce68d38402622fcd27fc54854115743b860a8bc1799c8db48112`.
++Its embedded signature and manifest signature verify against the production
++key, but it remains format 1. The release lists no format-2 asset or index.
++This separate signature check does not claim execution of the Rust parser;
++that negative admission test remains part of the next native run.
++
++## September 22: integrated checks and policy-control follow-up
++
++The complete local macOS workspace at `2cde4cee` passes. Its main CLI harness
++reports 2,095 passed and four ignored tests; core reports 6,159 passed and two
++ignored. All other harness results also pass. Retained log SHA-256:
++`8e5d9446cb33552e2d685aa9534b2dbca11e4de138cfe5ab2d7dc1c73d1bc485`.
++These results precede the later policy controls, terminal menu and Linux unwind
++follow-up; they do not qualify those changes.
++
++The same pushed commit passes release-build workflow 35696913620, native ARM
++containment 35696913329, fuzz 35696913341 and benchmarks 35696913327.
++[CI 35696913332](https://github.com/sheeki03/tirith/actions/runs/35696913332)
++passes macOS, Bash 5.3, installer and workflow checks but fails Clippy and the
++Linux, Windows and Rust 1.83 workspace jobs. Three lint corrections are prepared.
++Both Linux variants fail two legacy materialization tests whose byte-comparison
++helper reads the setup-lock root instead of XDG state. Windows fails a pure npm
++metadata test because a native path join inserts backslashes into a POSIX lock
++key. Corrections retain both tests and their original assertions. The nine
++Windows standard-account dashboard cases and their cleanup pass; the workspace
++failure skips subsequent PowerShell qualification. New CI remains required.
++
++The native integrated ARM v11 attempt ends with SIGKILL during the combined test
++typecheck. No historical memory counters were retained, so the cause is unknown.
++The v12 attempt passes the combined typecheck, then encounters a host log-name
++collision after the first test command returns zero. Its actual test output was
++not retained, so no test count is accepted. Cgroup `max`, `oom` and `oom_kill`
++counters remain zero. Both attempts preserve failures and pass owned-command
++cleanup, exact container removal and input posthash checks. The corrected driver
++uses distinct command-transcript and test-result names and records invocation,
++completion and retained output separately. These checks do not authorize npm
++execution or replace the required signed format-2 threat feed.
++
++The follow-up adds shared per-field policy authority and current source displays,
++explicit managed personal controls, and effective readback after browser apply
++and undo. Repository constraints remain distinct from organization/remote
++replacement. An optional `tirith menu` routes to existing typed inspections and
++previews. Seven menu tests, two human status-path privacy tests and all nine
++profile lifecycle tests pass locally. The latter includes CLI projection parity
++and read-only previews. At that checkpoint browser journeys and final lint/build checks were pending;
++the September 27 results above supersede that status without closing final WP14
++release acceptance.
++
++## September 22: earlier CI and integrated npm review route
+ 
+ Commit `87c0fdeecdbaf4c1bc3df6533b83b947e7e88819` passes
+ [CI 35587858181](https://github.com/sheeki03/tirith/actions/runs/35587858181),
+diff --git a/scripts/test-control-browser.py b/scripts/test-control-browser.py
+index 4de7db40676cef8cf7f26575d090bfa25c2ce08e..d74746ec22fbfad3bb7a1e914fb182ba86943227 100644
+--- a/scripts/test-control-browser.py
++++ b/scripts/test-control-browser.py
+@@ -358,6 +358,9 @@ def run(binary, output):
+             env[key] = str(directory)
+         env.update({"TIRITH_OFFLINE": "1", "TIRITH_THREATDB_PATH": str(root / "missing-db"),
+                     "TIRITH_THREATDB_SUPPLEMENTAL_PATH": str(root / "missing-supplemental")})
++        managed_root = root / "FIELD_PRIVATE"
++        managed_root.mkdir()
++        env["TIRITH_POLICY_ROOT"] = str(managed_root)
+         project = root / "project"
+         (project / ".git").mkdir(parents=True)
+         manifest = project / "package.json"
+@@ -483,7 +486,41 @@ def run(binary, output):
+                     page.get_by_role("heading", name="Recent friction review", exact=True).wait_for()
+                     page.get_by_role("button", name="Close change details").click()
+                     report["checks"].append("bounded_tuning_review_loads_without_mutating_policy")
++                    large_org_policy = managed_root / ".tirith/policy.yaml"
++                    large_org_policy.parent.mkdir(exist_ok=True)
++                    approvals = [{"rule_ids":["credential_in_command"], "timeout_secs":30,
++                                  "fallback":"block"}] * 3600
++                    try:
++                        large_org_policy.write_text("approval_rules: " + json.dumps(approvals) + "\n")
++                        large_policy = request(origin, token, csrf, "/api/policy")
++                        assert len(large_policy["policy"]["approval_rules"]) == 3600
++                        compound = large_policy["personal_controls"]["approval_rules"]
++                        assert compound["effective_value_omitted"] is True and compound["effective_value"] is None
++                        page.get_by_role("button", name="Protection", exact=True).click()
++                        page.locator('#content[aria-busy="false"]').wait_for()
++                        assert not page.get_by_text("This view could not be refreshed.", exact=False).count()
++                        page.get_by_role("button", name="Compare and review").nth(1).click()
++                        page.get_by_text("Value too large to display here", exact=True).wait_for()
++                        page.get_by_role("button", name="Close change details").click()
++                        large_org_policy.write_text("approval_rules: " + json.dumps(approvals[:1] * 5500) + "\n")
++                        large_policy = request(origin, token, csrf, "/api/policy")
++                        assert len(large_policy["policy"]["approval_rules"]) == 5500
++                        assert large_policy["personal_controls_omitted"] is True
++                        assert "personal_controls" not in large_policy
++                        page.get_by_role("button", name="Protection", exact=True).click()
++                        page.locator('#content[aria-busy="false"]').wait_for()
++                        page.get_by_text("Field summaries are unavailable because this policy response is large.", exact=False).wait_for()
++                        assert page.get_by_label("Personal value", exact=True).is_disabled()
++                        assert page.get_by_role("button", name="Compare personal change", exact=True).is_disabled()
++                    finally:
++                        large_org_policy.unlink()
++                    report["checks"].append("large_approval_policy_retains_full_details_with_explicit_bounded_field_summary")
++                    page.get_by_role("button", name="Protection", exact=True).click()
++                    page.locator('#content[aria-busy="false"]').wait_for()
+                     page.get_by_role("button", name="Compare and review").nth(1).click()
++                    page.get_by_role("columnheader", name="Effective now and source", exact=True).wait_for()
++                    assert page.locator("#operation-content .policy-field-control").count() > 0
++                    assert "effective result remains unverified" in page.locator("#operation-content").inner_text()
+                     page.get_by_role("button", name="Create change plan", exact=True).click()
+                     page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
+                     assert "protection_profile" not in policy.read_text()
+@@ -492,12 +529,74 @@ def run(binary, output):
+                     assert "balanced" in policy.read_text()
+                     assert not (config / "policy.yaml").exists()
+                     assert "preserve-browser-fixture" in policy.read_text()
++                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
++                    page.get_by_role("heading", name="approval_rules", exact=True).wait_for()
+                     page.screenshot(path=str(output / "profile-completed.png"), full_page=True)
+                     page.get_by_role("button", name="Undo owned change", exact=True).click()
+                     page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=40000)
+                     assert "protection_profile" not in policy.read_text()
++                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
+                     report["checks"].append("profile_preview_apply_readback_undo_preserves_yml")
+                     page.get_by_role("button", name="Close change details").click()
++                    page.get_by_role("button", name="Protection", exact=True).click()
++                    page.locator('#content[aria-busy="false"]').wait_for()
++                    page.get_by_label("Setting", exact=True).select_option("strict_warn")
++                    assert page.get_by_label("Personal value", exact=True).is_enabled()
++                    page.get_by_label("Personal value", exact=True).select_option("true")
++                    page.get_by_role("button", name="Compare personal change", exact=True).click()
++                    page.get_by_role("heading", name="Review personal setting", exact=True).wait_for()
++                    page.get_by_role("button", name="Create change plan", exact=True).click()
++                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
++                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
++                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
++                    readback = page.locator("#operation-content section").filter(has=page.get_by_role("heading", name="Current effective readback", exact=True))
++                    assert readback.get_by_role("heading", name="strict_warn", exact=True).count() == 1
++                    assert readback.get_by_text("true", exact=True).count() == 1
++                    page.get_by_role("button", name="Undo owned change", exact=True).click()
++                    page.locator("#operation-content > .badge").filter(has_text="undone").wait_for(timeout=40000)
++                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
++                    assert readback.get_by_text("false", exact=True).count() == 1
++                    page.get_by_role("button", name="Close change details").click()
++                    report["checks"].append("personal_setting_preview_apply_and_undo_show_fresh_effective_values")
++
++                    # Real resolver fixtures: repository tightening is a
++                    # constraint, while a selected organization replaces the
++                    # personal authority even for an omitted scalar field.
++                    repo_policy = project / ".tirith/policy.yaml"
++                    repo_policy.parent.mkdir(exist_ok=True)
++                    repo_policy.write_text("strict_warn: true\n")
++                    page.get_by_role("button", name="Protection", exact=True).click()
++                    page.locator('#content[aria-busy="false"]').wait_for()
++                    assert page.get_by_label("Personal value", exact=True).is_enabled()
++                    assert "Repository policy" in page.locator("#content .policy-field-control").inner_text()
++                    repo_policy.unlink()
++                    org_policy = managed_root / ".tirith/policy.yaml"
++                    org_policy.parent.mkdir(exist_ok=True)
++                    org_policy.write_text("paranoia: 2\ndlp_custom_patterns: [FIELD_PRIVATE]\n")
++                    page.get_by_role("button", name="Protection", exact=True).click()
++                    page.locator('#content[aria-busy="false"]').wait_for()
++                    assert page.get_by_label("Personal value", exact=True).is_disabled()
++                    assert page.get_by_role("button", name="Compare personal change", exact=True).is_disabled()
++                    control_text = page.locator("#content .policy-field-control").inner_text()
++                    assert "Built-in defaults" in control_text and "Managed by Organization policy" in control_text
++                    assert "FIELD_PRIVATE" not in control_text
++                    page.get_by_label("Setting", exact=True).select_option("rule_severity")
++                    page.get_by_label("Rule to customize", exact=True).fill("curl_pipe_shell")
++                    assert page.get_by_label("Personal value", exact=True).is_disabled()
++                    assert "No policy override" in page.locator("#content .policy-field-control").inner_text()
++                    page.get_by_role("button", name="Compare and review", exact=True).nth(2).click()
++                    page.get_by_role("heading", name="Review personal profile", exact=True).wait_for()
++                    assert page.get_by_role("button", name="Create change plan", exact=True).is_disabled()
++                    assert "FIELD_PRIVATE" not in page.locator("#operation-content").inner_text()
++                    page.screenshot(path=str(output / "managed-profile-wide.png"), full_page=True)
++                    page.set_viewport_size({"width":390, "height":844})
++                    page.screenshot(path=str(output / "managed-profile-narrow.png"), full_page=True)
++                    dimensions = page.evaluate("({width:innerWidth, document:document.documentElement.scrollWidth})")
++                    assert dimensions["document"] <= dimensions["width"], f"managed profile overflows narrow viewport: {dimensions}"
++                    page.set_viewport_size({"width":1440, "height":1050})
++                    page.get_by_role("button", name="Close change details").click()
++                    org_policy.unlink()
++                    report["checks"].append("field_authority_distinguishes_repository_constraints_and_redacted_managed_locks")
+                     page.get_by_role("button", name="Exceptions", exact=True).click()
+                     page.get_by_label("Exact target", exact=True).fill("https://fixture.example/install.sh")
+                     page.get_by_label("Rule ID", exact=True).fill("curl_pipe_shell")
+@@ -820,6 +919,22 @@ def run_response_order(binary, output, app_js=None):
+                     undo()
+                     report["checks"].append("older_same_id_planned_status_cannot_replace_apply_result")
+ 
++                    readback_id = profile("balanced")
++                    delay("old-effective-readback", "/api/policy")
++                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
++                    delayed("old-effective-readback")
++                    page.get_by_role("button", name="Undo owned change", exact=True).click()
++                    page.locator("#operation-content > .badge").filter(has_text="undone").wait_for(timeout=40000)
++                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
++                    assert stored()["operation_id"] == readback_id
++                    current_readback = page.locator("#operation-content").inner_text()
++                    current_notice = page.locator("#notice").inner_text()
++                    release("old-effective-readback")
++                    assert page.locator("#operation-content").inner_text() == current_readback
++                    assert page.locator("#notice").inner_text() == current_notice
++                    close()
++                    report["checks"].append("late_apply_readback_cannot_replace_fresh_undo_policy_or_diagnostics")
++
+                     navigate("Protection")
+                     page.get_by_label("Representative commands, one per line", exact=True).fill("echo reviewed-only")
+                     delay("coalesced-impact", "/api/plans", {"kind":"policy_rollout"})
+diff --git a/shell/lib/fish-hook.fish b/shell/lib/fish-hook.fish
+index 904455f3b1f8f5831ec72d5935c04573144c7e0a..340829fe34b99a89e3831717938ef7bae486c01c 100644
+--- a/shell/lib/fish-hook.fish
++++ b/shell/lib/fish-hook.fish
+@@ -80,9 +80,9 @@ end
+ # a hook that discards every command. Runtime capture failures still block.
+ if status is-interactive
+     and begin
+-        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"
++        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"; or test -z "$_TIRITH_SH_BIN"
+     end
+-    builtin printf '%s\n' 'tirith: mktemp or rm unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
++    builtin printf '%s\n' 'tirith: mktemp, rm or sh unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
+     set -g TIRITH_STATUS off
+     set -e _TIRITH_FISH_LOADED
+     return 0
+@@ -248,10 +248,13 @@ end
+ 
+ function _tirith_v3_new_capture_file
+     if not string match -q '/*' -- "$_TIRITH_MKTEMP_BIN"; or \
+-            not string match -q '/*' -- "$_TIRITH_RM_BIN"
++            not string match -q '/*' -- "$_TIRITH_RM_BIN"; or \
++            not string match -q '/*' -- "$_TIRITH_SH_BIN"
+         return 1
+     end
+-    set -l file (umask 077; command "$_TIRITH_MKTEMP_BIN")
++    # Fish command substitutions run in this shell. Apply the private mask in
++    # a child so failures or Ctrl-C cannot change the interactive shell's mask.
++    set -l file (command "$_TIRITH_SH_BIN" -c 'command umask 077 || exit 1; exec "$1"' tirith-capture "$_TIRITH_MKTEMP_BIN")
+     set -l create_status $status
+     if test $create_status -ne 0; or test -z "$file"; or not test -f "$file"; or test -L "$file"; or not test -O "$file"
+         if test -n "$file"
+diff --git a/tests/shell-private-environment.py b/tests/shell-private-environment.py
+index 49c08e5e72e66722663faa8d7cc91cba2408d878..abcca92f92d6a4c618ff38f072eae76786f63314 100644
+--- a/tests/shell-private-environment.py
++++ b/tests/shell-private-environment.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Native privacy regressions using inert endpoints and isolated startup roots.
++"""Native privacy and permission regressions with inert endpoints and isolated startup roots.
+ 
+ These exercise actual hook source/functions, not receipt authority or interception.
+ No Tirith binary, user startup files, signing keys, or services are used.
+@@ -41,30 +41,48 @@ CLEANUP = {"leader_reaped", "group_signaled_or_absent", "group_members_exited",
+ 
+ 
+ class Fixture:
+-    def __init__(self, root, family, shell, source, mode="allow", verification=False, operation_exit=0, ack_exit=0):
++    def __init__(self, root, family, shell, source, mode="allow", verification=False, operation_exit=0, ack_exit=0, incoming_umask=0o027, capture_failure=None):
+         self.root, self.family, self.shell, self.source = root, family, shell, source
+         self.mode, self.verification = mode, verification
+         self.operation_exit, self.ack_exit = operation_exit, ack_exit
++        self.incoming_umask, self.capture_failure = incoming_umask, capture_failure
+         self.command = "_tirith_verification_probe inert-private-command-e320ce6e allowed" if verification else COMMAND
+         interpreter = str(Path(sys.executable).resolve())
+         owned.require(not any(c.isspace() for c in interpreter), "fixture interpreter needs a simple shebang path")
++        # Observers must append even when the tested shell starts with umask 0777.
++        (root / "events").touch(mode=0o600)
+         observer = root / "observer"
+-        observer.write_text("#!" + interpreter + "\n" + f'''import json,os,sys,tempfile
++        observer.write_text("#!" + interpreter + "\n" + f'''import json,os,stat,sys,tempfile
+ from pathlib import Path
+ root=Path({str(root)!r});role=Path(sys.argv[0]).name;args=sys.argv[1:]
+ cap={CAP!r};token={TOKEN!r};state={STATE!r};command={self.command!r};issues=[]
++mask=os.umask(0);os.umask(mask);modes={{}}
++if role=='ordinary':
++ file=root/('ordinary-file-'+str(os.getpid()));directory=root/('ordinary-dir-'+str(os.getpid()))
++ fd=os.open(file,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o666);os.close(fd);directory.mkdir(mode=0o777)
++ modes={{'file':stat.S_IMODE(file.stat().st_mode),'directory':stat.S_IMODE(directory.stat().st_mode)}}
++ directory.chmod(0o700) # Permit fixture cleanup even when the observed directory mode was 000.
+ receipt=role=='tirith' and args[:1]==['__execution-receipt'] and len(args)>1 and args[1] in ('consume','discard','reconcile','acknowledge')
+ checker=role=='tirith' and args[:1]==['check']
++paster=role=='tirith' and args[:1]==['paste']
+ module_check=role=='tirith' and args==['__setup-activation','modules','--channel','zsh']
+ intended=receipt or checker or module_check
+ for name,value in os.environ.items():
+  if cap in value and not (intended and name=='_TIRITH_RECEIPT_INSTANCE' and value==cap):issues.append(name)
+  if token in value or state in value or command in value:issues.append(name)
+ if intended and os.environ.get('_TIRITH_RECEIPT_INSTANCE')!=cap:issues.append('missing-instance')
+-data=sys.stdin.buffer.read(262145) if role=='wc' or receipt or (checker and {verification!r}) else b''
+-with open(root/'events','a') as out:out.write(json.dumps({{'role':role,'args':args,'issues':issues,'stdin':data.decode()}})+'\\n')
++data=sys.stdin.buffer.read(262145) if role=='wc' or receipt or paster or (checker and {verification!r}) else b''
++with open(root/'events','a') as out:out.write(json.dumps({{'role':role,'args':args,'issues':issues,'stdin':data.decode(),'umask':mask,'modes':modes}})+'\\n')
+ if role=='mktemp':
+- fd,name=tempfile.mkstemp(dir=root);os.close(fd);print(name)
++ failure={capture_failure!r}
++ if failure=='exit':raise SystemExit(7)
++ if failure=='empty':raise SystemExit(0)
++ if failure=='missing':print(root/'absent-capture');raise SystemExit(0)
++ fd,name=tempfile.mkstemp(dir=root);os.close(fd)
++ if failure=='symlink':
++  link=root/'capture-link';link.symlink_to(name);name=str(link)
++ print(name)
++ if failure=='created-then-exit':raise SystemExit(7)
+ elif role=='rm':
+  for arg in args:
+   if arg.startswith('-'):continue
+@@ -82,6 +100,7 @@ elif role=='tirith':
+   raise SystemExit({{'allow':0,'block':1,'malformed':42}}[{mode!r}])
+  if args[:2]==['__execution-receipt','capability']:print('TIRITH_EXECUTION_RECEIPT_PROTOCOL=3')
+  elif args[:2]==['__execution-receipt','register']:print(cap)
++ elif paster:raise SystemExit({{'allow':0,'block':1,'malformed':42}}[{mode!r}])
+  elif module_check:raise SystemExit(74) # Inert endpoint never qualifies or loads native modules.
+  elif receipt:raise SystemExit({ack_exit!r} if args[1]=='acknowledge' else {operation_exit!r})
+  elif args[:2]==['env','snapshot']:pass
+@@ -110,6 +129,7 @@ elif role!='ordinary':raise SystemExit(75)
+         environment.update({"XDG_" + kind + "_HOME": str(self.root / kind.lower())
+                             for kind in ("CONFIG", "STATE", "DATA", "CACHE")})
+         environment.update({name: "inert-exported-placeholder" for name in PLACEHOLDERS})
++        script = f"umask {self.incoming_umask:03o}\n" + script
+         trace.run_native(name, [self.shell, *options, "-c", script], self.root, environment, 8)
+         row = trace.NATIVE_ROWS[-1]
+         owned.require(set(row.get("cleanup", {})) == CLEANUP and
+@@ -122,6 +142,10 @@ elif role!='ordinary':raise SystemExit(75)
+                       str([(item["role"], item["issues"]) for item in events if item["issues"]]))
+         owned.require(all(value not in row["stdout"] + row["stderr"] for value in (CAP, TOKEN, STATE)),
+                       "private sentinel reached output")
++        ordinary = [item for item in events if item["role"] == "ordinary"]
++        owned.require(all(item["umask"] == self.incoming_umask and item["modes"] == {
++            "file": 0o666 & ~self.incoming_umask, "directory": 0o777 & ~self.incoming_umask,
++        } for item in ordinary), "hook changed the caller's umask or ordinary child permissions")
+         return row, events
+ 
+     def ordinary(self):
+@@ -209,13 +233,11 @@ zle() {{ builtin printf '%s\\n' "$*" >> {fixture.q(fixture.root / 'editor')}; }}
+ """
+         invoke = "_tirith_accept_line"
+     else:
+-        names = ["_tirith_check_command", "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at", "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
++        names = ["_tirith_check_command", "_tirith_v3_new_capture_file", "_tirith_v3_remove_capture_files", "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at", "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
+         stubs = f"""function commandline
+  if test (count $argv) -eq 0; builtin printf '%s\\n' {fixture.q(fixture.command)}
+  else; builtin printf '%s\\n' "$argv" >> {fixture.q(fixture.root / 'editor')}; end
+ end
+-function _tirith_v3_new_capture_file; command {fixture.q(fixture.root / 'mktemp')}; end
+-function _tirith_v3_remove_capture_files; command {fixture.q(fixture.root / 'rm')} -f -- $argv; end
+ function _tirith_output; return 0; end
+ function _tirith_escape_preview; builtin printf '%s' "$argv[1]"; end
+ function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)}; end
+@@ -243,6 +265,54 @@ function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)};
+         owned.require(editor == expected, "inert editor effect changed")
+ 
+ 
++def capture_umask(fixture):
++    """Real capture helpers retain private files without changing caller masks."""
++    create = "_tirith_new_capture_file" if fixture.family == "bash" else "_tirith_v3_new_capture_file"
++    definitions = fixture.definitions([create])
++    if fixture.family == "fish":
++        body = f"set -l capture ({create})\nset -l result $status\n"
++    else:
++        body = f'capture="$({create})"\nresult=$?\n'
++    tail = fixture.ordinary() + '\nbuiltin printf "RESULT=%s\\nCAPTURE=%s\\n" "$result" "$capture"\nbuiltin true\n'
++    row, events = fixture.run("capture-umask", fixture.setup() + definitions + "\n" + body + tail)
++    expected = 0 if fixture.capture_failure is None else 7 if fixture.family == "bash" else 1
++    lines = row["stdout"].splitlines()
++    owned.require(len(lines) == 2 and lines[0] == "RESULT=" + str(expected), "capture status changed: " + row["stdout"])
++    captures = [item for item in events if item["role"] == "mktemp"]
++    owned.require(len(captures) == 1 and captures[0]["umask"] == 0o077, "capture helper did not inherit a private umask")
++    if fixture.capture_failure is None:
++        path = Path(lines[1].removeprefix("CAPTURE="))
++        owned.require(path.parent == fixture.root and path.is_file() and not path.is_symlink(), "capture file missing")
++        owned.require(path.stat().st_mode & 0o777 == 0o600, "capture file is not private")
++    else:
++        owned.require(lines[1] == "CAPTURE=", "failed capture returned a pathname")
++        if fixture.capture_failure in ("missing", "symlink", "created-then-exit"):
++            owned.require(sum(item["role"] == "rm" for item in events) == 1, "invalid capture was not cleaned up")
++
++
++def fish_paste_umask(fixture):
++    """Source the complete hook and exercise its installed paste wrapper."""
++    path = fixture.root / trace.FILES[fixture.family]
++    path.write_text(fixture.source)
++    script = f"""function fish_clipboard_paste
++ builtin printf '%s' {fixture.q(fixture.command)}
++end
++source {fixture.q(path)} --tirith-executable {fixture.q(fixture.root / 'tirith')}
++function commandline; return 0; end
++set -g _TIRITH_MKTEMP_BIN {fixture.q(fixture.root / 'mktemp')}
++set -g _TIRITH_RM_BIN {fixture.q(fixture.root / 'rm')}
++fish_clipboard_paste
++{fixture.ordinary()}
++builtin true
++"""
++    row, events = fixture.run("paste-umask", script, interactive=True)
++    allowed = fixture.capture_failure is None and fixture.mode == "allow"
++    owned.require(row["stdout"] == (fixture.command if allowed else ""), "paste allow/block behavior changed")
++    pastes = [item for item in events if item["role"] == "tirith" and item["args"][:1] == ["paste"]]
++    owned.require(len(pastes) == (1 if fixture.capture_failure is None else 0), "unexpected paste check count")
++    owned.require(all(item["stdin"] == fixture.command for item in pastes), "paste command bytes changed")
++
++
+ def receipt_operation(fixture, operation):
+     if fixture.family == "bash":
+         names = ["_tirith_trace_preserve_status", "_tirith_fixed_fd_is_valid", "_tirith_open_exact_input_pipe", "_tirith_close_pending_fd",
+@@ -307,7 +377,17 @@ def main():
+     with trace.retained_directory(prefix="tirith-private-env-", admission=admission) as temporary:
+         parent = Path(temporary).resolve()
+         for family, shell in available:
+-            plans = [("startup", startup, {})]
++            plans = [(f"startup-umask-{mask:03o}", startup, {"incoming_umask": mask})
++                     for mask in (0o000, 0o022, 0o027, 0o077, 0o777)]
++            plans += [(f"capture-umask-{mask:03o}-{failure}", capture_umask,
++                       {"incoming_umask": mask, "capture_failure": failure})
++                      for mask in (0o000, 0o002, 0o022, 0o027, 0o077, 0o777) for failure in (None, "exit")]
++            if family == "fish":
++                plans += [(f"capture-failure-{failure}", capture_umask, {"capture_failure": failure})
++                          for failure in ("empty", "missing", "symlink", "created-then-exit")]
++                plans += [(f"paste-umask-{mode}-{failure}", fish_paste_umask,
++                           {"mode": mode, "capture_failure": failure})
++                          for mode in ("allow", "block", "malformed") for failure in (None, "exit")]
+             plans += [(f"checker-{mode}-{verify}", checker, {"mode": mode, "verification": verify})
+                       for mode in ("allow", "block", "malformed") for verify in (False, True)]
+             plans += [(f"receipt-{operation}-{operation_exit}-{ack_exit}", lambda f, op=operation: receipt_operation(f, op), {"operation_exit": operation_exit, "ack_exit": ack_exit})
+diff --git a/threatdb-manifest.json b/threatdb-manifest.json
+index d20aede60ba16d5a3302414bc0fb3e486328d547..bd9eb1825651863c3998a34f14d689eead33cfb3 100644
+--- a/threatdb-manifest.json
++++ b/threatdb-manifest.json
+@@ -1 +1 @@
+-{"version":1789896030343,"sha256":"206c7ea5ad524761ce785e8e350f4c1b41d46835d0fb6ae8e6094d30cc4ca68c","size":11977934,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-current/tirith-threatdb-35501817260-1.dat","signature":"/pzxUDbQ0R18rxDomW9cOnsFrctlsQ+ecWMmLM9ExnlN46/S5Jaq1gTNSVErfB6j6+GDxTH0RZCjdBXbM/PQBA=="}
++{"version":1790503422402,"sha256":"47b867e2b686ce68d38402622fcd27fc54854115743b860a8bc1799c8db48112","size":11977934,"url":"https://github.com/sheeki03/tirith/releases/download/threatdb-current/tirith-threatdb-36311057301-1.dat","signature":"MdyHxNzjf9ZCa/FzI0UB4k10o9Dey79AwPlGAavNErX61wdlGvuGPLuZYhwlihsK0XxW01XCJEvjhaw42crmBA=="}
