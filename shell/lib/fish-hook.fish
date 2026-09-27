@@ -80,9 +80,9 @@ end
 # a hook that discards every command. Runtime capture failures still block.
 if status is-interactive
     and begin
-        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"
+        test -z "$_TIRITH_MKTEMP_BIN"; or test -z "$_TIRITH_RM_BIN"; or test -z "$_TIRITH_SH_BIN"
     end
-    builtin printf '%s\n' 'tirith: mktemp or rm unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
+    builtin printf '%s\n' 'tirith: mktemp, rm or sh unavailable; fish hooks disabled — install these helpers and restart the shell' >&2
     set -g TIRITH_STATUS off
     set -e _TIRITH_FISH_LOADED
     return 0
@@ -248,10 +248,13 @@ end
 
 function _tirith_v3_new_capture_file
     if not string match -q '/*' -- "$_TIRITH_MKTEMP_BIN"; or \
-            not string match -q '/*' -- "$_TIRITH_RM_BIN"
+            not string match -q '/*' -- "$_TIRITH_RM_BIN"; or \
+            not string match -q '/*' -- "$_TIRITH_SH_BIN"
         return 1
     end
-    set -l file (umask 077; command "$_TIRITH_MKTEMP_BIN")
+    # Fish command substitutions run in this shell. Apply the private mask in
+    # a child so failures or Ctrl-C cannot change the interactive shell's mask.
+    set -l file (command "$_TIRITH_SH_BIN" -c 'command umask 077 || exit 1; exec "$1"' tirith-capture "$_TIRITH_MKTEMP_BIN")
     set -l create_status $status
     if test $create_status -ne 0; or test -z "$file"; or not test -f "$file"; or test -L "$file"; or not test -O "$file"
         if test -n "$file"

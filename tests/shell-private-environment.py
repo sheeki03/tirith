@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native privacy regressions using inert endpoints and isolated startup roots.
+"""Native privacy and permission regressions with inert endpoints and isolated startup roots.
 
 These exercise actual hook source/functions, not receipt authority or interception.
 No Tirith binary, user startup files, signing keys, or services are used.
@@ -41,30 +41,48 @@ CLEANUP = {"leader_reaped", "group_signaled_or_absent", "group_members_exited", 
 
 
 class Fixture:
-    def __init__(self, root, family, shell, source, mode="allow", verification=False, operation_exit=0, ack_exit=0):
+    def __init__(self, root, family, shell, source, mode="allow", verification=False, operation_exit=0, ack_exit=0, incoming_umask=0o027, capture_failure=None):
         self.root, self.family, self.shell, self.source = root, family, shell, source
         self.mode, self.verification = mode, verification
         self.operation_exit, self.ack_exit = operation_exit, ack_exit
+        self.incoming_umask, self.capture_failure = incoming_umask, capture_failure
         self.command = "_tirith_verification_probe inert-private-command-e320ce6e allowed" if verification else COMMAND
         interpreter = str(Path(sys.executable).resolve())
         owned.require(not any(c.isspace() for c in interpreter), "fixture interpreter needs a simple shebang path")
+        # Observers must append even when the tested shell starts with umask 0777.
+        (root / "events").touch(mode=0o600)
         observer = root / "observer"
-        observer.write_text("#!" + interpreter + "\n" + f'''import json,os,sys,tempfile
+        observer.write_text("#!" + interpreter + "\n" + f'''import json,os,stat,sys,tempfile
 from pathlib import Path
 root=Path({str(root)!r});role=Path(sys.argv[0]).name;args=sys.argv[1:]
 cap={CAP!r};token={TOKEN!r};state={STATE!r};command={self.command!r};issues=[]
+mask=os.umask(0);os.umask(mask);modes={{}}
+if role=='ordinary':
+ file=root/('ordinary-file-'+str(os.getpid()));directory=root/('ordinary-dir-'+str(os.getpid()))
+ fd=os.open(file,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o666);os.close(fd);directory.mkdir(mode=0o777)
+ modes={{'file':stat.S_IMODE(file.stat().st_mode),'directory':stat.S_IMODE(directory.stat().st_mode)}}
+ directory.chmod(0o700) # Permit fixture cleanup even when the observed directory mode was 000.
 receipt=role=='tirith' and args[:1]==['__execution-receipt'] and len(args)>1 and args[1] in ('consume','discard','reconcile','acknowledge')
 checker=role=='tirith' and args[:1]==['check']
+paster=role=='tirith' and args[:1]==['paste']
 module_check=role=='tirith' and args==['__setup-activation','modules','--channel','zsh']
 intended=receipt or checker or module_check
 for name,value in os.environ.items():
  if cap in value and not (intended and name=='_TIRITH_RECEIPT_INSTANCE' and value==cap):issues.append(name)
  if token in value or state in value or command in value:issues.append(name)
 if intended and os.environ.get('_TIRITH_RECEIPT_INSTANCE')!=cap:issues.append('missing-instance')
-data=sys.stdin.buffer.read(262145) if role=='wc' or receipt or (checker and {verification!r}) else b''
-with open(root/'events','a') as out:out.write(json.dumps({{'role':role,'args':args,'issues':issues,'stdin':data.decode()}})+'\\n')
+data=sys.stdin.buffer.read(262145) if role=='wc' or receipt or paster or (checker and {verification!r}) else b''
+with open(root/'events','a') as out:out.write(json.dumps({{'role':role,'args':args,'issues':issues,'stdin':data.decode(),'umask':mask,'modes':modes}})+'\\n')
 if role=='mktemp':
- fd,name=tempfile.mkstemp(dir=root);os.close(fd);print(name)
+ failure={capture_failure!r}
+ if failure=='exit':raise SystemExit(7)
+ if failure=='empty':raise SystemExit(0)
+ if failure=='missing':print(root/'absent-capture');raise SystemExit(0)
+ fd,name=tempfile.mkstemp(dir=root);os.close(fd)
+ if failure=='symlink':
+  link=root/'capture-link';link.symlink_to(name);name=str(link)
+ print(name)
+ if failure=='created-then-exit':raise SystemExit(7)
 elif role=='rm':
  for arg in args:
   if arg.startswith('-'):continue
@@ -82,6 +100,7 @@ elif role=='tirith':
   raise SystemExit({{'allow':0,'block':1,'malformed':42}}[{mode!r}])
  if args[:2]==['__execution-receipt','capability']:print('TIRITH_EXECUTION_RECEIPT_PROTOCOL=3')
  elif args[:2]==['__execution-receipt','register']:print(cap)
+ elif paster:raise SystemExit({{'allow':0,'block':1,'malformed':42}}[{mode!r}])
  elif module_check:raise SystemExit(74) # Inert endpoint never qualifies or loads native modules.
  elif receipt:raise SystemExit({ack_exit!r} if args[1]=='acknowledge' else {operation_exit!r})
  elif args[:2]==['env','snapshot']:pass
@@ -110,6 +129,7 @@ elif role!='ordinary':raise SystemExit(75)
         environment.update({"XDG_" + kind + "_HOME": str(self.root / kind.lower())
                             for kind in ("CONFIG", "STATE", "DATA", "CACHE")})
         environment.update({name: "inert-exported-placeholder" for name in PLACEHOLDERS})
+        script = f"umask {self.incoming_umask:03o}\n" + script
         trace.run_native(name, [self.shell, *options, "-c", script], self.root, environment, 8)
         row = trace.NATIVE_ROWS[-1]
         owned.require(set(row.get("cleanup", {})) == CLEANUP and
@@ -122,6 +142,10 @@ elif role!='ordinary':raise SystemExit(75)
                       str([(item["role"], item["issues"]) for item in events if item["issues"]]))
         owned.require(all(value not in row["stdout"] + row["stderr"] for value in (CAP, TOKEN, STATE)),
                       "private sentinel reached output")
+        ordinary = [item for item in events if item["role"] == "ordinary"]
+        owned.require(all(item["umask"] == self.incoming_umask and item["modes"] == {
+            "file": 0o666 & ~self.incoming_umask, "directory": 0o777 & ~self.incoming_umask,
+        } for item in ordinary), "hook changed the caller's umask or ordinary child permissions")
         return row, events
 
     def ordinary(self):
@@ -209,13 +233,11 @@ zle() {{ builtin printf '%s\\n' "$*" >> {fixture.q(fixture.root / 'editor')}; }}
 """
         invoke = "_tirith_accept_line"
     else:
-        names = ["_tirith_check_command", "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at", "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
+        names = ["_tirith_check_command", "_tirith_v3_new_capture_file", "_tirith_v3_remove_capture_files", "_tirith_receipt_acknowledge_at", "_tirith_receipt_consume_at", "_tirith_receipt_discard_at", "_tirith_receipt_reconcile_at", "_tirith_receipt_discard_or_retain", "_tirith_unresolved_receipt_cleanup"]
         stubs = f"""function commandline
  if test (count $argv) -eq 0; builtin printf '%s\\n' {fixture.q(fixture.command)}
  else; builtin printf '%s\\n' "$argv" >> {fixture.q(fixture.root / 'editor')}; end
 end
-function _tirith_v3_new_capture_file; command {fixture.q(fixture.root / 'mktemp')}; end
-function _tirith_v3_remove_capture_files; command {fixture.q(fixture.root / 'rm')} -f -- $argv; end
 function _tirith_output; return 0; end
 function _tirith_escape_preview; builtin printf '%s' "$argv[1]"; end
 function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)}; end
@@ -241,6 +263,54 @@ function _tirith_verification_state; builtin printf '%s\\n' {fixture.q(STATE)}; 
         editor = (fixture.root / "editor").read_text()
         expected = (".accept-line\n" if fixture.mode == "allow" else "send-break\n") if fixture.family == "zsh" else ("-f execute\n" if fixture.mode == "allow" else "-r \n-f repaint\n")
         owned.require(editor == expected, "inert editor effect changed")
+
+
+def capture_umask(fixture):
+    """Real capture helpers retain private files without changing caller masks."""
+    create = "_tirith_new_capture_file" if fixture.family == "bash" else "_tirith_v3_new_capture_file"
+    definitions = fixture.definitions([create])
+    if fixture.family == "fish":
+        body = f"set -l capture ({create})\nset -l result $status\n"
+    else:
+        body = f'capture="$({create})"\nresult=$?\n'
+    tail = fixture.ordinary() + '\nbuiltin printf "RESULT=%s\\nCAPTURE=%s\\n" "$result" "$capture"\nbuiltin true\n'
+    row, events = fixture.run("capture-umask", fixture.setup() + definitions + "\n" + body + tail)
+    expected = 0 if fixture.capture_failure is None else 7 if fixture.family == "bash" else 1
+    lines = row["stdout"].splitlines()
+    owned.require(len(lines) == 2 and lines[0] == "RESULT=" + str(expected), "capture status changed: " + row["stdout"])
+    captures = [item for item in events if item["role"] == "mktemp"]
+    owned.require(len(captures) == 1 and captures[0]["umask"] == 0o077, "capture helper did not inherit a private umask")
+    if fixture.capture_failure is None:
+        path = Path(lines[1].removeprefix("CAPTURE="))
+        owned.require(path.parent == fixture.root and path.is_file() and not path.is_symlink(), "capture file missing")
+        owned.require(path.stat().st_mode & 0o777 == 0o600, "capture file is not private")
+    else:
+        owned.require(lines[1] == "CAPTURE=", "failed capture returned a pathname")
+        if fixture.capture_failure in ("missing", "symlink", "created-then-exit"):
+            owned.require(sum(item["role"] == "rm" for item in events) == 1, "invalid capture was not cleaned up")
+
+
+def fish_paste_umask(fixture):
+    """Source the complete hook and exercise its installed paste wrapper."""
+    path = fixture.root / trace.FILES[fixture.family]
+    path.write_text(fixture.source)
+    script = f"""function fish_clipboard_paste
+ builtin printf '%s' {fixture.q(fixture.command)}
+end
+source {fixture.q(path)} --tirith-executable {fixture.q(fixture.root / 'tirith')}
+function commandline; return 0; end
+set -g _TIRITH_MKTEMP_BIN {fixture.q(fixture.root / 'mktemp')}
+set -g _TIRITH_RM_BIN {fixture.q(fixture.root / 'rm')}
+fish_clipboard_paste
+{fixture.ordinary()}
+builtin true
+"""
+    row, events = fixture.run("paste-umask", script, interactive=True)
+    allowed = fixture.capture_failure is None and fixture.mode == "allow"
+    owned.require(row["stdout"] == (fixture.command if allowed else ""), "paste allow/block behavior changed")
+    pastes = [item for item in events if item["role"] == "tirith" and item["args"][:1] == ["paste"]]
+    owned.require(len(pastes) == (1 if fixture.capture_failure is None else 0), "unexpected paste check count")
+    owned.require(all(item["stdin"] == fixture.command for item in pastes), "paste command bytes changed")
 
 
 def receipt_operation(fixture, operation):
@@ -307,7 +377,17 @@ def main():
     with trace.retained_directory(prefix="tirith-private-env-", admission=admission) as temporary:
         parent = Path(temporary).resolve()
         for family, shell in available:
-            plans = [("startup", startup, {})]
+            plans = [(f"startup-umask-{mask:03o}", startup, {"incoming_umask": mask})
+                     for mask in (0o000, 0o022, 0o027, 0o077, 0o777)]
+            plans += [(f"capture-umask-{mask:03o}-{failure}", capture_umask,
+                       {"incoming_umask": mask, "capture_failure": failure})
+                      for mask in (0o000, 0o002, 0o022, 0o027, 0o077, 0o777) for failure in (None, "exit")]
+            if family == "fish":
+                plans += [(f"capture-failure-{failure}", capture_umask, {"capture_failure": failure})
+                          for failure in ("empty", "missing", "symlink", "created-then-exit")]
+                plans += [(f"paste-umask-{mode}-{failure}", fish_paste_umask,
+                           {"mode": mode, "capture_failure": failure})
+                          for mode in ("allow", "block", "malformed") for failure in (None, "exit")]
             plans += [(f"checker-{mode}-{verify}", checker, {"mode": mode, "verification": verify})
                       for mode in ("allow", "block", "malformed") for verify in (False, True)]
             plans += [(f"receipt-{operation}-{operation_exit}-{ack_exit}", lambda f, op=operation: receipt_operation(f, op), {"operation_exit": operation_exit, "ack_exit": ack_exit})
