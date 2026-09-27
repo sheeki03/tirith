@@ -145,7 +145,7 @@ fn session_typed_event_count(env: &IsolatedEnv) -> usize {
         // No session record yet is the strongest possible form of "nothing was
         // observed", so it counts as zero rather than failing the read.
         return 0;
-    }
+    };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         panic!("session record at {} must be valid JSON", path.display());
     };
@@ -392,7 +392,7 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
 
 /// Issue #176: modern Bash must bracket array-valued PROMPT_COMMAND entries,
 /// decide each typed line once, and keep lazy extdebug out of allowed function
-/// bodies or prompt functions. A blocked function/pipeline line must still be
+/// bodies and prompt functions. A blocked function/pipeline line must still be
 /// skipped, then Tirith-owned extdebug must be released at the next prompt.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
@@ -762,7 +762,7 @@ fn bash_enter_allowed_command_executes_exactly_once() {
 fn bash_enter_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
     let allowed_marker = env.workdir.join("enter_block_allowed.txt");
-    let blocked_marker = env.workdir.join("enter_blocked.txt");
+    let blocked_marker = env.workdir.join("enter_block_blocked.txt");
     let bash = match modern_bash() {
         Some(b) => b,
         None => {
@@ -1035,6 +1035,11 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     sess.send_line("export PS1='TIRITH_PTY> '");
     sess.expect("TIRITH_PTY> ");
     sess.clear_buffer();
+    sess.send_line(
+        r#"bind -m emacs-standard -x '"\C-o":printf EMACS-C-O'; bind -m vi-insert '"\C-o": "VI-INSERT-C-O"'; bind -m vi-command '"\C-o": "VI-COMMAND-C-O"'"#,
+    );
+    sess.expect("TIRITH_PTY> ");
+    sess.clear_buffer();
     let hook = embedded_hook("bash-hook.bash");
     sess.send_line(&format!("source '{}'", hook.display()));
     sess.expect("TIRITH_PTY> ");
@@ -1050,7 +1055,7 @@ fn bash_enter_degradation_restores_custom_ctrl_o_bindings() {
     );
     sess.clear_buffer();
     sess.send_line(
-        r#"if _tirith_bind_x_record_is_ctrl_o '"\C-o" "printf modern"' && _tirith_bind_x_record_is_ctrl_o '"\C-o" "printf legacy"'; then printf 'TIRITH_CTRL_O_RECORDS_%s\n' OK; else printf 'TIRITH_CTRL_O_RECORDS_%s\n' BAD; fi"#,
+        r#"if _tirith_bind_x_record_is_ctrl_o '"\C-o" "printf modern"' && _tirith_bind_x_record_is_ctrl_o '"\C-o": "printf legacy"'; then printf 'TIRITH_CTRL_O_RECORDS_%s\n' OK; else printf 'TIRITH_CTRL_O_RECORDS_%s\n' BAD; fi"#,
     );
     sess.expect("TIRITH_CTRL_O_RECORDS_OK");
     sess.expect("TIRITH_PTY> ");
@@ -1754,7 +1759,7 @@ fn zsh_rc_file_registration_survives_suppressed_exec_optimization() {
     );
     sess.clear_buffer();
     sess.send_line("print -r -- \"TIRITH_RC_PROTOCOL=$_TIRITH_RECEIPT_PROTOCOL\"");
-    sess.expect("TIRITH_RC_PROTOCOL<3>");
+    sess.expect("TIRITH_RC_PROTOCOL=3");
     sess.close();
 }
 
