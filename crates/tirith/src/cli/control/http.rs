@@ -7,6 +7,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 pub(super) const MAX_BODY: usize = 16 * 1024;
+pub(super) const MAX_RESPONSE: usize = 512 * 1024;
 const MAX_HEADERS: usize = 8 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(3);
 
@@ -65,6 +66,12 @@ pub(super) fn read(
     }
     #[cfg(not(windows))]
     {
+        // Accepted sockets can inherit the listener's nonblocking mode (for
+        // example on macOS). SO_RCVTIMEO only bounds blocking reads; otherwise
+        // a temporarily empty receive buffer becomes an immediate HTTP 408.
+        stream
+            .set_nonblocking(false)
+            .map_err(|_| error(400, "cannot configure request deadline"))?;
         read_request(stream, authorize)
     }
 }
@@ -309,13 +316,17 @@ pub(super) fn respond(
     content_type: &str,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    if bytes.len() > 512 * 1024 {
+    if bytes.len() > MAX_RESPONSE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "control response exceeds limit",
         ));
     }
     let started = Instant::now();
+    // Some errors are returned before read() normalizes the accepted socket.
+    // SO_SNDTIMEO must apply to blocking writes so ordinary backpressure does
+    // not truncate a response while its absolute deadline still has time left.
+    stream.set_nonblocking(false)?;
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
@@ -360,7 +371,7 @@ pub(super) fn respond(
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn receive_deadline_keeps_the_socket_usable_for_http_408() {
         for (request, initially_nonblocking) in [
@@ -383,6 +394,7 @@ mod tests {
             let started = Instant::now();
             let result = read(&mut stream, |_| Ok(()));
             let elapsed = started.elapsed();
+            #[cfg(windows)]
             let read_timeout = stream.read_timeout();
             let status = result.as_ref().err().map(|error| error.status);
             let written = respond(&mut stream, status.unwrap_or(500), "text/plain", b"deadline");
@@ -390,12 +402,69 @@ mod tests {
             let (response, received) = client.join().expect("join bounded deadline client");
             assert_eq!(status, Some(408));
             assert!(elapsed >= READ_DEADLINE && elapsed < Duration::from_secs(8));
+            #[cfg(windows)]
             assert_eq!(read_timeout.unwrap(), None, "must not use Winsock SO_RCVTIMEO");
             assert!(written.is_ok(), "deadline response write: {written:?}");
             assert!(received.is_ok(), "deadline response read: {received:?}");
             assert!(response.starts_with("HTTP/1.1 408"), "{response:?}");
             assert!(response.ends_with("deadline"), "{response:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_accepted_socket_sends_the_complete_response_under_backpressure() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        // Linux does not inherit this flag from the listener; exercise the
+        // macOS accepted-socket behavior on every Unix test host.
+        stream.set_nonblocking(true).unwrap();
+        let send_buffer: libc::c_int = 4096;
+        // SAFETY: the socket and pointer remain valid for this call, and the
+        // option length matches the initialized integer's size.
+        let configured = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&send_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(configured, 0, "{}", std::io::Error::last_os_error());
+        let receiver = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut response = Vec::new();
+            let result = client.read_to_end(&mut response);
+            (response, result)
+        });
+        let body = vec![b'x'; MAX_RESPONSE];
+        let started = Instant::now();
+        let written = respond(&mut stream, 200, "application/json", &body);
+        let elapsed = started.elapsed();
+        drop(stream);
+        let (response, received) = receiver.join().expect("join bounded response client");
+        assert!(written.is_ok(), "response write: {written:?}");
+        assert!(received.is_ok(), "response read: {received:?}");
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        let header_end = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("complete response headers")
+            + 4;
+        let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+        assert!(headers.starts_with(&format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        )));
+        assert_eq!(&response[header_end..], body.as_slice());
     }
 
     fn get(headers: &str) -> Request {
