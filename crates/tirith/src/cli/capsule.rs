@@ -318,6 +318,7 @@ pub enum CapsuleTerminationKind {
     Presentation,
     CleanupFailure,
     /// The contained target reached a nonzero or signaled exit.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     UnsuccessfulExit,
 }
 
@@ -689,6 +690,15 @@ impl HeldEphemeralDirectory {
 #[cfg(target_os = "linux")]
 impl Drop for HeldEphemeralDirectory {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // An unexpected unwind does not prove owned-child quiescence. Keep
+            // the directory and disarm TempDir's recursive pathname destructor
+            // before its fields drop; explicit ordinary cleanup is unchanged.
+            if let Some(guard) = self.guard.take() {
+                let _ = guard.keep();
+            }
+            return;
+        }
         if let Err(error) = self.cleanup_with_hook(|| {}) {
             eprintln!(
                 "tirith capsule: capability-relative ephemeral-directory cleanup failed; preserving residue: {error}"
@@ -7777,6 +7787,47 @@ mod tests {
         assert!(
             !path.exists(),
             "cleanup must remove the unchanged empty root non-recursively"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_ephemeral_directory_unwind_preserves_root_and_contents() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let parent = tempfile::tempdir().expect("ephemeral parent");
+        let directory = tempfile::Builder::new()
+            .prefix("tirith-held-unwind-")
+            .tempdir_in(parent.path())
+            .expect("held directory");
+        let path = directory.path().to_path_buf();
+        let cache = path.join("cache");
+        std::fs::create_dir(&cache).expect("create cache");
+        std::fs::write(cache.join("retained"), b"ambiguous cache state")
+            .expect("write retained cache bytes");
+        let identity = std::fs::symlink_metadata(&path).expect("root identity");
+        let held = HeldEphemeralDirectory::from_tempdir(
+            directory,
+            "landlock-seccomp",
+            "test ephemeral directory",
+        )
+        .expect("retain directory capability");
+
+        // Exercise the real destructor during unwinding. No child is launched
+        // and this preservation observation says nothing about child cleanup.
+        let unwind = std::panic::catch_unwind(move || {
+            let _held = held;
+            panic!("simulate unexpected unwind after a possible child launch");
+        });
+        assert!(unwind.is_err());
+        let retained = std::fs::symlink_metadata(&path).expect("preserved root");
+        assert_eq!(
+            (retained.dev(), retained.ino(), retained.mode()),
+            (identity.dev(), identity.ino(), identity.mode())
+        );
+        assert_eq!(
+            std::fs::read(cache.join("retained")).expect("preserved cache contents"),
+            b"ambiguous cache state"
         );
     }
 

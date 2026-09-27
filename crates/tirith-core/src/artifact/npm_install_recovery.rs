@@ -299,62 +299,6 @@ impl VerifiedNpmTree {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    #[test]
-    fn complete_observation_changes_for_bytes_metadata_extra_and_replaced_inode() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let file = root.join("package.json");
-        std::fs::write(&file, b"aaaa").unwrap();
-        let first = observe_npm_recovery_tree(&root).unwrap();
-        assert_eq!(
-            first.observation(),
-            observe_npm_recovery_tree(&root).unwrap().observation()
-        );
-        std::fs::write(&file, b"bbbb").unwrap();
-        assert_ne!(
-            first.observation(),
-            observe_npm_recovery_tree(&root).unwrap().observation()
-        );
-        let second = observe_npm_recovery_tree(&root).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
-        assert_ne!(
-            second.observation(),
-            observe_npm_recovery_tree(&root).unwrap().observation()
-        );
-        let third = observe_npm_recovery_tree(&root).unwrap();
-        std::fs::write(root.join("extra"), b"x").unwrap();
-        assert_ne!(
-            third.observation(),
-            observe_npm_recovery_tree(&root).unwrap().observation()
-        );
-        std::fs::rename(&file, root.join("old")).unwrap();
-        std::fs::write(&file, b"bbbb").unwrap();
-        assert_ne!(
-            third.observation(),
-            observe_npm_recovery_tree(&root).unwrap().observation()
-        );
-    }
-    #[test]
-    fn links_special_entries_and_alias_roots_are_refused() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("a"), b"x").unwrap();
-        symlink("a", root.join("b")).unwrap();
-        assert!(observe_npm_recovery_tree(&root).is_err());
-        std::fs::remove_file(root.join("b")).unwrap();
-        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
-        assert!(observe_npm_recovery_tree(&root).is_err());
-        symlink(&root, temp.path().join("alias")).unwrap();
-        assert!(observe_npm_recovery_tree(&temp.path().join("alias")).is_err());
-    }
-}
-
 /// Fresh policy/static/source assessment of an already published exact tree.
 /// It has no install, mutation, deletion, or replay method.
 pub struct NpmPublishedRecovery<'a> {
@@ -465,5 +409,61 @@ impl<'a> NpmPublishedRecovery<'a> {
             return Err(NpmInstallRefusal::InstalledContentChanged);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    #[test]
+    fn complete_observation_changes_for_bytes_metadata_extra_and_replaced_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("package.json");
+        std::fs::write(&file, b"aaaa").unwrap();
+        let first = observe_npm_recovery_tree(&root).unwrap();
+        assert_eq!(
+            first.observation(),
+            observe_npm_recovery_tree(&root).unwrap().observation()
+        );
+        std::fs::write(&file, b"bbbb").unwrap();
+        assert_ne!(
+            first.observation(),
+            observe_npm_recovery_tree(&root).unwrap().observation()
+        );
+        let second = observe_npm_recovery_tree(&root).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_ne!(
+            second.observation(),
+            observe_npm_recovery_tree(&root).unwrap().observation()
+        );
+        let third = observe_npm_recovery_tree(&root).unwrap();
+        std::fs::write(root.join("extra"), b"x").unwrap();
+        assert_ne!(
+            third.observation(),
+            observe_npm_recovery_tree(&root).unwrap().observation()
+        );
+        std::fs::rename(&file, root.join("old")).unwrap();
+        std::fs::write(&file, b"bbbb").unwrap();
+        assert_ne!(
+            third.observation(),
+            observe_npm_recovery_tree(&root).unwrap().observation()
+        );
+    }
+    #[test]
+    fn links_special_entries_and_alias_roots_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a"), b"x").unwrap();
+        symlink("a", root.join("b")).unwrap();
+        assert!(observe_npm_recovery_tree(&root).is_err());
+        std::fs::remove_file(root.join("b")).unwrap();
+        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        assert!(observe_npm_recovery_tree(&root).is_err());
+        symlink(&root, temp.path().join("alias")).unwrap();
+        assert!(observe_npm_recovery_tree(&temp.path().join("alias")).is_err());
     }
 }

@@ -1490,7 +1490,9 @@ mod linux {
         }
 
         fn stored_bytes(scope: &GlobalStateGuard) -> std::collections::BTreeMap<String, Vec<u8>> {
-            std::fs::read_dir(scope.roots().tirith_state.join("materialization-intents"))
+            // Match OperationStore's XDG state root, not the separate setup-lock root.
+            let state = scope.roots().xdg_state.join("tirith");
+            std::fs::read_dir(state.join("materialization-intents"))
                 .unwrap()
                 .map(|entry| {
                     let entry = entry.unwrap();

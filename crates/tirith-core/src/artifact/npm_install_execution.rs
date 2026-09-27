@@ -626,7 +626,18 @@ fn expected_hidden_lock(
     let sources = bind_artifact_operands(&expected_hashes, artifact_operands, target_operand)?;
     let mut packages = serde_json::Map::new();
     for artifact in artifacts {
-        let installed = target.join("node_modules").join(&artifact.leaf.name);
+        // This is the launcher's lexical POSIX layout even when the pure
+        // metadata verifier runs on Windows. Native Path::join would inject
+        // host separators into the expected npm lockfile key.
+        let target = target
+            .to_str()
+            .filter(|path| path.starts_with('/'))
+            .ok_or(NpmInstallRefusal::ExecutionLayoutUnsupported)?;
+        let installed = std::path::PathBuf::from(format!(
+            "{}/node_modules/{}",
+            target.trim_end_matches('/'),
+            artifact.leaf.name
+        ));
         let source = sources
             .get(artifact.sha256())
             .ok_or(NpmInstallRefusal::ExecutionLayoutUnsupported)?;

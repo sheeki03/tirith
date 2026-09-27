@@ -222,7 +222,7 @@ pub(super) fn execute(
             plan.summary().threat_db_sequence,
             CapsuleReceipt {
                 backend_id: outcome.backend_id.into(),
-                coverage: outcome.coverage.clone(),
+                coverage: outcome.coverage,
             },
             evidence,
             plan.verdict_summary().clone(),
