@@ -161,6 +161,18 @@ pub fn run(
     suggest_safe_command: bool,
     card: Option<String>,
 ) -> i32 {
+    // WP17 QUALIFICATION MUTANT ONLY: intentional real allocation; never ship.
+    struct Wp17RssPadding(Vec<u8>);
+    impl Drop for Wp17RssPadding {
+        fn drop(&mut self) { std::hint::black_box(self.0.as_slice()); }
+    }
+    let _wp17_padding = if cmd == "echo fixture" {
+        let mut bytes = vec![0u8; 16777216];
+        // Touch every page, so this is physical RSS as well as an allocator request.
+        for page in bytes.chunks_mut(4096) { std::hint::black_box(page)[0] = 0xa5; }
+        std::hint::black_box(bytes.as_slice());
+        Some(Wp17RssPadding(bytes))
+    } else { None };
     let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let offline = offline || crate::cli::offline_env_active();
     let shell_name = match shell_type {
