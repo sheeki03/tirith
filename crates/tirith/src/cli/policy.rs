@@ -1000,7 +1000,7 @@ pub(crate) fn effective_snapshot_display(
             remote[key] = project(value).into();
         }
     }
-    Ok(serde_json::json!({
+    let mut display = serde_json::json!({
         "schema_version": 1,
         "source_path": source,
         "scope": scope_label(snapshot.policy.scope),
@@ -1029,7 +1029,270 @@ pub(crate) fn effective_snapshot_display(
             "effective_allow_bypass_env_noninteractive": snapshot.policy.allow_bypass_env_noninteractive,
             "policy_is_redacted_display": true
         }
-    }))
+    });
+    if snapshot.resolution_mode == ResolutionMode::Runtime {
+        display["personal_controls"] = PersonalControlDisplay::new(snapshot, compiled).all();
+    }
+    Ok(display)
+}
+
+/// Field-specific display evidence from one captured resolver result. This is
+/// neither a writable-field allowlist nor authority to apply a change. In
+/// particular, a repository or incident contribution does not disable the
+/// operator's personal preference; the mutation service revalidates authority.
+pub(crate) struct PersonalControlDisplay<'a> {
+    snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
+    compiled: &'a tirith_core::redact::CompiledCustomPatterns,
+    policy: serde_json::Value,
+    authority: serde_json::Value,
+}
+
+const PERSONAL_CONTROL_FIELDS: &[&str] = &[
+    "strict_warn",
+    "allow_bypass_env",
+    "allow_bypass_env_noninteractive",
+    "scan.require_complete",
+    "env_guard_enabled",
+    "context_guard_enabled",
+    "exec_guard_enabled",
+    "hooks_guard_enabled",
+    "baseline_enabled",
+    "mcp_redact_injection",
+    "fail_mode",
+    "paranoia",
+];
+
+impl<'a> PersonalControlDisplay<'a> {
+    pub(crate) fn new(
+        snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
+        compiled: &'a tirith_core::redact::CompiledCustomPatterns,
+    ) -> Self {
+        let mut display = Self {
+            snapshot,
+            compiled,
+            // Serialize once for all fields. Only selected typed values or
+            // freshly redacted display content can leave this private value.
+            policy: serde_json::to_value(&snapshot.policy).unwrap_or_default(),
+            authority: serde_json::Value::Null,
+        };
+        display.authority = display.project_authority();
+        display
+    }
+
+    fn text(&self, value: &str, limit: usize) -> String {
+        let redacted = tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(value),
+            self.compiled,
+        );
+        let flattened = super::sanitize_for_human_output(&redacted, false);
+        // Removing row breaks can reconstitute a protected value. Reapply the
+        // frozen DLP plan to the exact flattened text before bounding it.
+        let safe =
+            tirith_core::redact::redact_sanitize_redact_with_compiled(&flattened, self.compiled);
+        if safe.chars().count() <= limit {
+            return safe;
+        }
+        let mut bounded = safe.chars().take(limit).collect::<String>();
+        bounded.push('…');
+        bounded
+    }
+
+    fn source(&self, source: &tirith_core::policy_snapshot::PolicySource) -> serde_json::Value {
+        serde_json::json!({"kind":source.kind,
+            "path":source.path.as_deref().map(|path|self.text(path, 160))})
+    }
+
+    fn project_authority(&self) -> serde_json::Value {
+        use tirith_core::policy::PolicyScope;
+        use tirith_core::policy_snapshot::ResolutionMode;
+        let target = self
+            .snapshot
+            .operator_targets
+            .iter()
+            .find(|target| target.scope == "user");
+        let (state, source, reason) = if self.snapshot.resolution_mode != ResolutionMode::Runtime {
+            (
+                "unknown",
+                serde_json::Value::Null,
+                "This diagnostic does not establish the current runtime authority.",
+            )
+        } else if self.snapshot.policy.path.as_deref() == Some("fail-closed") {
+            ("unknown", serde_json::Value::Null,
+                "The configured effective policy could not be validated; inspect its failure evidence.")
+        } else if let Some(target) = target {
+            if target.effective {
+                ("effective", serde_json::Value::Null, target.reason.as_str())
+            } else if self.snapshot.policy.scope == PolicyScope::Remote {
+                // Actual remote replacement, not merely a configured server
+                // or a failed fetch that fell back to the personal baseline.
+                let source = self.snapshot.field_provenance.values().find_map(|field| {
+                    std::iter::once(&field.effective_source)
+                        .chain(field.contributions.iter().rev().map(|part| &part.source))
+                        .find(|source| matches!(source.kind.as_str(), "remote" | "remote_cache"))
+                });
+                (
+                    "overridden",
+                    source
+                        .map(|source| self.source(source))
+                        .unwrap_or_else(|| serde_json::json!({"kind":"remote","path":null})),
+                    target.reason.as_str(),
+                )
+            } else if let Some(org) = self
+                .snapshot
+                .operator_targets
+                .iter()
+                .find(|target| target.scope == "org" && target.effective)
+            {
+                // An omitted organization field can have a default source;
+                // the selected organization authority still replaces personal
+                // preferences for that field.
+                (
+                    "overridden",
+                    serde_json::json!({"kind":"org","path":self.text(&org.path,160)}),
+                    target.reason.as_str(),
+                )
+            } else {
+                ("unknown", serde_json::Value::Null,
+                    "The personal destination is ineffective, but its governing authority is unavailable.")
+            }
+        } else {
+            (
+                "unknown",
+                serde_json::Value::Null,
+                "The resolver did not establish a personal policy destination.",
+            )
+        };
+        serde_json::json!({"state":state,"governing_source":source,"reason":self.text(reason,160)})
+    }
+
+    pub(crate) fn field(&self, field: &str) -> serde_json::Value {
+        let rule_field = ["severity_overrides.", "action_overrides."]
+            .iter()
+            .find_map(|prefix| {
+                field.strip_prefix(*prefix).and_then(|id| {
+                    serde_json::from_value::<tirith_core::verdict::RuleId>(serde_json::json!(id))
+                        .ok()
+                        .map(|rule| (*prefix, rule))
+                })
+            });
+        let canonical = PERSONAL_CONTROL_FIELDS.contains(&field)
+            || rule_field.is_some()
+            || field == "approval_rules";
+        let mut effective = field
+            .split('.')
+            .try_fold(&self.policy, |value, key| value.get(key))
+            .cloned()
+            .unwrap_or_default();
+        if !PERSONAL_CONTROL_FIELDS.contains(&field) && rule_field.is_none() {
+            // Profile-owned compound values can include sensitive rule text.
+            project_policy_cli_json(&mut effective);
+            tirith_core::redact::redact_json_strings(&mut effective, self.compiled);
+        }
+        let effective_value_omitted =
+            serde_json::to_vec(&effective).map_or(true, |bytes| bytes.len() > 16 * 1024);
+        if effective_value_omitted {
+            effective = serde_json::Value::Null;
+        }
+        let provenance = self.snapshot.field_provenance.get(field);
+        let effective_source = provenance.map(|value|self.source(&value.effective_source))
+            .unwrap_or_else(||serde_json::json!({"kind":if rule_field.is_some() && effective.is_null() {"not_set"} else {"unknown"},"path":null}));
+        let mut contributions: Vec<_> = provenance.into_iter()
+            .flat_map(|value|value.contributions.iter())
+            .map(|value|serde_json::json!({"source":self.source(&value.source),
+                "reason":self.text(&value.reason,160),"changed_effective_value":value.changed_effective_value}))
+            .collect();
+        let mut neutralized: Vec<_> = self
+            .snapshot
+            .neutralized_settings
+            .iter()
+            .filter(|value| {
+                value.field == field
+                    || field
+                        .strip_prefix(value.field.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+            .map(|value| {
+                serde_json::json!({"field":self.text(&value.field,128),
+                "source":self.source(&value.source),"reason":self.text(&value.reason,160)})
+            })
+            .collect();
+        let mut contributions_omitted = contributions.len().saturating_sub(4);
+        if contributions_omitted > 0 {
+            contributions.drain(..contributions_omitted);
+        }
+        let mut neutralized_omitted = neutralized.len().saturating_sub(2);
+        neutralized.truncate(2);
+        let mut value = serde_json::json!({"field":if canonical {field.to_owned()} else {self.text(field,128)},
+            "effective_value":effective,"effective_source":effective_source,
+            "personal_authority":self.authority,"contributions":contributions,
+            "neutralized_settings":neutralized,"contributions_omitted":contributions_omitted,
+            "neutralized_settings_omitted":neutralized_omitted,
+            "effective_after":{"availability":"unavailable","reason":"requires_apply_and_fresh_readback"}});
+        if effective_value_omitted {
+            value["effective_value_omitted"] = true.into();
+        }
+        // Keep the all-rule control inventory bounded independently of policy
+        // size. Omitted history remains explicitly counted; newest evidence is
+        // retained first. Compound profile values have a separate 16 KiB bound
+        // so the full approval list cannot be duplicated in every policy read.
+        if PERSONAL_CONTROL_FIELDS.contains(&field) || rule_field.is_some() {
+            while serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() > 1024) {
+                if let Some(items) = value["contributions"]
+                    .as_array_mut()
+                    .filter(|items| !items.is_empty())
+                {
+                    items.remove(0);
+                    contributions_omitted += 1;
+                    value["contributions_omitted"] = contributions_omitted.into();
+                } else if let Some(items) = value["neutralized_settings"]
+                    .as_array_mut()
+                    .filter(|items| !items.is_empty())
+                {
+                    items.pop();
+                    neutralized_omitted += 1;
+                    value["neutralized_settings_omitted"] = neutralized_omitted.into();
+                } else {
+                    // Escaping can expand even bounded hostile source names.
+                    // Preserve source kinds without an unbounded path copy.
+                    value["effective_source"]["path"] = serde_json::Value::Null;
+                    if !value["personal_authority"]["governing_source"].is_null() {
+                        value["personal_authority"]["governing_source"]["path"] =
+                            serde_json::Value::Null;
+                    }
+                    value["source_paths_omitted"] = true.into();
+                    break;
+                }
+            }
+        }
+        value
+    }
+
+    fn all(&self) -> serde_json::Value {
+        let mut fields = serde_json::Map::new();
+        for field in PERSONAL_CONTROL_FIELDS {
+            fields.insert((*field).into(), self.field(field));
+        }
+        // The generated explanation inventory is checked against RuleId at
+        // build time. Unset known rules report no policy override, never an
+        // invented default rule severity or provenance.
+        for rule in tirith_core::rule_explanations::list_all() {
+            let field = format!("severity_overrides.{}", rule.id);
+            fields.insert(field.clone(), self.field(&field));
+        }
+        // Profile changes also own compound approval rules and selected action
+        // overrides. Keep their apply/undo readback as complete as the preview.
+        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
+        for profile in ProtectionProfile::ALL {
+            if let Ok(definition) = definition(profile, PROFILE_VERSION) {
+                for field in definition.settings.keys() {
+                    fields
+                        .entry(field.clone())
+                        .or_insert_with(|| self.field(field));
+                }
+            }
+        }
+        fields.into()
+    }
 }
 
 /// Project only owned human content. Opaque revisions, source kinds, status
@@ -1401,6 +1664,248 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use tirith_core::policy_validate::{self, IssueLevel};
+
+    fn control_snapshot(
+        state: &tirith_test_support::GlobalStateGuard,
+    ) -> tirith_core::policy_snapshot::EffectivePolicySnapshot {
+        tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+            state.roots().cwd.to_str(),
+            tirith_core::policy_snapshot::ResolutionMode::Runtime,
+        )
+    }
+
+    #[test]
+    fn personal_control_org_omitted_field_is_overridden_even_with_default_source() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(org.join("policy.yaml"), "paranoia: 2\n").unwrap();
+        let snapshot = control_snapshot(&state);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
+        assert_eq!(value["effective_source"]["kind"], "default");
+        assert_eq!(value["personal_authority"]["state"], "overridden");
+        assert_eq!(
+            value["personal_authority"]["governing_source"]["kind"],
+            "org"
+        );
+        assert_eq!(value["effective_after"]["availability"], "unavailable");
+        assert!(value["personal_authority"]["governing_source"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("policy.yaml"));
+    }
+
+    #[test]
+    fn personal_control_repository_evidence_does_not_lock_personal_authority() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "paranoia: 2\nstrict_warn: true\n",
+        )
+        .unwrap();
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        std::fs::write(
+            cwd.join(".tirith/policy.yaml"),
+            "paranoia: 4\nstrict_warn: true\nallow_bypass_env_noninteractive: true\n",
+        )
+        .unwrap();
+        let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+            cwd.to_str(),
+            tirith_core::policy_snapshot::ResolutionMode::Runtime,
+        );
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
+        let paranoia = controls.field("paranoia");
+        assert_eq!(paranoia["effective_value"], 4);
+        assert_eq!(paranoia["effective_source"]["kind"], "repo");
+        assert_eq!(paranoia["personal_authority"]["state"], "effective");
+        let warning = controls.field("strict_warn");
+        assert_eq!(warning["effective_source"]["kind"], "user");
+        assert_eq!(warning["personal_authority"]["state"], "effective");
+        assert!(warning["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |item| item["source"]["kind"] == "repo" && item["changed_effective_value"] == false
+            ));
+        let unrelated = controls.field("env_guard_enabled");
+        assert_eq!(unrelated["personal_authority"]["state"], "effective");
+        assert!(!unrelated["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "repo"));
+        let bypass = controls.field("allow_bypass_env_noninteractive");
+        assert_eq!(bypass["personal_authority"]["state"], "effective");
+        assert!(bypass["neutralized_settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "repo"));
+    }
+
+    #[test]
+    fn personal_control_incident_constraints_are_field_specific_and_not_authority() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        tirith_core::incident::invalidate_cache();
+        tirith_core::incident::start("personal control fixture").unwrap();
+        let snapshot = control_snapshot(&state);
+        tirith_core::incident::stop().unwrap();
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
+        let bypass = controls.field("allow_bypass_env");
+        assert_eq!(bypass["effective_value"], false);
+        assert_eq!(bypass["personal_authority"]["state"], "effective");
+        assert!(bypass["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "incident"));
+        let unrelated = controls.field("env_guard_enabled");
+        assert!(!unrelated["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "incident"));
+    }
+
+    #[test]
+    fn personal_control_remote_local_fallback_is_not_a_managed_lock() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "policy_fetch_fail_mode: open\nparanoia: 2\n",
+        )
+        .unwrap();
+        // Transport validation refuses this URL without opening a connection.
+        state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        state.set_env("TIRITH_API_KEY", "fixture-key");
+        let snapshot = control_snapshot(&state);
+        assert_eq!(snapshot.remote.fallback.as_deref(), Some("local"));
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("paranoia");
+        assert_eq!(value["effective_value"], 2);
+        assert_eq!(value["personal_authority"]["state"], "effective");
+        assert!(value["personal_authority"]["governing_source"].is_null());
+    }
+
+    #[test]
+    fn personal_control_source_redacts_custom_values_after_row_flattening() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let mut snapshot = control_snapshot(&state);
+        let compiled =
+            tirith_core::redact::CompiledCustomPatterns::new_silent(&["project-private".into()]);
+        for separator in ["\n", "\r\n", "\x1b[0m\n"] {
+            snapshot
+                .field_provenance
+                .get_mut("strict_warn")
+                .unwrap()
+                .effective_source
+                .path = Some(format!("/workspace/project-{separator}private/policy.yaml"));
+            let control = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
+            let path = control["effective_source"]["path"].as_str().unwrap();
+            assert!(!path.contains("project-private"));
+            assert!(!path.chars().any(char::is_control));
+            assert!(path.ends_with("/policy.yaml"));
+            assert!(path.contains("REDACTED"));
+        }
+    }
+
+    #[test]
+    fn personal_control_rule_inventory_and_dlp_preserve_typed_identity_with_bounded_output() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(
+            org.join("policy.yaml"),
+            "severity_overrides:\n  non_standard_port: HIGH\n",
+        )
+        .unwrap();
+        let snapshot = control_snapshot(&state);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[".+".into()]);
+        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
+        let controls = &value["personal_controls"];
+        let selected = &controls["severity_overrides.non_standard_port"];
+        assert_eq!(selected["field"], "severity_overrides.non_standard_port");
+        assert_eq!(selected["effective_value"], "HIGH");
+        assert_eq!(selected["effective_source"]["kind"], "org");
+        assert_eq!(selected["personal_authority"]["state"], "overridden");
+        assert!(!value.to_string().contains(&org.display().to_string()));
+        assert_eq!(controls["fail_mode"]["effective_value"], "open");
+        for rule in tirith_core::rule_explanations::list_all() {
+            let key = format!("severity_overrides.{}", rule.id);
+            let control = &controls[&key];
+            assert_eq!(control["field"], key);
+            assert!(serde_json::to_vec(control).unwrap().len() <= 1024);
+        }
+        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
+        let display = PersonalControlDisplay::new(&snapshot, &compiled);
+        for profile in ProtectionProfile::ALL {
+            for field in definition(profile, PROFILE_VERSION)
+                .unwrap()
+                .settings
+                .keys()
+            {
+                assert_eq!(controls[field]["field"], *field);
+                assert_eq!(controls[field], display.field(field));
+            }
+        }
+        let unset = &controls["severity_overrides.curl_pipe_shell"];
+        assert!(unset["effective_value"].is_null());
+        assert_eq!(unset["effective_source"]["kind"], "not_set");
+        assert!(unset["contributions"].as_array().unwrap().is_empty());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
+        let unredacted = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        assert!(
+            serde_json::to_vec(&effective_snapshot_display(&snapshot, &unredacted).unwrap())
+                .unwrap()
+                .len()
+                < 512 * 1024
+        );
+    }
+
+    #[test]
+    fn personal_control_large_approval_list_is_not_duplicated_into_policy_response() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let mut snapshot = control_snapshot(&state);
+        snapshot.policy.approval_rules = vec![
+            tirith_core::policy::ApprovalRule {
+                rule_ids: vec!["credential_in_command".into()],
+                timeout_secs: 30,
+                fallback: "block".into(),
+            };
+            3600
+        ];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
+        let policy_bytes = serde_json::to_vec(&value["policy"]).unwrap().len();
+        assert!(policy_bytes > 256 * 1024 && policy_bytes < 360 * 1024);
+        assert_eq!(
+            value["policy"]["approval_rules"].as_array().unwrap().len(),
+            3600
+        );
+        let control = &value["personal_controls"]["approval_rules"];
+        assert_eq!(control["effective_value_omitted"], true);
+        assert!(control["effective_value"].is_null());
+        assert_eq!(control["field"], "approval_rules");
+        assert!(serde_json::to_vec(control).unwrap().len() < 4096);
+        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
+        snapshot.policy.approval_rules.truncate(1);
+        let small = PersonalControlDisplay::new(&snapshot, &compiled).field("approval_rules");
+        assert!(small.get("effective_value_omitted").is_none());
+        assert_eq!(small["effective_value"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn effective_projection_uses_captured_snapshot_and_explicit_privacy_union() {

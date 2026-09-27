@@ -4,6 +4,15 @@ These commands describe the unreleased cycle candidate based on 0.4.2. Use
 `tirith version --provenance` to identify the binary being tested. Native
 certification and release acceptance are tracked in [verification](verification.md).
 
+For guided terminal navigation, run `tirith menu`. Choose protection, profiles,
+activity, exceptions, integrations or maintenance, then select one inspection or
+preview. The selected command runs once and keeps its usual exit status. Each
+page's `g` option explains the direct commands for changes; the menu does not
+apply them. Policy-aware inspections may refresh configured remote policy.
+Use `b` to return, `q` to quit, or Ctrl-C to cancel. The menu requires terminal
+input and output. Scripts and redirected sessions use the direct CLI, such as
+`tirith status --json` or `tirith audit recent --limit 25 --json`.
+
 ## Protect a terminal
 
 Install Tirith through your chosen channel, then run personal setup as the

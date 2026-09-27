@@ -24,7 +24,7 @@
   function rawDetails(title, value) { const node = element('details'); node.append(element('summary', title), element('pre', JSON.stringify(value, null, 2))); return node; }
   function row(title, detail, status, actions = []) { const node = element('div', undefined, 'row'); const copy = element('div'); copy.append(element('strong', title), element('small', detail)); node.append(copy); if (status) node.append(badge(status)); if (actions.length) { const group = element('div', undefined, 'actions'); group.append(...actions); node.append(group); } return node; }
   function showError(error) { notice.textContent = error.message || String(error); notice.hidden = false; }
-  async function api(path, body) {
+  async function api(path, body, showDiagnostics = true) {
     const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 35000);
     try {
       const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
@@ -32,7 +32,7 @@
         ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
       const value = await response.json();
       if (!response.ok) { if (response.status === 401) document.querySelector('#session-state').textContent = 'Session expired — reopen with tirith dashboard'; throw new Error(value.error || 'Local request failed'); }
-      if (value.diagnostics?.length) showError(new Error(value.diagnostics.join('\n')));
+      if (showDiagnostics && value.diagnostics?.length) showError(new Error(value.diagnostics.join('\n')));
       return value;
     } catch (error) { if (error.name === 'AbortError') throw new Error('The response timed out. A submitted operation may still be running; inspect its stored ID before retrying.'); throw error; }
     finally { clearTimeout(timer); }
@@ -197,32 +197,80 @@
   }
   function advancedSettings(effective) {
     const section = panel('Advanced personal settings'); const form = element('form');
+    if (effective.personal_controls_omitted) section.append(paragraph('Field summaries are unavailable because this policy response is large. The effective policy details remain available, and profile previews can still show their specific fields.', 'notice'));
     const setting = select('Setting', [['strict_warn', 'Require acknowledgement for warnings'], ['allow_bypass_env', 'Permit explicit interactive bypass'], ['allow_bypass_env_noninteractive', 'Permit explicit noninteractive bypass'], ['scan_require_complete', 'Require complete scan coverage'], ['env_guard_enabled', 'Environment guard'], ['context_guard_enabled', 'Context guard'], ['exec_guard_enabled', 'Executable guard'], ['hooks_guard_enabled', 'Repository hooks guard'], ['baseline_enabled', 'Baseline checks'], ['mcp_redact_injection', 'Redact injection in MCP output'], ['fail_mode', 'Behavior on internal check failure'], ['paranoia', 'Heuristic sensitivity'], ['rule_severity', 'Specific rule severity']]);
-    const value = select('Personal value', []); const rule = field('Rule to customize', 'text', '', 'Exact rule ID'); const current = paragraph('', 'muted');
+    const value = select('Personal value', []); const rule = field('Rule to customize', 'text', '', 'Exact rule ID'); const current = element('div');
+    rule.input.maxLength = 128;
+    const submit = element('button','Compare personal change','primary'); submit.type='submit';
+    function showControl() {
+      const selected = setting.input.value;
+      const canonical = selected === 'scan_require_complete' ? 'scan.require_complete' : selected === 'rule_severity' ? `severity_overrides.${rule.input.value.trim()}` : selected;
+      const control = effective.personal_controls?.[canonical];
+      current.replaceChildren(policyFieldControl(control));
+      const overridden = control?.personal_authority?.state === 'overridden';
+      value.input.disabled = !control || overridden; submit.disabled = !control || overridden;
+    }
     function choices() {
       value.input.replaceChildren();
       const options = setting.input.value === 'fail_mode' ? [['open', 'Open'], ['closed', 'Closed']] : setting.input.value === 'paranoia' ? [1,2,3,4].map(n => [String(n), String(n)]) : setting.input.value === 'rule_severity' ? [['LOW','Low'],['MEDIUM','Medium'],['HIGH','High'],['CRITICAL','Critical']] : [['true','Enabled'],['false','Disabled']];
       for (const [key, title] of [['reset', 'Remove personal override'], ...options]) { const option = element('option', title); option.value = key; value.input.append(option); }
       rule.label.hidden = setting.input.value !== 'rule_severity'; rule.input.required = !rule.label.hidden;
-      const path = setting.input.value === 'scan_require_complete' ? ['scan','require_complete'] : [setting.input.value];
-      const effectiveValue = path.reduce((part, key) => part?.[key], effective.policy);
-      current.textContent = `Current effective value: ${effectiveValue === undefined ? 'inspect the rule in effective settings below' : JSON.stringify(effectiveValue)}. Stronger policy sources may override your personal choice.`;
+      showControl();
     }
     setting.input.addEventListener('change', choices); choices();
-    const submit = element('button','Compare personal change','primary'); submit.type='submit';
+    rule.input.addEventListener('input', showControl);
     form.append(setting.label, value.label, rule.label, current, submit);
     form.addEventListener('submit', event => { event.preventDefault(); const selected = value.input.value;
       const change = {setting:setting.input.value, value:selected === 'reset' ? null : selected === 'true' ? true : selected === 'false' ? false : setting.input.value === 'paranoia' ? Number(selected) : selected};
       if (setting.input.value === 'rule_severity') change.rule = rule.input.value.trim();
-      requestDialog(() => api('/api/settings/preview', change), preview => { showDialog('Review personal setting', preview); operationActions.append(button('Create change plan', () => plan({kind:'personal_setting',change}), 'primary')); }).catch(showError);
+      requestDialog(() => api('/api/settings/preview', change), preview => { showDialog('Review personal setting', preview); personalPlanButton(preview, () => plan({kind:'personal_setting',change})); }).catch(showError);
     });
     section.append(paragraph('These changes apply to your personal policy. Profile changes and resets preserve explicit overrides. Removal restores the value inherited from other policy sources.'), form); return section;
   }
   async function previewProfile(profile) {
     return requestDialog(() => api('/api/profile/preview', {profile}), value => {
       showDialog('Review personal profile', value);
-      operationActions.append(button('Create change plan', () => plan({kind:'profile', profile}), 'primary'));
+      personalPlanButton(value, () => plan({kind:'profile', profile}));
     });
+  }
+  function policyValue(value) { return value === undefined ? 'Unavailable' : value === null ? 'No policy override' : JSON.stringify(value); }
+  function policySource(source) {
+    const names = {default:'Built-in defaults', user:'Personal policy', org:'Organization policy', repo:'Repository policy', remote:'Remote policy', remote_cache:'Cached remote policy', incident:'Incident policy', not_set:'No policy override'};
+    const name = names[source?.kind] || (source?.kind ? String(source.kind).replace(/[_-]/g, ' ') : 'Source unavailable');
+    return source?.path ? `${name}: ${source.path}` : name;
+  }
+  function policyFieldControl(control) {
+    const node = element('div', undefined, 'policy-field-control');
+    if (!control) { node.append(paragraph('Field authority is unavailable. Review the current policy before changing this setting.', 'notice')); return node; }
+    node.append(row('Current effective value', policySource(control.effective_source), control.effective_value_omitted ? 'Value too large to display here' : policyValue(control.effective_value)));
+    if (control.effective_value_omitted) node.append(paragraph('The current value is omitted from this field summary. Inspect the effective policy details for the full redacted value.', 'muted'));
+    const authority = control.personal_authority;
+    if (authority?.state === 'overridden') {
+      node.append(paragraph(`Managed by ${policySource(authority.governing_source)}. A personal change cannot change the effective value. Use the managing policy or contact its owner.`, 'notice'));
+    } else if (authority?.state === 'effective') {
+      node.append(paragraph('Your personal policy can affect this setting. Repository and incident constraints still apply.', 'muted'));
+    } else {
+      node.append(paragraph('Whether a personal change can affect this setting is unknown. The change will be checked again before apply.', 'notice'));
+    }
+    if (authority?.reason) node.append(paragraph(authority.reason, 'muted'));
+    if (control.contributions?.length) {
+      const details = element('details'); details.append(element('summary', 'Captured policy contributions'));
+      for (const contribution of control.contributions.slice(0, 8)) details.append(paragraph(`${policySource(contribution.source)}: ${contribution.reason}`));
+      details.append(paragraph('Contributions include earlier and unchanged declarations; they do not each establish a current lock.', 'muted'));
+      node.append(details);
+    }
+    if (control.contributions?.length > 8 || control.contributions_omitted) node.append(paragraph('Additional contributions are omitted from this view.', 'muted'));
+    if (control.neutralized_settings?.length) node.append(paragraph('Rejected repository preferences are recorded in the details. They do not lock your personal setting.', 'muted'));
+    if (control.neutralized_settings_omitted) node.append(paragraph('Additional rejected repository preferences are omitted from this view.', 'muted'));
+    if (control.source_paths_omitted) node.append(paragraph('Some source paths are omitted to keep this response bounded.', 'muted'));
+    return node;
+  }
+  function personalPlanButton(preview, create) {
+    const controls = preview.control ? [preview.control] : (preview.field_changes || []).map(change => change.control);
+    const overridden = controls.some(control => control?.personal_authority?.state === 'overridden');
+    const action = button('Create change plan', create, 'primary'); action.disabled = overridden;
+    operationActions.append(action);
+    if (overridden) operationContent.append(paragraph('This personal policy is overridden by a managing authority. No personal change plan is available here.', 'notice'));
   }
   function field(title, type = 'text', value = '', placeholder = '') { const label = element('label', title); const input = element('input'); input.type = type; input.value = value; input.placeholder = placeholder; if (type === 'checkbox') label.replaceChildren(input, document.createTextNode(title)); else label.append(input); return { label, input }; }
   function select(title, options) { const label = element('label', title); const input = element('select'); input.setAttribute('aria-label', title); for (const [value, text] of options) { const option = element('option', text); option.value = value; input.append(option); } label.append(input); return { label, input }; }
@@ -572,12 +620,19 @@
     if (value.kind === 'profile_preview') {
       operationContent.append(paragraph(`Personal profile: ${value.selection?.name || 'reset owned settings'}`), paragraph(`Destination: ${value.target}`, 'muted'), paragraph('Organization, project, remote, and incident restrictions still apply. No settings have changed yet.'));
       if (value.definition) operationContent.append(paragraph(value.definition.presentation));
-      const table = element('table'); const head = element('tr'); for (const title of ['Setting', 'Before', 'After']) head.append(element('th', title)); table.append(head);
-      for (const change of value.field_changes || []) { const row = element('tr'); row.append(element('td', change.field), element('td', change.before === null ? 'Not set' : JSON.stringify(change.before)), element('td', change.after === null ? 'Not set' : JSON.stringify(change.after))); table.append(row); }
+      const table = element('table', undefined, 'profile-diff'); const titles = ['Setting', 'Personal before', 'Personal after', 'Effective now and source'];
+      const head = element('tr'); for (const title of titles) head.append(element('th', title));
+      const heading = element('thead'); heading.append(head); table.append(heading); const body = element('tbody'); table.append(body);
+      for (const change of value.field_changes || []) {
+        const entry = element('tr'); const effective = element('td'); effective.append(policyFieldControl(change.control));
+        const cells = [element('td', change.field), element('td', policyValue(change.before)), element('td', policyValue(change.after)), effective];
+        cells.forEach((cell, index) => { cell.dataset.label = titles[index]; entry.append(cell); }); body.append(entry);
+      }
       const scroll = element('div', undefined, 'table-scroll'); scroll.append(table); operationContent.append(scroll);
+      operationContent.append(paragraph('The proposed values are personal preferences. The effective result remains unverified until the change is applied and the resolver reads it back.', 'notice'));
       if (value.custom_overrides?.length) operationContent.append(paragraph(`Preserved custom settings: ${value.custom_overrides.join(', ')}`, 'notice'));
     } else if (value.kind === 'personal_setting_preview') {
-      operationContent.append(paragraph(`Personal setting: ${value.field}`), paragraph(`Destination: ${value.target}`, 'muted'), row('Current personal value', 'Before this change', JSON.stringify(value.before)), row('Proposed personal value', 'Null removes the personal override', JSON.stringify(value.after)), paragraph(value.constraints), paragraph('Refresh Protection after applying to inspect the effective result.'));
+      operationContent.append(paragraph(`Personal setting: ${value.field}`), paragraph(`Destination: ${value.target}`, 'muted'), row('Current personal value', 'Before this change', policyValue(value.before)), row('Proposed personal value', 'Removing an override restores inherited behavior', policyValue(value.after)), policyFieldControl(value.control), paragraph('The effective result will be read back after apply; a saved personal value does not prove it took effect.', 'notice'));
     } else if (value.semantics === 'trust_eligibility_only') {
       operationContent.append(paragraph('This explains whether an exception is eligible. Independent command blockers can remain; no command was evaluated.'));
     } else if (value.detail || value.error) {
@@ -618,7 +673,7 @@
           value.operation.impact_review = value.impact;
           value.operation.impact_observation = value.live?.impact_observation;
         }
-        displayOperation(value.operation);
+        displayOperation(value.operation, value.preview);
         if (value.kind === 'audit_rotation_plan' && value.preview) operationContent.prepend(paragraph(`Retain ${value.preview.retained_records} records (${value.preview.retained_bytes} bytes). ${value.preview.signed_segment ? 'The signed segment was verified.' : 'This segment has no signed-chain proof.'} Undo is available only before additional records are appended.`, 'notice'));
       }
     } catch (error) {
@@ -653,8 +708,10 @@
     node.append(paragraph(relations[history.setup_state] || relations.unknown, 'muted'));
     return node;
   }
-  function displayOperation(operation) {
+  function displayOperation(operation, preview) {
     const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
+    context.readbackSequence = (context.readbackSequence || 0) + 1;
+    if (preview) context.policyFields = preview.field ? [preview.field] : (preview.field_changes || []).map(change => change.field);
     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
     operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
     if (operation.setup_activation) operationContent.append(activationHistoryPanel(operation.setup_activation));
@@ -680,11 +737,34 @@
     }
     for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, step.state));
     operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${context.id}`, 'muted'));
+    if (['set-profile','set-managed-profile','set-personal-setting','recommended-setup','import-policy'].includes(operation.kind) && ['completed','completed-with-recovery','undone','undone-with-recovery'].includes(operation.state)) {
+      const readback = panel('Current effective readback'); readback.append(paragraph('Reading current policy…', 'muted')); operationContent.append(readback);
+      readEffectivePolicy(context, context.readbackSequence, readback);
+    }
     if (!operation.no_op && !operation.presentation_incomplete && operation.state === 'planned') operationActions.append(button('Apply reviewed change', () => act(context, 'apply'), 'primary'));
     if (['planned','running','waiting','queued','cancel-requested'].includes(operation.state)) operationActions.append(button('Request cancellation', () => act(context, 'cancel')));
     if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && ['completed','completed-with-recovery'].includes(operation.state)) operationActions.append(button('Undo owned change', () => act(context, 'undo')));
     operationActions.append(button('Refresh stored status', () => act(context, 'status')));
     if (['running','waiting','queued','cancel-requested'].includes(operation.state)) pollTimer = setTimeout(() => act(context, 'status').catch(showError), 1500);
+  }
+  async function readEffectivePolicy(context, sequence, target) {
+    const actionSequence = context.sequence;
+    try {
+      const effective = await api('/api/policy', undefined, false);
+      if (!currentOperation(context) || context.sequence !== actionSequence || context.readbackSequence !== sequence || !target.isConnected) return;
+      target.replaceChildren(element('h2', 'Current effective readback'), paragraph('These are the resolver’s current values. Other policy changes may have occurred since this operation.', 'muted'));
+      if (effective.diagnostics?.length) target.append(paragraph(effective.diagnostics.join('\n'), 'notice'));
+      if (effective.personal_controls_omitted) target.append(paragraph('Field summaries are unavailable because this policy response is large. Inspect the current effective policy details below.', 'notice'));
+      const fields = context.policyFields?.length ? context.policyFields : ['strict_warn','allow_bypass_env','fail_mode','paranoia','scan.require_complete'];
+      for (const field of [...new Set(fields)].slice(0, 32)) {
+        const control = effective.personal_controls?.[field];
+        target.append(element('h3', field), policyFieldControl(control));
+      }
+      target.append(rawDetails('Inspect current effective policy and sources', effective));
+    } catch (error) {
+      if (!currentOperation(context) || context.sequence !== actionSequence || context.readbackSequence !== sequence || !target.isConnected) return;
+      target.replaceChildren(element('h2', 'Current effective readback'), paragraph(`Current effective state is unavailable: ${error.message}. The stored operation result is unchanged.`, 'notice'));
+    }
   }
   async function act(context, action) {
     if (!currentOperation(context)) return;

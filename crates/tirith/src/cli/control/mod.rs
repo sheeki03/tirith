@@ -96,7 +96,7 @@ impl Service {
         let (status, result) = api::dispatch(self, &request);
         let bytes = serde_json::to_vec(&result)
             .unwrap_or_else(|_| b"{\"error\":\"response encoding failed\"}".to_vec());
-        if bytes.len() > 512 * 1024 {
+        if bytes.len() > http::MAX_RESPONSE {
             let _ = http::respond(
                 &mut stream,
                 413,

@@ -1,6 +1,171 @@
 # Implementation verification
 
-## September 22: passing CI and integrated npm review route
+## September 28: combined controls and remaining native checks
+
+The combined browser candidate
+`d57b2fe07410182708f6b20e86ec5ad9127e3ac41478275f28ae62d959e74893`
+passes all 24 recorded full-journey checks and eight response-order/ownership
+checks. Both runs use the embedded assets, report no browser errors, retain
+unchanged binary/harness identities and verify owned-service cleanup. The
+large-policy journey exercises 3,600-rule compound omission and 5,500-rule
+inventory omission through the actual service. Wide and narrow layouts remain
+usable; the corrected socket delivers the complete response.
+
+Complete-crate HTTP tests pass all five cases. The initial workspace run passes
+2,112 main CLI tests (four ignored) and subsequent integration selections, then
+stops at the frozen reader test because default local-only policy JSON acquired
+a new field. The product correction preserves that legacy shape; the fixture is
+unchanged. Explicit runtime CLI output and browser reads retain the new controls.
+All four frozen-reader groups and nine profile lifecycle cases then pass, as do
+strict workspace/all-target Clippy and the combined build. A new complete
+workspace/platform run remains required; the earlier interrupted run is not a
+complete pass.
+
+Native ARM capture v16 passes combined typechecking and seven CLI selections:
+7 descriptor, 1 completion-binding, 18 checkpoint, 1 unwind, 20 intent/recovery,
+16 materialization and 8 output-privacy tests. It then receives SIGKILL while
+compiling the core test executable. One OOM kill is observed, with peak cgroup
+memory 5,353,238,528 bytes under the configured 5,368,709,120-byte cap. The
+`max` and `oom` counters remain zero, so the record does not attribute the event
+to that cap specifically. Core policy/npm execution, actual signed-v1 refusal
+and native Clippy were not reached. All 105 owned command records have verified
+cleanup; the exact container is removed, and all 657 frozen inputs and 20 result
+logs rehash successfully. Report SHA-256:
+`4e4858cb28c778c3a42b2cbb22b6d71149c5e4ae34fb7df656e158e03a3dbdd5`.
+These results apply to v16, before the later HTTP and local-only display fixes.
+Remaining native checks are being separated to reduce accumulated compiler
+artifacts; unrelated host containers are not modified.
+
+## September 27: resumed field readback and issue verification
+
+The final field-control review catches an unbounded duplicate of compound
+approval rules and a total response-budget regression. Compound summaries now
+omit values above 16 KiB explicitly. If the complete browser response, including
+diagnostics, still exceeds 512 KiB, only the optional field inventory is omitted;
+legacy policy/provenance remains intact, missing controls stay unavailable, and
+precise profile previews remain usable. Seven field-control tests and the
+aggregate-budget regression pass, followed by strict workspace/all-target Clippy
+and a combined build. The new browser fixture uses actual organization policies
+with 3,600 and 5,500 approval rules. The first combined-source browser run
+passes the compound display case, then finds a truncated 5,500-rule response on
+macOS: the accepted socket inherits nonblocking mode and a filled send buffer
+terminates the write. The failure and successful owned-service cleanup are
+retained. Six delayed-response cases separately pass on the same binary
+`b6dfd9c6be03b868d5092709decdf3af409491f3e9ecbed16b44e250fe7146a3`.
+The blocking-socket correction preserves both three-second production deadlines.
+A standalone native harness using the exact transport module fails two cases
+before the correction and passes all five afterward, including a 4 KiB send
+buffer, delayed reader, complete 512 KiB response and partial-request 408s.
+That harness stubs the unrelated authentication sibling; complete-crate and
+browser checks remain separate. Independent source review finds no further
+product defect. The optional menu also passes an actual PTY category/back/quit smoke
+check with exit zero; that smoke does not execute the selected inspection commands.
+
+
+The September 22 follow-up's strict workspace/all-target Clippy and development
+build both finish successfully. The corrected POSIX npm metadata test also
+passes on macOS. These local results do not establish the Windows regression
+fix; a new Windows CI run remains required.
+
+The retained v13 native ARM check passes combined test typechecking and five
+focused groups (7, 1, 18, 1 and 20 passing tests). The materialization group then
+reports 14 passed and two failed: the previously identified test helper reads
+the wrong state root. The driver stops there, so later privacy, core, signed-v1
+refusal and Clippy selections were not attempted. All 90 owned Docker command
+records have clean termination; exact container removal and absence, plus final
+source/tool hashes, are verified. Peak cgroup memory is 4,941,623,296 bytes under
+the 5 GiB cap, with zero `max`, `oom` and `oom_kill` events. Retained report SHA:
+`9051f34648979730f34f46ab0514436bcb70b37c6bc06aed1aacd976b080369d`.
+
+Final source review finds that approval rules and Strict's action overrides
+appear in profile previews but are absent from the field-level effective
+readback inventory. The inventory now includes every current profile definition
+field, and the browser displays unavailable fields explicitly rather than
+silently omitting them. All six field-control unit tests and nine profile
+lifecycle tests pass. The complete browser journey passes 23 recorded checks
+on debug binary
+`051aef692e193515b1b27d114e8559eb1f111ae83a2a13ddf61d2ef417fad151`.
+This includes every profile field's readback, managed-control refusal,
+repository constraints, redacted paths, apply/undo and narrow layout. The first
+actual browser attempt finds narrow-screen overflow; responsive field rows and
+path wrapping correct it, and wide/narrow screenshots are inspected. Six
+delayed-response cases separately pass on the preceding binary
+`930a52598c19eb1c981c2fbebc4428c31cf897fc763db748113ff2e735a1ceef`,
+including late apply readback after undo. Both runs verify owned service cleanup.
+These binaries precede the two subsequently integrated issue fixes below.
+
+Issue #265 is fixed by applying the private capture mask in the existing pinned
+shell child. A save/restore implementation first fails a real fish Ctrl-C probe;
+the child implementation preserves both incoming `027` and `777` in fish and
+its next child. All 153 native privacy/permission cases pass on fish 4.8.1,
+Bash 3.2/5.3.15 and Zsh 5.9, covering startup, command and paste paths, failed
+helpers and ordinary child file/directory modes. Capture files remain `0600`.
+These fixtures use inert command endpoints; they do not establish interception
+or receipt authority. Source and embedded hook copies match.
+
+Issue #266 uses one discovery predicate for resolution and snapshot rechecks.
+Directory-shaped lookups need bounded listing evidence; permission errors,
+inconclusive listings and genuine invalid policies remain conservative. Case,
+Unicode and ignorable-character aliases are retained. Windows keeps its prior
+directory behavior because enumeration cannot disprove arbitrary NTFS 8.3
+alternate names. All 405 policy-selected core tests pass, including 15 new
+discovery, alias, revalidation and failure cases; the integrated four source
+files match the tested scratch bytes except a subsequent octal spelling fix
+required by Clippy in a test permission literal. Test log SHA-256:
+`fba0cd3804aedd4cdc22707873587f28a18d7315ccaba17c26a0d81a0875cffa`.
+Independent review finds no remaining blocking defect in this Unix fix.
+The virtual-stat seam models kio-fuse; a native KDE mount was not available.
+
+The refreshed September 27 published feed has digest
+`47b867e2b686ce68d38402622fcd27fc54854115743b860a8bc1799c8db48112`.
+Its embedded signature and manifest signature verify against the production
+key, but it remains format 1. The release lists no format-2 asset or index.
+This separate signature check does not claim execution of the Rust parser;
+that negative admission test remains part of the next native run.
+
+## September 22: integrated checks and policy-control follow-up
+
+The complete local macOS workspace at `2cde4cee` passes. Its main CLI harness
+reports 2,095 passed and four ignored tests; core reports 6,159 passed and two
+ignored. All other harness results also pass. Retained log SHA-256:
+`8e5d9446cb33552e2d685aa9534b2dbca11e4de138cfe5ab2d7dc1c73d1bc485`.
+These results precede the later policy controls, terminal menu and Linux unwind
+follow-up; they do not qualify those changes.
+
+The same pushed commit passes release-build workflow 35696913620, native ARM
+containment 35696913329, fuzz 35696913341 and benchmarks 35696913327.
+[CI 35696913332](https://github.com/sheeki03/tirith/actions/runs/35696913332)
+passes macOS, Bash 5.3, installer and workflow checks but fails Clippy and the
+Linux, Windows and Rust 1.83 workspace jobs. Three lint corrections are prepared.
+Both Linux variants fail two legacy materialization tests whose byte-comparison
+helper reads the setup-lock root instead of XDG state. Windows fails a pure npm
+metadata test because a native path join inserts backslashes into a POSIX lock
+key. Corrections retain both tests and their original assertions. The nine
+Windows standard-account dashboard cases and their cleanup pass; the workspace
+failure skips subsequent PowerShell qualification. New CI remains required.
+
+The native integrated ARM v11 attempt ends with SIGKILL during the combined test
+typecheck. No historical memory counters were retained, so the cause is unknown.
+The v12 attempt passes the combined typecheck, then encounters a host log-name
+collision after the first test command returns zero. Its actual test output was
+not retained, so no test count is accepted. Cgroup `max`, `oom` and `oom_kill`
+counters remain zero. Both attempts preserve failures and pass owned-command
+cleanup, exact container removal and input posthash checks. The corrected driver
+uses distinct command-transcript and test-result names and records invocation,
+completion and retained output separately. These checks do not authorize npm
+execution or replace the required signed format-2 threat feed.
+
+The follow-up adds shared per-field policy authority and current source displays,
+explicit managed personal controls, and effective readback after browser apply
+and undo. Repository constraints remain distinct from organization/remote
+replacement. An optional `tirith menu` routes to existing typed inspections and
+previews. Seven menu tests, two human status-path privacy tests and all nine
+profile lifecycle tests pass locally. The latter includes CLI projection parity
+and read-only previews. At that checkpoint browser journeys and final lint/build checks were pending;
+the September 27 results above supersede that status without closing final WP14
+release acceptance.
+
+## September 22: earlier CI and integrated npm review route
 
 Commit `87c0fdeecdbaf4c1bc3df6533b83b947e7e88819` passes
 [CI 35587858181](https://github.com/sheeki03/tirith/actions/runs/35587858181),

@@ -170,6 +170,9 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
     match result {
         Ok(mut value) => {
             merge_diagnostics(&mut value, diagnostics, &compiled);
+            if request.method == "GET" && request.target == "/api/policy" {
+                bound_policy_control_inventory(&mut value);
+            }
             (200, value)
         }
         Err(error) => (
@@ -177,6 +180,16 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
             json!({"error": tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &compiled),
             "diagnostics": diagnostics, "refresh_required": true}),
         ),
+    }
+}
+
+fn bound_policy_control_inventory(value: &mut Value) {
+    if serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() > http::MAX_RESPONSE) {
+        if let Some(object) = value.as_object_mut() {
+            if object.remove("personal_controls").is_some() {
+                object.insert("personal_controls_omitted".into(), true.into());
+            }
+        }
     }
 }
 
@@ -832,6 +845,40 @@ fn admission<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_policy_control_inventory_preserves_policy_and_diagnostics() {
+        let mut value = json!({"policy":{"allowlist":["x".repeat(450 * 1024)]},
+            "resolution":{"policy_posture_sha256":"captured"},
+            "personal_controls":{"strict_warn":{"effective_value":false,"reason":"y".repeat(80 * 1024)}}});
+        let compiled = CompiledCustomPatterns::new_silent(&[]);
+        merge_diagnostics(&mut value, vec!["captured diagnostic".into()], &compiled);
+        let mut expected = value.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("personal_controls");
+        bound_policy_control_inventory(&mut value);
+        assert_eq!(value["personal_controls_omitted"], true);
+        assert!(value.get("personal_controls").is_none());
+        assert!(serde_json::to_vec(&value).unwrap().len() <= http::MAX_RESPONSE);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("personal_controls_omitted");
+        assert_eq!(value, expected);
+
+        let mut small =
+            json!({"policy":{},"personal_controls":{"strict_warn":{"effective_value":false}}});
+        let expected = small.clone();
+        bound_policy_control_inventory(&mut small);
+        assert_eq!(small, expected);
+
+        let mut too_large =
+            json!({"policy":{"allowlist":["x".repeat(http::MAX_RESPONSE)]},"personal_controls":{}});
+        bound_policy_control_inventory(&mut too_large);
+        assert!(serde_json::to_vec(&too_large).unwrap().len() > http::MAX_RESPONSE);
+    }
 
     #[test]
     fn dispatch_preserves_route_diagnostics_and_bounds_combined_output() {

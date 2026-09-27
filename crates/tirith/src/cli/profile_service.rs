@@ -137,6 +137,7 @@ impl PreparedProfile {
     }
 
     pub fn projection(&self) -> serde_json::Value {
+        let controls = super::policy::PersonalControlDisplay::new(&self.snapshot, &self.compiled);
         let changes: Vec<_> = self
             .preview
             .changes
@@ -154,7 +155,8 @@ impl PreparedProfile {
                     value
                 };
                 serde_json::json!({"field": change.field, "operation": change.operation,
-                "before": display(&self.original), "after": display(self.preview.document())})
+                "before": display(&self.original), "after": display(self.preview.document()),
+                "control":controls.field(&change.field)})
             })
             .collect();
         let definition = self.preview.selection.as_ref().and_then(|selection| {
@@ -652,6 +654,7 @@ impl PreparedSetting {
         tirith_core::redact::redact_json_strings(&mut effective, &self.base.compiled);
         serde_json::json!({"schema_version":1,"kind":"personal_setting_preview", "applied":false,
             "scope":"user", "field":self.field, "before":before, "after":self.after,
+            "control":super::policy::PersonalControlDisplay::new(&self.base.snapshot,&self.base.compiled).field(&self.field),
             "effective_before":effective,"effective_after":"requires_apply_and_fresh_readback",
             "target":tirith_core::redact::redact_sanitize_redact_with_compiled(&self.base.path.display().to_string(),&self.base.compiled),
             "policy_identity":self.base.snapshot.identity, "profile_owns_this_setting_after":false,

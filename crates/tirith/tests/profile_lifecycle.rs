@@ -248,6 +248,83 @@ fn explicit_equal_profile_setting_survives_later_profile_reset() {
 }
 
 #[test]
+fn preview_controls_match_effective_snapshot_without_writing_policy() {
+    let mut state = state();
+    let org_root = state.roots().policy.clone();
+    state.set_env("TIRITH_POLICY_ROOT", &org_root);
+    let org = org_root.join(".tirith");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(org.join("policy.yaml"), "paranoia: 2\n").unwrap();
+    let personal = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    let effective = success(run(&state, &["policy", "effective", "--runtime", "--json"]));
+    let setting = success(run(
+        &state,
+        &[
+            "policy",
+            "setting",
+            "strict_warn",
+            "true",
+            "--dry-run",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        setting["control"],
+        effective["personal_controls"]["strict_warn"]
+    );
+    assert_eq!(setting["control"]["effective_source"]["kind"], "default");
+    assert_eq!(
+        setting["control"]["personal_authority"]["state"],
+        "overridden"
+    );
+    assert_eq!(
+        setting["effective_after"],
+        "requires_apply_and_fresh_readback"
+    );
+    let profile = success(run(
+        &state,
+        &["policy", "profile", "strict", "--dry-run", "--json"],
+    ));
+    for change in profile["field_changes"].as_array().unwrap() {
+        let field = change["field"].as_str().unwrap();
+        assert_eq!(change["control"]["field"], field);
+        assert_eq!(
+            change["control"]["personal_authority"]["state"],
+            "overridden"
+        );
+        let control = effective["personal_controls"]
+            .get(field)
+            .expect("each changed profile field needs effective readback");
+        assert_eq!(&change["control"], control);
+    }
+    assert!(
+        !personal.exists(),
+        "display previews must not write personal policy"
+    );
+    let unset = success(run(
+        &state,
+        &[
+            "policy",
+            "setting",
+            "rule_severity",
+            "HIGH",
+            "--rule",
+            "curl_pipe_shell",
+            "--dry-run",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        unset["control"],
+        effective["personal_controls"]["severity_overrides.curl_pipe_shell"]
+    );
+    assert!(unset["control"]["effective_value"].is_null());
+    assert_eq!(unset["control"]["effective_source"]["kind"], "not_set");
+}
+
+#[test]
 fn personal_setting_undo_preserves_unrelated_changes_and_typed_limits() {
     let state = state();
     let path = tirith_core::policy::config_dir()

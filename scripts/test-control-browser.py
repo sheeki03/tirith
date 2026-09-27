@@ -358,6 +358,9 @@ def run(binary, output):
             env[key] = str(directory)
         env.update({"TIRITH_OFFLINE": "1", "TIRITH_THREATDB_PATH": str(root / "missing-db"),
                     "TIRITH_THREATDB_SUPPLEMENTAL_PATH": str(root / "missing-supplemental")})
+        managed_root = root / "FIELD_PRIVATE"
+        managed_root.mkdir()
+        env["TIRITH_POLICY_ROOT"] = str(managed_root)
         project = root / "project"
         (project / ".git").mkdir(parents=True)
         manifest = project / "package.json"
@@ -483,7 +486,41 @@ def run(binary, output):
                     page.get_by_role("heading", name="Recent friction review", exact=True).wait_for()
                     page.get_by_role("button", name="Close change details").click()
                     report["checks"].append("bounded_tuning_review_loads_without_mutating_policy")
+                    large_org_policy = managed_root / ".tirith/policy.yaml"
+                    large_org_policy.parent.mkdir(exist_ok=True)
+                    approvals = [{"rule_ids":["credential_in_command"], "timeout_secs":30,
+                                  "fallback":"block"}] * 3600
+                    try:
+                        large_org_policy.write_text("approval_rules: " + json.dumps(approvals) + "\n")
+                        large_policy = request(origin, token, csrf, "/api/policy")
+                        assert len(large_policy["policy"]["approval_rules"]) == 3600
+                        compound = large_policy["personal_controls"]["approval_rules"]
+                        assert compound["effective_value_omitted"] is True and compound["effective_value"] is None
+                        page.get_by_role("button", name="Protection", exact=True).click()
+                        page.locator('#content[aria-busy="false"]').wait_for()
+                        assert not page.get_by_text("This view could not be refreshed.", exact=False).count()
+                        page.get_by_role("button", name="Compare and review").nth(1).click()
+                        page.get_by_text("Value too large to display here", exact=True).wait_for()
+                        page.get_by_role("button", name="Close change details").click()
+                        large_org_policy.write_text("approval_rules: " + json.dumps(approvals[:1] * 5500) + "\n")
+                        large_policy = request(origin, token, csrf, "/api/policy")
+                        assert len(large_policy["policy"]["approval_rules"]) == 5500
+                        assert large_policy["personal_controls_omitted"] is True
+                        assert "personal_controls" not in large_policy
+                        page.get_by_role("button", name="Protection", exact=True).click()
+                        page.locator('#content[aria-busy="false"]').wait_for()
+                        page.get_by_text("Field summaries are unavailable because this policy response is large.", exact=False).wait_for()
+                        assert page.get_by_label("Personal value", exact=True).is_disabled()
+                        assert page.get_by_role("button", name="Compare personal change", exact=True).is_disabled()
+                    finally:
+                        large_org_policy.unlink()
+                    report["checks"].append("large_approval_policy_retains_full_details_with_explicit_bounded_field_summary")
+                    page.get_by_role("button", name="Protection", exact=True).click()
+                    page.locator('#content[aria-busy="false"]').wait_for()
                     page.get_by_role("button", name="Compare and review").nth(1).click()
+                    page.get_by_role("columnheader", name="Effective now and source", exact=True).wait_for()
+                    assert page.locator("#operation-content .policy-field-control").count() > 0
+                    assert "effective result remains unverified" in page.locator("#operation-content").inner_text()
                     page.get_by_role("button", name="Create change plan", exact=True).click()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
                     assert "protection_profile" not in policy.read_text()
@@ -492,12 +529,74 @@ def run(binary, output):
                     assert "balanced" in policy.read_text()
                     assert not (config / "policy.yaml").exists()
                     assert "preserve-browser-fixture" in policy.read_text()
+                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
+                    page.get_by_role("heading", name="approval_rules", exact=True).wait_for()
                     page.screenshot(path=str(output / "profile-completed.png"), full_page=True)
                     page.get_by_role("button", name="Undo owned change", exact=True).click()
                     page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=40000)
                     assert "protection_profile" not in policy.read_text()
+                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
                     report["checks"].append("profile_preview_apply_readback_undo_preserves_yml")
                     page.get_by_role("button", name="Close change details").click()
+                    page.get_by_role("button", name="Protection", exact=True).click()
+                    page.locator('#content[aria-busy="false"]').wait_for()
+                    page.get_by_label("Setting", exact=True).select_option("strict_warn")
+                    assert page.get_by_label("Personal value", exact=True).is_enabled()
+                    page.get_by_label("Personal value", exact=True).select_option("true")
+                    page.get_by_role("button", name="Compare personal change", exact=True).click()
+                    page.get_by_role("heading", name="Review personal setting", exact=True).wait_for()
+                    page.get_by_role("button", name="Create change plan", exact=True).click()
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
+                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
+                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
+                    readback = page.locator("#operation-content section").filter(has=page.get_by_role("heading", name="Current effective readback", exact=True))
+                    assert readback.get_by_role("heading", name="strict_warn", exact=True).count() == 1
+                    assert readback.get_by_text("true", exact=True).count() == 1
+                    page.get_by_role("button", name="Undo owned change", exact=True).click()
+                    page.locator("#operation-content > .badge").filter(has_text="undone").wait_for(timeout=40000)
+                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
+                    assert readback.get_by_text("false", exact=True).count() == 1
+                    page.get_by_role("button", name="Close change details").click()
+                    report["checks"].append("personal_setting_preview_apply_and_undo_show_fresh_effective_values")
+
+                    # Real resolver fixtures: repository tightening is a
+                    # constraint, while a selected organization replaces the
+                    # personal authority even for an omitted scalar field.
+                    repo_policy = project / ".tirith/policy.yaml"
+                    repo_policy.parent.mkdir(exist_ok=True)
+                    repo_policy.write_text("strict_warn: true\n")
+                    page.get_by_role("button", name="Protection", exact=True).click()
+                    page.locator('#content[aria-busy="false"]').wait_for()
+                    assert page.get_by_label("Personal value", exact=True).is_enabled()
+                    assert "Repository policy" in page.locator("#content .policy-field-control").inner_text()
+                    repo_policy.unlink()
+                    org_policy = managed_root / ".tirith/policy.yaml"
+                    org_policy.parent.mkdir(exist_ok=True)
+                    org_policy.write_text("paranoia: 2\ndlp_custom_patterns: [FIELD_PRIVATE]\n")
+                    page.get_by_role("button", name="Protection", exact=True).click()
+                    page.locator('#content[aria-busy="false"]').wait_for()
+                    assert page.get_by_label("Personal value", exact=True).is_disabled()
+                    assert page.get_by_role("button", name="Compare personal change", exact=True).is_disabled()
+                    control_text = page.locator("#content .policy-field-control").inner_text()
+                    assert "Built-in defaults" in control_text and "Managed by Organization policy" in control_text
+                    assert "FIELD_PRIVATE" not in control_text
+                    page.get_by_label("Setting", exact=True).select_option("rule_severity")
+                    page.get_by_label("Rule to customize", exact=True).fill("curl_pipe_shell")
+                    assert page.get_by_label("Personal value", exact=True).is_disabled()
+                    assert "No policy override" in page.locator("#content .policy-field-control").inner_text()
+                    page.get_by_role("button", name="Compare and review", exact=True).nth(2).click()
+                    page.get_by_role("heading", name="Review personal profile", exact=True).wait_for()
+                    assert page.get_by_role("button", name="Create change plan", exact=True).is_disabled()
+                    assert "FIELD_PRIVATE" not in page.locator("#operation-content").inner_text()
+                    page.screenshot(path=str(output / "managed-profile-wide.png"), full_page=True)
+                    page.set_viewport_size({"width":390, "height":844})
+                    page.screenshot(path=str(output / "managed-profile-narrow.png"), full_page=True)
+                    dimensions = page.evaluate("({width:innerWidth, document:document.documentElement.scrollWidth})")
+                    assert dimensions["document"] <= dimensions["width"], f"managed profile overflows narrow viewport: {dimensions}"
+                    page.set_viewport_size({"width":1440, "height":1050})
+                    page.get_by_role("button", name="Close change details").click()
+                    org_policy.unlink()
+                    report["checks"].append("field_authority_distinguishes_repository_constraints_and_redacted_managed_locks")
                     page.get_by_role("button", name="Exceptions", exact=True).click()
                     page.get_by_label("Exact target", exact=True).fill("https://fixture.example/install.sh")
                     page.get_by_label("Rule ID", exact=True).fill("curl_pipe_shell")
@@ -819,6 +918,22 @@ def run_response_order(binary, output, app_js=None):
                     page.evaluate("window.__orderObserver.disconnect()")
                     undo()
                     report["checks"].append("older_same_id_planned_status_cannot_replace_apply_result")
+
+                    readback_id = profile("balanced")
+                    delay("old-effective-readback", "/api/policy")
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
+                    delayed("old-effective-readback")
+                    page.get_by_role("button", name="Undo owned change", exact=True).click()
+                    page.locator("#operation-content > .badge").filter(has_text="undone").wait_for(timeout=40000)
+                    page.get_by_text("These are the resolver’s current values.", exact=False).wait_for()
+                    assert stored()["operation_id"] == readback_id
+                    current_readback = page.locator("#operation-content").inner_text()
+                    current_notice = page.locator("#notice").inner_text()
+                    release("old-effective-readback")
+                    assert page.locator("#operation-content").inner_text() == current_readback
+                    assert page.locator("#notice").inner_text() == current_notice
+                    close()
+                    report["checks"].append("late_apply_readback_cannot_replace_fresh_undo_policy_or_diagnostics")
 
                     navigate("Protection")
                     page.get_by_label("Representative commands, one per line", exact=True).fill("echo reviewed-only")

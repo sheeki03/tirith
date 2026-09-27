@@ -160,7 +160,8 @@ impl StatusResult {
                 "NOT configured"
             }
         );
-        match (&quick.policy_path_used, &self.snapshot.scope) {
+        let policy_path = quick.policy_path_used.as_deref().map(human_policy_path);
+        match (&policy_path, &self.snapshot.scope) {
             (Some(p), Some(s)) => println!("  policy:      {p} (scope: {s})"),
             (Some(p), None) => println!("  policy:      {p}"),
             (None, _) => println!("  policy:      (none found)"),
@@ -190,6 +191,15 @@ impl StatusResult {
             eprintln!("tirith: verified blocking requirement not satisfied for current-shell; configuration and inherited environment are insufficient evidence");
         }
     }
+}
+
+/// Keep the typed status path intact; only the human terminal projection needs
+/// escaping/redaction. Reuse any DLP plan already frozen by the caller without
+/// adding policy resolution or network activity to this cheap status command.
+fn human_policy_path(path: &str) -> String {
+    let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&patterns);
+    tirith_core::output::sanitize_human_field_with_compiled(path, &compiled)
 }
 
 /// Build the `status --json` envelope. A pure seam (no env, no I/O) so the
@@ -262,6 +272,36 @@ fn health_reason(h: ProtectionHealth) -> &'static str {
 mod tests {
     use super::*;
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+
+    #[test]
+    fn human_policy_path_neutralizes_terminal_controls_and_row_forgery() {
+        let display = human_policy_path(
+            "/repo/\x1b[2J\x1b]8;;https://example.com\x07label\x1b]8;;\x07\u{202e}\n  protection: guarded\t/policy.yaml",
+        );
+        assert!(!display.chars().any(char::is_control));
+        assert!(!display.contains('\u{202e}'));
+        assert!(display.contains("\\n"));
+        assert!(display.ends_with("/policy.yaml"));
+        assert_eq!(
+            human_policy_path("/repo/.tirith/policy.yaml"),
+            "/repo/.tirith/policy.yaml"
+        );
+    }
+
+    #[test]
+    fn human_policy_path_reuses_frozen_dlp_after_escape_removal() {
+        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(&["private-project".into()]);
+        for path in [
+            "/private-project/policy.yaml",
+            "/private-\x1b[0mproject/policy.yaml",
+        ] {
+            let display = human_policy_path(path);
+            assert!(!display.contains("private-project"));
+            assert!(!display.contains('\x1b'));
+            assert!(display.ends_with("/policy.yaml"));
+        }
+    }
 
     #[test]
     fn canonical_strict_exit_never_accepts_configuration_as_observation() {

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 const COMMANDS_BY_CATEGORY: &str = "\
 COMMANDS BY CATEGORY:
   Scan & Analyze:   check paste run score diff fetch fix scan review view preview watch temp-run capsule taint intend task lab explain why visual-audit
-  Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
+  Status & Health:  status doctor prompt-status dashboard menu warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
@@ -226,6 +226,23 @@ enum ExecutionReceiptAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open an optional terminal menu for inspections and change previews
+    #[command(after_help = "\
+Requires terminal input and output. Choose protection, profiles, activity,
+exceptions, integrations, or maintenance, then select one inspection or preview.
+The selected direct command runs once with its usual output and exit status.
+The menu does not apply changes; each page links to explicit CLI workflows.
+Enter q or use Ctrl-C to quit; EOF cancels. No browser or extra runtime is needed.
+
+For scripts, CI, redirected input/output, and machine-readable results, use the
+direct commands instead. Start the menu explicitly with tirith menu.
+
+Examples:
+  tirith menu
+  tirith status --json
+  tirith audit recent --limit 25 --action block --json")]
+    Menu,
+
     /// Explicit read-only review of selected dependency, hook, AI and MCP files
     Review {
         /// Replace known-surface discovery with project-relative files
@@ -8200,7 +8217,23 @@ fn run() {
     cli::init_quiet(cli.quiet);
     cli::audit_health::install_sink();
 
-    let exit_code = match cli.command {
+    let command = match cli.command {
+        Commands::Menu => match cli::menu::select_command() {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!(
+                    "tirith menu: {}",
+                    cli::sanitize_for_human_output(&error.to_string(), false)
+                );
+                std::process::exit(2);
+            }
+        },
+        command => command,
+    };
+    let exit_code = match command {
+        // The menu returns only the closed set of direct inspection actions.
+        Commands::Menu => unreachable!("menu selection cannot select the menu itself"),
         Commands::Review { paths, json } => cli::project_review::run(paths, json),
         Commands::ShellVerificationInternal {
             action,
