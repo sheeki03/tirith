@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "review": "Pending independent review of the exact e282d038 ports and docs-only controller. Thresholds were separately approved in threshold-review.json. Do not dispatch this draft.",
+  "cohort": "native-macos15-m1-virtual-e282d038-growth-v1",
+  "base_revision": "e282d038519848caa8328cf32aa05a05daa502d2",
+  "base_tree": "71c7f346aefa9de9044c3b358252ab0cfc03dae1",
+  "budget_path": "docs/next-cycle/resource-reference/native-e282d038-v1/budget.json",
+  "budget_sha256": "126fb77191e6c5446df89dec1c86388cf31d97fbf6a63fd3b83f64676be86651",
+  "checker_sha256": "c409c5eb9fec640ecb79f26b6dd82320ac8265103705aca1f1d6131489f9f436",
+  "python_runtime": {
+    "version": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]",
+    "sha256": "d8f1d508de5acfd500f20d1949528375ff4a1f470efb267f00d1770941cdeee3"
+  },
+  "experiments": {
+    "clean_first": {
+      "control": {
+        "revision": "956c9d7e72db1fa9cde000839d0b2cc8dcf6e2c5",
+        "tree": "330d9e78b88ab496bdd455d28835dc7cc0e42423",
+        "source_sha256": "c115a48bad1759022ddacaa71712c1ec04050eee9e81c97c1eee024ffbb216b5"
+      },
+      "growth": {
+        "revision": "645a69fbc06b33fb7fb7998f2ea82ceaecabbab0",
+        "tree": "c1129d3c2381e8d990ff3b46d5b0c67faecfa220",
+        "source_sha256": "7ce79b1af2c3a72cb3e5131f7994be94b8ed9cbd68574a830a4b155dd505c469"
+      }
+    },
+    "clean_subsequent": {
+      "control": {
+        "revision": "080cc54c948759d4932d359efa4d2ee5027014dd",
+        "tree": "a3038f314a561ec2e382ba771df24e7b30932957",
+        "source_sha256": "07648f45d30d885000f4856c7c24727f7e9bbda7b1a482feea5e39f80eac6368"
+      },
+      "growth": {
+        "revision": "c6778bc89a3dfebdc0a30332ba25952a38f6c92c",
+        "tree": "fe61b64829178a29a21396773739b58a8dc56752",
+        "source_sha256": "a5e41d982143af5210b7ebe0e96dfdcef28101a78024642694c899052b2588a5"
+      }
+    },
+    "url_first": {
+      "control": {
+        "revision": "62ba7996b1fff1531a122a48d2162f04eeb954fa",
+        "tree": "1d24682e1287a65917983c4c8778a1b3e6f725fb",
+        "source_sha256": "fea0ea6468ef31792753c1c8d93bfec5df2804598c6b2c63161fc9eb473572d4"
+      },
+      "growth": {
+        "revision": "1a6e993553b77f0c8d9793b2075c4f6a1359a0d6",
+        "tree": "e5e44d6dd56d60c9c6ac6ddff30b110febfa6369",
+        "source_sha256": "fa6fcd3b1f96083d6e948700533403adef1548162bed2928e2a78050d57886e5"
+      }
+    },
+    "url_subsequent": {
+      "control": {
+        "revision": "c370412f45b841c6be607422fe6f610437cc3da7",
+        "tree": "f7944d7908c562adab700427ca271bb2846575e7",
+        "source_sha256": "a2b94786ba88bfb548cfdda1fa208ccdb745d5f543e4d6047f0d2f8c73643631"
+      },
+      "growth": {
+        "revision": "aedaa896bce0946ac2ebeeb550f9163501dbed87",
+        "tree": "ff4593746105bde5a94c6c6d174687ea8ce3b8d7",
+        "source_sha256": "f65af98467f3093670a12f8b3e3a2a8b3934d06782f0b59c0da3351c4b69eb91"
+      }
+    },
+    "history_requests": {
+      "control": {
+        "revision": "5e53dcd32bc8ff84207043bc0387818c818ced93",
+        "tree": "ee1c851ab4e65d715f209157c145f0e8fc1c2975",
+        "source_sha256": "6e4e6b11070001206657fd77aa8d124192c0ecd38d9fbcd3e57da7d08d64cf2d"
+      },
+      "growth": {
+        "revision": "c846862bb9ec79bc6398e21ccbb826697d356310",
+        "tree": "ac92c6b0bffab90f95b03c5e46065d48cd7852e5",
+        "source_sha256": "512d4f092bc306e04edc3b1801b090b2c73951b13f6e127dd2c2a5dd85c1ffd5"
+      }
+    },
+    "ordinary_rss": {
+      "control": {
+        "revision": "bc2caf413222f2d619e540f395876e1f86e50d2d",
+        "tree": "38d6c50a90df698db214942f740d7524156f211e",
+        "source_sha256": "a3e3c68afc384c530c72764d517ef962552b7b65bf5bf096399f1626ebe5e216"
+      },
+      "growth": {
+        "revision": "d69247f74a3c107b639e03bbff5c6a48e3af6646",
+        "tree": "bc3c6fd2ce3b8fd26358e7abd6d577b9da0483a2",
+        "source_sha256": "4978dff7baafd266cce719aa1e695f1704b9b0dca0cd8f7dd826b00182c62c6b"
+      }
+    }
+  }
+}
