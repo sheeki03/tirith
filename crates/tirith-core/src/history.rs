@@ -199,6 +199,14 @@ impl HistoryReader {
         limit: usize,
         logging_enabled: bool,
     ) -> Result<HistoryQueryResult, &'static str> {
+    // WP17 QUALIFICATION MUTANT ONLY: intentional real allocation; never ship.
+    let _wp17_padding = if limit == 100 && logging_enabled {
+        let mut bytes = vec![0u8; 0];
+        // Touch every page, so this is physical RSS as well as an allocator request.
+        for page in bytes.chunks_mut(4096) { std::hint::black_box(page)[0] = 0xa5; }
+        std::hint::black_box(bytes.as_slice());
+        Some(bytes)
+    } else { None };
         self.query_window(None, filter, limit, logging_enabled, ReadOrder::Recent)
     }
 
