@@ -229,7 +229,7 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     // `Path::exists` follows the final symlink and therefore treats a dangling
     // named policy as absent. Retain the directory entry so the scoped loader
     // can diagnose it and fail closed instead of silently using defaults.
-    let yaml_exists = std::fs::symlink_metadata(&yaml).is_ok();
+    let yaml_exists = crate::policy_discovery::entry_exists(&yaml, false);
     snapshot::observe_discovery(&yaml, false, yaml_exists);
     if yaml_exists && !snapshot::is_capturing() {
         return Some(yaml);
@@ -239,7 +239,7 @@ fn find_policy_in_dir(dir: &Path) -> Option<PathBuf> {
     // discovery witness from a multi-step operation's external-input guard.
     // This observes only entry presence; an unselected document is not read.
     let yml = dir.join("policy.yml");
-    let yml_exists = std::fs::symlink_metadata(&yml).is_ok();
+    let yml_exists = crate::policy_discovery::entry_exists(&yml, false);
     snapshot::observe_discovery(&yml, false, yml_exists);
     if yaml_exists {
         return Some(yaml);
@@ -3490,7 +3490,7 @@ impl Policy {
             let org_dir = repo_root.join(".tirith");
             // F9 — repo allowlist (suppression) is intentionally NOT loaded.
             let allowlist_path = org_dir.join("allowlist");
-            let allowlist_exists = allowlist_path.exists();
+            let allowlist_exists = crate::policy_discovery::entry_exists(&allowlist_path, true);
             snapshot::observe_discovery(&allowlist_path, true, allowlist_exists);
             if allowlist_exists {
                 snapshot::observe_neutralized(
@@ -4045,9 +4045,10 @@ fn discover_policy_path(cwd: Option<&str>) -> Option<PathBuf> {
             return Some(candidate);
         }
 
-        // `.git` may be a dir or a file (worktrees); `.exists()` handles both.
+        // `.git` may be a directory or a worktree file. Directory-shaped
+        // lookups must name real entries, not virtual filesystem phantoms.
         let git_dir = current.join(".git");
-        let git_exists = git_dir.exists();
+        let git_exists = crate::policy_discovery::entry_exists(&git_dir, true);
         snapshot::observe_discovery(&git_dir, true, git_exists);
         if git_exists {
             return None;
@@ -4116,7 +4117,7 @@ pub fn find_repo_root(cwd: Option<&str>) -> Option<PathBuf> {
     let mut current = start.as_path();
     loop {
         let git = current.join(".git");
-        let git_exists = git.exists();
+        let git_exists = crate::policy_discovery::entry_exists(&git, true);
         snapshot::observe_discovery(&git, true, git_exists);
         if git_exists {
             return Some(current.to_path_buf());
@@ -5592,6 +5593,167 @@ custom_rules:
             policy.task_gate.effects_denied_for_untrusted_sources,
             every_effect
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn phantom_directory_discovery_preserves_user_policy_and_snapshot() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        state.after_restore(crate::incident::invalidate_cache);
+        crate::incident::invalidate_cache();
+        let config = config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let user_policy = config.join("policy.yaml");
+        std::fs::write(&user_policy, "fail_mode: open\n").unwrap();
+        let cwd = &state.roots().cwd;
+
+        std::fs::create_dir(cwd.join("写真")).unwrap();
+        std::fs::write(cwd.join("résumé.txt"), "search result").unwrap();
+        crate::policy_discovery::with_directory_lookups(cwd, || {
+            assert_eq!(find_repo_root(cwd.to_str()), None);
+            assert_eq!(repo_context_labels_path(cwd.to_str()), None);
+            assert_eq!(repo_ssh_host_labels_path(cwd.to_str()), None);
+            assert_eq!(
+                discover_local_policy_path_scoped(cwd.to_str()),
+                Some((user_policy.clone(), PolicyScope::User))
+            );
+            let snapshot = snapshot::EffectivePolicySnapshot::resolve(
+                cwd.to_str(),
+                snapshot::ResolutionMode::Runtime,
+            );
+            assert_eq!(snapshot.policy.scope, PolicyScope::User);
+            assert_eq!(snapshot.policy.path.as_deref(), user_policy.to_str());
+            assert_eq!(snapshot.policy.fail_mode, FailMode::Open);
+            assert!(snapshot.revalidate_inputs().is_ok());
+
+            // A genuine entry appearing after discovery must invalidate the
+            // snapshot, even though stat already claimed it was present.
+            std::fs::create_dir_all(cwd.join(".tirith/policy.yaml")).unwrap();
+            assert!(snapshot.revalidate_inputs().is_err());
+            assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
+        });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn phantom_git_directory_does_not_hide_real_ancestor_policy() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let repo = &state.roots().cwd;
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
+        let policy = repo.join(".tirith/policy.yml");
+        std::fs::write(&policy, "paranoia: 4\n").unwrap();
+        let virtual_dir = repo.join("search-results");
+        std::fs::create_dir(&virtual_dir).unwrap();
+        crate::policy_discovery::with_directory_lookups(&virtual_dir, || {
+            assert_eq!(find_repo_root(virtual_dir.to_str()), Some(repo.clone()));
+            assert_eq!(discover_policy_path(virtual_dir.to_str()), Some(policy));
+            assert_eq!(
+                Policy::discover_local_only(virtual_dir.to_str()).paranoia,
+                4
+            );
+        });
+    }
+
+    #[test]
+    fn real_directory_policy_still_closes_without_a_git_marker() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".tirith/policy.yaml")).unwrap();
+        // The invalid YAML candidate must not fall through to the valid YML.
+        std::fs::write(cwd.join(".tirith/policy.yml"), "fail_mode: open\n").unwrap();
+        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
+    }
+
+    #[test]
+    fn regular_worktree_marker_remains_a_discovery_boundary() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        std::fs::write(cwd.join(".tirith/policy.yaml"), "paranoia: 4\n").unwrap();
+        let worktree = cwd.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../elsewhere\n").unwrap();
+        assert_eq!(find_repo_root(worktree.to_str()), Some(worktree.clone()));
+        assert_eq!(discover_policy_path(worktree.to_str()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_git_marker_does_not_hide_ancestor_policy() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let repo = &state.roots().cwd;
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".tirith")).unwrap();
+        let policy = repo.join(".tirith/policy.yaml");
+        std::fs::write(&policy, "paranoia: 4\n").unwrap();
+        let child = repo.join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::os::unix::fs::symlink(".git", child.join(".git")).unwrap();
+        assert_eq!(find_repo_root(child.to_str()), Some(repo.clone()));
+        assert_eq!(discover_policy_path(child.to_str()), Some(policy));
+    }
+
+    #[test]
+    fn policy_directory_case_alias_still_closes_when_native_lookup_resolves_it() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".tirith/POLICY.YAML")).unwrap();
+        // Exercise real case-insensitive filesystem lookup when supported;
+        // the platform-independent alias matrix is tested in policy_discovery.
+        if cwd.join(".tirith/policy.yaml").is_dir() {
+            assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_policy_symlink_still_closes() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        std::os::unix::fs::symlink("missing", cwd.join(".tirith/policy.yaml")).unwrap();
+        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_policy_still_closes_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        let path =
+            std::ffi::CString::new(cwd.join(".tirith/policy.yaml").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is a valid NUL-terminated path in this test's
+        // isolated directory; mkfifo retains no pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_task_boundaries_fail_closed(&Policy::discover_local_only(cwd.to_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsearchable_policy_directory_still_closes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let cwd = &state.roots().cwd;
+        let policy_dir = cwd.join(".tirith");
+        std::fs::create_dir(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("policy.yaml"), "task_gate: [").unwrap();
+        std::fs::set_permissions(&policy_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let policy = Policy::discover_local_only(cwd.to_str());
+        std::fs::set_permissions(&policy_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Also passes as root, where the malformed bytes remain readable.
+        assert_task_boundaries_fail_closed(&policy);
     }
 
     #[test]

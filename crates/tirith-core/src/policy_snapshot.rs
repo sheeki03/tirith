@@ -711,11 +711,7 @@ impl InputWitness {
                 ReadWitness::from_result(&read_input(path, *reader)) == *expected
             }
             WitnessKind::Discovery(path, follow, existed) => {
-                (if *follow {
-                    path.exists()
-                } else {
-                    std::fs::symlink_metadata(path).is_ok()
-                }) == *existed
+                crate::policy_discovery::entry_exists(path, *follow) == *existed
             }
             WitnessKind::NamedDestination(path, expected) => {
                 *expected != InputState::Unreadable && named_destination_state(path) == *expected

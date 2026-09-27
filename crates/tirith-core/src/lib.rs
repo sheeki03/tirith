@@ -70,6 +70,7 @@ pub mod pending;
 pub mod persistence;
 pub mod policy;
 pub mod policy_client;
+mod policy_discovery;
 mod policy_ignored;
 pub mod policy_migrations;
 pub mod policy_rollout;
