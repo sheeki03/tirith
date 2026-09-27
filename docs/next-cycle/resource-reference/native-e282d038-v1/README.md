@@ -5,9 +5,9 @@ product source `e282d038519848caa8328cf32aa05a05daa502d2`. They do not belong in
 product branch. This controller adds qualification documents only and preserves
 the source workflow, collector, checker, producers, helper and build inputs.
 
-The protocol is a draft pending independent review of these exact ports. The
-collector refuses it before compilation. The threshold review approves only the
-six byte ceilings for isolated detector qualification. No ordinary CI budget is
+Independent review accepted the exact ports, five-file controller and reviewed
+protocol. The threshold review approves only the six byte ceilings for isolated
+detector qualification. No ordinary CI budget is
 active, and no pair is yet qualified by this document.
 
 Three original final-source baselines, runs 36334250350, 36334255054 and
@@ -39,10 +39,9 @@ subsequent means samples 1 through 99. The exact URL command is
 and remain live through the selected analysis or history call. The RSS guard
 keeps its allocation until command return.
 
-After root reviews the exact patches and controller, freeze a separate reviewed
-protocol commit. Push thirteen refs without merging source variants, and dispatch
-the unchanged `bench.yml` once for each of the six experiments at the frozen
-controller ref. Use this tracked protocol path, `collect_pinned_reference=false`
+The separate reviewed protocol commit freezes the accepted inputs. Push thirteen
+refs without merging source variants, and dispatch the unchanged `bench.yml` once
+for each of the six experiments at the frozen controller ref. Use this tracked protocol path, `collect_pinned_reference=false`
 and `resource_samples=100`. Each job measures control then growth on one boot.
 The native job retains its 120-minute timeout and evidence upload on failure.
 There are no automatic retries or source, runtime or cohort substitutions.

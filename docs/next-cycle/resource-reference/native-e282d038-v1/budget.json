@@ -79,42 +79,42 @@
       "unit": "bytes",
       "maximum": 67108864,
       "minimum_samples": 100,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 48307398 bytes, spread 0 bytes and headroom 18801466 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 48307398 bytes, spread 0 bytes and headroom 18801466 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     },
     {
       "metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
       "unit": "bytes",
       "maximum": 131072,
       "minimum_samples": 99,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 120397 bytes, spread 0 bytes and headroom 10675 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 120397 bytes, spread 0 bytes and headroom 10675 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     },
     {
       "metric": "allocation.analysis_url_pipeline.requested_bytes.max",
       "unit": "bytes",
       "maximum": 100663296,
       "minimum_samples": 100,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 72060210 bytes, spread 0 bytes and headroom 28603086 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 72060210 bytes, spread 0 bytes and headroom 28603086 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     },
     {
       "metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
       "unit": "bytes",
       "maximum": 2097152,
       "minimum_samples": 99,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 1670608 bytes, spread 0 bytes and headroom 426544 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 1670608 bytes, spread 0 bytes and headroom 426544 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     },
     {
       "metric": "allocation.history_recent_100.requested_bytes.max",
       "unit": "bytes",
       "maximum": 12582912,
       "minimum_samples": 100,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 8692440 bytes, spread 0 bytes and headroom 3890472 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 8692440 bytes, spread 0 bytes and headroom 3890472 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     },
     {
       "metric": "local.ordinary_check.peak_rss_bytes.max",
       "unit": "bytes",
       "maximum": 50331648,
       "minimum_samples": 100,
-      "rationale": "Root independently rehashed three final-source archives and all 63 files and recomputed maximum 43974656 bytes, spread 327680 bytes and headroom 6356992 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
+      "rationale": "Independent review rehashed three final-source archives and all 63 files and recomputed maximum 43974656 bytes, spread 327680 bytes and headroom 6356992 bytes. This unchanged historical coarse ceiling is approved only for six real-growth detector pairs at exact e282d038. No ordinary CI activation until all six original pairs qualify; no timing, live-heap or fleet guarantee."
     }
   ]
 }

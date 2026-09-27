@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "status": "draft",
-  "review": "Pending independent review of the exact e282d038 ports and docs-only controller. Thresholds were separately approved in threshold-review.json. Do not dispatch this draft.",
+  "status": "reviewed",
+  "review": "Independent review verified all twelve exact e282d038 variant parents, one-file scopes, trees, source digests, historical added lines and six dose-only pair diffs; variants.json SHA-256 5dd16fa122bd0148f21d157106d8388df765e8ed5e416b33ab134aa47e6ed267. The five-file docs-only controller and six ceilings were checked against three authenticated final-source baselines; threshold-review.json SHA-256 d1d247d806ede8239f98801b8b5c9145c4dbcabdb91ca4b2cd17c875a4f8621e. Approved for six original detector pairs only, with no retries, cohort substitutions or ordinary CI budget activation.",
   "cohort": "native-macos15-m1-virtual-e282d038-growth-v1",
   "base_revision": "e282d038519848caa8328cf32aa05a05daa502d2",
   "base_tree": "71c7f346aefa9de9044c3b358252ab0cfc03dae1",
   "budget_path": "docs/next-cycle/resource-reference/native-e282d038-v1/budget.json",
-  "budget_sha256": "126fb77191e6c5446df89dec1c86388cf31d97fbf6a63fd3b83f64676be86651",
+  "budget_sha256": "dbb19f074abdf6df0cfe6335f463fe125df1c5ebcd27b7048a76d114069305f0",
   "checker_sha256": "c409c5eb9fec640ecb79f26b6dd82320ac8265103705aca1f1d6131489f9f436",
   "python_runtime": {
     "version": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]",
