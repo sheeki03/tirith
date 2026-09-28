@@ -2,8 +2,9 @@
 //!
 //! This module never launches npm. A retained artifact and a successful static
 //! review cannot stand in for a qualified tool closure, a native capsule, or a
-//! PackageInstallPreparation permit. The execution qualification table remains
-//! closed until the complete launcher contract has native acceptance evidence.
+//! PackageInstallPreparation permit. Native execution qualification is limited
+//! to the little-endian LP64 GNU Linux AArch64 route; all live tool, source and launch checks remain
+//! mandatory for every operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -117,7 +118,7 @@ impl std::fmt::Display for NpmInstallRefusal {
             Self::InvalidOperationId => "the operation identifier is not a canonical UUID",
             Self::UnexpectedInstalledEntry => "the installed tree contains an unexpected entry, link, or file type",
             Self::InstalledContentChanged => "the installed tree differs from its verified bytes or metadata",
-            Self::NativeExecutionUnqualified => "native npm execution has not passed qualification and remains disabled",
+            Self::NativeExecutionUnqualified => "native npm execution is qualified only for the little-endian LP64 GNU Linux AArch64 route",
             Self::ToolClosureUnsupported => "the required pinned Node, npm, and runtime files are unavailable on this host",
             Self::ToolClosureChanged => "a retained Node, npm, or runtime file changed",
             Self::ExecutionLayoutUnsupported => "the requested execution layout is outside the supported contract",
@@ -752,8 +753,30 @@ impl NpmInstallPlan {
         }
     }
 
+    /// Platform qualification is not a tool, source, task or launch permit.
+    /// Each operation must still admit the exact retained runtime and obtain
+    /// complete native containment before npm can start.
     pub fn execution_qualification(&self) -> Result<()> {
-        Err(NpmInstallRefusal::NativeExecutionUnqualified)
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            target_env = "gnu",
+            target_endian = "little",
+            target_pointer_width = "64"
+        ))]
+        {
+            Ok(())
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            target_env = "gnu",
+            target_endian = "little",
+            target_pointer_width = "64"
+        )))]
+        {
+            Err(NpmInstallRefusal::NativeExecutionUnqualified)
+        }
     }
 
     fn revalidate(
