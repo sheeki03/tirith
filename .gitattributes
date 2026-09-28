@@ -20,3 +20,10 @@ tools/npm-bootstrap/** text eol=lf
 docs/security/remediation/*.json text eol=lf
 docs/security/remediation/*.md text eol=lf
 docs/security/remediation/sources/*.md text eol=lf
+
+# Temporary native diagnostic inputs are checked against Git blob digests.
+.github/qualification/diagnose-powershell-startup.ps1 text eol=lf
+.github/scripts/windows-test-common.ps1 text eol=lf
+.github/scripts/windows-test-process.cs text eol=lf
+crates/tirith/src/cli/shell_target_native_tests.rs text eol=lf
+crates/tirith-core/src/trusted_child/windows.rs text eol=lf
