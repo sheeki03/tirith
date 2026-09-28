@@ -12,15 +12,22 @@ on:
       - '.github/scripts/*native*'
       - '.github/workflows/native-arm-containment.yml'
   workflow_dispatch:
+    inputs:
+      remaining_qualification:
+        description: 'Qualify seven npm contract cases using retained native binaries'
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
 concurrency:
-  group: native-arm-containment-${{ github.ref }}
-  cancel-in-progress: true
+  group: native-arm-containment-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification && github.run_id || 'standard' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.remaining_qualification) }}
 
 jobs:
   native-artifact:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.remaining_qualification }}
     name: Native ARM (${{ matrix.target }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -88,4 +95,72 @@ jobs:
             ${{ runner.temp }}/native-arm/evidence/*.json
             ${{ runner.temp }}/native-arm/evidence/*.txt
           if-no-files-found: warn
+          retention-days: 14
+
+  remaining-qualification:
+    name: Native ARM retained npm seven-case qualification
+    permissions:
+      contents: read
+      actions: read
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Create partial-failure evidence before checkout
+        timeout-minutes: 1
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-retained-seven-v2'
+          root.mkdir(mode=0o700, exist_ok=False)
+          (root / 'dispatch-context.json').write_text(json.dumps({
+              'controller_event_commit': os.environ['GITHUB_SHA'],
+              'product_commit': '24048758d511834d2becd6ab179d7c44e82d9ee9',
+              'product_tree': '38223ec02f4949d4f62f0390f32bc7a7ed2519e3',
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'runner_machine': platform.machine(),
+              'qualification_started': False
+          }, indent=2) + '\n')
+          PY
+      - name: Check out the reviewed controller revision
+        timeout-minutes: 2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the exact product revision independently
+        timeout-minutes: 2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 24048758d511834d2becd6ab179d7c44e82d9ee9
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Admit original successful publication and qualify seven cases
+        timeout-minutes: 50
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-npm-seven-cases.py" \
+            --source-root "$GITHUB_WORKSPACE/product" \
+            --output "$RUNNER_TEMP/native-arm-retained-seven-v2/run" \
+            --staging "$RUNNER_TEMP/native-arm-retained-seven-v2-inputs" \
+            --manifest-sha256 54899e96a466099d7c9ae009f957ec777c4b92629ae03adc4f988f0eef29f6e7 \
+            --driver-sha256 100f37aa1ebf5fba969c4612525062bd54a67b25203f34611ebfc6ef768a6d18 \
+            --runtime-inputs-sha256 8f9c01da2ce838c7c32968839012c2feb7430736902a08c2c59c1c62856d2475
+      - name: Preserve complete bounded evidence, including partial failures
+        timeout-minutes: 3
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-arm-retained-seven-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-arm-retained-seven-v2/dispatch-context.json
+            ${{ runner.temp }}/native-arm-retained-seven-v2/run/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
