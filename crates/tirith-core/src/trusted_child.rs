@@ -40,6 +40,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+mod tmpfs_acl;
 #[cfg(windows)]
 mod windows;
 
@@ -1289,11 +1291,15 @@ fn validate_unix_owner_and_mode(
             });
         }
     }
-    reject_unix_extended_acl(path, directory).map_err(|reason| {
-        TrustedExecutableError::InvalidPath {
-            path: path.to_path_buf(),
-            reason,
-        }
+    // Only this caller has already admitted the exact metadata's owner/mode.
+    // Metadata-free ACL callers retain the strict unsupported-filesystem rule.
+    #[cfg(target_os = "linux")]
+    let acl_result = inspect_posix_acl(path, directory, Some(metadata));
+    #[cfg(not(target_os = "linux"))]
+    let acl_result = reject_unix_extended_acl(path, directory);
+    acl_result.map_err(|reason| TrustedExecutableError::InvalidPath {
+        path: path.to_path_buf(),
+        reason,
     })?;
     Ok(())
 }
@@ -1321,6 +1327,15 @@ pub fn validate_unix_trusted_path_acl(path: &Path, directory: bool) -> Result<()
 /// allow entry carrying a mutation right.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(), String> {
+    inspect_posix_acl(path, directory, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn inspect_posix_acl(
+    path: &Path,
+    directory: bool,
+    admitted_metadata: Option<&std::fs::Metadata>,
+) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1335,6 +1350,11 @@ pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(
     // One 4-byte header plus 8-byte entries; 64 KiB bounds hostile attribute
     // sizes far beyond any legitimate ACL.
     const MAX_ACL_BYTES: usize = 64 * 1024;
+
+    // Android's filesystem/LSM combinations are not part of the Linux tmpfs
+    // qualification. No unsupported-ACL exception is enabled there.
+    #[cfg(target_os = "android")]
+    let _ = admitted_metadata;
 
     let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "path contains an interior NUL while checking ACLs".to_string())?;
@@ -1360,6 +1380,15 @@ pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ENODATA) {
                 continue;
+            }
+            #[cfg(target_os = "linux")]
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                if let Some(admitted) = admitted_metadata {
+                    let attribute = std::ffi::CStr::from_bytes_with_nul(name)
+                        .map_err(|_| "invalid fixed POSIX ACL attribute name".to_string())?;
+                    tmpfs_acl::verify_absence(path, directory, admitted, attribute)?;
+                    continue;
+                }
             }
             // ERANGE lands here too: an attribute larger than the bound above
             // is not something this rule will vouch for.

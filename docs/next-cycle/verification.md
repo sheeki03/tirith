@@ -1,5 +1,63 @@
 # Implementation verification
 
+## September 28: aa88c7ae native corrections pass
+
+All five ordinary PR workflows pass at `aa88c7ae`: [CI run
+36396156183](https://github.com/sheeki03/tirith/actions/runs/36396156183),
+[release builds 36396156598](https://github.com/sheeki03/tirith/actions/runs/36396156598),
+native ARM `36396156199`, fuzz `36396156268` and benchmarks `36396156218`.
+The observed PR merge `57c862192590f199b637519e7c27aa3518476d1b`
+has the same tree as the integration head. These are PR builds, not published
+official release artifacts.
+
+The Windows workspace passes all 60 harnesses, including nine dashboard cases
+under a standard account. All three new scoped-reader controls pass: actual
+reader/writer publication coordination, recursive reads with preserved short
+waits, and refusal of cross-target contention without a nested lock wait.
+Build, harness, dashboard and doctest processes report reaped leaders, empty
+native jobs and drained output without leaked descendants. Artifact
+`10958661912` ZIP SHA-256:
+`da3573838562627737d48af8f3111508b321bb55c77b350133e90d10230830ad`.
+
+Windows PowerShell 5.1.26100.33438 and PowerShell 7.6.6 both pass native profile
+resolution and the product's own-process command-line query. Profiles remain
+unchanged and poisoned user modules are not loaded. Artifact `10959016083`
+ZIP SHA-256:
+`7e960697586ec74c155a7d120f7d0ee056307c16a933b022b8e200b842a902bd`.
+Linux and macOS also pass both default and private-XDG target cases with their
+owned processes and staged runtimes cleaned up. Independent readback rehashes
+all 155 files from these four small evidence archives and verifies the native
+reports and cleanup records. Readback SHA-256:
+`9b9640b40730cb830e08a74f3c2af2dc04abb8387b8ae33373d411fce10f45a0`.
+This closes the corrected target-resolution and Windows journal checks; it
+does not advertise an automatic PowerShell receipt adapter.
+
+## September 28: narrow Linux tmpfs ACL compatibility correction
+
+The lifecycle diagnostic below identifies an unsupported ACL lookup on tmpfs.
+The correction does not treat that errno alone as ACL absence: Linux invokes
+the security hook before its unsupported-inode check. A successful tmpfs
+attribute listing separately includes both access and default POSIX ACL names.
+See the [kernel ACL implementation](https://github.com/gregkh/linux/blob/v6.12.76/fs/posix_acl.c)
+and [tmpfs attribute listing](https://github.com/gregkh/linux/blob/v6.12.76/fs/xattr.c).
+
+Only the Linux executable caller with already validated owner/mode metadata
+can use this exception. It opens a no-follow descriptor, matches the admitted
+identity and generation, proves the exact tmpfs filesystem type, repeats the
+unsupported ACL query on that descriptor, and requires a complete bounded
+attribute list containing neither ACL name. Descriptor and visible-path
+generations must still match afterward. Actual ACLs continue through the
+existing parser; unknown filesystems, failed lists and ambiguous state refuse.
+Metadata-free callers, Android and the separate npm authority digest retain
+their existing strict behavior.
+
+Eight focused controls cover supported self and foreign ACLs, actual tmpfs
+listings, list errors, malformed names, exact error/filesystem restrictions,
+type mismatches and path/generation changes. Source review and formatting pass;
+native compilation and execution remain pending. The current LinuxKit result
+does not yet establish that its list operation or remaining ancestors will pass,
+and a failure will not authorize a broader filesystem exception.
+
 ## September 28: protected Linux execute-only mode 2
 
 Native ARM run `36394084953` executes a small static OS probe in the pinned npm
@@ -44,7 +102,8 @@ never wait while holding another transaction mutex: same-path recursion works,
 and a contended different target refuses without creating a lock cycle.
 Native controls cover reader/writer contention, actual replacement with unchanged
 permissions, recursion, short waits and cross-target contention. Static review
-passes; the corrected Windows product and resolver checks remain pending.
+and the corrected `aa88c7ae` Windows product and resolver checks pass as recorded
+above.
 
 ## September 28: ordinary Linux lifecycle handoff diagnosis
 
@@ -74,9 +133,27 @@ stage separately from bounded private diagnostics. Each nonblocking write uses
 the existing scoped SIGPIPE guard so a peer closing after readiness cannot
 terminate the service. Five actual pipe/stdio controls, including default-SIGPIPE
 refusal and signal-state restoration, and eleven lifecycle-store controls pass
-locally. Identifying the earlier failure
-and qualifying the full corrected service/worker composition remain necessary.
-The passing numeric replacement/death/reload cases below remain distinct.
+locally and ordinary `aa88c7ae` CI passes. The passing numeric
+replacement/death/reload cases below remain distinct from full service/worker
+composition.
+
+A third bounded composition uses the ordinary `aa88c7ae` GNU ARM archive with
+the same previous image and synthetic history. The new diagnostics identify
+`worker_handoff_executable_untrusted`: the fixture binary's
+`system.posix_acl_access` query returns EOPNOTSUPP. The saved operation remains
+`refresh_required`, unpublished, and the installed image stays unchanged.
+This identifies the initiating cause of this attempt; it does not retrospectively
+establish the earlier attempts' causes. The unsupported-descriptor refusal and
+cancellation pass. All thirteen host child jobs and four direct guest children
+close, the exact container is removed and observed absent, eight input hashes
+remain unchanged, and the ten preexisting containers remain running with no
+additional container left behind. There is no OOM. The attempt lasts 41.73 seconds.
+Report SHA-256:
+`b36467f54214810f9461144b69d72722793eaddec95804810e004a6557c07d88`.
+Readback SHA-256:
+`85182562085b2fb92e34201c3ac5d2cd2e70a2ad8a6c853ac08cda5125c1db32`.
+Full positive handoff remains open; unsupported ACL inspection is not silently
+treated as proof of absent permissions.
 
 ## September 28: cd062069 native PowerShell follow-up
 
@@ -114,7 +191,8 @@ These serial diagnostic arms may warm OS services and do not certify cold-start
 latency. The correction uses the built-in WMI expression for Desktop edition,
 keeps the absolute CIM import for Core edition, and retains the two-second
 deadline, native SystemRoot-only environment and disabled module autoloading.
-The ordinary native product check must still qualify the corrected source.
+The ordinary `aa88c7ae` native product check now qualifies this correction as
+recorded above.
 
 ## September 28: repeated actual Claude adapter measurements
 

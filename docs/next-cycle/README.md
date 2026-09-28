@@ -32,6 +32,18 @@ Four numeric lifecycle cases and matched
 standalone/daemon measurements pass on its unchanged compiler-source closure.
 See the [platform results](verification.md#september-28-d0213a22-platform-follow-up).
 
+The corrected `aa88c7ae` checkpoint passes all five ordinary workflows. Windows
+passes all 60 workspace harnesses, including nine standard-account dashboard
+cases and all three new reader/writer coordination regressions. PowerShell
+5.1 and 7 pass native profile and process-query checks; Linux and macOS pass
+both target cases. See the [current native results](verification.md#september-28-aa88c7ae-native-corrections-pass).
+
+A subsequent Linux-only correction admits absent ACLs on tmpfs only through a
+descriptor bound to already validated metadata and a complete attribute listing.
+Source review and formatting pass; native CI and the full lifecycle composition
+remain pending. Other filesystem types and metadata-free ACL callers retain
+their existing refusal behavior.
+
 The [acceptance reconciliation](completion-review.md) maps all 24 acceptance
 rows and six user routes to the reviewed source. It identifies concrete open
 boundaries and supersedes earlier generic requests for more corpus, historical
@@ -43,7 +55,7 @@ schemas or storage tests where applicable evidence already exists.
 | WP01 | review | Runtime snapshots capture field provenance, input revisions, private replay guards, authority, neutralized preferences, trust expiry and remote-cache evidence. Mutations refuse unconditioned remote authority. A01 maps the unchanged paths to retained policy/HTTPS and browser evidence. |
 | WP02 | review | Frozen evaluation separates observed facts from pure policy evaluation and preserves combined blockers and incomplete evidence. Capture includes available cached threat enrichment and reports unavailable runtime/session/baseline evidence. A02 maps the evaluation regressions and browser preview/impact evidence to the current paths. |
 | WP03 | review | Producer-selected CLI/core/MCP projections preserve typed protocol values under broad DLP; signed documents remain separate. Saved receipts now have bounded typed reads, fresh display redaction and explicit canonical-output refusal when privacy requires a projection; the shared public Rust reader and CLI privacy/identity/limit cases passed on candidate 1a72833. A03 maps typed machine, signing, export and hostile-data browser controls to the current paths. |
-| WP04 | in progress | Shared native shell/operator targets and evidence grades are implemented. Authenticated helper completion now projects canonical status through a one-use core proof; five actual Bash/Zsh/Fish terminal cases and 48 other proof/status checks passed on candidate fad9af58. Configured/inherited state and saved success do not promote ordinary status or dashboard reads. Automatic fresh-shell verification passes for the retained macOS Zsh tuple with default job control enabled. Two native macOS PowerShell 7.6.6 profile-resolution cases pass with unchanged personal profiles; ordinary CI now requires native Windows PowerShell 5.1 and 7 checks, which remain pending. Automatic receipt adapters outside the advertised matrix remain unavailable; implementing every adapter is not a completion prerequisite. |
+| WP04 | review | Shared native shell/operator targets and evidence grades are implemented. Authenticated helper completion now projects canonical status through a one-use core proof; five actual Bash/Zsh/Fish terminal cases and 48 other proof/status checks passed on candidate fad9af58. Configured/inherited state and saved success do not promote ordinary status or dashboard reads. Automatic fresh-shell verification passes for the retained macOS Zsh tuple with default job control enabled. At aa88c7ae, native Windows PowerShell 5.1/7 profile and process-query checks pass, as do Linux/macOS default and private-XDG profile cases, with unchanged profiles and verified cleanup. Automatic receipt adapters outside the advertised matrix remain unavailable; implementing every adapter is not a completion prerequisite. |
 | WP05 | review | Comfortable/Balanced/Strict versioned personal presets preserve unknown settings/manual overrides; reset touches owned values. CLI and browser use shared preparation. A05 maps the current preset and browser controls, including mandatory restrictions and manual ownership. |
 | WP06 | review | Shared durable plan/apply/status/cancel/undo, exact preimages, typed intent, conflicts, compensation and bounded workers are implemented. Fourteen native process-death/storage cases pass again on the e282d038 development candidate, with every requested stopped boundary observed and owned cleanup verified. Signed audit recovery and actual HFS+/APFS ENOSPC cases also pass; remaining lifecycle-worker composition is tracked under WP15. |
 | WP07 | review | Stable scoped/expiring grants, retained project identities, legacy migration, CLI lifecycle and typed browser preparation implemented. Five actual 0.4.2/new-client compatibility assertions pass. One retained d0213a22 daemon now passes real one-minute expiry, renewal and revocation with unchanged store bytes through expiry and all seven child cleanups verified. A07 source and expiry evidence are mapped for review. |
