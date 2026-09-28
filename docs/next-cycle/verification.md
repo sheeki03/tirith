@@ -1,5 +1,52 @@
 # Implementation verification
 
+## September 28: native publication succeeds; script fixtures need correction
+
+All five original workflows pass on `caafefc8`: CI `36434532398`, native ARM
+`36434532379`, release validation `36434532989`, fuzz `36434532369` and benchmarks
+`36434532496`. The retained x86 and GNU ARM logs confirm the stdio controls and
+the npm Landlock control. The latter has an explicit older-kernel refusal branch;
+its passing line alone does not identify which ABI branch ran. The actual PR
+checkout is merge `4da64b03`, tree `c3799730fde5e94e0d3bcc28c330d48939e60c4c`.
+Its 662 captured inputs differ from the submitted head only in main's daily,
+test-included ThreatDB manifest. Source-binding SHA-256:
+`a876a7022f59841c15e7f3d0c93aaf789c89a1257aff0cd5f54f8c6ba59711f3`.
+
+[Native run 36435493526](https://github.com/sheeki03/tirith/actions/runs/36435493526)
+passes on private product `2e26baa3`, based on `caafefc8`. One human-output apply
+exits 0 and publishes the exact canonical tree and hidden lock, with linked
+private/committed receipts and confirmed cleanup. This is an explicitly isolated
+test-key build; the normal production-key build refuses that same signed fixture.
+Type checking, strict native Clippy and protected-exec parsing also pass.
+Artifact `10976780931` has ZIP SHA-256
+`6f5651d02d911ecaaba096e185205e4e09a86070ca9d55b2837057c4c91860c7`.
+All 2,479 members are hashed; both 662-file source captures, four retained ELFs,
+1,058 raw streams, 80 stage streams, 529 child cleanups and four container
+removal/absence records are verified. Source/runtime postchecks pass, with no
+OOM or maximum-counter event. The publication verifier independently reproduces
+the receipt from the retained finished event and bounded tree snapshot. Review
+SHA-256: `8fccf3aaf51d76773d8bab53315ea78a1ab7640e0f2f58757880d7323e0f36a6`.
+
+[Retained-build run 36442252373](https://github.com/sheeki03/tirith/actions/runs/36442252373)
+then passes all four coordinator cases: success, cancellation before effects,
+private unwind and published unwind. The latter two are controlled unwinds after
+authenticated child completion, not live process death. The script test refuses
+at preparation with `AnalysisIncomplete`; the full public CLI protocol is not
+reached. All 123 owned children and the single container clean up, and source
+and runtime postchecks pass. Artifact `10978847592` has ZIP SHA-256
+`8bb0e17f20c816f3e2115ebc186d99345d1ae359e166e016a6845231f3febcad`.
+
+The script fixture incorrectly expected module imports and lifecycle arguments
+outside the supported analyzer contract to receive an Allow decision. It now
+uses a literal, import-free hook that throws if executed, and its portable
+regression requires complete analysis with no coverage issues or review signals.
+An ordinary retained macOS product with unchanged analyzer source independently
+confirms that semantic fixture's complete static coverage. The native implicit
+build case now requires `AnalysisIncomplete`, no target, no operation state and
+no transaction checkpoint. The production completeness floor is unchanged.
+The corrected native script and complete CLI protocols remain to be executed;
+the integration branch's public execution gate remains closed.
+
 ## September 28: cache reparenting and stdio restoration corrections
 
 The npm-specific Landlock policy now requires ABI 2 and grants `REFER` beneath

@@ -92,8 +92,11 @@ with the exact bound input handles; it never accepts a generic command string.
 
 ## Contained launch
 
-Scripts are always disabled with a characterized `--ignore-scripts` contract,
-including npm's implicit `node-gyp` install. Configuration files, HOME, cache,
+Scripts are always disabled with a characterized `--ignore-scripts` contract.
+The mandatory analysis-completeness check still refuses unresolved lifecycle
+commands, module resolution and implicit `node-gyp` build configuration before
+transaction execution. Disabling scripts does not waive that check.
+Configuration files, HOME, cache,
 environment, project root and working directory are isolated; ambient project
 `.npmrc`, node injection flags, proxies and credentials cannot redirect npm.
 The install uses only staged local artifacts with offline operation and actual

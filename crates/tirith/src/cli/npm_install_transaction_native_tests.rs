@@ -175,16 +175,18 @@ fn script_archive(case: &str) -> Vec<u8> {
         "lifecycle-sentinels" => {
             let scripts: serde_json::Map<String, serde_json::Value> = LIFECYCLE_EVENTS
                 .iter()
-                .map(|event| {
-                    (
-                        event.to_string(),
-                        format!("node sentinel.cjs {event}").into(),
-                    )
-                })
+                .map(|event| (event.to_string(), "node sentinel.cjs".into()))
                 .collect();
-            files.push(("package/sentinel.cjs", br#"'use strict';
-require('fs').writeFileSync(require('path').join(__dirname, '.tirith-lifecycle-' + process.argv[2]), 'executed');
-"#.to_vec()));
+            // A literal, import-free entry stays within the analyzer's supported
+            // contract. Executing any declared hook throws, so a successful npm
+            // install is required evidence; an absent output file alone is not.
+            files.push((
+                "package/sentinel.cjs",
+                br#"'use strict';
+throw new Error('tirith lifecycle sentinel executed');
+"#
+                .to_vec(),
+            ));
             serde_json::json!({"name":"tirith-native-lifecycle-sentinels","version":"1.0.0","scripts":scripts})
         }
         "implicit-gyp-sentinel" => {
@@ -264,6 +266,24 @@ fn native_transaction_script_archives_are_deterministic_admitted_leaf_contracts(
         captured.revalidate().unwrap();
         let inspection = captured.inspection();
         assert!(inspection.coverage.archive_complete && inspection.coverage.metadata_complete);
+        if name == "lifecycle-sentinels" {
+            assert!(
+                inspection.coverage.static_analysis_complete,
+                "{inspection:?}"
+            );
+            assert!(inspection.coverage.issues.is_empty(), "{inspection:?}");
+            assert!(inspection
+                .signals
+                .iter()
+                .all(|signal| signal.level
+                    != tirith_core::artifact::npm_archive::NpmSignalLevel::Review));
+        } else {
+            // --ignore-scripts is not permission to invent complete analysis of
+            // native build configuration or the fixture's module imports.
+            assert!(!inspection.coverage.static_analysis_complete);
+            assert!(inspection.coverage.issues.iter().any(|issue| issue.kind
+                == tirith_core::artifact::npm_archive::NpmIssueKind::UnresolvedLifecycle));
+        }
         let members: Vec<_> = inspection
             .files
             .iter()
@@ -580,13 +600,44 @@ mod native {
             let target = case.join("installed");
             let binding = InstallTargetBinding::bind(&target).unwrap();
             let operation_id = uuid::Uuid::new_v4().to_string();
-            let plan = NpmInstallPlan::prepare(
+            let preparation = NpmInstallPlan::prepare(
                 &operation_id,
                 &artifacts,
                 NewNpmDestination::capture(&target).unwrap(),
                 &policy,
-            )
-            .expect("fresh signed-source artifact Allow and retained current authority");
+            );
+            if script_controls && names[index] == "implicit-gyp-sentinel" {
+                assert!(matches!(
+                    preparation,
+                    Err(NpmInstallRefusal::AnalysisIncomplete)
+                ));
+                assert!(!target.exists());
+                assert!(case.join("state").read_dir().unwrap().next().is_none());
+                assert!(!case.read_dir().unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tirith-install-journal-")));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "control":"native_script_refusal", "case":names[index],
+                        "authority":authority, "trusted_public_key_sha256":trusted_key_sha256,
+                        "threat_source_sha256":inputs.source_sha256, "threat_db_sequence":db.build_sequence(),
+                        "captured_launcher_sha256":inputs.launcher_sha256, "audit_public_sha256":inputs.audit_public_sha256,
+                        "archive_sha256":digest(&archive_for_case(names[index])),
+                        "production_feed_evidence":authority == "genuine_production_key",
+                        "preparation_refusal":"AnalysisIncomplete", "refused_before_transaction":true,
+                        "target_exists":false, "operation_state_absent":true,
+                        "publication_attempted":false, "native_launcher_invoked":false,
+                        "successful_install_and_exact_tree_verified":false,
+                        "installation_replayed":false
+                    })
+                );
+                continue;
+            }
+            let plan = preparation
+                .expect("fresh signed-source artifact Allow and retained current authority");
             assert!(matches!(
                 plan.execution_qualification(),
                 Err(NpmInstallRefusal::NativeExecutionUnqualified)
@@ -737,18 +788,10 @@ mod native {
                         "tirith-native-implicit-gyp-sentinel"
                     });
                     assert!(package.is_dir());
-                    for event in LIFECYCLE_EVENTS {
-                        assert!(package
-                            .join(format!(".tirith-lifecycle-{event}"))
-                            .symlink_metadata()
-                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
-                    }
-                    assert!(package
-                        .join(".tirith-implicit-gyp-sentinel")
-                        .symlink_metadata()
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
-                    // Publication already required complete member/hidden-lock
-                    // verification. Sentinel absence alone is never a pass.
+                    assert_eq!(index, 0, "implicit native builds must refuse preparation");
+                    // The import-free hook throws if executed. Successful native
+                    // completion plus exact member/hidden-lock verification is
+                    // required; filesystem denial cannot hide a failed script.
                 }
                 let mut recovery = NpmRecoveryStore::open(&operation_id, false).unwrap();
                 let parent = case.metadata().unwrap();
@@ -831,7 +874,7 @@ mod native {
                 "captured_launcher_sha256":inputs.launcher_sha256,"audit_public_sha256":inputs.audit_public_sha256,
                 "coordinator_seam_only":true,"public_cli_execution_enabled":false,
                 "successful_install_and_exact_tree_verified":script_controls || index == 0,
-                "script_sentinels_absent":script_controls,
+                "lifecycle_failure_sentinel_suppressed":script_controls,
                 "archive_sha256":digest(&archive_for_case(names[index])),
                 "interruption_kind":selected.map(|_| "controlled_unwind_after_authenticated_native_completion"),
                 "fixture_journal_is_public_cli_intent":false,"installation_replayed":false,
