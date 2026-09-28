@@ -1,5 +1,55 @@
 # Implementation verification
 
+## September 28: 83468789 ordinary checks pass
+
+All five ordinary PR workflows pass at `83468789`: [CI
+36420022612](https://github.com/sheeki03/tirith/actions/runs/36420022612),
+[release validation 36420022647](https://github.com/sheeki03/tirith/actions/runs/36420022647),
+[native ARM 36420022270](https://github.com/sheeki03/tirith/actions/runs/36420022270),
+fuzz `36420022385` and benchmarks `36420022275`. The release workflow includes
+all six target builds and its package/runtime checks; it does not publish an
+official release. Workflow result record SHA-256:
+`d7b09a8c24ebe9bfa150d023d3b50ad3935638a6f684183fcd1e8307395f05be`.
+The tmpfs native controls and precise actual-checkout source delta are recorded
+below. The full Linux lifecycle composition also passes as recorded next;
+integrated npm execution remains unqualified.
+
+## September 28: ordinary Linux service-worker composition passes
+
+The ordinary GNU ARM package from `83468789` passes the complete local
+service → production worker → binary replacement → product-created fresh service
+sequence on LinuxKit 6.12.76 as UID 65534. The installed binary changes from
+SHA-256 `0dc6c9e4ef0547eabd1d506d0af5aab8cdd64f31ca3caec12ede1afe6c3e68bc`
+to the retained `e282d038` package
+`be7abc4df2e1de7ab56083d3179914443903a5c31fcdcfe9ee219a1b256f0742`.
+Both packages remain version 0.4.2, and the prior receipt is explicitly synthetic.
+This proves the actual worker composition; numeric update/rollback and host
+reload are established by the separate macOS cases below.
+
+The operation moves from accepted to completed with publication true. The fresh
+service has a different PID, binary digest, service/startup identity and token;
+the old token receives HTTP 401. An identical retry returns saved status without
+another publication or file changes. The previous image, receipt and harmless
+shell configuration retain their exact identities and hashes. The separate
+non-FIFO worker refusal leaves its prepared journal and files unchanged, then
+cancels successfully.
+
+The single attempt lasts 13.44 seconds. All thirteen host jobs and four direct
+guest children close; the fresh service quiesces, and the exact owned container
+is removed and observed absent. All ten preexisting containers remain running,
+no additional container remains, all eight input hashes match, and no OOM is
+observed. The container remains the cleanup backstop. The supplemental process
+observer sees the production worker, but does not claim complete phase history.
+Original report SHA-256:
+`af602d0536273a180ea619c60b9ef7d7c678467871b99d8f9fa0b9e32faa3403`.
+Independent readback SHA-256:
+`a3cd282aa83eb87c675c0411f1c670c7891fdd041326ac84d25a1831a2e85da0`.
+
+This closes the concrete development handoff check. It does not claim an
+observed macOS dashboard worker sequence, a production download, historical
+receipt capture or final official channel acceptance. The remaining final-byte
+release rows stay under WP19.
+
 ## September 28: aa88c7ae native corrections pass
 
 All five ordinary PR workflows pass at `aa88c7ae`: [CI run
@@ -53,10 +103,59 @@ their existing strict behavior.
 
 Eight focused controls cover supported self and foreign ACLs, actual tmpfs
 listings, list errors, malformed names, exact error/filesystem restrictions,
-type mismatches and path/generation changes. Source review and formatting pass;
-native compilation and execution remain pending. The current LinuxKit result
-does not yet establish that its list operation or remaining ancestors will pass,
-and a failure will not authorize a broader filesystem exception.
+type mismatches and path/generation changes. All eight pass in the GNU job of
+[native ARM run 36420022270](https://github.com/sheeki03/tirith/actions/runs/36420022270),
+alongside all three existing Linux ACL controls. The actual checkout is PR merge
+`e8541cf1e7c572bdd51982d62b577fa63996307a`, containing head `83468789`
+and main's daily ThreatDB manifest update. Of 661 captured inputs, 660 match the
+head exactly; only the test-included manifest differs. The ordinary product's
+source files match. Native-test receipt SHA-256:
+`b8b9307cb06adb0235e89a3462e94176ff1e16c589c18144060405cef805dee5`.
+Actual-checkout source binding SHA-256:
+`bd2281a09594d3e886ed2d4a873f3e1c43d167fcea98b198ca0150f354b7ff5e`.
+The later full LinuxKit composition above passes with this ordinary binary.
+Its success report does not instrument the exact ACL fallback branch; the
+specific branch's use is inferred from the earlier same-platform refusal and
+the narrow source change. Other filesystem exceptions remain unsupported.
+
+## September 28: retained npm candidate reaches a post-launch failure
+
+Private candidate `dc8cb195` and controller `4197cbc4` complete native typecheck,
+strict Clippy, protected-mode parsing, fixture generation and rejection of the
+fixture feed by the unchanged production key in
+[run 36418502424](https://github.com/sheeki03/tirith/actions/runs/36418502424).
+The first fixture transaction reaches authenticated execution, then npm exits
+with status 1. Its result is `MayHaveStarted`, with publication false and cleanup
+confirmed. No mechanics case passes, and the public CLI case is not reached.
+This candidate separately enables the GNU ARM contract for qualification; the
+integration branch's production execution gate remains closed.
+
+Artifact `10968924300` retains all four normal/fixture launcher and test-harness
+executables. Independent
+readback rehashes all 2,427 members, checks the 660 normal source rows and the
+fixture's sole public-key substitution, and verifies all 509 child and four
+exact-container cleanups. No OOM event is observed. Final source, controller and
+executable checks pass; the fixture runtime's own input-postcheck was not reached.
+ZIP SHA-256:
+`1c7d21475ec40dbe58798e7aeea04470a8f3acbfe88403217901cefa1f972d27`.
+Independent readback SHA-256:
+`c0d0f038ec2c3aa5c1650a26620d76f6b201c191a3ffe1cd9ab4bc452b27b56f`.
+
+The test uses JSON presentation, which intentionally suppresses child output.
+Its discarded npm message cannot be recovered from this artifact. The existing
+non-JSON apply route forwards bounded sanitized child output and can diagnose a
+fresh case using the retained executables without another build. Such a run
+would not reconstruct the original failure or establish seven-case acceptance.
+
+A read-only recheck of successful scheduled publication `36412166266`, the
+`threatdb-current` asset inventory and main revision `77069300` still finds
+only the legacy database generations and source-provenance files without the
+matching signed integrity sidecars.
+The v2 index at that immutable main revision returns HTTP 404; no v2 database
+asset or signed source-integrity sidecar appears in the current release.
+This is a metadata observation, not another database verification or a publisher
+recovery exercise. Recheck SHA-256:
+`89e431395dcc8e32fa1cc39d597d255a56814422fe049aec8ba556bf13ace53a`.
 
 ## September 28: protected Linux execute-only mode 2
 
@@ -152,8 +251,9 @@ Report SHA-256:
 `b36467f54214810f9461144b69d72722793eaddec95804810e004a6557c07d88`.
 Readback SHA-256:
 `85182562085b2fb92e34201c3ac5d2cd2e70a2ad8a6c853ac08cda5125c1db32`.
-Full positive handoff remains open; unsupported ACL inspection is not silently
-treated as proof of absent permissions.
+This failed attempt remains preserved. The later `83468789` composition above
+passes after the narrow tmpfs correction; unsupported ACL inspection by itself
+is still not proof of absent permissions.
 
 ## September 28: cd062069 native PowerShell follow-up
 
