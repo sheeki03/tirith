@@ -7,7 +7,13 @@ use std::path::{Component, PathBuf};
 
 #[derive(Debug)]
 #[cfg_attr(
-    not(all(target_os = "linux", target_arch = "aarch64")),
+    not(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu",
+        target_endian = "little",
+        target_pointer_width = "64"
+    )),
     allow(dead_code)
 )]
 struct NativeInputs {
@@ -326,7 +332,13 @@ fn native_transaction_interruption_is_explicit_and_consumed_once() {
     observe_phase(Phase::TargetPublished);
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "aarch64",
+    target_env = "gnu",
+    target_endian = "little",
+    target_pointer_width = "64"
+))]
 mod native {
     use super::*;
     use crate::cli::{
@@ -490,7 +502,12 @@ mod native {
             PRODUCTION_KEY_SHA256,
             "genuine-production evidence requires the original compiled key"
         );
-        run_native_mechanics("genuine_production_key", PRODUCTION_KEY_SHA256, false);
+        run_native_mechanics(
+            "genuine_production_key",
+            PRODUCTION_KEY_SHA256,
+            false,
+            false,
+        );
     }
 
     #[test]
@@ -503,7 +520,16 @@ mod native {
             expected,
             "fixture build must contain the reviewed fixture key"
         );
-        run_native_mechanics("isolated_fixture_key", &expected, false);
+        run_native_mechanics("isolated_fixture_key", &expected, false, false);
+    }
+
+    #[test]
+    #[ignore = "one diagnostic success case only; requires the reviewed fixture-key build and all real native transaction prerequisites"]
+    fn fixture_authority_native_first_coordinator_case() {
+        let expected = fixture_key_pin();
+        assert_ne!(expected, PRODUCTION_KEY_SHA256);
+        assert_eq!(digest(COMPILED_THREAT_KEY), expected);
+        run_native_mechanics("isolated_fixture_key", &expected, false, true);
     }
 
     #[test]
@@ -512,7 +538,7 @@ mod native {
         let expected = fixture_key_pin();
         assert_ne!(expected, PRODUCTION_KEY_SHA256);
         assert_eq!(digest(COMPILED_THREAT_KEY), expected);
-        run_native_mechanics("isolated_fixture_key", &expected, true);
+        run_native_mechanics("isolated_fixture_key", &expected, true, false);
     }
 
     fn archive_for_case(name: &str) -> Vec<u8> {
@@ -535,7 +561,12 @@ mod native {
         expected
     }
 
-    fn run_native_mechanics(authority: &str, trusted_key_sha256: &str, script_controls: bool) {
+    fn run_native_mechanics(
+        authority: &str,
+        trusted_key_sha256: &str,
+        script_controls: bool,
+        first_case_only: bool,
+    ) {
         // Resolve explicit inputs before acquiring a guard that resets ambient
         // application paths. Missing prerequisites create no transaction state.
         let inputs = NativeInputs::from_lookup(|name| std::env::var_os(name))
@@ -552,8 +583,11 @@ mod native {
         let tools = QualifiedNpmToolClosure::capture()
             .expect("exact root-managed Node/npm/runtime closure");
         tools.revalidate().unwrap();
+        assert!(!(script_controls && first_case_only));
         let names = if script_controls {
             &SCRIPT_CASES[..]
+        } else if first_case_only {
+            &CASES[..1]
         } else {
             &CASES[..]
         };
@@ -587,10 +621,7 @@ mod native {
                 &policy,
             )
             .expect("fresh signed-source artifact Allow and retained current authority");
-            assert!(matches!(
-                plan.execution_qualification(),
-                Err(NpmInstallRefusal::NativeExecutionUnqualified)
-            ));
+            assert_eq!(plan.execution_qualification(), Ok(()));
             let permit = || {
                 task_boundary::prepare_locally_derived_boundary_authorization::<
                     PackageInstallPreparationBoundary,
@@ -610,28 +641,6 @@ mod native {
                 }))
                 .as_bytes(),
             );
-            // The production seam must still refuse with no callback/effects.
-            let mut gate_callback = || -> Result<(), String> {
-                panic!("closed production gate called an effect callback")
-            };
-            let refused = super::super::execute(
-                &plan,
-                &artifacts,
-                &policy,
-                &binding,
-                permit(),
-                true,
-                &reviewed,
-                &mut gate_callback,
-            )
-            .unwrap_err();
-            assert_eq!(refused.phase, "qualification");
-            assert!(
-                !target.exists()
-                    && !case.join("state/tirith/npm-install-intents").exists()
-                    && !case.join("state/tirith/npm-install-recovery").exists()
-            );
-
             // This is a bounded qualification journal, explicitly not a saved
             // public CLI intent. It excludes replay while all effect authority
             // below is freshly constructed from the real retained inputs.
@@ -672,7 +681,7 @@ mod native {
                 Ok(())
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::super::execute_after_qualification(
+                super::super::execute(
                     &plan,
                     &artifacts,
                     &policy,
@@ -829,12 +838,14 @@ mod native {
                 "production_feed_evidence":authority == "genuine_production_key",
                 "threat_source_sha256":inputs.source_sha256,"threat_db_sequence":db.build_sequence(),
                 "captured_launcher_sha256":inputs.launcher_sha256,"audit_public_sha256":inputs.audit_public_sha256,
-                "coordinator_seam_only":true,"public_cli_execution_enabled":false,
+                "coordinator_seam_only":true,"public_cli_execution_enabled":true,
+                "public_cli_exercised":false,"native_contract_gate_qualified":true,
                 "successful_install_and_exact_tree_verified":script_controls || index == 0,
                 "script_sentinels_absent":script_controls,
                 "archive_sha256":digest(&archive_for_case(names[index])),
                 "interruption_kind":selected.map(|_| "controlled_unwind_after_authenticated_native_completion"),
                 "fixture_journal_is_public_cli_intent":false,"installation_replayed":false,
+                "diagnostic_first_case_only":first_case_only,
                 "target_exists":target.exists(),"fixture_preserved_for_outer_owner":true})
             );
         }
@@ -1048,7 +1059,7 @@ mod native {
         write(&root.join("fixture-threatdb-v2.dat"), bytes);
         for name in CASES
             .into_iter()
-            .chain(["normal-key-negative"])
+            .chain(["normal-key-negative", "public-cli"])
             .chain(SCRIPT_CASES)
         {
             let case = root.join(name);

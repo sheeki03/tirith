@@ -150,15 +150,20 @@ fn policy_rules() -> Result<Rules, String> {
         libc::TIOCGPGRP,
         libc::FIONREAD,
     ] {
+        // libc ioctl requests are c_ulong on GNU and c_int on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let request = request as u64;
         terminal_rules.push(rule(vec![
             condition(0, SeccompCmpOp::Le, libc::STDERR_FILENO as u64)?,
-            eq(1, request as u64)?,
+            eq(1, request)?,
         ])?);
     }
     // Exact process-local CLOEXEC setter used by CPython custom file openers.
+    #[allow(clippy::unnecessary_cast)] // Same GNU/musl ioctl type difference.
+    let cloexec_request = libc::FIOCLEX as u64;
     terminal_rules.push(rule(vec![
         condition(0, SeccompCmpOp::Le, i32::MAX as u64)?,
-        eq(1, libc::FIOCLEX as u64)?,
+        eq(1, cloexec_request)?,
         eq(2, 0)?,
     ])?);
     rules.insert(libc::SYS_ioctl, terminal_rules);
@@ -492,29 +497,25 @@ mod tests {
                 DENY
             );
         }
-        assert_eq!(
-            decision(libc::SYS_ioctl, [1, libc::TCGETS as u64, 0, 0, 0, 0]),
-            ALLOW
+        // Preserve the same expected u64 arguments on GNU and musl.
+        #[allow(clippy::unnecessary_cast)]
+        let (tcgets, fioclex, fionclex, tiocsti) = (
+            libc::TCGETS as u64,
+            libc::FIOCLEX as u64,
+            libc::FIONCLEX as u64,
+            libc::TIOCSTI as u64,
         );
-        assert_eq!(
-            decision(libc::SYS_ioctl, [4, libc::FIOCLEX as u64, 0, 0, 0, 0]),
-            ALLOW
-        );
+        assert_eq!(decision(libc::SYS_ioctl, [1, tcgets, 0, 0, 0, 0]), ALLOW);
+        assert_eq!(decision(libc::SYS_ioctl, [4, fioclex, 0, 0, 0, 0]), ALLOW);
         for args in [
-            [4, libc::FIOCLEX as u64, 1, 0, 0, 0],
-            [u64::MAX, libc::FIOCLEX as u64, 0, 0, 0, 0],
-            [4, libc::FIONCLEX as u64, 0, 0, 0, 0],
+            [4, fioclex, 1, 0, 0, 0],
+            [u64::MAX, fioclex, 0, 0, 0, 0],
+            [4, fionclex, 0, 0, 0, 0],
         ] {
             assert_eq!(decision(libc::SYS_ioctl, args), DENY);
         }
-        assert_eq!(
-            decision(libc::SYS_ioctl, [4, libc::TCGETS as u64, 0, 0, 0, 0]),
-            DENY
-        );
-        assert_eq!(
-            decision(libc::SYS_ioctl, [0, libc::TIOCSTI as u64, 0, 0, 0, 0]),
-            DENY
-        );
+        assert_eq!(decision(libc::SYS_ioctl, [4, tcgets, 0, 0, 0, 0]), DENY);
+        assert_eq!(decision(libc::SYS_ioctl, [0, tiocsti, 0, 0, 0, 0]), DENY);
         let parent_death = [
             libc::PR_SET_PDEATHSIG as u64,
             libc::SIGKILL as u64,

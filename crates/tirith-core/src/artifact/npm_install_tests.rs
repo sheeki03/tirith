@@ -357,6 +357,21 @@ fn staged_leaf_retry_keeps_exact_inputs_but_never_replays_a_started_execution() 
         MaterializationThreatSource::fixture_empty(),
     )
     .unwrap();
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu",
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    assert_eq!(plan.execution_qualification(), Ok(()));
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu",
+        target_endian = "little",
+        target_pointer_width = "64"
+    )))]
     assert_eq!(
         plan.execution_qualification(),
         Err(NpmInstallRefusal::NativeExecutionUnqualified)
