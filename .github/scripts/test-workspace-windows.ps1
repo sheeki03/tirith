@@ -114,7 +114,7 @@ try {
         New-Item -ItemType Directory -Path $negativeRoot | Out-Null
         $environment = [Collections.Generic.Dictionary[string,string]]::new()
         foreach ($variable in @(Get-ChildItem Env:)) {
-            if ($variable.Name -eq 'TIRITH' -or $variable.Name.StartsWith('TIRITH_', [StringComparison]::OrdinalIgnoreCase)) { $environment[$variable.Name] = $null }
+            if ($variable.Name -eq 'TIRITH' -or $variable.Name.StartsWith('TIRITH_', [StringComparison]::OrdinalIgnoreCase)) { $environment.Add($variable.Name, [NullString]::Value) }
         }
         foreach ($name in @('HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME')) { $environment[$name] = $negativeRoot }
         $environment['TIRITH_OFFLINE'] = '1'

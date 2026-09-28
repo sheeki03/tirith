@@ -106,6 +106,75 @@ class RuntimeStaging(unittest.TestCase):
         os.mkfifo(self.source / 'pipe')
         with self.assertRaises(ValueError): target.runtime_inventory(self.source)
 
+    def test_only_exact_dangling_linux_compatibility_links_are_omitted(self):
+        for name, link in target.LINUX_DANGLING_COMPAT_LINKS.items():
+            (self.source / name).symlink_to(link)
+        with mock.patch.object(target.sys, 'platform', 'linux'), mock.patch.object(target, 'path_is_absent', return_value=True):
+            before = target.runtime_inventory(self.source, omit_dangling_linux_compat=True)
+            result = target.stage_runtime(self.source, self.destination)
+            self.assertEqual(result['source_inventory'], before)
+            self.assertEqual(len(result['source_omissions']), 2)
+            self.assertTrue(all(row['kind'] == 'omitted_symlink' for row in result['source_omissions']))
+            self.assertTrue(all(not (self.destination / name).is_symlink() for name in target.LINUX_DANGLING_COMPAT_LINKS))
+            target.cleanup_runtime(result)
+            self.assertEqual(target.runtime_inventory(self.source, omit_dangling_linux_compat=True), before)
+        self.assertTrue(all((self.source / name).is_symlink() for name in target.LINUX_DANGLING_COMPAT_LINKS))
+
+    def test_compatibility_omission_refuses_other_paths_targets_platforms_and_existing_targets(self):
+        name, link = next(iter(target.LINUX_DANGLING_COMPAT_LINKS.items()))
+        entry = self.source / name
+        for filename, value, platform, absent in (
+            ('unexpected', link, 'linux', True),
+            (name, '/lib64/unexpected.so', 'linux', True),
+            (name, link, 'darwin', True),
+            (name, link, 'linux', False),
+        ):
+            entry = self.source / filename
+            entry.symlink_to(value)
+            with mock.patch.object(target.sys, 'platform', platform), mock.patch.object(target, 'path_is_absent', return_value=absent):
+                with self.assertRaises(ValueError): target.stage_runtime(self.source, self.destination)
+            self.assertFalse(any(self.destination.iterdir()))
+            entry.unlink()
+
+    def test_omission_target_appearing_during_copy_refuses_and_preserves_partial_tree(self):
+        name, link = next(iter(target.LINUX_DANGLING_COMPAT_LINKS.items()))
+        (self.source / name).symlink_to(link)
+        staging = target.runtime_staging_record(self.destination)
+        with mock.patch.object(target.sys, 'platform', 'linux'), mock.patch.object(target, 'path_is_absent', side_effect=[True, False]):
+            with self.assertRaisesRegex(ValueError, 'target is present'):
+                target.stage_runtime(self.source, self.destination)
+        with self.assertRaisesRegex(ValueError, 'partial runtime copy retained'):
+            target.cleanup_incomplete_runtime(staging)
+        self.assertTrue((self.destination / 'pwsh').exists())
+        self.assertFalse(staging['cleanup_confirmed'])
+
+    def test_early_inventory_refusal_removes_only_owned_empty_staging_root(self):
+        staging = target.runtime_staging_record(self.destination)
+        (self.source / 'unexpected').symlink_to('/outside/unexpected')
+        with self.assertRaises(ValueError): target.stage_runtime(self.source, self.destination)
+        target.cleanup_incomplete_runtime(staging)
+        self.assertTrue(staging['cleanup_confirmed'])
+        self.assertFalse(self.destination.exists())
+        self.assertTrue((self.source / 'unexpected').is_symlink())
+
+    def test_incomplete_cleanup_refuses_replaced_root(self):
+        staging = target.runtime_staging_record(self.destination)
+        self.destination.rename(self.root / 'retained')
+        self.destination.mkdir(mode=0o700)
+        with self.assertRaisesRegex(ValueError, 'replaced'):
+            target.cleanup_incomplete_runtime(staging)
+        self.assertTrue(self.destination.exists())
+        self.assertFalse(staging['cleanup_confirmed'])
+
+    def test_absence_check_rejects_regular_files_and_dangling_link_entries(self):
+        path = self.root / 'external-target'
+        self.assertTrue(target.path_is_absent(path))
+        path.write_bytes(b'existing target')
+        self.assertFalse(target.path_is_absent(path))
+        path.unlink()
+        path.symlink_to('missing-target')
+        self.assertFalse(target.path_is_absent(path))
+
     def test_inventory_caps_and_nonprivate_destination_refuse(self):
         with mock.patch.object(target, 'RUNTIME_ENTRIES', 2), self.assertRaises(ValueError):
             target.runtime_inventory(self.source)

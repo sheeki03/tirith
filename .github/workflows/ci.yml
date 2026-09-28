@@ -57,6 +57,7 @@ jobs:
           python3 scripts/test-certify-powershell-target.py
           python3 scripts/test-control-browser-fixtures.py
           python3 scripts/test-collect-native-resource-reference.py
+          python3 scripts/test-measure-daemon-workloads.py
           python3 tools/qualification/test_mixed_audit_native.py
           python3 tools/qualification/test_compatibility_capture.py
           python3 tools/qualification/test_durable_boundaries_native.py

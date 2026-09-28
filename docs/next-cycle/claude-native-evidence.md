@@ -146,3 +146,30 @@ they do not qualify other native hosts. That later TypeScript correction is not
 part of the retained Claude binary above. Neither these development bytes nor
 their reports constitute final PR-package or official signed-release
 qualification; the final package must repeat the native routes.
+
+### Actual 6e79b3dd PR package
+
+The [release run 36378009327](https://github.com/sheeki03/tirith/actions/runs/36378009327)
+produced the macOS ARM package subsequently tested with that same Claude/Python
+tuple. The actual checkout `dfcd8ec5003fd7c09b9a452b3b25014908e3d307` has tree
+`a7bb69f2c398cac2941ea575d09947e6e6ac5132`, identical to product head `6e79b3dd`.
+GitHub artifact 10952083021 has ZIP SHA-256
+`5f86504b2a6e50c01f884c3ece815c6479bc944de468896c0b0aa7a5fa15fb4d`;
+the extracted ordinary 0.4.2 executable is 38,409,920 bytes with SHA-256
+`4583b1b18043f89a4fd4e642f4f0e5f645e3bd5ecb1a2bff1af7d46e0877167c`.
+
+Each route ran once through the unchanged harness: all nine recommended hook
+controls passed, MCP-only demonstrated its interception boundary, and a fresh
+host observed the hook and blocked after publication. In this run **both**
+retained-host turns omitted the new hook and executed the inert marker once.
+The earlier development observation of later blocking is not a reload promise;
+users must start a fresh host after setup.
+
+All 35 owned-child cleanup records pass. Input hashes stay unchanged and the
+isolated operator/temporary roots are empty after completion. Independent review
+rehashed the archive/binary bindings and twelve retained report/log files, and
+rechecked every route and cleanup result. Qualification summary SHA-256:
+`6fc5a1f5ed9b8adbd116ecc9defdd38c89d0723b0c52bf61614f0360f8bc5821`.
+This closes current PR-package hook recertification for the recorded tuple.
+Numeric binary replacement, the beginner pilot and official release acceptance
+remain separate requirements.

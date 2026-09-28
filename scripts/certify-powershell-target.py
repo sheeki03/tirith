@@ -23,6 +23,13 @@ TEST = 'cli::shell_target::native_tests::native_powershell_profile_matches_resol
 SCOPE = 'native_current_user_console_profile_resolution_only'
 RUNTIME_BYTES = 512 * 1024 * 1024
 RUNTIME_ENTRIES = 4096
+# The installed Linux archive carries these obsolete compatibility links even
+# when their targets are absent. Keep the originals unchanged; the private copy
+# can omit only these exact, still-dangling links observed on the native runner.
+LINUX_DANGLING_COMPAT_LINKS = {
+    'libcrypto.so.1.0.0': '/lib64/libcrypto.so.10',
+    'libssl.so.1.0.0': '/lib64/libssl.so.10',
+}
 
 
 def require(value, message):
@@ -55,7 +62,32 @@ def runtime_root_identity(path):
             'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
 
 
-def runtime_inventory(root):
+def path_is_absent(path):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def runtime_staging_record(path):
+    return {'staged': str(path), 'root_identity': runtime_root_identity(path),
+            'cleanup_confirmed': False}
+
+
+def cleanup_incomplete_runtime(staging):
+    """Remove only our unchanged empty root; retain any partially copied tree."""
+    staged = Path(staging['staged'])
+    require(runtime_root_identity(staged) == staging['root_identity'], 'staging root was replaced')
+    with os.scandir(staged) as entries:
+        require(next(entries, None) is None, 'partial runtime copy retained for inspection')
+    require(runtime_root_identity(staged) == staging['root_identity'], 'staging root changed before cleanup')
+    staged.rmdir()
+    require(path_is_absent(staged), 'empty staging root cleanup incomplete')
+    staging['cleanup_confirmed'] = True
+
+
+def runtime_inventory(root, *, omit_dangling_linux_compat=False):
     """Capture the public runtime without following links or special files."""
     require(root.is_absolute() and root.resolve(strict=True) == root, 'canonical runtime root required')
     rows, total = [], 0
@@ -99,9 +131,17 @@ def runtime_inventory(root):
                 os.close(fd)
         elif stat.S_ISLNK(info.st_mode):
             link = os.readlink(path)
-            require(not os.path.isabs(link) and len(link) <= 4096, 'absolute or oversized runtime link')
-            require(path.resolve(strict=True).is_relative_to(root), 'runtime link escapes its source')
-            row.update(kind='symlink', target=link)
+            require(len(link) <= 4096, 'oversized runtime link')
+            omit = (omit_dangling_linux_compat and sys.platform == 'linux'
+                    and LINUX_DANGLING_COMPAT_LINKS.get(relative.as_posix()) == link)
+            if omit:
+                require(path_is_absent(Path(link)), 'obsolete compatibility link target is present')
+                row.update(kind='omitted_symlink', target=link,
+                           omission_reason='observed_linux_compatibility_target_absent')
+            else:
+                require(not os.path.isabs(link), 'absolute runtime link')
+                require(path.resolve(strict=True).is_relative_to(root), 'runtime link escapes its source')
+                row.update(kind='symlink', target=link)
         else:
             raise ValueError('runtime contains a special file')
         require(runtime_token(path.lstat()) == runtime_token(info), 'runtime entry changed during inventory')
@@ -111,7 +151,7 @@ def runtime_inventory(root):
 
 def stage_runtime(source, destination):
     """Copy observed runtime bytes; never chmod or modify the installed runtime."""
-    before = runtime_inventory(source)
+    before = runtime_inventory(source, omit_dangling_linux_compat=True)
     require(destination.is_dir() and not destination.is_symlink() and not any(destination.iterdir())
             and destination.stat().st_uid == os.getuid() and stat.S_IMODE(destination.stat().st_mode) == 0o700,
             'empty owned private staging directory required')
@@ -121,6 +161,8 @@ def stage_runtime(source, destination):
     for original in before:
         row = dict(original)
         target = destination / row['path']
+        if row['kind'] == 'omitted_symlink':
+            continue
         if row['kind'] == 'directory':
             if row['path'] != '.':
                 target.mkdir(mode=0o700)
@@ -150,17 +192,19 @@ def stage_runtime(source, destination):
             row['mode'] = 0o500 if row['mode'] & 0o111 else 0o400
             target.chmod(row['mode'])
         expected.append(row)
-    require(runtime_inventory(source) == before, 'installed runtime changed during copying')
+    require(runtime_inventory(source, omit_dangling_linux_compat=True) == before, 'installed runtime changed during copying')
     require(runtime_inventory(destination) == expected, 'private runtime copy differs from observed source')
     require(runtime_root_identity(destination) == identity, 'staged runtime root changed during copy')
     return {'source': str(source), 'staged': str(destination), 'source_inventory': before,
-            'staged_inventory': expected, 'root_identity': identity, 'installed_runtime_modified': False}
+            'staged_inventory': expected, 'root_identity': identity, 'installed_runtime_modified': False,
+            'source_omissions': [row for row in before if row['kind'] == 'omitted_symlink']}
 
 
 def cleanup_runtime(copy):
     staged = Path(copy['staged'])
     require(runtime_root_identity(staged) == copy['root_identity'], 'staged runtime root was replaced')
-    require(runtime_inventory(Path(copy['source'])) == copy['source_inventory'], 'installed runtime changed')
+    require(runtime_inventory(Path(copy['source']), omit_dangling_linux_compat=True) == copy['source_inventory'],
+            'installed runtime changed')
     require(runtime_inventory(staged) == copy['staged_inventory'], 'staged runtime changed')
     require(runtime_root_identity(staged) == copy['root_identity'], 'staged runtime root changed before cleanup')
     shutil.rmtree(staged)
@@ -235,6 +279,7 @@ def main():
         shell = args.powershell.resolve(strict=True)
         if args.stage_runtime:
             staged = Path(tempfile.mkdtemp(prefix='.tirith-pwsh-runtime-', dir=Path.home().resolve(strict=True)))
+            report['runtime_staging'] = runtime_staging_record(staged)
             report['runtime_copy'] = stage_runtime(shell.parent, staged)
             shell = staged / shell.name
         binary_sha, shell_sha = digest(binary), digest(shell, 256*1024*1024)
@@ -282,7 +327,13 @@ def main():
     finally:
         if staged is not None:
             try:
-                cleanup_runtime(report['runtime_copy'])
+                if 'runtime_copy' in report:
+                    cleanup_runtime(report['runtime_copy'])
+                    report['runtime_staging']['cleanup_confirmed'] = True
+                elif 'runtime_staging' in report:
+                    cleanup_incomplete_runtime(report['runtime_staging'])
+                else:
+                    raise ValueError('staging root identity was not captured; preserve it for inspection')
             except BaseException as error:
                 report.update(passed=False, status='refused', runtime_cleanup_error=str(error)[:4096])
         with (args.output / 'report.json').open('x') as stream:

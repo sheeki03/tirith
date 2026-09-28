@@ -1,5 +1,127 @@
 # Implementation verification
 
+## September 28: matched standalone and daemon workloads
+
+The ordinary macOS ARM 0.4.2 release image from the `d0213a22` compiler closure,
+SHA-256 `076d0481c2fb95ebbc1ccef9e5384b5a4c2a7e9263bf1934863160f580e5d6f2`,
+passes the matched offline characterization on an Apple M4, ten logical CPUs,
+macOS 27.0. No build or other qualification was intentionally run alongside
+collection; ambient host contention remains uncontrolled.
+
+Both isolated fixtures use the unchanged production-signed database
+`47b867e2b686ce68d38402622fcd27fc54854115743b860a8bc1799c8db48112`:
+242,343 entries, sequence 1790503422402 and original timestamp 1790503433.
+Ordinary product status admits its signature. Publication age is about 19.7
+hours; separate source evidence is unavailable and remains reported that way.
+Disabling automatic updates prevents background collection and changes the
+product's `stale` boolean; it does not refresh the signed timestamp.
+
+Each row contains 100 samples per mode. Standalone time includes spawn through
+owned-process cleanup and EOF; direct daemon time runs from request send to
+response EOF after peer admission. These distinct units do not measure a shell
+hook, model, cache-hit counter or cold OS cache.
+
+| Fixture and inert input | Standalone p50 / p95, ms | Retained daemon p50 / p95, ms |
+| --- | --- | --- |
+| One custom rule, flat repository; URL analysis | 144.358 / 148.672 | 0.755 / 0.870 |
+| One custom rule, flat repository; custom block | 132.092 / 135.905 | 1.270 / 1.412 |
+| 256 rules, eight nested directories and 128 files; URL analysis | 149.175 / 154.368 | 3.621 / 4.041 |
+| Same larger fixture; custom block | 136.291 / 139.935 | 4.215 / 5.972 |
+
+One hundred fresh database-status processes have p50/p95 74.086/78.083 ms.
+The two daemon startup observations are 20.639 and 20.901 ms, not a startup
+distribution. Their sampled maximum RSS values are 81,166,336 and 84,426,752
+bytes; observed cumulative daemon CPU deltas are 710 and 2,640 ms. Each fixture
+grows by 548 logical bytes. The report keeps completed-child RSS high-water
+marks, sampled daemon RSS, allocation counts and disk growth as separate units.
+No new universal latency budget is inferred from this single host.
+
+Independent review accounts for all 1,356 raw rows, recomputes 22 distributions,
+compares 1,604 semantic results, checks 1,206 peer-PID/timing observations and
+verifies 400 overlapping direct-client pairs. These socket pairs do not establish
+simultaneous engine execution or real terminal behavior. All 552 owned children
+have confirmed cleanup; the private fixture is removed and input pins match.
+Twelve pure controls and eight owned responder controls passed before collection.
+
+Original report SHA-256:
+`8071fabab1c0b2fc202a8c9991ef24ee70561012493df037381015f6ed3bdaf0`.
+Independent review SHA-256:
+`5092c7be1cba42150a4b989168ed91edbd871f03125ea17964af80f7b5f933a8`.
+The existing real-Zsh measurements and six ordinary CI byte limits remain
+separate evidence. Repeated actual-host adapter distributions remain unfinished.
+
+## September 28: numeric upgrade, rollback and observed process death
+
+All four original native macOS ARM cases pass on the `d0213a22` compiler-source
+closure: ordinary 0.4.2 → 0.4.3 → 0.4.2, and controller death at verification,
+publication intent and published boundaries. The tracked package remains 0.4.2;
+only an isolated source copy has the reviewed Cargo manifest/lock version delta.
+The ordinary release executables are respectively
+`076d0481c2fb95ebbc1ccef9e5384b5a4c2a7e9263bf1934863160f580e5d6f2`
+and `2fd970cfb05b2d97e5516ca087099ed7052030b1255d78d21f9598c8c66baa41`.
+The separately built test controller is
+`c3aa0df7bc1b7685045916e1c3d8ab9a93229a1f3af3dfe225bec55949dbce77`.
+Independent admission verifies all three builds, release/test roles, unchanged
+660-file source captures and exact numeric-only variant before execution.
+
+| Original case | Fresh ordinary-product dashboard result | Published bytes | Result SHA-256 |
+| --- | --- | --- | --- |
+| Complete update and rollback | Completed; rollback also completed | 0.4.3, then exact original 0.4.2 | `05524cf0841f0fa0f3beaf6f549477dbe483d21a21ef6a62c9ddeace9865db2c` |
+| Death during verification | Refresh required | Original 0.4.2 | `4e6759df773fa01f4d49b2d1e2c0e5b660c331e4e80c2542037f73e8baef8519` |
+| Death at publication intent | Recovery required; publication unconfirmed | Original 0.4.2 | `293603e521a17fc03709b7ca4c874fb2238d1683ff9b94d4cae045b40ada1db5` |
+| Death after publication | Recovery required; publication recorded | New 0.4.3 | `24fa99ccfa294f31789c8141b990783de1a5792c1c2e321474d48f065b804cfd` |
+
+Each death case observes an actual SIGSTOP and held production operation lock
+before killing and reaping the owned controller. Two fresh product services
+read the same operation UUID and return its saved result on repeated apply;
+they do not resume interrupted work. Policy, startup configuration, legacy and
+scoped trust, and MCP lock bytes survive. Ordinary allow/block checks pass before
+and after replacement. All 44 registered direct-child cleanup records pass;
+independent readback rehashes all 224 retained inventory files.
+
+The retained interactive Zsh session reports installed version 0.4.3, loaded
+version 0.4.2 and `reload_required`. A fresh session reports loaded 0.4.3 while
+preserving the `matching_version_unverified` evidence grade. This is loaded
+version evidence, not a fresh blocking certificate. Actual Claude host behavior
+across numeric replacement remains separate.
+
+The root readback report is
+`756c58e386df09d7867718bcb93828bddf5d4b8835a8a1711e0a62d758177ebf`.
+These tests compose the real verifier, compatibility checks, publication,
+rollback receipt and lifecycle store using a public fixture signing key. They
+do not certify an official release, production download/worker handoff, power
+loss, all installation channels, or nested extractor cleanup after an outer
+failure. See the [qualification contract](numeric-lifecycle-qualification.md).
+
+## September 28: d0213a22 platform follow-up
+
+The [CI run](https://github.com/sheeki03/tirith/actions/runs/36381188762) passes
+macOS, Rust 1.83 and strict Clippy. Native ARM, fuzz and benchmark workflows also
+pass, including the ordinary macOS ARM resource gate. Windows PowerShell 7.6.6
+now matches the native profile target with unchanged profiles and confirmed
+cleanup. Windows PowerShell 5.1 starts but fails during .NET initialization,
+before the query. Linux refuses an absolute runtime symlink while preparing
+the private copy, before either native query. Both original failures remain
+retained and require correction; neither is counted as native qualification.
+The [release workflow](https://github.com/sheeki03/tirith/actions/runs/36381189053) also passes: all six target builds, package assembly, runtime smoke checks and both canonical ARM containment checks. Official publishing remains skipped.
+
+## September 28: current PR-package Claude qualification
+
+All eleven Claude 2.1.283 cases pass on the actual macOS ARM PR package from
+`6e79b3dd`: nine recommended-setup hook controls, MCP-only, and retained/fresh
+host reload. The exact package executable SHA-256 is
+`4583b1b18043f89a4fd4e642f4f0e5f645e3bd5ecb1a2bff1af7d46e0877167c`.
+All 35 owned-child cleanup records pass, all input pins remain unchanged and
+every isolated fixture root is removed. Independent review reproduces those
+results from the original reports and exact archive/source bindings.
+
+Both existing-host turns missed the newly published hook; the fresh host
+observed it and blocked. Setup therefore continues to require a fresh host.
+The qualification summary SHA-256 is
+`6fc5a1f5ed9b8adbd116ecc9defdd38c89d0723b0c52bf61614f0360f8bc5821`.
+See the [tuple and package record](claude-native-evidence.md#actual-6e79b3dd-pr-package).
+This does not qualify numeric binary replacement or official publication.
+
 ## September 28: 6e79b3dd platform results and PowerShell correction
 
 The [release workflow](https://github.com/sheeki03/tirith/actions/runs/36378009327),
@@ -27,6 +149,24 @@ Its receipt SHA-256 is
 `70d99007c56e1fc471e693cf763351b090e88078c8f4d1b9c8571880f4ee2921`.
 Independent review, formatting and workflow validation pass. Corrected native
 Linux/Windows execution remains pending; the previous failed run is retained.
+
+The corrected staging route also passes both native macOS PowerShell cases
+using the newly compiled CLI test image
+`c3aa0df7bc1b7685045916e1c3d8ab9a93229a1f3af3dfe225bec55949dbce77`.
+Default and private XDG profiles remain unchanged, both owned test processes
+complete with verified cleanup, and the staged runtime is removed after its
+source/copy inventory checks. Report SHA-256:
+`5470aa16d479677c9cb3b30e92d37a662146e32ad38d3a25c5e1f0f6266f11cf`.
+
+Both canonical GNU and musl ARM archives from the same release run also pass
+all sixteen native cases as UID 65534, including parent/guard interruption and
+process-tree cleanup. The authenticated reports identify GNU executable
+`45ea294fe3f57e73bfb6d26188f43a84d9b0261be313b00133f7c5ce1d4b183f`
+and musl executable
+`994a7497f2506e60b8f17eac542913d960cc3960d405fbce92288aab2428882b`.
+Independent review rechecks all twelve ordinary-case predicate sets and four
+cancellation records per target. This is the shared containment contract;
+the integrated npm transaction requires separate qualification.
 
 ## September 28: ordinary CI resource gate on 6e79b3dd
 
@@ -630,6 +770,12 @@ unexecuted. The shared two-terminal scenario completes 404 framed operations,
 plus setup traffic, beyond the old 256-receipt lifecycle failure. It does not
 measure peak registry occupancy or cross the separate per-session ledger limit;
 the core burst and clean/warning boundary regressions cover that limit.
+Both commands are dispatched before response pumping. All 200 measured paired
+rounds have positive overlapping outstanding-request intervals, ranging from
+263.163167 to 883.545708 ms. These are two real retained Zsh sessions; the
+observations do not establish simultaneous CPU execution. A September 28
+readback confirms this existing coverage, correcting a later working inventory
+that incorrectly described the driver as serially interleaved.
 
 Whole-terminal wall-clock p50/p95 in milliseconds on this Apple M4/macOS 27 host:
 
