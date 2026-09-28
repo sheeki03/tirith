@@ -14,11 +14,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Observe six bounded startup cases
+      - name: Observe four bounded query statement cases
         shell: pwsh
         run: |
           $driver = Join-Path $PWD '.github/qualification/diagnose-powershell-startup.ps1'
-          if ((Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne '43aff9db30077a4995b2ddcd8cdf919912c230c7d54c87550f050036a602565b') { throw 'Diagnostic driver pin differs' }
+          if ((Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne '25e0053bf8879b0d9832eb86a23c2a892413cbee97b97a4df5125019e83e41a5') { throw 'Diagnostic driver pin differs' }
           & $driver -Workspace $PWD -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'powershell-startup-diagnostic')
       - name: Retain original startup observations
         if: always()
@@ -26,33 +26,5 @@ jobs:
         with:
           name: powershell-startup-diagnostic-windows
           path: ${{ runner.temp }}/powershell-startup-diagnostic
-          if-no-files-found: error
-          retention-days: 14
-  linux-runtime-inventory:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Read installed runtime metadata without execution
-        env:
-          DIAGNOSTIC_OUTPUT: ${{ runner.temp }}/powershell-runtime-inventory
-        run: |
-          python3 -B - <<'PY'
-          import hashlib,os,runpy,sys
-          from pathlib import Path
-          driver=Path('.github/qualification/inventory-linux-powershell.py')
-          if hashlib.sha256(driver.read_bytes()).hexdigest()!='37c718833a2d4797e6a340ee5eef6f4b441a71d5554e27783331b165381f0947':
-              raise SystemExit('Diagnostic driver pin differs')
-          sys.argv=[str(driver),'--output',os.environ['DIAGNOSTIC_OUTPUT']]
-          runpy.run_path(str(driver),run_name='__main__')
-          PY
-      - name: Retain original runtime inventory
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: powershell-runtime-inventory-linux
-          path: ${{ runner.temp }}/powershell-runtime-inventory
           if-no-files-found: error
           retention-days: 14

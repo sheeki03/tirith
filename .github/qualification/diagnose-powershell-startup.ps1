@@ -26,9 +26,27 @@ foreach ($relative in $pins.Keys) {
 }
 . (Join-Path $Workspace '.github/scripts/windows-test-common.ps1')
 Add-Type -Path (Join-Path $Workspace '.github/scripts/windows-test-process.cs')
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class TirithDiagnosticWindowsDirectory {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetSystemWindowsDirectoryW(StringBuilder value, uint size);
+    public static string Read() {
+        var value = new StringBuilder(32768);
+        uint length = GetSystemWindowsDirectoryW(value, (uint)value.Capacity);
+        if (length == 0 || length >= value.Capacity) throw new InvalidOperationException("System Windows directory unavailable or oversized");
+        string path = value.ToString();
+        if (path.Length != length || path.Length < 3 || !Char.IsLetter(path[0]) || path[1] != ':' || path[2] != '\\') throw new InvalidOperationException("Unexpected system Windows directory form");
+        return path;
+    }
+}
+'@
+$systemWindowsDirectory=[TirithDiagnosticWindowsDirectory]::Read()
 New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
 $report = [ordered]@{
-    schema_version=1; status='refused'; scope='powershell_startup_path_environment_differential_only';
+    schema_version=1; status='refused'; scope='powershell_query_statement_and_minimal_environment_differential_only';
     product_supervisor_exercised=$false; automatic_adapter_qualified=$false;
     profile_loaded=$false; profile_writes=$false; source_pins=$pins; workflow_event_revision=$env:GITHUB_SHA; cases=@()
 }
@@ -57,22 +75,56 @@ try {
     $source=[IO.File]::ReadAllText((Join-Path $Workspace 'crates/tirith/src/cli/shell_target_native_tests.rs'))
     $match=[regex]::Match($source, '(?m)^const QUERY: &str = r#"([^\r\n]+)"#;$')
     if (-not $match.Success) { throw 'Missing exact native target query' }
-    $query="[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_ENTERED');"+$match.Groups[1].Value+";[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_FINISHED')"
+    $originalQuery=$match.Groups[1].Value
+    $fields=[ordered]@{
+        profile='[string]$PROFILE'
+        current_user_current_host='[string]$PROFILE.CurrentUserCurrentHost'
+        documents="[Environment]::GetFolderPath('MyDocuments')"
+        home='[string]$HOME'
+        version='$PSVersionTable.PSVersion.ToString()'
+        major='$PSVersionTable.PSVersion.Major'
+        minor='$PSVersionTable.PSVersion.Minor'
+        edition='[string]$PSVersionTable.PSEdition'
+        host_name='$Host.Name'
+        executable='[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName'
+        xdg='$env:XDG_CONFIG_HOME'
+    }
+    $pairs=@(foreach ($key in $fields.Keys) { $key+'='+$fields[$key] })
+    $reconstructed='$ErrorActionPreference=''Stop''; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Out.Write(([ordered]@{'+($pairs -join ';')+'}|ConvertTo-Json -Compress))'
+    if ($originalQuery -cne $reconstructed) { throw 'Diagnostic fields differ from exact pinned original query' }
+    $preamble="[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_ENTERED');"+
+        '$ErrorActionPreference=''Stop'';[Console]::Error.WriteLine(''TIRITH_ERROR_MODE_SET'');'+
+        '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::Error.WriteLine(''TIRITH_ENCODING_SET'');'+
+        '[Console]::Error.WriteLine(''TIRITH_MODULE_PATH_BASE64='' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$env:PSModulePath)));'+
+        '$observation=[ordered]@{};'
+    $collect=@(foreach ($key in $fields.Keys) {
+        '$observation['''+$key+''']='+$fields[$key]+';[Console]::Error.WriteLine(''TIRITH_FIELD_'+$key.ToUpperInvariant()+''');'
+    }) -join ''
+    $finish="[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_FINISHED')"
+    $queries=@{
+        statements=$preamble+$collect+'[Console]::Error.WriteLine(''TIRITH_SERIALIZE_BEGIN'');$json=$observation|ConvertTo-Json -Compress;[Console]::Error.WriteLine(''TIRITH_SERIALIZE_END'');[Console]::Out.Write($json);'+$finish
+        no_module='$PSModuleAutoloadingPreference=''None'';'+$preamble+$collect+
+            '[Console]::Out.WriteLine(''TIRITH_FIELDS_V1'');foreach($key in $observation.Keys){[Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$observation[$key])))};'+$finish
+    }
     $baseKeys=@('HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','XDG_CONFIG_HOME','SystemRoot','WINDIR','APPDATA','LOCALAPPDATA','TEMP','TMP','TMPDIR','LANG','LC_ALL')
     $documents=[Environment]::GetFolderPath('MyDocuments')
+    $report.system_windows_directory=$systemWindowsDirectory
     $variants=@(
-        @{name='powershell'; path=(Join-Path ([Environment]::GetFolderPath('Windows')) 'System32/WindowsPowerShell/v1.0/powershell.exe'); profile=(Join-Path $documents 'WindowsPowerShell/Microsoft.PowerShell_profile.ps1'); envs=@('current','empty')},
-        @{name='pwsh'; path=(Join-Path $PSHOME 'pwsh.exe'); profile=(Join-Path $documents 'PowerShell/Microsoft.PowerShell_profile.ps1'); envs=@('current')}
+        @{name='powershell'; path=(Join-Path $systemWindowsDirectory 'System32/WindowsPowerShell/v1.0/powershell.exe'); profile=(Join-Path $documents 'WindowsPowerShell/Microsoft.PowerShell_profile.ps1'); env='current'; path_kind='dos'; query='statements'},
+        @{name='powershell'; path=(Join-Path $systemWindowsDirectory 'System32/WindowsPowerShell/v1.0/powershell.exe'); profile=(Join-Path $documents 'WindowsPowerShell/Microsoft.PowerShell_profile.ps1'); env='current'; path_kind='dos'; query='no_module'},
+        @{name='powershell'; path=(Join-Path $systemWindowsDirectory 'System32/WindowsPowerShell/v1.0/powershell.exe'); profile=(Join-Path $documents 'WindowsPowerShell/Microsoft.PowerShell_profile.ps1'); env='system_root'; path_kind='dos'; query='no_module'},
+        @{name='pwsh'; path=(Join-Path $PSHOME 'pwsh.exe'); profile=(Join-Path $documents 'PowerShell/Microsoft.PowerShell_profile.ps1'); env='system_root'; path_kind='canonical'; query='no_module'}
     )
     foreach ($variant in $variants) {
         $pin=Get-CiFilePin $variant.path
         $leases.Add((Open-CiPinnedFile $pin))
         if ($pin.path -notmatch '^[A-Za-z]:\\' -or $pin.size -gt 268435456) { throw 'Ordinary DOS executable path required' }
-        foreach ($envKind in $variant.envs) {
-            foreach ($pathKind in @('canonical','dos')) {
-                $case=[ordered]@{shell=$variant.name; environment_kind=$envKind; path_kind=$pathKind; native_executable=$pin; process=$null}
+        $envKind=$variant.env
+        $pathKind=$variant.path_kind
+        $query=$queries[$variant.query]
+                $case=[ordered]@{shell=$variant.name; environment_kind=$envKind; path_kind=$pathKind; native_executable=$pin; query_kind=$variant.query; process=$null}
                 $report.cases += $case
-                $dir=Join-Path $EvidenceDirectory ($variant.name+'-'+$envKind+'-'+$pathKind)
+                $dir=Join-Path $EvidenceDirectory ($variant.name+'-'+$envKind+'-'+$pathKind+'-'+$variant.query)
                 New-Item -ItemType Directory -Path $dir | Out-Null
                 $environment=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
                 # ProcessRunner starts with inherited variables, so explicitly
@@ -97,6 +149,10 @@ try {
                     $environment['PSModuleAnalysisCachePath']=Join-Path $dir 'module-cache'
                     foreach ($key in @('POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK','PSModuleAnalysisCachePath')) { $expected[$key]=$environment[$key] }
                 }
+                if ($envKind -ceq 'system_root') {
+                    $environment['SystemRoot']=$systemWindowsDirectory
+                    $expected['SystemRoot']=$systemWindowsDirectory
+                }
                 foreach ($key in $ambient.Keys) {
                     if (-not $expected.ContainsKey([string]$key) -and $null -ne $environment[[string]$key]) { throw 'Ambient environment entry was not removed with actual null' }
                 }
@@ -105,7 +161,7 @@ try {
                 foreach ($key in $surviving) {
                     if (-not $expected.ContainsKey($key) -or $environment[$key] -cne $expected[$key]) { throw 'Finite environment key or value differs' }
                 }
-                if ($envKind -ceq 'empty' -and $surviving.Count -ne 0) { throw 'Empty environment retained an entry' }
+                if ($envKind -ceq 'system_root' -and ($surviving.Count -ne 1 -or -not $expected.ContainsKey('SystemRoot'))) { throw 'Minimal native environment differs' }
                 $case.environment_exactly_admitted=$true
                 $case.environment_names=@($environment.Keys | Where-Object {$null -ne $environment[$_]} | Sort-Object)
                 $application=if ($pathKind -ceq 'canonical') {'\\?\'+$pin.path} else {$pin.path}
@@ -120,6 +176,9 @@ try {
                 Assert-DiagnosticCleanup $run
                 $case.query_entered=$run.Stderr.Contains('TIRITH_NATIVE_QUERY_ENTERED')
                 $case.query_finished=$run.Stderr.Contains('TIRITH_NATIVE_QUERY_FINISHED')
+                $case.progress_markers=@([regex]::Matches($run.Stderr,'(?m)^TIRITH_[A-Z_]+\r?$') | ForEach-Object {$_.Value.TrimEnd([char]13)})
+                $moduleMatch=[regex]::Match($run.Stderr,'(?m)^TIRITH_MODULE_PATH_BASE64=([A-Za-z0-9+/=]*)\r?$')
+                if ($moduleMatch.Success) { $case.reconstructed_module_path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($moduleMatch.Groups[1].Value)) }
                 $after=Profile-State $variant.profile
                 $case.profile_after=$after
                 $case.profile_unchanged=($before|ConvertTo-Json -Depth 10 -Compress) -ceq ($after|ConvertTo-Json -Depth 10 -Compress)
@@ -127,7 +186,17 @@ try {
                 $case.query_succeeded=($run.ExitCode -eq 0 -and -not $run.TimedOut)
                 if ($case.query_succeeded) {
                     if (-not $case.query_entered -or -not $case.query_finished) { throw 'Successful query omitted progress markers' }
-                    $observed=$run.Stdout|ConvertFrom-Json -Depth 10
+                    if ($variant.query -ceq 'statements') { $observed=$run.Stdout|ConvertFrom-Json -Depth 10 }
+                    else {
+                        $lines=$run.Stdout.Replace("`r`n","`n").Split([char]10)
+                        if ($lines.Count -ne $fields.Count+2 -or $lines[0] -cne 'TIRITH_FIELDS_V1' -or $lines[-1] -cne '') { throw 'Fixed field wire framing differs' }
+                        $values=[ordered]@{}; $index=1
+                        foreach ($key in $fields.Keys) {
+                            if ($lines[$index] -cnotmatch '^[A-Za-z0-9+/=]*$') { throw 'Fixed field wire encoding differs' }
+                            $values[$key]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lines[$index])); $index++
+                        }
+                        $observed=[pscustomobject]$values
+                    }
                     if ($observed.host_name -cne 'ConsoleHost' -or $observed.profile -cne $variant.profile -or
                         $observed.current_user_current_host -cne $variant.profile -or
                         $observed.executable -ine $pin.path) { throw 'Query returned an unexpected native target' }
@@ -136,10 +205,8 @@ try {
                 $afterPin=Get-CiFilePin $pin.path
                 if ($afterPin.sha256 -cne $pin.sha256 -or $afterPin.size -ne $pin.size) { throw 'Native executable changed' }
                 Write-CiJson (Join-Path $EvidenceDirectory 'report.json') $report
-            }
-        }
     }
-    if ($report.cases.Count -ne 6) { throw 'Diagnostic matrix incomplete' }
+    if ($report.cases.Count -ne 4) { throw 'Diagnostic matrix incomplete' }
     foreach ($relative in $pins.Keys) {
         if ((Get-CiFilePin (Join-Path $Workspace $relative)).sha256 -cne $pins[$relative]) { throw 'Diagnostic source changed' }
     }
