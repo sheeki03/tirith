@@ -1700,6 +1700,23 @@ type SigpipePublicationGuard = SigpipeDeliveryGuard;
 #[cfg(target_os = "macos")]
 type SigpipePublicationGuard = SigpipeDescriptorGuard;
 
+/// One nonblocking pipe write under the existing scoped SIGPIPE protection.
+/// Callers poll before entering: Darwin's descriptor-policy mutex must never
+/// cover a readiness wait. Preserve EPIPE/WouldBlock for the framing caller.
+#[cfg(unix)]
+pub(crate) fn write_pipe_sigpipe_safe(writer: &mut File, bytes: &[u8]) -> std::io::Result<usize> {
+    let mut guard =
+        SigpipePublicationGuard::begin(writer.as_raw_fd()).map_err(std::io::Error::other)?;
+    let result = writer.write(bytes);
+    match (result, guard.finish()) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(std::io::Error::other(error)),
+        (Err(error), Err(signal_error)) => Err(std::io::Error::other(format!(
+            "pipe write: {error}; {signal_error}"
+        ))),
+    }
+}
+
 #[cfg(unix)]
 fn write_stdout_line_sigpipe_safe(line: &str) -> Result<(), String> {
     let mut guard = SigpipePublicationGuard::begin(libc::STDOUT_FILENO)?;

@@ -625,23 +625,23 @@ impl AcceptedOperation {
         Ok(())
     }
     /// After a failed child is killed and reaped, retire its unapplied grant.
-    pub(crate) fn fail_handoff(&self) -> Result<OperationView, String> {
-        let _lock = self
+    #[cfg(unix)]
+    pub(crate) fn fail_handoff(
+        &self,
+        stage: super::lifecycle_operations::HandoffStage,
+        diagnostic: &str,
+    ) -> Result<OperationView, String> {
+        let view = self
             .retained
             .store
-            .lock(&self.id)?
-            .ok_or("worker is still active; wait for it before retiring the handoff")?;
-        let mut operation = self.retained.store.load::<BinaryPlan>(&self.id)?;
-        if operation.phase() != Phase::Accepted {
-            return Err("handoff phase changed; inspect its durable status".into());
-        }
-        self.retained.store.transition(&mut operation, Phase::RefreshRequired, false, Some("worker_handoff_failed"), "The worker did not receive a complete retained-context handoff. No publication was authorized; prepare a fresh preview.")?;
+            .fail_handoff(&self.id, stage, diagnostic)?;
         retained_plans()
             .lock()
             .map_err(|_| "lifecycle registry unavailable")?
             .remove(&self.id);
-        Ok(operation.view())
+        Ok(view)
     }
+
     pub(crate) fn view(&self) -> Result<OperationView, String> {
         Ok(self.retained.store.load::<BinaryPlan>(&self.id)?.view())
     }

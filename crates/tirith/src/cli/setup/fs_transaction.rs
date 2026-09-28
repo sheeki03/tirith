@@ -405,12 +405,13 @@ where
     V: FnMut() -> Result<(), String>,
 {
     revalidate()?;
-    let pre = super::fs_helpers::read_snapshot_scoped_capped(path, scope, 128 * 1024)?;
+    let lock_timeout = std::time::Duration::from_secs(2);
+    let pre = read_transaction_snapshot(path, scope, 128 * 1024, lock_timeout)?;
     pre.require_private()?;
     if pre.bytes.is_none() || !matches(pre.bytes.as_deref()) {
         return Err("team connection changed before disconnect".into());
     }
-    let lock = PlatformTransaction::lock_for(path, scope, std::time::Duration::from_secs(2))?;
+    let lock = PlatformTransaction::lock_for(path, scope, lock_timeout)?;
     revalidate()?;
     let tx = PlatformTransaction::begin(path, scope, lock)?;
     tx.validate_snapshot(&pre)?;
@@ -440,7 +441,8 @@ where
         let cap = selector.cap();
         revalidate()?;
         witness.revalidate().map_err(|e| e.to_string())?;
-        let pre = super::fs_helpers::read_snapshot_scoped_capped(path, scope, cap)?;
+        let lock_timeout = std::time::Duration::from_secs(2);
+        let pre = read_transaction_snapshot(path, scope, cap, lock_timeout)?;
         pre.require_private()?;
         if pre.bytes.is_none()
             || !matches(pre.bytes.as_deref())
@@ -448,7 +450,7 @@ where
         {
             return Err("enrollment changed before withdrawal".into());
         }
-        let lock = PlatformTransaction::lock_for(path, scope, std::time::Duration::from_secs(2))?;
+        let lock = PlatformTransaction::lock_for(path, scope, lock_timeout)?;
         revalidate()?;
         witness.revalidate().map_err(|e| e.to_string())?;
         let tx = PlatformTransaction::begin(path, scope, lock)?;
@@ -547,6 +549,30 @@ fn prepare_private_activation_parent(
     Ok(private)
 }
 
+fn read_transaction_snapshot(
+    path: &Path,
+    scope_root: &Path,
+    read_cap: usize,
+    lock_timeout: std::time::Duration,
+) -> Result<super::fs_helpers::PlatformSnapshot, String> {
+    #[cfg(windows)]
+    {
+        // Snapshot readers join the writer mutex on Windows. Preserve an
+        // explicitly shorter transaction wait during the preflight read too.
+        super::fs_helpers::read_snapshot_scoped_capped_with_timeout(
+            path,
+            scope_root,
+            read_cap,
+            lock_timeout,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = lock_timeout;
+        super::fs_helpers::read_snapshot_scoped_capped(path, scope_root, read_cap)
+    }
+}
+
 fn transactional_update_impl<F, V, A>(
     path: &Path,
     scope_root: &Path,
@@ -566,7 +592,7 @@ where
     // rejected oversized writes therefore remain completely non-mutating.
     revalidate_selection()?;
     let preflight_snapshot = FileSnapshot {
-        inner: super::fs_helpers::read_snapshot_scoped_capped(path, scope_root, options.read_cap)?,
+        inner: read_transaction_snapshot(path, scope_root, options.read_cap, options.lock_timeout)?,
     };
     let mut update = transform(&preflight_snapshot)?;
     validate_update_size(&update)?;
@@ -587,7 +613,7 @@ where
     let transaction_lock = PlatformTransaction::lock_for(path, scope_root, options.lock_timeout)?;
     revalidate_selection()?;
     let snapshot = FileSnapshot {
-        inner: super::fs_helpers::read_snapshot_scoped_capped(path, scope_root, options.read_cap)?,
+        inner: read_transaction_snapshot(path, scope_root, options.read_cap, options.lock_timeout)?,
     };
     if snapshot.inner != preflight_snapshot.inner {
         // A cooperative writer may have completed between the side-effect-free

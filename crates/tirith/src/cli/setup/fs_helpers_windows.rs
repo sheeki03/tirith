@@ -107,6 +107,9 @@ thread_local! {
     static CREATED_ARTIFACT_CAPTURE_TEST_HOOK: std::cell::RefCell<
         Option<Box<dyn FnMut(&Path)>>,
     > = std::cell::RefCell::new(None);
+    static SCOPED_READ_TEST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&Path)>>,
+    > = std::cell::RefCell::new(None);
     static DELETE_FAILURE_TEST_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1416,16 +1419,11 @@ pub(crate) fn read_snapshot_scoped(
     path: &Path,
     scope_root: &Path,
 ) -> Result<PlatformSnapshot, String> {
-    let Some(parent) = validated_parent(path, scope_root, false)? else {
-        return Ok(PlatformSnapshot::absent());
-    };
-    let destination = parent.path.join(
-        path.file_name()
-            .ok_or_else(|| format!("no file name for {}", path.display()))?,
-    );
-    let snapshot = snapshot_destination(&destination, path)?;
-    drop(parent);
-    Ok(snapshot)
+    read_snapshot_scoped_capped(
+        path,
+        scope_root,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
 }
 
 /// Read at a smaller cap while retaining the same parent, ACL, and file-generation checks.
@@ -1434,6 +1432,26 @@ pub(crate) fn read_snapshot_scoped_capped(
     scope_root: &Path,
     limit: usize,
 ) -> Result<PlatformSnapshot, String> {
+    read_snapshot_scoped_capped_with_timeout(
+        path,
+        scope_root,
+        limit,
+        super::fs_transaction::SETUP_LOCK_TIMEOUT,
+    )
+}
+
+pub(crate) fn read_snapshot_scoped_capped_with_timeout(
+    path: &Path,
+    scope_root: &Path,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> Result<PlatformSnapshot, String> {
+    // A snapshot deliberately denies delete sharing while it checks the file's
+    // bytes and DACL. Coordinate with publication so a concurrent status read
+    // cannot turn ReplaceFileW into a sharing violation after a mutation has
+    // already applied. This transient mutex creates no filesystem entries and
+    // is recursive when the current transaction already owns it.
+    let _lock = PlatformTransaction::lock_for(path, scope_root, timeout)?;
     let Some(parent) = validated_parent(path, scope_root, false)? else {
         return Ok(PlatformSnapshot::absent());
     };
@@ -1443,6 +1461,12 @@ pub(crate) fn read_snapshot_scoped_capped(
     let Some(handle) = open_existing(&destination)? else {
         return Ok(PlatformSnapshot::absent());
     };
+    #[cfg(test)]
+    SCOPED_READ_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
     let (_, bytes, generation) = capture_stable_file_capped(
         handle.into_file(),
         path,
@@ -1648,9 +1672,16 @@ fn open_transaction_mutex(path: &Path, scope_root: &Path) -> Result<OwnedHandle,
     Ok(OwnedHandle(handle))
 }
 
+thread_local! {
+    static TRANSACTION_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct PlatformLock {
     mutex: OwnedHandle,
     owned: bool,
+    transaction: bool,
+    // Native mutex ownership and the nesting count belong to this thread.
+    _thread_bound: std::marker::PhantomData<Rc<()>>,
 }
 
 pub(crate) fn try_lock_operation(
@@ -1660,7 +1691,12 @@ pub(crate) fn try_lock_operation(
     let mutex = open_transaction_mutex(path, scope)?;
     let wait = unsafe { WaitForSingleObject(mutex.0, 0) };
     if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-        Ok(Some(PlatformLock { mutex, owned: true }))
+        Ok(Some(PlatformLock {
+            mutex,
+            owned: true,
+            transaction: false,
+            _thread_bound: std::marker::PhantomData,
+        }))
     } else if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
         Ok(None)
     } else {
@@ -1673,6 +1709,9 @@ impl Drop for PlatformLock {
         if self.owned {
             unsafe {
                 let _ = ReleaseMutex(self.mutex.0);
+            }
+            if self.transaction {
+                TRANSACTION_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
             }
         }
     }
@@ -1699,6 +1738,17 @@ impl PlatformTransaction {
         timeout: std::time::Duration,
     ) -> Result<PlatformLock, String> {
         let mutex = open_transaction_mutex(path, scope_root)?;
+        // Multi-file authorization may read another destination while holding
+        // the current writer lock. Never wait in that situation: two writers
+        // could otherwise hold A/B and each wait for the other's snapshot.
+        // Same-thread recursion on the same native mutex still succeeds.
+        let timeout = TRANSACTION_LOCK_DEPTH.with(|depth| {
+            if depth.get() == 0 {
+                timeout
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
         super::fs_transaction::wait_for_lock(timeout, || {
             let wait = unsafe { WaitForSingleObject(mutex.0, 0) };
             if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
@@ -1712,7 +1762,13 @@ impl PlatformTransaction {
                 ))
             }
         })?;
-        Ok(PlatformLock { mutex, owned: true })
+        TRANSACTION_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Ok(PlatformLock {
+            mutex,
+            owned: true,
+            transaction: true,
+            _thread_bound: std::marker::PhantomData,
+        })
     }
 
     pub(crate) fn begin(
@@ -3003,6 +3059,128 @@ mod tests {
     };
     use super::*;
 
+    #[test]
+    fn scoped_snapshot_readers_coordinate_with_atomic_publication() {
+        for capped in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("operation.json");
+            create_protected_owner_only_file(&path, b"prepared");
+            let before = read_snapshot_scoped(&path, root.path()).unwrap();
+            let worker_path = path.clone();
+            let worker_root = root.path().to_path_buf();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                start_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                // Observe the actual named mutex from another thread while
+                // the reader still holds the no-share-delete file handle.
+                let contended =
+                    PlatformTransaction::lock_is_contended(&worker_path, &worker_root).unwrap();
+                observed_tx.send(contended).unwrap();
+                transactional_update(&worker_path, &worker_root, false, |_| {
+                    Ok(FileUpdate::write_text("completed".into(), 0o600))
+                })
+            });
+            let read = with_scoped_read_hook(
+                move |_| {
+                    start_tx.send(()).unwrap();
+                    assert!(observed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap());
+                },
+                || {
+                    if capped {
+                        read_snapshot_scoped_capped(&path, root.path(), 32)
+                    } else {
+                        read_snapshot_scoped(&path, root.path())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(read, before);
+            writer.join().unwrap().unwrap();
+            let after = read_snapshot_scoped(&path, root.path()).unwrap();
+            assert_eq!(after.bytes.as_deref(), Some(&b"completed"[..]));
+            after.require_private().unwrap();
+            let (SnapshotGeneration::Present(before), SnapshotGeneration::Present(after)) =
+                (before.generation, after.generation)
+            else {
+                panic!("both generations must exist")
+            };
+            assert_ne!(before.file_index, after.file_index);
+            assert_eq!(before.security_descriptor, after.security_descriptor);
+        }
+    }
+
+    #[test]
+    fn snapshot_read_preserves_short_wait_and_is_recursive_for_its_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operation.json");
+        create_protected_owner_only_file(&path, b"prepared");
+        let _lock = PlatformTransaction::lock(&path, root.path()).unwrap();
+        // A transaction's own repeated capture must not deadlock.
+        let snapshot = read_snapshot_scoped_capped_with_timeout(
+            &path,
+            root.path(),
+            32,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(snapshot.bytes.as_deref(), Some(&b"prepared"[..]));
+        let worker_path = path.clone();
+        let worker_root = root.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            read_snapshot_scoped_capped_with_timeout(
+                &worker_path,
+                &worker_root,
+                32,
+                std::time::Duration::ZERO,
+            )
+        });
+        assert!(reader.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn cross_target_snapshot_contention_refuses_without_a_nested_lock_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.json");
+        let second = root.path().join("second.json");
+        create_protected_owner_only_file(&first, b"first");
+        create_protected_owner_only_file(&second, b"second");
+        let worker_path = second.clone();
+        let worker_root = root.path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = PlatformTransaction::lock(&worker_path, &worker_root).unwrap();
+            held_tx.send(()).unwrap();
+            // A broken reader that waits will only proceed after this deadline
+            // and return success, causing the parent's refusal assertion to fail.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let lock = PlatformTransaction::lock(&first, root.path()).unwrap();
+        let result = read_snapshot_scoped(&second, root.path());
+        let released_while_held = release_tx.send(()).is_ok();
+        drop(lock);
+        holder.join().unwrap();
+        assert!(result.is_err());
+        assert!(released_while_held);
+        // Releasing every guard restores normal reads; failed acquisition must
+        // not leave the thread's nesting count elevated.
+        assert_eq!(
+            read_snapshot_scoped(&second, root.path())
+                .unwrap()
+                .bytes
+                .as_deref(),
+            Some(&b"second"[..])
+        );
+    }
+
     fn symlink_directory_or_explicitly_skip(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => true,
@@ -3091,6 +3269,22 @@ mod tests {
         fn drop(&mut self) {
             CREATED_ARTIFACT_CAPTURE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
         }
+    }
+
+    struct ScopedReadHookReset;
+    impl Drop for ScopedReadHookReset {
+        fn drop(&mut self) {
+            SCOPED_READ_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn with_scoped_read_hook<T>(hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
+        SCOPED_READ_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        let _reset = ScopedReadHookReset;
+        run()
     }
 
     fn with_replace_hook<T>(

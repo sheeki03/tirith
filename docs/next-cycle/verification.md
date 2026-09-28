@@ -1,5 +1,83 @@
 # Implementation verification
 
+## September 28: protected Linux execute-only mode 2
+
+Native ARM run `36394084953` executes a small static OS probe in the pinned npm
+runtime image as UID 65534, with no capabilities or network and no system-setting
+changes. A readable executable becomes dumpability mode 1 and permits the
+same-user parent to read its inert canary through procfs and process memory and
+attach/detach with ptrace. The execute-only control becomes the observed host
+policy mode 2 and denies those fresh accesses with EACCES/EPERM. Before exec,
+mode 0 already denies private-descriptor acquisition; the launch descriptor is
+closed on exec in both controls.
+
+Both probe children exit normally, all 23 owned CLI children and both exact
+containers clean up, and all 54 retained files rehash. The static probe ELF is
+709,080 bytes, SHA-256
+`f0e570eae2f58d179bd4b50792abd9b5470231b604d74fe98ee3a1824f7a3605`.
+Independent original-result review SHA-256:
+`25d17e10be691b91491d8f74388c0df51cd6824a7a616d1b0e4436ca01f76cda`.
+
+The launcher prerequisite now accepts the kernel's protected modes 0 and 2;
+mode 1 and malformed values remain refused. Mode 2 permits administrator-controlled
+core handling and is not described as disabling core dumps. This change avoids
+an unnecessary system-wide configuration requirement while preserving the
+ordinary same-user protection boundary. It does not identify the original npm
+fixture failure or qualify integrated npm execution; that gate remains closed.
+
+## September 28: Windows snapshot/publication coordination
+
+At `2d723b0f`, CI run `36392165108` passes the ordinary Windows harnesses but
+one of nine standard-account dashboard cases fails: profile application reaches
+its applied step, then journal replacement reports `ERROR_SHARING_VIOLATION`
+while the client polls status. Artifact `10956724886` ZIP SHA-256:
+`7653a8a692aefb62f6fe6cefbbe83c41adef6fbcfe8057c794c001d03314e281`.
+Native cleanup passes. The later PowerShell resolver check is skipped. Linux,
+macOS, Rust 1.83, release, native ARM, fuzz and benchmark/resource jobs pass;
+Windows and its dependent missing-evidence uploads are the only failed CI steps.
+
+Scoped snapshot readers hold handles that intentionally deny deletion but did
+not coordinate with the atomic writer. They now join its bounded per-path mutex
+through the complete read, preserving file, generation and DACL checks. Explicit
+shorter transaction timeouts also apply to preflight reads. Nested acquisitions
+never wait while holding another transaction mutex: same-path recursion works,
+and a contended different target refuses without creating a lock cycle.
+Native controls cover reader/writer contention, actual replacement with unchanged
+permissions, recursion, short waits and cross-target contention. Static review
+passes; the corrected Windows product and resolver checks remain pending.
+
+## September 28: ordinary Linux lifecycle handoff diagnosis
+
+Two bounded compositions use the ordinary `d0213a22` and `e282d038` GNU ARM
+PR images with explicitly synthetic rollback history. Both images retain
+version 0.4.2; this checks worker composition, not numeric upgrade or production
+download. The actual service prepares and accepts the operation. The second
+attempt records `refresh_required`, `published: false` and
+`worker_handoff_failed` before cleanup; the installed image remains unchanged.
+It does not produce the replacement service within the observation deadline.
+The saved code cannot distinguish the initiating handoff stage. Report SHA-256:
+`38e99959032da37a3e9c209aab65734baf45450d826e5ea2c2f8b3eeae28c5a3`.
+
+The separate refusal control leaves its prepared plan, installed files and
+configuration unchanged, then cancels successfully. Its original fixture label
+mentions an oversized frame, but Node creates a socket pair and the worker
+requires FIFO handles. It therefore establishes unsupported-descriptor refusal,
+not the frame-size parser branch. Original artifacts retain their original
+labels; this correction defines the supported claim.
+
+All thirteen owned Docker CLI jobs and four direct guest children close, the
+exact container is removed and observed absent, all eight input postchecks
+pass, and the ten preexisting containers remain running. Source review separately
+identifies buffered worker standard I/O used with raw-descriptor polling.
+The correction retains unbuffered pipe files and records a finite public failure
+stage separately from bounded private diagnostics. Each nonblocking write uses
+the existing scoped SIGPIPE guard so a peer closing after readiness cannot
+terminate the service. Five actual pipe/stdio controls, including default-SIGPIPE
+refusal and signal-state restoration, and eleven lifecycle-store controls pass
+locally. Identifying the earlier failure
+and qualifying the full corrected service/worker composition remain necessary.
+The passing numeric replacement/death/reload cases below remain distinct.
+
 ## September 28: cd062069 native PowerShell follow-up
 
 CI run `36388805399` passes the Windows workspace and standard-account dashboard

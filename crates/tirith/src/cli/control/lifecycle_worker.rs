@@ -5,9 +5,13 @@ use serde_json::Value;
 #[cfg(unix)]
 mod native {
     use super::*;
+    use crate::cli::selfupdate::lifecycle_operations::HandoffStage;
     use crate::cli::selfupdate::lifecycle_service;
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::fs::File;
+    use std::io::Read;
+    #[cfg(test)]
+    use std::io::Write;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -80,7 +84,7 @@ mod native {
     }
 
     fn read_exact(
-        reader: &mut (impl Read + AsRawFd),
+        reader: &mut File,
         mut bytes: &mut [u8],
         deadline: Instant,
     ) -> Result<(), String> {
@@ -100,7 +104,7 @@ mod native {
         Ok(())
     }
 
-    fn read_frame(reader: &mut (impl Read + AsRawFd), deadline: Instant) -> Result<Value, String> {
+    fn read_frame(reader: &mut File, deadline: Instant) -> Result<Value, String> {
         pipe(reader.as_raw_fd())?;
         let mut prefix = [0u8; 4];
         read_exact(reader, &mut prefix, deadline)?;
@@ -113,11 +117,7 @@ mod native {
         serde_json::from_slice(&bytes).map_err(|_| "invalid lifecycle handoff frame".into())
     }
 
-    fn write_frame(
-        writer: &mut (impl Write + AsRawFd),
-        value: &Value,
-        deadline: Instant,
-    ) -> Result<(), String> {
+    fn write_frame(writer: &mut File, value: &Value, deadline: Instant) -> Result<(), String> {
         pipe(writer.as_raw_fd())?;
         let bytes = serde_json::to_vec(value).map_err(|_| "cannot encode lifecycle handoff")?;
         if bytes.is_empty() || bytes.len() > FRAME_CAP {
@@ -129,7 +129,7 @@ mod native {
         let mut remaining = framed.as_slice();
         while !remaining.is_empty() {
             ready(writer.as_raw_fd(), libc::POLLOUT, deadline)?;
-            match writer.write(remaining) {
+            match crate::cli::check::write_pipe_sigpipe_safe(writer, remaining) {
                 Ok(0) => return Err("lifecycle handoff pipe stopped accepting data".into()),
                 Ok(n) => remaining = &remaining[n..],
                 Err(error)
@@ -143,13 +143,46 @@ mod native {
         Ok(())
     }
 
-    fn execute(accepted: &lifecycle_service::AcceptedOperation) -> Result<(), String> {
+    struct HandoffFailure {
+        stage: HandoffStage,
+        diagnostic: String,
+    }
+
+    impl HandoffFailure {
+        fn new(stage: HandoffStage, error: impl std::fmt::Display) -> Self {
+            Self {
+                stage,
+                diagnostic: error.to_string(),
+            }
+        }
+    }
+
+    /// Raw-descriptor polling must use unbuffered reads and writes. Stdin may
+    /// prefetch a body when reading its prefix; Stdout may retain a reply while
+    /// awaiting GO. Duplicate and retain the actual pipes before any framed I/O.
+    fn worker_pipes() -> Result<(File, File), String> {
+        let input = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| "cannot retain worker input pipe")?;
+        let output = std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| "cannot retain worker output pipe")?;
+        pipe(input.as_raw_fd())?;
+        pipe(output.as_raw_fd())?;
+        Ok((File::from(input), File::from(output)))
+    }
+
+    fn execute(accepted: &lifecycle_service::AcceptedOperation) -> Result<(), HandoffFailure> {
         let executable = tirith_core::trusted_child::TrustedExecutable::from_absolute(
             accepted.executable(),
             &[],
         )
-        .map_err(|_| "lifecycle worker executable is untrusted")?;
-        let evidence = accepted.handoff_identity()?;
+        .map_err(|error| HandoffFailure::new(HandoffStage::ExecutableTrust, error))?;
+        let evidence = accepted
+            .handoff_identity()
+            .map_err(|error| HandoffFailure::new(HandoffStage::RetainedContext, error))?;
         let mut command = Command::new(executable.launch_path());
         command
             .args([
@@ -176,27 +209,30 @@ mod native {
         }
         executable
             .verify_identity()
-            .map_err(|_| "lifecycle worker executable changed")?;
+            .map_err(|error| HandoffFailure::new(HandoffStage::ExecutableIdentity, error))?;
         let mut child = ChildGuard(
             command
                 .spawn()
-                .map_err(|_| "cannot start lifecycle worker")?,
+                .map_err(|error| HandoffFailure::new(HandoffStage::Spawn, error))?,
         );
-        let mut input = child
-            .0
-            .stdin
-            .take()
-            .ok_or("worker input pipe unavailable")?;
-        let mut output = child
-            .0
-            .stdout
-            .take()
-            .ok_or("worker output pipe unavailable")?;
+        let input = child.0.stdin.take().ok_or_else(|| {
+            HandoffFailure::new(HandoffStage::InputPipe, "worker input pipe unavailable")
+        })?;
+        let output = child.0.stdout.take().ok_or_else(|| {
+            HandoffFailure::new(HandoffStage::OutputPipe, "worker output pipe unavailable")
+        })?;
+        let mut input = File::from(OwnedFd::from(input));
+        let mut output = File::from(OwnedFd::from(output));
         let deadline = Instant::now() + HANDOFF_DEADLINE;
-        write_frame(&mut input, &evidence, deadline)?;
-        let reply = read_frame(&mut output, deadline)?;
-        accepted.confirm_worker(&reply)?;
-        write_frame(&mut input, &reply, deadline)?;
+        write_frame(&mut input, &evidence, deadline)
+            .map_err(|error| HandoffFailure::new(HandoffStage::SendContext, error))?;
+        let reply = read_frame(&mut output, deadline)
+            .map_err(|error| HandoffFailure::new(HandoffStage::ReceiveContext, error))?;
+        accepted
+            .confirm_worker(&reply)
+            .map_err(|error| HandoffFailure::new(HandoffStage::ConfirmContext, error))?;
+        write_frame(&mut input, &reply, deadline)
+            .map_err(|error| HandoffFailure::new(HandoffStage::SendGo, error))?;
         drop(input);
         drop(output);
         let deadline = Instant::now() + WORKER_DEADLINE;
@@ -204,17 +240,20 @@ mod native {
             match child
                 .0
                 .try_wait()
-                .map_err(|_| "cannot inspect lifecycle worker")?
+                .map_err(|error| HandoffFailure::new(HandoffStage::InspectWorker, error))?
             {
                 Some(status) if status.success() => return Ok(()),
                 Some(_) => {
-                    return Err("lifecycle worker stopped; inspect its saved operation".into())
+                    return Err(HandoffFailure::new(
+                        HandoffStage::WorkerExit,
+                        "lifecycle worker stopped; inspect its saved operation",
+                    ))
                 }
                 None if Instant::now() >= deadline => {
-                    return Err(
-                        "lifecycle worker exceeded its deadline; inspect its saved operation"
-                            .into(),
-                    )
+                    return Err(HandoffFailure::new(
+                        HandoffStage::WorkerDeadline,
+                        "lifecycle worker exceeded its deadline; inspect its saved operation",
+                    ))
                 }
                 None => std::thread::sleep(Duration::from_millis(100)),
             }
@@ -237,15 +276,18 @@ mod native {
             .name("tirith-lifecycle-handoff".into())
             .spawn(move || {
                 let _permit = permit;
-                if execute(&worker_operation).is_err() {
+                if let Err(failure) = execute(&worker_operation) {
                     // execute drops/kills/reaps its own child before returning.
                     // A failed handshake must not leave a replayable Accepted job.
-                    let _ = worker_operation.fail_handoff();
+                    let _ = worker_operation.fail_handoff(failure.stage, &failure.diagnostic);
                 }
             })
             .is_err()
         {
-            let _ = accepted.fail_handoff();
+            let _ = accepted.fail_handoff(
+                HandoffStage::ThreadSpawn,
+                "cannot start lifecycle handoff thread",
+            );
             return Err("cannot start lifecycle handoff thread; inspect saved operation".into());
         }
         Ok(view)
@@ -256,8 +298,7 @@ mod native {
             return Err("invalid lifecycle worker operation identity".into());
         }
         super::super::lifecycle::require_unprivileged()?;
-        let mut input = std::io::stdin();
-        let mut output = std::io::stdout();
+        let (mut input, mut output) = worker_pipes()?;
         let deadline = Instant::now() + HANDOFF_DEADLINE;
         let parent = read_frame(&mut input, deadline)?;
         let captured = lifecycle_service::capture_worker(id)?;
@@ -324,9 +365,15 @@ mod native {
     mod tests {
         use super::*;
         use std::os::fd::FromRawFd;
-        fn pipes() -> (std::fs::File, std::fs::File) {
+        fn pipes() -> (File, File) {
             let mut fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for fd in fds {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
             unsafe {
                 (
                     std::fs::File::from_raw_fd(fds[0]),
@@ -334,6 +381,227 @@ mod native {
                 )
             }
         }
+        const PROBE: &str = "cli::control::lifecycle_worker::native::tests::stdio_framing_child";
+        const OUTPUT_FD: &str = "TIRITH_TEST_LIFECYCLE_PIPE_FD";
+        const MODE: &str = "TIRITH_TEST_LIFECYCLE_PIPE_MODE";
+
+        /// The test harness writes to /dev/null. Only this exact ignored child
+        /// redirects stdout to its parent's retained pipe before using the real
+        /// worker stdio adapter. No production environment-driven mode exists.
+        #[test]
+        #[ignore = "inert framing child; invoked only by owned stdio regression"]
+        fn stdio_framing_child() {
+            if !std::env::args()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair[0] == "--exact" && pair[1] == PROBE)
+            {
+                return;
+            }
+            let fd = std::env::var(OUTPUT_FD).unwrap().parse::<i32>().unwrap();
+            assert!(fd >= 3);
+            std::io::stdout().flush().unwrap();
+            assert_eq!(
+                unsafe { libc::dup2(fd, libc::STDOUT_FILENO) },
+                libc::STDOUT_FILENO
+            );
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            let (mut input, mut output) = worker_pipes().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            match std::env::var(MODE).unwrap().as_str() {
+                "roundtrip" => {
+                    for length in [16, 8192, 32 * 1024] {
+                        let expected = serde_json::json!({"payload":"x".repeat(length)});
+                        let incoming = read_frame(&mut input, deadline).unwrap();
+                        assert_eq!(incoming, expected);
+                        write_frame(&mut output, &incoming, deadline).unwrap();
+                    }
+                    // The parent closes its writer immediately after this GO,
+                    // so POLLIN|POLLHUP must still consume the pending bytes.
+                    assert_eq!(
+                        read_frame(&mut input, deadline).unwrap(),
+                        serde_json::json!({"go":true})
+                    );
+                }
+                "oversized" => {
+                    assert_eq!(
+                        read_frame(&mut input, deadline).unwrap_err(),
+                        "lifecycle handoff frame exceeds limit"
+                    );
+                    write_frame(
+                        &mut output,
+                        &serde_json::json!({"oversized_refused":true}),
+                        deadline,
+                    )
+                    .unwrap();
+                }
+                "sigpipe" => {
+                    // This is a separate owned process: never change the test
+                    // runner's or product's global signal policy.
+                    assert_ne!(
+                        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+                        libc::SIG_ERR
+                    );
+                    let mut before = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                    assert_eq!(
+                        unsafe {
+                            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut before)
+                        },
+                        0
+                    );
+                    assert_eq!(
+                        unsafe { libc::sigismember(&before, libc::SIGPIPE) },
+                        0,
+                        "regression requires an initially unblocked default SIGPIPE"
+                    );
+                    let (reader, mut writer) = pipes();
+                    pipe(writer.as_raw_fd()).unwrap();
+                    #[cfg(target_os = "macos")]
+                    let descriptor_policy = unsafe { libc::fcntl(writer.as_raw_fd(), 74) };
+                    ready(writer.as_raw_fd(), libc::POLLOUT, deadline).unwrap();
+                    // Deterministic reproduction of the readiness/write gap.
+                    drop(reader);
+                    let error = crate::cli::check::write_pipe_sigpipe_safe(&mut writer, b"frame")
+                        .unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                    assert!(write_frame(
+                        &mut writer,
+                        &serde_json::json!({"closed":true}),
+                        deadline
+                    )
+                    .is_err());
+                    let mut after = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                    assert_eq!(
+                        unsafe {
+                            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut after)
+                        },
+                        0
+                    );
+                    assert_eq!(
+                        unsafe { libc::sigismember(&before, libc::SIGPIPE) },
+                        unsafe { libc::sigismember(&after, libc::SIGPIPE) }
+                    );
+                    let mut pending = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                    assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
+                    assert_eq!(unsafe { libc::sigismember(&pending, libc::SIGPIPE) }, 0);
+                    let mut disposition = unsafe { std::mem::zeroed::<libc::sigaction>() };
+                    assert_eq!(
+                        unsafe {
+                            libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut disposition)
+                        },
+                        0
+                    );
+                    assert_eq!(disposition.sa_sigaction, libc::SIG_DFL);
+                    #[cfg(target_os = "macos")]
+                    assert_eq!(
+                        unsafe { libc::fcntl(writer.as_raw_fd(), 74) },
+                        descriptor_policy
+                    );
+                    write_frame(
+                        &mut output,
+                        &serde_json::json!({"broken_pipe_refused":true}),
+                        deadline,
+                    )
+                    .unwrap();
+                }
+                _ => panic!("unknown fixture mode"),
+            }
+            // No test-harness summary may enter the private framed stream.
+            std::process::exit(0);
+        }
+
+        fn stdio_child(mode: &str) -> (ChildGuard, File, File) {
+            use std::os::unix::process::CommandExt;
+            let (output, writer) = pipes();
+            // Keep the destination occupied in the parent so Rust's internal
+            // spawn error pipe cannot receive that descriptor number.
+            let destination = output.as_raw_fd();
+            let passed =
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, destination + 1) };
+            assert!(passed >= 0);
+            let passed = unsafe { File::from_raw_fd(passed) };
+            let source = passed.as_raw_fd();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", PROBE, "--test-threads=1"])
+                .env_clear()
+                .env(OUTPUT_FD, destination.to_string())
+                .env(MODE, mode)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(source, destination) < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut child = ChildGuard(command.spawn().unwrap());
+            drop(passed);
+            drop(writer);
+            let input = File::from(OwnedFd::from(child.0.stdin.take().unwrap()));
+            (child, input, output)
+        }
+
+        fn finished(child: &mut ChildGuard, deadline: Instant) {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                assert!(Instant::now() < deadline, "owned stdio child deadline");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        #[test]
+        fn real_worker_stdio_frames_complete_without_buffering_and_accept_final_hangup() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut child, mut input, mut output) = stdio_child("roundtrip");
+            for length in [16, 8192, 32 * 1024] {
+                let expected = serde_json::json!({"payload":"x".repeat(length)});
+                write_frame(&mut input, &expected, deadline).unwrap();
+                assert_eq!(read_frame(&mut output, deadline).unwrap(), expected);
+            }
+            write_frame(&mut input, &serde_json::json!({"go":true}), deadline).unwrap();
+            drop(input);
+            finished(&mut child, deadline);
+            let mut byte = [0];
+            assert_eq!(output.read(&mut byte).unwrap(), 0);
+        }
+
+        #[test]
+        fn actual_worker_stdio_fifo_rejects_oversized_frame_before_body() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut child, mut input, mut output) = stdio_child("oversized");
+            input
+                .write_all(&((FRAME_CAP + 1) as u32).to_be_bytes())
+                .unwrap();
+            assert_eq!(
+                read_frame(&mut output, deadline).unwrap(),
+                serde_json::json!({"oversized_refused":true})
+            );
+            drop(input);
+            finished(&mut child, deadline);
+        }
+
+        #[test]
+        fn reader_closing_after_ready_does_not_terminate_default_sigpipe_child() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut child, input, mut output) = stdio_child("sigpipe");
+            assert_eq!(
+                read_frame(&mut output, deadline).unwrap(),
+                serde_json::json!({"broken_pipe_refused":true})
+            );
+            drop(input);
+            finished(&mut child, deadline);
+            let mut byte = [0];
+            assert_eq!(output.read(&mut byte).unwrap(), 0);
+        }
+
         #[test]
         fn pipe_frames_preserve_identity_and_refuse_unbounded_or_truncated_input() {
             let (mut read, mut write) = pipes();

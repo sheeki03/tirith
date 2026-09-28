@@ -40,6 +40,49 @@ pub(crate) enum Phase {
     Failed,
 }
 
+/// A closed public vocabulary: private paths and transport errors stay in the
+/// owner-private support record, never in a browser failure code.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HandoffStage {
+    ThreadSpawn,
+    ExecutableTrust,
+    RetainedContext,
+    ExecutableIdentity,
+    Spawn,
+    InputPipe,
+    OutputPipe,
+    SendContext,
+    ReceiveContext,
+    ConfirmContext,
+    SendGo,
+    InspectWorker,
+    WorkerExit,
+    WorkerDeadline,
+}
+
+#[cfg(any(unix, test))]
+impl HandoffStage {
+    pub(crate) fn failure_code(self) -> &'static str {
+        match self {
+            Self::ThreadSpawn => "worker_handoff_thread_spawn_failed",
+            Self::ExecutableTrust => "worker_handoff_executable_untrusted",
+            Self::RetainedContext => "worker_handoff_retained_context_changed",
+            Self::ExecutableIdentity => "worker_handoff_executable_changed",
+            Self::Spawn => "worker_handoff_spawn_failed",
+            Self::InputPipe => "worker_handoff_input_pipe_unavailable",
+            Self::OutputPipe => "worker_handoff_output_pipe_unavailable",
+            Self::SendContext => "worker_handoff_context_send_failed",
+            Self::ReceiveContext => "worker_handoff_context_receive_failed",
+            Self::ConfirmContext => "worker_handoff_context_mismatch",
+            Self::SendGo => "worker_handoff_go_send_failed",
+            Self::InspectWorker => "worker_handoff_worker_inspection_failed",
+            Self::WorkerExit => "worker_handoff_worker_exited",
+            Self::WorkerDeadline => "worker_handoff_worker_deadline",
+        }
+    }
+}
+
 impl Phase {
     fn permits(self, next: Self) -> bool {
         self == next
@@ -401,6 +444,31 @@ impl Store {
         )
         .map_err(|_| "cannot encode private lifecycle diagnostic")?;
         self.write_private(&self.path(id, "failure.json")?, &bytes, None)
+    }
+
+    /// Retire only the original Accepted grant after its owned child has been
+    /// reaped. A worker that advanced its journal keeps its own result intact.
+    #[cfg(any(unix, test))]
+    pub(crate) fn fail_handoff(
+        &self,
+        id: &str,
+        stage: HandoffStage,
+        diagnostic: &str,
+    ) -> Result<OperationView, String> {
+        let _lock = self
+            .lock(id)?
+            .ok_or("worker is still active; wait for it before retiring the handoff")?;
+        let mut operation = self.load::<serde_json::Value>(id)?;
+        if operation.phase() != Phase::Accepted {
+            return Err("handoff phase changed; inspect its durable status".into());
+        }
+        // Failure to save an optional private diagnostic must not leave the
+        // Accepted grant replayable. Only the finite code enters the result.
+        let _ = self.record_failure(id, diagnostic);
+        self.transition(&mut operation, Phase::RefreshRequired, false,
+            Some(stage.failure_code()),
+            "The worker stopped before publication intent was recorded. This operation cannot resume; inspect the private support record and prepare a fresh preview.")?;
+        Ok(operation.view())
     }
 
     pub fn fail_preparation(&self, id: &str) -> Result<(), String> {
@@ -770,6 +838,98 @@ mod tests {
             std::fs::read(store.path(operation.id(), "plan.json").unwrap()).unwrap()
         );
         assert!(store.load::<serde_json::Value>(operation.id()).is_err());
+    }
+
+    #[test]
+    fn handoff_failure_persists_finite_stage_without_exposing_private_diagnostic() {
+        let (_directory, store) = fixture();
+        for stage in [
+            HandoffStage::ThreadSpawn,
+            HandoffStage::ExecutableTrust,
+            HandoffStage::RetainedContext,
+            HandoffStage::ExecutableIdentity,
+            HandoffStage::Spawn,
+            HandoffStage::InputPipe,
+            HandoffStage::OutputPipe,
+            HandoffStage::SendContext,
+            HandoffStage::ReceiveContext,
+            HandoffStage::ConfirmContext,
+            HandoffStage::SendGo,
+            HandoffStage::InspectWorker,
+            HandoffStage::WorkerExit,
+            HandoffStage::WorkerDeadline,
+        ] {
+            let mut operation = prepared(&store);
+            store
+                .transition(&mut operation, Phase::Accepted, false, None, "accepted")
+                .unwrap();
+            let view = store
+                .fail_handoff(operation.id(), stage, "/private/path token=secret-fixture")
+                .unwrap();
+            assert_eq!(view.phase, Phase::RefreshRequired);
+            assert!(!view.published);
+            assert_eq!(view.failure_code.as_deref(), Some(stage.failure_code()));
+            let saved = store
+                .load::<serde_json::Value>(operation.id())
+                .unwrap()
+                .view();
+            assert_eq!(saved.failure_code, view.failure_code);
+            let public = serde_json::to_string(&saved).unwrap();
+            assert!(!public.contains("/private/path") && !public.contains("secret-fixture"));
+            let private = store
+                .read_private(&store.path(operation.id(), "failure.json").unwrap())
+                .unwrap();
+            assert!(String::from_utf8(private)
+                .unwrap()
+                .contains("secret-fixture"));
+            assert!(store
+                .fail_handoff(operation.id(), stage, "later retry")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn handoff_failure_does_not_override_owned_or_advanced_worker() {
+        let (_directory, store) = fixture();
+        let mut operation = prepared(&store);
+        store
+            .transition(&mut operation, Phase::Accepted, false, None, "accepted")
+            .unwrap();
+        // Windows named mutexes are recursive on one thread. Retain the
+        // worker lock on another thread so this tests actual contention on
+        // both Windows and Unix; its release wait is independently bounded.
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let held_store = &store;
+            let id = operation.id();
+            let holder = scope.spawn(move || {
+                let _lock = held_store.lock(id).unwrap().unwrap();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(store
+                .fail_handoff(operation.id(), HandoffStage::WorkerExit, "private")
+                .is_err());
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+        });
+        store
+            .transition(&mut operation, Phase::Verifying, false, None, "verifying")
+            .unwrap();
+        assert!(store
+            .fail_handoff(operation.id(), HandoffStage::WorkerExit, "private")
+            .is_err());
+        let saved = store
+            .load::<serde_json::Value>(operation.id())
+            .unwrap()
+            .view();
+        assert_eq!(saved.phase, Phase::Verifying);
+        assert!(saved.failure_code.is_none());
+        assert!(!store.path(operation.id(), "failure.json").unwrap().exists());
     }
 
     #[test]

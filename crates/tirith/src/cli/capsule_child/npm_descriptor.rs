@@ -78,8 +78,8 @@ fn private_executor_copy(content: &Content) -> Result<(), String> {
         .take(16)
         .read_to_end(&mut policy)
         .map_err(|e| e.to_string())?;
-    if policy != b"0\n" && policy != b"0" {
-        return Err("npm execute-only launch requires fs.suid_dumpable=0".into());
+    if !protected_exec_dump_policy(&policy) {
+        return Err("npm execute-only launch requires fs.suid_dumpable=0 or 2".into());
     }
     let source = File::from(
         unsafe { BorrowedFd::borrow_raw(content.fd) }
@@ -144,6 +144,13 @@ fn private_executor_copy(content: &Content) -> Result<(), String> {
     // private/source drops close only their distinct owned descriptors. The
     // replaced reserved slot remains process-owned through execveat+CLOEXEC.
     Ok(())
+}
+
+// Linux resets execute-only exec to fs.suid_dumpable. Both DISABLE (0)
+// and ROOT (2) deny an ordinary same-UID peer access through ptrace/procfs;
+// USER (1) does not. Mode 2 retains administrator-controlled core handling.
+fn protected_exec_dump_policy(policy: &[u8]) -> bool {
+    matches!(policy, b"0" | b"0\n" | b"2" | b"2\n")
 }
 
 fn final_executor_seals(seals: i32) -> bool {
@@ -391,6 +398,26 @@ impl Prepared {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+    #[test]
+    fn exec_dump_policy_admits_only_kernel_protected_modes() {
+        for value in [b"0".as_slice(), b"0\n", b"2", b"2\n"] {
+            assert!(protected_exec_dump_policy(value));
+        }
+        for value in [
+            b"".as_slice(),
+            b"1",
+            b"1\n",
+            b"3",
+            b"-1",
+            b"02",
+            b"2 ",
+            b"2\n1",
+            b"2\0",
+        ] {
+            assert!(!protected_exec_dump_policy(value));
+        }
+    }
+
     #[test]
     fn final_executor_requires_exec_seal_and_rejects_query_errors() {
         assert!(final_executor_seals(wire::SEALED | libc::F_SEAL_EXEC));

@@ -73,6 +73,7 @@ jobs:
               cargo test -p tirith-core --lib --locked -j 3 capsule::linux::aarch64_seccomp::tests -- --test-threads=1 &&
               cargo test -p tirith-core --lib --locked -j 3 production_policy_allows_local_readiness_without_network_or_signal_escape -- --test-threads=1 &&
               cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::aarch64_trace::tests -- --test-threads=1 &&
+              cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::npm_descriptor::tests -- --test-threads=1 &&
               cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::parent_lifetime::tests -- --test-threads=1
             '
       - name: Preserve native evidence
