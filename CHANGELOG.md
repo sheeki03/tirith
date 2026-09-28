@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
 - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.
 - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
-- Reviewed local materialization of dependency-free, script-free npm artifacts on supported Linux hosts, with exact artifact binding and explicit recovery. Package code execution remains unavailable.
-- Separate npm installation review and status commands, with a sealed descriptor launcher and signed completion records under development. Execution stays disabled pending native qualification and a current signed v2 threat feed.
+- Reviewed local materialization of dependency-free, script-free npm artifacts on supported Linux hosts, with exact artifact binding and explicit recovery. This workflow does not execute package code.
+- Separate `pkg install-npm` review, installation, history and recovery for the qualified GNU Linux AArch64 local-leaf contract. It binds exact archives and pinned Node/npm/runtime files, disables lifecycle scripts, verifies installed bytes and refuses replay. Unresolved dependencies, scripts, implicit native builds and unsupported hosts refuse. Actual use still requires complete native containment, fresh policy/task authority and a current production-signed v2 threat feed; the published v1 feed is insufficient.
 - Native macOS ARM allocation and memory regression budgets in PR CI, backed by three reference runs and six deliberate-regression checks. Runner or measurement changes require a compatibility review.
 
 ### Fixed

@@ -1,5 +1,26 @@
 # Implementation verification
 
+## September 29: capability compatibility record
+
+The first integration at `cd914781` exposes one stale compatibility fingerprint:
+`capability_manifest_bytes_are_frozen` fails on Rust 1.83 and Windows because the
+new manifest was not reflected in its reviewed C00 contract. Windows completes
+all 60 harnesses; the other 59 and all nine standard-account dashboard cases
+pass, with owned cleanup verified. This is not a passing full-workspace result.
+
+The follow-up compares all parsed manifest entries against `bd9d5068`: 89 become
+90, with only `pkg install-npm` added to the existing Package firewall group.
+No existing command is removed, renamed, reordered or regrouped; all existing
+inspection levels and policy-completeness flags remain unchanged. Only the
+legacy `pkg install` coverage prose changes, to distinguish its unchanged refusal
+from the separately qualified local-leaf route. Manifest version remains 1.
+The new capability retains every bounded-contract and production-feed condition
+recorded below. The C00 fingerprint moves from
+`36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4` to
+`a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63`
+with that explicit review; no compatibility guard is removed or relaxed.
+Unreleased changelog and stability notes now describe the same qualified scope.
+
 ## September 28: complete supported native npm contract
 
 All five ordinary workflows pass on `bd9d5068`: CI `36443830209`, native ARM

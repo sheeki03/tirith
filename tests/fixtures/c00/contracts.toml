@@ -28,6 +28,20 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
+# Native npm contract review (cd914781): compare all parsed entries with
+# bd9d5068. 89 entries become 90; only pkg install-npm is added, in the existing
+# Package firewall group. No existing identity, relative order, group, inspected
+# value or policy_complete flag changes. Only pkg install coverage prose changes
+# to distinguish its unchanged disabled backend from the separate local-leaf
+# route. manifest_version remains 1. The new entry covers exact local archives
+# only on GNU Linux AArch64, with pinned tools, complete analysis, disabled
+# scripts, current authority/confinement checks and production-signed v2 data.
+# Native runs 36444393465 and 36447327426 supply explicit fixture-authority
+# qualification; production-feed publication remains a separate prerequisite.
+# This reviewed addition replaces digest
+# 36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4.
+# The exact-byte compatibility guard remains unchanged.
+#
 # Next-cycle compatibility review (71070bbb): parsed and compared the complete
 # previous/current manifest before approving this freeze. 88 entries become 89:
 # `review` is added as partial/read-only; zero existing entries are removed,
@@ -121,7 +135,7 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # Private-input execution qualification refusal: pkg install inspected changes
 # from full to none, and install/approve coverage now describes the refusal.
 # All 89 command identities, order and policy_complete values stay unchanged.
-sha256 = "36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4"
+sha256 = "a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63"
 
 [mcp]
 default_tools = [
