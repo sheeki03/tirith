@@ -1,0 +1,3321 @@
+{
+  "product_commit": "2e26baa35cbc14ba69865049f47ecfae0ac253bb",
+  "product_tree": "cd28fad2034be9b49e14d48476244447fefd0ef3",
+  "files": [
+    {
+      "path": ".cargo/audit.toml",
+      "sha256": "f9df02be1b607ad8ff42e513eb158d251fcba59cd3f730763e52aa84ab27345b",
+      "size": 1064
+    },
+    {
+      "path": ".github/scripts/release-compatibility.py",
+      "sha256": "05c7922550e9e8f67cb7b40f4108f413377039733eb3f9ed20c36079f9f75487",
+      "size": 9068
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "dd63693eedf0d10a651227bdd75f55c9dab583cb12d3f15ecbe48ed9df9e5546",
+      "size": 109389
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "0f9f51fdaf2d020b92f32ef819932237d974ec949a435a4978632ab56e75c0e4",
+      "size": 3694
+    },
+    {
+      "path": "crates/tirith-core/Cargo.toml",
+      "sha256": "246a6aa90cc0e044181b850ecdb207cb1070a2913f6f82c902a46299a1778aad",
+      "size": 9432
+    },
+    {
+      "path": "crates/tirith-core/assets/dashboard/template.html",
+      "sha256": "413e29ade083de023c96eca3c8877aaa861696f2962a21351304b7c8d1fb3237",
+      "size": 3451
+    },
+    {
+      "path": "crates/tirith-core/assets/data/bip39_english.SOURCE",
+      "sha256": "ba19428022e550d2e6b4c96be3625de23914a00fe8c0fa245c109997699d34cc",
+      "size": 489
+    },
+    {
+      "path": "crates/tirith-core/assets/data/bip39_english.txt",
+      "sha256": "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+      "size": 13116
+    },
+    {
+      "path": "crates/tirith-core/assets/data/confusables.txt",
+      "sha256": "2ecaae2994dd2a84ee284af9e0b76639f4981dc79bc37bc60005373e9a0abbb2",
+      "size": 2196
+    },
+    {
+      "path": "crates/tirith-core/assets/data/credential_patterns.toml",
+      "sha256": "4c69dade6ce6c973bc086a77b10e1ccfd6a88716daf89cbc6cb7de4f86329508",
+      "size": 6275
+    },
+    {
+      "path": "crates/tirith-core/assets/data/exfil_endpoints.txt",
+      "sha256": "a8d7ca3daf4f2373c52a098a24c5a8c1d1bbe4504b398e486b763a8c300be009",
+      "size": 1041
+    },
+    {
+      "path": "crates/tirith-core/assets/data/known_domains.csv",
+      "sha256": "6eaf28b6f2d7c80ff56624cbabb2ca7a8f883abcbcb0f047ac43940ac0b0409e",
+      "size": 3268
+    },
+    {
+      "path": "crates/tirith-core/assets/data/ocr_confusions.tsv",
+      "sha256": "6803f971efeaaacd423eeccd1e29c3a8cb53fef73b104f587e895f92d74d4ef1",
+      "size": 916
+    },
+    {
+      "path": "crates/tirith-core/assets/data/popular_repos.csv",
+      "sha256": "d797187adb712ed79ceeacc681990a35f70b4e03aaa4083dfb8ef21b9c02dd04",
+      "size": 466
+    },
+    {
+      "path": "crates/tirith-core/assets/data/prompt_injection_seeds.txt",
+      "sha256": "771f82901742d753679ff99336528497c92ab2399e49f5eab678cba37e9f1574",
+      "size": 4403
+    },
+    {
+      "path": "crates/tirith-core/assets/data/public_suffix_list.dat",
+      "sha256": "5118d56456a64ea26ff73777ca98851fe181ad1ec1338298fa4a983c684f1351",
+      "size": 1501
+    },
+    {
+      "path": "crates/tirith-core/assets/data/rule_explanations.toml",
+      "sha256": "149508ac1d08736c8d41d07cd5b71d459c05d2a27c0a07502f7e2af2759702be",
+      "size": 330715
+    },
+    {
+      "path": "crates/tirith-core/assets/data/share_patterns.toml",
+      "sha256": "09ead479b2c0e0f58fb4fe10665501c69975b874e30664097e6489f090c0fc1b",
+      "size": 3038
+    },
+    {
+      "path": "crates/tirith-core/assets/data/text_confusables.txt",
+      "sha256": "12146ed27906e137a92fff4dd4adfd2518456c8990df729bbab11890c6a81a17",
+      "size": 5445
+    },
+    {
+      "path": "crates/tirith-core/assets/keys/threatdb-verify.pub",
+      "sha256": "ee65a4cf011b55b19a8bbc6cc64d6b46dbcc5a2e35a690f8cf6f511f6d993db9",
+      "size": 32
+    },
+    {
+      "path": "crates/tirith-core/benches/budgets.txt",
+      "sha256": "2d1e94f8b85f1c0ecef47aba69e08059171980c3ae476a0eb307d08666b934ca",
+      "size": 5299
+    },
+    {
+      "path": "crates/tirith-core/benches/perf.rs",
+      "sha256": "bb8947dc1a62f8de0386d0fc3b5b4823389b12feb5e4c0e284ce83425e461c5a",
+      "size": 17988
+    },
+    {
+      "path": "crates/tirith-core/benches/resource_counts.rs",
+      "sha256": "d27263ac94b9859096ff6253aa3f1cf3ac60eb2d7fe5dcfd3edf148b360d5050",
+      "size": 11222
+    },
+    {
+      "path": "crates/tirith-core/build.rs",
+      "sha256": "efd8e9c79d9a348141406e48d2dc772683e4b9dbadeb5072ae8d4b83afebe536",
+      "size": 67689
+    },
+    {
+      "path": "crates/tirith-core/src/agent_origin.rs",
+      "sha256": "bc1be9d019fca804653013e8145e6fd8b596d65a9e74ea5275929329b9ab2c21",
+      "size": 32754
+    },
+    {
+      "path": "crates/tirith-core/src/aliases.rs",
+      "sha256": "5138c485050da2c7c1c658f2d8b7c82db42504dd8d210006bc046503c15e0d8d",
+      "size": 74129
+    },
+    {
+      "path": "crates/tirith-core/src/approval.rs",
+      "sha256": "b717e4825f353af897d5ba32d6fec472e6679a33386d8de5cf988a7b38bba46d",
+      "size": 25122
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/archive.rs",
+      "sha256": "d92d9d1eb57c93bbf44cd7e6303bbf86b1f02af67d70d8c1a7f609aee61a2ca0",
+      "size": 160243
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/correlate.rs",
+      "sha256": "07d615f253a0e9564ebab8833ab5810fbdae71d2b8374a93d01b2e441ce438fe",
+      "size": 34484
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/firewall.rs",
+      "sha256": "8e13ef576be057ec27f24a3a3090316119836785a5246c4f7f354fda7efa22df",
+      "size": 28936
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/inspect.rs",
+      "sha256": "82cbd898c0a43698f830eca79c0d0181a8d1cfe37299adb0ff09fd070fcb078c",
+      "size": 79187
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/install.rs",
+      "sha256": "80f775335987ba3a5ab725318c715167e91f506ebbd0c74c3d76d5ec2ad3714a",
+      "size": 120307
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/mod.rs",
+      "sha256": "c686b757e1515e1400870325d8f6b6b98f0cd723caf40604f333de4eb5b95611",
+      "size": 51212
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/native.rs",
+      "sha256": "d9fa8c840a1138b8b465c02a1f9c86da5b6dbfc96044539f24585dc339f966b7",
+      "size": 142898
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_archive.rs",
+      "sha256": "91567e126e521831f514bf246bc658194b89206a2b0bc8eba759761e47ae0ad6",
+      "size": 32743
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_archive_tests.rs",
+      "sha256": "2879bc4ab7628ac2d05c80da9b130c65a3b1b88e1c3f828701341fdd2aa0c840",
+      "size": 27047
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_diff.rs",
+      "sha256": "e1b69deb03b3a259fee85e0a0abe0caf6f940fcf8c99844fd78f26c55d6a9d98",
+      "size": 16761
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_diff_tests.rs",
+      "sha256": "80bf2a3ae857319a95ae10423a289480b920036363664495d76e89755fbf291b",
+      "size": 9488
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install.rs",
+      "sha256": "3051cd7d6db264bc64cca147f5c86b122c56ca529c85d5a4b4429573762680fb",
+      "size": 48270
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_execution.rs",
+      "sha256": "2d02de95cb84363b410f3b9d3304e8ee755d53f55ef891cdc272a945c09a6656",
+      "size": 32471
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_metadata.rs",
+      "sha256": "521d26b3e800f316eafcdba420f11f053e39e21bcd0df956d9762da82295f1b1",
+      "size": 9927
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_receipt.rs",
+      "sha256": "feba8c5c6c07379555320ed193552f7708b0b2e8d32ea590c125147d9926d21f",
+      "size": 6435
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_recovery.rs",
+      "sha256": "e132aed33ca2e8bde18398fda933dc44c8748f1181c32726886dfdf75db8ab8d",
+      "size": 18570
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_runtime_pack.rs",
+      "sha256": "0baaeb8407718a5761301d0acef1f579e02137538d3d5f94005287a44ab281a1",
+      "size": 16318
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_tests.rs",
+      "sha256": "04c7e92acc0ce44509566067c3f6a9885daf48d82e02181d3e53187f0096a145",
+      "size": 21082
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_install_tools.rs",
+      "sha256": "62fb1407347b1f5343b753faaf7038d0ce8923ab6e64fbb783233939eed0540f",
+      "size": 29097
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize.rs",
+      "sha256": "4c43f2d6523c2c485302dc94b8fe19e596f96e6ff7396ed790a9af07a6d4ebf8",
+      "size": 23828
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_decision.rs",
+      "sha256": "81e38a317549ee0ccefa12614c0fecf4e7dcc6bb67d6232a3d45570b9ac0bd50",
+      "size": 10521
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_namespace.rs",
+      "sha256": "b3867c450f62fc14ecde44514bee207a6048b8005dc06d95f71e247e6ecdf2be",
+      "size": 16806
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_recovery.rs",
+      "sha256": "1f60d51d9c42fe418e79ff6026a119bcb49d58c39260b6c53c95a7de1146d5ef",
+      "size": 29923
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_recovery_tests.rs",
+      "sha256": "fabe159edc5749a5af1ca22854e4926b78b25e99b587c3719f5ea78f7bac5c6f",
+      "size": 28514
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_tests.rs",
+      "sha256": "f7dbbf31a9c38d34ca7ef4651e0942a3ccdb5e744a70a9001caec06f4d2559c7",
+      "size": 21194
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_materialize_writer.rs",
+      "sha256": "bdac54f4e406a2d83c529ae5ccbfc3e274c47dfcdf9710891a6b5aace12a4675",
+      "size": 35763
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/npm_signals.rs",
+      "sha256": "b3a8e95c90777752e5962ad0ababed8c6eab29fe038b37a61597e7ea75f466e0",
+      "size": 34243
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/pth.rs",
+      "sha256": "434b87621d5ffb404b35b134de02997f4c32cac0e8ce62df8e6b01a4df1c6a94",
+      "size": 61366
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/quarantine.rs",
+      "sha256": "eca4710b05608b2a1e8648bfb36d04f399f7dadc830238558cb340324f798d89",
+      "size": 158040
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/record.rs",
+      "sha256": "915b250650fa679bcb4ecfd23d5294f5ca5e6f351fc9476724d2dd2f15102e59",
+      "size": 76484
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/release_diff.rs",
+      "sha256": "567415fcaf60f693f61acde85407eec9535dbc56cffff3d20cab2b34a1af1341",
+      "size": 54916
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/resolver.rs",
+      "sha256": "a723952895193aa084c4bbdc83c06b1a7604b1cb7553f2933b125eab0c9cba29",
+      "size": 201532
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/resolver_broker.rs",
+      "sha256": "4e25f07959546cb5b835422e830ba6abe8939ab3ba8bd042053c130dba05c332",
+      "size": 45168
+    },
+    {
+      "path": "crates/tirith-core/src/artifact/wheel.rs",
+      "sha256": "1c493edeae117809de86dfb95d718215f7f05a05faa9b440d345813d5f05e6ad",
+      "size": 26530
+    },
+    {
+      "path": "crates/tirith-core/src/audit.rs",
+      "sha256": "af2ff955118597400687a7f525521f21a5b0e27144902fc1f6338fd0597e87e3",
+      "size": 192404
+    },
+    {
+      "path": "crates/tirith-core/src/audit/health.rs",
+      "sha256": "00fac8a4e5ea5196d0b9c667500b19331cd664bd2ac9897a0d39934c38872e71",
+      "size": 7319
+    },
+    {
+      "path": "crates/tirith-core/src/audit/retention.rs",
+      "sha256": "fdd7fdb6a00c0b6a6650a32acf011304a9bb1fcb34253bef9abcb2d7772915fa",
+      "size": 37547
+    },
+    {
+      "path": "crates/tirith-core/src/audit/verify.rs",
+      "sha256": "cd10749d0bceaa007f8237a13dde97fefee57bdf37d3c59473090bae92689aa1",
+      "size": 20790
+    },
+    {
+      "path": "crates/tirith-core/src/audit/windows.rs",
+      "sha256": "2d518f250a5d09f39c17963a2ecab2fe74aa4e564409574200ffe81ef0be8a89",
+      "size": 26332
+    },
+    {
+      "path": "crates/tirith-core/src/audit_aggregator.rs",
+      "sha256": "b09f741d34248076a4534e9f0a027513ff594e790cd4f73c169c73a00f3c254c",
+      "size": 60333
+    },
+    {
+      "path": "crates/tirith-core/src/audit_tune.rs",
+      "sha256": "f141ddc2a392f7d86aa668c0f65a3d468104ffdfd4f8db6fef931618e01c7f37",
+      "size": 24014
+    },
+    {
+      "path": "crates/tirith-core/src/audit_upload.rs",
+      "sha256": "352274499be5c6fe353702517607a19489b2cca65b33d3933a0e6eb761369f21",
+      "size": 21089
+    },
+    {
+      "path": "crates/tirith-core/src/baseline.rs",
+      "sha256": "a6ee9ca11a042ba7c65f2f672aee282eef9dfd18620d3f1f070f35549eb936ca",
+      "size": 53024
+    },
+    {
+      "path": "crates/tirith-core/src/blast_radius.rs",
+      "sha256": "fe20a7fd53c081af91b713fbcb0261ad30df45062e2f9250463bd6542190fe6b",
+      "size": 96082
+    },
+    {
+      "path": "crates/tirith-core/src/browser_extensions.rs",
+      "sha256": "1c53f61864adeba966ec79158704770a68b08fe82a33669b3f9aeb38e94f9156",
+      "size": 159605
+    },
+    {
+      "path": "crates/tirith-core/src/browser_extensions/tests.rs",
+      "sha256": "787c663784d4bcc898dc420b191d649368a647545b9ef3c467c93236daacaab1",
+      "size": 97110
+    },
+    {
+      "path": "crates/tirith-core/src/build_receipt.rs",
+      "sha256": "8b2584e78a56ca60304ec8fe9be10d5316883780f0d9b2deaf7f210a2044b8e7",
+      "size": 108716
+    },
+    {
+      "path": "crates/tirith-core/src/build_receipt/tests.rs",
+      "sha256": "fdbc548d7b441a9a1b895211b7a21f2e0f4939759877b64f0abd8437c71a11a4",
+      "size": 78799
+    },
+    {
+      "path": "crates/tirith-core/src/canary.rs",
+      "sha256": "5363767641cea32a7acdb2aff4077ff9e71224b0f9c160bc92c35818059e7cfe",
+      "size": 75296
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/linux.rs",
+      "sha256": "3097e6bed0d45c0e10d5fccbe3758f96edb530c57ac1d51f32ba0e2ff5c4b540",
+      "size": 110086
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/linux/aarch64_seccomp.rs",
+      "sha256": "07c913376fbacbaddf9c2aea678606a13e7c0876f3a46a7bff582f80add6a86e",
+      "size": 34653
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/linux/npm_landlock.rs",
+      "sha256": "d4c2cf11ffd61f4245364edca3e80c4eccd1aa7a425d8728f13c9c4a25201ab0",
+      "size": 11025
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/macos.rs",
+      "sha256": "8b5256f319dcce29803441ea6f289a5fd65426fceee072e93196d3c07232df99",
+      "size": 41155
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/mod.rs",
+      "sha256": "5c1aa931548a8362cdaccdc83181f0b6260dfcb328e747831d4934f22ca1cfe6",
+      "size": 75653
+    },
+    {
+      "path": "crates/tirith-core/src/capsule/windows.rs",
+      "sha256": "0e632d52c003759ab82181019ca7520ae84129475e0b0f6607ac833aef97fd11",
+      "size": 55779
+    },
+    {
+      "path": "crates/tirith-core/src/capsule_project.rs",
+      "sha256": "a6b5ff11431654264d8dda1214db9cfc164567ded86aa464954d8b79c4edaaff",
+      "size": 125582
+    },
+    {
+      "path": "crates/tirith-core/src/capsule_receipt.rs",
+      "sha256": "2e9dc3b03ce10bce67430ff87c4464311c12ae64fa701945b929d9e3165c69b4",
+      "size": 50707
+    },
+    {
+      "path": "crates/tirith-core/src/checkpoint.rs",
+      "sha256": "a9cd835f920ac1fed53fe7c48df246c8f935b08e590ca7d850d0fc8891e7c906",
+      "size": 169052
+    },
+    {
+      "path": "crates/tirith-core/src/clipboard.rs",
+      "sha256": "9cfc375c23b0b31bca3c7ff8a6daf9ad8f62d925beb7128be9c05fcdea0320a8",
+      "size": 15079
+    },
+    {
+      "path": "crates/tirith-core/src/command_card.rs",
+      "sha256": "c40b7aac8df9f25f126c9f5b7aebcfe549e87aa2b913fce9c3d39c15fccd8b33",
+      "size": 108799
+    },
+    {
+      "path": "crates/tirith-core/src/commands_manifest.rs",
+      "sha256": "2f758a29809de4e6f32f25be501973d15f178edf0d6e5c087d70b2c97521c310",
+      "size": 51563
+    },
+    {
+      "path": "crates/tirith-core/src/config_write.rs",
+      "sha256": "698ae1f218bb84d119d6708ca8d2e958b68e0ddceac100fb2449322fb21cc779",
+      "size": 44576
+    },
+    {
+      "path": "crates/tirith-core/src/confusables.rs",
+      "sha256": "b653366ec0445bb6db591440a1086ff24532e63e50520ab98b20f83a97b8fef4",
+      "size": 1662
+    },
+    {
+      "path": "crates/tirith-core/src/content_kind.rs",
+      "sha256": "cf08b01f887333063a07723e9e45d73a26d8d1f811bb0b6f16ebd22504a715e3",
+      "size": 58353
+    },
+    {
+      "path": "crates/tirith-core/src/context_detect.rs",
+      "sha256": "3f1791827046e58ea64143e67beaa694c69311dfb4e70d16940e93f2a6bffa25",
+      "size": 30001
+    },
+    {
+      "path": "crates/tirith-core/src/custom_rule_dsl.rs",
+      "sha256": "adc31d7d8c74e642d545cb7ab5468c4fc8ae52a67a8c9a2687dd08414e9c38ad",
+      "size": 84959
+    },
+    {
+      "path": "crates/tirith-core/src/dashboard.rs",
+      "sha256": "d286f41e3f5f75231fc15a3a68d222da419c7f74875c4f013102f094bd8b7736",
+      "size": 78998
+    },
+    {
+      "path": "crates/tirith-core/src/data.rs",
+      "sha256": "3268e4c470d3c1e86368b0a3c0ef2f3a36b8bd13048a22c71a9147fad1eabe32",
+      "size": 2587
+    },
+    {
+      "path": "crates/tirith-core/src/deobfuscate.rs",
+      "sha256": "e7d1ab24683cb06418a7da3fa254e77a0049882624c00cbd645249da4d7c02a6",
+      "size": 73187
+    },
+    {
+      "path": "crates/tirith-core/src/dep_confusion.rs",
+      "sha256": "aa523f7612444535c65457b56718e35555493c64d4c2515af210d3d7f8f371be",
+      "size": 11228
+    },
+    {
+      "path": "crates/tirith-core/src/deployment_receipt.rs",
+      "sha256": "94dbf48d3ce697f155eb87c6a859f97c7d92c3695c5734c853c78adc5a50098f",
+      "size": 57881
+    },
+    {
+      "path": "crates/tirith-core/src/deployment_receipt/tests.rs",
+      "sha256": "3509448e71b95b02f5fb45fba7160c752fd8e137b30e5d54cc14a9529fd42526",
+      "size": 47595
+    },
+    {
+      "path": "crates/tirith-core/src/devcontainer_writer.rs",
+      "sha256": "6a8e06714426d9030650a9013d94841ef205bcdeae713445026583b973951b6c",
+      "size": 44242
+    },
+    {
+      "path": "crates/tirith-core/src/ecosystem_scan.rs",
+      "sha256": "4d8171f746cd84ed982c54650fdf5a26fea0c5befe6da82119fda985895a22d5",
+      "size": 296834
+    },
+    {
+      "path": "crates/tirith-core/src/effects.rs",
+      "sha256": "5c821f517ea21f2bcbae5935a008abdf566a0448cd310abbd3f0a890fc30d1b4",
+      "size": 24358
+    },
+    {
+      "path": "crates/tirith-core/src/engine.rs",
+      "sha256": "2517df523d86960e217399c3cca5ebe99585e5aa33920eebb67a25dff123bce2",
+      "size": 402926
+    },
+    {
+      "path": "crates/tirith-core/src/env_guard.rs",
+      "sha256": "326ac654263861133f73426f71cd0091a7b87a68b790148b59cbeaefd69bb2dc",
+      "size": 93603
+    },
+    {
+      "path": "crates/tirith-core/src/escalation.rs",
+      "sha256": "7af8ca3969a2253f602a6cef573df75a4068e3af739202e8ab11872f8a9e1ef9",
+      "size": 217546
+    },
+    {
+      "path": "crates/tirith-core/src/evaluation.rs",
+      "sha256": "e60bd627ec20b224a3d6122c9e9e3abef831054a692d519d978da1a467d1772f",
+      "size": 23961
+    },
+    {
+      "path": "crates/tirith-core/src/event_buffer.rs",
+      "sha256": "cdb4df2c27abe2dbeabd34bd06f7db7a5b29874323ed1a357d106689850d7aec",
+      "size": 96772
+    },
+    {
+      "path": "crates/tirith-core/src/exec_provenance.rs",
+      "sha256": "20ea58648ecac828b55288ffb15d222d49d9f266a214992090e4f4230a13c33e",
+      "size": 22086
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state.rs",
+      "sha256": "a68323a2ba2c29a3e886d1a939bfc074b49cf19c3ec0a4011b09b721f075fb46",
+      "size": 296526
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/activation_transport.rs",
+      "sha256": "34fee1ee9759ca0c067a425afa8d95c4daf3c077a8f774cbfb7a2f84caf6ac64",
+      "size": 30790
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/activation_transport_tests.rs",
+      "sha256": "2de45e3ad10ed38178604d13fc12e9f92677b7a71f25f424c1028586f333107f",
+      "size": 19424
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/shell_automatic.rs",
+      "sha256": "2febac6b03f4800dd855a06825386c5676203dc89287b6175560b22c72bb4889",
+      "size": 15447
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/shell_receipt.rs",
+      "sha256": "a3ce9a434a8a57d7fd64ad65801a0d2b733466a188549a0783ea9273f449a444",
+      "size": 299970
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/shell_verification.rs",
+      "sha256": "dabcc3e4ae633f3a7c59bced99411fe030c064f08381864b8c457ba8b24f1dce",
+      "size": 35282
+    },
+    {
+      "path": "crates/tirith-core/src/execution_state/shell_verification_tests.rs",
+      "sha256": "031cd12f158f83fe5aee82e7e25e6ac74d4b3e81c8760cb045028659ddfe1e8a",
+      "size": 36840
+    },
+    {
+      "path": "crates/tirith-core/src/extract.rs",
+      "sha256": "4f713b0a504893dc2a84d658d99f246c506103129080fa3b08f89f34d171da68",
+      "size": 637347
+    },
+    {
+      "path": "crates/tirith-core/src/history.rs",
+      "sha256": "84f252f14a7a3bd2c79b2d9eab9f6ea5aefe89f3cd92bc46dce4e177b13dcb79",
+      "size": 37699
+    },
+    {
+      "path": "crates/tirith-core/src/history_aggregate.rs",
+      "sha256": "cff6c420229071a6fdc3aea298bb9a5499bd3bc6aff69a4aadf67c63cfa81095",
+      "size": 18030
+    },
+    {
+      "path": "crates/tirith-core/src/homoglyph.rs",
+      "sha256": "1c3d64439159d3316039fe6f0014de8786b64288b64abcc61128a11e71d4789d",
+      "size": 6861
+    },
+    {
+      "path": "crates/tirith-core/src/hygiene.rs",
+      "sha256": "45135db29e1aa0d840d1993cf1b8b0fffea493558ee8985428ae7cf2301acecb",
+      "size": 40195
+    },
+    {
+      "path": "crates/tirith-core/src/iac_plan.rs",
+      "sha256": "1d9e31a717e8c143b08c65bd4e37445d85bcade2d04ec413764570854a1e5f7f",
+      "size": 32039
+    },
+    {
+      "path": "crates/tirith-core/src/incident.rs",
+      "sha256": "28dbf65b584ae9330714f2592f72995f965235f9813925fb8fe649a9b859cfee",
+      "size": 44968
+    },
+    {
+      "path": "crates/tirith-core/src/install_script_analysis.rs",
+      "sha256": "12b7f6e68de45a63743296aa778038454cf5f11572fde7040643af6e1a123a2f",
+      "size": 18254
+    },
+    {
+      "path": "crates/tirith-core/src/install_txn.rs",
+      "sha256": "98a2215f2d36cd0322d0862be820a662e230d4b7858343131454d21cda964251",
+      "size": 203834
+    },
+    {
+      "path": "crates/tirith-core/src/intent.rs",
+      "sha256": "222fb177265f6cbc017b057acb97bb0a745d1b9394350e18ec4c94394a72adbb",
+      "size": 21603
+    },
+    {
+      "path": "crates/tirith-core/src/lexical_path.rs",
+      "sha256": "8160b07bd068aa39a210e10383c3d6462203b6876c2952fec965c3f2f5c976c2",
+      "size": 32993
+    },
+    {
+      "path": "crates/tirith-core/src/lib.rs",
+      "sha256": "aca10153fa304773394a53e58905f5b8eec277bffe951cad2668852c80b335be",
+      "size": 2750
+    },
+    {
+      "path": "crates/tirith-core/src/license.rs",
+      "sha256": "3484b6544300d5c1cba91987298d9d036faca19ccee6db875cffc79bd64b10e1",
+      "size": 48604
+    },
+    {
+      "path": "crates/tirith-core/src/location.rs",
+      "sha256": "9803c5be374ed6c794c1b79c7d76dd7ee285da0f0ef3a57b65f3225546d48612",
+      "size": 6213
+    },
+    {
+      "path": "crates/tirith-core/src/lsp_profiles.rs",
+      "sha256": "36384991040fe2f250812daf09433d1dffb8595373f35e89a97128b90cee90d9",
+      "size": 22301
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/content.rs",
+      "sha256": "38511264b20d94baa1abbf45c4205283264f4fb4581f8771c764f3100bf18125",
+      "size": 31980
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/dispatcher.rs",
+      "sha256": "761a0ad03eded5ff5b8ee2aca11e7e8fceb7dcbc96024bf3b3672fb4b97e1462",
+      "size": 56075
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/mod.rs",
+      "sha256": "dd1e2974c380dec27a782f10c8db9c194b28c47fb995c0d546cdd7b008ea4cd2",
+      "size": 704
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/origin.rs",
+      "sha256": "44d0e0d429a219e7cab4943a28c44c70426528940f98c4933d611a52f9d7986f",
+      "size": 7829
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/output_filter.rs",
+      "sha256": "75ce4397c5a673e6f0c8283ddb5504df05da1942fa08021c7f62a85ca5e79af0",
+      "size": 171755
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/resources.rs",
+      "sha256": "dd5daa4cea3785399feb09bc3001784c3dd9bc83fc87e7be792baf1e6c389558",
+      "size": 22136
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/response_inspect.rs",
+      "sha256": "c8db0a3aef3e39b9f5ecec3de1437c0b9aa00d93f003896f135cd0a4f15515d4",
+      "size": 108515
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/tools.rs",
+      "sha256": "4e74652181a164c8011fd4fbcd608f05a22678659f7bd19bbc94cd1ce2b518a5",
+      "size": 111767
+    },
+    {
+      "path": "crates/tirith-core/src/mcp/types.rs",
+      "sha256": "7bab7015ff1e542b10cc4a64cbe844a8f76608a60460aa5739b1141fa3ae21fa",
+      "size": 4212
+    },
+    {
+      "path": "crates/tirith-core/src/mcp_lock.rs",
+      "sha256": "9bbd472f4d14683dc19cd307ce806b81ed1c0d088652eb351cbb97a265f54aee",
+      "size": 352296
+    },
+    {
+      "path": "crates/tirith-core/src/network/dns.rs",
+      "sha256": "a3db176827a365da037fb69a27ea567707d8594772fd1758c2026fbcff1dcdb1",
+      "size": 15875
+    },
+    {
+      "path": "crates/tirith-core/src/network/mod.rs",
+      "sha256": "6d563add8ffac8c79f8efa5ddb872bbc0f2cf152b167a24da6d95380ecf13888",
+      "size": 192
+    },
+    {
+      "path": "crates/tirith-core/src/network/shorturl.rs",
+      "sha256": "88b7793fa064cbd6b8d6aaee6fc47d6f6963740e6a0dfb3c8899d51120372473",
+      "size": 20176
+    },
+    {
+      "path": "crates/tirith-core/src/normalize.rs",
+      "sha256": "be84d38527b5cb43e3284d278b62451ae3c54fba661c8e608543028cad9f5c40",
+      "size": 13828
+    },
+    {
+      "path": "crates/tirith-core/src/npm_command.rs",
+      "sha256": "e26d2614ca06bb271fa159c25e0ee14a4a7c14b804ed7fd7ffa66fe33d37ab80",
+      "size": 42202
+    },
+    {
+      "path": "crates/tirith-core/src/osv_correlation.rs",
+      "sha256": "1b80906206a58601e317dfaeae77b5abdca307236ed0986852e709f3afff0b77",
+      "size": 18208
+    },
+    {
+      "path": "crates/tirith-core/src/output.rs",
+      "sha256": "88d026b127f3037948129e7129297313bbdf447773d63e2a6cd9feef573989cc",
+      "size": 94846
+    },
+    {
+      "path": "crates/tirith-core/src/output_contract.rs",
+      "sha256": "cf7ff8d7867869544c8518fee0fbad391ef9f62f1dac535f48ef66576768f3a4",
+      "size": 35250
+    },
+    {
+      "path": "crates/tirith-core/src/package_approval.rs",
+      "sha256": "12dfb7f06eab935cc34319b06989533f93226485fbd7d79e037167a712249d20",
+      "size": 18618
+    },
+    {
+      "path": "crates/tirith-core/src/package_risk.rs",
+      "sha256": "ca2184b63b836b022857c36b320a121070ddf527246fa94e99aed78ec7b8b81d",
+      "size": 76686
+    },
+    {
+      "path": "crates/tirith-core/src/parse.rs",
+      "sha256": "6b9948ebd2187ecb7285a1fabb59d15a3a0e8055b5b6455ea2d4bf421929fc85",
+      "size": 24086
+    },
+    {
+      "path": "crates/tirith-core/src/path_audit.rs",
+      "sha256": "a0b445b55c490e53d96a142f552c3f74cd3a3b30106dc1965ae9c8da4a919c46",
+      "size": 41784
+    },
+    {
+      "path": "crates/tirith-core/src/pending.rs",
+      "sha256": "ac49503891629fdf6a69b309fb6fda9cfb250627d8e0576d3a8ad1840c1fd293",
+      "size": 31449
+    },
+    {
+      "path": "crates/tirith-core/src/persistence.rs",
+      "sha256": "d931750683cbfd44c6981cea17e3455172a8a355e0f91d65acbd7a2dca9cc22e",
+      "size": 58425
+    },
+    {
+      "path": "crates/tirith-core/src/policy.rs",
+      "sha256": "e209f2a5f943f8ee408a26839fa276f6560258cdade6a26bfe04905d9cf64247",
+      "size": 338501
+    },
+    {
+      "path": "crates/tirith-core/src/policy_bounded_runtime.rs",
+      "sha256": "962636cefc943513368bb251b534907e7149505dcc371b624bf085b088ebe7e2",
+      "size": 3419
+    },
+    {
+      "path": "crates/tirith-core/src/policy_bounded_runtime_tests.rs",
+      "sha256": "71fb97a5bfc6b68fe39df26a735b48d1a80f34a3501a299c7f98628b138b33c0",
+      "size": 7043
+    },
+    {
+      "path": "crates/tirith-core/src/policy_client.rs",
+      "sha256": "5e6f7d25f66dac19e4484ff52edbb3f8d4b7b78f7f5f7062af09d97c2f45dbdd",
+      "size": 7271
+    },
+    {
+      "path": "crates/tirith-core/src/policy_discovery.rs",
+      "sha256": "d8c20e689c7e43c791e3661cf7dc0322e2d74a6775f4f55c714cbddbf051caeb",
+      "size": 9323
+    },
+    {
+      "path": "crates/tirith-core/src/policy_ignored.rs",
+      "sha256": "5523cabc9a4c5708aa625394beaa4bc48fedcdc8fc171a08721c5426a6e0e69c",
+      "size": 12688
+    },
+    {
+      "path": "crates/tirith-core/src/policy_migrations.rs",
+      "sha256": "394b66033e7af16a5ae030ec2676d4dad144b73f85298f302cb668f847e5cf15",
+      "size": 16238
+    },
+    {
+      "path": "crates/tirith-core/src/policy_rollout.rs",
+      "sha256": "b17f381f47799e55056cb9d35fbae85caaeb4ff93386e61ece68610642a71176",
+      "size": 27785
+    },
+    {
+      "path": "crates/tirith-core/src/policy_rollout_tests.rs",
+      "sha256": "a9f30192357c4836250df55e1e1f14b430d58aabf7a5fd8b5bd8410fe988b2c8",
+      "size": 16549
+    },
+    {
+      "path": "crates/tirith-core/src/policy_snapshot.rs",
+      "sha256": "c3895fcedd3e6e4e62fc77eaa5fafae6710457bcb549459eef18ceb357d4d37c",
+      "size": 80959
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team.rs",
+      "sha256": "c977bce50f6bc279080f971d2949b2398a12ab93f1f16421c4191ee51a092184",
+      "size": 16307
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_client.rs",
+      "sha256": "894e974316c532eeec22b2eefe6a2b39a6cb82cba07116495e7398fd0ce1cb50",
+      "size": 18667
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_client_tests.rs",
+      "sha256": "6c091fe863678e3d1269570d610b187ac568645dbaa4a30ad609a9aa7795fb46",
+      "size": 9112
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_connection.rs",
+      "sha256": "e3d4c0889bdc293beabc14407400d22fadabc407a5a97629565d51f4916312c4",
+      "size": 29739
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_connection_native.rs",
+      "sha256": "499a1e9efe7f350e2b297efd993c5239a4af2621b23ba4aa01bbabd723a21ee5",
+      "size": 31225
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_enrollment.rs",
+      "sha256": "933e2ef133713377d05343860e216373083f7e5b249da61c69d47195dfeec41f",
+      "size": 24077
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_enrollment_tests.rs",
+      "sha256": "9ea2521c489b541a273f86c21f3369cdd019e243bb34526d3f32e94a5deb3314",
+      "size": 34696
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_tests.rs",
+      "sha256": "5f7b2122c38f5fb59c9423ca5bcfad507ccd7857305ec4fff64be04a2ba587fd",
+      "size": 9141
+    },
+    {
+      "path": "crates/tirith-core/src/policy_team_yaml.rs",
+      "sha256": "e4acdd3fd368b0e4a7f6a72df4566eb35a3a5355f3278b192bbcf10dcaf64185",
+      "size": 4157
+    },
+    {
+      "path": "crates/tirith-core/src/policy_validate.rs",
+      "sha256": "781a808d91ad1f1777b7a1ac68b79bf33bd59affe7eb0a3d22cec73e8310472d",
+      "size": 85761
+    },
+    {
+      "path": "crates/tirith-core/src/project_review.rs",
+      "sha256": "0bad23b927a4ea081e98a2fee8e16ea5be4fafaf412f7afc657d69f2e96c262f",
+      "size": 28676
+    },
+    {
+      "path": "crates/tirith-core/src/protection_profiles.rs",
+      "sha256": "560a1d911253883e11260a75650e00d347179686e4ab6d0846f8e4450bc89e8a",
+      "size": 23791
+    },
+    {
+      "path": "crates/tirith-core/src/provenance/graph.rs",
+      "sha256": "d1aad7f94ed93ba6da04d98c3c60279a8090011d3e3112dbce45f2f3395939f4",
+      "size": 44602
+    },
+    {
+      "path": "crates/tirith-core/src/provenance/mod.rs",
+      "sha256": "b239c10efdfdb9997da18600ecbd21fb7d40b7223c479c9cc276c87922501426",
+      "size": 2534
+    },
+    {
+      "path": "crates/tirith-core/src/provenance/npm.rs",
+      "sha256": "1b4389a482b58b93a10299e510a4570877661123e66cc0b2552878f5737ba72b",
+      "size": 156877
+    },
+    {
+      "path": "crates/tirith-core/src/provenance/npm_facts.rs",
+      "sha256": "35d1a92fc13c4a7f699ba2122644a1ac70fd80573055c4e63bf3b1a4ee719944",
+      "size": 23488
+    },
+    {
+      "path": "crates/tirith-core/src/provenance/pypi_integrity.rs",
+      "sha256": "70f8dc93e29cacb8b2b3836792faa091d1097406cd52633913eb2d4d4e8e4786",
+      "size": 26496
+    },
+    {
+      "path": "crates/tirith-core/src/receipt.rs",
+      "sha256": "7f03f42c144834a21058a6ec5e5422688105a3b3ec658fb00341b0b0c39537d0",
+      "size": 110060
+    },
+    {
+      "path": "crates/tirith-core/src/receipt/stored.rs",
+      "sha256": "ad42ea99f5742e82a20d643aea31f3dd744ad9fc7ddae551fd7eb107250d557c",
+      "size": 11420
+    },
+    {
+      "path": "crates/tirith-core/src/recovery.rs",
+      "sha256": "3f8794de782d49e5e63a6e533787f6310ff6db00834334e7b495da46f826496b",
+      "size": 6439
+    },
+    {
+      "path": "crates/tirith-core/src/redact.rs",
+      "sha256": "a5d282261f0537c0554a0a3fb20ca782ffa6aacd94562af4a770cae54c036155",
+      "size": 138352
+    },
+    {
+      "path": "crates/tirith-core/src/registry_api.rs",
+      "sha256": "4681f0ec171e9ecaca27145f075e7e7a76fe57b16f8e17e26cbb54fb6a028961",
+      "size": 99014
+    },
+    {
+      "path": "crates/tirith-core/src/registry_history.rs",
+      "sha256": "9a1fa9abf37efde1f4bd0f634239ad99cc365aaf111f921c19500a212dca7365",
+      "size": 15020
+    },
+    {
+      "path": "crates/tirith-core/src/repo_hooks.rs",
+      "sha256": "1dc08ad2aecc0c265c14d4704999236c13a4e5ee8f733ddf5f185d358459ce97",
+      "size": 229448
+    },
+    {
+      "path": "crates/tirith-core/src/repo_mismatch.rs",
+      "sha256": "616fe462f13d7175263908e315628b8a7562f211984f92d6c80ad72d097e971d",
+      "size": 27020
+    },
+    {
+      "path": "crates/tirith-core/src/rule_explanations.rs",
+      "sha256": "9a69706f613979a3108299d2b5aac695274cf3a2467e409fda66f0cb26b74715",
+      "size": 7569
+    },
+    {
+      "path": "crates/tirith-core/src/rule_metadata.rs",
+      "sha256": "7dd7b3a5c94e778a8734d3e401f4754e25546d10f4b72f6fe781451919bfb95c",
+      "size": 8151
+    },
+    {
+      "path": "crates/tirith-core/src/rules/aifile.rs",
+      "sha256": "22b07c0661c91b1bd4da6997651f8ad9d9ab663a10bbf4a92c3453c22d5210b1",
+      "size": 139448
+    },
+    {
+      "path": "crates/tirith-core/src/rules/cifile.rs",
+      "sha256": "68589319a0c5f99b9d2aa3d8650ba59d1fd0b6fd4151f5893b51ccf4a73191f9",
+      "size": 159147
+    },
+    {
+      "path": "crates/tirith-core/src/rules/cloaking.rs",
+      "sha256": "8d2250d915b12a1b51520e0fed81c58f7447df51cdbaa1b80ada5042d7eeacd5",
+      "size": 46493
+    },
+    {
+      "path": "crates/tirith-core/src/rules/codefile.rs",
+      "sha256": "1857e7f7010c2600dd385fb8f2a8497c43f1288f7a7705ec4d1a6bcbff78c8f7",
+      "size": 43739
+    },
+    {
+      "path": "crates/tirith-core/src/rules/command.rs",
+      "sha256": "82a0168c48f9b52cfb8066187edd8f9b14721f1aa73ee86ca5af102f8d20fcad",
+      "size": 660426
+    },
+    {
+      "path": "crates/tirith-core/src/rules/configfile.rs",
+      "sha256": "4766e1ab7a54fcf05f7a1567ae0f385a1dd76e8ef8777673a3a1a6582683e559",
+      "size": 161843
+    },
+    {
+      "path": "crates/tirith-core/src/rules/container.rs",
+      "sha256": "a315b855b167af3a36a41857f8060869017a93d3ecc260ef80e2e046cbc75df1",
+      "size": 31924
+    },
+    {
+      "path": "crates/tirith-core/src/rules/context.rs",
+      "sha256": "57c7d6e6996cff0279429711a02e4df5fce7a121e97d91377d940d7dc76d8d39",
+      "size": 60012
+    },
+    {
+      "path": "crates/tirith-core/src/rules/credential.rs",
+      "sha256": "965ec47a02cf88a9bc22a80288ecb2d91187d946c7fcc168816e5c237162e4a0",
+      "size": 59334
+    },
+    {
+      "path": "crates/tirith-core/src/rules/custom.rs",
+      "sha256": "37be75ee8f9bf0f41f84981f8df21bc788f5140fa9c11849cb9c29a83e2d59e8",
+      "size": 43400
+    },
+    {
+      "path": "crates/tirith-core/src/rules/ecosystem.rs",
+      "sha256": "82319df65979a108f8db792d4493e853d58dea60d0e62f8429bb95851b32f286",
+      "size": 12573
+    },
+    {
+      "path": "crates/tirith-core/src/rules/environment.rs",
+      "sha256": "3b73e68d683034564d3a62299d8fe0ac33e2f02daae1615c254e4294af75157f",
+      "size": 3906
+    },
+    {
+      "path": "crates/tirith-core/src/rules/exfil.rs",
+      "sha256": "ecc114f6c53d77a992643039e2941a6de5b98991ecef875e6a95fc10be87bf70",
+      "size": 52767
+    },
+    {
+      "path": "crates/tirith-core/src/rules/hostname.rs",
+      "sha256": "776e0cd743335cefd99ad5f0accc44cd41e6e51b30249bfd08d8be3a8cf481d1",
+      "size": 16956
+    },
+    {
+      "path": "crates/tirith-core/src/rules/iac.rs",
+      "sha256": "96499a746f4f65a81652cd221de3c30fe7ff13e080a3e9a727886348b0a58ffd",
+      "size": 21210
+    },
+    {
+      "path": "crates/tirith-core/src/rules/install.rs",
+      "sha256": "180b209558a392ab0c9fd77ddafc198a7f9a99ca5c6e1d2530ad159fedd5778c",
+      "size": 102143
+    },
+    {
+      "path": "crates/tirith-core/src/rules/mcpdrift.rs",
+      "sha256": "e412c32477e78f4e76483ccc6c885171609cfbe98db910f707d8e4eaf9918696",
+      "size": 91007
+    },
+    {
+      "path": "crates/tirith-core/src/rules/mod.rs",
+      "sha256": "4c509c67a8f4ee3737116e81ec36d02fc36f545b8d2636e27131f199f5bd1aa0",
+      "size": 588
+    },
+    {
+      "path": "crates/tirith-core/src/rules/output.rs",
+      "sha256": "0edd98078e9e96ce8e02184169e854744567df34f0437d3f97a9de71c19e4731",
+      "size": 29227
+    },
+    {
+      "path": "crates/tirith-core/src/rules/paste_provenance.rs",
+      "sha256": "6f341acda1dc171867eb5e9714dce50b063f15c8e104f49c2704e54e28edd6a7",
+      "size": 29818
+    },
+    {
+      "path": "crates/tirith-core/src/rules/path.rs",
+      "sha256": "8743007262824044ef3e4e3a8d4a5149d645710358cac839487df2c0ef3819d2",
+      "size": 9299
+    },
+    {
+      "path": "crates/tirith-core/src/rules/powershell.rs",
+      "sha256": "6583d973f9844ed8a5c3b5b57bbf6f57992472479a9aabddb212da9825b589c2",
+      "size": 19019
+    },
+    {
+      "path": "crates/tirith-core/src/rules/prompt_injection.rs",
+      "sha256": "57a885f05b72c467cdac77e05a8da71aa1cb893175368dc4ab9908b0a621eb40",
+      "size": 64042
+    },
+    {
+      "path": "crates/tirith-core/src/rules/rendered.rs",
+      "sha256": "18500f0eef1437d17abe1358fd12e1905d676facf711a79dfc6d60c317fedf17",
+      "size": 480448
+    },
+    {
+      "path": "crates/tirith-core/src/rules/shared.rs",
+      "sha256": "b52651ead00bccc1db3c5108ac2a3b10774703eb94276132e4e423eb99461874",
+      "size": 13798
+    },
+    {
+      "path": "crates/tirith-core/src/rules/ssh_context.rs",
+      "sha256": "824f14eac661aba4550f481fb05f13cf44a22c9f5d3680b8627e013042b5993c",
+      "size": 32713
+    },
+    {
+      "path": "crates/tirith-core/src/rules/sudo.rs",
+      "sha256": "b0642fb6cd5fcdec039ead0d443a8b7a1ff54cd4fcb87323ec71a95480e4c64f",
+      "size": 77467
+    },
+    {
+      "path": "crates/tirith-core/src/rules/terminal.rs",
+      "sha256": "0325159a9f1700b22eef477f5783c59514502abd896d9559071169d3c61c72b8",
+      "size": 41351
+    },
+    {
+      "path": "crates/tirith-core/src/rules/threatintel.rs",
+      "sha256": "f132c3b8172a72108f42f117351630ab5ea275988ecc49834a084b62967c742e",
+      "size": 98709
+    },
+    {
+      "path": "crates/tirith-core/src/rules/transport.rs",
+      "sha256": "c4b67878aab30c1456630486552c238caad86d1762d90f2182316de7af24e070",
+      "size": 16576
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3/config.rs",
+      "sha256": "accdaf5814744a6289c67a4c398fba0857c3d2b249a4b3b10867170a9aed8df6",
+      "size": 40782
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3/coverage.rs",
+      "sha256": "0c33190c936a5ca35614957124e9801dff5763721b9c1d140de10e20ec0075a5",
+      "size": 14258
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3/mod.rs",
+      "sha256": "2ea79695f10157a19f2ee6ac8a6487b1180f50f7998d9539c42ee851de342c21",
+      "size": 1390
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3/model.rs",
+      "sha256": "526f476ae667f1574b119451949b3798b9764bb93f5e17ddf62d8fe1194371f5",
+      "size": 100737
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3/parse.rs",
+      "sha256": "e198ac95b94102bf1d2cbc509ee2d0b2020a8ba74ec5ee814ba3eb87b79a0719",
+      "size": 564292
+    },
+    {
+      "path": "crates/tirith-core/src/rules/web3_gate.rs",
+      "sha256": "15278f0cf86fe2d269eeb30ea6f9765894328f9b68974c5fca3e8714e1d62009",
+      "size": 83566
+    },
+    {
+      "path": "crates/tirith-core/src/rules/workflow_artifacts.rs",
+      "sha256": "2d95f2421e1f64fe97bc2d64c6c07913257bfb9e9819b1fa3306d41593072ee4",
+      "size": 125444
+    },
+    {
+      "path": "crates/tirith-core/src/runner.rs",
+      "sha256": "7dbf7beedc8042f6090eda4da19b90f534a87069b8f73ba6c3fbb939f8705f95",
+      "size": 191551
+    },
+    {
+      "path": "crates/tirith-core/src/safe_command.rs",
+      "sha256": "5b12816ac694aac3224c4b82b1ca99aa2f2463383caeae0c9475f1d71cef3d50",
+      "size": 92348
+    },
+    {
+      "path": "crates/tirith-core/src/sarif.rs",
+      "sha256": "1db81de33d4b08a81b93271526cfb915bc9067be77801e41cd68e25fcf91608a",
+      "size": 25499
+    },
+    {
+      "path": "crates/tirith-core/src/scan.rs",
+      "sha256": "cd99935fb3a897ab7165d4a5aadf22f6c17303da82b9aebaefe645e28ddd5e97",
+      "size": 190151
+    },
+    {
+      "path": "crates/tirith-core/src/scoring.rs",
+      "sha256": "af136eb7f2ffc938978a19df66d78dd6f7a026af9103d3252030bb4b89c8633b",
+      "size": 38107
+    },
+    {
+      "path": "crates/tirith-core/src/script_analysis.rs",
+      "sha256": "36e78b312ae95f0e00ca74acab005ec297cb6f15e7e07aa6e8fbfea4805082fe",
+      "size": 4866
+    },
+    {
+      "path": "crates/tirith-core/src/secret_rotation.rs",
+      "sha256": "f2f52e362f07c87f06ec0acb8e996b66f4b4cb25b05832e962069829950335e4",
+      "size": 42564
+    },
+    {
+      "path": "crates/tirith-core/src/selfupdate.rs",
+      "sha256": "c9384a47188e3e47f5e08a7f75cfabca6002d8e6a992e64f7e90f278f69b145c",
+      "size": 38081
+    },
+    {
+      "path": "crates/tirith-core/src/sensitive_assets.rs",
+      "sha256": "496128d12438ea34dbdbefca32398d2b16a848408e73c8d79350e5f228139b94",
+      "size": 165628
+    },
+    {
+      "path": "crates/tirith-core/src/session.rs",
+      "sha256": "efdeb84ea4ea50cc1179aa42eb3980cf75930459b9019bd9a4332315d9b510ae",
+      "size": 25721
+    },
+    {
+      "path": "crates/tirith-core/src/session_warnings.rs",
+      "sha256": "53c8480653b94cdf19a89bb34663513af6609e99455bdf3ad2da8e0228a9b9a0",
+      "size": 157631
+    },
+    {
+      "path": "crates/tirith-core/src/ssrf_guard.rs",
+      "sha256": "1b074c35baf8f1c69aab2272aa01bfae453115cb8dfc3f4811276ee789064c88",
+      "size": 31074
+    },
+    {
+      "path": "crates/tirith-core/src/style.rs",
+      "sha256": "546c0b0e96122f4c03f1030d8e87d163750cb48ea9a6e864e4c44e2edb48b177",
+      "size": 3071
+    },
+    {
+      "path": "crates/tirith-core/src/sudo_session.rs",
+      "sha256": "d7a413e6fc3e4143821c32d357a7186d961389078055a297adbe3ee37e131a0f",
+      "size": 9345
+    },
+    {
+      "path": "crates/tirith-core/src/suppression.rs",
+      "sha256": "b127bef7ae474531d9bbe85612e28d08e4147b4dd6da0fde9327e743dc582723",
+      "size": 3204
+    },
+    {
+      "path": "crates/tirith-core/src/taint.rs",
+      "sha256": "7076187b709555a06c5ebc87519ce66bcaf0389f67d672a5a3376725d80849b6",
+      "size": 35521
+    },
+    {
+      "path": "crates/tirith-core/src/task.rs",
+      "sha256": "2e4ef853764a313c4d4356b231ab2f83013854d7f2fb0956f3262f35d3e39229",
+      "size": 78854
+    },
+    {
+      "path": "crates/tirith-core/src/task_analysis.rs",
+      "sha256": "225c8b59af32427d5c75bcb51b5d89e198ad63433c54edae49bc02442c35eb4a",
+      "size": 4356
+    },
+    {
+      "path": "crates/tirith-core/src/task_boundary.rs",
+      "sha256": "410b0f502abf13e537c98f2d82ab0eec1697726d5ff764cbce85a835bb515ddc",
+      "size": 131255
+    },
+    {
+      "path": "crates/tirith-core/src/task_command_families.rs",
+      "sha256": "f9d49e024a75c52bbe7d4bf190f868c82aa98f3ef60e5a679cd39355d12e7fd2",
+      "size": 12950
+    },
+    {
+      "path": "crates/tirith-core/src/task_envelope.rs",
+      "sha256": "2622072cd6167588d8f6639e0f1f33552e44884aab62bbc826ce38cd7cb6617d",
+      "size": 17094
+    },
+    {
+      "path": "crates/tirith-core/src/task_receipt.rs",
+      "sha256": "ab190f924941823eb2f4466f182217d71ea7c31d7529ecc01a06dbd84782f7aa",
+      "size": 137323
+    },
+    {
+      "path": "crates/tirith-core/src/text_confusables.rs",
+      "sha256": "c3d66b29cb0eab5f57e57b014cade3c83d902794abf85569c0a253ef197bf906",
+      "size": 1750
+    },
+    {
+      "path": "crates/tirith-core/src/threatdb.rs",
+      "sha256": "cf6f31fb93770614e1de2940d0deb4456237a9787f6cef1b0859171e6b67c720",
+      "size": 276036
+    },
+    {
+      "path": "crates/tirith-core/src/threatdb/materialization_source.rs",
+      "sha256": "7faa55a4697272e9146c22ba3436d358f16b7fb462591d2c43f3918191f7e20f",
+      "size": 15052
+    },
+    {
+      "path": "crates/tirith-core/src/threatdb/operations.rs",
+      "sha256": "59e3d8d0bf14168803abe549b60e117006e6c6b3b342e7198a2abb022cecb212",
+      "size": 21839
+    },
+    {
+      "path": "crates/tirith-core/src/threatdb_api.rs",
+      "sha256": "4243ec11c46ca0a2f5b805d393b41fd038aa729df5313231e5ce0496d08a1784",
+      "size": 98969
+    },
+    {
+      "path": "crates/tirith-core/src/threatdb_feeds.rs",
+      "sha256": "bb303e34836a8829e1c4be8285f81401dbdf2e32b030ef133aa892d7fb441b43",
+      "size": 46965
+    },
+    {
+      "path": "crates/tirith-core/src/tokenize.rs",
+      "sha256": "6bb2fa05dfbc984ee8010c237cfc93784411e0ccfcbade7873f8363d14d5fc35",
+      "size": 110089
+    },
+    {
+      "path": "crates/tirith-core/src/trust_grants.rs",
+      "sha256": "da822e69973901dceb8d17d23460b4ceadfdabd5c6698e94a72fef9ae343cbe3",
+      "size": 21033
+    },
+    {
+      "path": "crates/tirith-core/src/trusted_child.rs",
+      "sha256": "22440d5c5461a793c26f609f77f811990fd0b36b01ef3ba9a607be23f9ce6f18",
+      "size": 136600
+    },
+    {
+      "path": "crates/tirith-core/src/trusted_child/tmpfs_acl.rs",
+      "sha256": "299066958c0634d4186464edfa9e1640873f8b015ab900892efb197ecf782514",
+      "size": 17437
+    },
+    {
+      "path": "crates/tirith-core/src/trusted_child/windows.rs",
+      "sha256": "b612f2703b7721d509d058e0fa762599886b8352b99ccb63afc6dda63c635584",
+      "size": 68376
+    },
+    {
+      "path": "crates/tirith-core/src/url_validate.rs",
+      "sha256": "69972db8f015987ee91f152f647e1fecb06db103696448929c55676e693ab511",
+      "size": 57642
+    },
+    {
+      "path": "crates/tirith-core/src/util.rs",
+      "sha256": "9eafd0eb5949dd5720497a6f8c19aab6d4a3cab6d56c48b47fe57a44dcd90028",
+      "size": 57359
+    },
+    {
+      "path": "crates/tirith-core/src/util/contained_fs.rs",
+      "sha256": "33ef36c59b3327e71ae626698718774dd89b3e286474d694b449505e1af69086",
+      "size": 127251
+    },
+    {
+      "path": "crates/tirith-core/src/util/dirfd.rs",
+      "sha256": "685b773fe73755137a9b05ede66123b0a3cdd6fe577015ba7d55cc2077cee212",
+      "size": 44054
+    },
+    {
+      "path": "crates/tirith-core/src/util_build_dirs.rs",
+      "sha256": "07aff9e430e682b07097c33250c31e050d4bcf635f8ffdbcbfdd65bf5a4501b0",
+      "size": 13517
+    },
+    {
+      "path": "crates/tirith-core/src/verdict.rs",
+      "sha256": "38b941444ee0d6c3aa7dad91ad955c79f29ca432f25a35129230c5bf050a30c0",
+      "size": 167488
+    },
+    {
+      "path": "crates/tirith-core/src/version_intent.rs",
+      "sha256": "8c9ef9ba2e7453a1e8eabfe782f26e462234ab2a9170b24ad0bc6f57cf0af66d",
+      "size": 60764
+    },
+    {
+      "path": "crates/tirith-core/src/web3_policy.rs",
+      "sha256": "1ad457f652c71094824e03e8f3e318e38ee9af535485f73f3a868f29d7629f40",
+      "size": 43314
+    },
+    {
+      "path": "crates/tirith-core/src/webhook.rs",
+      "sha256": "bb7cd646d81777f6d565c409200e7229c5013f5bc25694b0fb4a0fac397b07c7",
+      "size": 26835
+    },
+    {
+      "path": "crates/tirith-core/tests/bypass_regression.rs",
+      "sha256": "9779629fe1b512467afeb3be7edd4bb37d9940dde6c4e443a389a73acdb13ee1",
+      "size": 10556
+    },
+    {
+      "path": "crates/tirith-core/tests/c00_contracts.rs",
+      "sha256": "e88eb700c5ef4286f9c7d2ac247ee9693695f921268ccf876729045e89bd6c96",
+      "size": 7219
+    },
+    {
+      "path": "crates/tirith-core/tests/c19_cross_cutting.rs",
+      "sha256": "2c3ab18a22a8eaa9d311e2f7d502ec9e1d558954fc55c73dac5aab8b1a729416",
+      "size": 73456
+    },
+    {
+      "path": "crates/tirith-core/tests/curl_destination_extraction.rs",
+      "sha256": "e2604084219dd9de599e1c7b03a0b1e47bb4d7e92e89941d737723ecca4321ac",
+      "size": 8739
+    },
+    {
+      "path": "crates/tirith-core/tests/curl_empty_hex_authority.rs",
+      "sha256": "bfae8893ccf3e9337791c3225a7e68a554a7c12874d40bb540db628ad8f39309",
+      "size": 9751
+    },
+    {
+      "path": "crates/tirith-core/tests/fixtures/npm/README.md",
+      "sha256": "8226659b582192c821e7206dee3cf4aa1083b4fe26974cd6ae376cef9b7d477c",
+      "size": 1128
+    },
+    {
+      "path": "crates/tirith-core/tests/fixtures/npm/install/hidden-lock-11.19.0.json",
+      "sha256": "f6479c9fedfa5132a17aff30f4ebd8444c0b804b4c5911fbebd2657b038dcff0",
+      "size": 3680
+    },
+    {
+      "path": "crates/tirith-core/tests/fixtures/npm/install/node-26.7.0-arm64-libraries.json",
+      "sha256": "5bff5c714391f031b1ea8734a163c09652d37083a497c4793537e5616b40bc3b",
+      "size": 1956
+    },
+    {
+      "path": "crates/tirith-core/tests/fixtures/npm/npm-11.19.0-portable-pax.tgz",
+      "sha256": "769755af559bda513cfe86d6c433bf8e6c0b2431dbb24955393e0dc69eeb2c0f",
+      "size": 465
+    },
+    {
+      "path": "crates/tirith-core/tests/generate_test_fixtures.rs",
+      "sha256": "785645b152e5d97d7e1399a10444e2206882bcd0dc47babdf94f0ec69301d1ff",
+      "size": 6277
+    },
+    {
+      "path": "crates/tirith-core/tests/golden_fixtures.rs",
+      "sha256": "e0a863ad8faaae7c7e1358f50ce13d7e1794fc9af16fdf74a3fa148acf70c648",
+      "size": 118747
+    },
+    {
+      "path": "crates/tirith-core/tests/policy_integration.rs",
+      "sha256": "f65756448855bf26ca0f1fcef555ba7831c6a1535f6f6fca462163a01e17942d",
+      "size": 63030
+    },
+    {
+      "path": "crates/tirith-core/tests/raw_ip_url_diagnostics.rs",
+      "sha256": "a68d6ee9637b4d106dfb04f6feb911972c83f6628f143dcdb5c1254a0d015f3d",
+      "size": 9937
+    },
+    {
+      "path": "crates/tirith-core/tests/safe_command_integration.rs",
+      "sha256": "7b920cd36e106690e6aac85b655bd64adff30822e48a5db69bc54d9f70d25a05",
+      "size": 12229
+    },
+    {
+      "path": "crates/tirith-core/tests/shell_false_positive_regressions.rs",
+      "sha256": "a3f49706cac65b9ebf58366bdfbb64bcce920efad8165956e16f4fb50cfc9426",
+      "size": 5751
+    },
+    {
+      "path": "crates/tirith-core/tests/task_boundary.rs",
+      "sha256": "352426e46744a96cc511bc571aa8e2db57ab6bd54c815fd29dcb930e9a724129",
+      "size": 14003
+    },
+    {
+      "path": "crates/tirith-core/tests/task_command_family_coverage.rs",
+      "sha256": "5d9f19a8a9873ae327c8f5a9fd459b2c9c7437c761124772e7abf45cdb96d034",
+      "size": 8699
+    },
+    {
+      "path": "crates/tirith-core/tests/task_provenance.rs",
+      "sha256": "c8e06e23f98ec64fa7d5eba8e602622176c770056f1fe17e011a496493658182",
+      "size": 18105
+    },
+    {
+      "path": "crates/tirith-core/tests/trusted_child.rs",
+      "sha256": "02606b2d0276d72024d6ee3146be97007af91b60ca822b09a0847214a6cc462d",
+      "size": 42671
+    },
+    {
+      "path": "crates/tirith-core/tests/trusted_child_windows.rs",
+      "sha256": "926761d6c6ced0e70fe89565a7473f2e5f43aa41a64e96c1b5063a005a2e4af3",
+      "size": 14250
+    },
+    {
+      "path": "crates/tirith-core/tests/trusted_child_windows_policy.rs",
+      "sha256": "6cad498cf9595fc82d261d73371c13982df5a2873e7bdd9ff4e6222939379b51",
+      "size": 6585
+    },
+    {
+      "path": "crates/tirith-core/tests/web3_public_api_compat.rs",
+      "sha256": "5005bddbc9e7057760032021dadf2d6f4e24273be0f3cbe4ee39403a8dd1890a",
+      "size": 17403
+    },
+    {
+      "path": "crates/tirith-core/tests/workflow_artifact_flow.rs",
+      "sha256": "fddf601dc797388c2243fc7fbee6e31c6498bc6abb44870839fe7033d25f3dfc",
+      "size": 21856
+    },
+    {
+      "path": "crates/tirith-test-support/Cargo.toml",
+      "sha256": "5320715a9a973a8d1cb1b9b0002e55f7f04f6b5b5525adf0a281c6f5fdce5aa7",
+      "size": 260
+    },
+    {
+      "path": "crates/tirith-test-support/src/lib.rs",
+      "sha256": "2605496e024fa87af6d8505789e0105b0bff68833ad54402ba219833b702c424",
+      "size": 23778
+    },
+    {
+      "path": "crates/tirith/Cargo.toml",
+      "sha256": "58ce68e88094ad96db15670126f639675313288236e1f8fe5d3c3be26a03f591",
+      "size": 8721
+    },
+    {
+      "path": "crates/tirith/assets/configs/tirith-gateway.yaml",
+      "sha256": "a4b6f7daf3fb94e7ff7f0842c3d1515f62e7f420ecd987ab110bb13b3863bb6b",
+      "size": 3473
+    },
+    {
+      "path": "crates/tirith/assets/data/popular_packages.csv",
+      "sha256": "dac53146c07edb5c8ab5d3ea291df46d78e74d33d7bca09f35f43bfc18dd6d25",
+      "size": 2285
+    },
+    {
+      "path": "crates/tirith/assets/data/web3_package_anchors.SOURCE.md",
+      "sha256": "ceca15f31ca4bee731159b86f99b9bac0b4ab1ef1162163456734ab126cffb5d",
+      "size": 2329
+    },
+    {
+      "path": "crates/tirith/assets/data/web3_package_anchors.csv",
+      "sha256": "58c0b6c5441397bba67f1c2a2bacc1d535c38a12a060c7aa8c38c527de5f344b",
+      "size": 393
+    },
+    {
+      "path": "crates/tirith/assets/hooks/cline-pretooluse.ps1",
+      "sha256": "293ad31bce585d1bf1fec21bbf4b7fc5df27ce383a82044c74cc486ecf2d0841",
+      "size": 2296
+    },
+    {
+      "path": "crates/tirith/assets/hooks/copilot-cli-hook.py",
+      "sha256": "3080fb39a501cde77b222226c170401592efe12936c8b9283c931059ef7d88eb",
+      "size": 8865
+    },
+    {
+      "path": "crates/tirith/assets/hooks/cursor-hook.sh",
+      "sha256": "c0e8ef4718697f9f8189d6019000be7751e4439540cb31bba49a267dbaae8418",
+      "size": 5772
+    },
+    {
+      "path": "crates/tirith/assets/hooks/kiro-hook.py",
+      "sha256": "74149ce3c19f87cfe9ceb4c38b553522e1a8fddce119adc28c32f99c2601e092",
+      "size": 8139
+    },
+    {
+      "path": "crates/tirith/assets/hooks/openclaw-tirith-guard.ts",
+      "sha256": "ac497d1d257e632e7a914fb768e37e853ee516b01a287f1e33055fd0679df1fd",
+      "size": 16965
+    },
+    {
+      "path": "crates/tirith/assets/hooks/tirith-check.py",
+      "sha256": "ed2fb69abdcf2f7b3dda5dcc1d6591e19f32358dada50173094d129cb6725746",
+      "size": 21232
+    },
+    {
+      "path": "crates/tirith/assets/hooks/tirith-guard.ts",
+      "sha256": "47236951df372bc7e3e1959c3f27ab5f486b871e78b38fc6efa30e9cf90c2026",
+      "size": 50742
+    },
+    {
+      "path": "crates/tirith/assets/hooks/tirith-security-guard-gemini.py",
+      "sha256": "682ec392cdd6267c493cbbfb9593963518a67a9ce88d0a8eb4a4dab47e5035e8",
+      "size": 8192
+    },
+    {
+      "path": "crates/tirith/assets/hooks/vscode-hook.sh",
+      "sha256": "fcf038ebaffe3505619e90b343de448e2bb1b15b6c321276fb5524a0c39325b5",
+      "size": 6437
+    },
+    {
+      "path": "crates/tirith/assets/hooks/windsurf-hook.sh",
+      "sha256": "c3151f10e1570cbfe6de4c2b2bc0a9d8625bd15d8c6dc3766d79e1fdc5cfe36c",
+      "size": 4230
+    },
+    {
+      "path": "crates/tirith/assets/hooks/zshenv-guard.zsh",
+      "sha256": "1bb6725a9543f20a97cdea10b633b2b66d7337898cf5a1938fcc4ad4f1147c9e",
+      "size": 1802
+    },
+    {
+      "path": "crates/tirith/assets/keys/threatdb-verify.pub",
+      "sha256": "ee65a4cf011b55b19a8bbc6cc64d6b46dbcc5a2e35a690f8cf6f511f6d993db9",
+      "size": 32
+    },
+    {
+      "path": "crates/tirith/assets/lab_artifacts/README.md",
+      "sha256": "47d459ce4e58f4990d8d0a66dd0a808511d58eb6362d6187822a7d7677284a51",
+      "size": 2099
+    },
+    {
+      "path": "crates/tirith/assets/lab_artifacts/loader_cross_dist.pth",
+      "sha256": "797f923d3c789b804dae94c05a605e64741d617620c8cff59357ce47578b3238",
+      "size": 83
+    },
+    {
+      "path": "crates/tirith/assets/lab_artifacts/pth_benign_editable.pth",
+      "sha256": "93b9f6dd2555c46c734fac03759a144b7be2299df3099715b7ab1c0174a572f0",
+      "size": 86
+    },
+    {
+      "path": "crates/tirith/assets/lab_artifacts/pth_cross_runtime.pth",
+      "sha256": "861953f78f8fc0ee8663ce2e5309e40ace8f2719dea9b0d3ccfcfdd3046fa5cf",
+      "size": 82
+    },
+    {
+      "path": "crates/tirith/assets/lab_artifacts/pth_subprocess.pth",
+      "sha256": "4ea7f54ae022ece013ed9050c4786d61d834779f91562df779706e1c139503e6",
+      "size": 82
+    },
+    {
+      "path": "crates/tirith/assets/lab_corpus.toml",
+      "sha256": "67b86d3c3c2c7743bb908beb1dd6b332f6510e00efb0f4f867b5e85a64da7a0e",
+      "size": 15882
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/ai-agent-heavy.yaml",
+      "sha256": "47a2ec05fff47502e30d72b44781456ffd14e3e568b8cf75948583b5d2dfff97",
+      "size": 6821
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/ci-strict.yaml",
+      "sha256": "79250c94ca73948388b087f1dd53558420b9e0307fbc4efc7109dfa8fc05e23b",
+      "size": 3803
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/enterprise.yaml",
+      "sha256": "6d090d2f5243bb2e553191998b44416de2b5c3e4b2c8542b14d31835c5b1770f",
+      "size": 4469
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/individual.yaml",
+      "sha256": "edebd52d24d99bc19141e5b704aa6223665e389fc261cce3d49516ca003ccd8c",
+      "size": 3777
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/mcp-strict.yaml",
+      "sha256": "e4d4551d66790bf9e63ecb501f262a7385a21a1f9fa90ca4a20f373a88626a1e",
+      "size": 4430
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/oss-maintainer.yaml",
+      "sha256": "fc4339249418c2c4d0e6d02af5d0c7f961a4b3aa4df169296a8b6ceeefc7cb22",
+      "size": 4187
+    },
+    {
+      "path": "crates/tirith/assets/policy_templates/startup.yaml",
+      "sha256": "aeee27321aa238b4f7a264264fdb93c3099ca3fa1eafebfd404ae633b11cc75b",
+      "size": 4116
+    },
+    {
+      "path": "crates/tirith/assets/shell/lib/bash-hook.bash",
+      "sha256": "6a7f4079246fef6fee25927b7a87d5d4c742ef4111e430ffacc10fe25dd7c33a",
+      "size": 131870
+    },
+    {
+      "path": "crates/tirith/assets/shell/lib/fish-hook.fish",
+      "sha256": "56f6a9e86c08e1c7130303c74eabaa4748972717fc4807393d4c6af1bc043307",
+      "size": 37544
+    },
+    {
+      "path": "crates/tirith/assets/shell/lib/nushell-hook.nu",
+      "sha256": "66da600f5b27d69cee6ad3f62a8b5185833b320f1ca692a12a639d30ff57c0bf",
+      "size": 5253
+    },
+    {
+      "path": "crates/tirith/assets/shell/lib/powershell-hook.ps1",
+      "sha256": "820079af8ac266a9062122795bed4dbc4c336dcff7acda75e36a6d464aedcb95",
+      "size": 22772
+    },
+    {
+      "path": "crates/tirith/assets/shell/lib/zsh-hook.zsh",
+      "sha256": "c002e90fe9c5b158b02356c89ea373acfbb8938eae9f699e803a5552f2c07e46",
+      "size": 72041
+    },
+    {
+      "path": "crates/tirith/assets/shell/tirith.sh",
+      "sha256": "0fee41415c73ff61505504e6e651bf0ccba8165ad7f38763643c278529bb6025",
+      "size": 1515
+    },
+    {
+      "path": "crates/tirith/src/assets.rs",
+      "sha256": "35ea0cc4d6405e67d9e9cde5bda53baab1b96e29bf489acb3232cf6516053b6c",
+      "size": 2681
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/mal-2025-6812.json",
+      "sha256": "1f4aec9201bcb393ee640923ad6041e147c69f852dcc4a1555fec5f1f74474bb",
+      "size": 1334
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/mal-2026-2307.json",
+      "sha256": "87a720ea4404ff3d514b3a108fcd5946f4a6e7fe159d1a1d649c8463b4f278d2",
+      "size": 2851
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/MAL-solana-web3-bounded.json",
+      "sha256": "e72793c48def23b975bc0bc53cf2ed156426bd0d3bfedff413e2087603716112",
+      "size": 314
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/MAL-whole-package.json",
+      "sha256": "2b1884122f0b44fc6a7b3dfd8515a60fe2221387b33d37f32cf4b06f3694dc5b",
+      "size": 248
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/SOURCE.md",
+      "sha256": "59588f93ac86933de4c8598a906c601841ba1c249f56aceb80b923c81ef59c43",
+      "size": 802
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/datadog-npm-manifest.json",
+      "sha256": "bf306091fcbbe315feabb206fd5c1e2aa15f994fb79ebe87f5e7a2751e842f46",
+      "size": 67
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/datadog-pypi-manifest.json",
+      "sha256": "6be0257e1ad225018d587df854ef3e92c1c2ffadd2657086a8e1e7f7cb597e95",
+      "size": 63
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/registry-versions.json",
+      "sha256": "f5f64f44338b46431e3ef149e687a29d5180d86f45973703ac4aa396c4b54bf7",
+      "size": 529
+    },
+    {
+      "path": "crates/tirith/src/bin/fixtures/threatdb-c01/typosquats.csv",
+      "sha256": "0118685b2df1a50abef516857a553a556f16f90f4a04990a5bd2892220544f07",
+      "size": 189
+    },
+    {
+      "path": "crates/tirith/src/bin/tirith_package_approval_authority.rs",
+      "sha256": "de420e495285655b4f306e3188f8cc91f6c344536ffb24fd0da758182e5a611f",
+      "size": 718
+    },
+    {
+      "path": "crates/tirith/src/bin/tirith_threatdb_compile.rs",
+      "sha256": "c9776fd3b98e98993f4cbc83242c833dbc95c7b9c8e43b1f8adefc176d753197",
+      "size": 346189
+    },
+    {
+      "path": "crates/tirith/src/cli/agent.rs",
+      "sha256": "ea3cc25c656e03dc9acd7db79bc6f88feedd6e4f9ebbbd8f247f10439e10775d",
+      "size": 77131
+    },
+    {
+      "path": "crates/tirith/src/cli/ai.rs",
+      "sha256": "78a0293d95901a7361218f019dbea0a46438aa8e5aa2388e0000c8b82c85e131",
+      "size": 83770
+    },
+    {
+      "path": "crates/tirith/src/cli/aliases.rs",
+      "sha256": "0ab1c2f14c590508cfdcfb5a4828eaae9b915956d4d6e78d7f4d9be42cd8352d",
+      "size": 11149
+    },
+    {
+      "path": "crates/tirith/src/cli/attest.rs",
+      "sha256": "d1663764dd7b82198ed7d930508f348ae589f54811308eccd4a1375f03fc05f4",
+      "size": 25388
+    },
+    {
+      "path": "crates/tirith/src/cli/audit.rs",
+      "sha256": "a32003e59885acd41224fa84e0a12cb9490923706cadf0e01a2b5756a3aac323",
+      "size": 16168
+    },
+    {
+      "path": "crates/tirith/src/cli/audit_health.rs",
+      "sha256": "314a1984c67afb69e5ac697a57746b8764ccd869dfc44737a30482571da0e72b",
+      "size": 11914
+    },
+    {
+      "path": "crates/tirith/src/cli/audit_retention.rs",
+      "sha256": "9b8a84260d68e00d700544ed9052d03dc88aa2f696cba289f1343eb2d9e97ec6",
+      "size": 3244
+    },
+    {
+      "path": "crates/tirith/src/cli/automatic_deadline.rs",
+      "sha256": "879ca57ade8192fb38cd7d61488d07e64e07e3c88e0a03898aaf1258ee7a2dc4",
+      "size": 33274
+    },
+    {
+      "path": "crates/tirith/src/cli/baseline.rs",
+      "sha256": "65d5577737f595b6acace5fffb30168b44056825497a42fe9b30868f5a7dedc1",
+      "size": 11842
+    },
+    {
+      "path": "crates/tirith/src/cli/bash_capability.rs",
+      "sha256": "259dd1b78349f739b9c1019dc903292d228bbed730f8906002c6803dc71656cc",
+      "size": 55962
+    },
+    {
+      "path": "crates/tirith/src/cli/browser.rs",
+      "sha256": "886fd7bda10edfe604f25f58b734cd9e63c75e4b898f417812ab7700f52c4650",
+      "size": 29131
+    },
+    {
+      "path": "crates/tirith/src/cli/browser_audit.rs",
+      "sha256": "825c79db287dd7ae951ad09f2202ae223874b62f285d9f9a9c8555f386315167",
+      "size": 32462
+    },
+    {
+      "path": "crates/tirith/src/cli/browser_host.rs",
+      "sha256": "d890d71559f13a97640aa2e32846243488a0040f6a8877e65c61208c3c64d1d3",
+      "size": 22751
+    },
+    {
+      "path": "crates/tirith/src/cli/canary.rs",
+      "sha256": "a6a78c3c705f02d2fc60eff7f167549c48995d109df15a67afc4d51478fab864",
+      "size": 12861
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule.rs",
+      "sha256": "610d0a7b95b5dc526f76dc852e041d7049d6ca1b7b9bde0cf3f7de109c4c4bdc",
+      "size": 375762
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule/npm_descriptor.rs",
+      "sha256": "c8f48d734b0de33e1efee838273ef2e508520c61fe61bad23a6bd9fa389b504a",
+      "size": 43318
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule/npm_native_tests.rs",
+      "sha256": "ceaf8956a8e14355b597be3c90d1aef3fc44dfe09d76ca61db9b4d1c01ef31aa",
+      "size": 15480
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_child.rs",
+      "sha256": "ad0f6af7fe9a6e6fbec3faa1cc6d4a35b770608dcddb3da9680251843ad9eeeb",
+      "size": 148060
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_child/aarch64_trace.rs",
+      "sha256": "fbdf21be5f67a00fcb4520bf682b3a7119a3859308cc1397351e4e0dc7944f11",
+      "size": 5501
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_child/npm_descriptor.rs",
+      "sha256": "f40a9726912893307c1c909481b26ef3e46a286ee5da6514d30b64fac8b9c77a",
+      "size": 17239
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_child/parent_lifetime.rs",
+      "sha256": "e5ea8692091cf45e5acb51cd5dd9882b1f437ee6dc0f0def05238c3452edb103",
+      "size": 6435
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_child/private_input_fs.rs",
+      "sha256": "ef37333b1f984e83a315a91ff08fab6ac50455eff20ba58fb3241dbfbe973406",
+      "size": 17685
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_proxy.rs",
+      "sha256": "49dfcb8d92b1c3083ca9113130a87b2025ce5712fff83e49cc60632b2484240c",
+      "size": 46069
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_run.rs",
+      "sha256": "6a96cfbb87509e24702785894e16ce18a2eccc28dd9df8ec6091487b5d8538a1",
+      "size": 45384
+    },
+    {
+      "path": "crates/tirith/src/cli/capsule_windows.rs",
+      "sha256": "78c3ac25890e7abdb00cfde1ede3e092ab95bc8a57b2ae3bcbf6825ea83b2869",
+      "size": 52247
+    },
+    {
+      "path": "crates/tirith/src/cli/check.rs",
+      "sha256": "091f0a026a295b7d13871e4bb33db66fe815589bd052d6ebdfc5fb633470e455",
+      "size": 133302
+    },
+    {
+      "path": "crates/tirith/src/cli/checkpoint.rs",
+      "sha256": "1b1a790307f5307d0b9ca1600dd1118e5941d76cd6ff4c8148a98f3eaf615c8f",
+      "size": 32648
+    },
+    {
+      "path": "crates/tirith/src/cli/clipboard.rs",
+      "sha256": "4dc717ea7fea2975b69e611d9abec3aae2629a89e5d3ca5db69faaaa614954dd",
+      "size": 58439
+    },
+    {
+      "path": "crates/tirith/src/cli/codespaces.rs",
+      "sha256": "93de7a0bd3fd60bc513d07523b53f4600ee90ea469d944a7696d35426b50b1d2",
+      "size": 17471
+    },
+    {
+      "path": "crates/tirith/src/cli/command_card.rs",
+      "sha256": "48a69453350a71b1fec571fe7093f7ad7e6e33552afe7ca34157e567ea7fac69",
+      "size": 46089
+    },
+    {
+      "path": "crates/tirith/src/cli/commands.rs",
+      "sha256": "dd821df89f0b7df60fbdb1dce31531be445e4041651b575859921610d0cc00c4",
+      "size": 78694
+    },
+    {
+      "path": "crates/tirith/src/cli/completions.rs",
+      "sha256": "2074031456241d56cb650e61a2b54379270088524f028b02f1b1fde9cbad3167",
+      "size": 4161
+    },
+    {
+      "path": "crates/tirith/src/cli/context.rs",
+      "sha256": "0fda8632d674207cf361c510575c64c871bf955d7ca640849128d4ecb06d77a9",
+      "size": 21177
+    },
+    {
+      "path": "crates/tirith/src/cli/control/api.rs",
+      "sha256": "a6e015290ffb464b4f7e847382c3e28107f1bec3e67e86eeceaf21e27d025d9c",
+      "size": 39215
+    },
+    {
+      "path": "crates/tirith/src/cli/control/assets/app.css",
+      "sha256": "12c19f5548c6f6afc287d9451f011798aa53e7f24222cbe13ee4c6ffade59a16",
+      "size": 7576
+    },
+    {
+      "path": "crates/tirith/src/cli/control/assets/app.js",
+      "sha256": "4e9f6a83a3cea97d806aeee2aab48f5a352c976252315ef40cf7eb203d063658",
+      "size": 88900
+    },
+    {
+      "path": "crates/tirith/src/cli/control/assets/index.html",
+      "sha256": "fcd0b6679686ddf56478deefd83739d61352d1a1c748d65cc07d49d8521be71d",
+      "size": 1737
+    },
+    {
+      "path": "crates/tirith/src/cli/control/http.rs",
+      "sha256": "958d622ac11951bc28b447398dbf576dc8ab6c67ebac72c3a7c2ec96972f9a6c",
+      "size": 21376
+    },
+    {
+      "path": "crates/tirith/src/cli/control/identity.rs",
+      "sha256": "09f7b331a5a0c0c382630e06240e6e29ea3a956c0e1e5816337fd220b77a0ecf",
+      "size": 36527
+    },
+    {
+      "path": "crates/tirith/src/cli/control/lifecycle.rs",
+      "sha256": "8c924377a7489b302bc958fb36cea6086454779328613b40dd7ebdda4f21eb33",
+      "size": 22756
+    },
+    {
+      "path": "crates/tirith/src/cli/control/lifecycle_native_fixture.rs",
+      "sha256": "bc9e1d99363ef15035ddd4374d723fa93f193b9396a3f7953394fb722b5f5072",
+      "size": 13149
+    },
+    {
+      "path": "crates/tirith/src/cli/control/lifecycle_worker.rs",
+      "sha256": "e9a9e9b0a767837a2370246874652f2747726426211f8f13a30008ec39a7dfa0",
+      "size": 28156
+    },
+    {
+      "path": "crates/tirith/src/cli/control/mod.rs",
+      "sha256": "cf321b9754b4e08cbd7198ff5bae7bbb8cfeaee3c6296b0b38abeeb228565c23",
+      "size": 11959
+    },
+    {
+      "path": "crates/tirith/src/cli/control/windows_spawn.rs",
+      "sha256": "3b770062d8cee32af1b4c03e679c6d4e4c42b5d193140ac8920269dc5279a80d",
+      "size": 10179
+    },
+    {
+      "path": "crates/tirith/src/cli/control/windows_spawn_tests.rs",
+      "sha256": "6c453bdc36c0bf1d78cc0a0ffd54a67119e73baa3ffb57c815f41397f0f1aa41",
+      "size": 10681
+    },
+    {
+      "path": "crates/tirith/src/cli/daemon.rs",
+      "sha256": "189b8d56573f4ce3a3b5a44f0e325f3aa1ec56341f000dda38e2aeda2b9e0566",
+      "size": 81946
+    },
+    {
+      "path": "crates/tirith/src/cli/dashboard.rs",
+      "sha256": "08cfcdcdfbcd145ed107552aac7320801c982288757e61c7f6255aa52c5eb170",
+      "size": 58190
+    },
+    {
+      "path": "crates/tirith/src/cli/devcontainer.rs",
+      "sha256": "b88174290fd689a5f8017a9ba102b6431aa6cec044e794432b008c3395c705fa",
+      "size": 16133
+    },
+    {
+      "path": "crates/tirith/src/cli/diff.rs",
+      "sha256": "69654370f39259e111dfcf9ac1004242c6cb058d10813bdb55041cd6de717b1a",
+      "size": 5033
+    },
+    {
+      "path": "crates/tirith/src/cli/doctor.rs",
+      "sha256": "5d975ee923ecb67b8658e98cd775dfb6f7d188ef7a5ba4a8f1a4e227c2e3707d",
+      "size": 195488
+    },
+    {
+      "path": "crates/tirith/src/cli/ecosystem.rs",
+      "sha256": "bf2edbc1a1e14ca78b9b0869473bc5a83375d5ab06a09d34ed144e4f266d8b00",
+      "size": 29931
+    },
+    {
+      "path": "crates/tirith/src/cli/env_guard.rs",
+      "sha256": "5192ba055231f53e3fb8e48e70e80d71b333e33e3a079ed856dccd607b6c208a",
+      "size": 30338
+    },
+    {
+      "path": "crates/tirith/src/cli/exec.rs",
+      "sha256": "4311783564c470fc30772f000874b7be688f3f498e982933b56c1d46a6c2b157",
+      "size": 23526
+    },
+    {
+      "path": "crates/tirith/src/cli/explain.rs",
+      "sha256": "e946af138edde45e4619b917563d84b62033f6752c30c8365f8df6eaea3f7fb3",
+      "size": 8717
+    },
+    {
+      "path": "crates/tirith/src/cli/feedback.rs",
+      "sha256": "55fcd4975004fcaf28bc768d92a3a64256d8959e553dcba9396d98b4bdced1a3",
+      "size": 9550
+    },
+    {
+      "path": "crates/tirith/src/cli/feedback_read.rs",
+      "sha256": "9727bf7bdd3249da673f2cd710f2f4a9e36b932c0f2020d72a4e2dc0e6422aa0",
+      "size": 5220
+    },
+    {
+      "path": "crates/tirith/src/cli/fetch.rs",
+      "sha256": "8a2555a7386eb602bd93f18ff9b6135ce7ee1cf71df4e97ffb59d40c8740f38e",
+      "size": 14225
+    },
+    {
+      "path": "crates/tirith/src/cli/fix.rs",
+      "sha256": "5e5d3bab4347c5105069a87f7f273aa925f7f6de751fe032757aa014d416ecff",
+      "size": 26866
+    },
+    {
+      "path": "crates/tirith/src/cli/gateway.rs",
+      "sha256": "d66229e2d2e71759d307e53f8a926ca1c142b9c04a49488d72ccc07550386a7c",
+      "size": 588886
+    },
+    {
+      "path": "crates/tirith/src/cli/history.rs",
+      "sha256": "aac0e9035bbc23ffe2dae8e9133fa892c2b6f5f4694efb43b68367107ec059ab",
+      "size": 5473
+    },
+    {
+      "path": "crates/tirith/src/cli/hook_event.rs",
+      "sha256": "51925c6bcc8cdd919b4581446a0c5df4fe1a8d461f0d78010beaa61c30a4128c",
+      "size": 1414
+    },
+    {
+      "path": "crates/tirith/src/cli/hooks.rs",
+      "sha256": "184c32634ee3e84d1287a395132483c58482cf3e1fabcbe2128620a81e465a43",
+      "size": 26564
+    },
+    {
+      "path": "crates/tirith/src/cli/hygiene.rs",
+      "sha256": "9390d483093e78fcf67a3aa285e7c7fa912149cdde7f8e111c1eb2fd876439d4",
+      "size": 13450
+    },
+    {
+      "path": "crates/tirith/src/cli/iac.rs",
+      "sha256": "8f11535b1d80705a4641c5873e3159dde1686b243ecc094eaf6345593307e3d0",
+      "size": 21220
+    },
+    {
+      "path": "crates/tirith/src/cli/incident.rs",
+      "sha256": "fe590de788a7bbdb3d9719b3a69e9bb0da99ec556856b5d770831142f6125357",
+      "size": 36396
+    },
+    {
+      "path": "crates/tirith/src/cli/init.rs",
+      "sha256": "363722d29a236af2ec0d52e3d09653e27ee7262ec9ff299b191bf2943a1a7e8d",
+      "size": 65120
+    },
+    {
+      "path": "crates/tirith/src/cli/install.rs",
+      "sha256": "f069b684a5234b11ef337860ae6b950708bd9b82cd22bae41d9a0ef256104153",
+      "size": 279833
+    },
+    {
+      "path": "crates/tirith/src/cli/intent.rs",
+      "sha256": "5bd82fc77ebb22aef0d705641689bf1ca6032215c00a01431e2f8684dfd6213e",
+      "size": 8488
+    },
+    {
+      "path": "crates/tirith/src/cli/lab.rs",
+      "sha256": "ad3fb6074fb4e623c1422edab02086aba9262840cb2aeda5a8b5ddfb665aab83",
+      "size": 26803
+    },
+    {
+      "path": "crates/tirith/src/cli/lab_artifacts.rs",
+      "sha256": "0134d2b44780b0e86838fab56b578dd5ed41837b9753ae18ad438bd29f5f1f7f",
+      "size": 23365
+    },
+    {
+      "path": "crates/tirith/src/cli/last_trigger.rs",
+      "sha256": "aec41b4abefc87878524aaa98591e617ca8fa0da63dd96693bd52a0bc04dc473",
+      "size": 12098
+    },
+    {
+      "path": "crates/tirith/src/cli/license_cmd.rs",
+      "sha256": "4281fd14de84cecbe1152ebe04d137d0689de9b33a52740bcb7cabc46e905e2b",
+      "size": 19927
+    },
+    {
+      "path": "crates/tirith/src/cli/lifecycle.rs",
+      "sha256": "c64f38a5541459892a69bbf909861f31bace248bdb4e693b0c2e9a5fceb45441",
+      "size": 13144
+    },
+    {
+      "path": "crates/tirith/src/cli/lifecycle_formats.rs",
+      "sha256": "dc8d493fc63d25c97b5fe17bc866d9d443fcd3a7e2a8dc0886cdba84e5108c87",
+      "size": 42071
+    },
+    {
+      "path": "crates/tirith/src/cli/lifecycle_operations.rs",
+      "sha256": "5bcd4990f4aa0e43435fcb62f8ef6f28056489494fe91bbae79fdb8482692148",
+      "size": 42213
+    },
+    {
+      "path": "crates/tirith/src/cli/lifecycle_service.rs",
+      "sha256": "3560facad184e88b26e378b9b75946e6807c59668949fa07eecb264de481c6dc",
+      "size": 36860
+    },
+    {
+      "path": "crates/tirith/src/cli/logs.rs",
+      "sha256": "eeba84ecb11a4d5859ab27e42f6f76d018dc1355a628e3f6ed6469820a56d3dd",
+      "size": 48652
+    },
+    {
+      "path": "crates/tirith/src/cli/lsp.rs",
+      "sha256": "e6ea559a42df6d721453990de0d3ee6230ade584f3ce685ae0d15fabf48be8dc",
+      "size": 47289
+    },
+    {
+      "path": "crates/tirith/src/cli/managed_policy.rs",
+      "sha256": "e2647bcae733722a811c7b447a501abfb4197337a6bbf2d84dad8739a3a43701",
+      "size": 5921
+    },
+    {
+      "path": "crates/tirith/src/cli/manpage.rs",
+      "sha256": "50ac468e5c6de6e5ef954aa3cec02edf5334adc3b0b421704db14377fe3cb7e0",
+      "size": 323
+    },
+    {
+      "path": "crates/tirith/src/cli/mcp.rs",
+      "sha256": "9f4a7717dfe55c8335303796aecadf5845ee298f5c6e56472c4d5f53d7ca716b",
+      "size": 119852
+    },
+    {
+      "path": "crates/tirith/src/cli/mcp_server.rs",
+      "sha256": "aabe6e536a072017b57f6f643bc058c75eae4b919ffbc8f0b8d75740ec0c0ddf",
+      "size": 695
+    },
+    {
+      "path": "crates/tirith/src/cli/menu.rs",
+      "sha256": "9557d1051d5f42230d812f2ca65d5b20622dbcd2e029fec31b2ccc2f64db36c7",
+      "size": 22097
+    },
+    {
+      "path": "crates/tirith/src/cli/mod.rs",
+      "sha256": "2e94b82586543a1c5bdd92bdd1f2af1fc1dfeaaff382270d7938a7bb7d943240",
+      "size": 98446
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_artifact.rs",
+      "sha256": "8d8874041f74f4f15c4e915b978bf820fe880ad901e33701a1d635df9b016b6b",
+      "size": 24022
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_artifact_browser.rs",
+      "sha256": "31481f7187f55a3da67657ba3124198467f5749804f65d2e1377aa6985f248e7",
+      "size": 6409
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_artifact_tests.rs",
+      "sha256": "8d8acdeb9e067bb641f6e57ece884c4feea8784ace48ae49c097e8bb459787bc",
+      "size": 7984
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_checkpoint_binding.rs",
+      "sha256": "6d29a75f25fdc50e494f3ae3f72b8941b9848e00b5eb902d1d6909e5ffbeb4e7",
+      "size": 3377
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_install.rs",
+      "sha256": "e3f35f7dc7b178e5fc61edb059e1358e9e214d757fb0ef88029e4d23f8d3f005",
+      "size": 71448
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_install_recovery.rs",
+      "sha256": "a3d627cb81378cb91189bdcf4eae0e38958e1742a1f93063ab2874c752c1d353",
+      "size": 35407
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_install_transaction.rs",
+      "sha256": "b302dee921bf5c1a3c341902c4c7939df24a45fec267601f32939a7bf3084e61",
+      "size": 15053
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_install_transaction_native_tests.rs",
+      "sha256": "3cecc94850c880ff43efd4a7910de24de6305a5ca7d57e3c41c496fdd24b2031",
+      "size": 46203
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_integrity.rs",
+      "sha256": "918b357f21214c6b5b0e574cbae611a37608cb460eb59c97d614c63c39e67886",
+      "size": 66949
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_materialize.rs",
+      "sha256": "9c735a7c1eaef8b91418f945a1c9a77f7391b9dd0f536a959c8f946cc253a379",
+      "size": 75485
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_materialize_checkpoint.rs",
+      "sha256": "a66ee4aa30a0a2fb3a857035fa2d2ddf9322473a413f0328111d038bf5177924",
+      "size": 17370
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_materialize_recovery_checkpoint.rs",
+      "sha256": "017ae25994998b0a83e5fefaf6bc1e888a7a7b845574420c93fdd8b04b662f68",
+      "size": 21625
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_materialize_store.rs",
+      "sha256": "38f37a179469a2b0882da86af47644c60661f7942d8d8a5157da8ace143096de",
+      "size": 24518
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_operation_output.rs",
+      "sha256": "caf0ec561b6e0f38a13636e9e1f2fc495495088924a7f1cefbcd682c69609e72",
+      "size": 16541
+    },
+    {
+      "path": "crates/tirith/src/cli/npm_sealed_bootstrap.cjs",
+      "sha256": "70d34f769895fe1424473815c3032c6a48387684439f0efa6bb3b52aac8923dc",
+      "size": 35166
+    },
+    {
+      "path": "crates/tirith/src/cli/onboard.rs",
+      "sha256": "a93342768f42dd7c0117cfad3e68133a2d88eb8e598e82cb6517e98f4e04d43c",
+      "size": 43890
+    },
+    {
+      "path": "crates/tirith/src/cli/output_guard.rs",
+      "sha256": "1215b615f21ec373e1b323b8e160b02da90197bed91316f7f0674683fd179ec6",
+      "size": 16776
+    },
+    {
+      "path": "crates/tirith/src/cli/package.rs",
+      "sha256": "96330523fd628df7f15e222433e48a5ad6aa3c84b1ef710453a399003f708586",
+      "size": 72442
+    },
+    {
+      "path": "crates/tirith/src/cli/package_approval_authority.rs",
+      "sha256": "973b41e371f9abba9bb344508367fc4587a8a56997fdb1ddd1becc31c8a8d288",
+      "size": 14753
+    },
+    {
+      "path": "crates/tirith/src/cli/package_approval_authority_helper.rs",
+      "sha256": "b1cd2fafa496d0db554ca23d92b774ba50f74697ba3631ac93ca3a907a24ef2f",
+      "size": 12096
+    },
+    {
+      "path": "crates/tirith/src/cli/package_approval_authority_native.rs",
+      "sha256": "f23a7ba80a2ca6407a0db934f743ba835cb7ffa9d702006b1003c4a0deafb688",
+      "size": 6434
+    },
+    {
+      "path": "crates/tirith/src/cli/package_checkpoint.rs",
+      "sha256": "8a72f2f82a62c0e5a014b9b017c4ce752a2aa845b8c778b2aa885fdae2b1dc1e",
+      "size": 86957
+    },
+    {
+      "path": "crates/tirith/src/cli/paste.rs",
+      "sha256": "7331834af793ed46e1e78fba426e47db1e1da81fddc1a5168cf95255c208f5c5",
+      "size": 19429
+    },
+    {
+      "path": "crates/tirith/src/cli/path.rs",
+      "sha256": "85b7730e13d8c2cf08e0be198158f494c9050064eac3a004835b086d6edfe405",
+      "size": 10792
+    },
+    {
+      "path": "crates/tirith/src/cli/pending.rs",
+      "sha256": "0636967ecf97b6698c5751737a926d7e81d5ccb77514d2f208c050a7e5efd6b0",
+      "size": 8425
+    },
+    {
+      "path": "crates/tirith/src/cli/persistence.rs",
+      "sha256": "8ca4ebc1aa3754c5df27be94077a0bb91b37269a9483dfd708b9e5664798606f",
+      "size": 13111
+    },
+    {
+      "path": "crates/tirith/src/cli/pkg.rs",
+      "sha256": "a85540951bb46b626e1f82d8a8d046df949e41f171dd2b420cb164c4b6dfd52f",
+      "size": 152481
+    },
+    {
+      "path": "crates/tirith/src/cli/pkg_install.rs",
+      "sha256": "5e12a3352cd464de79c32c51bb78f5e2784c2b061f036e5359241515e7a4c4ff",
+      "size": 44919
+    },
+    {
+      "path": "crates/tirith/src/cli/policy.rs",
+      "sha256": "df0ea9647e05bc0f0f727959083ea8e8a9d3be30ec443a45f9834e71791500c3",
+      "size": 94456
+    },
+    {
+      "path": "crates/tirith/src/cli/preview.rs",
+      "sha256": "0cac2f81f03ce8886a8668ef07b278c79bf2ca944994edc46a3a9f947aebe434",
+      "size": 11594
+    },
+    {
+      "path": "crates/tirith/src/cli/profile.rs",
+      "sha256": "f04e716c11be4319bd8fbfdbca98ad78e4a24c06bfbde5856d511f35ce94a0e3",
+      "size": 8467
+    },
+    {
+      "path": "crates/tirith/src/cli/profile_service.rs",
+      "sha256": "cb10a190024f3f93d3bcd0f828edab73f6e3d39adb80521717adf17ca5859c04",
+      "size": 33851
+    },
+    {
+      "path": "crates/tirith/src/cli/project_review.rs",
+      "sha256": "51357af51d603f22a93410aba5ccdeb90451442014239bbb5a0be0b6e882537f",
+      "size": 7921
+    },
+    {
+      "path": "crates/tirith/src/cli/prompt_status.rs",
+      "sha256": "00155296883d0557da71a0e506f52c421fd8734725215ce438c594ab79736af9",
+      "size": 25603
+    },
+    {
+      "path": "crates/tirith/src/cli/protection_evidence.rs",
+      "sha256": "b81a16b4dfd38fb41c58e7f69b934269deb48b25a0dde04203fac21101f0f471",
+      "size": 9439
+    },
+    {
+      "path": "crates/tirith/src/cli/provenance.rs",
+      "sha256": "4aedfb8ecde037606084f68027e02114f4bb3ee4e855f2e347948231e46f4366",
+      "size": 28211
+    },
+    {
+      "path": "crates/tirith/src/cli/pypi_integrity.rs",
+      "sha256": "41b3c64e32a0018a46d154012a0745f6e1c965aad2e3710a976f892b21ad2b51",
+      "size": 36722
+    },
+    {
+      "path": "crates/tirith/src/cli/receipt.rs",
+      "sha256": "41a085d8d38b57a0bf5daa48e86a9de80fda43a59deb1c1e37c02fa1d1b731fc",
+      "size": 4197
+    },
+    {
+      "path": "crates/tirith/src/cli/receipt_display.rs",
+      "sha256": "53d4936d07b9953132bd79500e5c3a33ced2a0e255150da50d90fb54322cdb63",
+      "size": 8923
+    },
+    {
+      "path": "crates/tirith/src/cli/recommended_setup.rs",
+      "sha256": "ad7678ae6030af3313fc9796afac98368a23a9c18c318cf0cd769e0a40ca6846",
+      "size": 3903
+    },
+    {
+      "path": "crates/tirith/src/cli/release_compatibility.rs",
+      "sha256": "6f02a988e006d4b46980b7420cc83531aebdf9fdd90ff81c3b33b06483db2eea",
+      "size": 39523
+    },
+    {
+      "path": "crates/tirith/src/cli/rollout.rs",
+      "sha256": "aa411cd7e501c7180613d5f901832fc932e32a26ed1f1e74fc4c4e49e08877ab",
+      "size": 23569
+    },
+    {
+      "path": "crates/tirith/src/cli/rule.rs",
+      "sha256": "feaa6bdfd166614f69bd625359a5e08863b5314da0ecb118b8fbfdd71b254ce6",
+      "size": 52824
+    },
+    {
+      "path": "crates/tirith/src/cli/run.rs",
+      "sha256": "3e306060296047b617ee3ef778ec5f1c25c7ca35e3ccdfe63a839dc2dcdd02fa",
+      "size": 53312
+    },
+    {
+      "path": "crates/tirith/src/cli/scan.rs",
+      "sha256": "54c58b56ad61f1f4b1434aa5e34e6c30920690dcee996275220fee0a6a2f1add",
+      "size": 79390
+    },
+    {
+      "path": "crates/tirith/src/cli/score.rs",
+      "sha256": "4714b000c9df9225cdc0adce4ce1b3eb29a78d59e3f4aae9f7be00161bcc82ae",
+      "size": 12685
+    },
+    {
+      "path": "crates/tirith/src/cli/secret.rs",
+      "sha256": "1c1167a7c3bc5d9d56abfa612269a8093f5bbe75ac7b21e2c9e22e20be59ca75",
+      "size": 11289
+    },
+    {
+      "path": "crates/tirith/src/cli/selfupdate.rs",
+      "sha256": "6cc1827ae9733facbb802d01bd926a8018ac138c21a1f8be05103c1d22eb754f",
+      "size": 205191
+    },
+    {
+      "path": "crates/tirith/src/cli/selfupdate_numeric_fixture_tests.rs",
+      "sha256": "8b395f8e09a59d996c9a81eb926699d06338d30d7722deb45e872ced954c5c65",
+      "size": 21017
+    },
+    {
+      "path": "crates/tirith/src/cli/selfupdate_signed_fixture_tests.rs",
+      "sha256": "4a6d3494b73c1f09623d1dfb3ac4aa98faf004c58456e88e3bf8a6f26649a5c2",
+      "size": 40417
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/activation_clock.rs",
+      "sha256": "4e933eb2272984fbcd1406a7c6f4e8639f8f40969e5ae01bbe03fe90d40a9ee1",
+      "size": 27828
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/activation_protocol.rs",
+      "sha256": "c4367e4fb60dace428c144bf2cbbd7ada0177f1bf2381dd416a18d328c5cb8ea",
+      "size": 10530
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/audit_segments.rs",
+      "sha256": "287c463f4d7a5d314e5d5dc6448f7d96e4025b3ba6d2aad933ec44ce0046d2fb",
+      "size": 26238
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/audit_service.rs",
+      "sha256": "83186f5698c097de590d8abb3c4f39a49bd3abbc8f3837ca9d6e8c6cc9fca313",
+      "size": 21336
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/change_plan.rs",
+      "sha256": "36c027c5362de0f921008b026ec293688ded6835728ebca1e487f9f337133f9a",
+      "size": 177037
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/change_plan_activation_history.rs",
+      "sha256": "b7e92560d169fac5477e190e9d6ac2ac5612cdda72ce1c9a3869d128f50963aa",
+      "size": 40778
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/change_plan_automatic_claim.rs",
+      "sha256": "1e0cdd9fb290888670bb5751ad65968d32a44fb8db8a202b75ede5ab7f4f0d95",
+      "size": 33860
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/change_plan_setup_binding.rs",
+      "sha256": "50c99c2966ee20575edc1cecd2ec1b0f6d4bf1b7de2ae2b6e6bc5eded7796df4",
+      "size": 52620
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/claude_config.rs",
+      "sha256": "a0c479818a41d3727c382280fba1a8e98725cb8524af7b0ec84bacce85067edf",
+      "size": 15222
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/claude_service.rs",
+      "sha256": "5b6c34cb1c541285a066e6ee2e66240fafd917daa5808d2be3579931b8992c14",
+      "size": 30627
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_helpers.rs",
+      "sha256": "a2afb644f3f4ce04fe4d2c43ba0993c009bcf3a3469e0d123b11f1b70c66bd54",
+      "size": 145840
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_helpers_windows.rs",
+      "sha256": "b8b4adcb550e92bd74cc9f8cbc7939267c96a4ce8c703fde697df2e8f7c33551",
+      "size": 186506
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_helpers_windows_path.rs",
+      "sha256": "16da5c0a5737df0b848a66c037abc7aefa5bf9c3e4c6eba7b92cf57d5d2a0440",
+      "size": 3154
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_retention_unix.rs",
+      "sha256": "dfef3353647ff49d9aca2d4f66bde61140c7ab1dca24e05e34d34a3ec0ade14c",
+      "size": 4161
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_retention_windows.rs",
+      "sha256": "57966dbab7af1caee4eb2c7daed79d2e5a348049c6a4b4c53030bfd081b50366",
+      "size": 3136
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/fs_transaction.rs",
+      "sha256": "47a0dcf342ae31b900ec91874cea3db8870d29767e2f71ef76bf16e2edaae080",
+      "size": 43268
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/merge.rs",
+      "sha256": "a16d99cfa4da172252d70b5c465635e2bbd7de2b52e94b493df3d1ac1e786446",
+      "size": 104008
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/mod.rs",
+      "sha256": "385827138611a906440e236bbabdde5511640988df115e92dc8fffe951a2e7f5",
+      "size": 53169
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/recommended.rs",
+      "sha256": "c0b74e2a75bb7805ff44bfc4a494b3990f0c7c64607ab695d26d4a25eb7a55e5",
+      "size": 12637
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/shell_profile.rs",
+      "sha256": "89fde949a1cf5d2e22c0167f506f193b7ca019387729c763e8d7bc984231aa92",
+      "size": 20823
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/shell_service.rs",
+      "sha256": "e78dcf2da6c67796d5d1be1d5882370fcd8ec93b809ae3979f6cefa59a40da65",
+      "size": 49715
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/tools.rs",
+      "sha256": "5cd59b3dcebca47e5b11a33c6ba129df87d0d21629d636e2b07ac0f5f157c71b",
+      "size": 302970
+    },
+    {
+      "path": "crates/tirith/src/cli/setup/zshenv.rs",
+      "sha256": "be1263634836cd185dc9ffc7eab2c7890982c0037aa47891f589f3f9278851fb",
+      "size": 32222
+    },
+    {
+      "path": "crates/tirith/src/cli/setup_activation.rs",
+      "sha256": "30b1ed6be264da7d1414d5ca5e297487375c9955da8cb1cdf29178b681b17a76",
+      "size": 2375
+    },
+    {
+      "path": "crates/tirith/src/cli/setup_activation/coordinator.rs",
+      "sha256": "477a70403734584512f7d832f26b9fef8aa39e034e40fea1259dfbf074d8c13b",
+      "size": 15459
+    },
+    {
+      "path": "crates/tirith/src/cli/setup_activation/native_modules.rs",
+      "sha256": "8fe5a733e68f18cdd803ac179d59eb0ca31b9036be6abb23b593fd914d89c63e",
+      "size": 7833
+    },
+    {
+      "path": "crates/tirith/src/cli/setup_activation/receipt.rs",
+      "sha256": "17746345dcb9e01e66f81c3ce3908feddb8c15a1ef066947680496cfb1ef726b",
+      "size": 8491
+    },
+    {
+      "path": "crates/tirith/src/cli/share.rs",
+      "sha256": "5a73568d6944417d2550ab2a92b883758c684ea6dfb8c7a2138f9b2795a840b4",
+      "size": 12973
+    },
+    {
+      "path": "crates/tirith/src/cli/shell_target.rs",
+      "sha256": "f4c4a21f0222eb7ec2711abe754ff1eb1d70983c443a047136bd073119fadb73",
+      "size": 21946
+    },
+    {
+      "path": "crates/tirith/src/cli/shell_target_native_tests.rs",
+      "sha256": "5c4e060ddeb545445c7638d0613e6605d39f1810f2b0c6b53606b8668afc90bf",
+      "size": 19242
+    },
+    {
+      "path": "crates/tirith/src/cli/shell_verification.rs",
+      "sha256": "163c5015e07415f0d091fc67b49550359c45d42efcb10c9bee5b082e486a6f23",
+      "size": 10315
+    },
+    {
+      "path": "crates/tirith/src/cli/ssh.rs",
+      "sha256": "e25411119f9e2d46111378a5eaf8a1deb92d1ec28bc6e1cd824961719f1455e8",
+      "size": 23054
+    },
+    {
+      "path": "crates/tirith/src/cli/status.rs",
+      "sha256": "8d9f6c7a01980eedf9c3dc78895935ea319468ddb1ba91c98db0de43c2624804",
+      "size": 20918
+    },
+    {
+      "path": "crates/tirith/src/cli/sudo.rs",
+      "sha256": "841977169f8a7f4e131e8389821bb34b57a7367c26b4e70f756e1218d45a3fa1",
+      "size": 18276
+    },
+    {
+      "path": "crates/tirith/src/cli/support_bundle.rs",
+      "sha256": "3aa654f187ea38988766f56822fb2f301089b21eba55729b8e20df694ce1f5b1",
+      "size": 17252
+    },
+    {
+      "path": "crates/tirith/src/cli/taint.rs",
+      "sha256": "ed6bf51309537ba4beab46c44ded46f5a54d829d3c505c4d3ba4b1febc18bf47",
+      "size": 6144
+    },
+    {
+      "path": "crates/tirith/src/cli/task.rs",
+      "sha256": "2ddffb25aa5511e2865f55500511cbfd680872d5d4060023d4e2b7645a19e486",
+      "size": 9206
+    },
+    {
+      "path": "crates/tirith/src/cli/task_receipt_keys.rs",
+      "sha256": "8bc599d3de1dd63a523e2c17dedab2e8380e610225adc69893e2e3ca5a99ae58",
+      "size": 14005
+    },
+    {
+      "path": "crates/tirith/src/cli/team_connection.rs",
+      "sha256": "a3d28539cf24c212756229aa291717b8e0a92d23587f44e265a0ce7dd5e6c6d4",
+      "size": 12668
+    },
+    {
+      "path": "crates/tirith/src/cli/team_enrollment.rs",
+      "sha256": "175311fc59080aed92ef646a3510991fa89ff6af1ebb28d51c5f12bc215cf319",
+      "size": 43449
+    },
+    {
+      "path": "crates/tirith/src/cli/team_enrollment_tests.rs",
+      "sha256": "aa03e2471234a2c7f25eb972a85fe31c205c3af17df10bc00afb43f99a13c8a0",
+      "size": 21199
+    },
+    {
+      "path": "crates/tirith/src/cli/team_rollout.rs",
+      "sha256": "84c47267c9433d9fe8d522a0cffc1314b3ca859f0cc548d03be3e8162f7ff144",
+      "size": 32700
+    },
+    {
+      "path": "crates/tirith/src/cli/temp_run.rs",
+      "sha256": "0d9c5a5dddc4401c4c4734ea143577d509782042cb43ea5bd38d7c516e7e709e",
+      "size": 24592
+    },
+    {
+      "path": "crates/tirith/src/cli/test_harness.rs",
+      "sha256": "d36b167078605449f977f61775259e8e37427f7ea8eb0ae1426c4b07c035714d",
+      "size": 4196
+    },
+    {
+      "path": "crates/tirith/src/cli/threatdb_cmd.rs",
+      "sha256": "295f4e766ba8951d0b040eef003063964f402bec8961baa9ba621df9254a85f2",
+      "size": 205282
+    },
+    {
+      "path": "crates/tirith/src/cli/threatdb_evidence.rs",
+      "sha256": "016709467a690313054866da7e4d1f1755aaed917d7a626a51e38667ec4f6951",
+      "size": 11786
+    },
+    {
+      "path": "crates/tirith/src/cli/threatdb_lifecycle.rs",
+      "sha256": "71fdfc966d1a91885b05f5d99a4404a63040024e6d6a9fdcf9287bb0f652402a",
+      "size": 19687
+    },
+    {
+      "path": "crates/tirith/src/cli/trust.rs",
+      "sha256": "db92a226a72ddad7aba71080e0c477bb0d822e0b2dd0e0e3ba6396df2835a0be",
+      "size": 122260
+    },
+    {
+      "path": "crates/tirith/src/cli/trust_lifecycle.rs",
+      "sha256": "a3815db445e7ae524f8462738573fc5f53c12e119326cd3b8e9c44eeb1732062",
+      "size": 63437
+    },
+    {
+      "path": "crates/tirith/src/cli/tuning.rs",
+      "sha256": "cec40f3df8538ac618bf0c1b189ec0acc700af0e1e5f55caabe5e157fa81b8de",
+      "size": 10487
+    },
+    {
+      "path": "crates/tirith/src/cli/view.rs",
+      "sha256": "1788f48fbf7909e46e8dddad88e38bed6dba8f777eb30079606b61a7cdd5c587",
+      "size": 22492
+    },
+    {
+      "path": "crates/tirith/src/cli/visual_audit.rs",
+      "sha256": "83aae66f79a3857025428a60b427532ec15025745f89e64abecfc54afdcd1db8",
+      "size": 29386
+    },
+    {
+      "path": "crates/tirith/src/cli/warnings.rs",
+      "sha256": "82d442b8526c223a5d668f08dee5c701a31d76e7b2ba7b0fd43778a1fbc22489",
+      "size": 19929
+    },
+    {
+      "path": "crates/tirith/src/cli/why.rs",
+      "sha256": "58be612c1d153dd7a93dfeee26b8609bf6d6319325e218a6cf1161ed61eff48d",
+      "size": 5060
+    },
+    {
+      "path": "crates/tirith/src/cli/yaml.rs",
+      "sha256": "5da11c70ebc8ae892db0ec3b3d07ef821d8f53c2fb44bab48beaee78f512eca0",
+      "size": 9104
+    },
+    {
+      "path": "crates/tirith/src/main.rs",
+      "sha256": "e8b5842091df14f5994e768c45e4604bc80da84744307cfa81fbc4bfefbf4baf",
+      "size": 427645
+    },
+    {
+      "path": "crates/tirith/tests/attest_cli.rs",
+      "sha256": "118b24acf6a9358feb96633efbf992f0a2e8946417fcd6d5093bc1decadce76c",
+      "size": 29579
+    },
+    {
+      "path": "crates/tirith/tests/bash_hook_exports.rs",
+      "sha256": "6d4504633510363541c109f63f2db9531d0fc02c4202cf8cb1963cfd50f1864b",
+      "size": 31120
+    },
+    {
+      "path": "crates/tirith/tests/bash_preexec_enforce.rs",
+      "sha256": "6134d19a9389dc537ba0bfb9186a21d8f3e7c862c9d6b769b1e8f468f3a78cc5",
+      "size": 73138
+    },
+    {
+      "path": "crates/tirith/tests/browser_audit_cli.rs",
+      "sha256": "aceb0333c29fcec411f57ecda3feda79e01fe48cfc42724018ba9d0a55b61c71",
+      "size": 46438
+    },
+    {
+      "path": "crates/tirith/tests/c00_cli_compatibility.rs",
+      "sha256": "0278169b357ce906aa49b45830b8b82e1cba0077c355c3e77d77d4c287fd8034",
+      "size": 7730
+    },
+    {
+      "path": "crates/tirith/tests/capsule_preset.rs",
+      "sha256": "bae1e107c685d54c8236c93f7bdfb5ba0c721930fc2ffe49e523da516823f6a9",
+      "size": 26064
+    },
+    {
+      "path": "crates/tirith/tests/cli_integration.rs",
+      "sha256": "48857ec1547c6fd087b287e5a6e0f99e4ae03a6043620e6ad4f0d70830c71b93",
+      "size": 850359
+    },
+    {
+      "path": "crates/tirith/tests/control_dashboard.rs",
+      "sha256": "52b18a6041fd8fd463cbe9bc230aa95ac0c2b9753943cb2b094fb00b156af52b",
+      "size": 20819
+    },
+    {
+      "path": "crates/tirith/tests/cycle_reader_compatibility.rs",
+      "sha256": "bc50222a86cb79d328dc2bb189e7714abde1a907eb17a89a6bd8d337593d27a2",
+      "size": 9154
+    },
+    {
+      "path": "crates/tirith/tests/feedback.rs",
+      "sha256": "41978a09e1f3365ac043e2643fdbd0b0eab3345a3682da08ba96fce1f849396b",
+      "size": 7903
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/README.md",
+      "sha256": "31ca20f2f65547125df7047fbc6f5874b305afee245f2eeba35a4990dc6a9137",
+      "size": 947
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/broad-mv3/manifest.json",
+      "sha256": "a64f770c72124af656944440e0966dd7fa57e63af8ae57907a8522d8f40a68d9",
+      "size": 319
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/broad-mv3/sw.js",
+      "sha256": "0e78eff0b321a648f36b82bc686f682a267e3ce67202870ca17c83575b309daa",
+      "size": 43
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/enterprise-mv3/_metadata/computed_hashes.json",
+      "sha256": "729cd4435656683931ea719191f6786bbca51754bd7e573f413a655d71fdde49",
+      "size": 20
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/enterprise-mv3/_metadata/verified_contents.json",
+      "sha256": "729cd4435656683931ea719191f6786bbca51754bd7e573f413a655d71fdde49",
+      "size": 20
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/enterprise-mv3/manifest.json",
+      "sha256": "8f2a02028717d7551d1c1792d0c4b11fb20f447dacc68e5e69cce3ae8ab76801",
+      "size": 281
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/enterprise-mv3/sw.js",
+      "sha256": "bf73aced1cf743ddc914fe86a48a21deb63da2afc498226e6217c9b2809d4468",
+      "size": 45
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/legacy-mv2/bg.js",
+      "sha256": "d8f710abdfdd0403192dd95e71cb9ef2a1bf73858bcfcbbc214c12d5ef7fc458",
+      "size": 40
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/legacy-mv2/manifest.json",
+      "sha256": "04890031140eb46b58bba534047f52428bca1335cc12b6d5864ffb2d8800b1cb",
+      "size": 249
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/wallet-mv3/background.js",
+      "sha256": "eb9838198991d17aa12b8af342a5b2dc6999abf0f24106ea885ce412783cb4a4",
+      "size": 37
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/wallet-mv3/inpage.js",
+      "sha256": "263d84152e6d6673c75008fa0c6f3ca1143b2dd2ee706e33788829e112bb8c23",
+      "size": 34
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/browser_extensions/wallet-mv3/manifest.json",
+      "sha256": "dfaa6acd3dace9585b4f0bb3f9538e6400febd3e6e7e17a23f99ef23126750e7",
+      "size": 494
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/installed_node_modules/README.md",
+      "sha256": "f530820c65a9144f4bb7e3b02f86ff7876c489ad72de36943db90c323e205af4",
+      "size": 683
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/installed_node_modules/node_modules/left-pad/package.json",
+      "sha256": "e89a529e364fd71873fde511f484c705fab4c71901124d5314c556220eae517e",
+      "size": 83
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/installed_node_modules/node_modules/lodash/package.json",
+      "sha256": "bfe21067561ba47f62c290400e6208b95ac875f0c41e00c4dddce889e8a8ad4e",
+      "size": 93
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/installed_node_modules/node_modules/react/package.json",
+      "sha256": "3cbaa9e643ed1db96f22289f7f0fabbcace20d01aca8996786a48299ed6a74de",
+      "size": 125
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/README.md",
+      "sha256": "d193bee4aa914a0289b51b689b450fd56babe6ff2747a29e7aedff115ff79169",
+      "size": 3846
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/empty.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/malformed_duplicate_key.json",
+      "sha256": "50d81d9fe46dea16213c3ee38b6ad46b4a599f2bf9c3e48c9093a47f9aa02b25",
+      "size": 62
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/malformed_trailing_data.json",
+      "sha256": "4dcabdee35fe848eccd74b00f29691d067bd2b5019c11c4f538a3b3f8d0820fe",
+      "size": 63
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/malformed_truncated.json",
+      "sha256": "24f2c102f8b32a68381882f5541cdf4f420fc0b54447bf2206b6dbe0f2f810c1",
+      "size": 38
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/npm11_clean.json",
+      "sha256": "f96007e78fd0daf167ceb55234c96b4b1a18aefdd6b7afb940be2bfaaf67e7f0",
+      "size": 18080
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/npm11_clean_package-lock.json",
+      "sha256": "e76e5c3c2472617ae2930c043beaf4090721fde3c433bd75b53920ebda53d39c",
+      "size": 1107
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/npm11_invalid_attestation.json",
+      "sha256": "3d54c60b1edfd2e8c26108cac3105a70056405a8c4378493436b33140697b43c",
+      "size": 765
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/npm11_invalid_signature.json",
+      "sha256": "0a438be342493421dc2fab07745d73ed4861b561ffd39701920d8e5706049429",
+      "size": 710
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/npm11_missing.json",
+      "sha256": "aa541c9009bae2bc5bac8c9decd8caf4b824ca553058265b96179ab9ccd15a06",
+      "size": 397
+    },
+    {
+      "path": "crates/tirith/tests/fixtures/npm_audit_signatures/unknown_flag_hard_error.txt",
+      "sha256": "2ef79881f07d22c550040ccad4249c41a1a33fbeeb5ac055eafb3babe2e6f3b8",
+      "size": 112
+    },
+    {
+      "path": "crates/tirith/tests/help_snapshots.rs",
+      "sha256": "e6524ef103108bf2b24c0d6a9b57e10c61f84cb2fc1f258f21a6d922837c21a8",
+      "size": 39146
+    },
+    {
+      "path": "crates/tirith/tests/history_recent.rs",
+      "sha256": "f07e5d4d66fe726d2292c30c9421a82e3c558f4949be9e36254db23d620f3a98",
+      "size": 10390
+    },
+    {
+      "path": "crates/tirith/tests/lab_artifact_scenarios.rs",
+      "sha256": "6f02109789e05470d18eaec5ab379158c237d131a894ace72d3e585f34814eff",
+      "size": 8132
+    },
+    {
+      "path": "crates/tirith/tests/npm_artifact_cli.rs",
+      "sha256": "d4058969af7d931d53903489ee0cca304dbf538837a5e395a5d1f2a282784ac1",
+      "size": 5759
+    },
+    {
+      "path": "crates/tirith/tests/npm_attest_cli.rs",
+      "sha256": "59674d5d8e1166c24617381cd5962268e31ce712880eed5f2ccfb57ac444888f",
+      "size": 63430
+    },
+    {
+      "path": "crates/tirith/tests/npm_registry_facts.rs",
+      "sha256": "f74300b78468b1ba2d2aa28bc661dc343b6308ef16c202043e417e16e822a725",
+      "size": 27786
+    },
+    {
+      "path": "crates/tirith/tests/owned_boundary_enforcement.rs",
+      "sha256": "b8be854d568279ffbfc577fc2dfee1ef1f11394370688fb17883cd4eb42f1537",
+      "size": 36761
+    },
+    {
+      "path": "crates/tirith/tests/policy_effective_snapshot.rs",
+      "sha256": "5af1b9ee066eac76c38218d4279845335141d92232b68222c06b3b0aa6064392",
+      "size": 8121
+    },
+    {
+      "path": "crates/tirith/tests/policy_simulation.rs",
+      "sha256": "3a141a73d1841ef6846a4319b99a5f2a3efb5353598cbd01beb2b0b4dbaea461",
+      "size": 4056
+    },
+    {
+      "path": "crates/tirith/tests/policy_tune_decisions.rs",
+      "sha256": "9021d120732856565ee258602ba69eb4ac7720875e6ac307676ea485e1362f2e",
+      "size": 4988
+    },
+    {
+      "path": "crates/tirith/tests/policy_tuning.rs",
+      "sha256": "d3322c6ac02fbf8a732fe76c97f46c40932c39f02b5242aea7d33e777bc0b1e3",
+      "size": 6248
+    },
+    {
+      "path": "crates/tirith/tests/profile_lifecycle.rs",
+      "sha256": "c1e2016440e497be61c5544133eeb945848978dc4589461c70b7b23b55ec9133",
+      "size": 14299
+    },
+    {
+      "path": "crates/tirith/tests/project_review.rs",
+      "sha256": "50f1a6af49d49b9e770fa6ef1c3549052a8df3f1099b1ea24c79562deb953503",
+      "size": 2729
+    },
+    {
+      "path": "crates/tirith/tests/pty_support/mod.rs",
+      "sha256": "80c4334200b266bb1cbd5f77670ebc199ee43df07fc7018a1a5a4b7af00a4ad1",
+      "size": 43953
+    },
+    {
+      "path": "crates/tirith/tests/pty_support/owned.rs",
+      "sha256": "ff3e528bc50d153ca12d9a29b725b6e204caad057baac0f61b6577d233db5f04",
+      "size": 13163
+    },
+    {
+      "path": "crates/tirith/tests/pty_support/ownership_tests.rs",
+      "sha256": "7696ae1bfdfff39ee4f355854b82cd0a7b6484ed67b25b98930a33567e99784f",
+      "size": 6562
+    },
+    {
+      "path": "crates/tirith/tests/receipt_privacy.rs",
+      "sha256": "cb961d4571d9c7167bd3ddb322016b771c8b53271d5e5f100c9e199fce84f441",
+      "size": 6840
+    },
+    {
+      "path": "crates/tirith/tests/registry_api_integration.rs",
+      "sha256": "3be493db029b8f85fac154f93413f2e7ba84004b495a144da8bcceaef1cb38fa",
+      "size": 20122
+    },
+    {
+      "path": "crates/tirith/tests/release_security.rs",
+      "sha256": "c46d976aeec12186658b0714184704e0bd2b789286003acb667d9cfa856f60b8",
+      "size": 39433
+    },
+    {
+      "path": "crates/tirith/tests/rollout_lifecycle.rs",
+      "sha256": "82fdd025a74f1020932e3da7ea4001307de8aaeeb9ccec35aaf641b9d183550c",
+      "size": 17824
+    },
+    {
+      "path": "crates/tirith/tests/shell_conformance.rs",
+      "sha256": "3847d9fd296801ce0cdfa343cc61423613e716d2e7f0380d9ccc14a3f396cf84",
+      "size": 80865
+    },
+    {
+      "path": "crates/tirith/tests/shell_helper_portability.rs",
+      "sha256": "839d4674405e77a26da00aa683416f3361817ac37eb92c6b99779e170a17dae5",
+      "size": 15287
+    },
+    {
+      "path": "crates/tirith/tests/shell_session_identity.rs",
+      "sha256": "96c23f34d7bece2ace9fabb3b00e7d2fbc099778aa9ff8cc8bb41d87ffc045e0",
+      "size": 8521
+    },
+    {
+      "path": "crates/tirith/tests/support_bundle.rs",
+      "sha256": "3255c4046aa0b731e37438036bb7ef694c2dcaedefd75c0f814b32d50f395da2",
+      "size": 7602
+    },
+    {
+      "path": "crates/tirith/tests/task_cli.rs",
+      "sha256": "6f0e4c2b327825b85e3c0c42f311b00e06f92288de7878ec461a19693c05f4e1",
+      "size": 9992
+    },
+    {
+      "path": "tests/fixtures/README.md",
+      "sha256": "192970c4b9db29e969110ecbfb8b22c39f59340e52a7ac1f73dd31771a9e5bd9",
+      "size": 1217
+    },
+    {
+      "path": "tests/fixtures/aifile.toml",
+      "sha256": "bafb15751279109e027b228409424cff59618fd554f6209d3532dad476b69c1d",
+      "size": 11182
+    },
+    {
+      "path": "tests/fixtures/c00/README.md",
+      "sha256": "ae3d549a7e08d3bac4d47cd5a3735573c8d6738dc03a024cf5458c3559b5fb47",
+      "size": 2168
+    },
+    {
+      "path": "tests/fixtures/c00/cli-contracts.toml",
+      "sha256": "94faaabdbe6135613d6f634e5661f99b8bc99f7c3fa804a12bde3b321dc88333",
+      "size": 3424
+    },
+    {
+      "path": "tests/fixtures/c00/command-card-v1-signing.json",
+      "sha256": "33f8412af70ef6b5ced4ab7d7056af8928f9544a3121371733a5351a0f48cfb4",
+      "size": 318
+    },
+    {
+      "path": "tests/fixtures/c00/contracts.toml",
+      "sha256": "cbe33c0890e9f1ebfb7fcd4579ab7de1e8d10b677957613dd980496692e61b69",
+      "size": 8289
+    },
+    {
+      "path": "tests/fixtures/c00/legacy-policy-v1.yaml",
+      "sha256": "6b58d2f3418f9174495a1a1232991b6fcc63e64f61da7ecc6215b8dbabd40b63",
+      "size": 285
+    },
+    {
+      "path": "tests/fixtures/cifile.toml",
+      "sha256": "22e5de175d42d9538f68b0ef9eec81ee466d01cf953b89a296282df69a0499a5",
+      "size": 20182
+    },
+    {
+      "path": "tests/fixtures/clean.toml",
+      "sha256": "f466548b928a9e32d9f1636944c3b93844c768340ddd18b8b1c60e36a726183a",
+      "size": 7235
+    },
+    {
+      "path": "tests/fixtures/codefile.toml",
+      "sha256": "0ce044a23d3e21fbf3d09c402cd103ef3af5639637ad5130e3020cfcbcac79fb",
+      "size": 4549
+    },
+    {
+      "path": "tests/fixtures/command.toml",
+      "sha256": "34af1a49c50935cecee72b73b2d6ece7a5e23e97896ed6d6876ce966b3ec482d",
+      "size": 70094
+    },
+    {
+      "path": "tests/fixtures/configfile.toml",
+      "sha256": "bad92fbc4dbcace531da22ee9e1f4dcf39f9220b1757bd28e66de3bf0d552380",
+      "size": 41997
+    },
+    {
+      "path": "tests/fixtures/credential.toml",
+      "sha256": "b8f974b7fdda84d18b87f9ea9785805bc9254e2a0d3d4ca216f4323f1fa97c8b",
+      "size": 3337
+    },
+    {
+      "path": "tests/fixtures/custom_rules_dsl.yaml",
+      "sha256": "27b15179b1eff7a68ef4702d2c860864ebb52d702665847a614e9d543782937e",
+      "size": 3067
+    },
+    {
+      "path": "tests/fixtures/cycle-0.4.2/README.md",
+      "sha256": "7a302b19efe90f4c13dccc042a545c1bebd1c5a8c9e2a13fab60c09410485644",
+      "size": 2029
+    },
+    {
+      "path": "tests/fixtures/cycle-0.4.2/cli-reader-compatibility.json",
+      "sha256": "93510d7abf00e7698f0e9edec85c02db8f5aae0f4c4f50bada4f8acb2f614e00",
+      "size": 18383
+    },
+    {
+      "path": "tests/fixtures/cycle-0.4.2/macos-release-contracts.json",
+      "sha256": "824ff2b33784dda85411bb16d3d9ed23b26d336dc423af8d0b9d6aad3a459f00",
+      "size": 3094
+    },
+    {
+      "path": "tests/fixtures/cycle-0.4.2/scoped-trust-compatibility.json",
+      "sha256": "2bbbb61489d306e9bcb51ebc3409a0ecca043c1037e65425ed67bc0487f6063e",
+      "size": 687
+    },
+    {
+      "path": "tests/fixtures/documented_commands.toml",
+      "sha256": "ad57364b9c55b5891fed55b33bcdbbbc4fc99de4cc45557d762442ade8d9bf3a",
+      "size": 3626
+    },
+    {
+      "path": "tests/fixtures/ecosystem.toml",
+      "sha256": "b1e263191daf9c9a47277c3074f69a8a3c2286277ee3e405ef9af52acf88fdf4",
+      "size": 20583
+    },
+    {
+      "path": "tests/fixtures/environment.toml",
+      "sha256": "3468aa9375ab7f97e612fff2dccecb2e0a052896889cd677f5f3a08ed5142ea7",
+      "size": 1663
+    },
+    {
+      "path": "tests/fixtures/hostname.toml",
+      "sha256": "2f476faf5e3c33df7b0bf97c8f9cc5c4e3c46a254345ad2ec2619da267daab12",
+      "size": 7866
+    },
+    {
+      "path": "tests/fixtures/injection_evasion.toml",
+      "sha256": "66af6a1fea9bba118d76c8e214df445323196a786bce3ff450368b6f39d127dc",
+      "size": 2691
+    },
+    {
+      "path": "tests/fixtures/issue_trojan_bench/SOURCE.md",
+      "sha256": "0fd9afb099843cef5180299a6089335df1fe9275c376fc2f798e4f5ae613b4ca",
+      "size": 2169
+    },
+    {
+      "path": "tests/fixtures/issue_trojan_bench/effects.toml",
+      "sha256": "8c508087ef799fbedf8f20e74be5f6d061aaacc0b2c20f1e331c99ce6d21ee50",
+      "size": 5386
+    },
+    {
+      "path": "tests/fixtures/issue_trojan_bench/laundering.toml",
+      "sha256": "1a68389d2d3fa251a4bb414a2e489edc05c9d7fae480f5bcda09fb9d20c87e61",
+      "size": 6258
+    },
+    {
+      "path": "tests/fixtures/issue_trojan_bench/payloads.toml",
+      "sha256": "a7848ac2d83c7baa6923fd72974ceb4c486fb9bdc576481dc4986b7132010eeb",
+      "size": 5219
+    },
+    {
+      "path": "tests/fixtures/issue_trojan_bench/sources.toml",
+      "sha256": "6667538301dabc1f4971ebfe95e500aadd6626effe971a4a7409cde4726d462e",
+      "size": 2510
+    },
+    {
+      "path": "tests/fixtures/output.toml",
+      "sha256": "7d88a45eaf9b3ff85de24e83bc4d1d16e0d2b926df24308fbd25d7303ade339d",
+      "size": 27419
+    },
+    {
+      "path": "tests/fixtures/path.toml",
+      "sha256": "128639f84e668f4e147ed91f234084415cb624b6cc2f7794da31592e50a28d0c",
+      "size": 3003
+    },
+    {
+      "path": "tests/fixtures/policy.toml",
+      "sha256": "ee23e7b5c48d361ec8f6ed7c57f2151f7b758a0abfc35000299b39e92ddcbdca",
+      "size": 4099
+    },
+    {
+      "path": "tests/fixtures/rendered.toml",
+      "sha256": "11bd248cac51091447f734616bcd44b68d72061bf7c486ca3eec056c62595380",
+      "size": 11082
+    },
+    {
+      "path": "tests/fixtures/shell_weirdness.toml",
+      "sha256": "26ec2ebb9017ac4181897064f9925a4181d14a53fd0f229260b9bc88c0c5dace",
+      "size": 4267
+    },
+    {
+      "path": "tests/fixtures/task_provenance.toml",
+      "sha256": "6bad5af150489d6015f304bdc83d0fdbc3efca21da19b399825db8c94b5b903f",
+      "size": 15471
+    },
+    {
+      "path": "tests/fixtures/terminal.toml",
+      "sha256": "baa944906c000df76d0f487c278b1e3b0d85fbc5ddb2b110ef6194ba53445384",
+      "size": 14680
+    },
+    {
+      "path": "tests/fixtures/test-threatdb.dat",
+      "sha256": "32be54fcfa8abb1321787a1029bb781f6d60cd32fbe9609b60f4c376ef134371",
+      "size": 505
+    },
+    {
+      "path": "tests/fixtures/threatintel.toml",
+      "sha256": "1972c4b4d27991c87c5c00329d6c08f7cde33517e308d781cd356c609787484e",
+      "size": 12244
+    },
+    {
+      "path": "tests/fixtures/transport.toml",
+      "sha256": "c3734d7a2f49787eb84b58ba11eb62b708192b091443605fef215b974f2bdc48",
+      "size": 4552
+    },
+    {
+      "path": "tests/fixtures/web3.toml",
+      "sha256": "6879b58fc294472f9915632256bee2ab45ac075844cf411b2e45f32a2a406c14",
+      "size": 33901
+    },
+    {
+      "path": "threatdb-manifest.json",
+      "sha256": "d32a09f1a790ec177d81756ef6cd1d7314c74ae15a330bf407d09841c1e709fa",
+      "size": 333
+    },
+    {
+      "path": "tools/license-server/Cargo.toml",
+      "sha256": "14aa50b775c9ab6600442ec2c142aff93484788213f9600f0ee5e773cbff59da",
+      "size": 1329
+    },
+    {
+      "path": "tools/license-server/src/config.rs",
+      "sha256": "c1e04553c54b7a598b908bb0c98290cefe6facfd08b48e98b42486a59d577d5a",
+      "size": 5472
+    },
+    {
+      "path": "tools/license-server/src/db.rs",
+      "sha256": "c083b3350f90ebe40895ddd69d5f618a56c63ebf041e2ef509f5944f15c4b917",
+      "size": 109253
+    },
+    {
+      "path": "tools/license-server/src/error.rs",
+      "sha256": "3d0bcf9cc841538bccf20dcfa94d2ca390818b1b1eb28560ff2d4d1f5e87c102",
+      "size": 2310
+    },
+    {
+      "path": "tools/license-server/src/main.rs",
+      "sha256": "165188ac3005153abc704c72acf8fdaf5b845ce2b414dfb1c127c823f63644e5",
+      "size": 22627
+    },
+    {
+      "path": "tools/license-server/src/routes/health.rs",
+      "sha256": "8f0f05607c23e504a8dd5e9b5b3c65aa248d47f5a3bd5531bfe49321f43fca24",
+      "size": 154
+    },
+    {
+      "path": "tools/license-server/src/routes/mod.rs",
+      "sha256": "aafbd2b6aaf1509f00803f8cb5f4e2cd2bea19d2dadc7229a30a525171f90c34",
+      "size": 746
+    },
+    {
+      "path": "tools/license-server/src/routes/receipt.rs",
+      "sha256": "623c84f50866d69309434bcd6e32975a5b06e0fb6a1d11a45f973aff8a515f4c",
+      "size": 21583
+    },
+    {
+      "path": "tools/license-server/src/routes/refresh.rs",
+      "sha256": "ff958cf10d9e8810965ce0869d3e44b5a17d49657c7ac2cbadf90ee8d9248fab",
+      "size": 9788
+    },
+    {
+      "path": "tools/license-server/src/routes/webhook.rs",
+      "sha256": "69110224ee9eebc4536e8e80a86be28f45f287380dc979e41755cbf6671e0acd",
+      "size": 39107
+    },
+    {
+      "path": "tools/license-server/src/sign.rs",
+      "sha256": "5ce54198788c96761b51fac9c0c7719220f8cbbf6d46ce2aa768e8bfc331a71d",
+      "size": 3969
+    },
+    {
+      "path": "tools/license-server/src/state.rs",
+      "sha256": "ddd68dedb714e4e0f4f1aca0f35eca7cfd59326b5e695ffa823d1c82508eae5c",
+      "size": 276
+    },
+    {
+      "path": "tools/license-server/src/webhook_verify.rs",
+      "sha256": "af9e801aeb23e65eaaf2206beda9f2f542ea1909e3381265f031025bce408ce4",
+      "size": 9221
+    },
+    {
+      "path": "tools/policy-server/Cargo.toml",
+      "sha256": "b15d2d9d5d53c171e7954159cc2f2f66ee6dc8e241ecf62068ba72339ba98ae3",
+      "size": 927
+    },
+    {
+      "path": "tools/policy-server/README.md",
+      "sha256": "1d389b5907b2f78f5fa4fe94790512c217318f5dd022501189294c3b4698cf58",
+      "size": 15224
+    },
+    {
+      "path": "tools/policy-server/src/admin.rs",
+      "sha256": "b8880d705c41303c42ccdc5f4aad4c1b55a40b391526bfa864f7905233fc1a21",
+      "size": 6423
+    },
+    {
+      "path": "tools/policy-server/src/http.rs",
+      "sha256": "b99f1ea899f50c51e85c6dc65482929b650668be3b90a3dcec2e302c04e78b27",
+      "size": 13338
+    },
+    {
+      "path": "tools/policy-server/src/http_tests.rs",
+      "sha256": "213a12321cea6d23d9e024cb8dbf1c451105e14b7474f8ed628cf92228d155d4",
+      "size": 7270
+    },
+    {
+      "path": "tools/policy-server/src/lib.rs",
+      "sha256": "9133bb85f6adf30bb26231dd86ea4decf88953ac9026cc08acdc3e2364080a4f",
+      "size": 292
+    },
+    {
+      "path": "tools/policy-server/src/main.rs",
+      "sha256": "d74bffdc79057f9e2504431e99f75e4e62f670e776a9753e423d01ad4f9244b2",
+      "size": 454
+    },
+    {
+      "path": "tools/policy-server/src/private_fs.rs",
+      "sha256": "adb847d0ff5cfffa108e8b8070ff6d643544cb10ada3222232d0ed4e771596f9",
+      "size": 15615
+    },
+    {
+      "path": "tools/policy-server/src/store.rs",
+      "sha256": "cfe61d0fae310e26999c614b6ac570c40d101cf4d2bffee0d1b41d9736f5c3b7",
+      "size": 45525
+    },
+    {
+      "path": "tools/policy-server/src/store_tests.rs",
+      "sha256": "eaf0745ce330577bef474641f06ca33bc380f781f97e534719d9410a3f1cde71",
+      "size": 36912
+    },
+    {
+      "path": "tools/qualification/mixed_audit_native.py",
+      "sha256": "913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75",
+      "size": 37204
+    },
+    {
+      "path": "tools/sign-license/Cargo.toml",
+      "sha256": "3cbd6c115b58339da9ccbc77fe5aac1da20c32b23f905205b0e82e859e23a353",
+      "size": 774
+    },
+    {
+      "path": "tools/sign-license/src/main.rs",
+      "sha256": "64bed83050f28153414fe41a005c969d33efef897d003a066b05c2877fabff27",
+      "size": 19630
+    },
+    {
+      "path": "tools/sign-license/src/secure_file_windows.rs",
+      "sha256": "436fa6f992d81b5ac6923fa4740148202b80fa5a1e4f21ef8d3a23a450336358",
+      "size": 17541
+    }
+  ],
+  "source_optional_absent": [
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    "build.rs"
+  ]
+}
