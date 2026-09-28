@@ -1,0 +1,96 @@
+{
+  "source_revision": "e282d038519848caa8328cf32aa05a05daa502d2",
+  "summary_sha256": "6977502445fca40fa195363f5ca64e54bf168bc4041c12248d762fe31f336d70",
+  "archives_rehashed": 3,
+  "files_rehashed": 63,
+  "distinct_boots": 3,
+  "independently_recomputed": true,
+  "proposed_limits": [
+    {
+      "metric": "allocation.analysis_clean.requested_bytes.max",
+      "per_run": [
+        48307398,
+        48307398,
+        48307398
+      ],
+      "minimum": 48307398,
+      "maximum": 48307398,
+      "spread": 0,
+      "proposed_ceiling": 67108864,
+      "headroom": 18801466,
+      "qualification_dose": 33554432
+    },
+    {
+      "metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
+      "per_run": [
+        120397,
+        120397,
+        120397
+      ],
+      "minimum": 120397,
+      "maximum": 120397,
+      "spread": 0,
+      "proposed_ceiling": 131072,
+      "headroom": 10675,
+      "qualification_dose": 32768
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.requested_bytes.max",
+      "per_run": [
+        72060210,
+        72060210,
+        72060210
+      ],
+      "minimum": 72060210,
+      "maximum": 72060210,
+      "spread": 0,
+      "proposed_ceiling": 100663296,
+      "headroom": 28603086,
+      "qualification_dose": 33554432
+    },
+    {
+      "metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
+      "per_run": [
+        1670608,
+        1670608,
+        1670608
+      ],
+      "minimum": 1670608,
+      "maximum": 1670608,
+      "spread": 0,
+      "proposed_ceiling": 2097152,
+      "headroom": 426544,
+      "qualification_dose": 524288
+    },
+    {
+      "metric": "allocation.history_recent_100.requested_bytes.max",
+      "per_run": [
+        8692440,
+        8692440,
+        8692440
+      ],
+      "minimum": 8692440,
+      "maximum": 8692440,
+      "spread": 0,
+      "proposed_ceiling": 12582912,
+      "headroom": 3890472,
+      "qualification_dose": 4194304
+    },
+    {
+      "metric": "local.ordinary_check.peak_rss_bytes.max",
+      "per_run": [
+        43974656,
+        43876352,
+        43646976
+      ],
+      "minimum": 43646976,
+      "maximum": 43974656,
+      "spread": 327680,
+      "proposed_ceiling": 50331648,
+      "headroom": 6356992,
+      "qualification_dose": 16777216
+    }
+  ],
+  "decision": "Ceilings approved for detector qualification only. All are above the three-run maxima and expected growth crosses the selected ceiling. No CI budget activation until actual pairs qualify.",
+  "budget_activated": false
+}

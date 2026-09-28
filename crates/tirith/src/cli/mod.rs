@@ -9,6 +9,9 @@ pub(crate) mod npm_install;
 pub(crate) mod npm_install_recovery;
 #[cfg(target_os = "linux")]
 mod npm_install_transaction;
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "npm_install_transaction_native_tests.rs"]
+mod npm_install_transaction_native_tests;
 pub(crate) mod npm_materialize;
 mod npm_operation_output;
 pub mod project_review;

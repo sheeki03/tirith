@@ -13,7 +13,7 @@ use super::claude_config::OwnedClaudeHandler;
 use crate::cli::control::identity::BinaryIdentity;
 use crate::cli::shell_target;
 
-const QUALIFIED_CLAUDE_VERSION: &str = "2.1.268 (Claude Code)";
+const QUALIFIED_CLAUDE_VERSIONS: &[&str] = &["2.1.268 (Claude Code)", "2.1.283 (Claude Code)"];
 const QUALIFIED_PYTHON_VERSION: &str = "Python 3.9.6";
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -139,7 +139,7 @@ impl AgentPrecondition {
         #[cfg(test)]
         let native_scope = native_scope || self.tools.iter().all(|tool| tool.fixture);
         if !native_scope
-            || self.claude_version != QUALIFIED_CLAUDE_VERSION
+            || !QUALIFIED_CLAUDE_VERSIONS.contains(&self.claude_version.as_str())
             || self.tools.len() != 4
             || !self.tools.iter().map(|t| t.role).eq([
                 ToolRole::Claude,
@@ -423,7 +423,7 @@ impl PreparedClaude {
             return Err("combined Claude setup requires the qualified native executable, not a launcher wrapper".into());
         }
         let claude_version = version(&tools[0].executable, &["--version"])?;
-        if claude_version != QUALIFIED_CLAUDE_VERSION {
+        if !QUALIFIED_CLAUDE_VERSIONS.contains(&claude_version.as_str()) {
             return Err("this Claude host version lacks current combined-setup qualification; preserve the explicit setup workflow".into());
         }
         tools.push(capture_python_runtime(&tools[1])?);
@@ -550,7 +550,7 @@ impl PreparedClaude {
     pub(crate) fn projection(&self) -> serde_json::Value {
         // Canonical protocol facts only. Private identities, host output, config
         // bytes and paths stay in the prepared object/journal, never the browser.
-        serde_json::json!({"kind":"claude_setup_preview","scope":"user","tool_scope":"Bash","host":"claude-code","host_version":QUALIFIED_CLAUDE_VERSION,"applied":false,"reload_required":true,"verified_blocking":false,"verification_source":"configuration_only","preserves_unrelated_settings":true})
+        serde_json::json!({"kind":"claude_setup_preview","scope":"user","tool_scope":"Bash","host":"claude-code","host_version":self.retained.expected.claude_version,"applied":false,"reload_required":true,"verified_blocking":false,"verification_source":"configuration_only","preserves_unrelated_settings":true})
     }
 }
 
@@ -595,7 +595,7 @@ mod tests {
             expected: AgentPrecondition {
                 home: home.into(),
                 uid: operator.operator_uid,
-                claude_version: QUALIFIED_CLAUDE_VERSION.into(),
+                claude_version: "2.1.268 (Claude Code)".into(),
                 tools: tools.iter().map(|tool| tool.expected.clone()).collect(),
             },
             tools,
@@ -628,6 +628,31 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_host_versions_resume_and_preview_the_selected_version() {
+        crate::cli::test_harness::with_fake_env(true, |home, _| {
+            let mut prepared = fixture(home);
+            for version in ["2.1.268 (Claude Code)", "2.1.283 (Claude Code)"] {
+                prepared.retained.expected.claude_version = version.into();
+                let retained = prepared.retained.expected.retain().unwrap();
+                assert_eq!(retained.expected.claude_version, version);
+                assert_eq!(prepared.projection()["host_version"], version);
+            }
+            for version in [
+                "2.1.267 (Claude Code)",
+                "2.1.269 (Claude Code)",
+                "2.1.282 (Claude Code)",
+                "2.1.284 (Claude Code)",
+                "2.1.283",
+                "2.1.283 (Claude Code) preview",
+            ] {
+                prepared.retained.expected.claude_version = version.into();
+                assert!(prepared.retained.expected.retain().is_err(), "{version}");
+            }
+        });
     }
 
     #[cfg(unix)]

@@ -271,6 +271,76 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  native-resource-budget:
+    if: github.event_name != 'workflow_dispatch' || (inputs.native_resource_experiment == 'none' && !inputs.collect_pinned_reference)
+    name: Native macOS ARM resource budgets
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RESOURCE_RUNNER_LABEL: macos-15
+      RESOURCE_LEGACY_REFERENCE: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: '1.98.1'
+
+      - name: Check resource admission and measurement contracts
+        run: |
+          python3 -B scripts/test-admit-native-resource-budget.py
+          python3 -B scripts/test-collect-native-resource-reference.py
+          python3 -B scripts/test-check-resource-budgets.py
+
+      - name: Admit the reviewed native cohort
+        run: >-
+          python3 -B scripts/admit-native-resource-budget.py
+          --source "$GITHUB_WORKSPACE"
+          --admission docs/next-cycle/resource-reference/native-e282d038-v1/admission.json
+          --output "$RUNNER_TEMP/native-resource-admission.json"
+
+      - name: Measure the current event source
+        run: >-
+          python3 -B scripts/collect-native-resource-reference.py
+          --source "$GITHUB_WORKSPACE"
+          --output "$RUNNER_TEMP/native-resource-budget"
+          --experiment baseline
+
+      - name: Confirm the collected native cohort
+        run: >-
+          python3 -B scripts/admit-native-resource-budget.py
+          --source "$GITHUB_WORKSPACE"
+          --admission docs/next-cycle/resource-reference/native-e282d038-v1/admission.json
+          --prior "$RUNNER_TEMP/native-resource-admission.json"
+          --collected "$RUNNER_TEMP/native-resource-budget/evidence/baseline"
+          --output "$RUNNER_TEMP/native-resource-confirmation.json"
+
+      - name: Enforce qualified byte budgets
+        run: >-
+          python3 -B scripts/check-resource-budgets.py
+          --local-report "$RUNNER_TEMP/native-resource-budget/evidence/baseline/resource-local-control.json"
+          --allocation-report "$RUNNER_TEMP/native-resource-budget/evidence/baseline/resource-allocations.json"
+          --context "$RUNNER_TEMP/native-resource-budget/evidence/baseline/resource-context.json"
+          --build-provenance "$RUNNER_TEMP/native-resource-budget/evidence/baseline/resource-build-provenance.json"
+          --budget docs/next-cycle/resource-reference/native-e282d038-v1/active-budget.json
+          --output "$RUNNER_TEMP/native-resource-budget-result.json"
+
+      - name: Retain native budget observations and refusals
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-resource-budget-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-resource-admission.json
+            ${{ runner.temp }}/native-resource-confirmation.json
+            ${{ runner.temp }}/native-resource-budget/evidence
+            ${{ runner.temp }}/native-resource-budget-result.json
+          if-no-files-found: error
+          retention-days: 90
+
   publish-baseline:
     name: Publish trusted main benchmark baseline
     needs: benchmark

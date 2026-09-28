@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
 - Reviewed local materialization of dependency-free, script-free npm artifacts on supported Linux hosts, with exact artifact binding and explicit recovery. Package code execution remains unavailable.
 - Separate npm installation review and status commands, with a sealed descriptor launcher and signed completion records under development. Execution stays disabled pending native qualification and a current signed v2 threat feed.
+- Native macOS ARM allocation and memory regression budgets in PR CI, backed by three reference runs and six deliberate-regression checks. Runner or measurement changes require a compatibility review.
 
 ### Fixed
 
 - Remove sudo dependencies and suggestions from native packages. Ordinary protection stays unprivileged; manual privileged-helper installation is off by default, and unsupported or missing approval prerequisites have explicit guidance.
+- Wait for optional hook telemetry and stop overdue logging children so completed hooks do not leave ordinary background writers behind. Telemetry failures preserve the selected protection decision.
 - Preserve protocol fields under custom redaction, apply fresh privacy rules to selected support exports, and keep signed verification material separate from display copies.
 - Apply fresh privacy rules to npm operation output while preserving review handles and historical stderr behavior. Preserve private checkpoint data during unexpected unwinding, and check receipt-signing keys before package execution can start.
 - Bind npm approvals to the complete private review, including policy and file generations. Older materialization reviews remain readable but cannot authorize changes; unstarted work requires a new review.
@@ -29,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep large effective-policy responses usable with explicit field-summary limits, and prevent inherited nonblocking sockets from truncating local dashboard responses or timing out requests prematurely.
 - Preserve exact audit history through reviewed rotation and recovery; retained segment deletion requires an irreversible acknowledgement and never offers a false undo.
 - Recognize literal bracket conditions, bounded numeric shell arithmetic, and simple Python data pipelines without hiding executable substitutions or unresolved variable commands (#260, #264).
+- Distinguish curl URL operands from option values and retain the original numeric host spelling in diagnostics, without treating a second URL as a port (#255).
+- Give fresh interactive shells independent sessions and recover stale unconsumed receipts promptly while preserving double-source stability (#257).
 - Correct Android clipboard and errno portability, refuse incompatible release installation on Android, and document the remaining native qualification limits (#261, based on #262).
 - Preserve the interactive fish shell's umask during private capture, including helper failures and Ctrl-C. Capture files retain their private permissions (#265).
 - Ignore phantom policy and repository-marker directories reported by Unix virtual filesystems only when bounded directory enumeration proves the names absent. Genuine policy errors and filesystem name aliases retain conservative handling (#266).

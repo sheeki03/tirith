@@ -40,4 +40,9 @@ focus order and explicit state labels.
 All dynamic content uses text nodes. Mutation controls create typed plans and
 show operation state, conflicts and recovery. The UI does not reproduce policy
 composition or trust matching and does not offer an arbitrary command runner.
-This design is pending service integration and browser evidence.
+The embedded service and browser interface are integrated. Retained candidates
+have complete browser workflow and delayed-response evidence; the September 28
+combined candidate adds large-policy, narrow-layout and stale-readback checks.
+See [implementation progress](README.md) and [verification](verification.md) for
+exact candidate identities and results. Final platform, lifecycle and release
+qualification remain open.

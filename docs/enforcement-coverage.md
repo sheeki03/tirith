@@ -549,9 +549,11 @@ Named explicitly so no reader has to infer it from silence.
 - **No on-chain analysis.** No chain state is read, no transaction is simulated,
   no mempool is watched, no address or contract is scored, and no incident is
   attributed on-chain.
-- **No npm artifact firewall.** No npm tarball is downloaded, extracted,
-  quarantined, hashed, or bound. There is no npm install transaction and no npm
-  rollback. The existing artifact firewall remains Python-only.
+- **No package installation containment claim.** [Local npm inspection](npm-inspection.md)
+  hashes the exact supplied tarball bytes and reports bounded static evidence
+  without downloading it, writing its contents to disk, or executing package code.
+  Inspection and provenance do not authorize installation. `tirith pkg install` is disabled for
+  both npm and Python on every host pending private-input execution qualification.
 - **No browser forensics.** No browsing data is read, no browser is monitored,
   nothing is quarantined or removed, and no infostealer is attributed.
 - **No reproducible builds.** No receipt in this branch claims that an output

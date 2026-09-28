@@ -159,6 +159,24 @@ be established.
 
 ## Required acceptance evidence
 
+Native transaction mechanics can be tested under an explicitly identified test
+authority. Such a build changes only the embedded public-key asset in an
+isolated source capture; the production checkout and normal executable retain
+the production key. The fixture must still traverse the real bounded parser,
+fingerprint and signature verification, retained source handles, freshness and
+rollback checks, artifact Allow decision, task authorization, native launcher,
+publication and signed recovery. Constructors that bypass source revalidation
+cannot supply this evidence. The same signed fixture must be refused by a
+normal production-key build before transaction effects.
+
+Results must identify the source difference, compiled key, signed feed, tool
+closure and executable hashes. Test-authority results establish the exercised
+native mechanics; they do not establish production-feed adoption, public CLI
+admission or enabled installation. Controlled unwinding after child completion
+must be distinguished from process death during execution. The execution gate
+remains closed until the supported contract's complete acceptance evidence is
+reviewed.
+
 - Real supported npm/Node version and complete argv/output characterization.
 - Artifact replacement, tool/config/policy drift and changed destination refusal.
 - Dependency/peer/optional/bundled/workspace substitution refusal.

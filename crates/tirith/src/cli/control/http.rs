@@ -422,7 +422,19 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+        let accept_deadline = Instant::now() + Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < accept_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("bounded fixture accept failed: {error}"),
+            }
+        };
         // Linux does not inherit this flag from the listener; exercise the
         // macOS accepted-socket behavior on every Unix test host.
         stream.set_nonblocking(true).unwrap();

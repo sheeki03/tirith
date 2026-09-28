@@ -98,3 +98,51 @@ connection controls. They validate the certification harness, not Tirith or Clau
 enforcement. Previously retained native reports remain tied to their original
 one-off driver hashes; these repeatable routes need fresh native reports for each
 candidate they qualify.
+
+## Claude Code 2.1.283 checkpoint, September 28, 2026
+
+The exact-version combined-setup list now retains 2.1.268 and adds 2.1.283. The
+native scope remains macOS ARM, personal configuration, and the selected Python
+3.9.6 invocation/runtime. This checkpoint used Claude executable SHA256
+`d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e`,
+fresh private HOME/configuration roots, and the scripted loopback provider.
+
+The earlier PR CI package
+`076d6d457a42c76bb6227e7aeadd1a0bdb369020de6c4e6c3b9fa0af308368dc`
+passed all nine explicit-setup controls but correctly refused combined setup for
+this then-unqualified version. That refusal is retained. A first development
+candidate passed the nine behavior controls but failed the outer cleanup
+postcheck: an asynchronous `hook-event` writer recreated a removed private
+fixture. Its behavior result is not accepted as complete qualification.
+
+The corrected development candidate
+`6c17baad668e8d5dfef50040eba9d1fc690cf2bef117cc2c39df781b263ef45d`
+(145,953,936 bytes, dev profile) passed each fresh route once:
+
+| Route | Recorded outcome |
+| --- | --- |
+| Recommended setup, default user settings, nine controls | 9/9 pass; configured-hook and boundary outcomes remain distinct |
+| MCP-only | Connection observed; hook absent; policy-denied marker executed once, confirming the interception boundary |
+| Retained-host reload | Immediate retained turn omitted the hook and executed once; later retained turn at 1.023 seconds observed the hook and blocked; fresh host blocked |
+
+All corrected routes passed executable/harness hash and fixture cleanup
+postchecks. The reload observations do not establish immediate or universal hot
+reload. The unchanged native harness SHA256 is
+`bf719549ac06764d81030df808c30ad6e09ca15391d6d15f0806cc2ec6aeee91`.
+The build's 659-file source closure remained identical before and after
+compilation, with content SHA256
+`97cf7e2a11a5dfa2b6e086b902ab0b04cade06e21983add0a82f502dbe81265c`.
+Reports are retained as `candidate-v2-recommended-nine.json`,
+`candidate-v2-mcp-only.json`, and `candidate-v2-retained-host-reload.json` in the
+`native-macos-claude-2.1.283` evidence bundle.
+
+The telemetry fix covers the nine related Python, shell, and TypeScript
+templates. Python/shell helpers wait briefly, then request termination and a
+finite reap attempt; TypeScript helpers use a 250 ms synchronous timeout with SIGKILL.
+Telemetry remains optional and cannot change an allow/block decision. Later Pi
+review corrected warning telemetry ordering so it cannot shorten the existing
+ten-second checker budget. Focused helper/decision regressions cover that change;
+they do not qualify other native hosts. That later TypeScript correction is not
+part of the retained Claude binary above. Neither these development bytes nor
+their reports constitute final PR-package or official signed-release
+qualification; the final package must repeat the native routes.

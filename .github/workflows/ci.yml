@@ -51,8 +51,10 @@ jobs:
       - name: Validate native host certification bounds
         run: |
           python3 scripts/test-certify-claude-host.py
+          python3 scripts/test-hook-telemetry.py
           python3 scripts/test-certify-shell-package.py
           python3 scripts/test-certify-powershell-hook.py
+          python3 scripts/test-certify-powershell-target.py
           python3 scripts/test-control-browser-fixtures.py
           python3 scripts/test-collect-native-resource-reference.py
           python3 tools/qualification/test_mixed_audit_native.py
@@ -261,6 +263,26 @@ jobs:
           path: ${{ runner.temp }}/tirith-windows-tests
           if-no-files-found: error
           retention-days: 7
+      - name: Native PowerShell profile target resolution
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            ./.github/scripts/certify-powershell-target.ps1
+          } else {
+            python3 -B scripts/certify-powershell-target.py `
+              --cargo-messages (Join-Path $env:RUNNER_TEMP 'tirith-service-coordination/cargo.jsonl') `
+              --powershell (Get-Process -Id $PID).Path `
+              --output (Join-Path $env:RUNNER_TEMP 'tirith-powershell-targets')
+            if ($LASTEXITCODE -ne 0) { throw 'Native PowerShell target resolution failed' }
+          }
+      - name: Retain native PowerShell target evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: powershell-targets-${{ matrix.name }}
+          path: ${{ runner.temp }}/tirith-powershell-targets
+          if-no-files-found: error
+          retention-days: 14
       - name: Native PowerShell hook qualification
         shell: pwsh
         run: |

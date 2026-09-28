@@ -75,7 +75,7 @@ use tirith_core::trusted_child::TrustedExecutable;
 pub(crate) mod npm_descriptor;
 
 #[cfg(all(test, target_os = "linux"))]
-mod npm_native_tests;
+pub(super) mod npm_native_tests;
 
 /// A native npm run whose authenticated launch, successful exit, owned process
 /// cleanup and complete containment were all observed by this process. The held

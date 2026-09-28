@@ -205,9 +205,11 @@ cover:
   contract, or watch a mempool.
 - **An npm artifact firewall:** tirith parses npm command grammar and registry
   identity facts, and can ask the project's own npm for its signature and
-  provenance state. It does not download, extract, quarantine, or bind the
-  tarball bytes npm installs. The contained, hash-pinned artifact firewall is
-  Python-only.
+  provenance state. [Local npm inspection](docs/npm-inspection.md) hashes the exact
+  supplied tarball bytes and reports bounded static evidence without downloading
+  it, writing its contents to disk, or executing package code. These reports do
+  not authorize an installation. `tirith pkg install` remains disabled for both npm and Python on
+  every host pending private-input execution qualification.
 - **Browser forensics or monitoring:** `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension source trees. It never reads
   cookies, history, saved passwords, storage, wallet databases, or `Local

@@ -21,6 +21,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+
+
+# Optional telemetry owns its child until exit, or a bounded kill/reap attempt.
+# These waits do not extend the checker or host timeout.
+HOOK_EVENT_WAIT_SECONDS = 0.25
+HOOK_EVENT_REAP_SECONDS = 0.25
+_HOOK_CHECK_DEADLINE = None
 
 
 def get(data, *keys):
@@ -43,8 +51,12 @@ def fail_action():
 
 
 def _hook_event(event, detail=None):
-    """Log a hook telemetry event via tirith hook-event (fire-and-forget)."""
+    """Log optional telemetry without leaving an ordinary background writer."""
+    if (_HOOK_CHECK_DEADLINE is not None and
+            time.monotonic() + HOOK_EVENT_WAIT_SECONDS + HOOK_EVENT_REAP_SECONDS >= _HOOK_CHECK_DEADLINE):
+        return  # Telemetry cannot extend an exhausted check budget.
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
+    child = None
     try:
         cmd = [
             tirith_bin,
@@ -58,11 +70,25 @@ def _hook_event(event, detail=None):
         ]
         if detail:
             cmd.extend(["--detail", detail])
-        subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        child = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+        child.wait(timeout=HOOK_EVENT_WAIT_SECONDS)
     except Exception:
         pass
+    finally:
+        if child is not None:
+            try:
+                if child.poll() is None:
+                    try:
+                        child.kill()
+                    finally:
+                        child.wait(timeout=HOOK_EVENT_REAP_SECONDS)
+            except Exception:
+                # A bounded wait cannot guarantee kernel reaping. Do not claim
+                # cleanup or change the already selected security decision.
+                print("tirith: optional hook telemetry unavailable", file=sys.stderr)
 
 
 def _build_warning_text(stdout):
@@ -94,6 +120,8 @@ def fail_closed(reason):
 
 
 def main():
+    global _HOOK_CHECK_DEADLINE
+    _HOOK_CHECK_DEADLINE = None
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -132,6 +160,7 @@ def main():
 
     env = os.environ.copy()
     env["TIRITH_INTEGRATION"] = "gemini-cli"
+    _HOOK_CHECK_DEADLINE = time.monotonic() + 10.0
 
     try:
         result = subprocess.run(

@@ -94,7 +94,7 @@ qualification remains tracked separately.
 | Command | What it does |
 |---------|-------------|
 | `tirith package {risk,explain,scan}` | Score a package's supply-chain risk (offline by default; `--online` adds registry provenance; `--installed` walks installed trees) |
-| `tirith package inspect` | Inspect local wheel artifacts, an artifact set, or an installed Python environment for structural violations, identity/RECORD/ownership failures, startup hooks, native execution chains, and cross-distribution loader/payload splits. Never downloads artifacts (`--artifact`, `--artifact-set`, `--installed`, `--format json`) |
+| `tirith package inspect` | Inspect exact local npm tarballs, local wheels, a wheel set, or an installed Python environment without downloading or executing package content. [npm inspection](npm-inspection.md) reports bounded static signals and coverage; Python inspection reports structural, identity/RECORD/ownership and execution-chain evidence (`--artifact`, `--artifact-set`, `--installed`, `--ecosystem`, `--format json`) |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project, slopsquat-aware (`--installed`, `--online`, `--format json`) |
 | `tirith threat-db {update,status,health,sources,explain,diff}` | Manage the signed local threat database (`threatdb` is an alias) |
 | `tirith iac {guard,check-plan,require-plan-before-apply}` | Terraform / Pulumi / OpenTofu apply gates (saved-plan hash, no-plan-apply) |
@@ -110,10 +110,11 @@ qualification remains tracked separately.
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
 | `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
+| `tirith pkg inspect <artifact>...` | Inspect exact local npm tarballs or Python wheels without execution. [npm reports](npm-inspection.md) preserve captured hashes and explicit coverage; ambiguous `.tar.gz` files require `--ecosystem npm` for the npm reader (`--format json`, npm `--format sarif`) |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
 | `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
-| `tirith pkg diff <old> <new>` | Release differential between two wheels of the same distribution, flagging execution-shape changes |
+| `tirith pkg diff <old> <new>` | Compare two local npm tarballs or Python wheels. [npm comparison](npm-inspection.md) retains exact artifact hashes and separates byte changes from analyzer/coverage changes; it grants no installation authority (`--ecosystem`, `--format json`, npm `--format sarif`) |
 | `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |
 | `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures and provenance attestations, bound to the exact `package-lock.json` and `node_modules` inventory, and emit a signed receipt. Tirith does not download, inspect, or bind the tarball bytes npm installs (`--project`, `--require-provenance`, `--out`, `--format json`) |
 | `tirith pkg receipt {list,last,show}` | List or show the package-firewall tamper-evident receipts |

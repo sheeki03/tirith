@@ -404,6 +404,10 @@ fn observe_windows_startup(
 }
 
 #[cfg(test)]
+#[path = "shell_target_native_tests.rs"]
+mod native_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn inputs(platform: Platform) -> TargetInputs {

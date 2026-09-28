@@ -180,7 +180,7 @@ pub(super) fn retained_launcher() -> Result<Option<std::fs::File>, String> {
 }
 
 #[cfg(target_arch = "aarch64")]
-struct LauncherGuard;
+pub(in crate::cli) struct LauncherGuard;
 #[cfg(target_arch = "aarch64")]
 impl Drop for LauncherGuard {
     fn drop(&mut self) {
@@ -191,7 +191,7 @@ impl Drop for LauncherGuard {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn install_launcher(path: &Path, expected_sha256: &str) -> LauncherGuard {
+pub(in crate::cli) fn install_launcher(path: &Path, expected_sha256: &str) -> LauncherGuard {
     use sha2::{Digest as _, Sha256};
     use std::os::fd::{AsRawFd as _, BorrowedFd};
     use std::os::unix::fs::FileExt as _;

@@ -1,5 +1,224 @@
 # Implementation verification
 
+## September 28: integrated hook and native qualification candidate
+
+The complete local `cargo test --workspace --locked` run passes: 2,119 primary
+CLI tests with five ignored, 6,174 primary core tests with two ignored, and all
+integration suites and doctests. Its log SHA-256 is
+`d5c53db5e5db630e2554599f89c1dce8998fcad3bc3b9f4b833be3431dbf3354`.
+The first attempt exposed a nonblocking socket acceptance race in a test and
+a bounded global setup-lock refusal during concurrent native setup work. The
+socket test now retries acceptance within a fixed deadline; the production
+lock deadline is unchanged. The successful full rerun followed completion of
+the concurrent setup work.
+
+Strict workspace/all-target Clippy passes. Four focused portable npm
+qualification tests and strict CLI test-target Clippy also pass after the
+final script-archive fixture addition. Formatting and workflow checks pass.
+Independent review found no remaining actionable defects in the native npm
+packet after its launcher was moved into an owned, verified temporary root.
+Its four coordinator cases and two script-suppression controls still require
+native ARM execution; a portable pass is not attributed to those native rows.
+
+G0/G2 source review found no remaining code defects in its scoped acceptance
+contracts. Documentation now distinguishes captured npm archive inspection
+from execution, and npm/Python comparisons from npm installation. Final
+integrated platform checks, including native Windows PowerShell 5.1 and 7,
+remain required before closing those acceptance rows.
+
+## September 28: hook telemetry lifecycle and current Claude tuple
+
+Native testing of exact Claude 2.1.283 found an ordinary background telemetry
+writer that could recreate state after hook completion. All nine related hook
+templates now wait for optional logging and stop overdue children with bounded
+cleanup attempts. A separate review caught Pi warning telemetry consuming part
+of the checker's allowance; it now runs after the protection decision. The
+original ten-second checker timeout remains unchanged. Eight focused controls
+pass independently, including real-child reap/late-write tests and decision
+invariance. An actual 9.85-second Pi checker permits the same command with both
+quick and stalled telemetry. These checks do not certify unrelated native hosts.
+
+The corrected retained development binary
+`6c17baad668e8d5dfef50040eba9d1fc690cf2bef117cc2c39df781b263ef45d`
+passes all nine native combined-setup controls, the MCP-only boundary and the
+retained-host reload route, each once. All tuple input pins and successful
+fixture-root cleanup checks pass independent rehashing. Immediate hot reload
+is not guaranteed: the first retained-host turn omitted the hook, while a later
+retained turn and a fresh host observed blocking. The initial cleanup failure
+and the older PR package's correct exact-version refusal remain retained.
+See the [complete tuple record](claude-native-evidence.md#claude-code-21283-checkpoint-september-28-2026).
+
+The native build contains 659 source files with content digest
+`97cf7e2a11a5dfa2b6e086b902ab0b04cade06e21983add0a82f502dbe81265c`.
+Later changes to two TypeScript templates and one HTTP test are separately
+reviewed and tested; they are not attributed to that native binary. The native
+summary digest is
+`18761e30a9c7e3e169768f33307688b54fe34d403aa59183db2f428e9e30da84`.
+Final PR-package native checks remain distinct from this development record.
+
+## September 28: native PowerShell target checks
+
+The next integration candidate adds an explicit native profile-resolution test.
+It invokes PowerShell without loading profiles, compares the observed
+`$PROFILE.CurrentUserCurrentHost` with the shared resolver, and preserves
+before/after profile contents and metadata. On Windows it also compares the
+actual Documents location with the known-folder API. This verifies target
+selection, not an automatic hook adapter or observed command blocking.
+
+Both native macOS ARM PowerShell 7.6.6 cases pass: the current operator's default
+profile and a child-only private XDG location. Neither profile changes; the
+owned child completes with confirmed cleanup. All 578 runtime files match
+before and after. Seven focused Rust checks, three Python driver controls,
+strict CLI Clippy, workflow validation and Windows controller parsing pass.
+Native Windows PowerShell 5.1 and 7 execution remains pending ordinary CI;
+the workflow requires both and refuses missing runtimes instead of treating
+absence as a successful test.
+
+The official archive SHA-256 is
+`6df833d094ebac1c1a74340d7b3437f4aaf5e03ce640484a1c4359f3ce8b3db1`;
+the native executable is
+`86966ef5e53763c0d7cac9981b9b36c30245185dc347ca69ddfb815c665bf515`.
+The captured CLI test executable is
+`a1ac7ce90f15b5085cba65b78850176fc532952260011210be7a2ec745740d47`.
+The source snapshots, retained logs and native reports were independently
+rehashed against review receipt
+`0cd199a7d09e8f24490ea2bc402668ef728e7caa36c1390b64c3826bf7bdc7ac`.
+These results apply to the retained development inputs; the combined commit
+and platform CI will supply their own revision identities.
+
+## September 28: combined source e282d038
+
+The combined candidate is `e282d038519848caa8328cf32aa05a05daa502d2`, tree
+`71c7f346aefa9de9044c3b358252ab0cfc03dae1`. Version remains 0.4.2.
+All five original attempt-1 workflows pass:
+[CI](https://github.com/sheeki03/tirith/actions/runs/36333438640),
+[Release](https://github.com/sheeki03/tirith/actions/runs/36333439005),
+[native ARM containment](https://github.com/sheeki03/tirith/actions/runs/36333438682),
+[Fuzz](https://github.com/sheeki03/tirith/actions/runs/36333438583), and
+[Benchmarks](https://github.com/sheeki03/tirith/actions/runs/36333438646).
+Publication steps are intentionally skipped on the PR. The actual PR checkout
+is merge `e82324e9132238f063b3a3b50fdaa2f60c431a23`; its API-recorded tree equals
+the candidate tree. Artifact claims below use that actual checkout identity.
+
+The corrected complete local `cargo test --workspace --locked` run exits zero.
+Its primary CLI harness passes 2,114 tests with four ignored; its primary core
+harness passes 6,174 with two ignored. Integration suites and doctests pass.
+Nested subprocess summaries are not added again to these primary counts.
+Log SHA-256:
+`cbdc4f078edd9bf2d0df2a2c2ba7ce79c9a6cb9393d64466ee39150fd4440486`.
+Strict workspace/all-target Clippy also passes. The earlier incomplete run and
+unchanged frozen-reader fixture remain recorded below.
+
+Current development binary
+`d57b2fe07410182708f6b20e86ec5ad9127e3ac41478275f28ae62d959e74893`
+passes 32 paired released-0.4.2 compatibility cases, six signed/unsigned
+mixed-audit cases, and fourteen durable process-death/storage cases. The latter
+observe each requested stopped boundary and include actual permission and file
+size-limit failures. Every owned command's process/pipe cleanup and retained
+input hashes pass. These observations do not certify power-loss behavior,
+a physically full filesystem, or Windows signed replacement.
+
+The Windows CI artifact passes all 60 harnesses; primary totals are 8,357 passed,
+zero failed and three ignored. Build, doctests and native Job cleanup pass.
+Separately, all nine dashboard cases pass under the created standard account:
+medium integrity, no elevated token and no Administrators membership. The
+ordinary workspace harness is not described as running under that account.
+ZIP SHA-256:
+`8852810fa64dabfbe11639cc2e1b6096b8d4423898f5c858bdde915e6105f7b6`.
+The PowerShell jobs pass in CI; their larger artifacts were not independently
+inspected for this record.
+
+Both canonical GNU and musl ARM64 release archives pass all sixteen native
+containment cases, including four cancellation/cleanup cases, as UID 65534.
+The separate native-ARM workflow's two archives also pass sixteen cases each.
+These are distinct binaries and archive hashes, all tied to the recorded merge
+checkout; none is an npm private-input execution qualification. Release builds,
+Debian/RPM package jobs, GNU compatibility matrices and npm assembly pass.
+The retained Debian package is `0.4.2-1`, with only `ca-certificates` in Depends
+and no sudo dependency or suggestion. RPM CI verifies the same absence across
+its dependency classes. No official release was published.
+
+The actual macOS ARM PR archive has SHA-256
+`7f4050802588d855671e5f75c0fa9678adb2763efe5ba0619a0293dd20191714`;
+its executable has SHA-256
+`076d6d457a42c76bb6227e7aeadd1a0bdb369020de6c4e6c3b9fa0af308368dc`.
+It passes three fresh default-MONITOR Zsh activation sessions and all three
+removal cases: recommended removal/fresh-shell behavior, manual startup
+preservation, and edited/malformed-block handling. No product case was retried;
+all owned process/session/PTY cleanup and input postchecks pass. Provenance is
+bound through CI/API and matching Git trees, not an embedded Git attestation.
+The retained summary SHA-256 is
+`bb8865dd5fae9f08d79a338928e47675d3fcd1f4580c35533953bbd863990d84`.
+
+The same packaged executable passes 32 native Bash/Zsh/Fish cases using its own
+materialized hook assets: 19 on Bash 5.3.15, six on Apple Zsh 5.9, and seven on
+Fish 4.8.1. All twelve owned commands and 33 original PTY groups/sessions finish
+with observed EOF; the disposable fixture is removed. Report SHA-256:
+`0d5948b671bea982e4acbc6c6fbfdc2919a62ff7bef8b9e3f3047c5e7998b07a`.
+These cases do not establish escaped-session or arbitrary descendant cleanup.
+
+The package's embedded browser assets also pass all 24 full journeys and eight
+response-order/ownership cases, each once, with zero browser errors. Candidate,
+package, harness, runtime and 657 source-file identities match before and after.
+Both owned services and three CLI commands exit zero with original group/EOF
+cleanup; successful service fixtures are removed. Wide/narrow screenshots were
+inspected. Playwright closes its private browser context, but the harness does
+not claim full browser process-tree observation. Summary SHA-256:
+`ca3272e0049342bea54664fc0a466b46776ee9d773393c01d3dfe808afed741f`.
+
+Android API-24 check and link pass on the same 657-file compiler-input closure,
+using Rust 1.98.0 and official NDK r30/Clang 21. The resulting AArch64 PIE uses
+`/system/bin/linker64`, and the tool/sysroot/dependency identities match before
+and after. This is an opt-level-zero development build, not Android runtime
+qualification. No Android device, Termux execution, SELinux behavior or shell
+hooks were tested. ELF SHA-256:
+`971978b3ee77590298a32de684faf16302c14e52c38ffefbc909ee2b6b789b63`.
+
+Three original native macOS resource baselines on exact `e282d038` pass independent
+artifact, source/build and raw-sample verification. Allocation spreads are zero;
+ordinary-check RSS maxima range from 43,646,976 to 43,974,656 bytes. Compared with
+the historical cohort, URL requested-byte maxima increase by 72 bytes; other
+allocation maxima are unchanged. All six original control/growth pairs now pass:
+each control satisfies all six ceilings, and each growth variant exceeds only
+its selected ceiling. Independent review rehashes all six original archives and
+246 extracted files, then recomputes the six metrics and raw paired deltas. All
+100 RSS growth samples exceed its ceiling. The completed review SHA-256 is
+`0d38e2c773621ef39a13fc452d213f8b68c3a1bd2ba268b937aa805daac53207`.
+
+The [native resource reference](resource-reference/native-e282d038-v1/README.md)
+records the actual run/artifact identities, thresholds and activation decision.
+Ordinary PR CI now has a native job that checks cohort/build/runtime/tool
+compatibility, measures its own event source, confirms the retained facts after
+collection, and enforces those six byte ceilings. Nine admission controls, fifteen
+collector controls and 36 checker controls pass, as does workflow validation.
+Its first ordinary CI execution remains pending the integration commit; the
+six detector results do not substitute for that result.
+
+The local native ARM v17 follow-up passes core typechecking, then reaches its
+5 GiB cgroup cap while compiling the core test executable: one OOM and one OOM
+kill, with peak exactly 5,368,709,120 bytes. No selected core tests, signed-v1
+refusal or Clippy ran in that attempt. All owned commands clean up and the exact
+container is removed. A separate bounded isolated ARM CI run,
+[36338702048](https://github.com/sheeki03/tirith/actions/runs/36338702048), measures
+exact product `e282d038` through controller `27c327838680d0123b2e5f61ef7f14b1cb59d043`.
+It passes native core typechecking, the nested-policy regression, all 68 npm
+core tests and the genuine production-signed-v1 refusal test. Its only failure
+is an absent Clippy component in the pinned compiler image; the lint command
+does not run and no native lint pass is claimed. Peak cgroup memory is
+5,860,294,656 bytes under its 10 GiB cap, with zero max/OOM/OOM-kill events.
+All 657 source files, ten build/test logs, feed bytes and 91 owned-child cleanup
+records pass independent verification. The exact container is removed and the
+final inputs match. Artifact ZIP SHA-256:
+`c7cecc7b844059da8b0dad57fbedc3b3004582d253107c1695b1e44af1e8878a`;
+report SHA-256:
+`72a6551af65251a9bab51680e8b3eea48632e37ad69c0fc898c85f39982d7a33`.
+
+These results close the recorded combined-source regressions and add native
+package evidence. They do not close all release gates: official channel and
+upgrade certification, the consented beginner pilot, selected wider native
+journeys, genuine signed-v2 npm prerequisites and integrated npm execution
+qualification remain separate outstanding work.
+
 ## September 28: combined controls and remaining native checks
 
 The combined browser candidate

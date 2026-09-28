@@ -1,8 +1,10 @@
 # Output privacy and compatibility contracts
 
-Status: the MCP correction has regression evidence. CLI and history projection
-extensions are implemented and awaiting their current-revision regression run.
-WP03 remains open for the remaining signed display, support and browser audit.
+MCP, CLI and history projections are implemented and have regression evidence
+on retained candidates. Bounded saved-receipt readers, private support exports
+and embedded browser workflows also have recorded checks; see
+[verification](verification.md). WP03 remains open for complete final-candidate
+output, signed-display, support and browser acceptance.
 
 ## Implemented boundary inventory
 
@@ -101,13 +103,15 @@ while URLs, paths and analysis prose receive DLP. Safe suggestions retain their
 rule identity; an executable suggestion is omitted when its display would alter
 the analyzed bytes. History displays contain no signature or chain hash, retain
 canonical actions/rules/timestamps, and freshly redact recorded content. These
-extensions have additional tests but are not yet included in the prior evidence
-count. Schemas are not a global key allowlist. The policy
+extensions have retained CLI/core and receipt-privacy regression evidence;
+counts and exact candidate identities are recorded in [verification](verification.md).
+Schemas are not a global key allowlist. The policy
 snapshot work in this cycle has its own explicitly redacted display projection;
 it is not canonical or round-trip editable, and its enforcement-posture hash is
-not a full policy revision identity. Support exports and future browser output
-still require bounded content, fresh redaction and explicit signed/display
-separation before their work packages can close.
+not a full policy revision identity. Implemented support exports and browser
+output retain bounded content, fresh redaction and explicit signed/display
+separation. Their selected passing workflows do not replace a complete
+final-candidate audit before the corresponding work packages can close.
 
 
 ## Bounded saved receipt access

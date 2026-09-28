@@ -3,12 +3,13 @@
 Baseline revision: `7fd35101568bb06ee0d361dc1d4a4d193c5f60fd` (0.4.2).
 See [baseline.md](baseline.md) for source findings and fixture provenance.
 
-This matrix began as an inventory at the baseline above. All final acceptance
-rows remain **open**; later source tests and native observations qualify only
-their recorded candidates and scenarios. A completion record must name code
-revision, OS/toolchain/host versions, exact command, result artifact, skips and
-expected versus observed side effects. Keep local source tests, native host tests
-and final packaged-release evidence separate.
+This matrix began as an inventory at the baseline above. Acceptance is assessed
+per scenario and recorded candidate, with current package status in
+[implementation progress](README.md). A completed native backend does not imply
+completed npm execution or G1 release acceptance. Each evidence record names code
+revision, OS/toolchain/host versions, command, artifacts, skips and observed side
+effects. Keep local source tests, native host tests and packaged-release evidence
+separate; official publication is required where the named gate calls for it.
 
 The initial inventory attached no PR or CI run. Subsequent native, PR and platform
 CI results, including retained failures and corrective runs still pending, are
@@ -55,14 +56,14 @@ workflows.
 | Surface | Existing source evidence | Next-cycle status and missing proof |
 |---|---|---|
 | Linux x86_64, Bash 5.3 | Dedicated CI job builds pinned Bash 5.3; enter/preexec and PTY marker/receipt tests exist | Candidate only; capture exact patch version and installed-package default setup, fresh-shell, upgrade/removal and failure results |
-| macOS arm64, Apple Zsh 5.9 | Three actual recommended-setup/fresh-PTY runs pass with default MONITOR on, ordered allow/block/status evidence and restored history on retained release product `cc5558cd…ab5437`; see [verification](verification.md#integrated-native-checks-2026-09-21) | Exact native tuple qualified on those bytes; three owned terminal-removal scenarios also pass on those bytes; final tag-produced package, other profiles and complete upgrade acceptance remain |
+| macOS arm64, Apple Zsh 5.9 | Three fresh default-MONITOR activation sessions and three owned removal scenarios pass on actual PR package executable `076d6d45…08368dc`, from the e282d038 tree; see [verification](verification.md#september-28-combined-source-e282d038) | Exact native tuple qualified on those bytes; final tag-produced package, other profiles and complete upgrade acceptance remain |
 | Linux/macOS, Fish | PTY allow/block/warn/noninteractive tests | Manual workflow retained; exact shell versions and installed fresh-shell target paths unverified |
 | Other Bash versions/startup modes | Version-gated PTY suite; fallback/capability tests | Conditional until tested; missing/old shell skips must be listed |
 | PowerShell 5.1/7, Unix PowerShell | Native Unix PowerShell 7.6.6 passed 22 cases using hook bytes extracted from retained `39f6acc9`; later Linux CI also passes its native PowerShell step; see [verification](verification.md) | Unix hook evidence does not qualify Windows terminals or automatic receipt adapters; native Windows target/interception and final package evidence remain |
 | Nushell | Hook/config source; ignored PTY follow-up stub | No next-cycle native blocking certification |
 | Real agents and MCP clients | Actual macOS ARM Claude Code 2.1.268 dispatch passes configured-hook/boundary controls on retained candidates; recommended setup, all nine hook/failure cases, MCP-only and retained-host/fresh-host observations pass on release product `cc5558cd…ab5437`; see [Claude evidence](claude-native-evidence.md) and [verification](verification.md) | Qualified evidence is specific to the recorded host, interpreter, settings and candidate; unmatched tools, shortened host deadlines and disabled hooks remain explicit limits. Other hosts, later candidates and beginner/final release journeys remain |
-| Workspace/platform CI | All five workflows pass on `87c0fdee`. The later `2cde4cee` passes release, native ARM, fuzz and benchmark workflows, while CI identifies lint and Linux/Windows fixture failures. Nine Windows standard-account dashboard cases pass separately; see [verification](verification.md) | Corrections are prepared locally. New combined-source CI, native qualification and final release acceptance remain required |
-| Linux containment | Native ARM GNU and musl local archives each pass all 16 cases from source manifest `7d9788bf…5d317`; independent GNU/musl CI archives at `71070bbb` also pass all 16, including supervisor/guard interruption | These are distinct exact-source and exact-commit proofs. Final tag-produced release artifacts and later npm boundary changes require separate qualification; see containment-aarch64.md |
+| Workspace/platform CI | All five workflows pass on e282d038, as does the complete local workspace suite. Windows passes all sixty harnesses; nine dashboard checks separately pass under a standard account. Current source corrections close the 2cde4cee lint and Linux/Windows fixture failures; see [verification](verification.md) | Specific remaining native npm controls and final release acceptance remain separate requirements |
+| Linux containment | Both canonical GNU and musl ARM PR release archives for e282d038 pass all sixteen native cases as UID65534, including cancellation and cleanup. Independent native-ARM workflow archives also pass sixteen cases each | These exact-byte proofs qualify the selected WP27 backend contract. The separate integrated npm installation route remains unqualified; an eventual official release must bind its own artifact identities. See containment-aarch64.md |
 
 ## Reproducible starting commands
 

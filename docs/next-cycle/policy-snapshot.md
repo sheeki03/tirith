@@ -1,5 +1,10 @@
 # Policy resolution: first foundation slice
 
+This is a historical foundation note. The gaps below describe that first slice;
+the current [effective policy snapshot contract](policy-snapshots.md) documents
+implemented field provenance, input revisions, remote freshness and replay guards.
+Current qualification limits are tracked in [implementation progress](README.md).
+
 Implements part of WP01, covering baseline F02 / acceptance A01. It does not
 complete the field-provenance, revision or preview contracts.
 

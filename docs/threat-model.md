@@ -106,10 +106,12 @@
   and says in so many words that this is not a claim the host is malicious.
 - **An npm artifact firewall**: tirith parses npm command grammar and registry
   identity facts, and it can ask the project's own npm to report its signature
-  and provenance state. It does **not** download, extract, quarantine, hash, or
-  bind the tarball bytes npm installs, and there is no npm install transaction
-  and no npm rollback. The artifact firewall with quarantined bytes and a
-  contained install remains Python-only.
+  and provenance state. [Local npm inspection](npm-inspection.md) hashes the exact
+  supplied tarball bytes and reports bounded static evidence without downloading
+  it, writing its contents to disk, or executing package code. Captured hashes
+  identify the inspected bytes, not a later mutable path or a verified publisher, and do not authorize
+  installation. `tirith pkg install` is disabled for both npm and Python on every
+  host pending private-input execution qualification.
 - **Browser forensics or monitoring**: `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension SOURCE trees for Chrome,
   Chromium, Brave, and Edge. It never reads cookies, history, saved passwords,

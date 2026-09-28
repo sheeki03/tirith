@@ -23,6 +23,10 @@ use super::{
     package_checkpoint::{EnvironmentCheckpoint, InstallTargetBinding},
 };
 
+#[cfg(test)]
+#[path = "npm_install_transaction_native_tests.rs"]
+mod native_tests;
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ExecutionState {
@@ -74,6 +78,33 @@ pub(super) fn execute(
             "npm execution is not qualified on this host",
         )
     })?;
+    execute_after_qualification(
+        plan,
+        artifacts,
+        policy,
+        binding,
+        permit,
+        json_output,
+        reviewed_sha256,
+        validate_intent,
+    )
+}
+
+// This private body is shared with the explicit native qualification fixture.
+// Production callers can only enter through execute's unchanged closed gate.
+// The test fixture must retain real source/tool/task/launcher authority; it
+// cannot manufacture the native completion witness consumed below.
+#[allow(clippy::too_many_arguments)]
+fn execute_after_qualification(
+    plan: &NpmInstallPlan,
+    artifacts: &[VerifiedNpmArtifact],
+    policy: &EffectivePolicySnapshot,
+    binding: &InstallTargetBinding,
+    permit: TaskBoundaryPermit<PackageInstallPreparationBoundary>,
+    json_output: bool,
+    reviewed_sha256: &str,
+    validate_intent: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Value, TransactionFailure> {
     preflight_milestone_signing()
         .map_err(|reason| TransactionFailure::before("signed_receipt_preflight", reason))?;
     validate_intent()
@@ -244,6 +275,8 @@ pub(super) fn execute(
         let private_milestone = recovery
             .record_private(reviewed_sha256, &completed, &prepared, &verified, &recorded)
             .map_err(|reason| ("private_completion_milestone", reason))?;
+        #[cfg(test)]
+        native_tests::observe_phase(native_tests::Phase::PrivateMilestone);
         // Prepare and bind the opaque committed receipt before publication.
         let committed = recorded.prepare_committed().map_err(|_| {
             (
@@ -275,6 +308,8 @@ pub(super) fn execute(
                 "no-replace publication did not complete; inspect recovery state".into(),
             )
         })?;
+        #[cfg(test)]
+        native_tests::observe_phase(native_tests::Phase::TargetPublished);
         prepared.revalidate_published(&verified).map_err(|error| {
             (
                 "published_verification",

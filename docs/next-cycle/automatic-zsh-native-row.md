@@ -1,7 +1,13 @@
 # Automatic Zsh native module admission
 
-Automatic activation is under integration; the presence of this admission rule
-does not certify a completed installed-terminal journey.
+Automatic activation is implemented for the exact macOS ARM64 Apple Zsh 5.9
+row below. Three fresh native sessions with default job control enabled
+(`MONITOR=on`) passed on the retained September 21 product, SHA-256
+`cc5558cda58e51555a87829da011cc4635f73e8499d368968ba162bbaeab5437`.
+They observed the ordered allow/block/status sequence and restored history;
+see [integrated native checks](verification.md#integrated-native-checks-2026-09-21).
+This qualifies the recorded product and native tuple, not later source changes,
+other platforms, or a final tag-produced package.
 
 The initial module-import row is macOS on ARM64 with the exact Apple Zsh 5.9
 files listed in `setup_activation/native_modules.rs`. Full-file SHA-256 values
@@ -29,14 +35,15 @@ reviewed row. Signature similarity or a matching version string is insufficient.
 The exact-hash rule avoids running a signature verifier during shell startup;
 the admitted files are the bytes whose signatures and dependencies were reviewed.
 
-The shell initializer must additionally refuse preloaded, aliased or redirected
-required modules, and use the actual special readonly `module_path` parameter
+The shell initializer refuses preloaded, aliased or redirected required modules
+and uses the actual special readonly `module_path` parameter
 with the one fixed system directory. Those checks are about importing new code;
 they do not attest all previously loaded shell code or process memory.
 
-The proposed keymap collector bounds retained bytes and producer CPU time. Zsh
+The implemented keymap collector bounds retained bytes and producer CPU time. Zsh
 5.9 formats a complete key-binding macro before writing it, so a large existing
 macro can cause additional allocation before output is refused. This is not a
-total heap or resident-memory limit. Installed startup, editor restoration,
-user-input cancellation and the complete receipt sequence still require native
-end-to-end qualification before automatic verification can be advertised.
+total heap or resident-memory limit. The native results above cover only their
+recorded startup, editor and receipt scenarios. Other configurations, cancellation
+paths and later product/native bytes require their own qualification; final
+package and complete upgrade acceptance remain open.
