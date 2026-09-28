@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       remaining_qualification:
-        description: 'One metadata-only ARM runtime prerequisite observation; no product or build'
+        description: 'Two inert OS dumpability controls; no Tirith, Cargo or sysctl changes'
         type: boolean
         required: true
         default: false
@@ -12,13 +12,13 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-arm-metadata-${{ github.run_id }}
+  group: native-arm-dumpability-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
-  metadata-only:
+  dumpability-controls:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification }}
-    name: Native ARM metadata only
+    name: Native ARM dumpability controls
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
@@ -26,7 +26,7 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           import json, os, pathlib, platform
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-metadata-v1'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-dumpability-v1'
           root.mkdir(mode=0o700, exist_ok=False)
           (root / 'dispatch-context.json').write_text(json.dumps({
               'controller_event_commit': os.environ['GITHUB_SHA'],
@@ -34,12 +34,13 @@ jobs:
               'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
               'runner_machine': platform.machine(),
               'product_execution': False,
-              'build_execution': False,
+              'product_build_execution': False,
+              'inert_os_probe_compilation': True,
               'original_v5_runner_value_inferred': False
           }, indent=2) + '\n')
           assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
           PYCODE
-      - name: Sparse checkout the reviewed controller and owned process helper only
+      - name: Sparse checkout the reviewed OS probe, controller and owned process helper only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -48,23 +49,25 @@ jobs:
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
-            /.github/qualification/native-arm-npm-metadata.py
+            /.github/qualification/native-arm-dumpability-owner.py
+            /.github/qualification/native-arm-dumpability-probe.c
             /.github/workflows/native-arm-containment.yml
             /tools/qualification/mixed_audit_native.py
-      - name: Observe exact runtime prerequisites without product execution
+      - name: Compile the inert OS probe and observe same-UID kernel access
         run: |
           set -euo pipefail
           test "$(git -C "$GITHUB_WORKSPACE/controller" rev-parse HEAD)" = "$GITHUB_SHA"
-          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-npm-metadata.py" \
-            --output "$RUNNER_TEMP/native-arm-metadata-v1/run" \
-            --driver-sha256 e5ed3a1a754b3b46cb22d1cac3caf0c34b37f899684d6311739fbfcb7f744fc0
+          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-dumpability-owner.py" \
+            --output "$RUNNER_TEMP/native-arm-dumpability-v1/run" \
+            --driver-sha256 cedeb18df1096a807825a94257ac06ac7c097809f07588bd6e1194a15f9d2619 \
+            --source-sha256 3cf9ab393ce70b1337d067d631bd7ade84a3996db69d214bc8515f3718effc5c
       - name: Preserve bounded metadata and partial-failure cleanup
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-arm-metadata-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          name: native-arm-dumpability-v1-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-arm-metadata-v1/
+            ${{ runner.temp }}/native-arm-dumpability-v1/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
