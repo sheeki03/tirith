@@ -70,8 +70,8 @@ pub(super) fn execute(
     reviewed_sha256: &str,
     validate_intent: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Value, TransactionFailure> {
-    // The caller must also check platform qualification before creating intent
-    // state. Keep this guard at the transaction seam for direct callers.
+    // The caller must also check platform qualification before recording a
+    // Started event. Keep this guard at the transaction seam for direct callers.
     plan.execution_qualification().map_err(|_| {
         TransactionFailure::before(
             "qualification",
@@ -90,8 +90,8 @@ pub(super) fn execute(
     )
 }
 
-// This private body is shared with the explicit native qualification fixture.
-// Production callers can only enter through execute's unchanged closed gate.
+// Production callers and the explicit native fixture enter this private body
+// only through execute's native platform qualification gate.
 // The test fixture must retain real source/tool/task/launcher authority; it
 // cannot manufacture the native completion witness consumed below.
 #[allow(clippy::too_many_arguments)]

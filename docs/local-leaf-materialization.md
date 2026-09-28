@@ -1,6 +1,6 @@
 # Reviewed local leaf materialization
 
-Draft contract: `LocalLeafMaterializeV1`. Native Linux qualification is required before this candidate is admitted as a supported installer. This workflow writes reviewed archive data. It never launches Node, npm, lifecycle scripts, a resolver, an archive utility, or any other package-controlled process. The existing package execution gate remains closed.
+Draft contract: `LocalLeafMaterializeV1`. Native Linux qualification is required before this candidate is admitted as a supported installer. This workflow writes reviewed archive data. It never launches Node, npm, lifecycle scripts, a resolver, an archive utility, or any other package-controlled process. The separate `pkg install-npm` route has its own [native installation contract](npm-install-contract.md); general `pkg install` execution remains disabled.
 
 The core accepts one through eight exact local leaf tarballs, validates the complete retained compressed archive before obtaining output authority, and refuses unsupported scripts, execution declarations, dependency graphs, native payloads, metadata, archive ambiguity, or incomplete bounded analysis. Ordinary JavaScript and other supported files remain inert data. Output uses fixed nonexecutable file permissions and private directory permissions. Native addons, bin links, dependency solving, and npm runtime compatibility are not supplied by this contract.
 

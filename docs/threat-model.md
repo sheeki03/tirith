@@ -111,7 +111,11 @@
   it, writing its contents to disk, or executing package code. Captured hashes
   identify the inspected bytes, not a later mutable path or a verified publisher, and do not authorize
   installation. `tirith pkg install` is disabled for both npm and Python on every
-  host pending private-input execution qualification.
+  host pending private-input execution qualification. The separate
+  [local leaf npm installer](npm-install-contract.md) is limited to its qualified
+  GNU Linux AArch64 contract, exact inspected bytes, disabled scripts and a
+  current production-signed v2 feed; it is not general registry installation or
+  a claim that package code is safe.
 - **Browser forensics or monitoring**: `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension SOURCE trees for Chrome,
   Chromium, Brave, and Edge. It never reads cookies, history, saved passwords,

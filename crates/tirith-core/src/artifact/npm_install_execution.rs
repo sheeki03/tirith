@@ -155,7 +155,7 @@ impl<'a> PreparedNpmExecution<'a> {
             .pin_files_for_launch(specs.iter().map(|(name, _, _)| name.as_str()))
             .map_err(|_| NpmInstallRefusal::InputUnavailable)?;
         if files.len() != specs.len() {
-            return Err(NpmInstallRefusal::NativeExecutionUnqualified);
+            return Err(NpmInstallRefusal::InputUnavailable);
         }
         let mut pins = Vec::with_capacity(files.len());
         for (file, (name, sha256, size)) in files.into_iter().zip(specs) {

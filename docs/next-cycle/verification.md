@@ -1,5 +1,64 @@
 # Implementation verification
 
+## September 28: complete supported native npm contract
+
+All five ordinary workflows pass on `bd9d5068`: CI `36443830209`, native ARM
+`36443830065`, release validation `36443830848`, fuzz `36443830302` and benchmarks
+`36443830344`. Original macOS output confirms the corrected script-analysis
+regression. The actual CI merge is `55403c7c`: all 662 captured source inputs
+match the branch except main's daily test-included ThreatDB manifest. This
+checkpoint precedes the platform-gate promotion described below.
+
+[Run 36447327426](https://github.com/sheeki03/tirith/actions/runs/36447327426)
+passes all seven contract cases using the exact retained `24048758` fixture
+binaries from native build `36444393465`. Four coordinator cases cover success,
+cancellation before effects, private unwind and published unwind. These unwinds
+occur after authenticated child completion, not during live process execution.
+The literal import-free lifecycle hook throws if executed; exact successful
+installation proves its suppression. The implicit native-build fixture instead
+refuses with `AnalysisIncomplete` before transaction, target or operation-state
+effects. It is not counted as a successful install or implicit-script suppression.
+
+The actual public CLI completes plan, reviewed JSON apply, historical status and
+identical-retry refusal. Independent snapshots verify the exact canonical
+members/directories and hidden-lock schema/integrity, with unchanged installed
+tree and operation records across status/retry. Dynamic descriptor binding is
+the product verifier's observation; no separate kernel trace is claimed.
+
+The original artifact is `10982105336`, ZIP SHA-256
+`334938c6641ebd2c0e759e1ec584d98973de5f357486bdd66004206d32b9c4b2`. All original member hashes, raw/stage streams, source,
+runtime/ELF postchecks and owned-child/container cleanup are verified. Independent
+review SHA-256: `c58d8cd2b81c23c2d410e9ec5fe60bcc5359968333177503913cd9153f49475a`.
+Both source variants retain their sole explicit fixture-public-key difference;
+the normal production-key build refuses the signed fixture. Production trust is
+unchanged, and production feed availability is not established by these tests.
+
+The compiler run uses Rust 1.98.1 and the pinned Node 26.7.0/npm 11.19.0
+runtime on native AArch64. It passes strict Clippy, normal-key rejection and one
+human-output apply, then removes all four owned containers. The retained suite
+performs no compilation, runs as UID 65534 with no capabilities or network, and
+verifies cleanup of 192 owned children and its one container. Its measured
+memory peak is 1,482,534,912 bytes, with no memory-limit or OOM events.
+
+| Original build input/output | SHA-256 |
+| --- | --- |
+| Source manifest | `54899e96a466099d7c9ae009f957ec777c4b92629ae03adc4f988f0eef29f6e7` |
+| Compiler artifact ZIP | `d56f54ce93ea0ec8ab5d21961483916e1c25c87170212f6fc62b1ff15241a81c` |
+| Fixture public key | `0aa54a88aec2a8e704b67ebc1658dd149a88eb5af24f5c6e90ac00b52dadd519` |
+| Fixture signed feed | `56cf609ce14d1d0738d8ce6491397bb1408b920e3fa2c61509a4bf2c41ed54e9` |
+| normal launcher | `155f99563f0a705cfa2eba3e464ccb7ea6d16761c3c6ee41e14f1889224c58e6` |
+| normal libtest | `30839f29ccb472928ae72c14e22f455c0cfe12762e0bd884fa71410e3ea744f4` |
+| fixture launcher | `d05bf89c191b46c633f619cff92373f48dacc4c71e2f700cb39ea08f42474d67` |
+| fixture libtest | `fd8e20a30c459809edd9463123a5d55f3ca5a52a3f9e251892afc69cbf06231e` |
+
+The integration promotion uses the six reviewed qualification/test files from
+`24048758`. Two subsequent reporting corrections derive a lower-layer test's
+platform-gate flag and label missing pinned inputs `InputUnavailable`; neither
+widens execution authority. Only GNU Linux AArch64 passes the platform gate.
+All ordinary source/tool/task/confinement checks remain mandatory, and the
+published v1 feed still cannot admit the route. Final integration CI and official
+release acceptance remain distinct from the recorded native fixture evidence.
+
 ## September 28: native publication succeeds; script fixtures need correction
 
 All five original workflows pass on `caafefc8`: CI `36434532398`, native ARM

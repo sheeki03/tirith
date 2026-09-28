@@ -634,7 +634,14 @@ policy_complete = true
 name = "pkg install"
 group = "Package firewall"
 inspected = "none"
-coverage = "Package execution is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation is unavailable."
+coverage = "This legacy package-execution route is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation through this route is unavailable. Local leaf npm installation has a separate contract."
+policy_complete = true
+
+[[command]]
+name = "pkg install-npm"
+group = "Package firewall"
+inspected = "full"
+coverage = "Review and install exact local leaf npm tarballs into a new dedicated target; no dependency resolution or script execution. Qualified only on little-endian 64-bit GNU Linux AArch64 with pinned Node/npm/runtime files, complete native containment, fresh policy/task authority and a current production-signed ThreatDB v2. The published v1 feed is insufficient. Incomplete analysis and implicit native builds refuse before transaction effects. Status is historical; recovery only reconfirms an unchanged published tree and never replays npm. General pkg install remains disabled."
 policy_complete = true
 
 [[command]]

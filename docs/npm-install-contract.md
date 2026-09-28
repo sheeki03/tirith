@@ -1,10 +1,13 @@
 # LocalLeafNoScriptsV1 installation contract
 
-Status: the bounded WP26 implementation is registered for review and tracking.
-Native execution remains disabled on every host until the complete launch,
-publication and recovery route passes qualification. Inspection, comparison and
-saved review records do not authorize installation. Administrator access and
-confirmation flags do not enable the route.
+Status: native execution is qualified for little-endian, 64-bit GNU Linux
+AArch64 under this narrow contract. It requires the exact retained Node 26.7.0,
+npm 11.19.0 and runtime files, all required native controls, a current
+production-signed ThreatDB v2 and fresh policy/task authorization. The currently
+published v1 feed is insufficient, so ordinary installations still refuse until
+the signed v2 prerequisite is available. Elevation or confirmation flags cannot
+supply missing prerequisites. Native evidence and its test-authority scope are
+recorded in [verification](next-cycle/verification.md).
 
 ## Command lifecycle
 
@@ -12,8 +15,9 @@ On Linux, `tirith pkg install-npm plan ARCHIVE... --target NEW_DIRECTORY`
 reinspects exact local archives and records an immutable review intent. Its
 output identifies the operation and the digest to review. `status OPERATION`
 reads historical observations. `apply OPERATION --reviewed DIGEST` requires that
-exact review and recaptures current inputs, policy and task authority; it
-currently refuses at the native qualification gate before recording a start.
+exact review and recaptures current inputs, policy and task authority. The
+platform gate refuses unsupported hosts before recording a start; the qualified
+platform must still pass every current source, tool, task and confinement check.
 
 The review digest commits to the entire intent, including private policy inputs,
 working directory and retained archive generations. A private random nonce
@@ -70,8 +74,8 @@ the retained artifact bytes under the current effective policy. It refuses
 missing or stale threat data, incomplete analysis and any decision other than
 Allow. A caller-supplied threat generation or inspection report cannot substitute
 for that decision. The plan retains the source handles and private decision
-commitment and revalidates them before staging or other effects. This closes the
-preparation authority gap; it does not enable the contained install launcher.
+commitment and revalidates them before staging or other effects. Platform
+qualification never substitutes for this current preparation authority.
 
 The source must be a current, production-signed ThreatDB v2 with artifact-hash
 coverage. A valid v1 signature alone cannot provide that coverage. The published
@@ -131,8 +135,9 @@ offline mode, ignored scripts, no audit/fund/update checks, disabled bin links,
 no root lockfile/save mutation, and an explicit transaction target. Their
 complete interaction is bound to Node 26.7.0 and npm 11.19.0, including the entire
 hidden lockfile and physical target path used in its package keys. Native stock
-npm characterization has passed for the sealed bootstrap, but the full Tirith
-launch and output-verification transaction still needs native acceptance.
+npm characterization and the integrated Tirith launch, verification,
+publication, recovery and CLI retry controls pass on the recorded native fixture
+builds. The production feed and final release artifacts remain separate gates.
 
 ## Verification and recovery
 
@@ -181,24 +186,26 @@ normal production-key build before transaction effects.
 
 Results must identify the source difference, compiled key, signed feed, tool
 closure and executable hashes. Test-authority results establish the exercised
-native mechanics; they do not establish production-feed adoption, public CLI
-admission or enabled installation. Controlled unwinding after child completion
-must be distinguished from process death during execution. The execution gate
-remains closed until the supported contract's complete acceptance evidence is
-reviewed.
+native and CLI mechanics under that named authority. They do not establish
+production-feed availability or adoption. Controlled unwinding after child
+completion is distinct from process death during execution. The reviewed native
+contract permits its narrow platform gate; every ordinary operation retains the
+production signature, completeness and current-authority requirements.
 
 - Real supported npm/Node version and complete argv/output characterization.
 - Artifact replacement, tool/config/policy drift and changed destination refusal.
 - Dependency/peer/optional/bundled/workspace substitution refusal.
-- Lifecycle and implicit native-build sentinel scripts never execute.
+- A literal lifecycle hook that throws if executed is suppressed while exact
+  installation succeeds; unresolved implicit native builds refuse preparation
+  before transaction, target or operation-state effects.
 - Native denial of network access and writes outside the transaction tree.
 - Post-install member verification and unexpected-file/link detection.
 - Child failure, cancellation, interruption, identical retry, publication race
   and cleanup under replaced directories.
 
-The available Docker server uses an aarch64 Linux 6.12.76 kernel. A separate WP27
-native aarch64 Landlock/seccomp backend has passed its separate primitive and
-launcher checks, but that does not qualify this npm transaction. Existing
-package execution remains disabled. An emulated x86_64 process on an ARM kernel
-is not evidence of native x86_64 seccomp enforcement. The complete native npm
-contract must pass before this execution capability is enabled.
+The selected contract is GNU Linux AArch64 only. Other ABIs and architectures
+remain refused, even when a separate capsule backend is qualified. General
+`tirith pkg install` npm/Python execution remains disabled. An emulated x86_64
+process on an ARM kernel is not evidence of native x86_64 enforcement. The
+recorded fixture builds do not change the production verification key or qualify
+unresolved dependency graphs, implicit native builds or arbitrary scripts.

@@ -8,8 +8,10 @@ The `2d723b0f` correction changes the Windows process query. Subsequent fixes co
 Windows snapshot/writer coordination, lifecycle pipe framing/failure reporting
 and the Linux protected-exec prerequisite. All five ordinary workflows now
 pass at both checkpoints, including the corrected Windows native paths. Actual
-Linux service-worker composition now passes at `83468789`; integrated npm
-execution remains open.
+Linux service-worker composition passes at `83468789`. The later corrected
+npm source at `bd9d5068`, with the isolated qualified platform gate in
+`24048758`, passes the complete supported native transaction/CLI contract as
+recorded in verification. Its production feed prerequisite remains open.
 
 All 660 retained ordinary `d0213a22` compiler inputs were compared with their
 Git blobs and `aa88c7ae`: 649 are unchanged, eleven differ, and the
@@ -45,7 +47,7 @@ their original checkpoint and are superseded by later applicable results.
 | A18: documentation and release use | Six routes and seventeen command smoke checks mapped; consented beginner pilot and final package/channel acceptance remain open |
 | A20, A21, A23: project/npm inspection and comparison | Bounded no-execution readers, corpus/fuzz, exact identities and CLI/browser evidence mapped for G2 review |
 | A24: task modelling and optional team server | Conservative effects and 35 actual HTTPS/browser cases mapped; publication does not prove fleet adoption |
-| A26: npm installation and selected ARM backend | GNU/musl backend qualified on the recorded canonical PR archives; integrated npm execution remains unqualified and its gate remains closed |
+| A26: npm installation and selected ARM backend | GNU/musl backend qualified on the recorded canonical PR archives. The narrow GNU Linux AArch64 npm contract passes exact installation, cancellation, post-completion unwinds, lifecycle suppression, implicit-build refusal and public CLI history/retry checks with an explicitly isolated key. Ordinary use still requires production-signed v2 data; general npm/Python execution stays disabled |
 
 The six [everyday routes](user-journeys.md) have concrete observed components:
 recommended terminal setup/fresh activation, actual agent hook/reload behavior,

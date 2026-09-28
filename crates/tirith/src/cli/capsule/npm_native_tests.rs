@@ -279,7 +279,18 @@ fn genuine_signed_v2_native_leaf_completes_with_exact_output() {
         &policy,
     )
     .unwrap();
-    // This lower-layer qualification never enables the user-facing route.
+    // This lower-layer control does not qualify additional native targets.
+    #[cfg(all(
+        target_env = "gnu",
+        target_endian = "little",
+        target_pointer_width = "64"
+    ))]
+    assert_eq!(plan.execution_qualification(), Ok(()));
+    #[cfg(not(all(
+        target_env = "gnu",
+        target_endian = "little",
+        target_pointer_width = "64"
+    )))]
     assert!(matches!(
         plan.execution_qualification(),
         Err(NpmInstallRefusal::NativeExecutionUnqualified)
@@ -367,7 +378,7 @@ fn genuine_signed_v2_native_leaf_completes_with_exact_output() {
             "native_completion_proof": true,
             "exact_installed_tree_verified": true,
             "publication_attempted": false,
-            "user_facing_execution_qualification_enabled": false,
+            "user_facing_execution_qualification_enabled": plan.execution_qualification().is_ok(),
             "ongoing_immutability": false,
         })
     );

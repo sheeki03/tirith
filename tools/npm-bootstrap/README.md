@@ -45,9 +45,10 @@ change must update that regression and requalify the affected native boundary.
 | `project-config.cjs` | Supply verified-empty content for the one exact project `.npmrc` read |
 | `entry.cjs` | Fixed runtime/argv/VFS startup and stock npm CLI entry |
 
-The binding record accepts one to eight statically reviewed local script-free
-leaf packages, distinct descriptors 3..255, at most 32MiB per archive and 64MiB
-in total, and retained target/cache directory identities. It accepts no caller
+The binding record accepts one to eight statically reviewed local
+leaf packages with lifecycle execution disabled, distinct descriptors 3..255,
+at most 32MiB per archive and 64MiB in total, and retained target/cache directory
+identities. It accepts no caller
 argv or external fetch source. The empty user and global config descriptors are
 distinct. The SHA512 used by npm comes from the retained artifact bytes.
 
