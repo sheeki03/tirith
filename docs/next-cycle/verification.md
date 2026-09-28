@@ -1,5 +1,110 @@
 # Implementation verification
 
+## September 28: retained-daemon grant expiry and revocation
+
+One ordinary `d0213a22` macOS ARM daemon retains its exact PID, socket and PID-file
+identities through baseline block, real one-minute grant allow, natural-expiry
+block, same-UUID renewal allow and revocation block. All commands are analyzed
+in an isolated offline fixture; the command string is never executed. The
+production-signed database, exact URL/rule scope and private policy stay fixed.
+An independent ordinary `check --no-daemon` also blocks after expiry.
+
+The real-time wait records 117 unchanged grant-file generations and hashes;
+maximum wall/monotonic divergence is 55.8 microseconds. No clock, file expiry or
+cache state is injected. Eleven authenticated requests use the same daemon.
+All seven owned children have confirmed cleanup, the daemon exits gracefully,
+and its socket, PID file and private fixture are removed. Input postchecks and
+independent readback pass. Total elapsed time is 61.77 seconds.
+
+Report SHA-256:
+`bd9004a94b168dcef6b669b08a745ccd013edeb5f087cbb43e58a7a4aa7c9326`.
+Independent review SHA-256:
+`368f3f821aaeee244983b8b301725f4350de3eca8785d556066613debb353995`.
+This closes the planned retained-daemon expiry/revocation acceptance for these
+ordinary bytes. It does not imply a new latency threshold or a cache redesign.
+
+## September 28: retained Claude across numeric replacement
+
+The original ordinary macOS ARM products and test controller described below
+pass one actual Claude 2.1.283 composition across 0.4.2 → 0.4.3 → 0.4.2.
+Recommended setup runs through the product; its generated policy is preserved
+verbatim beneath an explicit schema-2 enforced restriction on untrusted
+resource escalation. Actual CLI policy validation passes before publication.
+This stronger policy belongs to this composition; the four earlier lifecycle
+cases retain their original mode-only fixture policy and identities.
+
+One retained host spans both replacements. Fresh hosts start after update and
+rollback. All ten fixed allow/block tool turns have matching hook events,
+results and once/never marker effects. Both durable publication records are
+completed and published; configuration and input pins remain unchanged.
+All 41 owned children and three loopback providers are cleaned up. The run uses
+23 provider requests and completes in 53.48 seconds. Independent postchecks
+rehash 157 retained files and all three 660-file compiler closures.
+
+Result SHA-256:
+`3e33d2ee4f4c83bc1d4fd0bf8b02693caef579234c621d62f4b591ff20c12087`.
+Independent readback SHA-256:
+`8bafbee67b4cc22a33b759cb6213972402d2d6eea3c5042b23f18de74db9d490`.
+This observes the already-configured host across actual binary replacement;
+it does not promise hot reload of newly installed hooks, expose a Claude
+loaded-Tirith-version field, or qualify the production worker/download path.
+The local provider supplies deterministic tool requests, not remote-model latency.
+
+## September 28: real ThreatDB discovery and cold-client acquisition
+
+The unchanged ordinary `d0213a22` macOS ARM 0.4.2 image runs `threat-db update`
+with empty private data and state caches and a finite environment containing no
+caller credentials. It installs production-signed format-v1 sequence
+1790503422402, 242,343 entries, SHA-256
+`47b867e2b686ce68d38402622fcd27fc54854115743b860a8bc1799c8db48112`.
+A fresh ordinary `health --json` verifies the installed signature and sequence.
+The independent publication verifier downloads both real primary and fallback
+discovery documents and their referenced database, validates signatures and
+hashes, and agrees with the actual installed bytes.
+
+The run completes in 5.02 seconds; all three registered process groups have
+confirmed cleanup, nine retained private files rehash correctly, and all input
+pins remain unchanged. Result SHA-256:
+`fa82302fa68a6e3e6dc24afbc5e1dc1b47b95a3a93a816aab7e2776731c0eccf`.
+Independent publication result SHA-256:
+`f3d214f1e924627f6fbcdf9c5e8f66a202c63e37a02403ec6b732ca4c1d5eb80`.
+
+The source-integrity sidecar returns HTTP 404 for this legacy generation.
+The product correctly retains the verified database and reports source evidence
+unavailable, with no fabricated source ages. This closes real format-v1
+acquisition/interoperability on these bytes. Signed v2/source-provenance
+publication and actual publisher concurrency, partial upload and later-failure
+recovery remain distinct operational acceptance; no remote state was changed.
+
+## September 28: Windows PowerShell startup correction
+
+Two bounded Windows diagnostic runs isolate the previous PowerShell 5.1
+failure: the canonical device-path spelling fails startup, automatic module
+discovery hangs at `ConvertTo-Json`, and an entirely empty environment lacks the
+native Windows system directory. The fixed-field module-free query passes with
+only OS-derived `SystemRoot`, for both PowerShell 5.1 and 7. Every diagnostic
+child has confirmed native cleanup and personal profiles stay unchanged.
+
+The product correction holds the admitted executable, verifies its bytes and
+file identity before choosing an equivalent DOS path, and checks image/cwd
+identity at both native process creation boundaries. Namespace-sensitive and
+long paths retain their original spelling. Current-directory handles use
+attributes-only access; pre-launch checks detect renamed paths rather than
+claiming those handles prevent every ancestor rename. The existing owner/ACL
+trust contract remains required. Parent/grandparent rename controls cover that
+boundary without claiming atomic protection of every ancestor or drive mapping.
+
+PowerShell version/startup observations opt into OS-derived `SystemRoot`.
+The native profile query uses bounded fixed Base64 fields without module
+autoloading. Startup observation imports the selected installation's built-in
+CIM module explicitly. Poisoned module-path, malformed-field, file-identity,
+handle-sharing and native startup controls accompany the correction.
+The local shell-target selection passes eight tests, with the explicit native
+PowerShell case correctly ignored outside its controlled driver. Formatting,
+strict workspace/all-target Clippy, thirteen runtime-copy controls and eight
+retained-daemon producer controls pass. Ordinary Windows/Linux CI must qualify the actual product changes;
+diagnostic success alone is not product qualification.
+
 ## September 28: matched standalone and daemon workloads
 
 The ordinary macOS ARM 0.4.2 release image from the `d0213a22` compiler closure,

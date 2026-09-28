@@ -173,3 +173,21 @@ rechecked every route and cleanup result. Qualification summary SHA-256:
 This closes current PR-package hook recertification for the recorded tuple.
 Numeric binary replacement, the beginner pilot and official release acceptance
 remain separate requirements.
+
+### Numeric replacement with an existing configured host
+
+The ordinary `d0213a22` 0.4.2 product and its exact isolated Cargo-version-only
+0.4.3 variant pass actual retained/fresh Claude behavior across update and
+rollback. All ten tool turns pass; one host stays alive across both swaps and
+fresh hosts verify each resulting installation. Forty-one owned child cleanup
+records and 23 loopback-provider requests are retained. The setup-generated
+configuration, exact valid enforced policy, three compiler closures and 157
+retained evidence files pass postchecks. Result SHA-256:
+`3e33d2ee4f4c83bc1d4fd0bf8b02693caef579234c621d62f4b591ff20c12087`.
+
+These public-fixture-key replacements exercise the actual verifier and
+publication mechanics. They do not certify official release authority or the
+service-to-worker handoff. Existing hooks following the replaced executable
+are distinct from hot reload of newly added hook configuration; the latter
+continues to require a fresh host. No loaded-Tirith-version field or remote
+model latency is inferred from the host observations.

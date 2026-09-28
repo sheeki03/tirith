@@ -303,7 +303,7 @@ pub(crate) fn inspect_current() -> Result<ShellTarget, String> {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "$PSVersionTable.PSVersion.ToString()",
+                    "$PSModuleAutoloadingPreference='None';[Console]::Out.Write($PSVersionTable.PSVersion.ToString())",
                 ]
             } else {
                 vec!["--version"]
@@ -312,6 +312,15 @@ pub(crate) fn inspect_current() -> Result<ShellTarget, String> {
                 args,
                 ChildLimits::new(std::time::Duration::from_secs(2), 4096, 4096),
             );
+            #[cfg(windows)]
+            let spec = if matches!(target.shell.as_str(), "powershell" | "pwsh") {
+                match spec.with_windows_system_root() {
+                    Ok(spec) => spec,
+                    Err(_) => return Ok(target),
+                }
+            } else {
+                spec
+            };
             if let ChildOutcome::Completed { status, stdout, .. } =
                 tirith_core::trusted_child::run(&executable, &spec)
             {
@@ -345,17 +354,15 @@ fn qualify_startup(target: &mut ShellTarget) {
 }
 
 #[cfg(windows)]
-fn observe_windows_startup(
-    target: &mut ShellTarget,
+fn windows_process_command_line(
+    pid: u32,
     executable: &tirith_core::trusted_child::TrustedExecutable,
-) {
+) -> Option<String> {
     use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec};
-    let Some(pid) = target.process_id else {
-        return;
-    };
-    // Query only the already-observed ancestor. Its command line is kept
-    // private, parsed for startup switches, then discarded.
-    let script = format!("$p = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)");
+    // Never discover a module by name through reconstructed user/project
+    // PSModulePath entries. Import the built-in manifest from the selected
+    // interpreter installation and keep automatic module loading disabled.
+    let script = format!("$PSModuleAutoloadingPreference='None';$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);Import-Module ([IO.Path]::Combine($PSHOME,'Modules','CimCmdlets','CimCmdlets.psd1')) -ErrorAction Stop;$p=CimCmdlets\\Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction Stop;if($null -eq $p -or $p.ProcessId -ne {pid}){{throw 'Observed process unavailable'}};[Console]::Out.Write($p.CommandLine)");
     let spec = ChildSpec::new(
         [
             "-NoLogo",
@@ -365,16 +372,31 @@ fn observe_windows_startup(
             &script,
         ],
         ChildLimits::new(std::time::Duration::from_secs(2), 16 * 1024, 1024),
-    );
+    )
+    .with_windows_system_root()
+    .ok()?;
     let ChildOutcome::Completed { status, stdout, .. } =
         tirith_core::trusted_child::run(executable, &spec)
     else {
-        return;
+        return None;
     };
     if !status.success() {
-        return;
+        return None;
     }
-    let Ok(command) = String::from_utf8(stdout) else {
+    String::from_utf8(stdout)
+        .ok()
+        .filter(|command| !command.is_empty())
+}
+
+#[cfg(windows)]
+fn observe_windows_startup(
+    target: &mut ShellTarget,
+    executable: &tirith_core::trusted_child::TrustedExecutable,
+) {
+    let Some(pid) = target.process_id else { return };
+    // Query only the already-observed ancestor. Its command line is kept
+    // private, parsed for startup switches, then discarded.
+    let Some(command) = windows_process_command_line(pid, executable) else {
         return;
     };
     let encoded: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();

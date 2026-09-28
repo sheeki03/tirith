@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec, TrustedExecutable};
 
-const QUERY: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Out.Write(([ordered]@{profile=[string]$PROFILE;current_user_current_host=[string]$PROFILE.CurrentUserCurrentHost;documents=[Environment]::GetFolderPath('MyDocuments');home=[string]$HOME;version=$PSVersionTable.PSVersion.ToString();major=$PSVersionTable.PSVersion.Major;minor=$PSVersionTable.PSVersion.Minor;edition=[string]$PSVersionTable.PSEdition;host_name=$Host.Name;executable=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName;xdg=$env:XDG_CONFIG_HOME}|ConvertTo-Json -Compress))"#;
+const QUERY: &str = r#"$PSModuleAutoloadingPreference='None';$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$observation=[ordered]@{profile=[string]$PROFILE;current_user_current_host=[string]$PROFILE.CurrentUserCurrentHost;documents=[Environment]::GetFolderPath('MyDocuments');home=[string]$HOME;version=$PSVersionTable.PSVersion.ToString();major=$PSVersionTable.PSVersion.Major;minor=$PSVersionTable.PSVersion.Minor;edition=[string]$PSVersionTable.PSEdition;host_name=$Host.Name;executable=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName;xdg=$env:XDG_CONFIG_HOME};[Console]::Out.WriteLine('TIRITH_FIELDS_V1');foreach($key in $observation.Keys){[Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$observation[$key])))}"#;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +21,49 @@ struct NativeProfile {
     host_name: String,
     executable: PathBuf,
     xdg: Option<String>,
+}
+
+// Fixed fields avoid cmdlet discovery, which can reconstruct user module paths
+// even after PSModulePath is removed from the child's environment.
+fn parse_native_profile(stdout: &[u8]) -> Result<NativeProfile, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    if stdout.len() > 32 * 1024 {
+        return Err("native profile output exceeds bound".into());
+    }
+    let text = std::str::from_utf8(stdout)
+        .map_err(|e| e.to_string())?
+        .replace("\r\n", "\n");
+    let body = text
+        .strip_suffix('\n')
+        .ok_or("missing native profile terminator")?;
+    let mut lines = body.split('\n');
+    if lines.next() != Some("TIRITH_FIELDS_V1") {
+        return Err("native profile header differs".into());
+    }
+    let fields = lines
+        .map(|line| {
+            let bytes = STANDARD.decode(line).map_err(|e| e.to_string())?;
+            String::from_utf8(bytes).map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let [profile, current, documents, home, version, major, minor, edition, host_name, executable, xdg] =
+        fields.as_slice()
+    else {
+        return Err("native profile field count differs".into());
+    };
+    Ok(NativeProfile {
+        profile: profile.into(),
+        current_user_current_host: current.into(),
+        documents: documents.into(),
+        home: home.into(),
+        version: version.clone(),
+        major: major.parse::<u32>().map_err(|e| e.to_string())?,
+        minor: minor.parse::<u32>().map_err(|e| e.to_string())?,
+        edition: edition.clone(),
+        host_name: host_name.clone(),
+        executable: executable.into(),
+        xdg: (!xdg.is_empty()).then(|| xdg.clone()),
+    })
 }
 
 fn require(value: bool, reason: &str) -> Result<(), String> {
@@ -181,6 +224,16 @@ fn native_powershell_profile_matches_resolver() {
         report["native_executable"] =
             serde_json::json!({"path": executable.path(), "sha256": expected});
         report["profile_before"] = before.clone();
+        let module_control = tempfile::Builder::new()
+            .prefix("native-module-control-")
+            .tempdir_in(output.parent().ok_or("missing report parent")?)
+            .map_err(|e| e.to_string())?;
+        let poison_module = module_control.path().join("Microsoft.PowerShell.Utility");
+        std::fs::create_dir(&poison_module).map_err(|e| e.to_string())?;
+        let module_marker = module_control.path().join("autoload-executed");
+        std::fs::write(poison_module.join("Microsoft.PowerShell.Utility.psm1"),
+            "[IO.File]::WriteAllText($env:TIRITH_NATIVE_MODULE_CONTROL,'executed');throw 'Native profile query loaded a user module'")
+            .map_err(|e| e.to_string())?;
         let spec = ChildSpec::new(
             [
                 "-NoLogo",
@@ -207,18 +260,25 @@ fn native_powershell_profile_matches_resolver() {
             "LANG",
             "LC_ALL",
         ])
+        .env("PSModulePath", module_control.path())
+        .env("TIRITH_NATIVE_MODULE_CONTROL", &module_marker)
         .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
         .env("POWERSHELL_UPDATECHECK", "Off")
         .env(
             "PSModuleAnalysisCachePath",
             output.with_extension("module-cache"),
         );
+        #[cfg(windows)]
+        let spec = spec.with_windows_system_root()?;
         // Windows deliberately chooses the trusted executable directory rather
         // than accepting a caller-controlled DLL search directory.
         #[cfg(unix)]
         let spec = spec.cwd(output.parent().ok_or("missing output parent")?);
         let outcome = tirith_core::trusted_child::run(&executable, &spec);
         let after = profile_state(profile)?;
+        let module_untouched = !module_marker.try_exists().map_err(|e| e.to_string())?;
+        report["poisoned_user_module_not_loaded"] = serde_json::json!(module_untouched);
+        require(module_untouched, "profile observation loaded a user module")?;
         report["profile_after"] = after.clone();
         report["profile_unchanged"] = serde_json::json!(before == after);
         let stdout = match outcome {
@@ -239,7 +299,7 @@ fn native_powershell_profile_matches_resolver() {
                 return Err("native PowerShell query did not complete with proven cleanup".into());
             }
         };
-        let observed: NativeProfile = serde_json::from_slice(&stdout).map_err(|e| e.to_string())?;
+        let observed = parse_native_profile(&stdout)?;
         report["observed"] = serde_json::to_value(&observed).map_err(|e| e.to_string())?;
         validate_observation(&shell, &target, inputs.documents.as_deref(), &observed)?;
         require(
@@ -256,6 +316,21 @@ fn native_powershell_profile_matches_resolver() {
                 == inputs.xdg_config,
             "native XDG environment differs",
         )?;
+        #[cfg(windows)]
+        {
+            let command = windows_process_command_line(std::process::id(), &executable)
+                .ok_or("native ancestor command-line observation failed")?;
+            require(
+                command.contains("native_powershell_profile_matches_resolver"),
+                "native process query did not identify the running target test",
+            )?;
+            report["startup_observation"] = serde_json::json!({
+                "passed": true, "queried_own_test_pid": std::process::id(),
+                "command_line_bytes": command.len(),
+                "command_line_sha256": format!("{:x}", Sha256::digest(command.as_bytes())),
+                "raw_command_line_retained": false
+            });
+        }
         executable.revalidate().map_err(|e| e.to_string())?;
         require(
             hash_file(&path, 256 * 1024 * 1024)? == expected && before == after,
@@ -337,4 +412,57 @@ fn profile_and_version_mismatches_are_not_native_success() {
     .is_err());
     observed.home = "/other/operator".into();
     assert!(validate_observation("pwsh", &target, None, &observed).is_err());
+}
+
+#[test]
+fn fixed_native_profile_wire_preserves_values_and_rejects_bad_frames() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let fields = [
+        "C:\\user é\\profile\nquoted\".ps1",
+        "profile",
+        "documents",
+        "home",
+        "5.1.2.3",
+        "5",
+        "1",
+        "Desktop",
+        "ConsoleHost",
+        "powershell.exe",
+        "",
+    ];
+    let encode = |values: &[&str]| {
+        format!(
+            "TIRITH_FIELDS_V1\r\n{}\r\n",
+            values
+                .iter()
+                .map(|value| STANDARD.encode(value))
+                .collect::<Vec<_>>()
+                .join("\r\n")
+        )
+    };
+    let wire = encode(&fields);
+    let observed = parse_native_profile(wire.as_bytes()).unwrap();
+    assert_eq!(observed.profile, PathBuf::from(fields[0]));
+    assert_eq!((observed.major, observed.minor), (5, 1));
+    assert_eq!(observed.xdg, None);
+    assert!(parse_native_profile(encode(&fields[..10]).as_bytes()).is_err());
+    assert!(parse_native_profile(format!("{wire}unexpected\n").as_bytes()).is_err());
+    assert!(parse_native_profile(wire.trim_end().as_bytes()).is_err());
+    assert!(
+        parse_native_profile(wire.replacen("TIRITH_FIELDS_V1", "unknown", 1).as_bytes()).is_err()
+    );
+    assert!(parse_native_profile(
+        wire.replacen(&STANDARD.encode(fields[0]), "!", 1)
+            .as_bytes()
+    )
+    .is_err());
+    assert!(parse_native_profile(
+        wire.replacen(&STANDARD.encode(fields[0]), "/w==", 1)
+            .as_bytes()
+    )
+    .is_err());
+    let mut invalid_major = fields;
+    invalid_major[5] = "five";
+    assert!(parse_native_profile(encode(&invalid_major).as_bytes()).is_err());
+    assert!(parse_native_profile(&vec![b'x'; 32 * 1024 + 1]).is_err());
 }

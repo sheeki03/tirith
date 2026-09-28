@@ -1915,6 +1915,27 @@ impl ChildSpec {
         self
     }
 
+    /// Supply the native Windows installation directory required by legacy
+    /// .NET children. This opt-in method never inherits ambient SystemRoot,
+    /// PATH, PSModulePath, or any other process environment entry.
+    #[cfg(windows)]
+    pub fn with_windows_system_root(self) -> Result<Self, String> {
+        use ::windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let mut buffer = vec![0_u16; 32 * 1024];
+        // SAFETY: the API writes at most the supplied slice length.
+        let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err("native Windows system directory unavailable or oversized".to_string());
+        }
+        let value = OsString::from_wide(&buffer[..length]);
+        if !Path::new(&value).is_absolute() || buffer[..length].contains(&0) {
+            return Err("native Windows system directory is not absolute".to_string());
+        }
+        Ok(self.env("SystemRoot", value))
+    }
+
     pub fn inherit_env(mut self, names: &[&str]) -> Self {
         for name in names {
             if let Some(value) = std::env::var_os(name) {
@@ -2014,11 +2035,6 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     if checked_timeout_deadline(spec.limits.timeout).is_none() {
         return timeout_deadline_overflow();
-    }
-    if let Err(error) = executable.revalidate() {
-        return ChildOutcome::SpawnError(format!(
-            "trusted executable failed pre-spawn revalidation: {error}"
-        ));
     }
     windows::run(executable, spec)
 }
