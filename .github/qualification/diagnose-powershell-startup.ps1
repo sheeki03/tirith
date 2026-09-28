@@ -64,17 +64,36 @@ try {
                 $environment=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
                 # ProcessRunner starts with inherited variables, so explicitly
                 # remove every entry before adding the same finite ChildSpec.
-                foreach ($key in [Environment]::GetEnvironmentVariables('Process').Keys) { $environment[[string]$key]=$null }
+                $ambient=[Environment]::GetEnvironmentVariables('Process')
+                $setter=$environment.GetType().GetProperty('Item')
+                foreach ($key in $ambient.Keys) {
+                    # PowerShell coerces a direct typed-index assignment of
+                    # $null to an empty string. PropertyInfo takes an object
+                    # value, preserving the null used by ProcessRunner.Remove.
+                    $setter.SetValue($environment,$null,[object[]]@([string]$key))
+                }
+                $expected=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
                 $keys=if ($envKind -ceq 'current') {@($baseKeys)} else {@()}
                 foreach ($key in $keys) {
                     $value=[Environment]::GetEnvironmentVariable($key,'Process')
-                    if ($null -ne $value) { $environment[$key]=$value }
+                    if ($null -ne $value) { $environment[$key]=$value; $expected[$key]=$value }
                 }
                 if ($envKind -ceq 'current') {
                     $environment['POWERSHELL_TELEMETRY_OPTOUT']='1'
                     $environment['POWERSHELL_UPDATECHECK']='Off'
                     $environment['PSModuleAnalysisCachePath']=Join-Path $dir 'module-cache'
+                    foreach ($key in @('POWERSHELL_TELEMETRY_OPTOUT','POWERSHELL_UPDATECHECK','PSModuleAnalysisCachePath')) { $expected[$key]=$environment[$key] }
                 }
+                foreach ($key in $ambient.Keys) {
+                    if (-not $expected.ContainsKey([string]$key) -and $null -ne $environment[[string]$key]) { throw 'Ambient environment entry was not removed with actual null' }
+                }
+                $surviving=@($environment.Keys | Where-Object {$null -ne $environment[$_]})
+                if ($surviving.Count -ne $expected.Count) { throw 'Finite environment key count differs' }
+                foreach ($key in $surviving) {
+                    if (-not $expected.ContainsKey($key) -or $environment[$key] -cne $expected[$key]) { throw 'Finite environment key or value differs' }
+                }
+                if ($envKind -ceq 'empty' -and $surviving.Count -ne 0) { throw 'Empty environment retained an entry' }
+                $case.environment_exactly_admitted=$true
                 $case.environment_names=@($environment.Keys | Where-Object {$null -ne $environment[$_]} | Sort-Object)
                 $application=if ($pathKind -ceq 'canonical') {'\\?\'+$pin.path} else {$pin.path}
                 $cwd=[IO.Path]::GetDirectoryName($pin.path)

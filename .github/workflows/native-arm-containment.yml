@@ -18,7 +18,7 @@ jobs:
         shell: pwsh
         run: |
           $driver = Join-Path $PWD '.github/qualification/diagnose-powershell-startup.ps1'
-          if ((Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'd3aa9f172c0d8098fb2dc4d3464a84a9871410f13ce183f6c9b0963a818c3db7') { throw 'Diagnostic driver pin differs' }
+          if ((Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne 'a945cd77e67f16b7c2e20bc5af7d0ef8869ae56548510222060bc598699bcbfa') { throw 'Diagnostic driver pin differs' }
           & $driver -Workspace $PWD -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'powershell-startup-diagnostic')
       - name: Retain original startup observations
         if: always()
