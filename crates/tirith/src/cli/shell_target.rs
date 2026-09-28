@@ -359,10 +359,11 @@ fn windows_process_command_line(
     executable: &tirith_core::trusted_child::TrustedExecutable,
 ) -> Option<String> {
     use tirith_core::trusted_child::{ChildLimits, ChildOutcome, ChildSpec};
-    // Never discover a module by name through reconstructed user/project
-    // PSModulePath entries. Import the built-in manifest from the selected
-    // interpreter installation and keep automatic module loading disabled.
-    let script = format!("$PSModuleAutoloadingPreference='None';$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);Import-Module ([IO.Path]::Combine($PSHOME,'Modules','CimCmdlets','CimCmdlets.psd1')) -ErrorAction Stop;$p=CimCmdlets\\Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction Stop;if($null -eq $p -or $p.ProcessId -ne {pid}){{throw 'Observed process unavailable'}};[Console]::Out.Write($p.CommandLine)");
+    // Windows PowerShell's CimCmdlets manifest invokes Set-Alias, which needs
+    // another module. Its built-in WMI accelerator avoids module discovery.
+    // PowerShell 7 lacks that accelerator, so import its built-in CimCmdlets
+    // manifest by absolute path. Neither branch enables user module autoload.
+    let script = format!("$PSModuleAutoloadingPreference='None';$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);if($PSVersionTable.PSEdition -eq 'Desktop'){{$p=[wmi]\"Win32_Process.Handle='{pid}'\";$p.Get()}}else{{Import-Module ([IO.Path]::Combine($PSHOME,'Modules','CimCmdlets','CimCmdlets.psd1')) -ErrorAction Stop;$p=CimCmdlets\\Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = {pid}' -ErrorAction Stop}};if($null -eq $p -or [uint32]$p.ProcessId -ne {pid}){{throw 'Observed process unavailable'}};[Console]::Out.Write($p.CommandLine)");
     let spec = ChildSpec::new(
         [
             "-NoLogo",

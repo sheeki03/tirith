@@ -15,9 +15,28 @@ Both outer native jobs report reaped leaders, empty jobs, drained output and no
 leaked descendants. This is target resolution evidence, not interactive Windows
 interception certification.
 
-The same source passes native ARM GNU/musl containment, all fourteen fuzz jobs
-and both benchmark/resource jobs. Release and remaining CI checks were still
-running when this checkpoint was recorded; no overall CI pass is claimed.
+The same source passes Linux/macOS CI, native ARM GNU/musl containment, all
+fourteen fuzz jobs, both benchmark/resource jobs and the complete PR release
+workflow, including all six target builds, runtime/package checks and release
+compatibility validation. Main CI fails only the Windows resolver step and
+its dependent missing-evidence upload; skipped downstream Windows checks are
+not passes.
+
+A separate six-arm native diagnostic (`36391775036`, controller `088a610a`)
+isolates the 5.1 query failure. Its absolute built-in CIM module import invokes
+`Set-Alias`, unavailable with automatic module loading disabled. Both the two-
+and twenty-second arms fail with that error; increasing the deadline does not
+resolve it. The built-in `[wmi]` expression succeeds in both arms, and the
+PowerShell 7 CIM query succeeds. All three return identical command-line text
+length and hash for the same controller PID. Raw command lines are omitted.
+All six jobs finish with confirmed cleanup and unchanged profiles. Artifact
+`10956725744` ZIP SHA-256:
+`3babbd13c77e7f00545f65effcacdc3a3c16c08ccaa495536c31cf1193648c29`.
+These serial diagnostic arms may warm OS services and do not certify cold-start
+latency. The correction uses the built-in WMI expression for Desktop edition,
+keeps the absolute CIM import for Core edition, and retains the two-second
+deadline, native SystemRoot-only environment and disabled module autoloading.
+The ordinary native product check must still qualify the corrected source.
 
 ## September 28: repeated actual Claude adapter measurements
 
