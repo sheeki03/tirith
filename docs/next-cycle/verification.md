@@ -1,5 +1,65 @@
 # Implementation verification
 
+## September 28: stdio compatibility and bounded bootstrap diagnostics
+
+The correction permits only `ioctl(FIONBIO)` on standard descriptors 0–2 in the
+ordinary x86-64 and ARM filters and the derived ARM npm filter. Ordinary capsule
+supervisors also pipe their output, so the same compatibility fix applies there.
+No socket, general ioctl, arbitrary descriptor-mode change or scheduling query
+is added. Controls check full-width argument aliases, actual pipe flag changes,
+other-descriptor refusals and continued network/unsafe-control denial.
+
+The generated bootstrap sets refusal status 78 before a bounded raw stderr
+write, using only closed stage/code/name/reason labels. Its exception message,
+stack and input paths are not printed. Seven generator checks and all 128 pure
+JavaScript controls pass (56 bootstrap, 37 descriptor and 35 resolver cases).
+The generated bundle is SHA-256
+`70d34f769895fe1424473815c3032c6a48387684439f0efa6bb3b52aac8923dc`.
+Native filter execution and the integrated install remain to be checked on the
+corrected source.
+
+A separate local Node 26.7.0 setup-only probe loads the retained 1,926-file npm
+inventory into the real VFS and reaches argument binding and fetcher setup. It
+stops deliberately before the npm CLI entry. The corrected inert input fixture
+passes in 0.72 seconds with its child reaped and process group absent; an earlier
+probe with an incomplete mocked descriptor row is retained as a fixture failure.
+Native binding admission and Linux process metadata are mocked in this probe,
+so it does not certify containment or installation. The original synchronous
+failure on Linux remains unknown until the corrected native observation.
+
+## September 28: retained npm diagnostic isolates a stdio incompatibility
+
+[Diagnostic run 36425528542](https://github.com/sheeki03/tirith/actions/runs/36425528542)
+uses the exact retained `dc8cb195` fixture executables without rebuilding. One
+fresh public plan is followed by one human-output apply. The diagnostic workflow
+completes successfully, but the apply exits 1: publication is false, the installed
+tree and checkpoint journal are absent, and only the intent, started and finished
+operation records remain. This is a failed installation observation, not native
+installation acceptance.
+
+The forwarded stderr contains `Error: open EPERM` in Node 26.7.0's lazy stderr
+initialization, reached from the bootstrap's catch handler. Source tracing maps
+this to libuv's `ioctl(FIONBIO)` on the inherited pipe; the captured ARM filter
+denies that request. The `Socket` constructor in the stack adopts the existing
+pipe and does not establish that network socket creation is needed. See the
+[exact Node constructor](https://github.com/nodejs/node/blob/v26.7.0/lib/net.js#L636-L651),
+[pipe adoption](https://github.com/nodejs/node/blob/v26.7.0/deps/uv/src/unix/pipe.c#L195-L213)
+and [Linux nonblocking operation](https://github.com/nodejs/node/blob/v26.7.0/deps/uv/src/unix/core.c#L654-L665).
+This secondary reporting failure masks the original synchronous bootstrap
+exception. Repeated thread-scheduling query warnings do not establish the
+installation's fatal cause. The discarded earlier V7 output is not recovered.
+
+Independent readback rehashes all 310 original artifact members, 284 raw command
+streams and 22 stage streams. All 142 owned-child cleanups and exact-container
+removal/absence pass, as do runtime and final source/input checks. Observed peak
+memory is 925,388,800 bytes, with no OOM or maximum-counter event. Artifact
+`10971363105` ZIP SHA-256:
+`cf286315b1e0b825042ef697d89fca20475e274b0a3a02ff94cb9994f82a040d`.
+Independent readback SHA-256:
+`cdd07c9f108e928523615b47054b409fbf8d20cc6c88c1ec264f671136eb588a`.
+The production execution gate remains closed while the narrow stdio correction,
+original bootstrap cause and seven-case native suite remain under investigation.
+
 ## September 28: 83468789 ordinary checks pass
 
 All five ordinary PR workflows pass at `83468789`: [CI

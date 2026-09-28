@@ -539,7 +539,8 @@ const module = { exports: {} };
 
 // The bundler supplies these private modules as lexical values. No external
 // path, caller-supplied source, npm configuration or module fallback is loaded.
-function runSealedNpm (bindings, runtimePack, resolver, descriptorBridge, projectConfig) {
+function runSealedNpm (bindings, runtimePack, resolver, descriptorBridge, projectConfig, setStage) {
+  setStage('runtime');
   const fs = require('node:fs');
   const fsPromises = require('node:fs/promises');
   const moduleApi = require('node:module');
@@ -548,20 +549,29 @@ function runSealedNpm (bindings, runtimePack, resolver, descriptorBridge, projec
   if (process.version !== 'v26.7.0' || process.platform !== 'linux' || process.arch !== 'arm64') {
     throw new Error('unsupported sealed npm runtime');
   }
+  setStage('binding');
   const binding = bindings.readBinding(fs, process.argv);
+  setStage('inputs');
   const verified = bindings.verifyInputs(fs, binding);
+  setStage('pack');
   const entries = runtimePack.decodeRuntimePack(verified.pack);
   const root = '/tirith-runtime/npm';
+  setStage('resolver');
   const adapter = resolver.closedResolver(entries, root);
+  setStage('vfs-create');
   const memory = vfs.create({ emitExperimentalWarning: false });
+  setStage('vfs-populate');
   for (const row of entries) {
     const file = '/' + row.path;
     memory.mkdirSync(path.dirname(file), { recursive: true });
     memory.writeFileSync(file, row.bytes);
   }
+  setStage('vfs-readonly');
   memory.provider.setReadOnly();
+  setStage('vfs-mount');
   memory.mount(root);
   if (memory.readonly !== true) throw new Error('runtime is not read-only');
+  setStage('module-hooks');
   moduleApi.registerHooks({
     resolve (specifier, context, nextResolve) {
       if (moduleApi.isBuiltin(specifier)) return nextResolve(specifier, context);
@@ -577,14 +587,18 @@ function runSealedNpm (bindings, runtimePack, resolver, descriptorBridge, projec
   const cache = bindings.operand(binding.cache.fd);
   // Native code already verified both config descriptors are sealed empty
   // bytes. Distinct operands preserve npm's per-source uniqueness invariant.
+  setStage('project-config');
   projectConfig.bindEmptyProjectConfig(fsPromises, target);
   const entry = root + '/bin/npm-cli.js';
+  setStage('npm-argument');
   const req = moduleApi.createRequire(entry);
   const npaPath = req.resolve('npm-package-arg');
   const stockNpa = req('npm-package-arg');
+  setStage('descriptor-bridge');
   const bridge = descriptorBridge.descriptorBridge(stockNpa, verified.artifacts);
   if (req.cache[npaPath]?.exports !== stockNpa) throw new Error('npm argument module changed');
   req.cache[npaPath].exports = bridge.npa;
+  setStage('npm-fetcher');
   const fetcher = req('pacote/lib/fetcher.js');
   if (req.cache[req.resolve('pacote')] !== undefined) throw new Error('npm fetcher loaded before binding');
   fetcher.get = bridge.guardFetcher(fetcher.get);
@@ -597,6 +611,7 @@ function runSealedNpm (bindings, runtimePack, resolver, descriptorBridge, projec
     '--logs-max=0', '--loglevel=error', ...verified.artifacts.map(row => bindings.operand(row.fd))];
   // Stock npm owns normal config loading, command dispatch and exit behavior.
   // Native code independently verifies bytes, metadata and effect boundaries.
+  setStage('npm-entry');
   req(entry);
 }
 
@@ -604,9 +619,97 @@ module.exports = { runSealedNpm };
 
 return module.exports;
 })();
+let bootstrapStage = 'entry';
+let diagnosticWrite;
+try { diagnosticWrite = require('node:fs').writeSync; } catch { /* Refusal still runs. */ }
+const diagnosticDescriptor = Object.getOwnPropertyDescriptor;
+const diagnosticPrototype = Object.getPrototypeOf;
+const setBootstrapStage = stage => {
+  switch (stage) {
+    case 'runtime': case 'binding': case 'inputs': case 'pack': case 'resolver':
+    case 'vfs-create': case 'vfs-populate': case 'vfs-readonly': case 'vfs-mount':
+    case 'module-hooks': case 'project-config': case 'npm-argument':
+    case 'descriptor-bridge': case 'npm-fetcher': case 'npm-entry':
+      bootstrapStage = stage; break;
+    default: bootstrapStage = 'unknown';
+  }
+};
 try {
-  entry.runSealedNpm(bindings, runtimePack, resolver, descriptorBridge, projectConfig);
-} catch {
-  console.error('tirith: sealed npm bootstrap refused its bound inputs');
+  entry.runSealedNpm(bindings, runtimePack, resolver, descriptorBridge, projectConfig, setBootstrapStage);
+} catch (error) {
+  // Set refusal first: a closed/broken/nonblocking stderr must not replace it.
   process.exitCode = 78;
+  let code = 'UNKNOWN';
+  let name = 'Error';
+  let reason = 'unclassified';
+  try {
+    const ownCode = diagnosticDescriptor(error, 'code')?.value;
+    switch (ownCode) {
+      case 'EBOUNDINPUT': case 'EBOUNDRUNTIME': case 'EPERM': case 'EACCES': case 'EBADF': case 'ENOENT':
+      case 'EINVAL': case 'ENOSYS': case 'ENOMEM': case 'EIO': case 'ENOTDIR':
+      case 'EROFS': case 'EEXIST': case 'MODULE_NOT_FOUND':
+      case 'ERR_MODULE_NOT_FOUND': case 'ERR_INVALID_ARG_TYPE':
+      case 'ERR_INVALID_ARG_VALUE': case 'ERR_INVALID_URL':
+      case 'ERR_UNKNOWN_BUILTIN_MODULE': case 'ERR_ACCESS_DENIED':
+      case 'ERR_PACKAGE_IMPORT_NOT_DEFINED': case 'ERR_PACKAGE_PATH_NOT_EXPORTED':
+        code = ownCode;
+    }
+    const ownName = diagnosticDescriptor(error, 'name')?.value;
+    const errorName = ownName === undefined
+      ? diagnosticDescriptor(diagnosticPrototype(error), 'name')?.value : ownName;
+    switch (errorName) {
+      case 'Error': case 'TypeError': case 'RangeError': case 'SyntaxError':
+      case 'ReferenceError': case 'URIError': case 'EvalError': name = errorName;
+    }
+    const message = diagnosticDescriptor(error, 'message')?.value;
+    // Compare known source literals only; never copy a caught message or its
+    // path-bearing suffix into output, and never invoke an exception getter.
+    switch (message) {
+      case 'unsupported sealed npm runtime': reason = 'unsupported-runtime'; break;
+      case 'invalid sealed npm binding': reason = 'invalid-binding'; break;
+      case 'invalid sealed npm runtime pack': reason = 'invalid-runtime-pack'; break;
+      case 'runtime is not read-only': reason = 'readonly-check'; break;
+      case 'npm argument module changed': reason = 'argument-module-changed'; break;
+      case 'npm fetcher loaded before binding': reason = 'fetcher-loaded-early'; break;
+      case 'invalid bounded closure': reason = 'invalid-closure'; break;
+      case 'invalid closure entry': reason = 'invalid-closure-entry'; break;
+      case 'duplicate or colliding closure entry': case 'file/directory collision': reason = 'closure-collision'; break;
+      case 'closure hash mismatch': reason = 'closure-hash'; break;
+      case 'closure byte limit': case 'closure directory limit': reason = 'closure-limit'; break;
+      case 'invalid package metadata': reason = 'invalid-package-metadata'; break;
+      case 'module outside captured closure': case 'module URL outside captured closure': reason = 'module-outside-closure'; break;
+      case 'module parent is outside captured inventory': reason = 'module-parent-outside-inventory'; break;
+      case 'package main escapes captured closure': case 'package target escapes its package': reason = 'package-target-escape'; break;
+      case 'conditional export depth': reason = 'export-depth'; break;
+      case 'unsupported package target': case 'unsupported package target traversal':
+      case 'unsupported conditional export': case 'unsupported package target shape':
+      case 'unsupported package map': reason = 'unsupported-package-target'; break;
+      case 'package subpath is not exported': case 'package map has no captured target':
+      case 'unbound internal import': case 'disabled internal import': case 'disabled package export': reason = 'package-target-unavailable'; break;
+      case 'unsupported module URL': reason = 'unsupported-module-url'; break;
+      case 'invalid module specifier': case 'unsupported bare specifier': case 'invalid package name': reason = 'invalid-module-specifier'; break;
+      case 'missing captured file': case 'missing captured relative module': reason = 'missing-module'; break;
+      case 'unsupported captured module format': reason = 'unsupported-module-format'; break;
+      case 'invalid closed descriptor model': case 'invalid bound descriptor row': reason = 'invalid-descriptor-binding'; break;
+      case 'missing stock fetcher': reason = 'missing-fetcher'; break;
+      case 'fetch is outside the exact approved descriptor binding': reason = 'fetch-outside-binding'; break;
+      case 'invalid project config binding': case 'unsupported project config read shape': reason = 'project-config-binding'; break;
+      default:
+        if (typeof message === 'string') {
+          if (message.startsWith('module not in captured closure: ')) reason = 'module-not-in-inventory';
+          else if (message.startsWith('package is outside captured closure: ')) reason = 'package-outside-closure';
+        }
+    }
+  } catch { /* Proxy traps and invalid thrown values keep fixed fallback labels. */ }
+  const text = `tirith: sealed npm bootstrap refused its bound inputs (stage=${bootstrapStage}, code=${code}, name=${name}, reason=${reason})\n`;
+  try {
+    // Raw fd writing avoids libuv's lazy console/stdio adoption. Bound both
+    // partial writes and retries; the public message is always below 256 bytes.
+    let offset = 0;
+    for (let attempt = 0; attempt < 8 && offset < text.length; attempt++) {
+      const written = diagnosticWrite(2, text.slice(offset));
+      if (!Number.isInteger(written) || written <= 0 || written > text.length - offset) break;
+      offset += written;
+    }
+  } catch { /* Reporting is best effort; refusal remains 78. */ }
 }

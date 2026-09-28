@@ -150,15 +150,28 @@ fn policy_rules() -> Result<Rules, String> {
         libc::TIOCGPGRP,
         libc::FIONREAD,
     ] {
+        // libc ioctl requests are c_ulong on GNU and c_int on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let request = request as u64;
         terminal_rules.push(rule(vec![
             condition(0, SeccompCmpOp::Le, libc::STDERR_FILENO as u64)?,
-            eq(1, request as u64)?,
+            eq(1, request)?,
         ])?);
     }
+    // libuv adopts inherited stdio pipes with FIONBIO. This changes only an
+    // existing descriptor's blocking mode; it creates no socket or new handle.
+    #[allow(clippy::unnecessary_cast)] // libc's ioctl request type differs on GNU and musl.
+    let nonblocking_request = libc::FIONBIO as u64;
+    terminal_rules.push(rule(vec![
+        condition(0, SeccompCmpOp::Le, libc::STDERR_FILENO as u64)?,
+        eq(1, nonblocking_request)?,
+    ])?);
     // Exact process-local CLOEXEC setter used by CPython custom file openers.
+    #[allow(clippy::unnecessary_cast)] // Same GNU/musl ioctl type difference.
+    let cloexec_request = libc::FIOCLEX as u64;
     terminal_rules.push(rule(vec![
         condition(0, SeccompCmpOp::Le, i32::MAX as u64)?,
-        eq(1, libc::FIOCLEX as u64)?,
+        eq(1, cloexec_request)?,
         eq(2, 0)?,
     ])?);
     rules.insert(libc::SYS_ioctl, terminal_rules);
@@ -421,6 +434,46 @@ mod tests {
     }
 
     #[test]
+    fn compiled_filters_allow_only_stdio_nonblocking_mode_changes() {
+        const ARM: u32 = 0xc00000b7;
+        const ALLOW: u32 = 0x7fff0000;
+        const DENY: u32 = 0x50000 | libc::EPERM as u32;
+        let npm = npm_filter(19).unwrap();
+        let (_, ordinary) = build_filters().unwrap();
+        #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
+        let request = libc::FIONBIO as u64;
+        for filter in [&npm, &ordinary] {
+            for fd in 0..=2 {
+                assert_eq!(
+                    evaluate(filter, ARM, libc::SYS_ioctl, [fd, request, 4096, 0, 0, 0]),
+                    ALLOW
+                );
+            }
+            for fd in [3, 19, 255, i32::MAX as u64, u64::MAX] {
+                assert_eq!(
+                    evaluate(filter, ARM, libc::SYS_ioctl, [fd, request, 4096, 0, 0, 0]),
+                    DENY
+                );
+            }
+            for request in [request - 1, request + 1, u64::MAX] {
+                assert_eq!(
+                    evaluate(filter, ARM, libc::SYS_ioctl, [2, request, 4096, 0, 0, 0]),
+                    DENY
+                );
+            }
+            for syscall in [
+                libc::SYS_socket,
+                libc::SYS_socketpair,
+                libc::SYS_connect,
+                libc::SYS_sched_getparam,
+                libc::SYS_sched_getscheduler,
+            ] {
+                assert_eq!(evaluate(filter, ARM, syscall, [0; 6]), DENY);
+            }
+        }
+    }
+
+    #[test]
     fn compiled_filter_binds_architecture_and_sensitive_arguments() {
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
@@ -492,29 +545,25 @@ mod tests {
                 DENY
             );
         }
-        assert_eq!(
-            decision(libc::SYS_ioctl, [1, libc::TCGETS as u64, 0, 0, 0, 0]),
-            ALLOW
+        // Preserve the same expected u64 arguments on GNU and musl.
+        #[allow(clippy::unnecessary_cast)]
+        let (tcgets, fioclex, fionclex, tiocsti) = (
+            libc::TCGETS as u64,
+            libc::FIOCLEX as u64,
+            libc::FIONCLEX as u64,
+            libc::TIOCSTI as u64,
         );
-        assert_eq!(
-            decision(libc::SYS_ioctl, [4, libc::FIOCLEX as u64, 0, 0, 0, 0]),
-            ALLOW
-        );
+        assert_eq!(decision(libc::SYS_ioctl, [1, tcgets, 0, 0, 0, 0]), ALLOW);
+        assert_eq!(decision(libc::SYS_ioctl, [4, fioclex, 0, 0, 0, 0]), ALLOW);
         for args in [
-            [4, libc::FIOCLEX as u64, 1, 0, 0, 0],
-            [u64::MAX, libc::FIOCLEX as u64, 0, 0, 0, 0],
-            [4, libc::FIONCLEX as u64, 0, 0, 0, 0],
+            [4, fioclex, 1, 0, 0, 0],
+            [u64::MAX, fioclex, 0, 0, 0, 0],
+            [4, fionclex, 0, 0, 0, 0],
         ] {
             assert_eq!(decision(libc::SYS_ioctl, args), DENY);
         }
-        assert_eq!(
-            decision(libc::SYS_ioctl, [4, libc::TCGETS as u64, 0, 0, 0, 0]),
-            DENY
-        );
-        assert_eq!(
-            decision(libc::SYS_ioctl, [0, libc::TIOCSTI as u64, 0, 0, 0, 0]),
-            DENY
-        );
+        assert_eq!(decision(libc::SYS_ioctl, [4, tcgets, 0, 0, 0, 0]), DENY);
+        assert_eq!(decision(libc::SYS_ioctl, [0, tiocsti, 0, 0, 0, 0]), DENY);
         let parent_death = [
             libc::PR_SET_PDEATHSIG as u64,
             libc::SIGKILL as u64,
@@ -589,6 +638,55 @@ mod tests {
             return;
         };
         assert!(kernel_support_observed());
+        if case == "npm-stdio" {
+            // The parent supplies actual inherited pipes, not regular files
+            // whose blocking-mode ioctl could fail independently of seccomp.
+            for fd in 0..=2 {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                assert_eq!(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, 0);
+                assert_eq!(
+                    unsafe { stat.assume_init() }.st_mode & libc::S_IFMT,
+                    libc::S_IFIFO
+                );
+            }
+            let duplicate = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(duplicate >= 3);
+            apply_npm(19).unwrap();
+            for fd in 0..=2 {
+                for enabled in [1, 0] {
+                    assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &enabled) }, 0);
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                    assert!(flags >= 0);
+                    assert_eq!(flags & libc::O_NONBLOCK != 0, enabled != 0);
+                }
+            }
+            let enabled = 1;
+            assert_eq!(
+                unsafe { libc::ioctl(duplicate, libc::FIONBIO, &enabled) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            assert_eq!(unsafe { libc::close(duplicate) }, 0);
+            assert_eq!(
+                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            for fd in [1, 2] {
+                let marker = b"native-npm-stdio-pipe-ok\n";
+                assert_eq!(
+                    unsafe { libc::write(fd, marker.as_ptr().cast(), marker.len()) },
+                    marker.len() as isize
+                );
+            }
+            return;
+        }
         if case == "network" {
             // Distinguish our filter from an outer container already denying
             // socket creation. This only opens unconnected local descriptors.
@@ -690,13 +788,14 @@ mod tests {
 
     #[test]
     fn native_filter_denies_network_escape_and_allows_reviewed_shell() {
-        for case in ["network", "escape", "exec", "unavailable"] {
+        for case in ["network", "escape", "exec", "unavailable", "npm-stdio"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "native_filter_subprocess",
                     "--nocapture",
                     "--test-threads=1",
                 ])
+                .stdin(std::process::Stdio::piped())
                 .env("TIRITH_AARCH64_FILTER_FIXTURE", case)
                 .output()
                 .unwrap();
@@ -708,6 +807,11 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if case == "npm-stdio" {
+                for bytes in [&output.stdout, &output.stderr] {
+                    assert!(String::from_utf8_lossy(bytes).contains("native-npm-stdio-pipe-ok"));
+                }
+            }
         }
     }
 }

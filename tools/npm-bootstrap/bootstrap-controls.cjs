@@ -5,6 +5,9 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
+const { readFileSync } = require('node:fs');
+const { runInNewContext } = require('node:vm');
+const { join } = require('node:path');
 const { decodeBinding, readBinding, verifyInputs } = require('./bindings.cjs');
 const { decodeRuntimePack, NODE_SHA256, NPM_TREE_SHA256 } = require('./runtime-pack.cjs');
 const { bindEmptyProjectConfig } = require('./project-config.cjs');
@@ -144,6 +147,92 @@ for (const rows of [
 check('trailing bytes and truncated pack refuse', () => {
   assert.throws(() => decodeRuntimePack(Buffer.concat([runtime, Buffer.from('x')])));
   assert.throws(() => decodeRuntimePack(runtime.subarray(0, runtime.length - 1)));
+});
+
+// Execute the actual generated refusal tail with inert private modules. The
+// throwing entry replaces npm; no package, VFS mount or child is launched.
+const generated = readFileSync(join(__dirname, '../../crates/tirith/src/cli/npm_sealed_bootstrap.cjs'), 'utf8');
+const tailStart = generated.indexOf("let bootstrapStage = 'entry';\n");
+assert(tailStart > 0);
+const refusalTail = generated.slice(tailStart);
+function observeRefusal (error, { stage = 'vfs-mount', write, loadFails = false } = {}) {
+  const writes = [];
+  const state = {};
+  let calls = 0;
+  const context = {
+    bindings: {}, runtimePack: {}, resolver: {}, descriptorBridge: {}, projectConfig: {},
+    process: state,
+    console: new Proxy({}, { get () { throw new Error('lazy console must not be used'); } }),
+    require (name) {
+      assert.equal(name, 'node:fs');
+      if (loadFails) throw new Error('unavailable diagnostic writer');
+      return { writeSync (fd, text) {
+        calls++;
+        assert.equal(fd, 2);
+        assert.equal(typeof text, 'string');
+        assert(Buffer.byteLength(text) < 256);
+        const count = write ? write(text, calls) : text.length;
+        if (Number.isInteger(count) && count > 0) writes.push(text.slice(0, count));
+        return count;
+      } };
+    },
+    entry: { runSealedNpm (...args) { args[5](stage); throw error; } },
+  };
+  runInNewContext(refusalTail, context, { timeout: 500 });
+  assert.equal(state.exitCode, 78);
+  assert(calls <= 8);
+  return { output: writes.join(''), calls };
+}
+check('generated catch reports static stage and known code without console initialization', () => {
+  const error = Object.assign(new TypeError('private path /secret/input'), { code: 'EPERM' });
+  const result = observeRefusal(error);
+  assert.equal(result.output, 'tirith: sealed npm bootstrap refused its bound inputs (stage=vfs-mount, code=EPERM, name=TypeError, reason=unclassified)\n');
+  assert.equal(result.calls, 1);
+});
+check('generated catch omits arbitrary messages names codes and stage values', () => {
+  const result = observeRefusal({ code: '/secret/token', name: '/secret/name', message: '/secret/message', stack: '/secret/stack' }, { stage: '/secret/stage' });
+  assert.equal(result.output, 'tirith: sealed npm bootstrap refused its bound inputs (stage=unknown, code=UNKNOWN, name=Error, reason=unclassified)\n');
+});
+check('generated catch avoids exception getters and tolerates proxy traps or invalid throws', () => {
+  let getterCalls = 0;
+  const getters = Object.defineProperties({}, {
+    code: { get () { getterCalls++; throw new Error('private code'); } },
+    name: { get () { getterCalls++; throw new Error('private name'); } },
+    message: { get () { getterCalls++; throw new Error('private message'); } },
+  });
+  for (const error of [getters, null, undefined, 'private thrown string', new Proxy({}, { getOwnPropertyDescriptor () { throw new Error('private proxy'); } })]) {
+    const result = observeRefusal(error);
+    assert.match(result.output, /code=UNKNOWN, name=Error, reason=unclassified\)\n$/);
+    assert.doesNotMatch(result.output, /private/);
+  }
+  assert.equal(getterCalls, 0);
+});
+check('generated catch maps only known refusal reasons without path suffixes', () => {
+  for (const [message, reason] of [
+    ['module parent is outside captured inventory', 'module-parent-outside-inventory'],
+    ['module not in captured closure: /secret/package.js', 'module-not-in-inventory'],
+    ['package is outside captured closure: @secret/package', 'package-outside-closure'],
+    ['runtime is not read-only', 'readonly-check'],
+    ['unsupported sealed npm runtime', 'unsupported-runtime'],
+  ]) {
+    const result = observeRefusal(new Error(message));
+    assert(result.output.endsWith(`reason=${reason})\n`));
+    assert.doesNotMatch(result.output, /secret/);
+  }
+});
+check('generated catch bounds partial writes and preserves refusal after broken output', () => {
+  const error = Object.assign(new Error('private'), { code: 'EBOUNDINPUT' });
+  const full = observeRefusal(error).output;
+  const short = observeRefusal(error, { write: text => Math.min(32, text.length) });
+  assert.equal(short.output, full);
+  assert(short.calls > 1);
+  const capped = observeRefusal(error, { write: () => 1 });
+  assert.equal(capped.calls, 8);
+  assert.equal(capped.output, full.slice(0, 8));
+  for (const write of [() => 0, () => -1, () => NaN, text => text.length + 1, () => { throw new Error('EPIPE'); }]) {
+    assert.equal(observeRefusal(error, { write }).calls, 1);
+  }
+  assert.equal(observeRefusal(error, { loadFails: true }).calls, 0);
 });
 
 (async () => {

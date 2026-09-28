@@ -1234,6 +1234,23 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
                     )),
             );
         }
+        // libuv adopts inherited stdio pipes with FIONBIO. Limit this exact
+        // blocking-mode operation to standard descriptors; do not grant general
+        // F_SETFL, asynchronous notification, or new endpoints. Compare the full
+        // syscall arguments so high-bit descriptor/request aliases also refuse.
+        rules.entry(Sysno::ioctl).or_insert_with(Vec::new).push(
+            SeccompRule::new(Sysno::ioctl)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Le,
+                    libc::STDERR_FILENO as u64,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    1,
+                    SeccompilerComparator::Eq,
+                    libc::FIONBIO,
+                )),
+        );
         // CPython's custom opener sets CLOEXEC with this exact ioctl. It
         // changes only the caller's descriptor flags, like permitted F_SETFD.
         rules.entry(Sysno::ioctl).or_insert_with(Vec::new).push(
@@ -1625,7 +1642,7 @@ mod tests {
         assert!(SafeDescriptorControls.simple_rules().is_empty());
         let rules = SafeDescriptorControls.conditional_rules();
         let ioctl_rules = rules.get(&Sysno::ioctl).expect("conditional ioctl rules");
-        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len() + 1);
+        assert_eq!(ioctl_rules.len(), SAFE_TERMINAL_IOCTL_REQUESTS.len() + 2);
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCSTI }));
         assert!(!SAFE_TERMINAL_IOCTL_REQUESTS.contains(&{ libc::TIOCLINUX }));
         for rule in &ioctl_rules[..SAFE_TERMINAL_IOCTL_REQUESTS.len()] {
@@ -1642,6 +1659,17 @@ mod tests {
                 .value;
             assert!(SAFE_TERMINAL_IOCTL_REQUESTS.contains(&request));
         }
+
+        let nonblocking = &ioctl_rules[SAFE_TERMINAL_IOCTL_REQUESTS.len()];
+        assert_eq!(nonblocking.argument_filters.len(), 2);
+        assert!(nonblocking
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 0 && f.value == libc::STDERR_FILENO as u64));
+        assert!(nonblocking
+            .argument_filters
+            .iter()
+            .any(|f| f.arg_idx == 1 && f.value == libc::FIONBIO));
 
         let close_on_exec = ioctl_rules.last().unwrap();
         assert_eq!(close_on_exec.argument_filters.len(), 3);
@@ -1672,6 +1700,7 @@ mod tests {
         }
         assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETOWN as u32)));
         assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETLK as u32)));
+        assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETFL as u32)));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2246,6 +2275,61 @@ mod tests {
             return;
         }
         assert!(apply_seccomp().expect("apply production syscall policy"));
+        // Command::output gives this child real inherited stdout/stderr pipes,
+        // matching the public capsule supervisor and libuv's fd adoption path.
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+            let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(original >= 0);
+            assert_eq!(original & libc::O_NONBLOCK, 0);
+            let enabled = 1;
+            assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &enabled) }, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFL) },
+                original | libc::O_NONBLOCK
+            );
+            let disabled = 0;
+            assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &disabled) }, 0);
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original);
+        }
+        let duplicate = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(duplicate >= 3);
+        #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
+        let nonblocking_request = libc::FIONBIO as u64;
+        #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
+        let asynchronous_request = libc::FIOASYNC as u64;
+        #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
+        let terminal_injection_request = libc::TIOCSTI as u64;
+        let enabled = 1;
+        let denied_requests = [
+            (duplicate as u64, nonblocking_request),
+            (3, nonblocking_request),
+            (u64::MAX, nonblocking_request),
+            ((1u64 << 32) | 1, nonblocking_request),
+            (1, (1u64 << 32) | nonblocking_request),
+            (1, asynchronous_request),
+            (1, terminal_injection_request),
+        ];
+        for (fd, request) in denied_requests {
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_ioctl, fd, request, &enabled) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        for command in [libc::F_SETFL, libc::F_SETOWN] {
+            assert_eq!(unsafe { libc::fcntl(duplicate, command, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        assert_eq!(unsafe { libc::close(duplicate) }, 0);
         let duration = libc::timespec {
             tv_sec: 0,
             tv_nsec: 1_000_000,

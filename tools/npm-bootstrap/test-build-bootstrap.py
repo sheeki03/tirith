@@ -30,7 +30,7 @@ class BootstrapGenerationTests(unittest.TestCase):
         first = builder.build_bundle(HERE)
         self.assertEqual(first, builder.build_bundle(HERE))
         self.assertEqual(hashlib.sha256(first[0]).hexdigest(),
-                         '41183108651b825e4712922f9056d1caf5766814f992167ac36fd200d9daa4d7')
+                         '70d34f769895fe1424473815c3032c6a48387684439f0efa6bb3b52aac8923dc')
         builder.check(self.root)
 
     def test_changed_module_cannot_pass_old_bundle_or_manifest(self):
