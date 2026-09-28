@@ -12,15 +12,22 @@ on:
       - '.github/scripts/*native*'
       - '.github/workflows/native-arm-containment.yml'
   workflow_dispatch:
+    inputs:
+      remaining_qualification:
+        description: 'Observe one fresh public npm text-apply after bounded native builds'
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
 concurrency:
-  group: native-arm-containment-${{ github.ref }}
-  cancel-in-progress: true
+  group: native-arm-containment-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification && github.run_id || 'standard' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.remaining_qualification) }}
 
 jobs:
   native-artifact:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.remaining_qualification }}
     name: Native ARM (${{ matrix.target }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -87,4 +94,60 @@ jobs:
             ${{ runner.temp }}/native-arm/evidence/*.json
             ${{ runner.temp }}/native-arm/evidence/*.txt
           if-no-files-found: warn
+          retention-days: 14
+
+  remaining-qualification:
+    name: Native ARM Clippy and first npm transaction diagnostic
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 110
+    steps:
+      - name: Create partial-failure evidence before checkout
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-bootstrap-v8'
+          root.mkdir(mode=0o700, exist_ok=False)
+          (root / 'dispatch-context.json').write_text(json.dumps({
+              'controller_event_commit': os.environ['GITHUB_SHA'],
+              'product_commit': '887944ad38086f7836f430f9ba013a3ee3f3b4ab',
+              'product_tree': '9d1febda94ea6be3dc61390d09d853e6015a2f68',
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'runner_machine': platform.machine(),
+              'qualification_started': False
+          }, indent=2) + '\n')
+          PY
+      - name: Check out the reviewed controller revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the exact product revision independently
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 887944ad38086f7836f430f9ba013a3ee3f3b4ab
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build the pinned source and observe one public apply
+        run: |
+          set -euo pipefail
+          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-npm-fixture.py" \
+            --source-root "$GITHUB_WORKSPACE/product" \
+            --output "$RUNNER_TEMP/native-arm-bootstrap-v8/run" \
+            --manifest-sha256 eaef10bc7bbe287ed11795af375667f4995d5c6f5e29d5c60dd2c39f962ee86b \
+            --driver-sha256 509a80400fd928ae1580962678568cf1706bf43f89629c5dc25f0675eeaa9927
+      - name: Preserve complete bounded evidence, including partial failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-arm-bootstrap-v8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-arm-bootstrap-v8/dispatch-context.json
+            ${{ runner.temp }}/native-arm-bootstrap-v8/run/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 14
