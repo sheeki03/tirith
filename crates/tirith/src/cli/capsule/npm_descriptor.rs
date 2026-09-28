@@ -737,8 +737,124 @@ fn cleanup_refusal(
     reason: String,
     ack: bool,
 ) -> CapsuleExecutionError {
-    let (cleanup, _) = terminate_supervised_tree(child, pid);
+    #[cfg(test)]
+    let before = refusal_diagnostics::terminal_before_cleanup(child.id());
+    let (cleanup, _cleanup_status) = terminate_supervised_tree(child, pid);
+    #[cfg(test)]
+    refusal_diagnostics::record(child, before, _cleanup_status, cleanup, ack);
     refusal_after_cleanup(home, reason, ack, cleanup)
+}
+
+// Test executables retain bounded launcher evidence on refusal. These reads do
+// not consume wait status or alter production errors, admission, or cleanup.
+#[cfg(test)]
+mod refusal_diagnostics {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, ExitStatus};
+    use std::time::{Duration, Instant};
+
+    pub(super) fn terminal_before_cleanup(pid: u32) -> serde_json::Value {
+        // Observe only this still-owned child, without reaping its PID/PGID.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return serde_json::json!({"observation":"error", "errno":std::io::Error::last_os_error().raw_os_error()});
+        }
+        let observed = unsafe { info.si_pid() };
+        if observed == 0 {
+            serde_json::json!({"observation":"not_terminal_at_observation"})
+        } else {
+            serde_json::json!({"observation":"terminal_before_cleanup", "pid":observed,
+                "si_code":info.si_code, "si_status":unsafe { info.si_status() }})
+        }
+    }
+
+    fn drain<R: Read + AsRawFd>(stream: Option<R>, deadline: Instant) -> serde_json::Value {
+        let Some(mut stream) = stream else {
+            return serde_json::json!({"present":false});
+        };
+        const CAP: usize = 16 * 1024;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let fd = stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return serde_json::json!({"present":true, "nonblocking_setup_errno":std::io::Error::last_os_error().raw_os_error()});
+        }
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        let mut truncated = false;
+        let mut would_block = false;
+        let mut read_error = None;
+        let mut deadline_exhausted = false;
+        for _ in 0..64 {
+            if Instant::now() >= deadline {
+                deadline_exhausted = true;
+                break;
+            }
+            let mut chunk = [0; 4096];
+            let limit = chunk.len().min(CAP + 1 - bytes.len());
+            match stream.read(&mut chunk[..limit]) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.len() > CAP {
+                        bytes.truncate(CAP);
+                        truncated = true;
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    would_block = true;
+                    break;
+                }
+                Err(error) => {
+                    read_error = error.raw_os_error();
+                    break;
+                }
+            }
+        }
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for &byte in &bytes {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        serde_json::json!({"present":true,"bytes":bytes.len(),"bytes_hex":encoded,
+            "eof":eof,"truncated":truncated,"would_block":would_block,"read_errno":read_error,
+            "deadline_exhausted":deadline_exhausted,"byte_cap":CAP,"read_attempt_cap":64})
+    }
+
+    pub(super) fn record(
+        child: &mut Child,
+        before: serde_json::Value,
+        cleanup_status: Option<ExitStatus>,
+        cleanup: bool,
+        ack: bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let stdout = drain(child.stdout.take(), deadline);
+        let stderr = drain(child.stderr.take(), deadline);
+        let value = serde_json::json!({"control":"npm_launcher_refusal_diagnostic",
+            "test_only":true,"resume_ack_observed":ack,"pre_cleanup":before,
+            "cleanup_return_status_raw":cleanup_status.map(|status| status.into_raw()),
+            "cleanup_status_may_reflect_cleanup_sigkill":true,"cleanup_confirmed":cleanup,
+            "drain_shared_deadline_ms":100,"stdout":stdout,"stderr":stderr});
+        // Diagnostic output cannot replace the original refusal if its sink is
+        // unavailable. The outer owner separately caps and retains test output.
+        let _ = writeln!(std::io::stderr(), "{value}");
+    }
 }
 
 fn refusal_after_cleanup(
