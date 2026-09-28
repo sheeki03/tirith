@@ -1,5 +1,64 @@
 # Implementation verification
 
+## September 28: cd062069 native PowerShell follow-up
+
+CI run `36388805399` passes the Windows workspace and standard-account dashboard
+suite, Linux workspace, Rust 1.83 workspace and native Linux PowerShell target
+resolution. The Windows target artifact `10956286477` has ZIP SHA-256
+`adaee46b91adb28888311852a12ef8beabc6d774aac50c616f0889a32aaf1263`.
+Its original reports show Windows PowerShell 5.1.26100.33438 now starts, returns
+all eleven profile fields, leaves the profile unchanged and avoids the poisoned
+user module. The separate process command-line query returns unavailable, so
+the complete 5.1 target check correctly remains failed. Its initiating cause is
+not established by the current report. PowerShell 7.6.6 passes both checks.
+Both outer native jobs report reaped leaders, empty jobs, drained output and no
+leaked descendants. This is target resolution evidence, not interactive Windows
+interception certification.
+
+The same source passes native ARM GNU/musl containment, all fourteen fuzz jobs
+and both benchmark/resource jobs. Release and remaining CI checks were still
+running when this checkpoint was recorded; no overall CI pass is claimed.
+
+## September 28: repeated actual Claude adapter measurements
+
+Four fresh Claude 2.1.283 hosts use the ordinary `d0213a22` macOS ARM 0.4.2
+product, the qualified Python runtime and actual recommended setup. Each host
+performs one no-tool initialization, one unmeasured allow/block warmup pair and
+six measured pairs. Independent ordinary checker preflights precede every pair.
+All 56 actual tool turns, including eight warmups, pass tool/result identity,
+hook-event and marker checks. Inputs, generated settings and policy stay fixed.
+
+| Measurement | Samples | Nearest-rank p50 / p95, ms |
+| --- | --- | --- |
+| Allow turn, send through successful host-result return | 24 | 391.041 / 410.052 |
+| Block turn, same unit | 24 | 369.972 / 395.690 |
+| Recommended setup including owned cleanup | 4 | 3938.162 / 3979.042 |
+| Host spawn through no-tool initialization, including owner checks | 4 | 387.658 / 409.991 |
+
+The four-sample p95 values are the observed maxima. Turn clocks include finite
+ownership checks while pumping host output; preflight and final semantic checks
+are outside the timed interval. A scripted loopback provider is part of the
+fixture, so no remote inference or service latency is measured. These are
+observations for one recorded tuple, not universal budgets or confidence bounds.
+
+Two direct-host resource observations per batch span warmup, turns and preflights.
+CPU deltas are 1,220, 1,210, 1,200 and 1,260 ms at the native observer's display
+precision. Sampled maximum host RSS is 321,781,760, 314,785,792, 318,734,336 and
+322,502,656 bytes. These exclude descendant totals and are not kernel RSS peaks.
+Each private fixture grows by 302,008 logical bytes after setup/initialization.
+No cold-OS-cache, production-feed freshness or daemon-route claim is inferred.
+
+The run completes in 51.54 seconds with exactly 29 requests per provider. All
+75 registered children and four providers have confirmed cleanup. Independent
+readback parses the four original host stdout streams, recomputes all sample
+counts/distributions, rehashes 262 retained files and checks all eight input
+generations. Report SHA-256:
+`6ad3287a0f51f1b071989afdf93452942eff097902395c23d3d6c88d5efb3118`.
+Readback SHA-256:
+`3f88cdfab399285742a5701ac17e7b0d37913dc4098e83f74059b5a1804014e4`.
+The separate resource regression gate continues to enforce its six reviewed
+byte ceilings; these latency observations do not silently introduce another gate.
+
 ## September 28: retained-daemon grant expiry and revocation
 
 One ordinary `d0213a22` macOS ARM daemon retains its exact PID, socket and PID-file
