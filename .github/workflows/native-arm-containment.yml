@@ -71,6 +71,7 @@ jobs:
             -v "$GITHUB_WORKSPACE:/source:ro" -v "$RUNNER_TEMP/native-arm/target:/build" \
             -w /source tirith-native-arm-builder sh -c '
               cargo test -p tirith-core --lib --locked -j 3 capsule::linux::aarch64_seccomp::tests -- --test-threads=1 &&
+              cargo test -p tirith-core --lib --locked -j 3 capsule::linux::npm_landlock::tests -- --test-threads=1 &&
               cargo test -p tirith-core --lib --locked -j 3 production_policy_allows_local_readiness_without_network_or_signal_escape -- --test-threads=1 &&
               cargo test -p tirith-core --lib --locked -j 3 trusted_child::tmpfs_acl::tests -- --test-threads=1 &&
               cargo test -p tirith-core --lib --locked -j 3 trusted_child::linux_acl_policy_tests -- --test-threads=1 &&

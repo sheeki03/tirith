@@ -108,6 +108,13 @@ receives an execution grant. Writable grants cover the new private target and
 temporary cache. The existing generic private-input execution path stays
 disabled.
 
+The npm path requires Landlock ABI 2 or newer (introduced in Linux 5.19), with
+full enforcement and no ABI 1 fallback. Its `REFER` right permits cache and
+target moves between directories beneath the two existing writable grants;
+runtime files retain their exact read/execute grants. ABI 1 denies these moves
+with `EXDEV` even inside a writable tree. This requirement follows the kernel's
+[Landlock filesystem access contract](https://docs.kernel.org/5.19/userspace-api/landlock.html#filesystem-flags).
+
 The launcher requires native filesystem, raw-network and resource restrictions
 and refuses when any required primitive is missing. Its ARM64 seccomp filter
 restricts `execveat` to the initial numeric Node descriptor and denies pathname

@@ -11,6 +11,10 @@ use seccompiler::{
 
 type Rules = BTreeMap<i64, Vec<SeccompRule>>;
 
+// Linux arm64's kernel ABI bit is 0400000 (uapi/asm/fcntl.h); GNU libc
+// exposes O_LARGEFILE as zero even when F_GETFL returns this kernel bit.
+const STDIO_STATUS_WORD: u64 = (libc::O_ACCMODE | libc::O_NONBLOCK) as u64 | 0o400000;
+
 fn condition(index: u8, operator: SeccompCmpOp, value: u64) -> Result<SeccompCondition, String> {
     SeccompCondition::new(index, SeccompCmpArgLen::Qword, operator, value)
         .map_err(|error| error.to_string())
@@ -142,6 +146,15 @@ fn policy_rules() -> Result<Rules, String> {
     ] {
         descriptor_rules.push(rule(vec![eq(1, command as u64)?])?);
     }
+    // Node restores inherited pipe blocking mode with F_SETFL at shutdown.
+    // Permit only stdio and these status bits, not setting append, async,
+    // direct-I/O or no-atime. This is fd-number scoped: on a rebound descriptor
+    // F_SETFL can also clear prior mutable flags; BPF cannot inspect f_flags.
+    descriptor_rules.push(rule(vec![
+        condition(0, SeccompCmpOp::Le, libc::STDERR_FILENO as u64)?,
+        eq(1, libc::F_SETFL as u64)?,
+        condition(2, SeccompCmpOp::MaskedEq(!STDIO_STATUS_WORD), 0)?,
+    ])?);
     rules.insert(libc::SYS_fcntl, descriptor_rules);
     let mut terminal_rules = Vec::new();
     for request in [
@@ -474,6 +487,66 @@ mod tests {
     }
 
     #[test]
+    fn compiled_filters_bound_stdio_status_restoration() {
+        const ARM: u32 = 0xc00000b7;
+        const ALLOW: u32 = 0x7fff0000;
+        const DENY: u32 = 0x50000 | libc::EPERM as u32;
+        let npm = npm_filter(19).unwrap();
+        let (_, ordinary) = build_filters().unwrap();
+        for filter in [&npm, &ordinary] {
+            for fd in 0..=2 {
+                for access in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
+                    for status in [0, libc::O_NONBLOCK as u64, 0o400000, STDIO_STATUS_WORD] {
+                        assert_eq!(
+                            evaluate(
+                                filter,
+                                ARM,
+                                libc::SYS_fcntl,
+                                [fd, libc::F_SETFL as u64, access as u64 | status, 0, 0, 0]
+                            ),
+                            ALLOW
+                        );
+                    }
+                }
+            }
+            for args in [
+                [3, libc::F_SETFL as u64, 0, 0, 0, 0],
+                [19, libc::F_SETFL as u64, 0, 0, 0, 0],
+                [(1u64 << 32) | 1, libc::F_SETFL as u64, 0, 0, 0, 0],
+                [1, (1u64 << 32) | libc::F_SETFL as u64, 0, 0, 0, 0],
+                [1, libc::F_SETOWN as u64, 0, 0, 0, 0],
+            ] {
+                assert_eq!(evaluate(filter, ARM, libc::SYS_fcntl, args), DENY);
+            }
+            for forbidden in [
+                libc::O_APPEND as u64,
+                libc::O_ASYNC as u64,
+                libc::O_DIRECT as u64,
+                libc::O_NOATIME as u64,
+                1u64 << 32,
+                u64::MAX,
+            ] {
+                assert_eq!(
+                    evaluate(
+                        filter,
+                        ARM,
+                        libc::SYS_fcntl,
+                        [
+                            1,
+                            libc::F_SETFL as u64,
+                            STDIO_STATUS_WORD | forbidden,
+                            0,
+                            0,
+                            0
+                        ]
+                    ),
+                    DENY
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compiled_filter_binds_architecture_and_sensitive_arguments() {
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
@@ -653,12 +726,38 @@ mod tests {
             assert!(duplicate >= 3);
             apply_npm(19).unwrap();
             for fd in 0..=2 {
-                for enabled in [1, 0] {
-                    assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &enabled) }, 0);
-                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                    assert!(flags >= 0);
-                    assert_eq!(flags & libc::O_NONBLOCK != 0, enabled != 0);
-                }
+                let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                assert!(original >= 0);
+                assert_eq!(original & libc::O_NONBLOCK, 0);
+                let enabled = 1;
+                assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &enabled) }, 0);
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_GETFL) },
+                    original | libc::O_NONBLOCK
+                );
+                // Match Node's actual libuv adoption followed by ResetStdio.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, original) }, 0);
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original);
+            }
+            for (fd, command, flags) in [
+                (duplicate as u64, libc::F_SETFL as u64, 0),
+                ((1u64 << 32) | 1, libc::F_SETFL as u64, 0),
+                (1, (1u64 << 32) | libc::F_SETFL as u64, 0),
+                (1, libc::F_SETFL as u64, 1u64 << 32),
+                (1, libc::F_SETFL as u64, libc::O_APPEND as u64),
+                (1, libc::F_SETFL as u64, libc::O_ASYNC as u64),
+                (1, libc::F_SETFL as u64, libc::O_DIRECT as u64),
+                (1, libc::F_SETFL as u64, libc::O_NOATIME as u64),
+                (1, libc::F_SETOWN as u64, 0),
+            ] {
+                assert_eq!(
+                    unsafe { libc::syscall(libc::SYS_fcntl, fd, command, flags) },
+                    -1
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM)
+                );
             }
             let enabled = 1;
             assert_eq!(

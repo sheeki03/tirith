@@ -1,5 +1,85 @@
 # Implementation verification
 
+## September 28: cache reparenting and stdio restoration corrections
+
+The npm-specific Landlock policy now requires ABI 2 and grants `REFER` beneath
+the two already held writable roots. ABI 1 denies a move between their child
+directories. In the captured npm inventory, cacache moves its temporary file
+into a content directory; `@npmcli/fs` falls back to `copyFile` after a cross-device
+or permission error. That fallback requests file metadata changes which remain
+denied. The correction enables the original confined move without adding
+metadata or copying syscalls. Exact read/execute file grants and the ordinary
+capsule's ABI requirement are unchanged. New native controls compare ABI 1's
+refusal with the production helper, verify outside/runtime-file refusals, and
+require refusal on kernels without ABI 2.
+The original rename errno was not logged, so its specific `EXDEV` remains a
+source-based explanation rather than a captured syscall result. Independent
+Landlock review SHA-256:
+`3ea0ff97b01c53926e6c638e4b5e8de7f74ee9213e6e9325a39c8f6f971518b5`.
+
+Node 26.7.0's [stdio restoration](https://github.com/nodejs/node/blob/v26.7.0/src/node.cc#L689-L698)
+uses `fcntl(F_SETFL)` after libuv changes pipe blocking mode. Both native syscall
+policies now admit that command only on descriptors 0–2, with a full-width mask
+limited to access bits, nonblocking mode and the architecture's kernel
+large-file bit. GNU libc's zero-valued `O_LARGEFILE` macro cannot substitute for
+the actual kernel bit. Setting append, asynchronous notification, direct I/O,
+no-atime and high-word flags remains denied. This is a descriptor-number rule:
+a descriptor rebound onto 0–2 can also have existing mutable flags cleared.
+The controls cover real pipe adoption followed by restoration and continued
+denial of other descriptors and flags. Independent source review found no
+actionable issue; SHA-256:
+`fa1c7f03d89f9567f685f5ca12005e38e2bad95371340ba7617b1dc300aa8a2f`.
+Native execution and the corrected public install still require verification.
+
+## September 28: corrected stdio reaches npm cache handling
+
+[Original run 36429827498](https://github.com/sheeki03/tirith/actions/runs/36429827498)
+builds private candidate `887944ad` from `7e8b4272` with the same explicitly
+isolated qualification and fixture-authority changes. Type checking, strict
+native Clippy, protected-exec parsing and normal-production-key refusal pass.
+The corrected bootstrap reaches npm itself. Its single public human-output
+apply fails: npm reports an unsuccessful cache `copyfile`, and Node then asserts
+while restoring standard-descriptor flags. The parent apply exits 1 and records
+contained status 139. Publication is false; the installed tree and journal are
+absent, with only intent, started and finished records retained. The diagnostic
+workflow's green result does not establish installation success.
+
+The original artifact is `10973892443`, ZIP SHA-256
+`49a46477ff1ab0e2c781cb381964cdc1a65adc7cb046bc428f89997d0cc4e4a9`.
+Independent readback rehashes all 2,477 members (693,367,637 bytes). Both 661-file
+source captures match, with only the expected fixture-key substitution. All
+1,058 raw command streams, 80 stage streams, 529 owned-child cleanups and four
+exact-container removal/absence proofs pass. Both runtime input checks and
+final source/tool/executable checks pass. Peak memory is 6,083,063,808 bytes,
+with no OOM or maximum-counter event. Independent review SHA-256:
+`a4f64cb535c8d0aa465f42dacdbba5fb88cd3ecbb659befef0f59a0d79e7caa5`.
+The transaction suite remains unexecuted pending the two compatibility fixes.
+
+## September 28: 7e8b4272 ordinary checks pass
+
+All five original PR workflows pass at `7e8b4272`: [CI
+36428525581](https://github.com/sheeki03/tirith/actions/runs/36428525581),
+[release validation 36428526046](https://github.com/sheeki03/tirith/actions/runs/36428526046),
+[native ARM 36428525594](https://github.com/sheeki03/tirith/actions/runs/36428525594),
+fuzz `36428525529` and benchmarks `36428525582`. All are attempt 1.
+The original x86 and GNU ARM logs confirm five named filter controls, including
+actual standard-output/error pipe mode changes and continued denial of other
+descriptor controls. The passing ARM parent also exercises the npm filter's
+inherited-pipe case. This verifies the syscall correction, not the complete
+Node/npm installation transaction.
+
+The actual checkout is merge `bebefe48a98d23a57b1bde6db88dcdc4aae55e9e`,
+tree `ee744e085ceddd0a653d81f0a93cf292c8084eef`. Of 661 captured inputs,
+660 match the submitted head; only main's daily test-included ThreatDB manifest
+differs. Exact source binding SHA-256:
+`52e9a63ff1347ccb23dd7be340fc82b43b86fc69e18a4d9f957be3c60df028b5`.
+Native qualification receipt SHA-256:
+`007bed8653aaf526cf6c84d74f63bb1e7825c479836b0cea0c1ce34eeda21619`.
+Independent readback verifies the nine retained API/log records and the exact
+checkout and passing-test lines; SHA-256:
+`c931820a3f432ccc6cb48ba3bb27c2791239e63942b349cd7bdb1aa934957803`.
+These are PR validation results, not official release publication.
+
 ## September 28: stdio compatibility and bounded bootstrap diagnostics
 
 The correction permits only `ioctl(FIONBIO)` on standard descriptors 0–2 in the
@@ -15,8 +95,8 @@ stack and input paths are not printed. Seven generator checks and all 128 pure
 JavaScript controls pass (56 bootstrap, 37 descriptor and 35 resolver cases).
 The generated bundle is SHA-256
 `70d34f769895fe1424473815c3032c6a48387684439f0efa6bb3b52aac8923dc`.
-Native filter execution and the integrated install remain to be checked on the
-corrected source.
+Native filter execution passes on the corrected source as recorded above.
+The integrated install remains a separate qualification.
 
 A separate local Node 26.7.0 setup-only probe loads the retained 1,926-file npm
 inventory into the real VFS and reaches argument binding and fetcher setup. It
@@ -24,8 +104,8 @@ stops deliberately before the npm CLI entry. The corrected inert input fixture
 passes in 0.72 seconds with its child reaped and process group absent; an earlier
 probe with an incomplete mocked descriptor row is retained as a fixture failure.
 Native binding admission and Linux process metadata are mocked in this probe,
-so it does not certify containment or installation. The original synchronous
-failure on Linux remains unknown until the corrected native observation.
+so it does not certify containment or installation. The corrected native
+observation above separately reaches the npm CLI and records its later failure.
 
 ## September 28: retained npm diagnostic isolates a stdio incompatibility
 

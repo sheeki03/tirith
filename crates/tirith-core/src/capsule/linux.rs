@@ -85,6 +85,9 @@ const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
 #[cfg(target_arch = "aarch64")]
 mod aarch64_seccomp;
 
+#[cfg(any(target_arch = "aarch64", all(test, target_arch = "x86_64")))]
+mod npm_landlock;
+
 /// Report only an architecture with an implemented filter and, on AArch64,
 /// observed kernel seccomp support. User-mode emulators that cannot install a
 /// native filter retain the before-launch unsupported result.
@@ -566,11 +569,6 @@ pub fn apply_npm_descriptor_containment(
     read_files: &[(i32, bool)],
     write_directories: &[i32],
 ) -> Result<CapsuleCoverage, ContainError> {
-    use landlock::{
-        Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
-    };
-    use std::os::fd::BorrowedFd;
     if !(3..256).contains(&node_fd)
         || read_files.len() != 9
         || read_files
@@ -616,42 +614,7 @@ pub fn apply_npm_descriptor_containment(
     close_unexpected_fds(&spec.handles)?;
     apply_rlimits(&spec.resources)?;
     set_no_new_privs()?;
-    let all = AccessFs::from_all(ABI::V1);
-    let mut ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(all)
-        .map_err(|e| ContainError::Landlock(e.to_string()))?
-        .create()
-        .map_err(|e| ContainError::Landlock(e.to_string()))?;
-    for (fd, executable) in read_files {
-        // SAFETY: caller retains and validates every descriptor through apply.
-        let file = unsafe { BorrowedFd::borrow_raw(*fd) };
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                file,
-                if *executable {
-                    AccessFs::ReadFile | AccessFs::Execute
-                } else {
-                    AccessFs::ReadFile.into()
-                },
-            ))
-            .map_err(|e| ContainError::Landlock(format!("exact npm runtime file: {e}")))?;
-    }
-    let writable = all & !AccessFs::Execute;
-    for fd in write_directories {
-        let directory = unsafe { BorrowedFd::borrow_raw(*fd) };
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(directory, writable))
-            .map_err(|e| ContainError::Landlock(format!("held npm directory: {e}")))?;
-    }
-    let status = ruleset
-        .restrict_self()
-        .map_err(|e| ContainError::Landlock(e.to_string()))?;
-    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
-        return Err(ContainError::Unsupported(
-            "closed npm requires full Landlock enforcement".into(),
-        ));
-    }
+    npm_landlock::apply(read_files, write_directories)?;
     aarch64_seccomp::apply_npm(node_fd).map_err(ContainError::Seccomp)?;
     apply_env(&spec.environment, Some(temp_home));
     Ok(CapsuleCoverage {
@@ -1006,6 +969,11 @@ const SAFE_FCNTL_COMMANDS: &[u32] = &[
     libc::F_DUPFD_CLOEXEC as u32,
 ];
 
+// Linux x86_64's kernel ABI bit comes from asm-generic/fcntl.h. GNU libc
+// defines O_LARGEFILE as zero, but F_GETFL may still return the kernel bit.
+#[cfg(target_arch = "x86_64")]
+const STDIO_STATUS_WORD: u64 = (libc::O_ACCMODE | libc::O_NONBLOCK) as u64 | 0o100000;
+
 #[cfg(target_arch = "x86_64")]
 impl extrasafe::RuleSet for PostExecRuntime {
     fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
@@ -1280,6 +1248,28 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
                 )),
             );
         }
+        // Node's ResetStdio restores pipe blocking mode with F_SETFL. Restrict
+        // the submitted status word; no append/async/direct/no-atime setting.
+        // As with FIONBIO this is fd-number scoped, not an identity check:
+        // F_SETFL can clear prior mutable flags on a descriptor rebound here.
+        rules.entry(Sysno::fcntl).or_insert_with(Vec::new).push(
+            SeccompRule::new(Sysno::fcntl)
+                .and_condition(SeccompArgumentFilter::new64(
+                    0,
+                    SeccompilerComparator::Le,
+                    libc::STDERR_FILENO as u64,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    1,
+                    SeccompilerComparator::Eq,
+                    libc::F_SETFL as u64,
+                ))
+                .and_condition(SeccompArgumentFilter::new64(
+                    2,
+                    SeccompilerComparator::MaskedEq(!STDIO_STATUS_WORD),
+                    0,
+                )),
+        );
         rules
     }
 
@@ -1687,8 +1677,8 @@ mod tests {
             .any(|f| f.arg_idx == 2 && f.value == 0));
 
         let fcntl_rules = rules.get(&Sysno::fcntl).expect("conditional fcntl rules");
-        assert_eq!(fcntl_rules.len(), SAFE_FCNTL_COMMANDS.len());
-        for rule in fcntl_rules {
+        assert_eq!(fcntl_rules.len(), SAFE_FCNTL_COMMANDS.len() + 1);
+        for rule in &fcntl_rules[..SAFE_FCNTL_COMMANDS.len()] {
             assert_eq!(rule.argument_filters.len(), 1);
             let command = rule
                 .argument_filters
@@ -1701,6 +1691,15 @@ mod tests {
         assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETOWN as u32)));
         assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETLK as u32)));
         assert!(!SAFE_FCNTL_COMMANDS.contains(&(libc::F_SETFL as u32)));
+        let restoration = fcntl_rules.last().unwrap();
+        assert_eq!(restoration.argument_filters.len(), 3);
+        assert!(restoration.argument_filters.iter().all(|f| f.is_64bit));
+        for (index, value) in [(0, 2), (1, libc::F_SETFL as u64), (2, 0)] {
+            assert!(restoration
+                .argument_filters
+                .iter()
+                .any(|f| f.arg_idx == index && f.value == value));
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2290,8 +2289,8 @@ mod tests {
                 unsafe { libc::fcntl(fd, libc::F_GETFL) },
                 original | libc::O_NONBLOCK
             );
-            let disabled = 0;
-            assert_eq!(unsafe { libc::ioctl(fd, libc::FIONBIO, &disabled) }, 0);
+            // Node restores the flags with fcntl, not the adoption ioctl.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, original) }, 0);
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original);
         }
         let duplicate = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
@@ -2324,6 +2323,25 @@ mod tests {
         }
         for command in [libc::F_SETFL, libc::F_SETOWN] {
             assert_eq!(unsafe { libc::fcntl(duplicate, command, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        for (fd, command, flags) in [
+            ((1u64 << 32) | 1, libc::F_SETFL as u64, 0),
+            (1, (1u64 << 32) | libc::F_SETFL as u64, 0),
+            (1, libc::F_SETFL as u64, 1u64 << 32),
+            (1, libc::F_SETFL as u64, libc::O_APPEND as u64),
+            (1, libc::F_SETFL as u64, libc::O_ASYNC as u64),
+            (1, libc::F_SETFL as u64, libc::O_DIRECT as u64),
+            (1, libc::F_SETFL as u64, libc::O_NOATIME as u64),
+            (1, libc::F_SETOWN as u64, 0),
+        ] {
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_fcntl, fd, command, flags) },
+                -1
+            );
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::EPERM)
