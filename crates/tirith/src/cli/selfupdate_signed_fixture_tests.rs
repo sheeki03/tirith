@@ -7,6 +7,9 @@ use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
+#[path = "selfupdate_numeric_fixture_tests.rs"]
+mod numeric;
+
 const CONTRACT: &str = "tirith_signed_replacement_fixture_v1";
 const AUTHORITY: &str = "fixture_key_signed_checksums_not_official_release";
 const MANIFEST_ENV: &str = "TIRITH_TEST_SIGNED_REPLACEMENT_MANIFEST";

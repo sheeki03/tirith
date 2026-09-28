@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only Unix PowerShell target comparisons through a pinned CLI test image.
+"""Unix PowerShell target comparisons through a pinned CLI test image.
 
 Windows uses the existing native Job controller in certify-powershell-target.ps1.
 Neither route loads a profile, installs a hook, or qualifies an automatic adapter.
+An optional private runtime copy leaves the installed runtime unchanged.
 """
 import argparse
 import hashlib
@@ -10,14 +11,18 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / 'tools/qualification/mixed_audit_native.py'
 HELPER_SHA = '913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75'
 TEST = 'cli::shell_target::native_tests::native_powershell_profile_matches_resolver'
 SCOPE = 'native_current_user_console_profile_resolution_only'
+RUNTIME_BYTES = 512 * 1024 * 1024
+RUNTIME_ENTRIES = 4096
 
 
 def require(value, message):
@@ -35,6 +40,132 @@ def digest(path, cap=512*1024*1024):
 def load_json(path, cap=128*1024):
     require(path.is_file() and not path.is_symlink() and path.stat().st_size <= cap, 'missing or oversized evidence')
     return json.loads(path.read_bytes())
+
+
+def runtime_token(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_uid, info.st_gid, info.st_nlink)
+
+
+def runtime_root_identity(path):
+    info = path.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700, 'owned private runtime root required')
+    return {'device': info.st_dev, 'inode': info.st_ino, 'uid': info.st_uid,
+            'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+
+
+def runtime_inventory(root):
+    """Capture the public runtime without following links or special files."""
+    require(root.is_absolute() and root.resolve(strict=True) == root, 'canonical runtime root required')
+    rows, total = [], 0
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        info = path.lstat()
+        relative = path.relative_to(root)
+        require(len(relative.parts) <= 24 and len(rows) < RUNTIME_ENTRIES, 'runtime inventory exceeds bound')
+        row = {'path': relative.as_posix(), 'mode': stat.S_IMODE(info.st_mode)}
+        if stat.S_ISDIR(info.st_mode):
+            row['kind'] = 'directory'
+            children = []
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    require(len(rows) + len(pending) + len(children) + 1 < RUNTIME_ENTRIES,
+                            'runtime entry cap exceeded')
+                    children.append(Path(entry.path))
+            pending.extend(sorted(children, reverse=True))
+        elif stat.S_ISREG(info.st_mode):
+            total += info.st_size
+            require(info.st_size <= 64*1024*1024 and total <= RUNTIME_BYTES, 'runtime byte cap exceeded')
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                before = os.fstat(fd)
+                require(runtime_token(before) == runtime_token(info), 'runtime file changed during capture')
+                h, count = hashlib.sha256(), 0
+                while True:
+                    part = os.read(fd, 1024*1024)
+                    if not part:
+                        break
+                    count += len(part)
+                    require(count <= info.st_size, 'runtime file grew during capture')
+                    h.update(part)
+                after = os.fstat(fd)
+                require(count == info.st_size and runtime_token(before) == runtime_token(after)
+                        and runtime_token(path.lstat()) == runtime_token(info),
+                        'runtime file changed during capture')
+                row.update(kind='file', size=count, sha256=h.hexdigest())
+            finally:
+                os.close(fd)
+        elif stat.S_ISLNK(info.st_mode):
+            link = os.readlink(path)
+            require(not os.path.isabs(link) and len(link) <= 4096, 'absolute or oversized runtime link')
+            require(path.resolve(strict=True).is_relative_to(root), 'runtime link escapes its source')
+            row.update(kind='symlink', target=link)
+        else:
+            raise ValueError('runtime contains a special file')
+        require(runtime_token(path.lstat()) == runtime_token(info), 'runtime entry changed during inventory')
+        rows.append(row)
+    return sorted(rows, key=lambda row: row['path'])
+
+
+def stage_runtime(source, destination):
+    """Copy observed runtime bytes; never chmod or modify the installed runtime."""
+    before = runtime_inventory(source)
+    require(destination.is_dir() and not destination.is_symlink() and not any(destination.iterdir())
+            and destination.stat().st_uid == os.getuid() and stat.S_IMODE(destination.stat().st_mode) == 0o700,
+            'empty owned private staging directory required')
+    identity = runtime_root_identity(destination)
+    require(shutil.disk_usage(destination).free >= 2*RUNTIME_BYTES, 'insufficient runtime staging space')
+    expected = []
+    for original in before:
+        row = dict(original)
+        target = destination / row['path']
+        if row['kind'] == 'directory':
+            if row['path'] != '.':
+                target.mkdir(mode=0o700)
+            row['mode'] = 0o700
+        elif row['kind'] == 'symlink':
+            target.symlink_to(row['target'])
+            row['mode'] = stat.S_IMODE(target.lstat().st_mode)
+        else:
+            origin = source / row['path']
+            fd = os.open(origin, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as reader, target.open('xb') as writer:
+                info = os.fstat(reader.fileno())
+                require(stat.S_ISREG(info.st_mode) and info.st_size == row['size'], 'runtime source type or size changed')
+                copied = 0
+                h = hashlib.sha256()
+                while True:
+                    part = reader.read(min(1024*1024, row['size'] + 1 - copied))
+                    if not part:
+                        break
+                    copied += len(part)
+                    require(copied <= row['size'], 'runtime source grew while copying')
+                    writer.write(part)
+                    h.update(part)
+                require(copied == row['size'] and h.hexdigest() == row['sha256']
+                        and runtime_token(os.fstat(reader.fileno())) == runtime_token(info)
+                        and runtime_token(origin.lstat()) == runtime_token(info), 'runtime source changed while copying')
+            row['mode'] = 0o500 if row['mode'] & 0o111 else 0o400
+            target.chmod(row['mode'])
+        expected.append(row)
+    require(runtime_inventory(source) == before, 'installed runtime changed during copying')
+    require(runtime_inventory(destination) == expected, 'private runtime copy differs from observed source')
+    require(runtime_root_identity(destination) == identity, 'staged runtime root changed during copy')
+    return {'source': str(source), 'staged': str(destination), 'source_inventory': before,
+            'staged_inventory': expected, 'root_identity': identity, 'installed_runtime_modified': False}
+
+
+def cleanup_runtime(copy):
+    staged = Path(copy['staged'])
+    require(runtime_root_identity(staged) == copy['root_identity'], 'staged runtime root was replaced')
+    require(runtime_inventory(Path(copy['source'])) == copy['source_inventory'], 'installed runtime changed')
+    require(runtime_inventory(staged) == copy['staged_inventory'], 'staged runtime changed')
+    require(runtime_root_identity(staged) == copy['root_identity'], 'staged runtime root changed before cleanup')
+    shutil.rmtree(staged)
+    require(not staged.exists(), 'owned runtime cleanup incomplete')
+    copy['cleanup_confirmed'] = True
 
 
 def select_artifact(messages, root):
@@ -85,11 +216,14 @@ def main():
     parser.add_argument('--cargo-messages', type=Path, required=True)
     parser.add_argument('--powershell', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--stage-runtime', action='store_true',
+                        help='copy the observed public runtime into a private owned root before qualification')
     args = parser.parse_args()
     require(args.output.is_absolute() and not args.output.exists(), 'fresh absolute evidence directory required')
     args.output.mkdir(mode=0o700)
     report = {'schema_version': 1, 'passed': False, 'status': 'refused', 'scope': SCOPE,
               'cases': [], 'automatic_adapter_qualified': False}
+    staged = None
     try:
         require(sys.flags.optimize == 0 and not os.environ.get('PYTHONOPTIMIZE'), 'unoptimized Python required')
         if os.name != 'posix' or sys.platform not in ('linux', 'darwin') or not args.powershell.is_file():
@@ -99,6 +233,10 @@ def main():
         selected = select_artifact(args.cargo_messages.read_text(), ROOT)
         binary = Path(selected['executable']).resolve(strict=True)
         shell = args.powershell.resolve(strict=True)
+        if args.stage_runtime:
+            staged = Path(tempfile.mkdtemp(prefix='.tirith-pwsh-runtime-', dir=Path.home().resolve(strict=True)))
+            report['runtime_copy'] = stage_runtime(shell.parent, staged)
+            shell = staged / shell.name
         binary_sha, shell_sha = digest(binary), digest(shell, 256*1024*1024)
         require(digest(HELPER) == HELPER_SHA, 'native ownership helper changed')
         spec = importlib.util.spec_from_file_location('powershell_target_owner', HELPER)
@@ -142,6 +280,11 @@ def main():
     except BaseException as error:
         report['error'] = str(error)[:4096]
     finally:
+        if staged is not None:
+            try:
+                cleanup_runtime(report['runtime_copy'])
+            except BaseException as error:
+                report.update(passed=False, status='refused', runtime_cleanup_error=str(error)[:4096])
         with (args.output / 'report.json').open('x') as stream:
             json.dump(report, stream, indent=2); stream.write('\n')
     print(json.dumps({'passed': report['passed'], 'status': report['status'], 'report': str(args.output / 'report.json')}))

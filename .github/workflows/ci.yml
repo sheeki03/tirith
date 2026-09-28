@@ -61,6 +61,7 @@ jobs:
           python3 tools/qualification/test_compatibility_capture.py
           python3 tools/qualification/test_durable_boundaries_native.py
           python3 tools/qualification/test_service_coordination_native.py
+          python3 tools/qualification/test_signed_numeric_inputs.py
       - name: Validate managed browser qualification predicates
         run: |
           set -euo pipefail
@@ -272,6 +273,7 @@ jobs:
             python3 -B scripts/certify-powershell-target.py `
               --cargo-messages (Join-Path $env:RUNNER_TEMP 'tirith-service-coordination/cargo.jsonl') `
               --powershell (Get-Process -Id $PID).Path `
+              --stage-runtime `
               --output (Join-Path $env:RUNNER_TEMP 'tirith-powershell-targets')
             if ($LASTEXITCODE -ne 0) { throw 'Native PowerShell target resolution failed' }
           }

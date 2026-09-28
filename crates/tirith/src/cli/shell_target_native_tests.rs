@@ -212,8 +212,11 @@ fn native_powershell_profile_matches_resolver() {
         .env(
             "PSModuleAnalysisCachePath",
             output.with_extension("module-cache"),
-        )
-        .cwd(output.parent().ok_or("missing output parent")?);
+        );
+        // Windows deliberately chooses the trusted executable directory rather
+        // than accepting a caller-controlled DLL search directory.
+        #[cfg(unix)]
+        let spec = spec.cwd(output.parent().ok_or("missing output parent")?);
         let outcome = tirith_core::trusted_child::run(&executable, &spec);
         let after = profile_state(profile)?;
         report["profile_after"] = after.clone();

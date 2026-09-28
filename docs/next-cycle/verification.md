@@ -1,5 +1,66 @@
 # Implementation verification
 
+## September 28: 6e79b3dd platform results and PowerShell correction
+
+The [release workflow](https://github.com/sheeki03/tirith/actions/runs/36378009327),
+[native ARM workflow](https://github.com/sheeki03/tirith/actions/runs/36378009053),
+[fuzz workflow](https://github.com/sheeki03/tirith/actions/runs/36378009093) and
+[benchmark workflow](https://github.com/sheeki03/tirith/actions/runs/36378009149)
+pass on `6e79b3dd`. All six release target builds pass; publishing remains
+skipped. The [CI run](https://github.com/sheeki03/tirith/actions/runs/36378009061)
+passes macOS, Rust 1.83, strict Clippy and the ordinary Linux/Windows workspace
+tests, but fails the new native PowerShell target step on Linux and Windows.
+
+The retained Windows reports identify the forbidden explicit child working
+directory in the test harness. The correction uses the trusted-child runner's
+existing Windows directory selection. The Linux reports identify a writable
+ancestor of the preinstalled PowerShell runtime. The Unix driver can now copy
+the observed runtime into a fresh private directory in the current user's home,
+verify its bounded file inventory, and query through that copy. The installed
+runtime is not modified. Both changes preserve the production trust checks.
+
+Seven driver controls pass, including refusing escaping links, special files,
+oversized inventories and cleanup of a replaced or changed staging directory.
+A real macOS PowerShell runtime copy preserves all 614 entries and 201,084,070
+file bytes, then confirms owned cleanup with the original inventory unchanged.
+Its receipt SHA-256 is
+`70d99007c56e1fc471e693cf763351b090e88078c8f4d1b9c8571880f4ee2921`.
+Independent review, formatting and workflow validation pass. Corrected native
+Linux/Windows execution remains pending; the previous failed run is retained.
+
+## September 28: ordinary CI resource gate on 6e79b3dd
+
+The first ordinary PR resource gate passes in
+[run 36378009149, attempt 1](https://github.com/sheeki03/tirith/actions/runs/36378009149).
+Its actual measured checkout is `dfcd8ec5003fd7c09b9a452b3b25014908e3d307`,
+whose tree `a7bb69f2c398cac2941ea575d09947e6e6ac5132` matches product commit
+`6e79b3ddda1e9d266f144c3b4bffdcaa7f2742b7`. Source observations before and after
+match. Admission and confirmation agree on the reviewed macOS ARM cohort,
+Rust/Cargo 1.98.1, Python runtime, unchanged measurement tools and budget.
+
+Independent recomputation from the retained raw samples reproduces all six
+maxima, and rerunning the unchanged budget checker produces the identical
+result. The owned dashboard service exits with every cleanup check satisfied.
+
+| Measured workload | Maximum bytes | Ceiling bytes | Samples |
+| --- | ---: | ---: | ---: |
+| Clean analysis allocations | 48,307,398 | 67,108,864 | 100 |
+| Subsequent clean analysis allocations | 120,397 | 131,072 | 99 |
+| URL pipeline allocations | 72,060,053 | 100,663,296 | 100 |
+| Subsequent URL pipeline allocations | 1,670,451 | 2,097,152 | 99 |
+| Recent history allocations | 8,692,440 | 12,582,912 | 100 |
+| Ordinary check peak RSS | 43,974,656 | 50,331,648 | 100 |
+
+The authenticated artifact ZIP SHA-256 is
+`7413911daad1c900f6334b42a10afb4871e97f48434fc797767deb739cba4676`;
+the independent review is
+`256eda8b272edb94922aed8e6103428eeb870e42f1d6b671185748a3fcecc426`.
+The measured executable is
+`1cc6abed10e6dbaf300f737154775d4082bc4ba3829cf5e318a8a5c8e5d81dba`.
+This closes the pending ordinary-CI enforcement check for the six reviewed byte
+limits. It does not establish a universal latency budget or qualify unrelated
+host workloads. The separate Performance job also passes in that run.
+
 ## September 28: integrated hook and native qualification candidate
 
 The complete local `cargo test --workspace --locked` run passes: 2,119 primary
