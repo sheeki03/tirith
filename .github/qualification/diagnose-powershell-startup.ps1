@@ -33,6 +33,19 @@ $report = [ordered]@{
     profile_loaded=$false; profile_writes=$false; source_pins=$pins; workflow_event_revision=$env:GITHUB_SHA; cases=@()
 }
 $leases=[Collections.Generic.List[IO.FileStream]]::new()
+function Assert-DiagnosticCleanup($Result) {
+    # Timeout is an observation only when no native process or pipe remains.
+    foreach ($name in @('NativeJob','JobEmpty','LeaderReaped','OutputDrained')) {
+        if ($Result.$name -isnot [bool] -or -not $Result.$name) { throw ('Unconfirmed diagnostic cleanup: '+$name) }
+    }
+    foreach ($name in @('DescendantsLeaked','OutputOverflow')) {
+        if ($Result.$name -isnot [bool] -or $Result.$name) { throw ('Diagnostic ownership/capture failed: '+$name) }
+    }
+    foreach ($name in @('Error','CleanupError')) {
+        if ($Result.$name -isnot [string] -or $Result.$name.Length -ne 0) { throw ('Diagnostic process failure: '+$name) }
+    }
+    if ($Result.TimedOut -isnot [bool]) { throw 'Missing diagnostic timeout state' }
+}
 function Profile-State([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return @{exists=$false} }
     $file=Get-CiRegularFile $Path
@@ -44,7 +57,7 @@ try {
     $source=[IO.File]::ReadAllText((Join-Path $Workspace 'crates/tirith/src/cli/shell_target_native_tests.rs'))
     $match=[regex]::Match($source, '(?m)^const QUERY: &str = r#"([^\r\n]+)"#;$')
     if (-not $match.Success) { throw 'Missing exact native target query' }
-    $query=$match.Groups[1].Value
+    $query="[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_ENTERED');"+$match.Groups[1].Value+";[Console]::Error.WriteLine('TIRITH_NATIVE_QUERY_FINISHED')"
     $baseKeys=@('HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','XDG_CONFIG_HOME','SystemRoot','WINDIR','APPDATA','LOCALAPPDATA','TEMP','TMP','TMPDIR','LANG','LC_ALL')
     $documents=[Environment]::GetFolderPath('MyDocuments')
     $variants=@(
@@ -103,14 +116,17 @@ try {
                 $case.profile_before=$before
                 $run=[TirithCi.ProcessRunner]::Run($application,@('-NoLogo','-NoProfile','-NonInteractive','-Command',$query),$cwd,$environment,20,65536)
                 $case.process=Save-CiProcessResult $dir 'query' $run
-                # Nonzero is data, but an unowned/unfinished process halts the matrix.
-                Assert-CiProcessCompleted $run
+                # Nonzero/timeout is data; uncertain native cleanup halts the matrix.
+                Assert-DiagnosticCleanup $run
+                $case.query_entered=$run.Stderr.Contains('TIRITH_NATIVE_QUERY_ENTERED')
+                $case.query_finished=$run.Stderr.Contains('TIRITH_NATIVE_QUERY_FINISHED')
                 $after=Profile-State $variant.profile
                 $case.profile_after=$after
                 $case.profile_unchanged=($before|ConvertTo-Json -Depth 10 -Compress) -ceq ($after|ConvertTo-Json -Depth 10 -Compress)
                 if (-not $case.profile_unchanged) { throw 'Personal profile changed' }
-                $case.query_succeeded=$run.ExitCode -eq 0
-                if ($run.ExitCode -eq 0) {
+                $case.query_succeeded=($run.ExitCode -eq 0 -and -not $run.TimedOut)
+                if ($case.query_succeeded) {
+                    if (-not $case.query_entered -or -not $case.query_finished) { throw 'Successful query omitted progress markers' }
                     $observed=$run.Stdout|ConvertFrom-Json -Depth 10
                     if ($observed.host_name -cne 'ConsoleHost' -or $observed.profile -cne $variant.profile -or
                         $observed.current_user_current_host -cne $variant.profile -or
