@@ -16,7 +16,8 @@ tirith itself launches, never to arbitrary shell commands.
 | `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | default for every live run (`--capsule` remains accepted) | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
-| `tirith pkg install` (execution currently disabled on every host) | always | deny-all | refuses before resolver, quarantine, checkpoint, or package execution |
+| `tirith pkg install` (generic backend disabled on every host) | always | deny-all | refuses before resolver, quarantine, checkpoint, or package execution |
+| `tirith pkg install-npm` (little-endian LP64 GNU Linux AArch64 with exact characterized runtime) | always | deny-all | fail closed; requires current signed v2 source, fresh task authority and complete native controls |
 | `tirith capsule run` (native x86_64 and AArch64 Linux with usable Landlock and seccomp) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; hosts missing required controls refuse before anything is copied or spawned |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
@@ -34,7 +35,11 @@ checkpoint creation, or package execution. `--yes`, `--allow-degraded`, sudo, an
 administrator access do not enable it. The hidden private-input launcher also
 refuses before creating a namespace or starting its target.
 
-This restriction applies to contained package execution. `tirith package inspect`
+This restriction applies to the generic private-input package backend. The
+separate `tirith pkg install-npm` route uses its own sealed-descriptor launcher
+and narrow [LocalLeafNoScriptsV1 contract](npm-install-contract.md). Its native
+qualification covers little-endian LP64 GNU Linux AArch64 only and cannot bypass exact runtime,
+production threat-data or current task/containment checks. `tirith package inspect`
 and `tirith pkg verify-env` remain available; the latter verifies an existing
 environment without launching pip. `tirith pkg approve` remains subject to its
 separate approval-authority and platform requirements and never installs; an

@@ -1,10 +1,12 @@
 # LocalLeafNoScriptsV1 installation contract
 
-Status: the bounded WP26 implementation is registered for review and tracking.
-Native execution remains disabled on every host until the complete launch,
-publication and recovery route passes qualification. Inspection, comparison and
-saved review records do not authorize installation. Administrator access and
-confirmation flags do not enable the route.
+Status: native execution is qualified only for little-endian LP64 GNU Linux AArch64 with the exact
+Node 26.7.0, npm 11.19.0 and retained runtime-file closure. GNU ILP32, ARM musl, x86 and
+other platforms remain unqualified for this route. Every launch must still
+obtain complete native containment and satisfy current artifact, production
+threat-source, policy, task, tool, target and signing-key checks. Inspection,
+comparison and saved review records do not authorize installation.
+Administrator access and confirmation flags cannot bypass these requirements.
 
 ## Command lifecycle
 
@@ -12,8 +14,11 @@ On Linux, `tirith pkg install-npm plan ARCHIVE... --target NEW_DIRECTORY`
 reinspects exact local archives and records an immutable review intent. Its
 output identifies the operation and the digest to review. `status OPERATION`
 reads historical observations. `apply OPERATION --reviewed DIGEST` requires that
-exact review and recaptures current inputs, policy and task authority; it
-currently refuses at the native qualification gate before recording a start.
+exact review and recaptures current inputs, policy and task authority. Unsupported
+native targets refuse at the qualification gate before recording a start. On
+the qualified target, a successful gate check does not promise that the exact
+runtime or required kernel controls are available; those checks still precede
+package-manager execution.
 
 The review digest commits to the entire intent, including private policy inputs,
 working directory and retained archive generations. A private random nonce
@@ -71,7 +76,8 @@ missing or stale threat data, incomplete analysis and any decision other than
 Allow. A caller-supplied threat generation or inspection report cannot substitute
 for that decision. The plan retains the source handles and private decision
 commitment and revalidates them before staging or other effects. This closes the
-preparation authority gap; it does not enable the contained install launcher.
+preparation authority gap; it does not itself authorize the contained install
+launcher.
 
 The source must be a current, production-signed ThreatDB v2 with artifact-hash
 coverage. A valid v1 signature alone cannot provide that coverage. The published
@@ -121,8 +127,10 @@ offline mode, ignored scripts, no audit/fund/update checks, disabled bin links,
 no root lockfile/save mutation, and an explicit transaction target. Their
 complete interaction is bound to Node 26.7.0 and npm 11.19.0, including the entire
 hidden lockfile and physical target path used in its package keys. Native stock
-npm characterization has passed for the sealed bootstrap, but the full Tirith
-launch and output-verification transaction still needs native acceptance.
+npm characterization and the complete native launch, verification, publication
+and recovery mechanics have passed for the qualified little-endian LP64 GNU Linux AArch64 route.
+The latter uses an explicitly isolated test signing authority and is separate
+from production-feed availability.
 
 ## Verification and recovery
 
@@ -171,11 +179,13 @@ normal production-key build before transaction effects.
 
 Results must identify the source difference, compiled key, signed feed, tool
 closure and executable hashes. Test-authority results establish the exercised
-native mechanics; they do not establish production-feed adoption, public CLI
-admission or enabled installation. Controlled unwinding after child completion
-must be distinguished from process death during execution. The execution gate
-remains closed until the supported contract's complete acceptance evidence is
-reviewed.
+native mechanics and the explicit ordinary-executable plan/apply/status/retry
+case under that fixture authority. They do not establish production-feed
+adoption or authorize a real installation. Controlled unwinding after child completion
+must be distinguished from process death during execution. The qualified target
+selection is based on reviewed native mechanics and shared containment/lifetime
+controls. Production-signed v2 availability remains a runtime prerequisite; a
+test-authority feed cannot satisfy a normal production build.
 
 - Real supported npm/Node version and complete argv/output characterization.
 - Artifact replacement, tool/config/policy drift and changed destination refusal.
@@ -186,9 +196,11 @@ reviewed.
 - Child failure, cancellation, interruption, identical retry, publication race
   and cleanup under replaced directories.
 
-The available Docker server uses an aarch64 Linux 6.12.76 kernel. A separate WP27
-native aarch64 Landlock/seccomp backend has passed its separate primitive and
-launcher checks, but that does not qualify this npm transaction. Existing
-package execution remains disabled. An emulated x86_64 process on an ARM kernel
-is not evidence of native x86_64 seccomp enforcement. The complete native npm
-contract must pass before this execution capability is enabled.
+The accepted native transaction evidence covers little-endian LP64 GNU Linux AArch64, four
+coordinator cases, separate lifecycle/implicit-gyp controls and an ordinary CLI
+plan/apply/status/retry case under the isolated test signing authority. Network and
+outside-write restrictions and parent/guard lifetime behavior also rely on the
+reviewed composition with the qualified shared native mechanisms; they are not
+claims of directly observed malicious npm outside writes or live npm SIGKILL.
+The generic private-input package backend remains disabled. Emulated x86_64 and
+ARM musl do not acquire npm execution qualification from this GNU evidence.
