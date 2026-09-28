@@ -1,20 +1,10 @@
 name: Native ARM containment
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/docker/native-arm-builder.Dockerfile'
-      - '.github/scripts/*native*'
-      - '.github/workflows/native-arm-containment.yml'
   workflow_dispatch:
     inputs:
       remaining_qualification:
-        description: 'Qualify pinned normal-source Clippy and isolated npm fixture-authority mechanics'
+        description: 'One metadata-only ARM runtime prerequisite observation; no product or build'
         type: boolean
         required: true
         default: false
@@ -22,129 +12,59 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-arm-containment-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification && github.run_id || 'standard' }}
-  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.remaining_qualification) }}
+  group: native-arm-metadata-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  native-artifact:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.remaining_qualification }}
-    name: Native ARM (${{ matrix.target }})
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Require a native ARM kernel and identify source
-        id: source
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = aarch64
-          digest=$(git archive --format=tar HEAD | sha256sum | cut -d ' ' -f 1)
-          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/native-arm/target" "$RUNNER_TEMP/native-arm/artifact"
-      - name: Prepare pinned MSRV builder
-        run: docker build --platform linux/arm64 -t tirith-native-arm-builder -f .github/docker/native-arm-builder.Dockerfile .github/docker
-      - name: Build candidate archive from this source
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          docker run --rm --cpus 3 --memory 10g --memory-swap 10g --pids-limit 1024 \
-            -e CARGO_TARGET_DIR=/build \
-            -v "$GITHUB_WORKSPACE:/source:ro" -v "$RUNNER_TEMP/native-arm/target:/build" \
-            -w /source tirith-native-arm-builder \
-            cargo build -p tirith --bin tirith --release --locked --target "$TARGET" -j 3
-          tar -czf "$RUNNER_TEMP/native-arm/artifact/tirith-$TARGET.tar.gz" \
-            -C "$RUNNER_TEMP/native-arm/target/$TARGET/release" tirith
-      - name: Qualify exact candidate archive without elevation
-        env:
-          TARGET: ${{ matrix.target }}
-          SOURCE_SHA256: ${{ steps.source.outputs.sha256 }}
-        run: |
-          .github/scripts/test-native-arm-artifact.sh \
-            "$RUNNER_TEMP/native-arm/artifact/tirith-$TARGET.tar.gz" \
-            "$TARGET" "$SOURCE_SHA256" "$RUNNER_TEMP/native-arm/evidence"
-      - name: Native ARM syscall and breakpoint contracts
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          set -euo pipefail
-          docker run --rm --cpus 3 --memory 10g --memory-swap 10g --pids-limit 1024 \
-            -e CARGO_TARGET_DIR=/build \
-            -v "$GITHUB_WORKSPACE:/source:ro" -v "$RUNNER_TEMP/native-arm/target:/build" \
-            -w /source tirith-native-arm-builder sh -c '
-              cargo test -p tirith-core --lib --locked -j 3 capsule::linux::aarch64_seccomp::tests -- --test-threads=1 &&
-              cargo test -p tirith-core --lib --locked -j 3 production_policy_allows_local_readiness_without_network_or_signal_escape -- --test-threads=1 &&
-              cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::aarch64_trace::tests -- --test-threads=1 &&
-              cargo test -p tirith --bin tirith --locked -j 3 cli::capsule_child::parent_lifetime::tests -- --test-threads=1
-            '
-      - name: Preserve native evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: native-arm-evidence-${{ matrix.target }}
-          path: |
-            ${{ runner.temp }}/native-arm/evidence/*.json
-            ${{ runner.temp }}/native-arm/evidence/*.txt
-          if-no-files-found: warn
-          retention-days: 14
-
-  remaining-qualification:
-    name: Native ARM Clippy and fixture-authority npm lifecycle
+  metadata-only:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.remaining_qualification }}
+    name: Native ARM metadata only
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 110
+    timeout-minutes: 10
     steps:
-      - name: Create partial-failure evidence before checkout
+      - name: Retain original dispatch identity before checkout
         run: |
-          python3 - <<'PY'
+          python3 - <<'PYCODE'
           import json, os, pathlib, platform
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-fixture-v5'
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-arm-metadata-v1'
           root.mkdir(mode=0o700, exist_ok=False)
           (root / 'dispatch-context.json').write_text(json.dumps({
               'controller_event_commit': os.environ['GITHUB_SHA'],
-              'product_commit': '572e42f3991378526491450b2922d2ff85c2edf4',
-              'product_tree': 'a38793a23a4431690f3f68a345d6e7397b66d376',
               'run_id': os.environ['GITHUB_RUN_ID'],
               'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
               'runner_machine': platform.machine(),
-              'qualification_started': False
+              'product_execution': False,
+              'build_execution': False,
+              'original_v5_runner_value_inferred': False
           }, indent=2) + '\n')
-          PY
-      - name: Check out the reviewed controller revision
+          assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+          PYCODE
+      - name: Sparse checkout the reviewed controller and owned process helper only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: controller
           fetch-depth: 1
           persist-credentials: false
-      - name: Check out the exact product revision independently
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: 572e42f3991378526491450b2922d2ff85c2edf4
-          path: product
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Admit isolated resources and qualify the pinned source
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/qualification/native-arm-npm-metadata.py
+            /.github/workflows/native-arm-containment.yml
+            /tools/qualification/mixed_audit_native.py
+      - name: Observe exact runtime prerequisites without product execution
         run: |
           set -euo pipefail
-          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-npm-fixture.py" \
-            --source-root "$GITHUB_WORKSPACE/product" \
-            --output "$RUNNER_TEMP/native-arm-fixture-v5/run" \
-            --manifest-sha256 59d3dccd552fa118742fd60619078047db88c83b7caa2645d7841c6bb6f1f7bc \
-            --driver-sha256 9220bb4a01857a4eb70ea75ee46bdd2d96d932a5357ae85f66304511426e6eea
-      - name: Preserve complete bounded evidence, including partial failures
+          test "$(git -C "$GITHUB_WORKSPACE/controller" rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B "$GITHUB_WORKSPACE/controller/.github/qualification/native-arm-npm-metadata.py" \
+            --output "$RUNNER_TEMP/native-arm-metadata-v1/run" \
+            --driver-sha256 e5ed3a1a754b3b46cb22d1cac3caf0c34b37f899684d6311739fbfcb7f744fc0
+      - name: Preserve bounded metadata and partial-failure cleanup
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: native-arm-fixture-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          name: native-arm-metadata-v1-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-arm-fixture-v5/dispatch-context.json
-            ${{ runner.temp }}/native-arm-fixture-v5/run/
+            ${{ runner.temp }}/native-arm-metadata-v1/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
