@@ -34,14 +34,34 @@ pub(crate) struct PackageApprovalAvailability {
 
 impl PackageApprovalAvailability {
     fn from_prerequisites(platform: bool, sudo: bool, helper: bool) -> Self {
+        // `pkg approve` refuses after this check in every state (contained
+        // package execution, the only consumer of approvals, is disabled), so
+        // no state may suggest that sudo, the helper, or approve itself would
+        // issue an approval. The state names are part of the status schema.
         let (state, detail, next_action) = if !platform {
-            ("unsupported", "package approvals are redeemable only on x86_64 Linux; native issuance is unavailable on this platform.", "Command checks and shell protection remain available; use a supported x86_64 Linux host for native package approvals.")
+            (
+                "unsupported",
+                "package approvals are redeemable only on x86_64 Linux, and tirith pkg approve issues no approvals in this release on any platform.",
+                "No action needed: command checks and shell protection remain available. Contained package execution is disabled, so moving to another host does not enable it.",
+            )
         } else if !sudo {
-            ("unavailable", "Native package-approval issuance is off: trusted /usr/bin/sudo is unavailable. Command checks and shell protection do not require sudo.", "Only if you need tirith pkg approve, have an administrator install sudo and the protected Tirith approval helper, then run pkg approve from a non-root interactive session with fresh administrator confirmation.")
+            (
+                "unavailable",
+                "Native package-approval issuance is off: trusted /usr/bin/sudo is unavailable, and tirith pkg approve issues no approvals in this release. Command checks and shell protection do not require sudo.",
+                "No action needed: contained package execution is disabled, so installing sudo or the protected approval helper does not enable it.",
+            )
         } else if !helper {
-            ("unavailable", "Native package-approval issuance is off: the protected approval helper is unavailable. Command checks and shell protection do not require it.", "Only if you need tirith pkg approve, install the protected helper from a verified matching release (manual installer: TIRITH_INSTALL_APPROVAL_HELPER=1); provisioning requires a root session or trusted /usr/bin/sudo.")
+            (
+                "unavailable",
+                "Native package-approval issuance is off: the protected approval helper is unavailable, and tirith pkg approve issues no approvals in this release. Command checks and shell protection do not require it.",
+                "No action needed: contained package execution is disabled, so installing the protected approval helper does not enable it.",
+            )
         } else {
-            ("available_on_explicit_request", "Native approval prerequisites are present; nothing runs or elevates automatically. Fresh administrator confirmation is still required for each pkg approve invocation.", "Run tirith pkg approve only when you intend to approve an exact package plan. A non-root interactive operator and sudo password confirmation are required; passwordless approval is refused.")
+            (
+                "available_on_explicit_request",
+                "Native approval prerequisites are present, but tirith pkg approve issues no approvals in this release; nothing runs or elevates automatically.",
+                "No action needed: pkg approve validates its request and then refuses with private_input_execution_unqualified without prompting for sudo or calling the helper. Contained package execution is disabled; having the helper and sudo does not enable it.",
+            )
         };
         Self {
             state,
@@ -152,7 +172,37 @@ mod availability_tests {
                     if platform && !sudo {
                         assert!(report.detail.contains("off"));
                         assert!(report.detail.contains("/usr/bin/sudo"));
-                        assert!(report.next_action.contains("Only if you need"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `pkg approve` refuses in every state, so the availability metadata
+    /// (printed by `status --json`, `doctor`, the control API and approve's own
+    /// native_authority error) must never tell the operator that installing
+    /// sudo or the helper, or running approve, will issue an approval.
+    #[test]
+    fn every_state_says_approve_issues_no_approvals_and_nothing_enables_it() {
+        for platform in [false, true] {
+            for sudo in [false, true] {
+                for helper in [false, true] {
+                    let report =
+                        PackageApprovalAvailability::from_prerequisites(platform, sudo, helper);
+                    let text = format!("{} {}", report.detail, report.next_action);
+                    assert!(
+                        text.contains("tirith pkg approve issues no approvals"),
+                        "{text}"
+                    );
+                    assert!(text.contains("does not enable it"), "{text}");
+                    for stale in [
+                        "Only if you need",
+                        "Run tirith pkg approve",
+                        "use a supported x86_64 Linux host for native package approvals",
+                        "sudo password confirmation are required",
+                        "Fresh administrator confirmation is still required",
+                    ] {
+                        assert!(!text.contains(stale), "stale guidance {stale:?}: {text}");
                     }
                 }
             }

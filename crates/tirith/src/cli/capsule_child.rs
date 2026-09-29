@@ -106,14 +106,6 @@ pub struct ParsedArgs {
     /// uses `/proc/self/fd/<n>` so a later visible-path replacement cannot
     /// redirect HOME/XDG authority.
     pub temp_home_fd: Option<i32>,
-    /// Optional inherited directory descriptor used as the exact target cwd.
-    /// The launcher validates it against `cwd_root`, enters it with `fchdir`,
-    /// and keeps artifact operands strictly relative to that vnode.
-    pub cwd_fd: Option<i32>,
-    /// The single read-root placeholder paired with `cwd_fd`. The launcher
-    /// replaces it with the held directory's observed canonical location before
-    /// building the OS sandbox policy.
-    pub cwd_root: Option<OsString>,
     /// Optional inherited directory descriptor that is BOTH the target's working
     /// directory and its single writable grant. The launcher enters it with
     /// `fchdir` and sources the Landlock write rule from this descriptor, so no
@@ -131,8 +123,8 @@ pub struct ParsedArgs {
 /// appear at most once: `--target-argv0 <value>`, `--target-fd <number>`,
 /// `--script-fd <number>`, `--launch-status-fd <number>`,
 /// `--launch-ack-fd <number>`, `--coverage-status-fd <number>`, and
-/// `--temp-home <absolute>`, `--cwd-fd <number>`, and
-/// `--cwd-root <absolute>`, `--work-fd <number>`, and `--work-root <absolute>`.
+/// `--temp-home <absolute>`, `--temp-home-fd <number>`, `--work-fd <number>`,
+/// and `--work-root <absolute>`.
 /// Any other option (including the retired private-input operands) is refused
 /// as unknown. Pure and platform-independent, so the argv grammar is unit-testable
 /// everywhere.
@@ -164,8 +156,6 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     let mut coverage_status_fd = None;
     let mut temp_home = None;
     let mut temp_home_fd = None;
-    let mut cwd_fd = None;
-    let mut cwd_root = None;
     let mut work_fd = None;
     let mut work_root = None;
     let mut option_index = 3usize;
@@ -268,24 +258,6 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
                 return Err("`--temp-home-fd` must not overlap standard I/O".to_string());
             }
             temp_home_fd = Some(parsed);
-        } else if option == "--cwd-fd" {
-            if cwd_fd.is_some() {
-                return Err("duplicate `--cwd-fd` launcher option".to_string());
-            }
-            let raw = value
-                .to_str()
-                .ok_or_else(|| "`--cwd-fd` is not valid UTF-8".to_string())?;
-            let parsed = raw
-                .parse::<i32>()
-                .map_err(|_| "`--cwd-fd` must be a decimal descriptor".to_string())?;
-            if parsed < 3 {
-                return Err("`--cwd-fd` must not overlap standard I/O".to_string());
-            }
-            cwd_fd = Some(parsed);
-        } else if option == "--cwd-root" {
-            if cwd_root.replace(value).is_some() {
-                return Err("duplicate `--cwd-root` launcher option".to_string());
-            }
         } else if option == "--work-fd" {
             if work_fd.is_some() {
                 return Err("duplicate `--work-fd` launcher option".to_string());
@@ -316,7 +288,6 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         launch_ack_fd,
         coverage_status_fd,
         temp_home_fd,
-        cwd_fd,
         work_fd,
     ];
     for (index, descriptor) in internal_fds.iter().enumerate() {
@@ -329,17 +300,8 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             "`--launch-status-fd` and `--launch-ack-fd` must be supplied together".to_string(),
         );
     }
-    if cwd_fd.is_some() != cwd_root.is_some() {
-        return Err("`--cwd-fd` and `--cwd-root` must be supplied together".to_string());
-    }
     if work_fd.is_some() != work_root.is_some() {
         return Err("`--work-fd` and `--work-root` must be supplied together".to_string());
-    }
-    // The two working-directory protocols are mutually exclusive: one binds a
-    // read-only grant to the descriptor, the other a writable one, and accepting
-    // both would leave the target's cwd ambiguous.
-    if work_fd.is_some() && cwd_fd.is_some() {
-        return Err("`--work-fd` and `--cwd-fd` are mutually exclusive".to_string());
     }
     if temp_home_fd.is_some() != temp_home.is_some() {
         return Err("`--temp-home-fd` and `--temp-home` must be supplied together".to_string());
@@ -361,8 +323,6 @@ pub fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         coverage_status_fd,
         temp_home,
         temp_home_fd,
-        cwd_fd,
-        cwd_root,
         work_fd,
         work_root,
         program_args,
@@ -407,221 +367,12 @@ pub fn run_on_main_thread(args: &[OsString]) -> ! {
     }
 }
 
-/// Enter a parent-held directory capability and rebase exactly one read grant to
-/// the vnode's current canonical location. The descriptor itself is the identity
-/// authority: pathname metadata is accepted only when it resolves back to the
-/// same `(device, inode)`, and the descriptor remains in the handle policy until
-/// the OS filesystem sandbox has consumed it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn prepare_bound_working_directory(
-    spec: &mut tirith_core::capsule::CapsuleSpec,
-    parsed: &ParsedArgs,
-) -> Result<Option<(std::path::PathBuf, i32)>, String> {
-    let (fd, original_root) = match (parsed.cwd_fd, parsed.cwd_root.as_deref()) {
-        (None, None) => return Ok(None),
-        (Some(fd), Some(root)) => (fd, std::path::Path::new(root)),
-        _ => return Err("bound cwd descriptor and root must be supplied together".to_string()),
-    };
-    if !original_root.is_absolute() {
-        return Err("bound cwd root must be absolute".to_string());
-    }
-    if !spec.handles.extra_unix_fds.contains(&fd) {
-        return Err(format!(
-            "bound cwd descriptor {fd} is absent from the handle allow-list"
-        ));
-    }
-
-    let canonical_bound = canonicalize_bound_working_policy(spec, original_root)?;
-
-    let mut descriptor_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, descriptor_stat.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "inspect bound cwd descriptor {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let descriptor_stat = unsafe { descriptor_stat.assume_init() };
-    if descriptor_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(format!("bound cwd descriptor {fd} is not a directory"));
-    }
-
-    if unsafe { libc::fchdir(fd) } != 0 {
-        return Err(format!(
-            "enter bound cwd descriptor {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let observed = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| format!("resolve bound cwd after fchdir: {error}"))?;
-    let observed_stat = stat_path(&observed)
-        .map_err(|error| format!("inspect resolved bound cwd {}: {error}", observed.display()))?;
-    if observed_stat.st_dev != descriptor_stat.st_dev
-        || observed_stat.st_ino != descriptor_stat.st_ino
-    {
-        return Err("resolved bound cwd no longer names the held directory identity".to_string());
-    }
-    rebase_bound_cwd_root(spec, &canonical_bound, &observed)?;
-
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(format!(
-            "arm close-on-exec for bound cwd descriptor {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(Some((observed, fd)))
-}
-
-/// Resolve every filesystem root against the launcher's inherited cwd before
-/// `fchdir` can change the meaning of a relative path. The bound root must be an
-/// isolated read grant: a broader/narrower read or write grant would authorize
-/// pathname aliases that are not tied to the retained directory descriptor.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn canonicalize_bound_working_policy(
-    spec: &mut tirith_core::capsule::CapsuleSpec,
-    original_root: &std::path::Path,
-) -> Result<std::path::PathBuf, String> {
-    let original_policy = spec.filesystem.clone();
-    let exact_bound_indices: Vec<usize> = original_policy
-        .read_roots
-        .iter()
-        .enumerate()
-        .filter_map(|(index, root)| (root == original_root).then_some(index))
-        .collect();
-    if exact_bound_indices.len() != 1 {
-        return Err(format!(
-            "bound cwd root must appear exactly once in the pre-launch read policy (found {})",
-            exact_bound_indices.len()
-        ));
-    }
-    let bound_index = exact_bound_indices[0];
-    let canonical_bound = canonicalize_one_read_root(original_root)?;
-    for (index, root) in original_policy.read_roots.iter().enumerate() {
-        if index == bound_index {
-            continue;
-        }
-        let canonical = canonicalize_one_read_root(root)?;
-        if paths_overlap(&canonical_bound, &canonical) {
-            return Err(format!(
-                "bound cwd root {} overlaps another read grant {}",
-                canonical_bound.display(),
-                canonical.display()
-            ));
-        }
-    }
-    for root in &original_policy.write_roots {
-        let canonical = canonicalize_one_read_root(root)?;
-        if paths_overlap(&canonical_bound, &canonical) {
-            return Err(format!(
-                "bound cwd root {} overlaps a writable grant {}",
-                canonical_bound.display(),
-                canonical.display()
-            ));
-        }
-    }
-    spec.filesystem =
-        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&original_policy)
-            .map_err(|error| format!("invalid pre-launch filesystem policy: {error}"))?;
-    rebase_bound_cwd_root(spec, &canonical_bound, &canonical_bound)?;
-    Ok(canonical_bound)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn canonicalize_one_read_root(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let policy = tirith_core::capsule::FilesystemPolicy {
-        read_roots: vec![root.to_path_buf()],
-        write_roots: Vec::new(),
-        deny_roots: Vec::new(),
-    };
-    let canonical = tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&policy)
-        .map_err(|error| {
-            format!(
-                "cannot canonicalize filesystem root {}: {error}",
-                root.display()
-            )
-        })?;
-    canonical.read_roots.into_iter().next().ok_or_else(|| {
-        format!(
-            "filesystem root {} disappeared during canonicalization",
-            root.display()
-        )
-    })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn stat_path(path: &std::path::Path) -> std::io::Result<libc::stat> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "bound cwd path contains an interior NUL",
-        )
-    })?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::stat(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { stat.assume_init() })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rebase_bound_cwd_root(
-    spec: &mut tirith_core::capsule::CapsuleSpec,
-    original_root: &std::path::Path,
-    observed_root: &std::path::Path,
-) -> Result<(), String> {
-    let matching: Vec<usize> = spec
-        .filesystem
-        .read_roots
-        .iter()
-        .enumerate()
-        .filter_map(|(index, root)| (root == original_root).then_some(index))
-        .collect();
-    if matching.len() != 1 {
-        return Err(format!(
-            "bound cwd root must appear exactly once in read_roots (found {})",
-            matching.len()
-        ));
-    }
-    if spec
-        .filesystem
-        .write_roots
-        .iter()
-        .any(|root| paths_overlap(original_root, root) || paths_overlap(observed_root, root))
-    {
-        return Err("bound cwd must not overlap a writable filesystem grant".to_string());
-    }
-    if spec
-        .filesystem
-        .read_roots
-        .iter()
-        .enumerate()
-        .any(|(index, root)| {
-            index != matching[0]
-                && (paths_overlap(original_root, root) || paths_overlap(observed_root, root))
-        })
-    {
-        return Err("bound cwd must not overlap another readable filesystem grant".to_string());
-    }
-    spec.filesystem.read_roots[matching[0]] = observed_root.to_path_buf();
-    Ok(())
-}
-
 /// Enter a parent-held directory capability that is also the target's single
 /// writable grant, and return it so the Landlock rule is built from the
 /// DESCRIPTOR rather than from the pathname.
 ///
-/// This is the shape the untrusted-project preset needs and the bound-cwd
-/// protocol cannot express: there the held directory is a READ grant, and a
-/// writable grant overlapping it would be a second, pathname-derived authority.
-/// Here the writable grant IS the descriptor, so there is no second authority to
+/// This is the shape the untrusted-project preset needs: the writable grant IS
+/// the descriptor, so there is no second, pathname-derived authority to
 /// disagree with it. The pathname is still proved to identify the descriptor,
 /// because a visible root that was swapped out from under the parent is a
 /// refusal rather than a run.
@@ -703,17 +454,13 @@ fn macos_launch(parsed: &ParsedArgs) -> ! {
     use std::os::unix::ffi::OsStrExt;
     use tirith_core::capsule::CapsuleSpec;
 
-    let mut spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
+    let spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith __capsule-child: invalid capsule spec JSON: {e}");
             std::process::exit(2);
         }
     };
-    if let Err(error) = prepare_bound_working_directory(&mut spec, parsed) {
-        eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
-        std::process::exit(2);
-    }
     // Seatbelt cannot bind a filesystem grant to a held vnode, so a descriptor
     // bound working directory has no meaning here and must not be silently
     // downgraded to a pathname grant.
@@ -786,7 +533,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
     use tirith_core::capsule::linux::{apply_containment, exec_cstrings};
     use tirith_core::capsule::CapsuleSpec;
 
-    let mut spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
+    let spec: CapsuleSpec = match serde_json::from_str(&parsed.spec_json) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tirith __capsule-child: invalid capsule spec JSON: {e}");
@@ -827,13 +574,6 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         std::process::exit(2);
     }
 
-    let bound_cwd = match prepare_bound_working_directory(&mut spec, parsed) {
-        Ok(bound) => bound,
-        Err(error) => {
-            eprintln!("tirith __capsule-child: invalid bound working directory: {error}");
-            std::process::exit(2);
-        }
-    };
     let bound_work = match prepare_bound_work_directory(&spec, parsed) {
         Ok(bound) => bound,
         Err(error) => {
@@ -997,18 +737,14 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
 
     // Apply the full containment sequence. On ANY error we exit non-zero and never
     // exec the target (fail-closed).
-    let mut bound_read_roots = Vec::new();
     let mut bound_write_roots = Vec::new();
-    if let Some((root, fd)) = bound_cwd.as_ref() {
-        bound_read_roots.push((root.as_path(), *fd));
-    }
     if let Some((root, fd)) = bound_work.as_ref() {
         bound_write_roots.push((root.as_path(), *fd));
     }
     if let Some(home) = temp_home.as_ref() {
         bound_write_roots.push((home.diagnostic_root.as_path(), home.fd));
     }
-    let containment_result = if bound_read_roots.is_empty() && bound_write_roots.is_empty() {
+    let containment_result = if bound_write_roots.is_empty() {
         apply_containment(
             &spec,
             temp_home.as_ref().map(|home| home.runtime_root.as_path()),
@@ -1017,7 +753,7 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
         tirith_core::capsule::linux::apply_containment_with_bound_root_sets(
             &spec,
             temp_home.as_ref().map(|home| home.runtime_root.as_path()),
-            &bound_read_roots,
+            &[],
             &bound_write_roots,
         )
     };
@@ -1028,15 +764,6 @@ fn linux_launch(parsed: &ParsedArgs) -> ! {
             std::process::exit(2);
         }
     };
-    if let Some((_, fd)) = bound_cwd {
-        if unsafe { libc::close(fd) } != 0 {
-            eprintln!(
-                "tirith __capsule-child: close bound working-directory descriptor failed: {}",
-                std::io::Error::last_os_error()
-            );
-            std::process::exit(2);
-        }
-    }
     if let Some((_, fd)) = bound_work {
         // The Landlock rule has consumed the descriptor's identity; the target
         // must not inherit the capability itself.
@@ -2053,10 +1780,10 @@ mod tests {
             "/tmp/tirith-capsule-fixed",
             "--temp-home-fd",
             "57",
-            "--cwd-fd",
+            "--work-fd",
             "59",
-            "--cwd-root",
-            "/tmp/quarantine/transactions/txn-1",
+            "--work-root",
+            "/tmp/tirith-capsule-project-ab12ef",
             "--",
             "/tmp/bound/busybox",
             "-s",
@@ -2073,17 +1800,17 @@ mod tests {
             parsed.temp_home.as_deref(),
             Some(OsStr::new("/tmp/tirith-capsule-fixed"))
         );
-        assert_eq!(parsed.cwd_fd, Some(59));
+        assert_eq!(parsed.work_fd, Some(59));
         assert_eq!(
-            parsed.cwd_root.as_deref(),
-            Some(OsStr::new("/tmp/quarantine/transactions/txn-1"))
+            parsed.work_root.as_deref(),
+            Some(OsStr::new("/tmp/tirith-capsule-project-ab12ef"))
         );
         assert_eq!(parsed.program, "/tmp/bound/busybox");
         assert_eq!(parsed.program_args, vec![OsString::from("-s")]);
     }
 
     #[test]
-    fn parse_args_carries_a_bound_work_directory_and_keeps_it_apart_from_a_bound_cwd() {
+    fn parse_args_carries_a_bound_work_directory() {
         let base = [
             "tirith",
             "__capsule-child",
@@ -2103,8 +1830,7 @@ mod tests {
             Some(OsStr::new("/tmp/tirith-capsule-project-ab12ef"))
         );
 
-        // Paired, exclusive with the read-only bound cwd, and never a duplicate
-        // of another internal descriptor.
+        // Paired, and never a duplicate of another internal descriptor.
         assert!(parse_args(&argv(&[
             "tirith",
             "__capsule-child",
@@ -2114,21 +1840,6 @@ mod tests {
             "--",
             "/bin/sh"
         ]))
-        .is_err());
-        assert!(parse_args(&argv(
-            &[
-                &base[..],
-                &[
-                    "--cwd-fd",
-                    "58",
-                    "--cwd-root",
-                    "/tmp/other",
-                    "--",
-                    "/bin/sh"
-                ]
-            ]
-            .concat()
-        ))
         .is_err());
         assert!(parse_args(&argv(
             &[
@@ -2177,6 +1888,49 @@ mod tests {
                 format!("unknown internal launcher option {:?}", OsStr::new(option))
             );
         }
+    }
+
+    /// The read-only bound-cwd protocol (`--cwd-fd`/`--cwd-root`) had one
+    /// parent caller, the removed private-input directory launch. Its operands
+    /// are refused as unknown, alone or as a complete pair, so a stale caller
+    /// can never reach a descriptor-rebased read grant.
+    #[test]
+    fn parse_args_refuses_retired_bound_cwd_operands_as_unknown() {
+        for (option, value) in [("--cwd-fd", "59"), ("--cwd-root", "/tmp/txn")] {
+            let error = parse_args(&argv(&[
+                "tirith",
+                "__capsule-child",
+                "{}",
+                option,
+                value,
+                "--",
+                "ls",
+            ]))
+            .expect_err("a retired bound-cwd operand must be refused");
+            assert_eq!(
+                error,
+                format!("unknown internal launcher option {:?}", OsStr::new(option))
+            );
+        }
+        let error = parse_args(&argv(&[
+            "tirith",
+            "__capsule-child",
+            "{}",
+            "--cwd-fd",
+            "59",
+            "--cwd-root",
+            "/tmp/txn",
+            "--",
+            "ls",
+        ]))
+        .expect_err("the retired bound-cwd pair must be refused");
+        assert_eq!(
+            error,
+            format!(
+                "unknown internal launcher option {:?}",
+                OsStr::new("--cwd-fd")
+            )
+        );
     }
 
     #[test]
@@ -2263,22 +2017,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_requires_a_complete_distinct_bound_cwd_pair() {
+    fn parse_args_requires_a_complete_distinct_bound_work_pair() {
         for args in [
             argv(&[
                 "tirith",
                 "__capsule-child",
                 "{}",
-                "--cwd-fd",
-                "63",
-                "--",
-                "ls",
-            ]),
-            argv(&[
-                "tirith",
-                "__capsule-child",
-                "{}",
-                "--cwd-root",
+                "--work-root",
                 "/tmp/txn",
                 "--",
                 "ls",
@@ -2289,9 +2034,9 @@ mod tests {
                 "{}",
                 "--target-fd",
                 "63",
-                "--cwd-fd",
+                "--work-fd",
                 "63",
-                "--cwd-root",
+                "--work-root",
                 "/tmp/txn",
                 "--",
                 "ls",
@@ -2389,89 +2134,6 @@ mod tests {
         let home_error = validate_parent_temp_home(&spec, path.as_os_str(), fd)
             .expect_err("visible temporary-HOME swap must fail");
         assert!(home_error.contains("does not identify"), "{home_error}");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn bound_cwd_rebase_requires_one_read_only_root() {
-        let original = std::path::Path::new("/private/quarantine/txn");
-        let observed = std::path::Path::new("/private/quarantine-held/txn");
-        let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
-        spec.filesystem.read_roots = vec![original.to_path_buf()];
-        spec.filesystem.write_roots.clear();
-        rebase_bound_cwd_root(&mut spec, original, observed).expect("one read-only grant");
-        assert_eq!(spec.filesystem.read_roots, vec![observed.to_path_buf()]);
-
-        let mut duplicate = tirith_core::capsule::CapsuleSpec::locked_down();
-        duplicate.filesystem.read_roots = vec![original.to_path_buf(), original.to_path_buf()];
-        duplicate.filesystem.write_roots.clear();
-        assert!(rebase_bound_cwd_root(&mut duplicate, original, observed).is_err());
-
-        let mut writable = tirith_core::capsule::CapsuleSpec::locked_down();
-        writable.filesystem.read_roots = vec![original.to_path_buf()];
-        writable.filesystem.write_roots = vec![std::path::PathBuf::from("/private/quarantine")];
-        assert!(rebase_bound_cwd_root(&mut writable, original, observed).is_err());
-
-        let mut readable_parent = tirith_core::capsule::CapsuleSpec::locked_down();
-        readable_parent.filesystem.read_roots = vec![
-            original.to_path_buf(),
-            std::path::PathBuf::from("/private/quarantine"),
-        ];
-        readable_parent.filesystem.write_roots.clear();
-        assert!(rebase_bound_cwd_root(&mut readable_parent, original, observed).is_err());
-
-        let mut readable_child = tirith_core::capsule::CapsuleSpec::locked_down();
-        readable_child.filesystem.read_roots =
-            vec![original.to_path_buf(), original.join("nested")];
-        readable_child.filesystem.write_roots.clear();
-        assert!(rebase_bound_cwd_root(&mut readable_child, original, observed).is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn bound_cwd_policy_canonicalizes_relative_roots_before_fchdir() {
-        let _global = crate::cli::test_harness::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let inherited_cwd = std::env::current_dir()
-            .and_then(std::fs::canonicalize)
-            .expect("canonical inherited cwd");
-        let original = inherited_cwd.join("nonexistent-quarantine-bound-root");
-        let relative_read = std::path::PathBuf::from("nonexistent-relative-read-root");
-        let relative_write = std::path::PathBuf::from("nonexistent-relative-write-root");
-
-        let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
-        spec.filesystem.read_roots = vec![original.clone(), relative_read.clone()];
-        spec.filesystem.write_roots = vec![relative_write.clone()];
-        spec.filesystem.deny_roots.clear();
-
-        let canonical_bound = canonicalize_bound_working_policy(&mut spec, &original)
-            .expect("preflight policy canonicalization");
-        assert_eq!(canonical_bound, original);
-        assert!(spec
-            .filesystem
-            .read_roots
-            .contains(&inherited_cwd.join(relative_read)));
-        assert!(spec
-            .filesystem
-            .write_roots
-            .contains(&inherited_cwd.join(relative_write)));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn bound_cwd_policy_rejects_overlapping_read_aliases() {
-        let original = std::path::PathBuf::from("/private/quarantine/txn");
-        for overlapping in [
-            std::path::PathBuf::from("/private/quarantine"),
-            original.join("nested"),
-        ] {
-            let mut spec = tirith_core::capsule::CapsuleSpec::locked_down();
-            spec.filesystem.read_roots = vec![original.clone(), overlapping];
-            spec.filesystem.write_roots.clear();
-            spec.filesystem.deny_roots.clear();
-            assert!(canonicalize_bound_working_policy(&mut spec, &original).is_err());
-        }
     }
 
     #[test]

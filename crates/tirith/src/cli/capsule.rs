@@ -2074,9 +2074,10 @@ struct BoundTargetFd {
 }
 
 /// A duplicate of a caller-verified directory capability reserved below the
-/// capsule's RLIMIT_NOFILE ceiling. The trusted Unix launcher inherits it,
-/// enters it with `fchdir`, rebases the matching filesystem grant to that exact
-/// identity, then arms close-on-exec before the target starts.
+/// capsule's RLIMIT_NOFILE ceiling. The trusted Unix launcher inherits it as the
+/// temporary HOME (`--temp-home-fd`) or the writable work directory
+/// (`--work-fd`), builds that write grant from the descriptor, and closes it
+/// before the target starts.
 #[derive(Debug)]
 #[cfg(target_os = "linux")]
 struct BoundDirectoryFd {
@@ -2965,7 +2966,6 @@ fn run_to_completion_with_stdin_captured(
             Some(coverage_fd),
             vec![coverage_child],
             None,
-            None,
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -3228,7 +3228,6 @@ fn run_to_completion_with_reviewed_file_captured(
             Some(launch_arm.launch_ack_fd().as_raw_fd()),
             Some(coverage_fd),
             vec![coverage_child],
-            None,
             None,
         )?;
         if let Some(directory) = cwd {
@@ -4203,7 +4202,6 @@ fn linux_supervised_launch(
         Some(ack_fd),
         Some(coverage_fd),
         proof.take_child_fds(),
-        None,
         bound_work,
     )?;
     if let Some(directory) = cwd {
@@ -4653,7 +4651,6 @@ fn linux_spawn_piped_supervised(
         Some(proof.coverage_fd),
         proof.take_child_fds(),
         None,
-        None,
     )?;
     if let Some(directory) = cwd {
         command.current_dir(directory);
@@ -4926,7 +4923,6 @@ fn linux_contained_command_os(
         None,
         Vec::new(),
         None,
-        None,
     )?;
     prepared.temp_home = temp_home;
     Ok(prepared)
@@ -4950,7 +4946,6 @@ fn linux_contained_command_os_with_options(
     launch_ack_fd: Option<i32>,
     coverage_status_fd: Option<i32>,
     extra_bound_fds: Vec<BoundTargetFd>,
-    bound_directory: Option<BoundDirectoryFd>,
     bound_work_directory: Option<BoundDirectoryFd>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -5011,12 +5006,6 @@ fn linux_contained_command_os_with_options(
             .arg("--temp-home-fd")
             .arg(capability.inherited.to_string());
     }
-    if let Some(directory) = bound_directory.as_ref() {
-        cmd.arg("--cwd-fd")
-            .arg(directory.inherited.to_string())
-            .arg("--cwd-root")
-            .arg(&directory.original_root);
-    }
     if let Some(directory) = bound_work_directory.as_ref() {
         cmd.arg("--work-fd")
             .arg(directory.inherited.to_string())
@@ -5045,12 +5034,6 @@ fn linux_contained_command_os_with_options(
             if let Some(script) = bound_script.as_ref() {
                 let _keep_destination_reserved = (&script._reservation, &script._blockers);
                 if libc::fcntl(script.inherited, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if let Some(directory) = bound_directory.as_ref() {
-                let _keep_destination_reserved = (&directory._reservation, &directory._blockers);
-                if libc::fcntl(directory.inherited, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }

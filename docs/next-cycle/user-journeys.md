@@ -22,9 +22,8 @@ tirith setup recommended --scope user --shell zsh
 
 Choose `bash`, `zsh` or `fish` for the supported initial personal setup scope.
 If `package_approval` is unavailable, ordinary checks and shell protection still
-work. Only explicit native package approval on x86_64 Linux needs its protected
-helper and fresh administrator confirmation. An unsupported backend cannot be
-enabled with sudo.
+work. `tirith pkg approve` issues no approvals in this release, so installing
+sudo or the protected helper does not enable it.
 
 The default profile is Balanced. `--profile comfortable` or `--profile strict`
 changes the reviewed selection while preserving explicit manual settings.

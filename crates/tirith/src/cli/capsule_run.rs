@@ -49,17 +49,11 @@
 //! pre-installed by a separate trusted transaction; this preset performs no
 //! network dependency installation.
 //!
-//! # Why this is not the bound-CWD launcher, and what it uses instead
+//! # Why the working directory is descriptor-bound
 //!
-//! [`crate::cli::capsule::run_to_completion_bound_directory`] refuses a bound cwd
-//! that overlaps a writable grant. That invariant protects a real property: in
-//! the bound-cwd protocol the held directory is a READ grant, so a writable grant
-//! covering the same subtree would hand the child a second, PATHNAME-derived
-//! authority that the descriptor-identity proof does not cover. The preset's held
-//! copy has to be writable, so that protocol cannot express it.
-//!
-//! What the preset must NOT do is fall back to a pathname. A pathname is resolved
-//! again in the child (once by `chdir`, once by `PathFd::new` inside the Landlock
+//! The preset's held copy is the target's working directory AND its single
+//! writable grant. What the preset must NOT do is fall back to a pathname. A
+//! pathname is resolved again in the child (once by `chdir`, once by `PathFd::new` inside the Landlock
 //! rule), and a same-UID process that renames the copy and drops a symlink in its
 //! place between the parent's identity proof and those resolutions moves the
 //! write grant to whatever the symlink names. So the launch goes through

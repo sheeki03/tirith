@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `tirith pkg approve` refuses with `private_input_execution_unqualified` right after its native-authority check and records no approval, because contained `tirith pkg install` (its only consumer) is disabled on every host. Usage and request errors keep their exit codes. The unreachable private-input launcher and pip execution path were removed; `pkg install` output, exit code, and JSON are unchanged.
+- `tirith pkg approve` refuses with `private_input_execution_unqualified` right after its native-authority check and records no approval, because contained `tirith pkg install` (its only consumer) is disabled on every host. Usage and request errors keep their exit codes. The unreachable private-input launcher and pip execution path were removed; `pkg install` output, exit code, and JSON are unchanged. The `package_approval` `detail` and `next_action` text in `tirith status --json`, `tirith doctor`, and the dashboard now says approve issues no approvals and that installing sudo or the helper does not enable it (state names unchanged).
 
 ### Fixed
 

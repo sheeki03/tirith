@@ -71,9 +71,10 @@ present, not that any approval was issued or administrator access was verified.
 All states report `automatic_elevation: false` and
 `ordinary_protection_requires_sudo: false`. `pkg approve` refuses missing native
 prerequisites before policy-server access, resolver execution, or quarantine
-work, with an explanation of the optional feature and how to enable it. When the
-prerequisites are present it refuses with `private_input_execution_unqualified`
-before any of that work.
+work. When the prerequisites are present it refuses with
+`private_input_execution_unqualified` before any of that work. In every state
+the reported `detail` and `next_action` say that approve issues no approvals in
+this release and that installing sudo or the helper does not enable it.
 
 Uninstall the CLI with its owning package manager or remove its user-owned
 binary, then remove the shell/integration entries and user data. Only remove a
