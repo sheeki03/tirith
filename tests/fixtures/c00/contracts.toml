@@ -153,7 +153,16 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # entry is added, removed, renamed, regrouped or reordered; manifest_version
 # and every policy_complete flag stay unchanged. It replaces digest
 # 36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4.
-sha256 = "3f6aa6a786787e6bb734d60b9fd23dc2083cb97cd1ad2649b08a58392ba6046e"
+#
+# Browser update pipeline removal (simplify/cycle-cleanup): the dashboard no
+# longer prepares or applies binary updates/rollbacks; it shows the exact CLI
+# or package-manager command and keeps one guarded ThreatDB refresh. Only the
+# `dashboard` coverage prose changes (it no longer claims lifecycle changes).
+# No entry is added, removed, renamed, regrouped or reordered; manifest_version,
+# every inspected value and every policy_complete flag stay unchanged. It
+# replaces digest
+# 3f6aa6a786787e6bb734d60b9fd23dc2083cb97cd1ad2649b08a58392ba6046e.
+sha256 = "9bc4e04b0aacc1bd0da755da03ab42bd5d52147ef3a3a14e6ff5f29df131ddd0"
 
 [mcp]
 default_tools = [

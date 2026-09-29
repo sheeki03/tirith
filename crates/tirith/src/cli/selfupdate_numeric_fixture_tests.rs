@@ -1,5 +1,7 @@
 //! Ignored test-only controller for owned ordinary 0.4.2/0.4.3 products.
-//! No production key, URL, policy, journal or recovery override is introduced.
+//! It drives the CLI update/rollback primitives (`tirith update` building
+//! blocks) and stops at named crash boundaries between them.
+//! No production key, URL, policy or recovery override is introduced.
 //! The controller has an independent executable path; it never impersonates a
 //! running installed product. Its input provenance is an outer owned-process
 //! observation bound to the held installed bytes and retained build closure.
@@ -9,7 +11,7 @@ use serde_json::{json, Value};
 const NUMERIC_ENV: &str = "TIRITH_TEST_NUMERIC_REPLACEMENT_MANIFEST";
 const NUMERIC_CONTRACT: &str = "tirith_signed_numeric_replacement_fixture_v1";
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Boundary {
     Complete,
@@ -209,20 +211,17 @@ fn observed_provenance(
     })
 }
 
-fn stop_at(
-    m: &NumericManifest,
-    boundary: Boundary,
-    operation: &lifecycle_operations::Operation<Value>,
-) -> Result<(), String> {
+fn stop_at(m: &NumericManifest, boundary: Boundary) -> Result<(), String> {
     if m.boundary != boundary {
         return Ok(());
     }
-    // The durable production transition and held operation lock precede this
-    // marker. The owner must observe WSTOPPED, then kill/reap its own process.
+    // Every CLI primitive before this boundary has completed. The owner must
+    // observe WSTOPPED, then kill/reap its own process and check that the
+    // installed binary is the complete old or the complete new image.
     // A marker alone never qualifies process death or recovery.
     let bytes = serde_json::to_vec(&json!({"contract": NUMERIC_CONTRACT, "operation_id": m.operation_id,
-        "pid": std::process::id(), "phase": operation.phase(), "published": operation.view().published,
-        "plan_sha256": operation.plan_sha256()})).map_err(|e| e.to_string())?;
+        "pid": std::process::id(), "phase": boundary, "published": boundary == Boundary::Published}))
+        .map_err(|e| e.to_string())?;
     fixture_create(
         &m.fixture.root.join("observed-boundary.json"),
         &bytes,
@@ -431,41 +430,7 @@ fn signed_numeric_product_publication() -> Result<(), String> {
     )?;
     revalidate(&guards, &inputs)?;
     current.revalidate()?;
-    let action = if m.action == "update" {
-        lifecycle_operations::Action::Update
-    } else {
-        lifecycle_operations::Action::Rollback
-    };
-    let store = lifecycle_operations::Store::current()?;
-    require(
-        store.reserve(&m.operation_id, action)?.is_none(),
-        "numeric operation UUID already exists",
-    )?;
-    let mut operation = store.create(&m.operation_id, action, lifecycle_operations::Preview {
-        current_version: provenance.version.clone(), candidate_version: Some(if m.action == "update" { "0.4.3" } else { "0.4.2" }.into()),
-        candidate_sequence: None, candidate_format: None, evidence: AUTHORITY.into(), compatible: true, issues: vec![],
-        configuration_changed: false, integration_reload_required: true, service_restart_required: true },
-        json!({"contract": NUMERIC_CONTRACT, "authority": AUTHORITY, "installed_sha256": m.installed.identity.sha256,
-            "candidate_sha256": f.candidate.identity.sha256, "test_source_sha256": f.test_source_manifest.sha256,
-            "installed_source_sha256": m.installed_source_manifest.sha256, "candidate_source_sha256": f.candidate_source_manifest.sha256}))?;
-    let _lock = store
-        .lock(&m.operation_id)?
-        .ok_or("numeric operation is already active")?;
-    store.transition(
-        &mut operation,
-        lifecycle_operations::Phase::Accepted,
-        false,
-        None,
-        "Owned numeric fixture accepted",
-    )?;
-    store.transition(
-        &mut operation,
-        lifecycle_operations::Phase::Verifying,
-        false,
-        None,
-        "Owned numeric fixture verifying",
-    )?;
-    stop_at(&m, Boundary::Verifying, &operation)?;
+    stop_at(&m, Boundary::Verifying)?;
     if m.action == "update" {
         verify_exact_regular_preimage(&backup, None)?;
         let auth = authorization(
@@ -491,14 +456,7 @@ fn signed_numeric_product_publication() -> Result<(), String> {
         current.revalidate()?;
         revalidate(&guards, &inputs)?;
         release_compatibility::preserve_current_for_rollback(&provenance, &auth)?;
-        store.transition(
-            &mut operation,
-            lifecycle_operations::Phase::PublicationIntent,
-            false,
-            None,
-            "Owned numeric publication intent",
-        )?;
-        stop_at(&m, Boundary::PublicationIntent, &operation)?;
+        stop_at(&m, Boundary::PublicationIntent)?;
         control.revalidate()?;
         revalidate(&guards, &inputs)?;
         current.revalidate()?;
@@ -514,14 +472,7 @@ fn signed_numeric_product_publication() -> Result<(), String> {
         )?;
         verify_exact_regular_preimage(&destination, Some(verified.binary_sha256()))?;
         verify_exact_regular_preimage(&backup, Some(&m.installed.identity.sha256))?;
-        store.transition(
-            &mut operation,
-            lifecycle_operations::Phase::Published,
-            true,
-            None,
-            "Owned numeric publication verified",
-        )?;
-        stop_at(&m, Boundary::Published, &operation)?;
+        stop_at(&m, Boundary::Published)?;
     } else {
         verify_exact_regular_preimage(&backup, Some(&m.installed.identity.sha256))?;
         let rollback = release_compatibility::VerifiedRollback::load(
@@ -540,13 +491,6 @@ fn signed_numeric_product_publication() -> Result<(), String> {
         )?;
         let control = crate::cli::control::quiesce_for_update()?;
         control.revalidate()?;
-        store.transition(
-            &mut operation,
-            lifecycle_operations::Phase::PublicationIntent,
-            false,
-            None,
-            "Owned numeric rollback intent",
-        )?;
         revalidate(&guards, &inputs)?;
         current.revalidate()?;
         rollback.revalidate(&destination, &m.installed.identity.sha256)?;
@@ -559,22 +503,8 @@ fn signed_numeric_product_publication() -> Result<(), String> {
             &auth,
         )?;
         verify_exact_regular_preimage(&destination, Some(&m.installed.identity.sha256))?;
-        store.transition(
-            &mut operation,
-            lifecycle_operations::Phase::Published,
-            true,
-            None,
-            "Owned numeric rollback verified",
-        )?;
     }
     revalidate(&guards, &inputs)?;
-    store.transition(
-        &mut operation,
-        lifecycle_operations::Phase::Completed,
-        true,
-        None,
-        "Owned numeric fixture completed; verify startup and reload separately",
-    )?;
     println!("\nTIRITH_NUMERIC_PUBLICATION_COMPLETE");
     Ok(())
 }

@@ -7,13 +7,10 @@ crashed operation. The public RFC8032 fixture key stays explicitly test-only.
 """
 import argparse
 import contextlib
-import fcntl
 import os
 from pathlib import Path
 import signal
-import stat
 import time
-import urllib.request
 import uuid
 
 import signed_numeric_inputs as numeric
@@ -75,29 +72,13 @@ def observe_and_kill(native, job, owned, operation, boundary, installed_sha, can
         time.sleep(0.01)
     marker, marker_id = base.load_json(owned.root / "observed-boundary.json", 8192)
     require(marker == {"contract": CONTRACT, "operation_id": operation, "pid": job.process.pid,
-                       "phase": boundary, "published": boundary == "published", "plan_sha256": marker.get("plan_sha256")},
+                       "phase": boundary, "published": boundary == "published"},
             "stopped controller marker differs")
-    journal_root = owned.root / "state/tirith/lifecycle/v1"
-    status, status_id = base.load_json(journal_root / (operation + ".status.json"), 2 * MIB)
-    plan, plan_id = base.load_json(journal_root / (operation + ".plan.json"), 2 * MIB)
-    require(status["operation_id"] == operation and status["phase"] == boundary and
-            status["published"] is (boundary == "published") and
-            status["plan_sha256"] == plan_id["sha256"] == marker["plan_sha256"] and
-            plan["operation_id"] == operation and plan["payload"]["contract"] == CONTRACT,
-            "durable production journal does not match the observed stop")
-    with base.HeldFile(journal_root / (operation + ".lock"), 8192, private=True, allow_empty=True) as lock:
-        try:
-            fcntl.flock(lock.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            pass
-        else:
-            fcntl.flock(lock.fd, fcntl.LOCK_UN)
-            raise ValueError("stopped controller no longer owns the production operation lock")
-    with base.HeldFile(owned.root / "home/.local/bin/tirith", 256 * MIB) as image:
-        expected = candidate_sha if boundary == "published" else installed_sha
-        require(image.identity["sha256"] == expected, "publication bytes contradict the stopped phase")
-    # Only the retained owned child/group is signalled. The marker/record PID
-    # is never signal authority; it must equal our already retained child.
+    expected = candidate_sha if boundary == "published" else installed_sha
+    at_stop = installed_image(owned, installed_sha, candidate_sha)
+    require(at_stop == expected, "publication bytes contradict the stopped boundary")
+    # Only the retained owned child/group is signalled. The marker PID is
+    # never signal authority; it must equal our already retained child.
     job.kill()
     row = finish(native, job)
     complete(row, -signal.SIGKILL)
@@ -105,111 +86,19 @@ def observe_and_kill(native, job, owned, operation, boundary, installed_sha, can
     if boundary != "verifying":
         require("TIRITH_NUMERIC_EXTRACTOR_COMPLETED" in row["stdout"], "extractor completion not observed")
     require("TIRITH_NUMERIC_PUBLICATION_COMPLETE" not in row["stdout"], "death case completed unexpectedly")
+    after_kill = installed_image(owned, installed_sha, candidate_sha)
+    require(after_kill == expected, "installed binary changed after the controller was killed")
     return {"observed_stop": "waitid_WSTOPPED_SIGSTOP", "observed_exit": "SIGKILL_reaped",
-            "marker": marker_id, "status_before_reopen": status, "status_identity": status_id,
-            "plan_identity": plan_id, "operation_lock_held_at_stop": True, "installed_sha256_at_stop": expected}
+            "marker": marker_id, "installed_sha256_at_stop": at_stop,
+            "installed_sha256_after_kill": after_kill, "installed_image_complete": True}
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_):
-        raise ValueError("loopback service redirect refused")
-
-
-def request(origin, token, csrf, path, body=None, *, deadline):
-    headers = {"Authorization": "Bearer " + token}
-    if body is not None:
-        headers.update({"Origin": origin, "X-Tirith-CSRF": csrf, "Content-Type": "application/json"})
-    req = urllib.request.Request(origin + path, data=None if body is None else base.canonical(body), headers=headers)
-    with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(req, timeout=remaining(deadline, 5)) as response:
-        raw = response.read(64 * 1024 + 1)
-        require(len(raw) <= 64 * 1024, "dashboard response exceeds cap")
-        remaining(deadline, 1)
-        return base.parse_json(raw)
-
-
-def read_service(owned, job, startup, binary_sha, prior=None):
-    with base.HeldFile(owned.root / "state/tirith/control/v1/service.json", 16384, private=True) as held:
-        require(job.process.poll() is None, "owned service exited during discovery")
-        if prior is not None and held.token == prior.token:
-            require(held.identity == prior.identity, "prior discovery bytes changed within the retained generation")
-            return None
-        record = base.parse_json(held.read())
-        identity = dict(held.identity)
-    require(type(record["protocol"]) is int and record["protocol"] == 1 and
-            type(record["pid"]) is int and record["pid"] == job.process.pid and
-            record["startup_id"] == startup and record["binary_sha256"] == binary_sha and
-            record["cwd"] == str(owned.root / "workspace") and
-            type(record["port"]) is int and 0 < record["port"] < 65536 and
-            str(uuid.UUID(record["service_id"])) == record["service_id"] and
-            type(record["token"]) is str and base.SHA.fullmatch(record["token"]), "owned service discovery differs")
-    require(job.process.poll() is None, "owned service exited during discovery")
-    return record, identity
-
-
-def reopened_status(native, jobs, owned, binary_sha, operation, expected_phase, published, previous=None, *, deadline):
-    remaining(deadline, 1)
-    binary = owned.root / "home/.local/bin/tirith"
-    discovery = owned.root / "state/tirith/control/v1/service.json"
-    prior = None
-    try:
-        prior = base.HeldFile(discovery, 16384, private=True)
-        require(previous is not None and prior.identity == previous["discovery_identity"],
-                "unexpected prior service discovery generation")
-        record = base.parse_json(prior.read())
-        require(all(record[key] == value for key, value in previous["service"].items()),
-                "prior service discovery differs from the earlier owned service")
-    except FileNotFoundError:
-        require(previous is None, "previous owned discovery disappeared before reopening")
-    except BaseException:
-        if prior is not None:
-            prior.close()
-        raise
-    startup = str(uuid.uuid4())
-    job = None
-    authentication = None
-    try:
-        job = native.Job("fresh-product-dashboard", [binary, "dashboard", "control-serve", "--startup-id", startup],
-                         owned.root / "workspace", owned.env(), timeout=remaining(deadline, 45))
-        jobs.append(job)
-        until = time.monotonic() + remaining(deadline, 12)
-        while True:
-            drain_available(job)
-            try:
-                selected = read_service(owned, job, startup, binary_sha, prior)
-                if selected is not None:
-                    record, discovery_identity = selected
-                    break
-            except FileNotFoundError:
-                pass
-            require(job.process.poll() is None and time.monotonic() < until, "dashboard discovery deadline")
-            time.sleep(0.025)
-        origin, token = f"http://127.0.0.1:{record['port']}", record["token"]
-        csrf = request(origin, token, "", "/api/session", deadline=deadline)["csrf"]
-        require(type(csrf) is str and 0 < len(csrf) <= 256, "missing bounded dashboard CSRF")
-        authentication = origin, token, csrf
-        before = request(*authentication, "/api/lifecycle/operation", {"operation_id": operation, "action": "status"}, deadline=deadline)
-        require(before["operation_id"] == operation and before["phase"] == expected_phase and before["published"] is published,
-                "fresh actual product did not reconcile the original UUID as expected")
-        with base.HeldFile(binary, 256 * MIB) as image:
-            identity = dict(image.identity)
-            replay = request(*authentication, "/api/lifecycle/operation", {"operation_id": operation, "action": "apply"}, deadline=deadline)
-            require(replay == before, "original UUID replay did not return the saved non-replayable status")
-            image.revalidate()
-        response = request(*authentication, "/api/quiesce", {}, deadline=deadline)
-        require(response["state"] == "draining" and response["new_mutations_accepted"] is False,
-                "owned service refused graceful quiescence")
-        row = finish(native, job)
-        complete(row)
-        remaining(deadline, 1)
-        return {"service": {key: record[key] for key in ("protocol", "pid", "startup_id", "service_id", "binary_sha256")},
-                "discovery_identity": discovery_identity, "operation": before,
-                "replay_returned_saved_status": True, "installed_identity_unchanged": identity}
-    finally:
-        if prior is not None:
-            prior.close()
-        if job is not None and not job.cleanup_attempted:
-            job.kill()
-            finish(native, job)
+def installed_image(owned, installed_sha, candidate_sha):
+    """The installed slot must hold exactly the complete old or new image."""
+    with base.HeldFile(owned.root / "home/.local/bin/tirith", 256 * MIB) as image:
+        observed = image.identity["sha256"]
+    require(observed in (installed_sha, candidate_sha), "installed binary is neither the complete old nor the complete new image")
+    return observed
 
 
 def replace_owned(path, expected, raw):
@@ -276,7 +165,7 @@ def main():
     require(os.getuid() != 0, "numeric fixture cannot run as root")
     os.umask(0o077)
     result = {"schema_version": 1, "status": "refused", "authority": AUTHORITY, "case": args.case,
-              "scope": "test-only signed ordinary-product numeric publication and production journal reopen",
+              "scope": "test-only signed ordinary-product numeric publication through the CLI update/rollback primitives",
               "official_release_claim": False, "production_download_worker_claim": False,
               "power_loss_claim": False, "nested_process_tree_cleanup_attested": False, "jobs": []}
     jobs, owned, native = [], None, None
@@ -421,17 +310,6 @@ def main():
             current_version = "0.4.3" if args.case in ("complete", "published") else "0.4.2"
             result["after_publication_provenance"] = provenance(current_version)
             result["functional_products"].append(functional(current_version))
-            expected_phase = "completed" if args.case == "complete" else "refresh_required" if args.case == "verifying" else "recovery_required"
-            published = args.case in ("complete", "published")
-            binary_sha = result["after_publication_provenance"]["binary_sha256"]
-            result["fresh_dashboard_reads"] = []
-            previous = None
-            for _ in range(2):
-                previous = reopened_status(native, jobs, owned, binary_sha,
-                    manifest["operation_id"], expected_phase, published, previous, deadline=deadline)
-                result["fresh_dashboard_reads"].append(previous)
-            require(result["fresh_dashboard_reads"][0]["service"]["service_id"] != result["fresh_dashboard_reads"][1]["service"]["service_id"],
-                    "dashboard reopen reused a prior service identity")
             if args.case == "complete":
                 base.write_new(owned.root / "shell-continue", b"continue\n")
                 complete(finish(native, retained_shell))
@@ -455,8 +333,6 @@ def main():
                 require("TIRITH_NUMERIC_PUBLICATION_COMPLETE" in row["stdout"], "rollback controller did not complete")
                 result["after_rollback_provenance"] = provenance("0.4.2")
                 result["functional_products"].append(functional("0.4.2"))
-                result["rollback_dashboard_read"] = reopened_status(native, jobs, owned, images["installed"].identity["sha256"],
-                    manifest["operation_id"], "completed", True, previous, deadline=deadline)
             for item in immutable:
                 item.revalidate()
             for role in images:
@@ -479,7 +355,7 @@ def main():
                     result["status"] = "refused"
             result["limitations"] = ["Public fixture key; no official release or production download/worker claim.",
                 "SIGKILL at three observed test-controller boundaries qualifies process death, not kernel crash or power loss.",
-                "Fresh real product services read/reconcile original UUIDs; interrupted plans are never resumed.",
+                "After each observed death the installed slot holds exactly the complete old or new image; interrupted runs are never resumed.",
                 "Normal extractor completion is observed; original-group cleanup does not attest its separate nested group after outer failure.",
                 "Loaded Zsh stamps are actual init observations, not host blocking, Claude reload, Windows, or all-channel acceptance."]
             if owned is not None:

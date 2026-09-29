@@ -391,20 +391,33 @@ enum UpdateOutcome {
 /// or invalid index, an unverifiable asset, or any parse failure. Old clients
 /// only ever run the legacy path, so they only ever install v1.
 fn do_update(force: bool) -> Result<(), String> {
-    let result = do_update_inner(force);
+    do_update_checked(force, &|_| Ok(()))
+}
+
+/// The update behind `tirith threatdb update`. `before_publish` runs
+/// immediately before each database write (and once when the primary is
+/// already current); the dashboard refresh uses it to recheck its guards.
+fn do_update_checked(
+    force: bool,
+    before_publish: &dyn Fn(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let result = do_update_inner(force, before_publish);
     if let Err(error) = &result {
         evidence::record("primary", Some(error));
     }
     result
 }
 
-fn do_update_inner(force: bool) -> Result<(), String> {
+fn do_update_inner(
+    force: bool,
+    before_publish: &dyn Fn(bool) -> Result<(), String>,
+) -> Result<(), String> {
     let candidate = lifecycle::resolve_candidate()?;
-    let outcome = match lifecycle::apply_primary(&candidate, force, |_| Ok(())) {
+    let outcome = match lifecycle::apply_primary(&candidate, force, before_publish) {
         Ok(outcome) => outcome,
         Err(error) if matches!(candidate, lifecycle::Candidate::Index { .. }) => {
             eprintln!("tirith: selected index asset unavailable ({error}); trying independently signed legacy manifest");
-            lifecycle::apply_primary(&lifecycle::resolve_legacy()?, force, |_| Ok(()))?
+            lifecycle::apply_primary(&lifecycle::resolve_legacy()?, force, before_publish)?
         }
         Err(error) => return Err(error),
     };
@@ -414,7 +427,7 @@ fn do_update_inner(force: bool) -> Result<(), String> {
     // the signed primary DB was already current.
     ThreatDb::refresh_cache();
     if let Err(e) = reconcile_supplemental_after_primary(outcome, || {
-        update_supplemental_db(&policy::Policy::discover(None))
+        update_supplemental_db_checked(&policy::Policy::discover(None), &|| before_publish(true))
     }) {
         eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
         evidence::record("supplemental", Some(&e));
@@ -764,10 +777,6 @@ impl SupplementalEntries {
             .extend(entries.ips.into_iter().map(|ip| (ip, source)));
         Ok(count)
     }
-}
-
-fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
-    update_supplemental_db_checked(policy, &|| Ok(()))
 }
 
 fn update_supplemental_db_checked(

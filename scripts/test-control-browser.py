@@ -783,7 +783,7 @@ def run(binary, output):
 
 
 def run_response_order(binary, output, app_js=None):
-    """Delay real API responses; all plans, mutations and lifecycle state are real."""
+    """Delay real API responses; all plans, mutations and refresh refusals are real."""
     source = app_js.read_bytes() if app_js else None
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "source_override": source is not None,
@@ -969,29 +969,35 @@ def run_response_order(binary, output, app_js=None):
                     report["checks"].append("late_apply_response_cannot_replace_or_redirect_a_new_settings_operation")
 
                     navigate("Settings")
-                    page.get_by_role("button", name="Check and review database refresh", exact=True).click()
-                    # Redirected isolated ThreatDB paths deliberately refuse
-                    # preview before network access. The real reserved operation
-                    # still has persisted refusal state which status can read.
-                    page.get_by_role("button", name="Inspect saved lifecycle request", exact=True).wait_for(timeout=40000)
-                    page.get_by_role("button", name="Inspect saved lifecycle request", exact=True).click()
-                    page.get_by_role("button", name="Refresh lifecycle status", exact=True).wait_for(timeout=40000)
-                    lifecycle = json.loads(page.locator("#operation-content details pre").last.text_content())
-                    assert lifecycle["phase"] in ("failed", "refresh_required"), lifecycle
-                    assert lifecycle["preview"]["compatible"] is False, lifecycle
-                    lifecycle_id = lifecycle["operation_id"]
-                    delay("old-lifecycle-status", "/api/lifecycle/operation", {"operation_id":lifecycle_id, "action":"status"})
-                    page.get_by_role("button", name="Refresh lifecycle status", exact=True).click()
-                    delayed("old-lifecycle-status")
-                    close()
+                    # Updates are terminal commands; the view offers copyable
+                    # commands and no browser update or rollback.
+                    page.get_by_text("tirith threat-db update", exact=True).wait_for()
+                    assert page.get_by_role("button", name="Copy command").count() >= 2
+                    for removed in ("Check and review update", "Review saved rollback", "Check and review database refresh"):
+                        assert not page.get_by_role("button", name=removed, exact=True).count(), removed
+                    # Redirected isolated ThreatDB paths make the guarded refresh
+                    # refuse before network access. Hold that real response
+                    # while a settings plan is opened; the late refusal must
+                    # not take over the new dialog.
+                    delay("late-threatdb-refresh", "/api/threatdb/refresh")
+                    page.get_by_role("button", name="Refresh threat DB now", exact=True).click()
+                    page.get_by_text("Refreshing the signed threat database", exact=False).wait_for()
+                    refused = delayed("late-threatdb-refresh")
+                    assert refused["response"].status == 409 and "redirected" in refused["body"]["error"], refused["body"]
                     settings_id = profile("balanced")
-                    release("old-lifecycle-status")
+                    release("late-threatdb-refresh")
                     assert stored()["operation_id"] == settings_id
                     page.get_by_role("button", name="Request cancellation", exact=True).click()
                     page.locator("#operation-content > .badge").filter(has_text="cancelled").wait_for(timeout=40000)
-                    assert not any(item["path"] == "/api/lifecycle/operation" and item.get("action") == "apply" for item in report["requests"])
                     close()
-                    report["checks"].append("stale_lifecycle_response_cannot_take_over_settings_or_launch_an_update")
+                    refreshes = [item for item in report["requests"] if item["path"] == "/api/threatdb/refresh"]
+                    assert len(refreshes) == 1, refreshes
+                    assert not any(item["path"].startswith("/api/lifecycle/") for item in report["requests"])
+                    navigate("Settings")
+                    page.get_by_role("button", name="Refresh threat DB now", exact=True).click()
+                    page.get_by_text("Refresh did not complete:", exact=False).wait_for(timeout=40000)
+                    assert "redirected" in page.locator("#notice").inner_text()
+                    report["checks"].append("settings_shows_commands_and_guarded_threatdb_refresh_cannot_take_over_settings")
 
                     navigate("Protection")
                     page.get_by_role("button", name="Compare and review", exact=True).nth(2).click()

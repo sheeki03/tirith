@@ -56,18 +56,6 @@ impl DirectoryIdentity {
         Ok(result)
     }
 
-    /// Private live-process handoff evidence, never browser output or durable
-    /// authority. Original handles MUST remain held until the receiver captures
-    /// matching objects; after both close, inode/file-ID reuse invalidates proof.
-    pub(crate) fn private_handoff_identity(&self) -> Result<serde_json::Value, String> {
-        self.revalidate()?;
-        Ok(serde_json::json!({
-            "requested": self.requested, "canonical": self.canonical,
-            "private_leaf": self.private_leaf,
-            "ancestors": self.held.iter().map(|held| held.identity).collect::<Vec<_>>()
-        }))
-    }
-
     /// Validate an existing operator-owned leaf before tightening its ordinary
     /// read permissions. Never repair another owner's directory, a writable
     /// shared directory, or a Darwin ACL that would survive private mode bits.
@@ -209,14 +197,6 @@ impl BinaryIdentity {
     }
     pub fn sha256(&self) -> &str {
         &self.sha256
-    }
-
-    /// Private anonymous-pipe evidence under simultaneous retained handles.
-    pub(crate) fn private_handoff_identity(&self) -> Result<serde_json::Value, String> {
-        self.revalidate()?;
-        Ok(
-            serde_json::json!({"path": self.path, "generation": self.generation, "sha256": self.sha256}),
-        )
     }
 
     pub fn revalidate(&self) -> Result<(), String> {

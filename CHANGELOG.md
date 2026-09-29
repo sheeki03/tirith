@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Versioned personal protection profiles, explicit shell/profile setup, scoped expiring trust grants, and shared reviewed operations with status, cancellation and owned undo.
-- Authenticated loopback controls for protection settings, history, project review, support selection, retained audit segments and supported lifecycle changes.
+- Authenticated loopback controls for protection settings, history, project review, support selection and retained audit segments. Settings shows the running version and install channel with the exact copyable upgrade and rollback command (binary updates stay in the terminal), plus a guarded "Refresh threat DB now" button that runs the same signed update as `tirith threat-db update`.
 - Shared field-specific policy sources and personal-authority explanations in CLI/browser previews, managed-control disabling, and fresh effective readback after browser apply and undo.
 - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
 - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.

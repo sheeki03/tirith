@@ -207,7 +207,7 @@ policy_complete = true
 name = "dashboard"
 group = "Status & health"
 inspected = "none"
-coverage = "Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants, retention and lifecycle changes. History, project and artifact evidence have explicit limits; a running service does not prove shell interception."
+coverage = "Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants and retention, plus a guarded ThreatDB refresh; binary updates stay CLI commands. History, project and artifact evidence have explicit limits; a running service does not prove shell interception."
 policy_complete = false
 
 [[command]]

@@ -4,7 +4,6 @@ mod api;
 mod http;
 pub(crate) mod identity;
 mod lifecycle;
-pub(crate) mod lifecycle_worker;
 pub(crate) use lifecycle::quiesce_for_update;
 
 use std::net::{TcpListener, TcpStream};

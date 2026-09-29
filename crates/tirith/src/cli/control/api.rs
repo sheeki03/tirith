@@ -128,13 +128,6 @@ struct ShellRequest {
     shell: ShellKind,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LifecyclePrepare {
-    operation_id: String,
-    action: super::super::selfupdate::lifecycle_operations::Action,
-}
-
 fn body<T: serde::de::DeserializeOwned>(request: &http::Request) -> Result<T, String> {
     serde_json::from_slice(&request.body)
         .map_err(|_| "request does not match the endpoint schema".into())
@@ -413,43 +406,19 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             let query: ReviewRequest = body(request)?;
             super::super::project_review::revalidate(&query.report_id, cwd)
         }
-        ("POST", "/api/lifecycle/prepare") => {
-            let query: LifecyclePrepare = body(request)?;
+        ("POST", "/api/threatdb/refresh") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Empty {}
+            let _: Empty = body(request)?;
             let _admission = admission(service, request)?;
-            let view = super::super::selfupdate::lifecycle_service::prepare(
-                &query.operation_id,
-                query.action,
-            )?;
-            lifecycle_projection(view, service)
-        }
-        ("POST", "/api/lifecycle/operation") => {
-            let query: OperationRequest = body(request)?;
-            let service_api = super::super::selfupdate::lifecycle_service::status;
-            let view = if query.action == OperationAction::Status {
-                service_api(&query.operation_id)?
-            } else {
-                let _admission = admission(service, request)?;
-                match query.action {
-                    OperationAction::Apply => {
-                        let saved = service_api(&query.operation_id)?;
-                        if saved.phase != super::super::selfupdate::lifecycle_operations::Phase::Prepared {
-                            saved
-                        } else if saved.action == super::super::selfupdate::lifecycle_operations::Action::RefreshThreatDb {
-                            super::super::threatdb_cmd::lifecycle::apply(&query.operation_id)?
-                        } else {
-                            super::lifecycle_worker::start(&query.operation_id)?
-                        }
-                    }
-                    OperationAction::Cancel => {
-                        super::super::selfupdate::lifecycle_service::cancel(&query.operation_id)?
-                    }
-                    OperationAction::Undo => {
-                        return Err("prepare an explicit compatible rollback from Settings".into())
-                    }
-                    OperationAction::Status => unreachable!(),
-                }
-            };
-            lifecycle_projection(view, service)
+            super::super::threatdb_cmd::lifecycle::guarded_refresh(std::path::Path::new(
+                &service.record.cwd,
+            ))?;
+            Ok(
+                json!({"schema_version": 1, "kind": "threatdb_refresh", "state": "completed",
+                "freshness": freshness_projection(service)?}),
+            )
         }
         ("POST", "/api/support/preview") => {
             let selection: super::super::support_bundle::Selection = body(request)?;
@@ -526,58 +495,7 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                 .map_err(|_| "cannot project lifecycle state")?;
             Ok(value)
         }
-        ("GET", "/api/freshness") => {
-            let (_, compiled) = snapshot(service);
-            let mut value = serde_json::to_value(super::super::threatdb_cmd::gather_health())
-                .map_err(|_| "cannot project ThreatDB health")?;
-            // The signed blob stays private; the existing health projection is
-            // display-only and does not mutate verification material.
-            for pointer in [
-                "/path",
-                "/error",
-                "/supplemental/path",
-                "/freshness/source_evidence_error",
-            ] {
-                if let Some(content) = value.pointer_mut(pointer) {
-                    tirith_core::redact::redact_json_strings(content, &compiled);
-                }
-            }
-            project_update_record(&mut value["last_update"], &compiled);
-            if let Some(sources) = value
-                .pointer_mut("/freshness/sources")
-                .and_then(Value::as_array_mut)
-            {
-                for source in sources {
-                    for (field, canonical) in [
-                        (
-                            "source",
-                            source["source"].as_str().is_some_and(|s| {
-                                tirith_core::threatdb::operations::SOURCE_IDS.contains(&s)
-                            }),
-                        ),
-                        (
-                            "revision",
-                            source["revision"].as_str().is_some_and(|s| {
-                                s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
-                            }),
-                        ),
-                        (
-                            "pin_selected_at",
-                            source["pin_selected_at"]
-                                .as_str()
-                                .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
-                        ),
-                    ] {
-                        if !canonical {
-                            if let Some(content) = source.get_mut(field) {
-                                tirith_core::redact::redact_json_strings(content, &compiled);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(value)
-        }
+        ("GET", "/api/freshness") => freshness_projection(service),
         ("POST", "/api/history") => {
             let query: HistoryRequest = body(request)?;
             if query
@@ -769,23 +687,54 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
     }
 }
 
-fn lifecycle_projection(
-    view: super::super::selfupdate::lifecycle_operations::OperationView,
-    service: &Service,
-) -> Result<Value, String> {
+fn freshness_projection(service: &Service) -> Result<Value, String> {
     let (_, compiled) = snapshot(service);
-    let mut value = serde_json::to_value(view).map_err(|_| "cannot project lifecycle operation")?;
-    // Canonical action/phase/UUID/time fields are protocol. Candidate prose is
-    // a display copy and receives the current privacy rules on every request.
+    let mut value = serde_json::to_value(super::super::threatdb_cmd::gather_health())
+        .map_err(|_| "cannot project ThreatDB health")?;
+    // The signed blob stays private; the existing health projection is
+    // display-only and does not mutate verification material.
     for pointer in [
-        "/preview/current_version",
-        "/preview/candidate_version",
-        "/preview/evidence",
-        "/preview/issues",
-        "/next_action",
+        "/path",
+        "/error",
+        "/supplemental/path",
+        "/freshness/source_evidence_error",
     ] {
         if let Some(content) = value.pointer_mut(pointer) {
             tirith_core::redact::redact_json_strings(content, &compiled);
+        }
+    }
+    project_update_record(&mut value["last_update"], &compiled);
+    if let Some(sources) = value
+        .pointer_mut("/freshness/sources")
+        .and_then(Value::as_array_mut)
+    {
+        for source in sources {
+            for (field, canonical) in [
+                (
+                    "source",
+                    source["source"].as_str().is_some_and(|s| {
+                        tirith_core::threatdb::operations::SOURCE_IDS.contains(&s)
+                    }),
+                ),
+                (
+                    "revision",
+                    source["revision"]
+                        .as_str()
+                        .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+                ),
+                (
+                    "pin_selected_at",
+                    source["pin_selected_at"]
+                        .as_str()
+                        .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+                ),
+            ] {
+                if !canonical {
+                    if let Some(content) = source.get_mut(field) {
+                        tirith_core::redact::redact_json_strings(content, &compiled);
+                    }
+                }
+            }
         }
     }
     Ok(value)

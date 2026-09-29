@@ -160,12 +160,15 @@ tirith update --dry-run
 Package-managed installations use the owning manager's update command. A
 self-replaceable personal installation can use `tirith update`; a supported
 saved rollback uses `tirith update --rollback`. Review candidate identity and
-compatibility first. In the dashboard, Settings offers explicit update and
-database checks, followed by a separately reviewed apply action. Retain its
-operation UUID if the response is lost. Reopen the service and reload relevant
-integrations after replacement. A protected system destination or previously
-installed privileged helper may require administrator action; the dashboard
-does not request credentials or silently elevate.
+compatibility first. The dashboard's Settings view shows the exact command for
+your installation channel to copy into a terminal; it does not replace the
+binary. Its "Refresh threat DB now" button runs the same signed update as
+`tirith threat-db update` and refuses redirected database paths, an
+administrator-owned data directory, the root account and a remote policy that
+forbids local changes. Reopen the service and reload relevant integrations after
+replacement. A protected system destination or previously installed privileged
+helper may require administrator action; the dashboard does not request
+credentials or silently elevate.
 
 ## Remove
 
@@ -190,7 +193,7 @@ requires the documented administrator cleanup after its users are gone.
 
 `tirith doctor --bundle --bundle-preview --bundle-incident EVENT_UUID --json`
 previews selected diagnostics. Add `--bundle-operation OPERATION_UUID` to include
-a saved setup or lifecycle operation. Keep `--bundle` and omit `--bundle-preview`
+a saved setup operation. Keep `--bundle` and omit `--bundle-preview`
 to save the freshly redacted selection privately; nothing is uploaded. Review
 the resulting file before deliberately sharing it. Selection is bounded and an
 unavailable incident is not evidence that the event never happened. The

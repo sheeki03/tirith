@@ -1,9 +1,10 @@
 # Owned numeric lifecycle qualification
 
-This is a test-only composition of the real signature verifier, compatibility
-preview, task policy authorization, rollback receipt, atomic publication,
-service locks and lifecycle journal. It does not exercise the production
-release download or lifecycle-worker handoff. A public RFC8032 test-vector key
+This is a test-only composition of the primitives behind `tirith update` and
+`tirith update --rollback`: the real signature verifier, compatibility preview,
+task policy authorization, rollback receipt, service quiesce and atomic
+publication. It does not exercise the production release download. A public
+RFC8032 test-vector key
 is its only signature authority. It adds no production key or URL override.
 
 The tracked workspace remains version **0.4.2**. A separately retained source
@@ -38,28 +39,27 @@ The unchanged dependencies retain these SHA-256 pins:
 
 ## Cases and permitted claims
 
-Run one case per new evidence directory. Every input, failed fixture, operation
-UUID, journal and resulting installed generation is retained.
+Run one case per new evidence directory. Every input, failed fixture, run
+UUID and resulting installed generation is retained.
 
-| Case | Actual publication | Fresh product dashboard result |
+| Case | Crash boundary | Installed binary afterwards |
 | --- | --- | --- |
-| `complete` | 0.4.2 → 0.4.3, then receipt-bound 0.4.3 → 0.4.2 | Both operations completed; exact UUID replay returns saved status |
-| `verifying` | Controller killed before publication intent; installed 0.4.2 unchanged | Original UUID becomes `refresh_required`, unpublished |
-| `publication_intent` | Controller killed after durable intent, before swap; installed 0.4.2 unchanged | Original UUID becomes `recovery_required`, unpublished |
-| `published` | Controller killed after verified swap and durable published phase; installed 0.4.3 | Original UUID becomes `recovery_required`, published |
+| `complete` | None: 0.4.2 → 0.4.3, then receipt-bound 0.4.3 → 0.4.2 | Exactly 0.4.3, then exactly 0.4.2 |
+| `verifying` | Killed after verification, before extraction | Exactly the old 0.4.2 image |
+| `publication_intent` | Killed after extraction, quiesce and the rollback receipt, before the swap | Exactly the old 0.4.2 image |
+| `published` | Killed after the verified swap | Exactly the new 0.4.3 image |
 
-Each death case requires the controller's real `waitid(WSTOPPED)` event, exact
-marker/journal/plan identity, held production operation lock and installed-byte
-readback before SIGKILL. The runner signals only its retained child/group and
-requires leader reap, observed group exit and output EOF. A marker or deliberate
-error return cannot replace process-death evidence. Publication-intent and
-published cases require normal completion of the production extractor first.
+Each death case requires the controller's real `waitid(WSTOPPED)` event, an
+exact boundary marker and installed-byte readback before SIGKILL. The runner
+signals only its retained child/group and requires leader reap, observed group
+exit and output EOF. A marker or deliberate error return cannot replace
+process-death evidence. Publication-intent and published cases require normal
+completion of the production extractor first.
 
-After death, two separately launched ordinary-product dashboard services read
-the original UUID through authenticated loopback HTTP. Their fresh service IDs,
-actual executable hashes and saved non-replayable responses are recorded. No
-interrupted operation is resumed, no recovery status is erased, and an `apply`
-probe must return the same saved status without changing installed bytes.
+After death the installed slot must hold exactly the complete old or the
+complete new image (never a partial one), and the installed product's own
+`tirith version --provenance` and allow/block checks must match that image.
+No interrupted run is resumed.
 
 The complete case observes actual installed provenance and allow/block checker
 behavior before upgrade, after upgrade and after rollback. It retains an actual
@@ -78,10 +78,10 @@ scope; this lane does not turn those into numeric cross-version coverage.
 ## Bounds and execution gate
 
 Preparation/execution uses a 600-second case deadline. Every native spawn,
-discovery/stop wait and HTTP request is refused after expiry and clamped to the
+stop wait is refused after expiry and clamped to the
 remaining case time; successful stage completion rechecks it. Cleanup is exempt.
-Ordinary CLI/controller jobs are bounded at 45 seconds, service discovery at
-12 seconds, HTTP requests at 5 seconds, and the retained shell at 180 seconds.
+Ordinary CLI/controller jobs are bounded at 45 seconds and the retained shell
+at 180 seconds.
 The shared owner helper supplies bounded kill/reap/group-observation/output
 drain attempts. These are finite userspace attempts, not a kernel-time guarantee.
 Input/source/metadata/archive caps are inherited from strict v1 admission. Each

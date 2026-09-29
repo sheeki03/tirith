@@ -43,7 +43,7 @@ Inspected:
 | `tirith status` | None | Reports protection mode, hook health, active policy, and threat-DB freshness. Reporting surface. | Yes |
 | `tirith doctor` | None | Diagnoses install, hooks, policy, and per-OS capsule coverage. Reports state and can --fix configuration. | Yes |
 | `tirith prompt-status` | None | One-line protection and active-context indicator for the shell prompt. Reporting surface (30s cache). | Yes |
-| `tirith dashboard` | None | Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants, retention and lifecycle changes. History, project and artifact evidence have explicit limits; a running service does not prove shell interception. | Partial |
+| `tirith dashboard` | None | Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants and retention, plus a guarded ThreatDB refresh; binary updates stay CLI commands. History, project and artifact evidence have explicit limits; a running service does not prove shell interception. | Partial |
 | `tirith warnings` | None | Shows accumulated session warnings. Reporting surface over prior verdicts. | Yes |
 | `tirith receipt` | None | Tracks and verifies scripts run through tirith run against the audit hash-chain. Verification surface. | Yes |
 | `tirith logs` | Full | Inspects agent and CLI logs for injection seeds, secrets, and escape bytes. | Yes |

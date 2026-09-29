@@ -68,7 +68,6 @@ fn preview_with_snapshot(
                 service
                     .as_ref()
                     .and_then(|service| service.read_status(id).ok()),
-                super::selfupdate::lifecycle_operations::support_status(id).ok(),
             ));
         }
     }
@@ -87,21 +86,14 @@ fn preview_with_snapshot(
     let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);
     let compiled = CompiledCustomPatterns::new_silent(&patterns);
     let mut operations = Vec::new();
-    for (id, status, lifecycle) in selected_operations {
-        let entry = match (status, lifecycle) {
-            (Some(status), None) => {
+    for (id, status) in selected_operations {
+        let entry = match status {
+            Some(status) => {
                 let mut content = super::profile::status_projection(&status, &compiled)?;
                 redact_home(&mut content, home.as_deref());
                 bounded_entry("operation", id, content)
             }
-            (None, Some(status)) => {
-                let mut content = serde_json::to_value(status)
-                    .map_err(|_| "cannot project selected lifecycle operation")?;
-                redact_lifecycle(&mut content, &compiled);
-                redact_home(&mut content, home.as_deref());
-                bounded_entry("operation", id, content)
-            }
-            _ => json!({"kind":"operation", "id":id, "availability":"unavailable",
+            None => json!({"kind":"operation", "id":id, "availability":"unavailable",
                 "detail":"The selected private operation was absent, unreadable, or ambiguous; it was not reconciled or replayed."}),
         };
         operations.push(entry);
@@ -197,23 +189,6 @@ fn preview_with_snapshot(
         }
     }
     Ok((report, snapshot))
-}
-
-fn redact_lifecycle(value: &mut Value, compiled: &CompiledCustomPatterns) {
-    // UUIDs, phases, action enums, and timestamps remain protocol fields. Only
-    // selected human-readable evidence receives display redaction.
-    for pointer in [
-        "/operation/preview/current_version",
-        "/operation/preview/candidate_version",
-        "/operation/preview/evidence",
-        "/operation/preview/issues",
-        "/operation/next_action",
-        "/selected_failure_detail",
-    ] {
-        if let Some(content) = value.pointer_mut(pointer) {
-            tirith_core::redact::redact_json_strings(content, compiled);
-        }
-    }
 }
 
 fn bounded_entry(kind: &str, id: &str, content: Value) -> Value {
@@ -353,21 +328,6 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn lifecycle_selection_redacts_evidence_and_preserves_protocol() {
-        let mut value = json!({"operation":{"operation_id":"id","phase":"cancelled","action":"update",
-            "preview":{"current_version":"private-version","candidate_version":"private-candidate","evidence":"private-evidence","issues":["private-issue"]},
-            "next_action":"private-instruction","published":false},"selected_failure_detail":"private-detail"});
-        redact_lifecycle(
-            &mut value,
-            &CompiledCustomPatterns::new_silent(&[".+".into()]),
-        );
-        assert!(!value.to_string().contains("private-"));
-        assert_eq!(value["operation"]["operation_id"], "id");
-        assert_eq!(value["operation"]["phase"], "cancelled");
-        assert_eq!(value["operation"]["action"], "update");
-        assert_eq!(value["operation"]["published"], false);
-    }
     #[test]
     fn selection_rejects_paths_duplicate_ids_and_excess_work() {
         assert!(Selection {

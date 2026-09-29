@@ -2,13 +2,11 @@
 """Pure admission controls. No Cargo, product, native service or replacement runs."""
 import copy
 import json
-import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
-import uuid
 
 import signed_numeric_inputs as numeric
 import signed_numeric_native as runner
@@ -126,49 +124,27 @@ class NumericAdmission(unittest.TestCase):
     def test_existing_capture_helper_pin(self):
         numeric.admit_base()
 
-    def test_discovery_waits_only_for_exact_retained_prior_generation(self):
+    def test_killed_case_accepts_only_a_complete_old_or_new_image(self):
         owned = SimpleNamespace(root=self.root)
-        job = SimpleNamespace(process=SimpleNamespace(pid=42, poll=lambda: None))
-        startup = str(uuid.uuid4())
-        path = self.root / "state/tirith/control/v1/service.json"
-        path.parent.mkdir(parents=True)
-        record = {"protocol": 1, "pid": 41, "startup_id": str(uuid.uuid4()),
-                  "binary_sha256": "a" * 64, "cwd": str(self.root / "workspace"),
-                  "port": 23456, "service_id": str(uuid.uuid4()), "token": "b" * 64}
-        numeric.base.write_new(path, numeric.base.canonical(record))
-        with numeric.base.HeldFile(path, 16384, private=True) as prior:
-            self.assertIsNone(runner.read_service(owned, job, startup, "a" * 64, prior))
-            with self.assertRaises(ValueError):
-                runner.read_service(owned, job, startup, "a" * 64)
-            # Another inode with identical stale JSON is not the retained old
-            # generation; it cannot be swallowed as a pending startup.
-            next_path = path.with_name("next.json")
-            numeric.base.write_new(next_path, numeric.base.canonical(record))
-            os.replace(next_path, path)
-            with self.assertRaises(ValueError):
-                runner.read_service(owned, job, startup, "a" * 64, prior)
-            record.update(pid=42, startup_id=startup, service_id=str(uuid.uuid4()))
-            numeric.base.write_new(next_path, numeric.base.canonical(record))
-            os.replace(next_path, path)
-            selected, identity = runner.read_service(owned, job, startup, "a" * 64, prior)
-            self.assertEqual(selected, record)
-            self.assertEqual(identity, numeric.base.identity(numeric.base.canonical(record)))
+        binary = self.root / "home/.local/bin/tirith"
+        binary.parent.mkdir(parents=True)
+        old, new = b"old-complete-image", b"new-complete-image"
+        old_sha, new_sha = numeric.base.digest(old), numeric.base.digest(new)
+        for body in (old, new):
+            binary.write_bytes(body)
+            self.assertEqual(runner.installed_image(owned, old_sha, new_sha), numeric.base.digest(body))
+        # A torn or foreign image is neither complete generation.
+        binary.write_bytes(old[:9] + b"-torn")
+        with self.assertRaisesRegex(ValueError, "neither the complete old nor the complete new"):
+            runner.installed_image(owned, old_sha, new_sha)
 
-    def test_expired_case_cannot_start_service_shell_or_http(self):
+    def test_expired_case_cannot_start_a_shell(self):
         deadline = SimpleNamespace(start=0.0)
         native = SimpleNamespace(Job=mock.Mock())
         owned = SimpleNamespace(root=self.root)
         with mock.patch.object(runner.time, "monotonic", return_value=600.0):
             with self.assertRaisesRegex(ValueError, "deadline exceeded"):
-                runner.reopened_status(native, [], owned, "a" * 64, str(uuid.uuid4()),
-                                       "completed", True, deadline=deadline)
-            with self.assertRaisesRegex(ValueError, "deadline exceeded"):
                 runner.shell_snapshot(native, [], owned, "expired-shell", deadline)
-            opener = mock.Mock()
-            with mock.patch.object(runner.urllib.request, "build_opener", return_value=opener):
-                with self.assertRaisesRegex(ValueError, "deadline exceeded"):
-                    runner.request("http://127.0.0.1:12345", "a" * 64, "", "/api/session", deadline=deadline)
-            opener.open.assert_not_called()
         native.Job.assert_not_called()
         self.assertFalse((self.root / "expired-shell.zsh").exists())
 

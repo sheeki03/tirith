@@ -15,10 +15,6 @@ use tirith_core::selfupdate::{self, InstallMethod, Provenance, SemVer, Verificat
 
 #[path = "lifecycle.rs"]
 mod lifecycle;
-#[path = "lifecycle_operations.rs"]
-pub(crate) mod lifecycle_operations;
-#[path = "lifecycle_service.rs"]
-pub(crate) mod lifecycle_service;
 #[path = "release_compatibility.rs"]
 mod release_compatibility;
 
@@ -151,6 +147,7 @@ fn prepare_self_authorization_with_audit<B: tirith_core::task_boundary::Boundary
     )
 }
 
+#[cfg(test)]
 fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::BoundaryMarker>(
     envelope: tirith_core::task::TaskEnvelopeInput,
     effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
@@ -207,6 +204,31 @@ fn prepare_self_authorization_with_policy_and_audit<
         lease,
         marker: PhantomData,
     })
+}
+
+/// Task-gate authorization for the dashboard's ThreatDB refresh. The decision
+/// is audited like every self-integrity operation, and its retained lease is
+/// rechecked immediately before each database publication.
+pub(crate) struct ThreatDbRefreshAuthorization(
+    RetainedSelfAuthorization<tirith_core::task_boundary::SelfUpdateBoundary>,
+);
+
+impl ThreatDbRefreshAuthorization {
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        self.0.authorize_effect()
+    }
+}
+
+pub(crate) fn authorize_threatdb_refresh() -> Result<ThreatDbRefreshAuthorization, String> {
+    prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
+        self_boundary_envelope(
+            "browser-threatdb-refresh",
+            serde_json::json!({"force": false}),
+            None,
+        )?,
+        update_effects(false, false),
+    )
+    .map(ThreatDbRefreshAuthorization)
 }
 
 /// System and package-manager roots must never gain self-replacement authority

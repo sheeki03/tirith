@@ -312,6 +312,10 @@ integrated npm execution remains unqualified.
 
 ## September 28: ordinary Linux service-worker composition passes
 
+Historical record. The browser update/rollback pipeline this entry qualified
+(lifecycle journal, detached worker and `/api/lifecycle/{prepare,operation}`)
+was later removed; binary updates are CLI-only.
+
 The ordinary GNU ARM package from `83468789` passes the complete local
 service → production worker → binary replacement → product-created fresh service
 sequence on LinuxKit 6.12.76 as UID 65534. The installed binary changes from
@@ -822,8 +826,9 @@ across numeric replacement remains separate.
 
 The root readback report is
 `756c58e386df09d7867718bcb93828bddf5d4b8835a8a1711e0a62d758177ebf`.
-These tests compose the real verifier, compatibility checks, publication,
-rollback receipt and lifecycle store using a public fixture signing key. They
+These tests composed the real verifier, compatibility checks, publication,
+rollback receipt and the since-removed lifecycle store using a public fixture
+signing key; the lane now stops between the CLI update primitives instead. They
 do not certify an official release, production download/worker handoff, power
 loss, all installation channels, or nested extractor cleanup after an outer
 failure. See the [qualification contract](numeric-lifecycle-qualification.md).

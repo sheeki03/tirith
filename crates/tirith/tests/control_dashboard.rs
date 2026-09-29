@@ -392,48 +392,77 @@ fn explicit_project_review_is_inert_and_revalidates_retained_files() {
 }
 
 #[test]
-fn failed_lifecycle_apply_retry_returns_saved_state_without_starting_work() {
+fn threatdb_refresh_is_a_guarded_write_and_lifecycle_writes_are_gone() {
     let state = state();
     let (server, _) = service(&state);
-    let id = uuid::Uuid::new_v4().to_string();
-    let (status, prepared) = server.request(
+    // The isolated fixture redirects both ThreatDB paths, so the guarded
+    // refresh must refuse before any network access or database write.
+    let (status, refused) = server.request("POST", "/api/threatdb/refresh", Some(json!({})));
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("redirected"),
+        "{refused}"
+    );
+    assert!(!state.roots().threatdb.exists());
+    // The browser cannot request force or any other mode.
+    let (status, refused) = server.request(
         "POST",
+        "/api/threatdb/refresh",
+        Some(json!({"force": true})),
+    );
+    assert_eq!(status, 409, "{refused}");
+    // Same origin and CSRF checks as every other write; both are refused
+    // before the body is read, so none is sent.
+    let response = server.raw(&format!("POST /api/threatdb/refresh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n", server.port, server.token, server.port));
+    assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = server.raw(&format!("POST /api/threatdb/refresh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: http://attacker.example\r\nX-Tirith-CSRF: {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n", server.port, server.token, server.csrf));
+    assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+    // Browser binary update/rollback is removed; the read-only views remain.
+    for (path, body) in [
+        (
+            "/api/lifecycle/prepare",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"action":"update"}),
+        ),
+        (
+            "/api/lifecycle/operation",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"action":"apply"}),
+        ),
+    ] {
+        let (status, value) = server.request("POST", path, Some(body));
+        assert_eq!(status, 409, "{value}");
+        assert_eq!(value["error"], "unknown local control endpoint");
+    }
+    let (status, lifecycle) = server.request("GET", "/api/lifecycle", None);
+    assert_eq!(status, 200, "{lifecycle}");
+    let (status, freshness) = server.request("GET", "/api/freshness", None);
+    assert_eq!(status, 200, "{freshness}");
+    assert!(freshness["refresh_interval_hours"].is_u64(), "{freshness}");
+    // The Settings view shows copyable commands and one refresh button, and
+    // offers no browser update or rollback.
+    let asset = server.raw(&format!(
+        "GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        server.port
+    ));
+    assert!(asset.starts_with("HTTP/1.1 200"));
+    for present in [
+        "Refresh threat DB now",
+        "/api/threatdb/refresh",
+        "tirith threat-db update",
+        "'tirith update'",
+        "'tirith update --rollback'",
+        "Copy command",
+    ] {
+        assert!(asset.contains(present), "{present}");
+    }
+    for absent in [
         "/api/lifecycle/prepare",
-        Some(json!({"operation_id":id,"action":"rollback"})),
-    );
-    // This fixture has no saved compatible rollback. Preparation is local and
-    // leaves a durable failed request; retrying apply must not start a worker.
-    assert_eq!(status, 409, "{prepared}");
-    let (status, saved) = server.request(
-        "POST",
         "/api/lifecycle/operation",
-        Some(json!({"operation_id":id,"action":"status"})),
-    );
-    assert_eq!(status, 200, "prepared={prepared}; saved={saved}");
-    assert_eq!(saved["phase"], "refresh_required");
-    let (status, retry) = server.request(
-        "POST",
-        "/api/lifecycle/operation",
-        Some(json!({"operation_id":id,"action":"apply"})),
-    );
-    assert_eq!(status, 200, "{retry}");
-    assert_eq!(retry["phase"], saved["phase"]);
-    assert_eq!(retry["published"], false);
-    let (status, support) = server.request(
-        "POST",
-        "/api/support/preview",
-        Some(json!({"operation_ids":[id],"incident_ids":[]})),
-    );
-    assert_eq!(status, 200, "{support}");
-    assert_eq!(support["operations"][0]["availability"], "available");
-    assert_eq!(
-        support["operations"][0]["content"]["operation"]["operation_id"],
-        id
-    );
-    assert_eq!(
-        support["operations"][0]["content"]["operation"]["phase"],
-        retry["phase"]
-    );
+        "Check and review update",
+        "Review saved rollback",
+        "Apply reviewed lifecycle change",
+    ] {
+        assert!(!asset.contains(absent), "{absent}");
+    }
 }
 
 #[test]

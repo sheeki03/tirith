@@ -3482,11 +3482,6 @@ enum DashboardAction {
         #[arg(long)]
         startup_id: String,
     },
-    #[command(hide = true)]
-    LifecycleWorker {
-        #[arg(long)]
-        operation_id: String,
-    },
     /// Write the HTML security report to a file
     #[command(after_help = "\
 Default output is <documents-dir>/tirith-dashboard-<date>.html (<documents-dir> is
@@ -9429,9 +9424,6 @@ fn run() {
                     }
                     Some(DashboardAction::ControlServe { startup_id }) => {
                         cli::control::serve(&startup_id)
-                    }
-                    Some(DashboardAction::LifecycleWorker { operation_id }) => {
-                        cli::control::lifecycle_worker::run(&operation_id)
                     }
                     Some(DashboardAction::Export { out, json }) => {
                         cli::dashboard::export(out.as_deref(), json)
