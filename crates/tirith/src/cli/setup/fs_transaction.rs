@@ -464,50 +464,6 @@ where
     })
 }
 
-/// Fixed small private activation claims share contained publication and the
-/// setup writer rendezvous. Inventory/authority validation runs again while
-/// that global lock is held, including when the transform is unchanged.
-#[cfg(unix)]
-pub(super) fn update_private_activation_claim<F, V>(
-    path: &Path,
-    scope: &Path,
-    mut transform: F,
-    revalidate: V,
-) -> Result<TransactionOutcome, String>
-where
-    F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
-    V: FnMut() -> Result<(), String>,
-{
-    transactional_update_impl(
-        path,
-        scope,
-        TransactionOptions {
-            dry_run: false,
-            lock_timeout: std::time::Duration::from_millis(100),
-            read_cap: 4096,
-            quiet: true,
-            retain_artifacts: false,
-            private_parent: true,
-        },
-        |snapshot| {
-            let update = transform(snapshot)?;
-            if matches!(&update, FileUpdate::Write { bytes, .. } if bytes.len() > 4096) {
-                return Err("automatic claim exceeds its fixed 4 KiB bound".into());
-            }
-            Ok(update)
-        },
-        revalidate,
-        |bytes| {
-            if bytes.len() > 4096 {
-                return Err("automatic claim exceeds its fixed 4 KiB bound".into());
-            }
-            Ok(())
-        },
-        #[cfg(test)]
-        |_| Ok(()),
-    )
-}
-
 /// Keep the existing ancestor and resulting private parent simultaneously
 /// retained. The earlier scoped snapshot walk already rejects symlinks below
 /// the authority root, traversal, and paths outside that root.
@@ -958,12 +914,12 @@ mod private_notice_tests {
 }
 
 #[cfg(all(test, unix))]
-mod activation_parent_tests {
+mod private_parent_tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
-    fn activation_parent_refuses_unsafe_aliases_permissions_and_outside_scope() {
+    fn private_parent_refuses_unsafe_aliases_permissions_and_outside_scope() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let unsafe_parent = root.path().join("unsafe-parent");
@@ -976,7 +932,7 @@ mod activation_parent_tests {
             alias.join("claim.json"),
             outside.path().join("claim.json"),
         ] {
-            assert!(update_private_activation_claim(
+            assert!(update_private_team_connection(
                 &path,
                 root.path(),
                 |_| Ok(FileUpdate::write_text("{}".into(), 0o600).with_exact_mode()),
@@ -993,19 +949,19 @@ mod activation_parent_tests {
     }
 
     #[test]
-    fn activation_parent_admission_follows_locked_authorization_and_size_checks() {
+    fn private_parent_admission_follows_locked_authorization_and_size_checks() {
         for denied in [true, false] {
             let root = tempfile::tempdir().unwrap();
             let target = root.path().join("never-created").join("claim.json");
             let mut authority_calls = 0;
-            assert!(update_private_activation_claim(
+            assert!(update_private_team_connection(
                 &target,
                 root.path(),
                 |_| Ok(FileUpdate::write_text(
                     if denied {
                         "{}".into()
                     } else {
-                        "x".repeat(4097)
+                        "x".repeat(128 * 1024 + 1)
                     },
                     0o600
                 )),
@@ -1024,7 +980,7 @@ mod activation_parent_tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("absent-noop").join("claim.json");
         assert_eq!(
-            update_private_activation_claim(
+            update_private_team_connection(
                 &target,
                 root.path(),
                 |_| Ok(FileUpdate::unchanged()),

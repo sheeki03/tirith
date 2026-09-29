@@ -1898,6 +1898,9 @@ pilot and release/channel gates remain open.
 
 ## Integrated automatic activation and recovery qualification (2026-09-13)
 
+Automatic fresh-terminal activation was later removed in this cycle (local tag
+`archive/automatic-zsh-activation`); this section is historical.
+
 The local candidate built from 90 retained changed/new inputs at base
 `aab72fdf` has manifest SHA-256
 `42aa775c321e75281cdc78ec4ae5a9fd58efac6b46455c3d4ee31036450149f0`.
@@ -2715,6 +2718,8 @@ cancellation, undo and drift. Its public request scope is
 Historical file-only records never acquire startup behavior on replay.
 Automatic verification in the real newly opened terminal remains under
 implementation; no new automatic shell row is certified by these fixtures.
+(Later removed in this cycle together with automatic fresh-terminal
+activation; `setup recommended` no longer records a verification intent.)
 
 The focused current-main curl correction is [PR 256](https://github.com/sheeki03/tirith/pull/256),
 head `3998ed261b08db782811c03c6293784b5e149058`. All seventeen new native

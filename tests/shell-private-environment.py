@@ -65,8 +65,7 @@ if role=='ordinary':
 receipt=role=='tirith' and args[:1]==['__execution-receipt'] and len(args)>1 and args[1] in ('consume','discard','reconcile','acknowledge')
 checker=role=='tirith' and args[:1]==['check']
 paster=role=='tirith' and args[:1]==['paste']
-module_check=role=='tirith' and args==['__setup-activation','modules','--channel','zsh']
-intended=receipt or checker or module_check
+intended=receipt or checker
 for name,value in os.environ.items():
  if cap in value and not (intended and name=='_TIRITH_RECEIPT_INSTANCE' and value==cap):issues.append(name)
  if token in value or state in value or command in value:issues.append(name)
@@ -101,7 +100,6 @@ elif role=='tirith':
  if args[:2]==['__execution-receipt','capability']:print('TIRITH_EXECUTION_RECEIPT_PROTOCOL=3')
  elif args[:2]==['__execution-receipt','register']:print(cap)
  elif paster:raise SystemExit({{'allow':0,'block':1,'malformed':42}}[{mode!r}])
- elif module_check:raise SystemExit(74) # Inert endpoint never qualifies or loads native modules.
  elif receipt:raise SystemExit({ack_exit!r} if args[1]=='acknowledge' else {operation_exit!r})
  elif args[:2]==['env','snapshot']:pass
  else:raise SystemExit(74)
@@ -178,12 +176,12 @@ def startup(fixture):
     owned.require(sum(item["role"] == "ordinary" for item in events) == 2, "ordinary child observers missing")
 
 
-def module_consumer_boundary(fixture):
-    """Only the exact module-qualification argv may receive the instance."""
+def instance_consumer_boundary(fixture):
+    """Only receipt and check invocations may receive the instance."""
     attempts = [
-        ["__setup-activation", "modules", "--channel", "zsh", "extra"],
-        ["__setup-activation", "modules", "--channel", "bash"],
-        ["__setup-activation", "probe", "allowed"],
+        ["status"],
+        ["__execution-receipt", "capability"],
+        ["env", "snapshot"],
     ]
     for index, args in enumerate(attempts):
         directory = fixture.root / str(index)
@@ -192,13 +190,13 @@ def module_consumer_boundary(fixture):
         command = "command " + negative.q(directory / "tirith") + " " + " ".join(negative.q(arg) for arg in args)
         script = "_TIRITH_RECEIPT_INSTANCE=" + negative.q(CAP) + " " + command + "\nbuiltin true\n"
         try:
-            negative.run("module-consumer-negative", script)
+            negative.run("instance-consumer-negative", script)
         except AssertionError as error:
             owned.require("private environment or intended instance mismatch" in str(error)
                           and "_TIRITH_RECEIPT_INSTANCE" in str(error),
                           "negative control failed for an unrelated reason")
         else:
-            raise AssertionError("non-exact automatic argv accepted a private instance")
+            raise AssertionError("an unintended argv accepted a private instance")
 
 
 def checker(fixture, outer_preexec=False):
@@ -393,7 +391,7 @@ def main():
             plans += [(f"receipt-{operation}-{operation_exit}-{ack_exit}", lambda f, op=operation: receipt_operation(f, op), {"operation_exit": operation_exit, "ack_exit": ack_exit})
                       for operation in ("consume", "discard", "reconcile") for operation_exit, ack_exit in ((0, 0), (0, 99), (7, 0))]
             if family == "zsh":
-                plans.append(("module-consumer-boundary", module_consumer_boundary, {}))
+                plans.append(("instance-consumer-boundary", instance_consumer_boundary, {}))
             if family == "bash":
                 plans.append(("preexec-command-cache", lambda f: checker(f, outer_preexec=True), {}))
                 plans += [(f"deferred-{initial}-{choice}", lambda f, i=initial, c=choice: prompt(f, i, c), {})

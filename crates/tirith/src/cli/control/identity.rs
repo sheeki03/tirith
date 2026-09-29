@@ -146,15 +146,6 @@ impl BinaryIdentity {
         Self::capture_with_empty_input(path, true)
     }
 
-    /// Apply a caller's smaller bound to the opened file before hashing it.
-    /// A preceding pathname size check cannot close a replacement race.
-    pub(crate) fn capture_input_capped(path: &Path, cap: u64) -> Result<Self, String> {
-        if cap == 0 || cap > 512 * 1024 * 1024 {
-            return Err("invalid retained input size limit".into());
-        }
-        Self::capture_with_limit(path, true, cap)
-    }
-
     fn capture_with_empty_input(path: &Path, allow_empty: bool) -> Result<Self, String> {
         Self::capture_with_limit(path, allow_empty, 512 * 1024 * 1024)
     }
@@ -608,24 +599,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn capped_input_identity_checks_the_opened_generation_before_hashing() {
+    fn input_identity_checks_the_opened_generation_before_hashing() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small-private-input");
         std::fs::write(&path, b"1234").unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 3).is_err());
-        let held = BinaryIdentity::capture_input_capped(&path, 4).unwrap();
+        let held = BinaryIdentity::capture_input(&path).unwrap();
         assert_eq!(held.sha256(), format!("{:x}", Sha256::digest(b"1234")));
         drop(held);
-        assert!(BinaryIdentity::capture_input_capped(&path, 0).is_err());
-        assert!(BinaryIdentity::capture_input_capped(&path, 512 * 1024 * 1024 + 1).is_err());
         std::fs::write(&path, b"").unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 4).is_ok());
+        assert!(BinaryIdentity::capture_input(&path).is_ok());
         assert!(
             BinaryIdentity::capture(&path).is_err(),
             "binary emptiness contract is unchanged"
         );
-        std::fs::write(&path, vec![b'x'; 4097]).unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 4096).is_err());
         // A sparse oversized executable must refuse before hashing, with a
         // useful size diagnosis instead of an indistinguishable open failure.
         File::create(&path)

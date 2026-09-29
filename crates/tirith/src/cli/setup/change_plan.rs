@@ -16,20 +16,6 @@ use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayG
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome, MAX_SETUP_FILE_BYTES};
 
-#[path = "change_plan_activation_history.rs"]
-mod activation_history;
-#[cfg(unix)]
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-#[path = "change_plan_automatic_claim.rs"]
-mod automatic_claim;
-#[path = "change_plan_setup_binding.rs"]
-mod setup_binding;
-#[cfg(unix)]
-pub(crate) use automatic_claim::{
-    FinishedActivationClaim, PendingActivationClaim, RunningActivationClaim,
-};
-pub(crate) use setup_binding::{SetupVerificationDocument, SetupVerificationIntent};
-
 const SCHEMA: u32 = 1;
 const MAX_STEPS: usize = 64;
 const MAX_ACTIVE_JOBS: usize = 4;
@@ -369,12 +355,6 @@ struct Journal {
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_precondition: Option<super::claude_service::AgentPrecondition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    setup_verification: Option<SetupVerificationIntent>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    setup_verification_cancelled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    setup_completion: Option<setup_binding::SetupCompletionEvidence>,
     created_at: u64,
     updated_at: u64,
     state: JobState,
@@ -406,8 +386,6 @@ pub(crate) struct OperationStatus {
     pub updated_at: u64,
     pub detail: Option<String>,
     pub steps: Vec<StepStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub setup_activation: Option<activation_history::SetupActivationHistory>,
 }
 
 #[derive(Serialize)]
@@ -446,7 +424,6 @@ impl Journal {
             created_at: self.created_at,
             updated_at: self.updated_at,
             detail: self.detail.clone(),
-            setup_activation: None,
             steps: self
                 .steps
                 .iter()
@@ -553,7 +530,6 @@ struct PlanMetadata {
     caller_intent_digest: Option<String>,
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
     agent_precondition: Option<super::claude_service::AgentPrecondition>,
-    setup_verification: Option<SetupVerificationIntent>,
     no_op: bool,
     impact_review: Option<ImpactReport>,
 }
@@ -689,10 +665,7 @@ impl MutationService {
                 JobState::Running | JobState::CancelRequested
             )
         });
-        let operations = operations
-            .iter()
-            .map(|record| self.public_with_activation_history(record, false))
-            .collect();
+        let operations = operations.iter().map(Journal::public).collect();
         Ok(RecentOperations {
             schema_version: 1,
             operations,
@@ -766,7 +739,6 @@ impl MutationService {
                 caller_intent_digest: None,
                 shell_precondition: None,
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -830,7 +802,6 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -868,14 +839,12 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: Some(precondition),
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: false,
                 impact_review: None,
             },
         )
     }
 
-    #[cfg(all(test, unix))]
     pub(crate) fn plan_integrations_with_intent(
         &self,
         operation_id: &str,
@@ -896,43 +865,7 @@ impl MutationService {
                 ),
                 shell_precondition: preconditions.shell,
                 agent_precondition: preconditions.agent,
-                setup_verification: None,
                 no_op: false,
-                impact_review: None,
-            },
-        )
-    }
-
-    /// A versioned verification request is retained even when configuration
-    /// needs no edits. This still publishes only a file-mutation journal; it
-    /// does not start a shell or alter apply's established exit semantics.
-    pub(crate) fn plan_recommended_with_verification_intent(
-        &self,
-        operation_id: &str,
-        changes: PlanChanges<'_>,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-        preconditions: IntegrationPreconditions,
-        verification: SetupVerificationIntent,
-    ) -> Result<OperationStatus, String> {
-        if !uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id) {
-            return Err("recommended setup ID must be a canonical UUID".into());
-        }
-        let no_op = changes.requests.is_empty();
-        self.plan_inner(
-            operation_id,
-            OperationKind::RecommendedSetup,
-            changes.requests,
-            policy,
-            changes.preimages,
-            PlanMetadata {
-                caller_intent_digest: Some(
-                    self.intent_digest(OperationKind::RecommendedSetup, intent)?,
-                ),
-                shell_precondition: preconditions.shell,
-                agent_precondition: preconditions.agent,
-                setup_verification: Some(verification),
-                no_op,
                 impact_review: None,
             },
         )
@@ -965,7 +898,6 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: true,
                 impact_review: None,
             },
@@ -997,7 +929,6 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: false,
                 impact_review: Some(review),
             },
@@ -1022,7 +953,6 @@ impl MutationService {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
                 agent_precondition: None,
-                setup_verification: None,
                 no_op: true,
                 impact_review: Some(review),
             },
@@ -1055,7 +985,6 @@ impl MutationService {
             caller_intent_digest,
             shell_precondition,
             agent_precondition,
-            mut setup_verification,
             no_op,
             impact_review,
         } = metadata;
@@ -1091,8 +1020,6 @@ impl MutationService {
             bind_review_digest(request_digest, &impact_review)?,
             &agent_precondition,
         )?;
-        let request_digest =
-            setup_binding::bind_verification_digest(request_digest, &setup_verification)?;
         if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
             let record: Journal = serde_json::from_str(&existing)
                 .map_err(|_| "existing operation journal is malformed")?;
@@ -1108,18 +1035,6 @@ impl MutationService {
             return Ok(record.public());
         }
         validate_review(&impact_review, operation_id, kind, &policy.identity)?;
-        if let Some(verification) = &setup_verification {
-            verification.validate_for(
-                kind,
-                shell_precondition.as_ref(),
-                requests.iter().map(|request| request.target.clone()),
-            )?;
-        }
-        let verification_inputs = setup_verification
-            .as_ref()
-            .map(|intent| intent.retain_unchanged())
-            .transpose()?
-            .unwrap_or_default();
         policy.revalidate_for_mutation().map_err(refresh)?;
         let shell_inputs = shell_precondition
             .as_ref()
@@ -1305,9 +1220,6 @@ impl MutationService {
             steps.push(step);
         }
         steps.sort_by_key(|step| step.activation);
-        if let Some(verification) = &mut setup_verification {
-            verification.bind_planned_postconditions(&steps, expected_documents)?;
-        }
         // The digest includes private owned preimages and payload, never public output.
         let original_payload_digest = digest(&(
             kind,
@@ -1329,9 +1241,7 @@ impl MutationService {
             bind_review_digest(payload_digest, &impact_review)?,
             &agent_precondition,
         )?;
-        let payload_digest =
-            setup_binding::bind_verification_digest(payload_digest, &setup_verification)?;
-        let mut record = Journal {
+        let record = Journal {
             schema_version: SCHEMA,
             operation_id: operation_id.into(),
             kind,
@@ -1351,9 +1261,6 @@ impl MutationService {
             undo_external_authorization: None,
             shell_precondition,
             agent_precondition,
-            setup_verification,
-            setup_verification_cancelled: false,
-            setup_completion: None,
             created_at: now(),
             updated_at: now(),
             state: if no_op {
@@ -1367,7 +1274,6 @@ impl MutationService {
             }),
             steps,
         };
-        setup_binding::capture_file_completion(&mut record);
         fs_helpers::ensure_private_directory(&self.root, &self.scope)?;
         fs_helpers::transactional_update_checked(
             &path,
@@ -1423,9 +1329,6 @@ impl MutationService {
                     .map_err(refresh)?;
                 validate_agent_lease(record.agent_precondition.as_ref(), agent_inputs.as_ref())
                     .map_err(refresh)?;
-                for input in &verification_inputs {
-                    input.revalidate().map_err(refresh)?;
-                }
                 for step in &record.steps {
                     preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
                     step.scope_identity.validate()?;
@@ -1468,8 +1371,7 @@ impl MutationService {
 
     /// Read the private persisted result without crash reconciliation or writes.
     pub(crate) fn read_status(&self, operation_id: &str) -> Result<OperationStatus, String> {
-        self.read(operation_id)
-            .map(|record| self.public_with_activation_history(&record, true))
+        self.read(operation_id).map(|record| record.public())
     }
 
     pub(crate) fn status(&self, operation_id: &str) -> Result<OperationStatus, String> {
@@ -1479,24 +1381,21 @@ impl MutationService {
             if let Some(_lock) = fs_helpers::try_lock_operation(&lock_path, &self.scope)? {
                 let record = self.read(operation_id)?;
                 if matches!(record.state, JobState::Running | JobState::CancelRequested) {
-                    return Ok(self.public_with_activation_history(&self.update(operation_id, |record| {
+                    return Ok(self.update(operation_id, |record| {
                         record.state = JobState::RecoveryRequired;
                         record.detail = Some("worker ended without a terminal journal result; inspect owned postconditions before retry or undo".into());
                         Ok(())
-                    })?, true));
+                    })?.public());
                 }
-                return Ok(self.public_with_activation_history(&record, true));
+                return Ok(record.public());
             }
         }
-        Ok(self.public_with_activation_history(&record, true))
+        Ok(record.public())
     }
 
     pub(crate) fn cancel(&self, operation_id: &str) -> Result<OperationStatus, String> {
         Ok(self
             .update(operation_id, |record| {
-                if record.setup_verification.is_some() {
-                    record.setup_verification_cancelled = true;
-                }
                 if !record.state.completed() && record.state != JobState::Cancelled {
                     record.state = if record
                         .steps
@@ -1592,7 +1491,7 @@ impl MutationService {
             return Ok(self.update(operation_id, |record| { let recovery = record.steps.iter().any(|s| matches!(s.state, StepState::Applying | StepState::AppliedWithRecovery));
                 record.state = if recovery { JobState::CompletedWithRecovery } else { JobState::Completed };
                 record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
-                for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } setup_binding::capture_file_completion(record); Ok(()) })?.public());
+                for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } Ok(()) })?.public());
         }
         if let Err(error) = self.authorize(
             &record,
@@ -1814,7 +1713,6 @@ impl MutationService {
                     JobState::Completed
                 };
                 record.detail = None;
-                setup_binding::capture_file_completion(record);
                 Ok(())
             })?
             .public())
@@ -2078,7 +1976,6 @@ impl MutationService {
                 "segment deletion is irreversible; checkpoint and deletion record remain".into(),
             );
         }
-        self.invalidate_setup_verification(operation_id)?;
         if record.no_op {
             return Ok(record.public());
         }
@@ -2385,7 +2282,6 @@ impl MutationService {
                 "segment deletion is irreversible; checkpoint and deletion record remain".into(),
             );
         }
-        self.invalidate_setup_verification(&operation_id)?;
         self.spawn_job(operation_id, policy, true)
     }
 

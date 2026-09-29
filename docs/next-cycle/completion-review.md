@@ -50,7 +50,7 @@ their original checkpoint and are superseded by later applicable results.
 | A26: npm installation and selected ARM backend | GNU/musl backend qualified on the recorded canonical PR archives. The narrow GNU Linux AArch64 npm contract passes exact installation, cancellation, post-completion unwinds, lifecycle suppression, implicit-build refusal and public CLI history/retry checks with an explicitly isolated key. Ordinary use still requires production-signed v2 data; general npm/Python execution stays disabled |
 
 The six [everyday routes](user-journeys.md) have concrete observed components:
-recommended terminal setup/fresh activation, actual agent hook/reload behavior,
+recommended terminal setup, actual agent hook/reload behavior,
 read-only project inspection, narrow interruption recovery, numeric replacement,
 and ownership-preserving removal. These compose with the unchanged current
 paths. Final official artifact and beginner observations remain separate from

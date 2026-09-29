@@ -365,9 +365,7 @@
     approval.append(row('Native package approval', state.package_approval.detail, state.package_approval.state), paragraph(state.package_approval.next_action), paragraph('Ordinary command checks and shell protection do not require sudo. This dashboard never requests administrator credentials.'));
     const recent = panel('Saved changes and recovery'); recent.append(paragraph('These are saved operation states. Open an operation to reconcile its current status; closing the browser does not cancel submitted work.'));
     if (!jobs.operations.length) recent.append(paragraph('No saved operations in the bounded inventory.', 'empty'));
-    for (const operation of jobs.operations) { recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
-      if (operation.setup_activation) recent.append(activationHistoryPanel(operation.setup_activation));
-    }
+    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
     recent.append(rawDetails('Inspect inventory coverage', jobs.coverage));
     return [install, approval, sources, await teamConnectionPanel(), await teamEnrollmentPanel(), teamRolloutPanel(), retention, recent, supportPanel(), local, exportPanel];
   }
@@ -677,40 +675,12 @@
       pendingPlanActions(pending);
     } finally { if (planRequest === request) planRequest = null; }
   }
-  function activationHistoryPanel(history) {
-    const node = panel('Stored terminal observation');
-    const messages = {
-      missing: 'No automatic terminal result was recorded. Older setup records may have no result.',
-      incomplete: history.claim_phase === 'running'
-        ? 'An attempt was started but has no recorded terminal result. It may still be running or may have been interrupted.'
-        : 'An attempt was reserved or ended without a recorded terminal result. Its outcome is unknown.',
-      invalid: 'The private historical record could not be validated. Its outcome is unknown.',
-      recorded: 'This is a stored historical terminal observation.'
-    };
-    node.append(paragraph(messages[history.availability] || 'Historical outcome is unavailable.'),
-      paragraph('This recorded result does not tell us whether your current terminal is protected. Run verification in that terminal to check its protection.', 'notice'));
-    if (history.availability === 'recorded' && history.observation) {
-      const observed = history.observation;
-      const outcomes = {observed_blocking:'Blocking was observed', cancelled:'The attempt was cancelled', refused:'The attempt was refused'};
-      node.append(row(outcomes[observed.terminal?.outcome] || 'Historical outcome unavailable',
-        `Channel: ${observed.channel}; client: ${observed.client_version}; attempt: ${observed.attempt_id}`,
-        new Date(observed.recorded_unix_ms).toLocaleString()));
-    }
-    const relations = {changed:'Setup changed or was undone after this result. The historical observation is retained.',
-      recorded_inputs_match:'Recorded setup files matched during this read. This does not check the current shell, binary, or effective policy.',
-      not_checked:'Current setup files were not compared in this inventory. Open or refresh the saved operation to compare them.',
-      unknown:'Current setup inputs could not be compared.'};
-    node.append(paragraph(relations[history.setup_state] || relations.unknown, 'muted'));
-    return node;
-  }
   function displayOperation(operation, preview) {
     const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
     context.readbackSequence = (context.readbackSequence || 0) + 1;
     if (preview) context.policyFields = preview.field ? [preview.field] : (preview.field_changes || []).map(change => change.field);
     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
     operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
-    if (operation.setup_activation) operationContent.append(activationHistoryPanel(operation.setup_activation));
-    else if (operation.kind === 'recommended-setup') operationContent.append(paragraph('Automatic terminal history has not been read in this response. Refresh stored status; current protection remains unknown.', 'notice'));
     if (operation.detail) operationContent.append(paragraph(operation.detail, 'notice'));
     if (operation.irreversible) operationContent.append(paragraph('This operation permanently deletes retained records. A checkpoint and tombstone remain, but these records cannot be restored by undo.', 'notice'));
     if (operation.impact_review) {

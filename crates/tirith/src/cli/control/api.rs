@@ -433,7 +433,7 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             let operations: Vec<_> = recent.operations.iter().map(|status| {
                 json!({"schema_version":status.schema_version,"operation_id":status.operation_id,
                 "kind":status.kind,"state":status.state,"no_op":status.no_op,"active_action":status.active_action,
-                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len(),"setup_activation":status.setup_activation})
+                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len()})
             }).collect();
             Ok(
                 json!({"schema_version":1,"kind":"recent_operations", "operations":operations,"coverage":recent.coverage}),

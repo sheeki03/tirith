@@ -535,7 +535,6 @@ mod tests {
         })
         .unwrap();
         let status = OperationStatus {
-            setup_activation: None,
             schema_version: 1,
             operation_id: id.clone(),
             kind: OperationKind::SetProfile,

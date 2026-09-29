@@ -32,15 +32,13 @@ def function(source, name, fish=False):
 class AckControls(unittest.TestCase):
     serial = 0
 
-    def invoke(self, family, operation, channel, operation_exit, ack_exit,
-               reconcile_exit=None, discard_exit=None, wrong_cwd=False):
+    def invoke(self, family, operation, channel, operation_exit, ack_exit):
         self.__class__.serial += 1
         case = self.root / str(self.serial)
         case.mkdir()
         hook = self.sources[family]
         env = dict(self.base_env, ACK_LOG=str(case / 'calls.jsonl'), ACK_OPERATION_EXIT=str(operation_exit),
-                   ACK_EXIT=str(ack_exit), ACK_RECONCILE_EXIT=str(reconcile_exit or 0),
-                   ACK_DISCARD_EXIT=str(discard_exit or 0), ACK_TOKEN=TOKEN, ACK_COMMAND=COMMAND,
+                   ACK_EXIT=str(ack_exit), ACK_TOKEN=TOKEN, ACK_COMMAND=COMMAND,
                    ACK_CWD=str(case), _TIRITH_BIN=str(self.stub), _TIRITH_ENV_BIN='/usr/bin/env',
                    _TIRITH_SH_BIN='/bin/sh', _TIRITH_RECEIPT_INSTANCE='b' * 64,
                    _TIRITH_RECEIPT_FAMILY=family, _TIRITH_V3_HELPERS_READY='1',
@@ -56,13 +54,6 @@ class AckControls(unittest.TestCase):
                 call += ' "$ACK_COMMAND"'
             body += call + '\nrc=$?\n[[ $_TIRITH_UNRESOLVED_RECEIPT == untouched ]] || exit 90\nexit "$rc"\n'
             argv = [self.shells[family], '--noprofile', '--norc', '-c', body]
-        elif operation == 'activation-retire':
-            body = '\n'.join(function(hook, name) for name in
-                             ['_tirith_activation_acknowledge_receipt', '_tirith_activation_retire_receipt'])
-            cwd = '"$ACK_CWD"' if wrong_cwd else '"$PWD"'
-            body += f'\nunset _TIRITH_UNRESOLVED_RECEIPT\n_tirith_activation_retire_receipt "$ACK_TOKEN" {cwd}\n'
-            body += 'rc=$?\nif (( rc == 0 )); then [[ -z ${_TIRITH_UNRESOLVED_RECEIPT:-} ]] || exit 90; else [[ $_TIRITH_UNRESOLVED_RECEIPT == "$ACK_TOKEN" ]] || exit 91; fi\nexit "$rc"\n'
-            argv = [self.shells['zsh'], '-dfc', body]
         else:
             fish = family == 'fish'
             names = ['_tirith_receipt_acknowledge_at', '_tirith_receipt_' + operation + '_at']
@@ -102,24 +93,6 @@ class AckControls(unittest.TestCase):
                             if operation_exit == 0:
                                 self.assertEqual(calls[1]['stdin'], TOKEN)
 
-    def test_automatic_retirement_ack_follows_known_result_and_preserves_uncertainty(self):
-        cases = [(0, 1, 0, False), (0, 1, 99, False), (1, 0, 0, False),
-                 (1, 0, 99, False), (1, 1, 0, False), (0, 0, 0, True)]
-        for reconcile, discard, ack, wrong_cwd in cases:
-            with self.subTest(reconcile=reconcile, discard=discard, ack=ack, wrong_cwd=wrong_cwd):
-                code, calls = self.invoke('zsh', 'activation-retire', 'zsh', 0, ack,
-                                          reconcile, discard, wrong_cwd)
-                expected = [] if wrong_cwd else ['receipt-reconcile']
-                if not wrong_cwd and reconcile:
-                    expected.append('receipt-discard')
-                successful = not wrong_cwd and (reconcile == 0 or discard == 0)
-                if successful:
-                    expected.append('receipt-acknowledge')
-                self.assertEqual([r['argv'][1] for r in calls], expected)
-                self.assertEqual(code, 0 if successful else 1)
-                for row in calls:
-                    self.assertEqual(row['stdin'], TOKEN + '\n')
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -158,13 +131,9 @@ def main():
 action = sys.argv[2]
 with open(os.environ['ACK_LOG'], 'a') as f:
     f.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read(1048577)}) + '\\n')
-if action in ('acknowledge', 'receipt-acknowledge'):
+if action == 'acknowledge':
     sys.stderr.write('simulated unsupported ACK route\\n')
     sys.exit(int(os.environ['ACK_EXIT']))
-if action == 'receipt-reconcile':
-    sys.exit(int(os.environ['ACK_RECONCILE_EXIT']))
-if action == 'receipt-discard':
-    sys.exit(int(os.environ['ACK_DISCARD_EXIT']))
 sys.exit(int(os.environ['ACK_OPERATION_EXIT']))
 ''')
         stub.chmod(0o700)

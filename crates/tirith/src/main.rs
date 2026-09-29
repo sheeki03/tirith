@@ -8113,63 +8113,10 @@ fn main() {
         cli::capsule_child::run_on_main_thread(&raw_args);
     }
 
-    // Automatic diagnostics have a fixed child-free ABI. Bound stdin, policy,
-    // capability and output work before any of it starts. Capsule containment
-    // must still run first, while there is no watchdog or worker thread.
-    let automatic = cli::automatic_deadline::match_zsh_automatic_diagnostic(&raw_args);
-    let coordinator = cli::automatic_deadline::match_zsh_automatic_coordinator(&raw_args);
-    if raw_args
-        .get(1)
-        .is_some_and(|arg| arg == "__setup-activation")
-        && !matches!(
-            automatic,
-            Some(
-                cli::automatic_deadline::DiagnosticInvocation::Probe(_)
-                    | cli::automatic_deadline::DiagnosticInvocation::Receipt(_)
-            )
-        )
-        && coordinator.is_none()
-    {
-        // No watchdog exists yet. Even an error write or buffered exit could
-        // wait on an unread pipe; the internal caller classifies this code.
-        unsafe { libc::_exit(2) }
-    }
-    let budget =
-        coordinator.or(automatic.map(|_| cli::automatic_deadline::DeadlineBudget::Diagnostic));
-    let _automatic_deadline = budget.map(|budget| {
-        cli::automatic_deadline::SelfDeadline::arm(budget).unwrap_or_else(|_| {
-            // Arming failed, so no operation or output may precede refusal.
-            unsafe { libc::_exit(125) }
-        })
-    });
-
     let handle = std::thread::Builder::new()
         .name("tirith-main".to_string())
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            // Thread-local: enter inside the worker, before automatic stdin,
-            // authentication or policy work. Ordinary/manual routes are unchanged.
-            let _automatic_policy_inputs =
-                budget.map(|_| tirith_core::policy::BoundedRuntimePolicyInputs::enter());
-            if coordinator.is_some() {
-                std::process::exit(cli::setup_activation::run_coordinator(&raw_args));
-            }
-            if let Some(cli::automatic_deadline::DiagnosticInvocation::Receipt(action)) = automatic
-            {
-                std::process::exit(cli::setup_activation::run_receipt(action));
-            }
-            if matches!(
-                automatic,
-                Some(cli::automatic_deadline::DiagnosticInvocation::Probe(_))
-            ) {
-                // The raw matcher already bounded and validated these fields.
-                // Avoid the manual adapter and canonical current-status path.
-                let action = raw_args[3].to_str().expect("validated probe action");
-                let id = raw_args[7].to_str().expect("validated probe identifier");
-                std::process::exit(cli::setup_activation::run_probe(action, id));
-            }
-            run();
-        })
+        .spawn(run)
         .expect("failed to spawn tirith main thread");
     if handle.join().is_err() {
         // `run` panicked (hook already reported it); exit 101 without re-panicking.

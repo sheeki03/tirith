@@ -1,4 +1,4 @@
-//! Internal bounded input admission for automatic activation processes.
+//! Internal bounded input admission for scoped runtime policy reads (team rollout).
 //! Runtime resolution, authority selection and overlays stay unchanged. An
 //! unreadable/oversized/special user list refuses this entire scoped operation;
 //! it is never interpreted as an absent allowlist or blocklist.
@@ -18,8 +18,7 @@ thread_local! {
     static ACTIVE: RefCell<Weak<Cell<bool>>> = const { RefCell::new(Weak::new()) };
 }
 
-/// Internal thread-local scope for the fixed automatic broker/relay/probe/check
-/// routes. It grants no policy or execution authority. A nested scope shares
+/// Internal thread-local scope for bounded runtime policy reads. It grants no policy or execution authority. A nested scope shares
 /// refusal state; dropping it cannot erase an outer refusal. Ordinary callers
 /// keep their existing user-list reader and diagnostic behavior.
 #[doc(hidden)]
