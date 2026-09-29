@@ -109,8 +109,7 @@ and can recheck retained file identities. Package inspection and comparison
 report exact artifact identity where available, with bounded static evidence;
 neither authorizes installation. `pkg install` remains disabled on every host;
 flags, sudo and administrator access cannot enable that unqualified backend.
-The separate Linux `pkg materialize` workflow copies eligible local archive data
-without executing package code and has its own reviewed plan and apply steps.
+For npm, `tirith install npm <pkg>` analyzes the request before running npm.
 
 ## Resolve an interruption
 

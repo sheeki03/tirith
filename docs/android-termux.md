@@ -37,7 +37,6 @@ a Linux release archive. Keep source builds updated from reviewed source.
 | Clipboard guard, daemon, and source watcher | No Android backend; refuse instead of claiming a running guard. Sudo does not enable them. |
 | Required containment | No Android containment backend. Coverage is absent and an enforcing launch refuses. |
 | Native package approval | Unsupported on Android. Installing sudo does not enable the x86_64 Linux authority. |
-| Local npm materialization | Native publication is Linux-only; Android is refused. |
 | Shell hooks | Device and shell qualification is still required; do not infer interception from a successful `check` invocation. |
 
 Do not bypass a containment refusal with a degraded-execution option when the

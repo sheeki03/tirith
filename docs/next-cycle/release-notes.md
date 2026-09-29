@@ -36,19 +36,14 @@ authenticated publication, reviewed activation, rollback and client reports
 preserve policy authority and distinguish missing or stale clients. Personal
 protection requires no server; publishing a policy does not prove adoption.
 
-## Inspection and bounded npm installation
+## Inspection
 
 Project review and local npm inspection/comparison report inspected identities,
 skipped inputs and incomplete analysis without executing package scripts.
-Data-only materialization remains a separate operation.
-
-The experimental `pkg install-npm` route is qualified only for GNU Linux
-AArch64 and exact local leaf archives. It requires pinned Node/npm/runtime
-files, disabled lifecycle scripts, full native containment, fresh authority and
-a current production-signed v2 threat feed. Unresolved dependencies or lifecycle
-analysis, implicit native builds and unsupported hosts refuse. The currently published
-v1 feed cannot enable this route. General npm/Python `pkg install` remains
-disabled. See the [installation contract](../npm-install-contract.md).
+To check an npm package before installing it, use `tirith install npm <pkg>`
+(analyze first, then run npm) or inspect a local tarball with `tirith pkg
+inspect` and compare releases with `tirith pkg diff`. General npm/Python
+`pkg install` remains disabled.
 
 ## Reliability fixes
 
@@ -67,8 +62,8 @@ disabled. See the [installation contract](../npm-install-contract.md).
 ## Validation and release status
 
 CI, native ARM, release validation, fuzz and benchmark workflows pass on the
-recorded integrated product. Native npm contract tests pass all seven supported
-cases with isolated test authority; production-key builds reject that authority.
+recorded integrated product. The local-leaf npm install contract was retired
+before release; `tirith install npm`, `pkg inspect` and `pkg diff` remain.
 Exact artifacts, platform limits and earlier corrected failures remain in
 [verification](verification.md) and the [acceptance matrix](acceptance-matrix.md).
 

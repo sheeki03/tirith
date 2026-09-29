@@ -15,8 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
 - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.
 - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
-- Reviewed local materialization of dependency-free, script-free npm artifacts on supported Linux hosts, with exact artifact binding and explicit recovery. This workflow does not execute package code.
-- Separate `pkg install-npm` review, installation, history and recovery for the qualified GNU Linux AArch64 local-leaf contract. It binds exact archives and pinned Node/npm/runtime files, disables lifecycle scripts, verifies installed bytes and refuses replay. Unresolved dependencies or lifecycle analysis, implicit native builds and unsupported hosts refuse. Actual use still requires complete native containment, fresh policy/task authority and a current production-signed v2 threat feed; the published v1 feed is insufficient.
 - Native macOS ARM allocation and memory regression budgets in PR CI, backed by three reference runs and six deliberate-regression checks. Runner or measurement changes require a compatibility review.
 
 ### Fixed
@@ -24,8 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove sudo dependencies and suggestions from native packages. Ordinary protection stays unprivileged; manual privileged-helper installation is off by default, and unsupported or missing approval prerequisites have explicit guidance.
 - Wait for optional hook telemetry and stop overdue logging children so completed hooks do not leave ordinary background writers behind. Telemetry failures preserve the selected protection decision.
 - Preserve protocol fields under custom redaction, apply fresh privacy rules to selected support exports, and keep signed verification material separate from display copies.
-- Apply fresh privacy rules to npm operation output while preserving review handles and historical stderr behavior. Preserve private checkpoint data during unexpected unwinding, and check receipt-signing keys before package execution can start.
-- Bind npm approvals to the complete private review, including policy and file generations. Older materialization reviews remain readable but cannot authorize changes; unstarted work requires a new review.
+- Preserve private checkpoint data during unexpected unwinding.
 - Bound recent history and tuning reads, preserve all contributing blockers in previews, and report expectation labels without inferring safety or automatic approval.
 - Keep large effective-policy responses usable with explicit field-summary limits, and prevent inherited nonblocking sockets from truncating local dashboard responses or timing out requests prematurely.
 - Preserve exact audit history through reviewed rotation and recovery; retained segment deletion requires an irreversible acknowledgement and never offers a false undo.

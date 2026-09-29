@@ -6035,17 +6035,6 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
-    /// Review and track a confined install of exact local npm leaf archives.
-    InstallNpm {
-        #[command(subcommand)]
-        action: cli::npm_install::Action,
-    },
-    /// Materialize reviewed local leaf archive data without running package code.
-    /// This Linux-only contract is separate from the disabled execution backend.
-    Materialize {
-        #[command(subcommand)]
-        action: cli::npm_materialize::Action,
-    },
     /// Inspect exact local npm tarballs or Python wheels without executing them.
     #[command(after_help = "\
 Examples:
@@ -8382,12 +8371,6 @@ fn run() {
         }
 
         Commands::Pkg {
-            action: PkgAction::InstallNpm { action },
-        } => cli::npm_install::run(action),
-        Commands::Pkg {
-            action: PkgAction::Materialize { action },
-        } => cli::npm_materialize::run(action),
-        Commands::Pkg {
             action:
                 PkgAction::Inspect {
                     artifacts,
@@ -8570,8 +8553,6 @@ fn run() {
                 // match.
                 PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
                 PkgAction::Inspect { .. } => unreachable!("pkg inspect handled above"),
-                PkgAction::Materialize { .. } => unreachable!("pkg materialize handled above"),
-                PkgAction::InstallNpm { .. } => unreachable!("pkg install-npm handled above"),
                 // `Diff` is likewise handled by its own earlier arm (it returns the
                 // release-differential verdict's exit code through
                 // `cli::provenance::run_diff`), so it never reaches here.
@@ -10491,114 +10472,38 @@ fn run() {
 #[cfg(test)]
 mod help_category_tests {
     #[test]
-    fn npm_install_requires_review_and_rejects_execution_overrides() {
+    fn retired_local_leaf_npm_routes_are_not_commands() {
         with_large_cli_stack(|| {
             use clap::Parser;
-            for action in ["apply", "recover", "undo"] {
-                let base = [
-                    "tirith",
-                    "pkg",
-                    "install-npm",
-                    action,
-                    "11111111-1111-4111-8111-111111111111",
-                ];
-                assert!(super::Cli::try_parse_from(base).is_err());
-                let digest = "a".repeat(64);
-                let reviewed = base.into_iter().chain(["--reviewed", &digest, "--json"]);
-                assert!(matches!(
-                    super::Cli::try_parse_from(reviewed.clone())
-                        .unwrap()
-                        .command,
-                    super::Commands::Pkg {
-                        action: super::PkgAction::InstallNpm { .. }
-                    }
-                ));
-                for option in [
-                    "--yes",
-                    "--allow-degraded",
-                    "--online",
-                    "--script",
-                    "--index-url",
+            for route in ["install-npm", "materialize"] {
+                for action in [
+                    vec!["plan", "package.tgz"],
+                    vec!["apply", "11111111-1111-4111-8111-111111111111"],
+                    vec!["--help"],
                 ] {
-                    assert!(super::Cli::try_parse_from(reviewed.clone().chain([option])).is_err());
+                    let argv = ["tirith", "pkg", route].into_iter().chain(action);
+                    let error = match super::Cli::try_parse_from(argv) {
+                        Ok(_) => panic!("pkg {route} must not parse"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(
+                        error.kind(),
+                        clap::error::ErrorKind::InvalidSubcommand,
+                        "pkg {route}"
+                    );
                 }
             }
+            // The kept npm routes still parse.
             assert!(super::Cli::try_parse_from([
                 "tirith",
                 "pkg",
-                "install-npm",
-                "plan",
+                "inspect",
                 "package.tgz",
+                "--ecosystem",
+                "npm"
             ])
-            .is_err());
-        });
-    }
-
-    #[test]
-    fn materialize_cli_requires_explicit_review_for_apply_and_recovery() {
-        with_large_cli_stack(|| {
-            use clap::Parser;
-            for action in ["apply", "recover", "undo"] {
-                assert!(super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    action,
-                    "11111111-1111-4111-8111-111111111111"
-                ])
-                .is_err());
-                let parsed = super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    action,
-                    "11111111-1111-4111-8111-111111111111",
-                    "--reviewed",
-                    &"a".repeat(64),
-                    "--json",
-                ])
-                .unwrap();
-                assert!(matches!(
-                    parsed.command,
-                    super::Commands::Pkg {
-                        action: super::PkgAction::Materialize { .. }
-                    }
-                ));
-            }
-        });
-    }
-    #[test]
-    fn materialize_cli_does_not_accept_execution_or_resolver_overrides() {
-        with_large_cli_stack(|| {
-            use clap::Parser;
-            for option in [
-                "--yes",
-                "--allow-degraded",
-                "--online",
-                "--script",
-                "--index-url",
-            ] {
-                assert!(super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    "plan",
-                    "demo.tgz",
-                    "--target",
-                    "fresh",
-                    option
-                ])
-                .is_err());
-            }
-            assert!(super::Cli::try_parse_from([
-                "tirith",
-                "pkg",
-                "materialize",
-                "plan",
-                "--target",
-                "fresh"
-            ])
-            .is_err());
+            .is_ok());
+            assert!(super::Cli::try_parse_from(["tirith", "pkg", "attest-npm"]).is_ok());
         });
     }
 

@@ -32,7 +32,7 @@ The unchanged dependencies retain these SHA-256 pins:
 
 | Dependency | SHA-256 |
 | --- | --- |
-| `signed_replacement_inputs.py` | `d398b167eac3a672aa5996fe93c0a8ba47ab571c6dd747f777fafe02b43fac80` |
+| `signed_replacement_inputs.py` | `f7a512121b7a400e34fe86bb8fc0fdc86b8bca6e892b4fcc107ff8a60b57f101` (re-pinned after the retired npm generator inputs were removed) |
 | `mixed_audit_native.py` | `913a3499bd78b39c6870b9dc280fcaad8a49739db7f2781bbfe914ff4db12e75` |
 | `signed_replacement_native.py` | `de7b2ac0af3c10d10e27fd44ec0d60fa5486803b03f69b693a5ed6b67d1b4e7b` |
 

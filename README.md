@@ -957,7 +957,6 @@ The everyday commands:
 | `tirith package inspect --artifact <wheel>` | Inspect exact Python artifact bytes, startup hooks, native code, RECORD integrity, and cross-wheel execution chains |
 | `tirith pkg approve` | Create a non-installing Python package approval under its native authority and platform requirements |
 | `tirith pkg install` | Currently disabled on every host: refuses with `private_input_execution_unqualified` before resolver or package execution |
-| `tirith pkg install-npm` | Review, apply, inspect history and reconfirm a bounded local leaf installation. GNU Linux AArch64 only, with exact pinned tools, disabled scripts, full native confinement and a current production-signed v2 threat feed. The published v1 feed is insufficient; unsupported or incomplete requests refuse. See the [installation contract](docs/npm-install-contract.md) |
 | `tirith pkg verify-env` | Verify an existing Python environment without installing packages |
 | `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |
 | `tirith gateway run` | Proxy an upstream MCP server and enforce configured request/output boundaries |

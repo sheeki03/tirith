@@ -29,6 +29,8 @@ official publication, production v2 availability or a human pilot.
 
 ## September 29: capability compatibility record
 
+(Historical: the local-leaf npm routes `pkg install-npm` and `pkg materialize` were
+later retired before release; see the archive tags.)
 The first integration at `cd914781` exposes one stale compatibility fingerprint:
 `capability_manifest_bytes_are_frozen` fails on Rust 1.83 and Windows because the
 new manifest was not reflected in its reviewed C00 contract. Windows completes
@@ -1337,6 +1339,8 @@ checks pass 45 core npm tests, seven release compatibility tests, eleven stored
 format inventory tests and thirteen npm-selected CLI tests. The latter selection
 includes command grammar and existing package metadata tests; it does not run
 the Linux-only intent tests on macOS.
+(Historical: the local-leaf npm routes `pkg install-npm` and `pkg materialize` were
+later retired before release; see the archive tags.)
 
 The auditable bootstrap sources regenerate the exact previously reviewed
 `41183108651b825e4712922f9056d1caf5766814f992167ac36fd200d9daa4d7`
@@ -1847,6 +1851,8 @@ measurements.
 
 ## Optional team policy and local materialization (2026-09-21)
 
+(Historical: the local-leaf npm routes `pkg install-npm` and `pkg materialize` were
+later retired before release; see the archive tags.)
 The resumed source matches all 62 retained changed/new inputs at base
 `3629a724`. Its input manifest SHA-256 is
 `fe209fcf795e589e5a35869848237749365c2282b5b9ff8108231cedbbdb4b1b`. The corrected full CLI unit executable

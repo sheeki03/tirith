@@ -14,7 +14,9 @@ import tomllib
 
 import signed_replacement_inputs as base
 
-PIN = "d398b167eac3a672aa5996fe93c0a8ba47ab571c6dd747f777fafe02b43fac80"
+# Re-pinned when the retired local-leaf npm generator inputs were removed
+# (previous pin d398b167eac3a672aa5996fe93c0a8ba47ab571c6dd747f777fafe02b43fac80).
+PIN = "f7a512121b7a400e34fe86bb8fc0fdc86b8bca6e892b4fcc107ff8a60b57f101"
 CONTRACT = "tirith_signed_numeric_build_input_v1"
 VERSIONS = ("0.4.2", "0.4.3")
 require = base.require

@@ -110,7 +110,6 @@ qualification remains tracked separately.
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
 | `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
-| `tirith pkg install-npm` | Review, apply, inspect history and reconfirm a bounded local leaf installation. GNU Linux AArch64 only, with exact pinned tools, disabled scripts, full native confinement and a current production-signed v2 threat feed. The published v1 feed is insufficient; unsupported or incomplete requests refuse. See the [installation contract](npm-install-contract.md) |
 | `tirith pkg inspect <artifact>...` | Inspect exact local npm tarballs or Python wheels without execution. [npm reports](npm-inspection.md) preserve captured hashes and explicit coverage; ambiguous `.tar.gz` files require `--ecosystem npm` for the npm reader (`--format json`, npm `--format sarif`) |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
 | `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |

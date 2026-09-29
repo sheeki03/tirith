@@ -109,10 +109,6 @@ pub enum OwnedBoundary {
     /// `tirith pkg install` is about to checkpoint the target environment and
     /// prepare the contained install.
     PackageInstallPreparation,
-    /// Retained local npm bytes become inert files under a held new tree.
-    LocalPackageMaterialization,
-    /// Fresh exact-tree confirmation or delete-only recovery authorization.
-    LocalPackageRecovery,
     /// `tirith install <manager>` is about to contact a registry.
     PackageManagerNetwork,
     /// `tirith install <manager>` is about to spawn the package manager.
@@ -147,8 +143,6 @@ impl OwnedBoundary {
             Self::PackageApproval => "package_approval",
             Self::PackageResolve => "package_resolve",
             Self::PackageInstallPreparation => "package_install_preparation",
-            Self::LocalPackageMaterialization => "local_package_materialization",
-            Self::LocalPackageRecovery => "local_package_recovery",
             Self::PackageManagerNetwork => "package_manager_network",
             Self::PackageManagerExecution => "package_manager_execution",
             Self::RemoteScriptRun => "remote_script_run",
@@ -453,11 +447,6 @@ boundary_markers!(
     (PackageApprovalBoundary, PackageApproval),
     (PackageResolveBoundary, PackageResolve),
     (PackageInstallPreparationBoundary, PackageInstallPreparation),
-    (
-        LocalPackageMaterializationBoundary,
-        LocalPackageMaterialization
-    ),
-    (LocalPackageRecoveryBoundary, LocalPackageRecovery),
     (PackageManagerNetworkBoundary, PackageManagerNetwork),
     (PackageManagerExecutionBoundary, PackageManagerExecution),
     (RemoteScriptRunBoundary, RemoteScriptRun),
@@ -3276,7 +3265,7 @@ mod exact_gate_lease_tests {
     use super::*;
     fn operation(envelope: &TaskEnvelopeInput) -> BoundaryOperation<'_> {
         BoundaryOperation {
-            boundary: OwnedBoundary::LocalPackageRecovery,
+            boundary: OwnedBoundary::ConfigWrite,
             envelope,
             adapter: IngressAdapter::Unattributed,
             boundary_effects: BTreeSet::new(),
@@ -3294,7 +3283,7 @@ mod exact_gate_lease_tests {
         let op = operation(&envelope);
         let gate = TaskGatePolicy::default();
         let pending = || {
-            prepare_locally_derived_boundary_authorization::<LocalPackageRecoveryBoundary>(
+            prepare_locally_derived_boundary_authorization::<ConfigWriteBoundary>(
                 &op,
                 &gate,
                 &TaskAnalysisContext::default(),

@@ -1,21 +1,6 @@
 //! Shared retained-target checkpoint for closed contained package installers.
-//! The wheel entrypoint retains its existing exact-envelope behavior. Npm uses
-//! a typed staged authorization bound to its immutable complete leaf plan.
+//! The wheel entrypoint retains its existing exact-envelope behavior.
 #![allow(dead_code)]
-
-#[path = "npm_materialize_recovery_checkpoint.rs"]
-pub(crate) mod materialization_recovery_checkpoint;
-
-#[path = "npm_materialize_store.rs"]
-pub(crate) mod materialization_store;
-
-#[path = "npm_materialize_checkpoint.rs"]
-pub(crate) mod materialization;
-
-#[path = "npm_checkpoint_binding.rs"]
-mod npm_binding;
-#[cfg(target_os = "linux")]
-use npm_binding::NpmReceiptBinding;
 
 #[cfg(target_os = "linux")]
 use crate::cli::capsule;
@@ -59,9 +44,8 @@ use tirith_core::task_boundary::{
 /// The journal is durable evidence, not recovery authority. If a process crashes
 /// and leaves it behind, a later attempt refuses rather than trusting path-based or
 /// same-UID-mutable recovery metadata. Target binding itself is Linux-only. The
-/// wheel execution remains x86_64 Linux-only. The separate closed npm contract
-/// must establish its own qualified tool closure and native launcher coverage;
-/// this shared checkpoint does not broaden either execution gate.
+/// wheel execution remains x86_64 Linux-only; this shared checkpoint does not
+/// broaden that execution gate.
 #[derive(Debug)]
 pub struct InstallTargetBinding {
     target: PathBuf,
@@ -245,8 +229,6 @@ pub struct EnvironmentCheckpoint {
     private_target: PathBuf,
     task_authorization: Option<Arc<TaskBoundaryEffectLease<PackageInstallPreparationBoundary>>>,
     task_envelope: Option<tirith_core::task::TaskEnvelopeInput>,
-    #[cfg(target_os = "linux")]
-    npm_receipt_binding: Option<NpmReceiptBinding>,
     #[cfg(target_os = "linux")]
     state: CheckpointState,
 }
@@ -489,48 +471,6 @@ impl EnvironmentCheckpoint {
         Ok(checkpoint)
     }
 
-    /// Consume the one staged npm authorization for this exact held target.
-    /// It already binds retained manifests, artifacts, policy and tool closure;
-    /// never reconstruct a weaker wheel-style envelope from package strings.
-    pub(crate) fn begin_npm_authorized(
-        binding: &InstallTargetBinding,
-        authorization: tirith_core::artifact::npm_install::NpmPreparationAuthorization,
-    ) -> std::io::Result<Self> {
-        if authorization.target_identity() != &binding.package_target_identity() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "staged npm authorization identifies a different target",
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        let npm_operation_id = authorization.operation_id().to_owned();
-        let (envelope, lease) = authorization.into_parts();
-        let operation = BoundaryOperation {
-            boundary: tirith_core::task_boundary::OwnedBoundary::PackageInstallPreparation,
-            envelope: &envelope,
-            adapter: tirith_core::task::IngressAdapter::Unattributed,
-            boundary_effects: Default::default(),
-        };
-        lease
-            .authorize_effect_at(&operation, chrono::Utc::now())
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("staged npm authorization expired or changed: {error}"),
-                )
-            })?;
-        // begin rechecks the retained parent and final absence before the first
-        // journal/target write. All cleanup remains descriptor-confined here.
-        let mut checkpoint = Self::begin(binding)?;
-        checkpoint.task_authorization = Some(lease);
-        checkpoint.task_envelope = Some(envelope);
-        #[cfg(target_os = "linux")]
-        {
-            checkpoint.npm_receipt_binding = Some(NpmReceiptBinding::new(npm_operation_id));
-        }
-        Ok(checkpoint)
-    }
-
     /// Untyped initialization is private so production callers cannot bypass
     /// [`Self::begin_authorized`]. Unit tests in this module exercise the
     /// descriptor/journal machinery directly through this inner seam.
@@ -708,7 +648,6 @@ impl EnvironmentCheckpoint {
                 private_target,
                 task_authorization: None,
                 task_envelope: None,
-                npm_receipt_binding: None,
                 state: CheckpointState::Private,
             })
         }
@@ -780,59 +719,11 @@ impl EnvironmentCheckpoint {
         }
     }
 
-    /// Bind the exact prepared npm receipt before publication. The operation ID
-    /// comes from the consumed preparation authorization, and the receipt values
-    /// come from the core's opaque signed private-to-committed derivation.
-    pub(crate) fn bind_npm_committed_receipt(
-        &mut self,
-        prepared: &tirith_core::receipt::PreparedCommittedReceipt,
-    ) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            if self.state != CheckpointState::Private {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "npm receipt must be bound before checkpoint publication",
-                ));
-            }
-            self.verify_private_identity()?;
-            self.npm_receipt_binding
-                .as_mut()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "only npm preparation accepts an npm receipt binding",
-                    )
-                })?
-                .bind_prepared(prepared.npm_operation_id(), prepared.receipt_id())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = prepared;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "held npm checkpoints are not implemented on this platform",
-            ))
-        }
-    }
-
-    /// Suppress automatic private rollback when child quiescence is unproven.
-    /// This preserves owned objects and does not assert any recovery success.
-    pub(crate) fn preserve_for_recovery(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.state == CheckpointState::Private {
-            self.state = CheckpointState::Retained;
-        }
-    }
-
     /// Atomically publish the privately verified target without claiming that the
     /// mandatory linked committed receipt has been recorded yet.
     pub fn publish_verified(&mut self) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            if let Some(binding) = &self.npm_receipt_binding {
-                binding.require_prepared()?;
-            }
             match self.state {
                 CheckpointState::Committed => return Ok(()),
                 CheckpointState::PublishedUnconfirmed
@@ -896,9 +787,6 @@ impl EnvironmentCheckpoint {
     ) -> std::io::Result<RecordedReceipt> {
         #[cfg(target_os = "linux")]
         {
-            if let Some(binding) = &self.npm_receipt_binding {
-                binding.verify_committed(proof.receipt_id())?;
-            }
             match self.state {
                 CheckpointState::Committed => return Ok(proof.into_recorded()),
                 CheckpointState::PublishedUnconfirmed => {}
@@ -1605,27 +1493,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn uncertain_child_cleanup_preserves_owned_tree_and_journal_on_drop() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        let binding = InstallTargetBinding::bind(&target).unwrap();
-        let mut checkpoint = EnvironmentCheckpoint::begin(&binding).unwrap();
-        let private = checkpoint.install_path().to_owned();
-        let journal = root.path().join(checkpoint_journal_name(&target));
-        std::fs::write(private.join("unfinished"), b"preserve").unwrap();
-        checkpoint.preserve_for_recovery();
-        assert_eq!(checkpoint.state(), CheckpointState::Retained);
-        drop(checkpoint);
-        assert_eq!(
-            std::fs::read(private.join("unfinished")).unwrap(),
-            b"preserve"
-        );
-        assert!(journal.is_dir());
-        assert!(!target.exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn unexpected_unwind_preserves_private_bytes_and_journal() {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
@@ -2028,7 +1895,7 @@ mod tests {
         );
     }
     /// An actual exited process loses every checkpoint capability. Inert test
-    /// bytes only: this test does not manufacture npm execution/completion proof.
+    /// bytes only: this test does not manufacture execution/completion proof.
     #[test]
     #[ignore = "invoked only by bounded parent interruption tests"]
     fn checkpoint_interruption_child_process() {

@@ -235,8 +235,6 @@ pub struct PublicReceipt {
 /// [`Receipt`] above (which is unversioned and describes a single fetched script):
 /// the only thing the two share is the atomic-`0600` save mechanism.
 pub const ARTIFACT_SCAN_RECEIPT_SCHEMA: u32 = 2;
-/// Npm evidence is refused by old readers through distinct publication variants.
-pub const NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA: u32 = 3;
 
 /// The build-time engine SHA, sourced from the `TIRITH_BUILD_SHA` env var when the
 /// binary is built in CI (which sets it to the commit SHA), else `"unknown"`. There
@@ -331,22 +329,17 @@ pub enum ReceiptPublicationState {
     LegacyUnspecified,
     PrivateVerified,
     Committed,
-    NpmPrivateVerified,
-    NpmCommitted,
 }
 
 impl ReceiptPublicationState {
     fn is_private_verified(self) -> bool {
-        matches!(self, Self::PrivateVerified | Self::NpmPrivateVerified)
+        self == Self::PrivateVerified
     }
     fn is_committed(self) -> bool {
-        matches!(self, Self::Committed | Self::NpmCommitted)
+        self == Self::Committed
     }
     fn committed(self) -> Self {
-        match self {
-            Self::NpmPrivateVerified => Self::NpmCommitted,
-            _ => Self::Committed,
-        }
+        Self::Committed
     }
     fn is_legacy_unspecified(&self) -> bool {
         *self == Self::LegacyUnspecified
@@ -415,10 +408,6 @@ pub struct ArtifactScanReceipt {
     /// completion; `None` when the install failed before extraction (nothing to
     /// verify).
     pub post_install_record: Option<PostInstallRecordSummary>,
-    /// Schema-v3 npm verification. Omitted for unchanged schema-v1/v2 hashes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub npm_verification:
-        Option<crate::artifact::npm_install::receipt_evidence::NpmVerificationSummary>,
     /// The finalised install verdict, summarised (no evidence text).
     pub verdict: VerdictSummary,
     /// Whether this receipt covers a still-private verified target or a target
@@ -554,15 +543,6 @@ pub struct PreparedCommittedReceipt {
 }
 
 impl PreparedCommittedReceipt {
-    /// The canonical npm operation bound by this exact signed private-to-
-    /// committed derivation. Wheel receipts return None.
-    pub fn npm_operation_id(&self) -> Option<&str> {
-        self.committed
-            .npm_verification
-            .as_ref()
-            .map(|summary| summary.operation_id.as_str())
-    }
-
     /// Content-addressed id the committed receipt will have when recorded.
     pub fn receipt_id(&self) -> &str {
         &self.committed.receipt_id
@@ -679,7 +659,6 @@ impl ArtifactScanReceipt {
             capsule,
             artifact_sha256,
             post_install_record,
-            npm_verification: None,
             verdict,
             publication_state: ReceiptPublicationState::PrivateVerified,
             private_receipt_id: None,
@@ -687,45 +666,6 @@ impl ArtifactScanReceipt {
         };
         receipt.receipt_id = receipt.compute_content_hash();
         receipt
-    }
-
-    /// Construct npm evidence only from a current retained tree witness. Node,
-    /// runtime pack, TGZ/manifest and exact output identities enter the same
-    /// signed private-to-committed chain. No wheel RECORD claim is synthesized.
-    pub fn new_npm(
-        policy_hash: String,
-        threat_db_sequence: u64,
-        capsule: CapsuleReceipt,
-        evidence: crate::artifact::npm_install::receipt_evidence::VerifiedNpmReceiptEvidence,
-        verdict: VerdictSummary,
-    ) -> Result<Self, ReceiptError> {
-        let summary = evidence.summary;
-        summary
-            .validate_stored()
-            .map_err(|error| ReceiptError::InvalidReceipt(error.into()))?;
-        let artifacts = summary
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.artifact_sha256.clone())
-            .collect();
-        let mut receipt = Self::new(
-            env!("CARGO_PKG_VERSION").into(),
-            policy_hash,
-            threat_db_sequence,
-            "local_npm_leaf_artifacts".into(),
-            "1".into(),
-            summary.npm_version.clone(),
-            capsule,
-            artifacts,
-            None,
-            verdict,
-        );
-        receipt.schema = NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA;
-        receipt.publication_state = ReceiptPublicationState::NpmPrivateVerified;
-        receipt.npm_verification = Some(summary);
-        receipt.receipt_id = receipt.compute_content_hash();
-        receipt.validate_for_record()?;
-        Ok(receipt)
     }
 
     /// Publication phase carried by this persisted receipt.
@@ -746,10 +686,8 @@ impl ArtifactScanReceipt {
     /// may reach it.
     fn committed_from_private(&self) -> Result<Self, ReceiptError> {
         self.validate_for_record()?;
-        if !matches!(
-            self.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !self.publication_state.is_private_verified()
+        if self.schema != ARTIFACT_SCAN_RECEIPT_SCHEMA
+            || !self.publication_state.is_private_verified()
             || self.private_receipt_id.is_some()
         {
             return Err(ReceiptError::InvalidReceipt(
@@ -782,10 +720,8 @@ impl ArtifactScanReceipt {
     /// This proves the content linkage only. The caller must separately verify
     /// both receipts' mandatory signed audit anchors.
     pub fn is_committed_publication_for(&self, private: &Self) -> bool {
-        if !matches!(
-            private.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !private.publication_state.is_private_verified()
+        if private.schema != ARTIFACT_SCAN_RECEIPT_SCHEMA
+            || !private.publication_state.is_private_verified()
             || private.validate_for_record().is_err()
             || private.private_receipt_id.is_some()
             || !private.content_hash_matches()
@@ -847,7 +783,6 @@ impl ArtifactScanReceipt {
             ));
         }
 
-        self.validate_npm_evidence()?;
         match (self.schema, self.publication_state) {
             (1, ReceiptPublicationState::LegacyUnspecified) => {
                 if self.private_receipt_id.is_some() {
@@ -856,16 +791,14 @@ impl ArtifactScanReceipt {
                     ));
                 }
             }
-            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::PrivateVerified)
-            | (NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::NpmPrivateVerified) => {
+            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::PrivateVerified) => {
                 if self.private_receipt_id.is_some() {
                     return Err(ReceiptError::InvalidReceipt(
                         "private_verified receipt cannot carry a predecessor link".to_string(),
                     ));
                 }
             }
-            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::Committed)
-            | (NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::NpmCommitted) => {
+            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::Committed) => {
                 let private_id = self.private_receipt_id.as_deref().ok_or_else(|| {
                     ReceiptError::InvalidReceipt(
                         "committed receipt is missing its signed private predecessor".to_string(),
@@ -898,59 +831,6 @@ impl ArtifactScanReceipt {
                     "unsupported artifact receipt schema {schema}"
                 )));
             }
-        }
-        Ok(())
-    }
-
-    fn validate_npm_evidence(&self) -> Result<(), ReceiptError> {
-        let reject = |reason: &str| ReceiptError::InvalidReceipt(reason.into());
-        let Some(summary) = &self.npm_verification else {
-            if self.schema == NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-                || matches!(
-                    self.publication_state,
-                    ReceiptPublicationState::NpmPrivateVerified
-                        | ReceiptPublicationState::NpmCommitted
-                )
-            {
-                return Err(reject("npm receipt is missing its verified-tree evidence"));
-            }
-            return Ok(());
-        };
-        if self.schema != NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-            || !matches!(
-                self.publication_state,
-                ReceiptPublicationState::NpmPrivateVerified | ReceiptPublicationState::NpmCommitted
-            )
-            || self.post_install_record.is_some()
-        {
-            return Err(reject(
-                "npm and wheel receipt schemas or evidence cannot be mixed",
-            ));
-        }
-        summary.validate_stored().map_err(reject)?;
-        let hashes: Vec<_> = summary
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.artifact_sha256.clone())
-            .collect();
-        let coverage = self.capsule.coverage;
-        if hashes != self.artifact_sha256
-            || self.package_manager_version != summary.npm_version
-            || self.resolver_command != "local_npm_leaf_artifacts"
-            || self.resolver_version != "1"
-            || self.capsule.backend_id != "landlock-seccomp"
-            || !(coverage.fs_read_enforced
-                && coverage.fs_write_enforced
-                && coverage.exec_limited
-                && coverage.network_raw_denied
-                && coverage.resource_limits_enforced
-                && coverage.env_isolated
-                && coverage.handles_isolated)
-            || !matches!(self.verdict.action.as_str(), "Allow" | "Warn")
-        {
-            return Err(reject(
-                "npm receipt has inconsistent artifacts, runtime, verdict or containment",
-            ));
         }
         Ok(())
     }
@@ -995,10 +875,8 @@ impl ArtifactScanReceipt {
     /// proof.
     pub fn record_private_signed(&self) -> Result<RecordedPrivateReceipt, ReceiptError> {
         self.validate_for_record()?;
-        if !matches!(
-            self.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !self.publication_state.is_private_verified()
+        if self.schema != ARTIFACT_SCAN_RECEIPT_SCHEMA
+            || !self.publication_state.is_private_verified()
             || self.private_receipt_id.is_some()
         {
             return Err(ReceiptError::InvalidReceipt(
@@ -1529,11 +1407,11 @@ mod tests {
         legacy.schema = 1;
         legacy.publication_state = ReceiptPublicationState::LegacyUnspecified;
         legacy.timestamp = "2026-01-01T00:00:00Z".into();
-        let mut npm = sample_npm_receipt();
-        npm.timestamp = "2026-01-03T00:00:00Z".into();
+        let mut committed = sample_receipt().committed_from_private().unwrap();
+        committed.timestamp = "2026-01-03T00:00:00Z".into();
         let mut wheel = sample_receipt();
         wheel.timestamp = "2026-01-02T00:00:00Z".into();
-        let mut artifacts = [legacy, npm, wheel];
+        let mut artifacts = [legacy, committed, wheel];
         for receipt in &mut artifacts {
             receipt.receipt_id = receipt.compute_content_hash();
             fs::write(
@@ -1743,47 +1621,10 @@ mod tests {
         )
     }
 
-    fn sample_npm_receipt() -> ArtifactScanReceipt {
-        use crate::artifact::npm_install::{receipt_evidence::*, tools};
-        let summary = NpmVerificationSummary {
-            schema_version: 1,
-            contract: "LocalLeafNoScriptsV1".into(),
-            operation_id: "cd21c4d7-018e-4730-93c7-ef4bbba50c54".into(),
-            node_version: tools::NODE_VERSION.into(),
-            node_sha256: tools::NODE_SHA256.into(),
-            npm_version: tools::NPM_VERSION.into(),
-            npm_tree_sha256: tools::NPM_TREE_SHA256.into(),
-            runtime_pack_sha256: "c".repeat(64),
-            artifacts: vec![NpmArtifactVerification {
-                artifact_sha256: "a".repeat(64),
-                manifest_sha256: "b".repeat(64),
-            }],
-            output_tree_sha256: "d".repeat(64),
-            files_verified: 3,
-            directories_verified: 2,
-            bytes_verified: 512,
-            lifecycle_scripts: NpmLifecycleMode::Disabled,
-            dependency_graph: NpmDependencyGraph::LocalLeafOnly,
-            code_safety: NpmCodeSafety::NotEstablished,
-        };
-        ArtifactScanReceipt::new_npm(
-            "e".repeat(64),
-            42,
-            sample_capsule(),
-            VerifiedNpmReceiptEvidence { summary },
-            VerdictSummary {
-                action: "Allow".into(),
-                rule_ids: vec![],
-                finding_count: 0,
-            },
-        )
-        .unwrap()
-    }
-
     #[test]
     fn wheel_v1_v2_canonical_hashes_remain_byte_compatible() {
-        // Fixed hashes predate the optional npm field and use the original
-        // wheel JSON shape. A newly serialized null field would break them.
+        // Fixed hashes pin the original wheel JSON shape. A newly serialized
+        // field would break them.
         for (schema, phase, expected) in [
             (
                 2,
@@ -1804,164 +1645,10 @@ mod tests {
             receipt.receipt_id = receipt.compute_content_hash();
             assert_eq!(receipt.receipt_id, expected);
             let value = serde_json::to_value(&receipt).unwrap();
-            assert!(value.get("npm_verification").is_none());
             let decoded: ArtifactScanReceipt = serde_json::from_value(value).unwrap();
             assert_eq!(decoded, receipt);
             decoded.validate_for_record().unwrap();
         }
-    }
-
-    #[test]
-    fn npm_receipts_roundtrip_and_bind_all_runtime_and_output_identities() {
-        let private = sample_npm_receipt();
-        let encoded = serde_json::to_string(&private).unwrap();
-        let decoded: ArtifactScanReceipt = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(private, decoded);
-        assert!(decoded.content_hash_matches());
-        assert!(decoded.post_install_record.is_none());
-        let committed = decoded.committed_from_private().unwrap();
-        assert_eq!(
-            committed.publication_state(),
-            ReceiptPublicationState::NpmCommitted
-        );
-        assert!(committed.is_committed_publication_for(&private));
-        assert_eq!(committed.npm_verification, private.npm_verification);
-        for field in [
-            "node_sha256",
-            "npm_tree_sha256",
-            "runtime_pack_sha256",
-            "output_tree_sha256",
-        ] {
-            let mut changed = serde_json::to_value(&private).unwrap();
-            changed["npm_verification"][field] = serde_json::Value::String("f".repeat(64));
-            let changed: ArtifactScanReceipt = serde_json::from_value(changed).unwrap();
-            assert!(
-                !changed.content_hash_matches(),
-                "{field} must remain hash-bound"
-            );
-        }
-        let mut changed = committed.clone();
-        changed.npm_verification.as_mut().unwrap().artifacts[0].manifest_sha256 = "f".repeat(64);
-        changed.receipt_id = changed.compute_content_hash();
-        assert!(!changed.is_committed_publication_for(&private));
-    }
-
-    #[test]
-    fn old_publication_readers_refuse_both_npm_phases() {
-        // Exact pre-extension enum vocabulary; serde must not treat npm data as
-        // a wheel receipt even though old structs ignore unknown extra fields.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum OldPublicationState {
-            LegacyUnspecified,
-            PrivateVerified,
-            Committed,
-        }
-        for phase in [
-            ReceiptPublicationState::NpmPrivateVerified,
-            ReceiptPublicationState::NpmCommitted,
-        ] {
-            let encoded = serde_json::to_value(phase).unwrap();
-            assert!(serde_json::from_value::<OldPublicationState>(encoded).is_err());
-        }
-        assert!(
-            serde_json::from_value::<OldPublicationState>(serde_json::json!("private_verified"))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn prepared_commitment_exposes_only_its_exact_npm_operation_identity() {
-        let private = sample_npm_receipt();
-        let expected = private
-            .npm_verification
-            .as_ref()
-            .unwrap()
-            .operation_id
-            .clone();
-        let prepared = PreparedCommittedReceipt {
-            committed: private.committed_from_private().unwrap(),
-            private,
-        };
-        assert_eq!(prepared.npm_operation_id(), Some(expected.as_str()));
-        assert_ne!(prepared.receipt_id(), prepared.private_receipt_id());
-        let private = sample_receipt();
-        let wheel = PreparedCommittedReceipt {
-            committed: private.committed_from_private().unwrap(),
-            private,
-        };
-        assert_eq!(wheel.npm_operation_id(), None);
-    }
-
-    #[test]
-    fn npm_mixed_schema_phase_runtime_and_incomplete_claims_are_refused() {
-        let changes: &[fn(&mut ArtifactScanReceipt)] = &[
-            |r| r.schema = 2,
-            |r| r.schema = 1,
-            |r| r.npm_verification = None,
-            |r| r.publication_state = ReceiptPublicationState::PrivateVerified,
-            |r| r.publication_state = ReceiptPublicationState::Committed,
-            |r| r.publication_state = ReceiptPublicationState::NpmCommitted,
-            |r| r.post_install_record = sample_receipt().post_install_record,
-            |r| r.artifact_sha256[0] = "f".repeat(64),
-            |r| r.package_manager_version = "unbound".into(),
-            |r| r.resolver_command = "npm install".into(),
-            |r| r.resolver_version = "2".into(),
-            |r| r.capsule.backend_id = "noop".into(),
-            |r| r.capsule.coverage.fs_read_enforced = false,
-            |r| r.capsule.coverage.fs_write_enforced = false,
-            |r| r.capsule.coverage.exec_limited = false,
-            |r| r.capsule.coverage.network_raw_denied = false,
-            |r| r.capsule.coverage.resource_limits_enforced = false,
-            |r| r.capsule.coverage.env_isolated = false,
-            |r| r.capsule.coverage.handles_isolated = false,
-            |r| r.verdict.action = "Block".into(),
-            |r| r.npm_verification.as_mut().unwrap().node_sha256 = "f".repeat(64),
-            |r| r.npm_verification.as_mut().unwrap().runtime_pack_sha256 = "UPPERCASE".into(),
-            |r| r.npm_verification.as_mut().unwrap().files_verified = 0,
-            |r| r.npm_verification.as_mut().unwrap().bytes_verified = 0,
-            |r| {
-                let summary = r.npm_verification.as_mut().unwrap();
-                summary.files_verified = 20_000;
-                summary.directories_verified = 1;
-            },
-            |r| r.npm_verification.as_mut().unwrap().artifacts.clear(),
-        ];
-        for (index, change) in changes.iter().enumerate() {
-            let mut receipt = sample_npm_receipt();
-            change(&mut receipt);
-            receipt.receipt_id = receipt.compute_content_hash();
-            assert!(receipt.content_hash_matches());
-            assert!(receipt.validate_for_record().is_err(), "case {index}");
-            assert!(receipt.committed_from_private().is_err(), "case {index}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn npm_signed_chain_preserves_verified_summary_and_refuses_forged_commit() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "1");
-        plant_signing_key(&root.path().join("tirith"));
-        let private = sample_npm_receipt();
-        let forged = private.committed_from_private().unwrap();
-        assert!(matches!(
-            forged.record(false),
-            Err(ReceiptError::InvalidReceipt(_))
-        ));
-        assert!(!receipts_dir().unwrap().exists());
-        assert!(!crate::audit::audit_log_path().unwrap().exists());
-        let proof = private.record_private_signed().unwrap();
-        let committed = proof.prepare_committed().unwrap().record_signed().unwrap();
-        assert!(committed.recorded().signed);
-        let loaded = ArtifactScanReceipt::load(committed.receipt_id()).unwrap();
-        assert!(loaded.is_committed_publication_for(&private));
-        assert_eq!(loaded.npm_verification, private.npm_verification);
-        assert_eq!(
-            loaded.publication_state(),
-            ReceiptPublicationState::NpmCommitted
-        );
     }
 
     #[test]

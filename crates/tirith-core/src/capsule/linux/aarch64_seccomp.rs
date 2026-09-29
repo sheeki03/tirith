@@ -297,42 +297,6 @@ pub(super) fn build_filters() -> Result<(BpfProgram, BpfProgram), String> {
     Ok((clone_fallback, default_deny))
 }
 
-/// The reviewed runtime policy with a narrower initial executable capability.
-/// Node's descriptor is CLOEXEC; pathname exec and memfd_create are denied.
-/// This numeric FD check is not a stateful one-exec guarantee: descriptor reuse
-/// remains possible. Landlock grants Execute only to the pinned ELF interpreter
-/// and never to writable directories. Ordinary capsules are unchanged.
-fn npm_filter(node_fd: i32) -> Result<BpfProgram, String> {
-    if !(3..256).contains(&node_fd) {
-        return Err("invalid npm Node descriptor".into());
-    }
-    let mut rules = policy_rules()?;
-    rules.remove(&libc::SYS_execve);
-    rules.insert(
-        libc::SYS_execveat,
-        vec![rule(vec![
-            eq(0, node_fd as u64)?,
-            eq(4, libc::AT_EMPTY_PATH as u64)?,
-        ])?],
-    );
-    SeccompFilter::new(
-        rules,
-        SeccompAction::Errno(libc::EPERM as u32),
-        SeccompAction::Allow,
-        TargetArch::aarch64,
-    )
-    .map_err(|e| e.to_string())?
-    .try_into()
-    .map_err(|e: seccompiler::BackendError| e.to_string())
-}
-
-pub(super) fn apply_npm(node_fd: i32) -> Result<(), String> {
-    let (fallback, _) = build_filters()?;
-    let filter = npm_filter(node_fd)?;
-    seccompiler::apply_filter(&fallback).map_err(|e| e.to_string())?;
-    seccompiler::apply_filter(&filter).map_err(|e| e.to_string())
-}
-
 /// Called only in the single-threaded Linux launcher after Landlock and NNP.
 pub(super) fn apply() -> Result<bool, String> {
     let (clone_fallback, default_deny) = build_filters()?;
@@ -389,73 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn npm_filter_restricts_initial_exec_without_expanding_ambient_authority() {
-        const ARM: u32 = 0xc00000b7;
-        const ALLOW: u32 = 0x7fff0000;
-        const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let filter = npm_filter(19).unwrap();
-        let decide = |call, args| evaluate(&filter, ARM, call, args);
-        assert_eq!(
-            decide(
-                libc::SYS_execveat,
-                [19, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
-            ),
-            ALLOW
-        );
-        assert_eq!(
-            decide(
-                libc::SYS_execveat,
-                [20, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
-            ),
-            DENY
-        );
-        assert_eq!(decide(libc::SYS_execveat, [19, 1, 2, 3, 0, 0]), DENY);
-        for call in [
-            libc::SYS_execve,
-            libc::SYS_memfd_create,
-            libc::SYS_socket,
-            libc::SYS_fchmod,
-            libc::SYS_setpgid,
-            libc::SYS_setsid,
-            libc::SYS_process_vm_readv,
-        ] {
-            assert_eq!(decide(call, [0; 6]), DENY);
-        }
-        assert_eq!(
-            decide(
-                libc::SYS_prctl,
-                [libc::PR_SET_DUMPABLE as u64, 1, 0, 0, 0, 0]
-            ),
-            DENY
-        );
-        assert_eq!(
-            decide(
-                libc::SYS_prctl,
-                [
-                    libc::PR_SET_PDEATHSIG as u64,
-                    libc::SIGKILL as u64,
-                    0,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            ALLOW
-        );
-        assert!(npm_filter(2).is_err());
-        assert!(npm_filter(256).is_err());
-    }
-
-    #[test]
     fn compiled_filters_allow_only_stdio_nonblocking_mode_changes() {
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let npm = npm_filter(19).unwrap();
         let (_, ordinary) = build_filters().unwrap();
         #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
         let request = libc::FIONBIO as u64;
-        for filter in [&npm, &ordinary] {
+        for filter in [&ordinary] {
             for fd in 0..=2 {
                 assert_eq!(
                     evaluate(filter, ARM, libc::SYS_ioctl, [fd, request, 4096, 0, 0, 0]),
@@ -491,9 +396,8 @@ mod tests {
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let npm = npm_filter(19).unwrap();
         let (_, ordinary) = build_filters().unwrap();
-        for filter in [&npm, &ordinary] {
+        for filter in [&ordinary] {
             for fd in 0..=2 {
                 for access in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
                     for status in [0, libc::O_NONBLOCK as u64, 0o400000, STDIO_STATUS_WORD] {
@@ -711,7 +615,7 @@ mod tests {
             return;
         };
         assert!(kernel_support_observed());
-        if case == "npm-stdio" {
+        if case == "stdio" {
             // The parent supplies actual inherited pipes, not regular files
             // whose blocking-mode ioctl could fail independently of seccomp.
             for fd in 0..=2 {
@@ -724,7 +628,7 @@ mod tests {
             }
             let duplicate = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
             assert!(duplicate >= 3);
-            apply_npm(19).unwrap();
+            assert!(apply().unwrap());
             for fd in 0..=2 {
                 let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 assert!(original >= 0);
@@ -778,7 +682,7 @@ mod tests {
                 Some(libc::EPERM)
             );
             for fd in [1, 2] {
-                let marker = b"native-npm-stdio-pipe-ok\n";
+                let marker = b"native-stdio-pipe-ok\n";
                 assert_eq!(
                     unsafe { libc::write(fd, marker.as_ptr().cast(), marker.len()) },
                     marker.len() as isize
@@ -887,7 +791,7 @@ mod tests {
 
     #[test]
     fn native_filter_denies_network_escape_and_allows_reviewed_shell() {
-        for case in ["network", "escape", "exec", "unavailable", "npm-stdio"] {
+        for case in ["network", "escape", "exec", "unavailable", "stdio"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "native_filter_subprocess",
@@ -906,9 +810,9 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            if case == "npm-stdio" {
+            if case == "stdio" {
                 for bytes in [&output.stdout, &output.stderr] {
-                    assert!(String::from_utf8_lossy(bytes).contains("native-npm-stdio-pipe-ok"));
+                    assert!(String::from_utf8_lossy(bytes).contains("native-stdio-pipe-ok"));
                 }
             }
         }
