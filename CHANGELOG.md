@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Versioned personal protection profiles, explicit shell/profile setup, scoped expiring trust grants, and shared reviewed operations with status, cancellation and owned undo.
 - Authenticated loopback controls for protection settings, history, project review, support selection, retained audit segments and supported lifecycle changes.
-- Optional `tirith menu` navigation for terminal inspections and previews, with direct command guidance for changes and explicit refusal in redirected sessions.
 - Shared field-specific policy sources and personal-authority explanations in CLI/browser previews, managed-control disabling, and fresh effective readback after browser apply and undo.
 - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
 - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.

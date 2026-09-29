@@ -1213,6 +1213,7 @@ That harness stubs the unrelated authentication sibling; complete-crate and
 browser checks remain separate. Independent source review finds no further
 product defect. The optional menu also passes an actual PTY category/back/quit smoke
 check with exit zero; that smoke does not execute the selected inspection commands.
+(Historical: the terminal menu was later removed.)
 
 
 The September 22 follow-up's strict workspace/all-target Clippy and development
@@ -1312,7 +1313,7 @@ The follow-up adds shared per-field policy authority and current source displays
 explicit managed personal controls, and effective readback after browser apply
 and undo. Repository constraints remain distinct from organization/remote
 replacement. An optional `tirith menu` routes to existing typed inspections and
-previews. Seven menu tests, two human status-path privacy tests and all nine
+previews (historical: the menu was later removed). Seven menu tests, two human status-path privacy tests and all nine
 profile lifecycle tests pass locally. The latter includes CLI projection parity
 and read-only previews. At that checkpoint browser journeys and final lint/build checks were pending;
 the September 27 results above supersede that status without closing final WP14

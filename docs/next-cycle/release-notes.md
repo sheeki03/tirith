@@ -15,7 +15,6 @@ observed blocking separately from configuration that still needs activation.
 The CLI and authenticated local dashboard share policy sources, change previews,
 saved operations, cancellation, retry and owned undo. Scoped exceptions retain
 their target and expiry; resolving one finding leaves other blockers visible.
-An optional terminal menu provides navigation and command guidance.
 
 History and support tools report incomplete coverage, bound their reads and
 apply current redaction to selected exports. Sharing remains deliberate. Update,
