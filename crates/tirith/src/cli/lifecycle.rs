@@ -72,6 +72,17 @@ pub(crate) struct LifecycleFacts {
     pub compatibility: CompatibilityFacts,
 }
 
+/// The inherited `TIRITH_INTEGRATION_VERSION`, parsed and bounded like
+/// `loaded_integration`. Unverified: any parent process can set it.
+pub(crate) fn inherited_integration_version() -> Option<String> {
+    loaded_integration(
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("TIRITH_INTEGRATION_VERSION").ok().as_deref(),
+        None,
+    )
+    .version
+}
+
 fn loaded_integration(
     binary_version: &str,
     inherited_version: Option<&str>,

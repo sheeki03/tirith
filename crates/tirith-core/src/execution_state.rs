@@ -35,13 +35,14 @@ pub use shell_receipt::{
     acknowledge_shell_execution_receipt, arm_shell_execution_receipt,
     consume_shell_execution_receipt, create_shell_execution_receipt,
     discard_shell_execution_receipt, execute_shell_verification_probe, finish_shell_verification,
-    finish_shell_verification_authenticated, observe_shell_verification_hook,
+    finish_shell_verification_authenticated, hook_freshness, observe_shell_verification_hook,
     reconcile_shell_execution_receipt, register_shell_hook_instance,
     register_shell_hook_instance_with_delivery, shell_execution_receipt_context,
-    start_shell_verification, validate_shell_hook_instance, ShellApprovalOutcome, ShellHookFamily,
-    ShellReceiptChannel, ShellReceiptContext, ShellVerificationChallenge,
-    ShellVerificationHookDecision, ShellVerificationObservation, ShellVerificationProbe,
-    ShellVerificationProof, ShellVerificationStatus, SHELL_RECEIPT_READ_VERSIONS,
+    start_shell_verification, validate_shell_hook_instance, HookFreshness, HookFreshnessState,
+    ShellApprovalOutcome, ShellHookFamily, ShellReceiptChannel, ShellReceiptContext,
+    ShellVerificationChallenge, ShellVerificationHookDecision, ShellVerificationObservation,
+    ShellVerificationProbe, ShellVerificationProof, ShellVerificationStatus,
+    SHELL_RECEIPT_READ_VERSIONS,
 };
 
 pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 3;

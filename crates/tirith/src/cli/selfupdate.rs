@@ -22,6 +22,10 @@ pub(crate) fn gather_lifecycle_facts() -> lifecycle::LifecycleFacts {
     lifecycle::gather(&gather_cli_provenance(), None)
 }
 
+pub(crate) fn inherited_integration_version() -> Option<String> {
+    lifecycle::inherited_integration_version()
+}
+
 /// GitHub repository slug for tirith releases.
 const REPO: &str = "sheeki03/tirith";
 /// HTTP timeout for the small GitHub API metadata request.

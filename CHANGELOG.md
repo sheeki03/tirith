@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared field-specific policy sources and personal-authority explanations in CLI/browser previews, managed-control disabling, and fresh effective readback after browser apply and undo.
 - Bounded offline npm artifact inspection and release comparison, explicit project-surface review, and policy impact reports with coverage and adoption limits.
 - Current-shell diagnostic verification based on authenticated harmless probes; configured or inherited hook state alone does not claim observed blocking.
+- `tirith status` and `tirith doctor` report whether this terminal's loaded Bash, Zsh or Fish hook is current, stale (registered by a different or replaced Tirith executable, for example before an upgrade) or unregistered, and count other open terminals still running an older hook. JSON adds a `hook_freshness` object; it is loaded-hook evidence and never a blocking proof.
 - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
 - Native macOS ARM allocation and memory regression budgets in PR CI, backed by three reference runs and six deliberate-regression checks. Runner or measurement changes require a compatibility review.
 

@@ -1070,6 +1070,9 @@ struct DoctorInfo {
     protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     audit_recording: super::audit_health::AuditHealth,
     package_approval: super::package_approval_authority::PackageApprovalAvailability,
+    /// Whether this terminal's loaded hook was registered by this executable.
+    /// Loaded-hook evidence only, never blocking proof.
+    hook_freshness: super::hook_freshness::HookFreshnessReport,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1385,6 +1388,7 @@ fn gather_info() -> DoctorInfo {
         ),
         audit_recording: super::audit_health::read(),
         package_approval: super::package_approval_authority::availability(),
+        hook_freshness: super::hook_freshness::gather(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
         detected_shell,
@@ -2568,6 +2572,9 @@ fn print_human(info: &DoctorInfo) {
         println!();
     }
     println!("{}", format_protection_evidence(&info.protection_evidence));
+    for line in info.hook_freshness.human_lines() {
+        println!("  {line}");
+    }
     print!(
         "{}",
         format_protection_status(info.tirith_status.as_deref())
@@ -4322,6 +4329,9 @@ mod tests {
             assert!(!human.contains("observed-blocking"));
             assert!(format_protection_evidence(&full.protection_evidence)
                 .contains("blocking unverified"));
+            let full_value = serde_json::to_value(&full).unwrap();
+            assert_eq!(full_value["hook_freshness"]["blocking_proof"], false);
+            assert!(full_value["hook_freshness"]["this_shell"].is_string());
         }
     }
 

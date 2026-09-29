@@ -932,6 +932,19 @@ fn existing_capability_paths(
     shell_pid: u32,
     shell_start_fingerprint: &str,
 ) -> Result<(PathBuf, PathBuf), String> {
+    let receipts = existing_receipt_directory(effective_uid)?
+        .ok_or_else(|| "existing shell capability directory is unavailable".to_string())?;
+    let key = capability_key(effective_uid, shell_pid, shell_start_fingerprint);
+    Ok((
+        receipts.join(format!(".hook-{key}.capability")),
+        receipts.join(format!(".hook-{key}.capability.lock")),
+    ))
+}
+
+/// The private receipt directory, or `None` when it (or its parent) was never
+/// provisioned. Never creates or repairs anything.
+#[cfg(unix)]
+fn existing_receipt_directory(effective_uid: u32) -> Result<Option<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let root = crate::policy::state_dir()
@@ -939,8 +952,11 @@ fn existing_capability_paths(
     let sessions = root.join("sessions");
     let receipts = sessions.join("execution-receipts");
     for (directory, receipt_directory) in [(&sessions, false), (&receipts, true)] {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|_| "existing shell capability directory is unavailable".to_string())?;
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("existing shell capability directory is unavailable".to_string()),
+        };
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
             || metadata.uid() != effective_uid
@@ -950,11 +966,7 @@ fn existing_capability_paths(
             return Err("existing shell capability directory is not private".to_string());
         }
     }
-    let key = capability_key(effective_uid, shell_pid, shell_start_fingerprint);
-    Ok((
-        receipts.join(format!(".hook-{key}.capability")),
-        receipts.join(format!(".hook-{key}.capability.lock")),
-    ))
+    Ok(Some(receipts))
 }
 
 #[cfg(unix)]
@@ -1840,6 +1852,205 @@ where
         }
         Ok(delivered)
     }
+}
+
+/// Whether a live shell runs a hook registered by this Tirith executable.
+/// Loaded-hook evidence only: never interception or blocking proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFreshnessState {
+    /// Registered by this exact executable.
+    Current,
+    /// Registered by a different or since-replaced executable.
+    Stale,
+    /// No completed protocol-v3 registration for this shell.
+    Unregistered,
+    /// Not determinable (no shell identified, unsupported platform, or
+    /// unreadable state).
+    Unknown,
+}
+
+/// Read-only projection over the private hook capability records. Secrets and
+/// seals are neither needed nor read; records of dead or reused processes are
+/// ignored with the registry's own liveness test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HookFreshness {
+    pub this_shell: HookFreshnessState,
+    pub other_live_current: u32,
+    pub other_live_stale: u32,
+    pub scan_limited: bool,
+}
+
+impl HookFreshness {
+    fn unknown() -> Self {
+        Self {
+            this_shell: HookFreshnessState::Unknown,
+            other_live_current: 0,
+            other_live_stale: 0,
+            scan_limited: false,
+        }
+    }
+}
+
+/// `shell_pid` is the caller's shell, when known. Other live registered shells
+/// of this user are counted separately. Never creates, repairs or locks state.
+pub fn hook_freshness(shell_pid: Option<u32>) -> HookFreshness {
+    #[cfg(not(unix))]
+    {
+        let _ = shell_pid;
+        HookFreshness::unknown()
+    }
+    #[cfg(unix)]
+    {
+        match current_tirith_executable_identity() {
+            Ok(executable) => hook_freshness_for(shell_pid, &executable),
+            Err(_) => HookFreshness::unknown(),
+        }
+    }
+}
+
+#[cfg(unix)]
+enum RegisteredHook {
+    Absent,
+    Invalid,
+    Live { current: bool },
+}
+
+#[cfg(unix)]
+fn registered_hook(
+    directory: &Path,
+    key: &str,
+    effective_uid: u32,
+    executable: &TirithExecutableIdentity,
+) -> RegisteredHook {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let capability_path = directory.join(format!(".hook-{key}.capability"));
+    let anchor_path = directory.join(format!(".hook-{key}.capability.lock"));
+    let capability = match fs::symlink_metadata(&capability_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+        Ok(_) => match read_capability(&capability_path) {
+            Ok((capability, _)) => capability,
+            Err(_) => return RegisteredHook::Invalid,
+        },
+    };
+    let live = matches!(
+        shell_process_identity(capability.shell_pid),
+        Ok(identity) if identity.effective_uid == capability.effective_uid
+            && identity.start_fingerprint == capability.shell_start_fingerprint
+    );
+    if !capability_key_matches_record(key, &capability)
+        || capability.effective_uid != effective_uid
+        || !live
+    {
+        return RegisteredHook::Invalid;
+    }
+    // A Prepared anchor is a registration that never delivered its bearer, so
+    // the shell runs without a protocol-v3 hook instance.
+    let anchor = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&anchor_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+    };
+    if secure_regular_identity(&anchor, "shell hook capability anchor").is_err() {
+        return RegisteredHook::Invalid;
+    }
+    match read_capability_anchor(&anchor) {
+        Ok(anchor)
+            if matches!(anchor.state, ShellHookCapabilityAnchorState::Issued { .. })
+                && validate_capability_anchor_process(
+                    &anchor,
+                    capability.effective_uid,
+                    capability.shell_pid,
+                    &capability.shell_start_fingerprint,
+                )
+                .is_ok() => {}
+        Ok(_) => return RegisteredHook::Absent,
+        Err(_) => return RegisteredHook::Invalid,
+    }
+    RegisteredHook::Live {
+        current: capability.tirith_executable == *executable,
+    }
+}
+
+#[cfg(unix)]
+fn hook_freshness_for(
+    shell_pid: Option<u32>,
+    executable: &TirithExecutableIdentity,
+) -> HookFreshness {
+    let effective_uid = unsafe { libc::geteuid() };
+    let mut result = HookFreshness::unknown();
+    let this_key = shell_pid.and_then(|pid| match shell_process_identity(pid) {
+        Ok(identity) if identity.effective_uid == effective_uid => Some(capability_key(
+            effective_uid,
+            pid,
+            &identity.start_fingerprint,
+        )),
+        _ => None,
+    });
+    // Never-provisioned receipt state means no hook ever registered here, even
+    // when an unrelated session fallback created the parent directory.
+    let directory = match existing_receipt_directory(effective_uid) {
+        Ok(Some(directory)) => directory,
+        outcome => {
+            let never_provisioned = crate::policy::state_dir().is_some_and(|root| {
+                fs::symlink_metadata(root.join("sessions").join("execution-receipts"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            });
+            if this_key.is_some() && (outcome.is_ok() || never_provisioned) {
+                result.this_shell = HookFreshnessState::Unregistered;
+            }
+            return result;
+        }
+    };
+    if let Some(key) = &this_key {
+        result.this_shell = match registered_hook(&directory, key, effective_uid, executable) {
+            RegisteredHook::Absent => HookFreshnessState::Unregistered,
+            RegisteredHook::Invalid => HookFreshnessState::Unknown,
+            RegisteredHook::Live { current: true } => HookFreshnessState::Current,
+            RegisteredHook::Live { current: false } => HookFreshnessState::Stale,
+        };
+    }
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return result;
+    };
+    let mut examined = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(key) = name.to_str().and_then(hook_capability_key) else {
+            continue;
+        };
+        if this_key.as_deref() == Some(key) {
+            continue;
+        }
+        examined += 1;
+        if examined > MAX_HOOK_CAPABILITIES {
+            result.scan_limited = true;
+            break;
+        }
+        if let RegisteredHook::Live { current } =
+            registered_hook(&directory, key, effective_uid, executable)
+        {
+            if current {
+                result.other_live_current = result.other_live_current.saturating_add(1);
+            } else {
+                result.other_live_stale = result.other_live_stale.saturating_add(1);
+            }
+        }
+    }
+    result
 }
 
 /// Validate a protocol-v3 bearer against its live shell and executable
@@ -5594,6 +5805,66 @@ mod tests {
             }
             mode => panic!("unexpected subprocess-helper mode: {mode:?}"),
         }
+    }
+
+    #[test]
+    fn hook_freshness_reports_current_stale_and_unregistered_hooks() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        isolated_unregistered_state(|_, _| {
+            let freshness = hook_freshness(Some(shell_pid));
+            assert_eq!(freshness.this_shell, HookFreshnessState::Unregistered);
+            assert_eq!(
+                (freshness.other_live_current, freshness.other_live_stale),
+                (0, 0)
+            );
+            assert_eq!(hook_freshness(None).this_shell, HookFreshnessState::Unknown);
+        });
+        isolated_state(|temporary, _| {
+            // The hook registered by this executable is current.
+            assert_eq!(
+                hook_freshness(Some(shell_pid)).this_shell,
+                HookFreshnessState::Current
+            );
+            // Seen from another shell, it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // After the binary is replaced (a different executable identity),
+            // the same record is a stale loaded hook, for this and other shells.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some(shell_pid), &upgraded).this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+            // A record whose shell process has exited is never counted.
+            let (mut capability, _) = read_capability(&active_capability_path()).unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            capability.shell_pid = dead_pid;
+            let key = capability_key(
+                capability.effective_uid,
+                dead_pid,
+                &capability.shell_start_fingerprint,
+            );
+            let directory = active_capability_path().parent().unwrap().to_path_buf();
+            let dead_path = directory.join(format!(".hook-{key}.capability"));
+            fs::write(&dead_path, serde_json::to_vec(&capability).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+        });
     }
 
     #[test]

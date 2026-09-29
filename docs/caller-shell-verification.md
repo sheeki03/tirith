@@ -59,6 +59,29 @@ claim current blocking. This sequence does not activate hooks automatically:
 run each exact command separately in the intended interactive shell. Commands
 executed in a disposable child only describe that child's shell.
 
+## Is this terminal's hook current?
+
+`tirith status` and `tirith doctor` report whether the hook loaded in the
+calling terminal is current, and `--json` adds a `hook_freshness` object. Bash,
+Zsh and Fish hooks register a private record at startup that names the Tirith
+executable which generated them:
+
+- `current`: registered by this Tirith executable (loaded, not a blocking proof).
+- `stale`: registered by a different or since-replaced executable, for example
+  before an upgrade. Open a new terminal to load the upgraded hook.
+- `unregistered`: no completed registration for this shell. Open a new terminal
+  after setup, or run `tirith init`.
+- `unknown`: the calling shell or its record could not be determined.
+  PowerShell and Nushell have no registration and report the inherited,
+  unverified `TIRITH_INTEGRATION_VERSION` instead.
+
+The human output also counts other open terminals that still run an older hook
+(`other_live_stale`, with `other_live_current` in JSON). Records of exited
+shells are ignored. This readout never reports verified or blocking protection
+(`blocking_proof` is always `false`); use the sequence above for that.
+
+## Limits
+
 The core state-machine tests do not qualify a shell adapter. Each adapter must
 also demonstrate the full sequence in a real interactive shell, including
 helper redefinition, hook disablement, configuration changes and failed

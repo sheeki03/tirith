@@ -1674,6 +1674,7 @@ pub mod fix;
 pub mod gateway;
 pub mod history;
 pub mod hook_event;
+pub(crate) mod hook_freshness;
 pub mod hooks;
 pub mod hygiene;
 pub mod iac;
