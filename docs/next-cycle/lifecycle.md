@@ -126,8 +126,9 @@ personal setup does not implicitly select another user's home or invoke sudo.
 
 The optional native package-approval capability is separate from ordinary
 command checks and shell protection. Package metadata does not install or
-suggest sudo. Explicit approval issuance requires a supported host, protected
-helper, trusted sudo, and fresh interactive administrator confirmation.
+suggest sudo. `tirith pkg approve` issues no approvals in this release, and the
+packaged helper refuses every operation, so neither sudo nor the helper enables
+approval.
 
 The unreleased local-leaf npm routes (`pkg install-npm` and `pkg materialize`)
 were retired before release, so their intent, checkpoint and completion stores

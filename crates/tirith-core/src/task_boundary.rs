@@ -77,9 +77,7 @@ use std::marker::PhantomData;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::artifact::resolver::ResolverRequest;
 use crate::effects::{BoundaryCapability, CommandEffectKind};
-use crate::package_approval::VerifiedPackageApproval;
 use crate::task::{
     assign_provenance, decide_with_boundary_effects_and_context, decide_with_verified_evidence,
     decision_projection, infer_effects_detailed_with_context,
@@ -101,13 +99,15 @@ pub enum OwnedBoundary {
     /// The MCP gateway is about to register a pending request and write the
     /// call upstream.
     GatewayForward,
-    /// `tirith pkg approve` is about to run the resolver: PATH lookup,
-    /// quarantine creation, DNS, and artifact download.
+    /// `tirith pkg approve` running the pip resolver. Not reached: approve
+    /// refuses before any resolver work. The token stays so task receipts, MCP
+    /// schemas, and policies that name it keep parsing.
     PackageApproval,
-    /// `tirith pkg install` is about to run the same resolver network.
+    /// `tirith pkg install` running the pip resolver. Not reached: install
+    /// refuses first. Kept as a wire token, like [`Self::PackageApproval`].
     PackageResolve,
-    /// `tirith pkg install` is about to checkpoint the target environment and
-    /// prepare the contained install.
+    /// `tirith pkg install` preparing a contained install. Not reached: install
+    /// refuses first. Kept as a wire token, like [`Self::PackageApproval`].
     PackageInstallPreparation,
     /// `tirith install <manager>` is about to contact a registry.
     PackageManagerNetwork,
@@ -444,7 +444,6 @@ macro_rules! boundary_markers {
 
 boundary_markers!(
     (GatewayForwardBoundary, GatewayForward),
-    (PackageApprovalBoundary, PackageApproval),
     (PackageResolveBoundary, PackageResolve),
     (PackageInstallPreparationBoundary, PackageInstallPreparation),
     (PackageManagerNetworkBoundary, PackageManagerNetwork),
@@ -465,8 +464,6 @@ mod approval_boundary_sealed {
 /// and turn `RequireApproval` into `Allow`.
 pub trait ApprovalCapableBoundary: BoundaryMarker + approval_boundary_sealed::Sealed {}
 
-impl approval_boundary_sealed::Sealed for PackageInstallPreparationBoundary {}
-impl ApprovalCapableBoundary for PackageInstallPreparationBoundary {}
 impl approval_boundary_sealed::Sealed for PackageManagerExecutionBoundary {}
 impl ApprovalCapableBoundary for PackageManagerExecutionBoundary {}
 
@@ -479,76 +476,6 @@ struct BoundaryApprovalEvidence<B: ApprovalCapableBoundary> {
     nonce: String,
     not_after: Option<DateTime<Utc>>,
     marker: PhantomData<fn() -> B>,
-}
-
-/// Opaque, non-cloneable capability returned only from a cryptographically
-/// verified native-authority package approval. It is bound to both the final
-/// plan digest and the exact install-preparation operation.
-pub struct PackageInstallApprovalChannel {
-    evidence: BoundaryApprovalEvidence<PackageInstallPreparationBoundary>,
-}
-
-/// Canonical preparation operation for one already-resolved, expiry-independent
-/// install plan. It is derived entirely from signed-plan fields; callers cannot
-/// add an unrelated action while retaining the same operation identity.
-pub fn package_install_plan_envelope(
-    requested_plan: &crate::artifact::install::InstallPlanDigest,
-) -> Result<TaskEnvelopeInput, BoundaryAuthorizationError> {
-    let requested = crate::package_approval::expiry_independent_plan(requested_plan)
-        .map_err(|_| BoundaryAuthorizationError::ApprovalMismatch)?;
-    let mut source = unattributed_source();
-    source.content = format!(
-        "tirith-package-install-plan:v2:sha256:{}",
-        requested.plan_digest
-    );
-    Ok(TaskEnvelopeInput {
-        task_id: None,
-        sources: vec![source],
-        actions: vec![ProposedAction::PackageInstall {
-            ecosystem: "pip".to_string(),
-            package: format!("plan-sha256:{}", requested.plan_digest),
-        }],
-        requested_effects: BTreeSet::new(),
-    })
-}
-
-impl PackageInstallApprovalChannel {
-    /// Consume opaque proof minted only after schema-v2 signature, authority,
-    /// freshness, and exact-plan verification, and bind it to the final typed
-    /// preparation operation. No boolean or self-consistent digest can mint this
-    /// channel.
-    pub fn from_native_authority(
-        approval: VerifiedPackageApproval,
-        operation: &BoundaryOperation<'_>,
-    ) -> Result<Self, BoundaryAuthorizationError> {
-        let expected_envelope = package_install_plan_envelope(approval.requested_plan())?;
-        let expected_operation = BoundaryOperation {
-            boundary: OwnedBoundary::PackageInstallPreparation,
-            envelope: &expected_envelope,
-            adapter: IngressAdapter::Unattributed,
-            boundary_effects: BTreeSet::new(),
-        };
-        if operation_binding_digest(operation) != operation_binding_digest(&expected_operation) {
-            return Err(BoundaryAuthorizationError::ApprovalMismatch);
-        }
-        let not_after = DateTime::parse_from_rfc3339(approval.expires_at())
-            .map_err(|_| BoundaryAuthorizationError::ApprovalMismatch)?
-            .with_timezone(&Utc);
-        let channel_binding_sha256 = approval_channel_binding(&serde_json::json!({
-            "channel": "native_package_approval_v2",
-            "authority_key_id": approval.authority_key_id(),
-            "approved_plan_digest": approval.approved_plan_digest(),
-            "requested_plan_digest": approval.requested_plan_digest(),
-            "approved_expiry": approval.expires_at(),
-        }));
-        Ok(Self {
-            evidence: approval_evidence_for::<PackageInstallPreparationBoundary>(
-                operation,
-                channel_binding_sha256,
-                Some(not_after),
-            )?,
-        })
-    }
 }
 
 /// Which real package-manager confirmation channel produced an approval.
@@ -642,6 +569,9 @@ fn confirm_package_manager_tty(prompt: &str) -> Result<(), BoundaryAuthorization
     }
 }
 
+/// Test-only evidence minter. Production evidence comes only from
+/// [`PackageManagerApprovalChallenge::confirm_cli`].
+#[cfg(test)]
 fn approval_evidence_for<B: ApprovalCapableBoundary>(
     operation: &BoundaryOperation<'_>,
     channel_binding_sha256: String,
@@ -1132,17 +1062,6 @@ impl<B: ApprovalCapableBoundary> PendingBoundaryAuthorization<B> {
         self.approval_satisfied = true;
         self.approval_not_after = earliest_deadline(self.approval_not_after, evidence.not_after);
         Ok(self)
-    }
-}
-
-impl PendingBoundaryAuthorization<PackageInstallPreparationBoundary> {
-    /// Attach a native-authority-verified package-install channel capability.
-    /// No boolean or operation-only evidence API exists.
-    pub fn with_package_install_approval(
-        self,
-        approval: PackageInstallApprovalChannel,
-    ) -> Result<Self, BoundaryAuthorizationError> {
-        self.attach_approval(approval.evidence)
     }
 }
 
@@ -1888,125 +1807,6 @@ pub fn fetch_cloaking_operation_binding(
     })
 }
 
-/// Stable identity of the held package-install target selected before resolver
-/// or checkpoint side effects. The path itself is represented by a digest so a
-/// task receipt never exposes a local filesystem name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackageTargetIdentity {
-    target_path_sha256: String,
-    parent_identity: String,
-    target_component: String,
-}
-
-impl PackageTargetIdentity {
-    pub fn new(
-        target_path_sha256: impl Into<String>,
-        parent_identity: impl Into<String>,
-        target_component: impl Into<String>,
-    ) -> Self {
-        Self {
-            target_path_sha256: target_path_sha256.into(),
-            parent_identity: parent_identity.into(),
-            target_component: target_component.into(),
-        }
-    }
-}
-
-/// The complete package request that an owned resolver or checkpoint boundary
-/// must bind. Keeping the resolver request by reference prevents a caller from
-/// accidentally authorizing only its displayed requirements while omitting
-/// indexes or resolver allowances.
-pub struct PackageOperationBinding<'a> {
-    ecosystem: &'a str,
-    request: &'a ResolverRequest,
-    artifact_origins: &'a [String],
-    target: &'a PackageTargetIdentity,
-}
-
-impl<'a> PackageOperationBinding<'a> {
-    pub fn new(
-        ecosystem: &'a str,
-        request: &'a ResolverRequest,
-        artifact_origins: &'a [String],
-        target: &'a PackageTargetIdentity,
-    ) -> Self {
-        Self {
-            ecosystem,
-            request,
-            artifact_origins,
-            target,
-        }
-    }
-}
-
-/// A package argv larger than the task-envelope action ceiling cannot be
-/// represented exactly and is therefore rejected rather than truncated.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum PackageEnvelopeError {
-    #[error(
-        "package request has {provided} requirements, exceeding the exact authorization limit of {max}"
-    )]
-    TooManyRequirements { provided: usize, max: usize },
-}
-
-/// Build the exact envelope for a package operation. Every requirement remains
-/// a visible action, while the unattributed source carries only a
-/// domain-separated digest of the canonical full request projection: raw
-/// requirements, registry/index endpoints, broker-only artifact origins,
-/// resolver allowances, and held target identity.
-pub fn package_envelope(
-    binding: &PackageOperationBinding<'_>,
-) -> Result<TaskEnvelopeInput, PackageEnvelopeError> {
-    if binding.request.requirements.len() > crate::task::MAX_ACTIONS {
-        return Err(PackageEnvelopeError::TooManyRequirements {
-            provided: binding.request.requirements.len(),
-            max: crate::task::MAX_ACTIONS,
-        });
-    }
-
-    let allowances = &binding.request.allowances;
-    let projection = serde_json::json!({
-        "binding_version": 1,
-        "ecosystem": binding.ecosystem,
-        "requirements": binding.request.requirements,
-        "index_urls": binding.request.index_urls,
-        "artifact_origins": binding.artifact_origins,
-        "resolver_allowances": {
-            "allow_sdist": allowances.allow_sdist,
-            "allow_vcs": allowances.allow_vcs,
-            "allow_editable": allowances.allow_editable,
-            "allow_local_path": allowances.allow_local_path,
-            "allow_direct_url": allowances.allow_direct_url,
-            "allow_untrusted_tool": allowances.allow_untrusted_tool,
-        },
-        "target": {
-            "path_sha256": binding.target.target_path_sha256,
-            "parent_identity": binding.target.parent_identity,
-            "component": binding.target.target_component,
-        },
-    });
-    let binding_sha256 = crate::command_card::sha256_hex(
-        crate::audit::canonical_json_for_hash(&projection).as_bytes(),
-    );
-    let mut source = unattributed_source();
-    source.content = format!("tirith-package-operation:v1:sha256:{binding_sha256}");
-
-    Ok(TaskEnvelopeInput {
-        task_id: None,
-        sources: vec![source],
-        actions: binding
-            .request
-            .requirements
-            .iter()
-            .map(|package| ProposedAction::PackageInstall {
-                ecosystem: binding.ecosystem.to_string(),
-                package: package.clone(),
-            })
-            .collect(),
-        requested_effects: BTreeSet::new(),
-    })
-}
-
 /// Complete, privacy-preserving identity of a Tirith-owned configuration write.
 /// The path remains visible as the action so effect inference can classify
 /// sensitive destinations; every other binding is represented only by its
@@ -2448,27 +2248,6 @@ mod tests {
             Err(BoundaryAuthorizationError::DecisionDenied { assessment })
                 if matches!(&assessment.outcome, BoundaryOutcome::RequireApproval { .. })
         ));
-    }
-
-    #[test]
-    fn package_envelope_rejects_a_thirty_third_requirement_instead_of_truncating() {
-        let request = ResolverRequest {
-            requirements: (0..=crate::task::MAX_ACTIONS)
-                .map(|index| format!("package-{index}==1.0"))
-                .collect(),
-            index_urls: vec!["https://index.example/simple".to_string()],
-            allowances: Default::default(),
-        };
-        let target = PackageTargetIdentity::new("ab".repeat(32), "linux-devino-v1:1:2", "target");
-        let binding = PackageOperationBinding::new("pip", &request, &[], &target);
-
-        assert_eq!(
-            package_envelope(&binding).unwrap_err(),
-            PackageEnvelopeError::TooManyRequirements {
-                provided: crate::task::MAX_ACTIONS + 1,
-                max: crate::task::MAX_ACTIONS,
-            }
-        );
     }
 
     #[test]

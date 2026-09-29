@@ -1037,9 +1037,8 @@ fn spec_for(args: Vec<std::ffi::OsString>, limits: ChildLimits) -> ChildSpec {
 
 /// Probe `npm --version` under a short budget.
 ///
-/// Structure copied from `artifact::resolver`'s `capture_bound_tool_version`
-/// (which is `#[cfg(unix)]` and module-private, so it cannot be called): a
-/// short timeout, a bounded output, and an exhaustive [`ChildOutcome`] match so
+/// Structure copied from the retired package resolver's bound-tool version
+/// probe: a short timeout, a bounded output, and an exhaustive [`ChildOutcome`] match so
 /// no failure mode silently becomes an empty version.
 fn probe_version(launcher: &Launcher) -> Result<String, String> {
     launcher.revalidate_auxiliary()?;

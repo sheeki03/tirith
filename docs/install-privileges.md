@@ -7,10 +7,10 @@ sudo is one way to obtain that access, and an existing root session also works.
 
 | Channel | Install, update, and removal | Native package approval |
 | --- | --- | --- |
-| Debian / Ubuntu `.deb` | Administrator manages the system package database. No sudo dependency or suggestion. | The package ships an inert root-owned helper on x86_64 Linux. Explicit issuance also needs trusted `/usr/bin/sudo`. |
-| RPM | Administrator manages the system package database. No sudo dependency or suggestion. | The x86_64 package ships an inert helper; explicit issuance needs trusted `/usr/bin/sudo`. |
-| AUR | Build as the normal user; package installation/removal needs an administrator. No sudo dependency or suggestion. | The x86_64 package ships an inert helper. The aarch64 package does not support issuance. |
-| Shell installer | Defaults to the user's `~/.local/bin` and needs no elevation for a fresh install. An existing helper is updated as a protected pair. | Explicitly opt in with `TIRITH_INSTALL_APPROVAL_HELPER=1`; see below. |
+| Debian / Ubuntu `.deb` | Administrator manages the system package database. No sudo dependency or suggestion. | The package ships an inert root-owned helper on x86_64 Linux. It refuses every operation; approval is disabled in this release. |
+| RPM | Administrator manages the system package database. No sudo dependency or suggestion. | The x86_64 package ships an inert helper that refuses every operation. |
+| AUR | Build as the normal user; package installation/removal needs an administrator. No sudo dependency or suggestion. | The x86_64 package ships an inert helper that refuses every operation. The aarch64 package has no helper. |
+| Shell installer | Defaults to the user's `~/.local/bin` and needs no elevation for a fresh install. An existing helper is updated as a protected pair. | `TIRITH_INSTALL_APPROVAL_HELPER=1` still installs the helper, but it enables nothing in this release; see below. |
 | Manual release archive | Copy the CLI into a user-writable directory without elevation. A protected system destination requires administrator access. | A helper copied into a home directory cannot issue approvals. |
 | Cargo | A user-owned Cargo prefix needs no elevation. Update with Cargo. | User-installed helper binaries are not trusted native authorities. |
 | npm | A user-owned npm prefix needs no elevation. A system prefix follows its filesystem permissions. Update with npm. | The npm packages do not install a privileged helper. |
@@ -28,16 +28,17 @@ rule, starts an elevated approval service, or invokes the approval authority
 as part of ordinary command checks. The packaged helper has ordinary executable
 permissions, with no setuid/setgid bits. `tirith pkg approve` currently refuses
 after its native-authority check (contained package execution, the only
-consumer of approvals, is disabled), so this release never asks the helper to
-create a key or sign an approval.
+consumer of approvals, is disabled), and the helper itself refuses every
+operation: it creates no key or authority directory and signs nothing.
 
 The shell installer accepts `TIRITH_INSTALL_APPROVAL_HELPER=0` (the default)
 or `TIRITH_INSTALL_APPROVAL_HELPER=1`. Other values are rejected. On a fresh
 x86_64 Linux installation, `0` installs only the CLI; checks and shell
-protection work, while `tirith pkg approve` remains unavailable. Set `1` when
-running the installer to also install the root-owned helper. That operation
-requires a root session or trusted `/usr/bin/sudo`. The opt-in is rejected on
-platforms where native approval issuance is unsupported.
+protection work. Set `1` when running the installer to also install the
+root-owned helper. That operation requires a root session or trusted
+`/usr/bin/sudo`, and it does not enable package approval in this release:
+`tirith pkg approve` refuses either way. The opt-in is rejected on platforms
+where the helper is not packaged.
 
 If the manual helper or its rollback state already exists under
 `/usr/local/libexec`, either setting preserves paired installation. Setting

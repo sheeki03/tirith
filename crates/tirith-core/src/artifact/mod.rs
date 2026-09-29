@@ -100,43 +100,14 @@ pub mod correlate;
 /// cross-distribution loader/payload splits across multiple wheels.
 pub mod inspect;
 
-/// Content-addressed quarantine store for the package firewall (PR D1): land
-/// resolver downloads as immutable verified blobs and materialise per-install
-/// transaction copies, with atomic publishes, path containment, file leases, and
-/// GC. The store the D3 inspection and D4 install-from-digest stand on.
-pub mod quarantine;
-
-/// Hash-locked Python wheel resolver for the package firewall (PR D2): turn
-/// requirement specs into a fully hash-pinned lock
-/// (`uv pip compile --generate-hashes --no-build`), download only the pinned,
-/// binary-only wheels (`python -m pip download --only-binary=:all:
-/// --require-hashes`) into the D1 quarantine, and refuse sdist / VCS / editable /
-/// local-path / direct-URL / credentialed-index / repo-config inputs. The
-/// controlled-network step D3 inspection and D4 install-from-digest stand on.
+/// Python requirement validation and resolver-tool enrollment used by the
+/// refusing `tirith pkg approve` / `tirith pkg install` and by
+/// `tirith pkg trust-tool`.
 pub mod resolver;
 
-/// Internal connect-time network boundary used by the Python resolver. Kept
-/// private to the artifact package so callers cannot repurpose it as a general
-/// proxy.
-mod resolver_broker;
-
-/// The package firewall's inspect-and-verdict layer (PR D3): re-hash each
-/// content-addressed quarantine blob (the TOCTOU re-bind), run the wheel-set
-/// inspection over the verified bytes, fold the signal/native/cross findings plus
-/// the threat-DB hash lookup through `finalize_static_verdict`, and surface a
-/// download-vs-expected hash mismatch as the Critical
-/// [`crate::verdict::RuleId::ArtifactDownloadIntegrityMismatch`]. The verdict D4
-/// install-from-digest gates on.
-pub mod firewall;
-
-/// Install-from-digest planning for the package firewall (PR D4): re-bind the
-/// approval against the live threat DB immediately before launch (re-hash every
-/// quarantine blob via the firewall, reject a stale DB sequence), generate the
-/// `approved.txt` direct-reference requirements (`name @ file://... --hash=...`),
-/// the pinned `python -m pip install --isolated --no-index --no-deps
-/// --require-hashes --no-cache-dir --force-reinstall` argv, and the locked-down
-/// deny-all capsule spec. The pure planning half; the CLI crate runs the plan
-/// through the fail-closed capsule launcher (never the uncontained install runner).
+/// Installed-environment checks that outlive contained package execution: the
+/// D5 post-install RECORD verification behind `tirith pkg verify-env` and the
+/// distribution enumeration behind `tirith env graph`.
 pub mod install;
 
 /// Local release differential between two versions of the same distribution (PR

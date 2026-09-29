@@ -885,9 +885,10 @@ pub enum RuleId {
     /// this fires and the enforcing surface fails closed. DISTINCT from
     /// [`Self::ArtifactKnownMalicious`], which is a POSITIVE threat-DB match on a
     /// known-malicious hash: this is an integrity failure (the bytes are not the
-    /// approved bytes), not a reputation hit. Produced by
-    /// `crate::artifact::firewall`, not from a command/paste fixture, so it has no
-    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
+    /// approved bytes), not a reputation hit. It was produced only by the removed
+    /// pip package firewall, never from a command/paste fixture, so it has no
+    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`; the id stays
+    /// so policies and audit readers that name it keep parsing. Critical
     /// severity (whence the action is Block).
     ArtifactDownloadIntegrityMismatch,
     /// F2: a local release differential between two versions of the SAME

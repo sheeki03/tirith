@@ -1469,11 +1469,10 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // duplicate-path collision). It is triggered by artifact inspection at the CLI, not by
     // the engine over a fixture string, so it has no PATTERN_TABLE entry and no fixture.
     "wheel_structurally_rejected",
-    // D3: `artifact_download_integrity_mismatch` is produced by the package
-    // firewall (`crate::artifact::firewall`) when a content-addressed quarantine
-    // blob no longer hashes to the resolver-pinned digest at firewall time, never
-    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
-    // unit tests in `artifact/firewall.rs`.
+    // D3: `artifact_download_integrity_mismatch` was produced only by the removed
+    // pip package firewall when a quarantine blob no longer matched its pinned
+    // digest, never from a command/paste fixture, so it has no PATTERN_TABLE
+    // entry. The rule id stays for policy and audit-reader compatibility.
     "artifact_download_integrity_mismatch",
     // F2: `artifact_release_anomaly` is produced by the package-firewall release
     // differential (`crate::artifact::release_diff`) comparing two on-disk wheels

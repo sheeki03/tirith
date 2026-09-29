@@ -391,8 +391,8 @@ fn inspect_artifact_paths(paths: &[std::path::PathBuf]) -> tirith_core::verdict:
 
     let set = inspect_artifact_set(paths);
     let findings = set.all_findings(None);
-    // Tier 3 by construction (no tier-1 command gate on this seam), mirroring
-    // `crate::artifact::firewall::firewall_resolved_set`.
+    // Tier 3 by construction (no tier-1 command gate on this seam), as the
+    // removed pip package firewall did.
     let policy = Policy::default();
     let mut verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
     tirith_core::artifact::enforce_artifact_coverage_floor(

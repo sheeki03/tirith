@@ -22024,9 +22024,9 @@ fn scan_directory_with_wheel_inspects_member() {
 // resolver and the OS containment backend, so it stays integration-only off-CI;
 // these tests pin the parts that refuse deterministically with no network / index.
 
-/// An empty PATH (no `uv`/`python` resolver) for the enforcing install: forces
-/// `ResolverTools::discover` to fail, so `tirith pkg install` cannot reach a real
-/// index or spawn anything. The dir is created so PATH resolution finds nothing
+/// An empty PATH (no `uv`/`python` resolver) for the refusing install/approve
+/// commands, so they could not reach a real index or spawn anything even if they
+/// did not refuse first. The dir is created so PATH resolution finds nothing
 /// there rather than reading the host's tools.
 fn empty_path_dir(home: &std::path::Path) -> std::path::PathBuf {
     let empty_bin = home.join("empty-bin");

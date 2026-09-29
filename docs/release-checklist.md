@@ -3,7 +3,11 @@
 ## Release sequence
 
 Substitute the release version for `<VERSION>` throughout (for example `0.4.2`,
-tagged `v0.4.2`). The changelog and release notes describe the final tree. The
+tagged `v0.4.2`). Choose `<VERSION>` by the `tirith-core` library contract:
+`tirith-core` is published on crates.io, and Cargo treats every `0.x.y` with the
+same `x` as compatible, so if `[Unreleased]` → `Removed` lists any `tirith-core`
+public API removal or other breaking library change, bump the minor version
+(`0.4.x` → `0.5.0`), never only the patch version. The changelog and release notes describe the final tree. The
 workspace version stays on the previous release until the integration tree is
 known, then the release commit performs the version and documentation
 transition below:

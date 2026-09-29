@@ -51,7 +51,11 @@ run_install_case fresh 0 > "$work/fresh.log"
 cmp "$work/payload/tirith" "$work/fresh/bin/tirith"
 test ! -e "$work/fresh/elevated"
 test ! -e "$work/fresh/helper-attempted"
-grep -q 'Native package approval is unavailable' "$work/fresh.log"
+grep -q 'Package approval is disabled in this release: tirith pkg approve issues no approvals' "$work/fresh.log"
+if grep -q 'TIRITH_INSTALL_APPROVAL_HELPER=1' "$work/fresh.log"; then
+  echo 'installer still suggests the approval helper opt-in' >&2
+  exit 1
+fi
 if run_install_case failed 1 > "$work/failed.log" 2>&1; then
   echo 'failed installation unexpectedly succeeded' >&2
   exit 1

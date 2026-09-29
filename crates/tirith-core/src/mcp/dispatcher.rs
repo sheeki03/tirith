@@ -785,6 +785,10 @@ mod tests {
     /// origin-store serial lock for the session (an `initialize` writes
     /// `MCP_ORIGIN`, must not race `mcp::origin::tests::*`).
     fn run_session(input: &str) -> (String, String) {
+        // Hold the process-global state lock (always before the origin lock, as
+        // every other test does) so a concurrent test that installs a policy,
+        // such as a broad custom DLP pattern, cannot leak into this session.
+        let _global = tirith_test_support::GlobalStateGuard::new().unwrap();
         let _serial = super::super::origin::serial_lock();
         let reader = BufReader::new(input.as_bytes());
         let mut stdout = Vec::new();
