@@ -60,6 +60,14 @@ implicit native builds. Only the GNU Linux AArch64 platform gate is promoted;
 production-signed v2 data and all current authority checks remain mandatory.
 See the [native contract evidence](verification.md#september-28-complete-supported-native-npm-contract).
 
+The integrated product at `e2c94439` passes all five workflows on their original
+attempt, including the reviewed capability fingerprint, Windows standard-account
+checks and all six release target builds. Publication jobs remain skipped.
+See the [integration results](verification.md#september-29-integrated-product-checks-pass).
+The [release notes draft](release-notes.md) and [channel record](channel-report.md)
+prepare the remaining release review without selecting a version or claiming
+publication.
+
 | Package | Status | Current implementation and remaining work |
 | --- | --- | --- |
 | WP00 | review | Baseline, schema inventory and acceptance matrix recorded. Signed macOS 0.4.2 baseline commands, five scoped-grant assertions and 32 paired policy/trust/shell-mode/receipt reader cases passed. A00 source/evidence reconciliation is complete for review; final release acceptance remains separate. |

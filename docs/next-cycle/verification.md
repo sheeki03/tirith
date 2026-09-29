@@ -1,5 +1,32 @@
 # Implementation verification
 
+## September 29: integrated product checks pass
+
+All five workflows pass on `e2c94439786d2d2abf87bd50a17b227f8e632c12`, each
+on its original attempt: [CI 36450736676](https://github.com/sheeki03/tirith/actions/runs/36450736676),
+[native ARM 36450736531](https://github.com/sheeki03/tirith/actions/runs/36450736531),
+[release validation 36450737299](https://github.com/sheeki03/tirith/actions/runs/36450737299),
+[fuzz 36450736603](https://github.com/sheeki03/tirith/actions/runs/36450736603)
+and [benchmarks 36450736660](https://github.com/sheeki03/tirith/actions/runs/36450736660).
+The C00 capability fingerprint and generated matrix now pass on the integrated
+source; the previous failure and its reviewed correction remain recorded below.
+
+The actual CI merge is `3252fe93c96ccf308336c03e59547de77e8f0ec5`.
+Of 662 captured source inputs, 661 match the submitted head; the sole difference
+is main's daily root ThreatDB manifest, which tests include. Original macOS
+output confirms both capability checks. Windows passes all 60 harnesses and the
+nine standard-account dashboard cases, with the account's lack of elevation and
+administrator SID confirmed and owned process cleanup verified. Its original
+artifact is `10984038839`, ZIP SHA-256
+`4214d502fa35865e24b65325786848fa869780052f1a97e54c323dbc72fde4e1`.
+
+Release validation passes all six target builds, platform smoke tests, GNU
+runtime checks on AlmaLinux 8, Amazon Linux 2023 and Rocky Linux 9, native GNU
+and musl ARM containment, npm assembly, Debian/RPM assembly and RPM runtime
+checks. Publication and attestation jobs are skipped on the PR as intended.
+These results establish development-package checks; they do not establish
+official publication, production v2 availability or a human pilot.
+
 ## September 29: capability compatibility record
 
 The first integration at `cd914781` exposes one stale compatibility fingerprint:
