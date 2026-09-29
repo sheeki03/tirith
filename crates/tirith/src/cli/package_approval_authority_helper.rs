@@ -7,9 +7,10 @@ use tirith_core::package_approval::PackageApprovalRecordV2;
 use crate::package_approval_authority_native::NativeAuthorityError;
 #[cfg(unix)]
 use crate::package_approval_authority_native::{
-    load_trusted_keys, open_no_follow, validate_admin_hierarchy, validate_root_owned_executable,
-    TRUSTED_KEYS_PATH,
+    validate_admin_hierarchy, validate_root_owned_executable,
 };
+#[cfg(unix)]
+use std::collections::BTreeMap;
 
 #[cfg(unix)]
 use std::io::{Read as _, Write as _};
@@ -32,6 +33,13 @@ const NOPASSWD_PROBE_EXIT: i32 = 42;
 const HELPER_REQUEST_CAP: u64 = 128 * 1024;
 #[cfg(unix)]
 const PUBLIC_KEY_CAP: u64 = 128;
+#[cfg(unix)]
+const MAX_TRUSTED_KEYS: usize = 32;
+
+#[cfg(target_os = "macos")]
+const TRUSTED_KEYS_PATH: &str = "/Library/Application Support/Tirith/package-approval/trusted-keys";
+#[cfg(all(unix, not(target_os = "macos")))]
+const TRUSTED_KEYS_PATH: &str = "/etc/tirith/package-approval/trusted-keys";
 
 #[cfg(unix)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -303,4 +311,97 @@ mod tests {
         let extra = br#"{"digest":{},"extra":true}"#;
         assert!(serde_json::from_slice::<HelperRequest>(extra).is_err());
     }
+}
+
+#[cfg(unix)]
+fn load_trusted_keys(
+    directory: &Path,
+    expected_uid: u32,
+) -> Result<BTreeMap<String, [u8; 32]>, NativeAuthorityError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_admin_hierarchy(directory, expected_uid)?;
+    let entries = std::fs::read_dir(directory)
+        .map_err(|_| NativeAuthorityError::blocked("trusted authority keyring is unavailable"))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        paths.push(
+            entry
+                .map_err(|_| NativeAuthorityError::blocked("trusted authority keyring changed"))?
+                .path(),
+        );
+        if paths.len() > MAX_TRUSTED_KEYS {
+            return Err(NativeAuthorityError::blocked(
+                "trusted authority keyring exceeds its key limit",
+            ));
+        }
+    }
+    paths.sort();
+
+    let mut keys = BTreeMap::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".pub"))
+            .filter(|name| {
+                name.len() == 16
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                NativeAuthorityError::blocked("trusted authority keyring contains an invalid entry")
+            })?;
+        let mut file = open_no_follow(&path, PUBLIC_KEY_CAP)?;
+        let metadata = file.metadata().map_err(|_| {
+            NativeAuthorityError::blocked("trusted authority key metadata is unavailable")
+        })?;
+        if metadata.uid() != expected_uid || metadata.mode() & 0o022 != 0 || metadata.nlink() != 1 {
+            return Err(NativeAuthorityError::blocked(
+                "trusted authority key permissions are unsafe",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| {
+            NativeAuthorityError::blocked("trusted authority key could not be read")
+        })?;
+        let public: [u8; 32] = bytes.try_into().map_err(|_| {
+            NativeAuthorityError::blocked("trusted authority public key has the wrong size")
+        })?;
+        if ed25519_dalek::VerifyingKey::from_bytes(&public).is_err()
+            || tirith_core::command_card::key_id_for_pubkey(&public) != name
+        {
+            return Err(NativeAuthorityError::blocked(
+                "trusted authority public key is invalid or mislabeled",
+            ));
+        }
+        keys.insert(name.to_string(), public);
+    }
+    if keys.is_empty() {
+        return Err(NativeAuthorityError::blocked(
+            "trusted package approval authority has no installed public key",
+        ));
+    }
+    Ok(keys)
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path, cap: u64) -> Result<std::fs::File, NativeAuthorityError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| NativeAuthorityError::blocked("native authority file could not be opened"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| NativeAuthorityError::blocked("native authority file metadata failed"))?;
+    if !metadata.is_file() || metadata.len() > cap {
+        return Err(NativeAuthorityError::blocked(
+            "native authority file is not a bounded regular file",
+        ));
+    }
+    Ok(file)
 }

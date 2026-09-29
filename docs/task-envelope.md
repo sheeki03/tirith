@@ -251,8 +251,11 @@ These assessment results do not qualify the package execution backend.
 or package execution. The refusal applies regardless of `task_gate.mode`,
 `action_incomplete_analysis`, existing approvals, confirmation flags, or elevation.
 
-`tirith pkg approve` and tirith-owned config writes retain their existing
-native authority and policy requirements. Local `tirith package inspect`,
+`tirith pkg approve` refuses with the same reason after its native-authority
+check, so the `package_approval`, `package_resolve`, and
+`package_install_preparation` boundaries below are not reached while contained
+package execution is disabled. Tirith-owned config writes retain their existing
+policy requirements. Local `tirith package inspect`,
 `pkg verify-env`, ordinary `tirith check`, and shell protection remain available
 under their existing policies.
 
@@ -274,9 +277,8 @@ out of every call, including commands the operator typed personally.
 
 With `mode: enforce` and
 `effects_denied_for_untrusted_sources: [policy_change, package_install]`,
-`tirith pkg approve pip requests` refuses before any network or install step,
-and `tirith policy init` cannot write `.tirith/policy.yaml`. The same policy at
-`mode: observe` allows both. Choose this field for what it is: a host-wide
+`tirith policy init` cannot write `.tirith/policy.yaml`. The same policy at
+`mode: observe` allows it. Choose this field for what it is: a host-wide
 switch that turns the named effect off at every owned boundary.
 
 ## Where the gate actually enforces

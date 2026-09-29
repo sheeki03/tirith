@@ -17,24 +17,20 @@
 //!   AppContainer, ACLs the roots, and runs the child in a kill-on-close Job.
 //!
 //! This module is the **single seam every E5 consumer goes through** — `runner.rs`
-//! (`tirith run`), `temp_run.rs` (opt-in `--capsule`), the package-firewall install
-//! (Stack D's D4), and the gateway upstream spawn. It picks the host backend,
+//! (`tirith run`), `temp_run.rs` (opt-in `--capsule`), and the gateway upstream
+//! spawn. It picks the host backend,
 //! probes the coverage it can actually deliver for the spec, and **fails closed**
 //! when an enforcing surface's required coverage is not met (cross-cutting
 //! invariant 2). Analysis-only surfaces may opt to run degraded with an honest
 //! banner instead.
 //!
-//! ## Three launch shapes
+//! ## Two launch shapes
 //!
-//! Consumers need one of three things, so this module offers all three on top of
-//! the same backend selection + fail-closed gate:
+//! Consumers need one of two things, so this module offers both on top of the
+//! same backend selection + fail-closed gate:
 //!
 //! - [`run_to_completion_os`]: build the contained child, inherit stdio, wait, return
 //!   its exit code. Used by `tirith run` and `temp-run --capsule`.
-//! - [`run_to_completion_bound_inputs`]: execute a content-bound program against
-//!   immutable named inputs and a held writable target. This is the production D4
-//!   `pkg install` seam. It requires Linux private namespaces and complete native
-//!   containment; other platforms or missing capabilities refuse before execution.
 //! - [`spawn_piped`]: build the contained child with piped stdin/stdout/stderr and
 //!   hand back a [`ManagedChild`] the caller bridges (the MCP gateway needs to sit
 //!   between the client and the upstream server). Linux and macOS support
@@ -49,9 +45,9 @@
 //! caller that did not permit degradation never reaches a spawn at all.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
 #[cfg(target_os = "linux")]
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::io::Write as _;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd as _;
 use std::process::{Child, Command, Stdio};
@@ -69,6 +65,7 @@ use std::time::Instant;
     allow(unused_imports)
 )]
 use tirith_core::capsule::{Capsule, CapsuleCoverage, CapsuleSpec, NoOpCapsule};
+#[cfg(unix)]
 use tirith_core::trusted_child::TrustedExecutable;
 
 /// The download path already caps remote scripts at 10 MiB. Enforce the same
@@ -143,9 +140,8 @@ impl SelectedBackend {
 /// **Invariant (enforcing surfaces using this policy must hold):** an *enforcing*
 /// surface — one that promises containment (the contained MCP gateway or
 /// `tirith run --require-capsule`) — must ALWAYS pass [`Self::FailClosed`].
-/// `pkg install` instead uses [`run_to_completion_bound_inputs`], whose API has no
-/// degraded mode and refuses unsupported or insufficiently covered hosts before
-/// package execution.
+/// (`pkg install` never launches anything: contained package execution is
+/// disabled by [`private_input_execution_refusal`].)
 /// [`Self::AllowDegraded`] runs the program fully uncontained on a degraded host
 /// and is reserved for best-effort, explicitly-not-a-boundary surfaces
 /// (`temp-run --capsule`) that print an honest banner. An enforcing surface that
@@ -186,8 +182,8 @@ impl DegradedPolicy {
 /// enforcing task decision must never reach a degraded run, or a decision that
 /// TIGHTENED the capsule (`task_boundary::tighten_capsule_spec`) would be
 /// satisfied by no capsule at all. That holds structurally today, because
-/// `pkg install` launches through `run_to_completion_bound_inputs` (whose API
-/// has no degraded mode) and `tirith run` passes `FailClosed`; the source scan
+/// `pkg install` refuses before any launch and `tirith run` passes
+/// `FailClosed`; the source scan
 /// `only_the_declared_best_effort_surfaces_name_the_degraded_policy` in
 /// `crates/tirith/tests/owned_boundary_enforcement.rs` keeps a future surface
 /// from quietly joining the list.
@@ -207,7 +203,9 @@ pub struct CapsuleOutcome {
     pub exit_code: i32,
     /// The backend that ran it.
     pub backend_id: &'static str,
-    /// The coverage actually achieved.
+    /// The coverage actually achieved. Windows fills it but only the Unix
+    /// launch surfaces report it.
+    #[cfg_attr(windows, allow(dead_code))]
     pub coverage: CapsuleCoverage,
     /// Whether the run proceeded under degraded coverage (only possible with
     /// [`DegradedPolicy::AllowDegraded`]).
@@ -215,7 +213,9 @@ pub struct CapsuleOutcome {
     /// A parent-enforced policy termination that happened after the target crossed
     /// its authenticated exec boundary. `None` means the target reached its own
     /// ordinary exit status. Keeping this on the successful outcome prevents a
-    /// wall/output kill from being misreported as a pre-exec refusal.
+    /// wall/output kill from being misreported as a pre-exec refusal. Only the
+    /// Unix launch surfaces read it.
+    #[cfg_attr(windows, allow(dead_code))]
     pub termination: Option<CapsuleTermination>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// Whether this launch PROVED the launcher's temporary HOME was removed.
@@ -251,13 +251,11 @@ pub struct CapsuleTermination {
     pub cleanup_confirmed: bool,
 }
 
-/// Compatibility name used by capability-bound callers.
-pub type CapsuleExecutionOutcome = CapsuleOutcome;
-
 impl CapsuleOutcome {
     /// A compact, secret-free description of the coverage actually achieved, for a
     /// receipt or an audit line. Reads the [`CapsuleCoverage`] flags into a stable
     /// string so a downstream record need not depend on the struct shape.
+    #[cfg(any(unix, test))]
     pub fn coverage_summary(&self) -> String {
         let c = &self.coverage;
         format!(
@@ -339,40 +337,8 @@ pub struct PreparedCapsulePlan {
     limits: SupervisedLimits,
 }
 
-/// One immutable input capability for a package launch. `name` is a single safe
-/// filename component (wheel names retain `.whl`; the control file is exactly
-/// `approved.txt`). The held source is copied and re-hashed into a fully sealed
-/// anonymous file before any child is spawned.
-#[derive(Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub struct BoundLaunchInput {
-    pub name: String,
-    pub source: std::fs::File,
-    pub expected_sha256: String,
-}
-
-/// Held target directory identity for capability-bound writes.
-#[derive(Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub struct BoundLaunchDirectory {
-    /// Canonical path represented in the finalized write policy/receipt.
-    pub policy_root: std::path::PathBuf,
-    /// Canonical path currently naming the retained capability. This may be a
-    /// private pending-install directory before an atomic publish.
-    pub visible_path: std::path::PathBuf,
-    pub handle: std::fs::File,
-}
-
-/// Typed argv expansion for a bound-input package launch. Numeric descriptor
-/// slots stay private to the capsule layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoundLaunchArg {
-    Literal(OsString),
-    InputName(String),
-    TargetDirectory,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
 pub enum BoundOutputPresentation {
     ForwardSanitized,
     Suppress,
@@ -1966,370 +1932,10 @@ pub(super) fn preflight_run_to_completion(spec: &CapsuleSpec) -> Result<(), Caps
     }
 }
 
-/// Run a contained child with its working directory bound to an already-open,
-/// caller-verified directory capability. This is a retained compatibility seam,
-/// not the production package installer: `pkg install` uses
-/// [`run_to_completion_bound_inputs`]. Linux inherits the directory fd into the
-/// trusted capsule launcher, Windows retains a no-delete-sharing directory handle,
-/// and macOS refuses because Seatbelt cannot bind a pathname grant to the held
-/// vnode. There is no degraded/uncontained fallback for this launch shape.
-#[allow(dead_code)]
-pub fn run_to_completion_bound_directory(
-    spec: &CapsuleSpec,
-    program: &str,
-    args: &[String],
-    directory_path: &std::path::Path,
-    directory_handle: std::fs::File,
-    extra_env: &[(String, String)],
-    degraded: DegradedPolicy,
-) -> Result<CapsuleOutcome, CapsuleRefused> {
-    #[cfg(target_os = "linux")]
-    {
-        if degraded != DegradedPolicy::FailClosed {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "a capability-bound directory launch never permits degraded execution"
-                    .to_string(),
-            });
-        }
-        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-        linux_run_to_completion_bound_directory_supervised(
-            spec,
-            OsStr::new(program),
-            &args_os,
-            directory_path,
-            directory_handle,
-            extra_env,
-        )
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let sel = select_backend(spec);
-        if !std::path::Path::new(program).is_absolute() {
-            return Err(CapsuleRefused {
-                backend_id: sel.backend_id,
-                reason: "a capability-bound working directory requires an absolute executable path"
-                    .to_string(),
-            });
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let _ = (args, directory_path, directory_handle, extra_env, degraded);
-            Err(CapsuleRefused {
-                backend_id: sel.backend_id,
-                reason: "capability-bound package installation is unavailable on macOS because Seatbelt cannot bind a filesystem grant to the held transaction vnode"
-                    .to_string(),
-            })
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            if sel.is_degraded() || degraded != DegradedPolicy::FailClosed {
-                return Err(CapsuleRefused {
-                    backend_id: sel.backend_id,
-                    reason: if sel.is_degraded() {
-                        shortfall_reason(sel.backend_id, &sel)
-                    } else {
-                        "a capability-bound directory launch never permits degraded execution"
-                            .to_string()
-                    },
-                });
-            }
-
-            let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
-
-            #[cfg(target_os = "windows")]
-            {
-                // Keeping this handle alive is load-bearing: it was opened without delete
-                // sharing, so every absolute transaction path remains attached to the same
-                // directory identity until the contained process has exited.
-                let _directory_handle = directory_handle;
-                return run_to_completion_os(
-                    spec,
-                    OsStr::new(program),
-                    &args_os,
-                    Some(directory_path),
-                    extra_env,
-                    DegradedPolicy::FailClosed,
-                );
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = (directory_path, directory_handle, extra_env, args_os);
-                Err(CapsuleRefused {
-                    backend_id: sel.backend_id,
-                    reason: "capability-bound directory launch is unsupported on this platform"
-                        .to_string(),
-                })
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_run_to_completion_bound_directory_supervised(
-    spec: &CapsuleSpec,
-    program: &OsStr,
-    args: &[OsString],
-    directory_path: &std::path::Path,
-    directory_handle: std::fs::File,
-    extra_env: &[(String, String)],
-) -> Result<CapsuleOutcome, CapsuleRefused> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !program.as_encoded_bytes().starts_with(b"/") {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: "a capability-bound working directory requires an absolute executable path"
-                .to_string(),
-        });
-    }
-    reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
-    let canonical_root = directory_path
-        .canonicalize()
-        .map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "canonicalize capability-bound directory {}: {error}",
-                directory_path.display()
-            ),
-        })?;
-    let path_metadata = std::fs::metadata(&canonical_root).map_err(|error| CapsuleRefused {
-        backend_id: "landlock-seccomp",
-        reason: format!(
-            "inspect capability-bound directory {}: {error}",
-            canonical_root.display()
-        ),
-    })?;
-    let handle_metadata = directory_handle
-        .metadata()
-        .map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("inspect capability-bound directory descriptor: {error}"),
-        })?;
-    if !path_metadata.is_dir()
-        || !handle_metadata.is_dir()
-        || path_metadata.dev() != handle_metadata.dev()
-        || path_metadata.ino() != handle_metadata.ino()
-    {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: "capability-bound pathname does not identify the retained directory"
-                .to_string(),
-        });
-    }
-
-    let mut launch_spec = spec.clone();
-    let bound_directory =
-        reserve_bound_directory_fd(&launch_spec, directory_handle.as_raw_fd(), &canonical_root)?;
-    launch_spec
-        .handles
-        .extra_unix_fds
-        .push(bound_directory.inherited);
-    let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
-    let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
-    let plan = supervised_stdin_plan(&launch_spec, 0)?;
-    if plan
-        .backend_spec
-        .filesystem
-        .read_roots
-        .iter()
-        .filter(|root| *root == &canonical_root)
-        .count()
-        != 1
-    {
-        return Err(CapsuleRefused {
-            backend_id: plan.backend_selected.backend_id,
-            reason: format!(
-                "capability-bound directory {} must be one exact canonical read grant",
-                canonical_root.display()
-            ),
-        });
-    }
-    let mut command = linux_contained_command_os_with_options(
-        &plan.backend_spec,
-        program,
-        args,
-        None,
-        &plan.backend_selected,
-        None,
-        temp_home.as_mut(),
-        None,
-        None,
-        Some(proof.status_fd),
-        Some(proof.ack_fd),
-        Some(proof.coverage_fd),
-        proof.take_child_fds(),
-        Some(bound_directory),
-        None,
-        None,
-    )?;
-    for (name, value) in extra_env {
-        command.env(name, value);
-    }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let launch_started = Instant::now();
-    let mut child = command.spawn().map_err(|error| CapsuleRefused {
-        backend_id: plan.backend_selected.backend_id,
-        reason: format!("capability-bound capsule launch failed: {error}"),
-    })?;
-    drop(command);
-    let child_pid = child.id();
-    let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
-        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-        return Err(CapsuleRefused {
-            backend_id: plan.backend_selected.backend_id,
-            reason: format!(
-                "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
-            ),
-        });
-    };
-    let mut achieved = match proof.confirm_coverage(deadline) {
-        Ok(coverage) => coverage,
-        Err(reason) => {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            return Err(CapsuleRefused {
-                backend_id: plan.backend_selected.backend_id,
-                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
-            });
-        }
-    };
-    if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
-        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-        return Err(CapsuleRefused {
-            backend_id: plan.backend_selected.backend_id,
-            reason: format!(
-                "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
-            ),
-        });
-    }
-    match proof.confirm_target_exec(deadline) {
-        Ok(()) => {}
-        Err(TargetExecConfirmationError::BeforeAck(reason)) => {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            return Err(CapsuleRefused {
-                backend_id: plan.backend_selected.backend_id,
-                reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
-            });
-        }
-        Err(TargetExecConfirmationError::AfterAck(reason)) => {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            return Ok(terminated_outcome(
-                plan.backend_selected.backend_id,
-                achieved,
-                post_ack_confirmation_termination(reason, cleanup),
-            ));
-        }
-    }
-    achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
-    let mut remaining = plan.limits;
-    remaining.timeout = deadline.saturating_duration_since(Instant::now());
-    if remaining.timeout.is_zero() {
-        let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-        preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-        return Ok(terminated_outcome(
-            plan.backend_selected.backend_id,
-            achieved,
-            CapsuleTermination {
-                kind: if cleanup {
-                    CapsuleTerminationKind::WallClock
-                } else {
-                    CapsuleTerminationKind::CleanupFailure
-                },
-                reason: format!(
-                    "bound target exhausted its wall budget after authenticated exec; child-tree cleanup succeeded={cleanup}"
-                ),
-                cleanup_confirmed: cleanup,
-            },
-        ));
-    }
-    match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
-        Ok(output) => Ok(forward_bounded_child_output(
-            CapsuleOutcome {
-                exit_code: output.status.code().unwrap_or(128),
-                backend_id: plan.backend_selected.backend_id,
-                coverage: achieved,
-                degraded: false,
-                termination: None,
-                ephemeral_home_cleanup_confirmed: None,
-            },
-            &output.stdout,
-            &output.stderr,
-            BoundOutputPresentation::ForwardSanitized,
-        )),
-        Err(reason) => {
-            let termination = supervision_termination(reason);
-            eprintln!("tirith: {}", termination.reason);
-            Ok(terminated_outcome(
-                plan.backend_selected.backend_id,
-                achieved,
-                termination,
-            ))
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn normalize_bound_target_policy(
-    spec: &CapsuleSpec,
-    target_policy_root: &std::path::Path,
-) -> Result<(tirith_core::capsule::FilesystemPolicy, std::path::PathBuf), CapsuleRefused> {
-    let normalize_one = |root: &std::path::Path, label: &str| {
-        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(
-            &tirith_core::capsule::FilesystemPolicy {
-                read_roots: Vec::new(),
-                write_roots: vec![root.to_path_buf()],
-                deny_roots: Vec::new(),
-            },
-        )
-        .map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("normalize {label} {}: {error}", root.display()),
-        })
-        .map(|policy| {
-            policy
-                .write_roots
-                .into_iter()
-                .next()
-                .expect("one write root normalizes to one root")
-        })
-    };
-    let requested_target_policy =
-        normalize_one(target_policy_root, "approved package target policy root")?;
-    let mut incoming_matches = 0usize;
-    for root in &spec.filesystem.write_roots {
-        if normalize_one(root, "incoming package write root")? == requested_target_policy {
-            incoming_matches += 1;
-        }
-    }
-    if incoming_matches != 1 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "approved package target policy root must appear exactly once before capability binding (found {incoming_matches})"
-            ),
-        });
-    }
-    let filesystem =
-        tirith_core::capsule::canonicalize_and_validate_filesystem_policy(&spec.filesystem)
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("normalize bound-input filesystem policy: {error}"),
-            })?;
-    Ok((filesystem, requested_target_policy))
-}
-
 /// Qualification refusal for the package-only private named-input backend.
 /// Generic capsule coverage does not establish this additional input-lifetime
-/// guarantee. There is deliberately no environment, flag, or test override.
+/// guarantee, and the backend itself was removed. There is deliberately no
+/// environment, flag, or test override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateInputExecutionRefusal {
     InputLifetimeUnqualified,
@@ -2351,471 +1957,12 @@ impl std::fmt::Display for PrivateInputExecutionRefusal {
 
 impl std::error::Error for PrivateInputExecutionRefusal {}
 
-impl PrivateInputExecutionRefusal {
-    pub(crate) fn into_capsule_refusal(self, spec: &CapsuleSpec) -> CapsuleRefused {
-        CapsuleRefused {
-            backend_id: select_backend(spec).backend_id,
-            reason: self.to_string(),
-        }
-    }
-}
-
-/// A single production decision shared by the public install command, its
-/// side-effect seam, and both sides of the hidden private-input launcher.
-/// Re-enabling requires a reviewed implementation and native qualification of
+/// The single production decision shared by `pkg install` and `pkg approve`:
+/// contained package execution with private named inputs is unavailable.
+/// Re-enabling it requires a new reviewed design and native qualification of
 /// immutable named inputs for the complete target lifetime.
-pub(crate) fn require_private_input_execution_qualification(
-) -> Result<(), PrivateInputExecutionRefusal> {
-    Err(PrivateInputExecutionRefusal::InputLifetimeUnqualified)
-}
-
-/// Disabled production `pkg install` seam. The qualification guard refuses before
-/// target/input binding, staging creation, or spawning the hidden launcher. The
-/// retained implementation below is not an enabled or qualified capability.
-///
-/// Intended contract: execute a content-bound program against immutable
-/// named inputs and one held writable target directory. A qualified Linux host constructs a
-/// private user+mount namespace in the hidden launcher, copies sealed source
-/// bytes into a private filesystem made read-only and verified in full, installs
-/// the target Landlock WRITE rule from the
-/// retained directory descriptor, and proves achieved coverage plus target exec
-/// before reporting execution. Native x86_64 and AArch64 filters are implemented;
-/// each launch must still prove kernel, namespace, policy, and tool requirements.
-/// Other operating systems or incomplete coverage refuse before execution. This
-/// primitive does not itself qualify the complete package install/receipt flow.
-pub fn run_to_completion_bound_inputs(
-    spec: &CapsuleSpec,
-    program: &TrustedExecutable,
-    args: &[BoundLaunchArg],
-    inputs: Vec<BoundLaunchInput>,
-    target: BoundLaunchDirectory,
-    extra_env: &[(String, String)],
-    output_presentation: BoundOutputPresentation,
-) -> Result<CapsuleExecutionOutcome, CapsuleExecutionError> {
-    require_private_input_execution_qualification()
-        .map_err(|error| error.into_capsule_refusal(spec))?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            spec,
-            program,
-            args,
-            inputs,
-            target,
-            extra_env,
-            output_presentation,
-        );
-        Err(CapsuleRefused {
-            backend_id: select_backend(spec).backend_id,
-            reason: "capability-bound sealed-input execution is supported only on Linux"
-                .to_string(),
-        }
-        .into())
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-
-        reject_linux_loader_control_env(extra_env, "extra environment", "landlock-seccomp")?;
-        let bound_program = program.bind_content().map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("bind package executor to immutable content: {error}"),
-        })?;
-        bound_program
-            .verify_identity()
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("package executor changed before launch: {error}"),
-            })?;
-        let program_source = bound_program
-            .bound_launch_fd()
-            .ok_or_else(|| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "bound-input execution requires a sealed executor descriptor".to_string(),
-            })?;
-
-        let target_policy_root = target.policy_root;
-        if !target_policy_root.is_absolute() {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "package target policy root must be absolute: {}",
-                    target_policy_root.display()
-                ),
-            }
-            .into());
-        }
-        let target_visible_root =
-            target
-                .visible_path
-                .canonicalize()
-                .map_err(|error| CapsuleRefused {
-                    backend_id: "landlock-seccomp",
-                    reason: format!(
-                        "canonicalize package target {}: {error}",
-                        target.visible_path.display()
-                    ),
-                })?;
-        if target_visible_root != target.visible_path || !target_visible_root.is_absolute() {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "package target must be an absolute canonical path: {} -> {}",
-                    target.visible_path.display(),
-                    target_visible_root.display()
-                ),
-            }
-            .into());
-        }
-        let target_path_metadata =
-            std::fs::metadata(&target_visible_root).map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "inspect package target {}: {error}",
-                    target_visible_root.display()
-                ),
-            })?;
-        let target_handle_metadata = target.handle.metadata().map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("inspect held package target descriptor: {error}"),
-        })?;
-        if !target_path_metadata.is_dir()
-            || !target_handle_metadata.is_dir()
-            || target_path_metadata.dev() != target_handle_metadata.dev()
-            || target_path_metadata.ino() != target_handle_metadata.ino()
-        {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason:
-                    "package target pathname does not identify the retained directory capability"
-                        .to_string(),
-            }
-            .into());
-        }
-        let staging_base = std::path::Path::new("/tmp")
-            .canonicalize()
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("resolve fixed sealed-input staging root /tmp: {error}"),
-            })?;
-        let staging_base_handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&staging_base)
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "open sealed-input cleanup preflight root {}: {error}",
-                    staging_base.display()
-                ),
-            })?;
-        preflight_owned_directory_cleanup(staging_base_handle.as_raw_fd()).map_err(|error| {
-            CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "prove capability-confined cleanup before creating sealed-input staging: {error}"
-                ),
-            }
-        })?;
-
-        validate_bound_launch_inputs(&inputs)?;
-        let input_names = inputs
-            .iter()
-            .map(|input| input.name.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut target_placeholders = 0usize;
-        let mut expanded_args = Vec::with_capacity(args.len());
-        for arg in args {
-            match arg {
-                BoundLaunchArg::Literal(value) => expanded_args.push(value.clone()),
-                BoundLaunchArg::InputName(name) => {
-                    if !input_names.contains(name) {
-                        return Err(CapsuleRefused {
-                            backend_id: "landlock-seccomp",
-                            reason: format!("argv references unknown sealed input {name:?}"),
-                        }
-                        .into());
-                    }
-                    expanded_args.push(OsString::from(name));
-                }
-                BoundLaunchArg::TargetDirectory => {
-                    target_placeholders += 1;
-                    // Filled after the target descriptor has a reserved child slot.
-                    expanded_args.push(OsString::new());
-                }
-            }
-        }
-        if target_placeholders != 1 {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "bound-input argv requires exactly one TargetDirectory placeholder (found {target_placeholders})"
-                ),
-            }
-            .into());
-        }
-
-        let staging = tempfile::Builder::new()
-            .prefix("tirith-bound-inputs-")
-            .tempdir_in(&staging_base)
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("create private sealed-input mountpoint: {error}"),
-            })?;
-        std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("secure private sealed-input mountpoint: {error}"),
-            },
-        )?;
-        let staging = HeldEphemeralDirectory::from_tempdir(
-            staging,
-            "landlock-seccomp",
-            "sealed-input staging",
-        )?;
-        let staging_root = staging
-            .path()
-            .canonicalize()
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("canonicalize private sealed-input mountpoint: {error}"),
-            })?;
-
-        let mut launch_spec = spec.clone();
-        let (filesystem, requested_target_policy) =
-            normalize_bound_target_policy(spec, &target_policy_root)?;
-        launch_spec.filesystem = filesystem;
-        launch_spec.filesystem.read_roots.push(staging_root.clone());
-        let bound_staging_directory =
-            reserve_bound_directory_fd(&launch_spec, staging.handle().as_raw_fd(), &staging_root)?;
-        launch_spec
-            .handles
-            .extra_unix_fds
-            .push(bound_staging_directory.inherited);
-        // Keep the approved final root as the logical policy/receipt identity,
-        // but install its Landlock rule from the descriptor that was verified
-        // against the private pending directory. The child receives the visible
-        // path only to attest the descriptor; it is never added as a path grant.
-        let bound_target_directory = reserve_bound_directory_fd(
-            &launch_spec,
-            target.handle.as_raw_fd(),
-            &requested_target_policy,
-        )?;
-        launch_spec
-            .handles
-            .extra_unix_fds
-            .push(bound_target_directory.inherited);
-        for (template, expanded) in args.iter().zip(&mut expanded_args) {
-            if matches!(template, BoundLaunchArg::TargetDirectory) {
-                *expanded = OsString::from(format!(
-                    "/proc/self/fd/{}",
-                    bound_target_directory.inherited
-                ));
-            }
-        }
-
-        let mut bound_inputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let sealed = seal_bound_launch_input(input)?;
-            let descriptor = reserve_bound_target_fd(&launch_spec, sealed.0.as_raw_fd())?;
-            launch_spec
-                .handles
-                .extra_unix_fds
-                .push(descriptor.inherited);
-            bound_inputs.push(BoundInputFd {
-                name: sealed.1,
-                descriptor,
-            });
-        }
-        let bound_executor = reserve_bound_target_fd(&launch_spec, program_source)?;
-        launch_spec
-            .handles
-            .extra_unix_fds
-            .push(bound_executor.inherited);
-        let mut temp_home = create_parent_owned_temp_home(&mut launch_spec)?;
-        let mut proof = LinuxLaunchProof::create(&mut launch_spec)?;
-        let plan = supervised_stdin_plan(&launch_spec, 0)?;
-        let mut command = linux_contained_command_os_with_options(
-            &plan.backend_spec,
-            bound_program.launch_path().as_os_str(),
-            &expanded_args,
-            None,
-            &plan.backend_selected,
-            Some(bound_program.invocation_path().as_os_str()),
-            temp_home.as_mut(),
-            Some(bound_executor),
-            None,
-            Some(proof.status_fd),
-            Some(proof.ack_fd),
-            Some(proof.coverage_fd),
-            proof.take_child_fds(),
-            None,
-            Some(BoundInputLaunch {
-                staging: bound_staging_directory,
-                inputs: bound_inputs,
-                target: bound_target_directory,
-                target_visible_root,
-            }),
-            None,
-        )?;
-        for (name, value) in extra_env {
-            command.env(name, value);
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        bound_program
-            .verify_identity()
-            .map_err(|error| CapsuleRefused {
-                backend_id: plan.backend_selected.backend_id,
-                reason: format!("package executor changed before capsule spawn: {error}"),
-            })?;
-
-        let launch_started = Instant::now();
-        let mut child = command.spawn().map_err(|error| CapsuleRefused {
-            backend_id: plan.backend_selected.backend_id,
-            reason: format!("capability-bound capsule launch failed: {error}"),
-        })?;
-        drop(command);
-        let child_pid = child.id();
-        let Some(deadline) = launch_started.checked_add(plan.limits.timeout) else {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            if !cleanup {
-                staging.preserve();
-            }
-            return Err(CapsuleRefused {
-                backend_id: plan.backend_selected.backend_id,
-                reason: format!(
-                    "capsule wall deadline is outside the platform range; child-tree cleanup succeeded={cleanup}"
-                ),
-            }
-            .into());
-        };
-        let mut achieved = match proof.confirm_coverage(deadline) {
-            Ok(coverage) => coverage,
-            Err(reason) => {
-                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-                if !cleanup {
-                    staging.preserve();
-                }
-                return Err(CapsuleRefused {
-                    backend_id: plan.backend_selected.backend_id,
-                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
-                }
-                .into());
-            }
-        };
-        if achieved.is_degraded_against(&plan.backend_spec.required_coverage()) {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            if !cleanup {
-                staging.preserve();
-            }
-            return Err(CapsuleRefused {
-                backend_id: plan.backend_selected.backend_id,
-                reason: format!(
-                    "launcher reported achieved coverage below the canonical backend plan; child-tree cleanup succeeded={cleanup}"
-                ),
-            }
-            .into());
-        }
-        match proof.confirm_target_exec(deadline) {
-            Ok(()) => {}
-            Err(TargetExecConfirmationError::BeforeAck(reason)) => {
-                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-                if !cleanup {
-                    staging.preserve();
-                }
-                return Err(CapsuleRefused {
-                    backend_id: plan.backend_selected.backend_id,
-                    reason: format!("{reason}; child-tree cleanup succeeded={cleanup}"),
-                }
-                .into());
-            }
-            Err(TargetExecConfirmationError::AfterAck(reason)) => {
-                let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-                preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-                if !cleanup {
-                    staging.preserve();
-                }
-                return Err(CapsuleExecutionError::ExecutedTerminated {
-                    backend_id: plan.backend_selected.backend_id,
-                    termination: post_ack_confirmation_termination(reason, cleanup),
-                });
-            }
-        }
-        achieved.resource_limits_enforced = plan.effective_spec.resources.any_set();
-        let mut remaining = plan.limits;
-        remaining.timeout = deadline.saturating_duration_since(Instant::now());
-        if remaining.timeout.is_zero() {
-            let (cleanup, _) = terminate_supervised_tree(&mut child, child_pid);
-            preserve_temp_home_on_unconfirmed_cleanup(&mut temp_home, cleanup);
-            if !cleanup {
-                staging.preserve();
-            }
-            let termination = CapsuleTermination {
-                kind: if cleanup {
-                    CapsuleTerminationKind::WallClock
-                } else {
-                    CapsuleTerminationKind::CleanupFailure
-                },
-                reason: format!(
-                    "bound target exhausted the wall budget after authenticated exec; child-tree cleanup succeeded={cleanup}"
-                ),
-                cleanup_confirmed: cleanup,
-            };
-            return if cleanup {
-                Ok(terminated_outcome(
-                    plan.backend_selected.backend_id,
-                    achieved,
-                    termination,
-                ))
-            } else {
-                Err(CapsuleExecutionError::ExecutedTerminated {
-                    backend_id: plan.backend_selected.backend_id,
-                    termination,
-                })
-            };
-        }
-        match supervise_inherited_stdin_child(child, remaining, &mut temp_home) {
-            Ok(output) => Ok(forward_bounded_child_output(
-                CapsuleOutcome {
-                    exit_code: output.status.code().unwrap_or(128),
-                    backend_id: plan.backend_selected.backend_id,
-                    coverage: achieved,
-                    degraded: false,
-                    termination: None,
-                    ephemeral_home_cleanup_confirmed: None,
-                },
-                &output.stdout,
-                &output.stderr,
-                output_presentation,
-            )),
-            Err(reason) => {
-                let termination = supervision_termination(reason);
-                if !termination.cleanup_confirmed {
-                    staging.preserve();
-                    Err(CapsuleExecutionError::ExecutedTerminated {
-                        backend_id: plan.backend_selected.backend_id,
-                        termination,
-                    })
-                } else {
-                    eprintln!("tirith: {}", termination.reason);
-                    Ok(terminated_outcome(
-                        plan.backend_selected.backend_id,
-                        achieved,
-                        termination,
-                    ))
-                }
-            }
-        }
-    }
+pub(crate) fn private_input_execution_refusal() -> PrivateInputExecutionRefusal {
+    PrivateInputExecutionRefusal::InputLifetimeUnqualified
 }
 
 /// Run a contained process with exact caller-supplied bytes on stdin while
@@ -2937,22 +2084,6 @@ struct BoundDirectoryFd {
     original_root: std::path::PathBuf,
     _reservation: std::os::fd::OwnedFd,
     _blockers: Vec<std::os::fd::OwnedFd>,
-}
-
-#[derive(Debug)]
-#[cfg(target_os = "linux")]
-struct BoundInputFd {
-    name: String,
-    descriptor: BoundTargetFd,
-}
-
-#[derive(Debug)]
-#[cfg(target_os = "linux")]
-struct BoundInputLaunch {
-    staging: BoundDirectoryFd,
-    inputs: Vec<BoundInputFd>,
-    target: BoundDirectoryFd,
-    target_visible_root: std::path::PathBuf,
 }
 
 /// Parent-owned proof channels for one Linux launcher. The child endpoint files
@@ -3835,7 +2966,6 @@ fn run_to_completion_with_stdin_captured(
             vec![coverage_child],
             None,
             None,
-            None,
         )?;
         if let Some(directory) = cwd {
             command.current_dir(directory);
@@ -4098,7 +3228,6 @@ fn run_to_completion_with_reviewed_file_captured(
             Some(launch_arm.launch_ack_fd().as_raw_fd()),
             Some(coverage_fd),
             vec![coverage_child],
-            None,
             None,
             None,
         )?;
@@ -4862,28 +3991,6 @@ fn bounded_child_output_presentation(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn test_suppress_bound_child_output(stdout: &[u8], stderr: &[u8]) -> CapsuleOutcome {
-    let (outcome, presented) = bounded_child_output_presentation(
-        CapsuleOutcome {
-            exit_code: 0,
-            backend_id: "landlock-seccomp",
-            coverage: CapsuleCoverage::NONE,
-            degraded: false,
-            termination: None,
-            ephemeral_home_cleanup_confirmed: None,
-        },
-        stdout,
-        stderr,
-        BoundOutputPresentation::Suppress,
-    );
-    assert!(
-        presented.is_none(),
-        "suppressed package output must never reach the JSON presentation layer"
-    );
-    outcome
-}
-
 #[cfg(target_os = "linux")]
 fn forward_bounded_child_output(
     outcome: CapsuleOutcome,
@@ -5096,7 +4203,6 @@ fn linux_supervised_launch(
         Some(ack_fd),
         Some(coverage_fd),
         proof.take_child_fds(),
-        None,
         None,
         bound_work,
     )?;
@@ -5548,7 +4654,6 @@ fn linux_spawn_piped_supervised(
         proof.take_child_fds(),
         None,
         None,
-        None,
     )?;
     if let Some(directory) = cwd {
         command.current_dir(directory);
@@ -5822,7 +4927,6 @@ fn linux_contained_command_os(
         Vec::new(),
         None,
         None,
-        None,
     )?;
     prepared.temp_home = temp_home;
     Ok(prepared)
@@ -5847,7 +4951,6 @@ fn linux_contained_command_os_with_options(
     coverage_status_fd: Option<i32>,
     extra_bound_fds: Vec<BoundTargetFd>,
     bound_directory: Option<BoundDirectoryFd>,
-    bound_inputs: Option<BoundInputLaunch>,
     bound_work_directory: Option<BoundDirectoryFd>,
 ) -> Result<PreparedContainedCommand, CapsuleRefused> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -5920,24 +5023,6 @@ fn linux_contained_command_os_with_options(
             .arg("--work-root")
             .arg(&directory.original_root);
     }
-    if let Some(bound) = bound_inputs.as_ref() {
-        cmd.arg("--staging-fd")
-            .arg(bound.staging.inherited.to_string())
-            .arg("--staging-root")
-            .arg(&bound.staging.original_root);
-        for input in &bound.inputs {
-            cmd.arg("--input-fd")
-                .arg(input.descriptor.inherited.to_string())
-                .arg("--input-name")
-                .arg(&input.name);
-        }
-        cmd.arg("--target-dir-fd")
-            .arg(bound.target.inherited.to_string())
-            .arg("--target-dir-root")
-            .arg(&bound.target.original_root)
-            .arg("--target-dir-visible-root")
-            .arg(&bound.target_visible_root);
-    }
     cmd.arg("--").arg(program).args(args);
     configure_linux_launcher_environment(&mut cmd, exact_env, sel.backend_id)?;
     use std::os::unix::process::CommandExt as _;
@@ -5979,24 +5064,6 @@ fn linux_contained_command_os_with_options(
                 let _keep_home_reserved = (&home._reservation, &home._blockers);
                 if libc::fcntl(home.inherited, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
-                }
-            }
-            if let Some(bound) = bound_inputs.as_ref() {
-                let _keep_staging_reserved =
-                    (&bound.staging._reservation, &bound.staging._blockers);
-                if libc::fcntl(bound.staging.inherited, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let _keep_target_reserved = (&bound.target._reservation, &bound.target._blockers);
-                if libc::fcntl(bound.target.inherited, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for input in &bound.inputs {
-                    let descriptor = &input.descriptor;
-                    let _keep_input_reserved = (&descriptor._reservation, &descriptor._blockers);
-                    if libc::fcntl(descriptor.inherited, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
                 }
             }
             if let Some(status_fd) = launch_status_fd {
@@ -6141,205 +5208,6 @@ fn reserve_bound_directory_fd(
         _reservation: reserved._reservation,
         _blockers: reserved._blockers,
     })
-}
-
-#[cfg(target_os = "linux")]
-fn validate_bound_launch_inputs(inputs: &[BoundLaunchInput]) -> Result<(), CapsuleRefused> {
-    let mut names = std::collections::BTreeSet::new();
-    let mut approved = 0usize;
-    let mut total_bytes = 0u64;
-    for input in inputs {
-        let metadata = input.source.metadata().map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("inspect captured input: {error}"),
-        })?;
-        total_bytes = total_bytes
-            .checked_add(metadata.len())
-            .ok_or_else(|| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "captured input size overflow".into(),
-            })?;
-        if !metadata.is_file() || total_bytes > 64 * 1024 * 1024 {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "wheel input collection exceeds the 64 MiB private staging bound".into(),
-            });
-        }
-        let name = input.name.as_str();
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.as_bytes().contains(&0)
-            || std::path::Path::new(name).components().count() != 1
-            || !std::path::Path::new(name)
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("bound input name {name:?} is not one safe filename component"),
-            });
-        }
-        if !names.insert(name.to_string()) {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("duplicate bound input filename {name:?}"),
-            });
-        }
-        if name == "approved.txt" {
-            approved += 1;
-        } else if !name.ends_with(".whl") {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("bound package input {name:?} must retain its .whl filename"),
-            });
-        }
-        if input.expected_sha256.len() != 64
-            || !input
-                .expected_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("bound input {name:?} has a non-canonical expected SHA-256 digest"),
-            });
-        }
-    }
-    if approved != 1 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "bound-input launch requires exactly one approved.txt (found {approved})"
-            ),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn seal_bound_launch_input(
-    mut input: BoundLaunchInput,
-) -> Result<(std::fs::File, String), CapsuleRefused> {
-    use sha2::{Digest as _, Sha256};
-    use std::os::fd::FromRawFd as _;
-
-    let expected_length = input.source.metadata().map_err(|error| CapsuleRefused {
-        backend_id: "landlock-seccomp",
-        reason: format!("inspect captured input before bounded sealing: {error}"),
-    })?;
-    if !expected_length.is_file() || expected_length.len() > 64 * 1024 * 1024 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: "captured input must remain a regular file within the 64 MiB per-input bound"
-                .to_owned(),
-        });
-    }
-    let expected_length = expected_length.len();
-    input
-        .source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("rewind bound input {:?}: {error}", input.name),
-        })?;
-    let label = std::ffi::CString::new("tirith-bound-input").expect("literal has no NUL");
-    let raw = unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            label.as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    if raw < 0 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "create sealed input {:?}: {}",
-                input.name,
-                std::io::Error::last_os_error()
-            ),
-        });
-    }
-    // SAFETY: memfd_create returned one fresh owned descriptor.
-    let mut sealed = unsafe { std::fs::File::from_raw_fd(raw as i32) };
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        // Read at most one byte beyond the retained regular-file size. A
-        // concurrent growing writer cannot turn sealing into unbounded work.
-        let read_limit = (expected_length.saturating_sub(total).saturating_add(1))
-            .min(buffer.len() as u64) as usize;
-        let count = input
-            .source
-            .read(&mut buffer[..read_limit])
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!("read bound input {:?}: {error}", input.name),
-            })?;
-        if count == 0 {
-            break;
-        }
-        total += count as u64;
-        if total > expected_length {
-            return Err(CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: "captured input grew while being sealed".to_owned(),
-            });
-        }
-        digest.update(&buffer[..count]);
-        sealed
-            .write_all(&buffer[..count])
-            .map_err(|error| CapsuleRefused {
-                backend_id: "landlock-seccomp",
-                reason: format!(
-                    "copy bound input {:?} into sealed storage: {error}",
-                    input.name
-                ),
-            })?;
-    }
-    let actual = format!("{:x}", digest.finalize());
-    if total != expected_length || actual != input.expected_sha256 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "bound input {:?} digest mismatch: expected {}, got {actual}",
-                input.name, input.expected_sha256
-            ),
-        });
-    }
-    if unsafe { libc::fchmod(std::os::fd::AsRawFd::as_raw_fd(&sealed), 0o444) } != 0 {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "make sealed input {:?} read-only: {}",
-                input.name,
-                std::io::Error::last_os_error()
-            ),
-        });
-    }
-    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&sealed);
-    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, required) } < 0
-        || unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } & required != required
-    {
-        return Err(CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!(
-                "fully seal bound input {:?}: {}",
-                input.name,
-                std::io::Error::last_os_error()
-            ),
-        });
-    }
-    sealed
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| CapsuleRefused {
-            backend_id: "landlock-seccomp",
-            reason: format!("rewind sealed bound input {:?}: {error}", input.name),
-        })?;
-    Ok((sealed, input.name))
 }
 
 /// macOS: re-exec the internal capsule launcher, which closes inherited handles,
@@ -6791,9 +5659,8 @@ pub struct CapsuleDoctorInfo {
     /// The backend selected for this host.
     pub backend_id: &'static str,
     /// Whether the backend can fully satisfy a locked-down (deny-all) spec. This
-    /// alone does not make `pkg install` available: the package flow separately
-    /// requires Linux private namespaces, bound inputs, a supported toolchain,
-    /// and its policy/approval/publication checks.
+    /// alone does not make `pkg install` available: contained package execution
+    /// is disabled on every host.
     pub deny_all_enforceable: bool,
     /// The individual coverage flags achieved for a locked-down spec.
     pub fs_read_enforced: bool,
@@ -7542,32 +6409,6 @@ mod tests {
             private_paths.iter().all(|path| !path.exists()),
             "dropping the parent guard must capability-clean every advertised XDG directory"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn absent_logical_target_root_is_normalized_once_without_becoming_path_authority() {
-        let parent = tempfile::tempdir().expect("target parent");
-        let target = parent.path().join("absent-final").join("site-packages");
-        assert!(!target.exists(), "fixture target must remain absent");
-        let mut spec = CapsuleSpec::locked_down();
-        spec.filesystem.read_roots.clear();
-        spec.filesystem.write_roots = vec![target.clone()];
-        spec.filesystem.deny_roots.clear();
-
-        let (filesystem, logical_root) =
-            normalize_bound_target_policy(&spec, &target).expect("normalize absent final root");
-        assert_eq!(logical_root, target);
-        assert_eq!(filesystem.write_roots, vec![target.clone()]);
-        assert!(
-            !target.exists(),
-            "normalization must not create or reopen the final root"
-        );
-
-        spec.filesystem.write_roots.push(target.clone());
-        let duplicate = normalize_bound_target_policy(&spec, &target)
-            .expect_err("duplicate logical target authority must fail");
-        assert!(duplicate.reason.contains("exactly once"), "{duplicate}");
     }
 
     #[cfg(target_os = "linux")]
@@ -8759,40 +7600,6 @@ mod tests {
             .expect("sandbox-exec separator");
         assert_eq!(argv[separator + 1], OsString::from("/usr/bin/printf"));
         assert_eq!(argv[separator + 2].as_encoded_bytes(), raw);
-    }
-
-    /// Seatbelt grants are pathname-based, so they cannot safely authorize a
-    /// transaction vnode held only by directory fd across a same-UID rename race.
-    /// This retained directory-bound compatibility seam therefore refuses before
-    /// any interpreter spawn; production package installs use the bound-input seam.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_capability_bound_install_refuses_before_spawn() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp = tempfile::tempdir().expect("tempdir");
-        let transaction = temp.path().join("transaction");
-        std::fs::create_dir(&transaction).expect("create transaction");
-        let held = std::fs::File::open(&transaction).expect("hold transaction directory");
-        let marker = temp.path().join("spawned");
-
-        let mut spec = CapsuleSpec::locked_down();
-        spec.resources = tirith_core::capsule::ResourceLimits::default();
-        spec.filesystem.read_roots.push(transaction.clone());
-        let result = run_to_completion_bound_directory(
-            &spec,
-            "/usr/bin/touch",
-            &[marker.display().to_string()],
-            &transaction,
-            held,
-            &[],
-            DegradedPolicy::FailClosed,
-        );
-        let refusal = result.expect_err("macOS capability-bound launch must fail closed");
-        assert!(
-            refusal.reason.contains("cannot bind a filesystem grant"),
-            "unexpected refusal: {refusal}"
-        );
-        assert!(!marker.exists(), "refusal must occur before target spawn");
     }
 
     #[cfg(debug_assertions)]

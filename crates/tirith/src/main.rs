@@ -568,10 +568,11 @@ or package execution. --yes, --allow-degraded, sudo, and administrator access
 do not enable it. Immutable named inputs must be qualified for the complete
 target lifetime before contained package execution can be enabled.
 
-`tirith pkg approve` remains subject to its separate native authority and
-x86_64 Linux requirements; an approval cannot bypass the execution refusal.
-`pkg verify-env` remains a read-only verifier, and `tirith package inspect`
-remains available for local artifact inspection.")]
+`tirith pkg approve` first checks its native approval authority (x86_64 Linux
+only), then refuses with the same private_input_execution_unqualified reason:
+it records no approval, because nothing could redeem one. `pkg verify-env`
+remains a read-only verifier, and `tirith package inspect` remains available
+for local artifact inspection.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -6060,15 +6061,18 @@ contacts a registry, or issues installation approval.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Resolve + inspect a requirement set and approve its install plan through
-    /// the x86_64 Linux native authority. Does NOT install.
+    /// Package-plan approval (currently disabled on every host). Checks the
+    /// native approval authority, then refuses; records no approval.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
   tirith pkg approve pip flask --target .venv
 
-Native approval issuance is available only on x86_64 Linux. Unsupported
-platforms fail closed before publishing an approval record.")]
+Approvals existed only for contained `tirith pkg install`, which is disabled.
+Hosts without the native approval authority (it is available only on x86_64
+Linux) refuse at native_authority. Otherwise approve validates its arguments
+and refuses with private_input_execution_unqualified before resolver
+execution, network access, quarantine writes, or approval-record publication.")]
     Approve {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -8463,10 +8467,13 @@ fn run() {
         }
         Commands::Pkg { action } => {
             let pkg_action = match action {
+                // `--target` (and install's `--yes` / `--allow-degraded`) stay
+                // accepted for compatibility; both commands refuse before any
+                // target or confirmation is consulted.
                 PkgAction::Approve {
                     ecosystem,
                     requirements,
-                    target,
+                    target: _,
                     index_url,
                     artifact_origin,
                     format,
@@ -8476,7 +8483,6 @@ fn run() {
                     cli::pkg::PkgAction::Approve {
                         ecosystem: ecosystem.into_core(),
                         requirements,
-                        target,
                         index_url,
                         artifact_origin,
                         json,
@@ -8485,11 +8491,11 @@ fn run() {
                 PkgAction::Install {
                     ecosystem,
                     requirements,
-                    target,
+                    target: _,
                     index_url,
                     artifact_origin,
-                    yes,
-                    allow_degraded,
+                    yes: _,
+                    allow_degraded: _,
                     format,
                     json,
                 } => {
@@ -8497,11 +8503,8 @@ fn run() {
                     cli::pkg::PkgAction::Install {
                         ecosystem: ecosystem.into_core(),
                         requirements,
-                        target,
                         index_url,
                         artifact_origin,
-                        yes,
-                        allow_degraded,
                         json,
                     }
                 }

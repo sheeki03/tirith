@@ -605,13 +605,11 @@ sudo dnf install ./tirith-*.rpm
 
 Package installation requires administrator privileges; in an existing root
 session, run the commands without `sudo`. Tirith packages neither depend on nor
-suggest installing sudo. On x86_64 Linux, only the explicitly requested
-`tirith pkg approve` operation requires a trusted
-`/usr/bin/sudo` and the root-owned approval helper for fresh administrator
-confirmation. The packaged helper is inert: installation creates no sudoers
-rule, elevated service, or signing key. If that authority is unavailable,
-approval remains blocked; ordinary command checks and shell protection
-continue to work.
+suggest installing sudo. The optional root-owned approval helper belongs to
+`tirith pkg approve`, which currently refuses (contained package execution, its
+only consumer, is disabled). The packaged helper is inert: installation creates
+no sudoers rule, elevated service, or signing key. Ordinary command checks and
+shell protection never need it.
 The [installation privileges guide](docs/install-privileges.md) covers all
 package formats, manual installs, updates, and removal.
 
@@ -955,7 +953,7 @@ The everyday commands:
 | `tirith package risk <eco> <name>` | Score a package's supply-chain risk |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project |
 | `tirith package inspect --artifact <wheel>` | Inspect exact Python artifact bytes, startup hooks, native code, RECORD integrity, and cross-wheel execution chains |
-| `tirith pkg approve` | Create a non-installing Python package approval under its native authority and platform requirements |
+| `tirith pkg approve` | Currently disabled: after its native-authority check it refuses with `private_input_execution_unqualified` and records no approval |
 | `tirith pkg install` | Currently disabled on every host: refuses with `private_input_execution_unqualified` before resolver or package execution |
 | `tirith pkg verify-env` | Verify an existing Python environment without installing packages |
 | `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |

@@ -17,12 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional self-hosted team policy service, explicit client enrollment, reviewed publication and rollback, and adoption reports that retain missing, stale and failed clients.
 - Native macOS ARM allocation and memory regression budgets in PR CI, backed by three reference runs and six deliberate-regression checks. Runner or measurement changes require a compatibility review.
 
+### Changed
+
+- `tirith pkg approve` refuses with `private_input_execution_unqualified` right after its native-authority check and records no approval, because contained `tirith pkg install` (its only consumer) is disabled on every host. Usage and request errors keep their exit codes. The unreachable private-input launcher and pip execution path were removed; `pkg install` output, exit code, and JSON are unchanged.
+
 ### Fixed
 
 - Remove sudo dependencies and suggestions from native packages. Ordinary protection stays unprivileged; manual privileged-helper installation is off by default, and unsupported or missing approval prerequisites have explicit guidance.
 - Wait for optional hook telemetry and stop overdue logging children so completed hooks do not leave ordinary background writers behind. Telemetry failures preserve the selected protection decision.
 - Preserve protocol fields under custom redaction, apply fresh privacy rules to selected support exports, and keep signed verification material separate from display copies.
-- Preserve private checkpoint data during unexpected unwinding.
 - Bound recent history and tuning reads, preserve all contributing blockers in previews, and report expectation labels without inferring safety or automatic approval.
 - Keep large effective-policy responses usable with explicit field-summary limits, and prevent inherited nonblocking sockets from truncating local dashboard responses or timing out requests prematurely.
 - Preserve exact audit history through reviewed rotation and recovery; retained segment deletion requires an irreversible acknowledgement and never offers a false undo.

@@ -144,7 +144,16 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # remaining identity, order, group, inspected value or policy_complete flag
 # changes. It replaces digest
 # a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63.
-sha256 = "36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4"
+#
+# Private-input launcher removal (simplify/cycle-cleanup): `pkg approve` now
+# refuses with the pkg install qualification reason right after its native
+# authority check, because approvals existed only for the disabled contained
+# install. Its `inspected` value changes from full to none (the same disclosure
+# `pkg install` received) and its coverage prose describes the refusal. No
+# entry is added, removed, renamed, regrouped or reordered; manifest_version
+# and every policy_complete flag stay unchanged. It replaces digest
+# 36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4.
+sha256 = "3f6aa6a786787e6bb734d60b9fd23dc2083cb97cd1ad2649b08a58392ba6046e"
 
 [mcp]
 default_tools = [

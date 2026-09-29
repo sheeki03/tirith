@@ -108,7 +108,11 @@ approval availability separately from ordinary protection. Exact heads
 failures. These separate PR results do not certify the larger cycle branch.
 The focused private-input execution refusal in
 [PR 254](https://github.com/sheeki03/tirith/pull/254), exact head `0f679ac4`, also
-has 53 passing checks and 12 expected skips. On cycle commit `897bad30`, Linux,
+has 53 passing checks and 12 expected skips. The disabled private-input launcher
+(`capsule_child/private_input_fs.rs`, `run_to_completion_bound_inputs`), the pip
+execution path behind it and the approval issuance that fed it were later removed;
+the last commit that contains them is `77633d4a` (local tag
+`archive/private-input-launcher-v1`). On cycle commit `897bad30`, Linux,
 macOS and Rust 1.83 workspace jobs passed; Windows detected and cleaned up a
 surviving build descendant and refused qualification. The later `c3445508` run
 compiles Windows successfully and passes the native standard-account dashboard

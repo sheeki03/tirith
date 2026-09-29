@@ -26,8 +26,10 @@ sudo is one way to obtain that access, and an existing root session also works.
 Tirith never installs sudo, grants passwordless sudo access, creates a sudoers
 rule, starts an elevated approval service, or invokes the approval authority
 as part of ordinary command checks. The packaged helper has ordinary executable
-permissions, with no setuid/setgid bits. Its private key is created only during
-an explicitly requested, freshly confirmed `tirith pkg approve` operation.
+permissions, with no setuid/setgid bits. `tirith pkg approve` currently refuses
+after its native-authority check (contained package execution, the only
+consumer of approvals, is disabled), so this release never asks the helper to
+create a key or sign an approval.
 
 The shell installer accepts `TIRITH_INSTALL_APPROVAL_HELPER=0` (the default)
 or `TIRITH_INSTALL_APPROVAL_HELPER=1`. Other values are rejected. On a fresh
@@ -52,12 +54,9 @@ must still match the release.
 
 ## Approval, setup, and cleanup
 
-Fresh package approvals require a non-root interactive operator, a protected
-helper, and trusted `/usr/bin/sudo` with fresh administrator confirmation.
-Missing sudo, unsafe permissions, noninteractive execution, and passwordless
-approval channels remain blocked. Running `tirith pkg approve` as root does
-not bypass operator-presence checks. Existing approval verification continues
-to require the protected public keyring.
+`tirith pkg approve` issues no approvals in this release: after its
+native-authority check it refuses with `private_input_execution_unqualified`,
+whatever the operator, session, or privilege level.
 
 `tirith init` prints shell integration, and `tirith setup` writes the selected
 user/project integration files with ownership and symlink checks. They do not
@@ -72,7 +71,9 @@ present, not that any approval was issued or administrator access was verified.
 All states report `automatic_elevation: false` and
 `ordinary_protection_requires_sudo: false`. `pkg approve` refuses missing native
 prerequisites before policy-server access, resolver execution, or quarantine
-work, with an explanation of the optional feature and how to enable it.
+work, with an explanation of the optional feature and how to enable it. When the
+prerequisites are present it refuses with `private_input_execution_unqualified`
+before any of that work.
 
 Uninstall the CLI with its owning package manager or remove its user-owned
 binary, then remove the shell/integration entries and user data. Only remove a

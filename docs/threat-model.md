@@ -64,7 +64,8 @@
   tirith-owned irreversible transitions, and nowhere else:
   - the MCP gateway's upstream forward, before pending registration;
   - `tirith pkg approve` / `tirith pkg install`, before resolver network and
-    again before install preparation;
+    again before install preparation (not reached while contained package
+    execution is disabled: both commands refuse first);
   - `tirith install <manager>`, before registry network and before the manager
     is spawned;
   - `tirith run <url>` and `tirith install url <URL>`, before download and

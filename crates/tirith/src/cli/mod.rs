@@ -1708,21 +1708,15 @@ pub mod output_guard;
 pub mod package;
 pub(crate) mod package_approval_authority;
 pub(crate) mod package_approval_authority_native;
-mod package_checkpoint;
 pub mod paste;
 pub mod path;
 pub mod pending;
 pub mod persistence;
 /// The package-firewall CLI surface (PR D7): `tirith pkg install | verify-env |
-/// approve | receipt`. Drives the D1-D6 resolve -> firewall -> re-bind -> contained
-/// install -> receipt pipeline, binding an operator approval to an
-/// `InstallPlanDigest`. Distinct from `tirith install` (analysis-only).
+/// approve | receipt | trust-tool`. Contained package execution is disabled, so
+/// `install` and `approve` refuse with a named reason; the verification and
+/// receipt commands keep working. Distinct from `tirith install` (analysis-only).
 pub mod pkg;
-/// Contained install-from-digest for the package firewall (PR D4, CLI half): write
-/// the re-bound plan's `approved.txt`, build the pinned `python -m pip install`
-/// argv, and run it through the fail-closed capsule launcher (never the uncontained
-/// `ProcessInstallRunner`).
-pub mod pkg_install;
 pub mod policy;
 pub mod preview;
 pub mod profile;

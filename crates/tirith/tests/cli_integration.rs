@@ -22095,16 +22095,12 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"
             );
-        } else if action == "install" {
+        } else {
+            // Both commands refuse contained package execution before resolver
+            // discovery; approve records nothing that install could redeem.
             assert!(
                 stderr.contains("private_input_execution_unqualified:"),
-                "pkg install must refuse before resolver discovery: {stderr}"
-            );
-        } else {
-            assert!(
-                stderr.contains("resolve failed")
-                    && stderr.contains("explicit `tirith pkg trust-tool"),
-                "pkg {action} must report the resolver trust boundary: {stderr}"
+                "pkg {action} must refuse before resolver discovery: {stderr}"
             );
         }
     }
@@ -22311,9 +22307,86 @@ fn pkg_install_private_input_qualification_refuses_before_package_side_effects()
     }
 }
 
-/// A complete private-input argv and valid spec must hit qualification before
-/// platform setup or descriptor validation. The target is a harmless shell that
-/// would create a marker if reached; no package or namespace attack is attempted.
+/// The exact bytes `tirith pkg install` prints when it refuses. Captured from the
+/// pre-cleanup implementation so deleting the unreachable execution path cannot
+/// change a single byte of the human diagnostic, the JSON document, or the exit
+/// code. Both the qualification refusal and the earlier request-validation
+/// refusal are pinned, with every historical flag combination.
+#[test]
+fn pkg_install_refusal_output_is_byte_identical() {
+    const REASON: &str = "private_input_execution_unqualified: contained package execution is \
+disabled; the private-input backend cannot guarantee unchanged package inputs throughout \
+execution against another process owned by the same user. Sudo or administrator access does \
+not qualify this backend. Package inspection and ordinary command protection remain available.";
+    const DIRECT_URL: &str = "examplepkg@https://unapproved.example/pkg-1.0-py3-none-any.whl";
+    let direct_url_reason = format!(
+        "resolve failed: refusing requirement \"{DIRECT_URL}\": direct-URL requirements \
+(name @ url / bare url) are not permitted"
+    );
+    let json_document = |phase: &str, reason: &str| {
+        format!(
+            "{{\n  \"error_phase\": \"{phase}\",\n  \"reason\": {},\n  \"success\": false,\n  \
+\"target_executed\": false,\n  \"target_published\": false\n}}\n",
+            serde_json::to_string(reason).unwrap()
+        )
+    };
+    let cases: [(&str, &str, String); 2] = [
+        (
+            "examplepkg==1.0.0",
+            "refused_before_exec",
+            REASON.to_string(),
+        ),
+        (DIRECT_URL, "plan_preparation", direct_url_reason),
+    ];
+    for (requirement, phase, reason) in &cases {
+        for flags in [
+            Vec::<&str>::new(),
+            vec!["--yes"],
+            vec!["--allow-degraded", "--yes"],
+        ] {
+            for json in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let mut command = tirith();
+                command
+                    .current_dir(fixture.path())
+                    .env("HOME", fixture.path())
+                    .env("USERPROFILE", fixture.path())
+                    .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+                    .env("XDG_DATA_HOME", fixture.path().join("data"))
+                    .env("APPDATA", fixture.path().join("data"))
+                    .env("LOCALAPPDATA", fixture.path().join("data"))
+                    .env("TIRITH_LOG", "0")
+                    .args(["pkg", "install", "pip", requirement, "--target"])
+                    .arg(fixture.path().join("target"))
+                    .args(&flags);
+                if json {
+                    command.arg("--json");
+                }
+                let output = command.output().expect("run pkg install refusal");
+                assert_eq!(output.status.code(), Some(1), "flags={flags:?} json={json}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                if json {
+                    assert_eq!(stdout, json_document(phase, reason), "flags={flags:?}");
+                    assert_eq!(stderr, "", "flags={flags:?}");
+                } else {
+                    assert_eq!(stdout, "", "flags={flags:?}");
+                    assert_eq!(
+                        stderr,
+                        format!("tirith pkg install: {phase}: {reason}\n"),
+                        "flags={flags:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The private-input launcher was removed, so its operands are unknown to the
+/// hidden launcher grammar: a complete former private-input argv with a valid
+/// spec is refused as a usage error (exit 2) before platform setup, descriptor
+/// use, or target execution. The target is a harmless shell that would create a
+/// marker if reached; no package or namespace attack is attempted.
 #[cfg(unix)]
 #[test]
 fn hidden_capsule_private_inputs_refuse_before_target_execution() {
@@ -22350,11 +22423,10 @@ fn hidden_capsule_private_inputs_refuse_before_target_execution() {
         .expect("run hidden private-input refusal");
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("private_input_execution_unqualified:"),
-        "{stderr}"
+    assert_eq!(
+        stderr,
+        "tirith __capsule-child: unknown internal launcher option \"--staging-root\"\n"
     );
-    assert!(!stderr.contains("invalid capsule spec"));
     assert!(output.stdout.is_empty());
     assert!(!marker.exists(), "refused target must never execute");
     assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());

@@ -156,7 +156,8 @@ So `gateway_forward` produces audit-chain lines, and `package_approval`,
 `package_resolve`, `package_install_preparation`, `package_manager_network`,
 `package_manager_execution`, `remote_script_run`, `config_write`, and
 `capsule_preset_run` produce nothing at all, in any mode. Running
-`tirith pkg approve` under `mode: observe` creates no audit file anywhere.
+`tirith policy init` under `mode: observe` creates no audit file anywhere.
+(`pkg approve` and `pkg install` currently refuse before their boundaries.)
 
 The records that do exist land in the standard audit chain, so read them with
 `tirith audit` (and note `TIRITH_LOG=0` disables that chain entirely). For the
@@ -247,10 +248,8 @@ The name suggests it discriminates by origin; at these boundaries it cannot.
 (`crates/tirith-core/src/task.rs:71-73`) and every owned boundary passes
 `IngressAdapter::Unattributed`, so the effect is filtered out on every call,
 including the operator's own typed commands. With the snippet above,
-`tirith pkg approve pip requests` refuses with "task gate denied these effects at
-this boundary: package_install", and `tirith policy init` refuses with "task gate
-refused this configuration write". Under `mode: observe` both are allowed, so the
-mode is the only variable. Enable it deliberately, knowing it turns off those
+`tirith policy init` refuses with "task gate refused this configuration write".
+Under `mode: observe` it is allowed, so the mode is the only variable. Enable it deliberately, knowing it turns off those
 commands for everyone on the host.
 
 ## Rollback

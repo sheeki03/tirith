@@ -1877,8 +1877,9 @@ mod tests {
     #[test]
     // Unix-only: the audit-chain anchor needs the audit-log lock, which fs2 cannot
     // take on a Windows append handle, so the "anchor succeeds" assertions below
-    // cannot hold there. The Windows degrade (receipt saved, unanchored) is covered
-    // by the pkg_install receipt tests.
+    // cannot hold there. The Windows degrade (receipt saved, unanchored) has no
+    // CLI writer since contained `pkg install` was removed; `pkg receipt` only
+    // reads stored receipts.
     #[cfg(unix)]
     fn record_saves_file_and_anchors_in_audit_chain() {
         let root = tempfile::tempdir().unwrap();

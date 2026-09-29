@@ -812,3 +812,24 @@ fn package_install_help_states_the_disabled_execution_scope() {
         assert!(text.contains("verify-env"));
     }
 }
+
+#[test]
+fn package_approve_help_states_that_it_refuses_and_records_nothing() {
+    let out = tirith()
+        .args(["pkg", "approve", "--help"])
+        .output()
+        .expect("read package approve help");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("currently disabled on every host"), "{text}");
+    assert!(text.contains("native_authority"), "{text}");
+    assert!(
+        text.contains("private_input_execution_unqualified"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("approve its install plan"),
+        "help must not imply a working approval path: {text}"
+    );
+}

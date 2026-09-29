@@ -372,8 +372,8 @@ task_gate:
 
 **That denied-effect set applies to YOUR commands too.** Every tirith-owned
 boundary reports its source as unattributed and untrusted, so the effect is
-denied on every call. With the snippet above, `tirith pkg approve` and
-`tirith policy init` both refuse. Under `mode: observe` they do not. Enable it
+denied on every call. With the snippet above, `tirith policy init` refuses.
+Under `mode: observe` it does not. Enable it
 knowing that.
 
 **`action_incomplete_analysis: block` is narrower than it sounds.** Task effect

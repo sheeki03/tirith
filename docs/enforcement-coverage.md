@@ -279,9 +279,9 @@ tool.
 | Boundary token | Where |
 |---|---|
 | `gateway_forward` | before the MCP gateway registers a pending request and writes upstream |
-| `package_approval` | before `tirith pkg approve` runs the resolver |
-| `package_resolve` | before `tirith pkg install` runs the same resolver network |
-| `package_install_preparation` | before the target environment is checkpointed |
+| `package_approval` | before `tirith pkg approve` runs the resolver (not reached while contained package execution is disabled: the command refuses first) |
+| `package_resolve` | before `tirith pkg install` runs the same resolver network (not reached while contained package execution is disabled: the command refuses first) |
+| `package_install_preparation` | before the target environment is checkpointed (not reached while contained package execution is disabled: the command refuses first) |
 | `package_manager_network` | before `tirith install <manager>` contacts a registry |
 | `package_manager_execution` | before the package manager is spawned |
 | `remote_script_run` | before `tirith run <url>` and `tirith install url <URL>` download and launch |
@@ -305,7 +305,7 @@ production caller, `crates/tirith/src/cli/gateway.rs:3214`, and
 (`gateway.rs:4227` and `:3215`). The `gateway_forward` boundary writes an
 audit-chain line in observe and enforce modes; the other eight decide, refuse or
 allow, and write nothing anywhere. An observation burn-in run against
-`pkg approve` under `mode: observe` produces no audit file at all.
+`tirith policy init` under `mode: observe` produces no audit file at all.
 
 This matters for anyone planning a burn-in: eight of the nine boundaries cannot
 be measured from records, so "no records" means "not instrumented", never "not
@@ -359,11 +359,9 @@ on every call, including the operator's own typed commands.
 
 Under `mode: enforce` with
 `effects_denied_for_untrusted_sources: [policy_change, package_install]`,
-`tirith pkg approve pip requests` refuses with "task gate denied these effects at
-this boundary: package_install", and `tirith policy init` refuses with "task gate
-refused this configuration write: task gate denied these effects at this
-boundary: policy_change". The same policy under `mode: observe` allows both, so
-the mode is the only variable. Price that cost before enabling it; it is a real
+`tirith policy init` refuses with "task gate refused this configuration write:
+task gate denied these effects at this boundary: policy_change". The same policy
+under `mode: observe` allows it, so the mode is the only variable. Price that cost before enabling it; it is a real
 control, and it is broader than its name suggests.
 
 ### npm command grammar and registry identity facts

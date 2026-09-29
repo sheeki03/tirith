@@ -647,8 +647,8 @@ policy_complete = true
 [[command]]
 name = "pkg approve"
 group = "Package firewall"
-inspected = "full"
-coverage = "Binds an approval to the inspected artifact hashes, packages, target environment, policy projection, and DB sequence. This explicit approval route requires the opt-in privileged helper and its supported authority, currently Linux x86_64. It is unavailable by default. Ordinary checks do not require it, and an approval cannot enable the currently disabled package-execution backend."
+inspected = "none"
+coverage = "Approval is disabled with package execution, its only consumer. After the native approval-authority check (available only on Linux x86_64 with the opt-in privileged helper), valid pip requests refuse with the same private-input qualification reason before resolver, network, quarantine or approval-record effects. No approval is recorded. Ordinary checks do not require the authority."
 policy_complete = true
 
 [[command]]
