@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use crate::cli::{HumanJsonFormat, HumanJsonSarifFormat};
 use clap::{Parser, Subcommand};
 
-/// A categorized command overview appended to `tirith --help` (the long help),
-/// since clap-derive cannot group subcommands by category. The
-/// `every_command_is_categorized` test guards this against drift.
-const COMMANDS_BY_CATEGORY: &str = "\
+/// The categorized command overview, as a macro so it can be `concat!`ed
+/// into the long help after the task list. The `every_command_is_categorized`
+/// test guards this against drift.
+macro_rules! commands_by_category_text {
+    () => {
+        "\
 COMMANDS BY CATEGORY:
   Scan & Analyze:   check paste run score diff fetch fix scan review view preview watch temp-run capsule taint intend task lab explain why visual-audit
   Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
@@ -20,14 +22,57 @@ COMMANDS BY CATEGORY:
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
-Run `tirith <command> --help` for details on any command.";
+Run `tirith <command> --help` for details on any command."
+    };
+}
+
+/// A short task list shown after the short help, so bare `tirith`, `tirith -h`
+/// and `tirith --help` all show a beginner which command does what. It only
+/// prints commands; it never runs them. `tasks_help_commands_parse` checks
+/// that every `tirith ...` command named here parses against the real CLI.
+macro_rules! tasks_help_text {
+    () => {
+        "\
+COMMON TASKS:
+  New here?               tirith onboard   (or: tirith setup recommended --dry-run)
+  Check protection        tirith status
+  See recent blocks       tirith audit recent --action block
+  Why was this blocked?   tirith why
+  Resolve an exception    tirith trust explain PATTERN  |  tirith trust add --help
+  Remove an exception     tirith trust revoke GRANT_ID
+  Change profile          tirith policy profile --help
+  Open the dashboard      tirith dashboard
+  Upgrade                 tirith update --dry-run
+  Remove shell hooks      tirith setup shell --remove --dry-run
+  Scripts / JSON          tirith status --json; tirith audit recent --limit 25 --action block --json"
+    };
+}
+
+/// Shown after the short help (bare `tirith` and `tirith -h`).
+const TASKS_HELP: &str = concat!(
+    tasks_help_text!(),
+    "\n\nRun `tirith --help` for all commands by category."
+);
+
+/// The task list alone, as it also appears in the long help.
+#[cfg(test)]
+const TASKS_LIST: &str = tasks_help_text!();
+
+/// The category block alone, for the `every_command_is_categorized` test.
+#[cfg(test)]
+const COMMANDS_BY_CATEGORY: &str = commands_by_category_text!();
+
+/// Shown after the long help (`tirith --help`): the task list, then every
+/// command by category (clap-derive cannot group subcommands itself).
+const LONG_AFTER_HELP: &str = concat!(tasks_help_text!(), "\n\n", commands_by_category_text!());
 
 #[derive(Parser)]
 #[command(
     name = "tirith",
     version,
     about = "URL security analysis for shell environments",
-    after_long_help = COMMANDS_BY_CATEGORY
+    after_help = TASKS_HELP,
+    after_long_help = LONG_AFTER_HELP
 )]
 pub struct Cli {
     /// Suppress low-value advisory output (clean "no issues" lines, shadow-binary
@@ -10451,7 +10496,7 @@ mod help_category_tests {
 
     use super::{
         Cli, Commands, PkgAction, TrustAction, TrustMutationScope, TrustQueryScope,
-        COMMANDS_BY_CATEGORY,
+        COMMANDS_BY_CATEGORY, LONG_AFTER_HELP, TASKS_HELP, TASKS_LIST,
     };
     use clap::{CommandFactory, Parser};
 
@@ -10587,6 +10632,89 @@ mod help_category_tests {
                     .command,
                 Commands::Status { json: true, .. }
             ));
+        });
+    }
+
+    /// Every `tirith ...` command named in the task list must parse against
+    /// the real command tree, so the list cannot silently name a command that
+    /// was renamed or removed. A line may hold several commands separated by
+    /// `|`, `;` or parentheses; placeholders such as GRANT_ID stay literal
+    /// positional values, and a trailing `--help` must reach clap's help.
+    #[test]
+    fn tasks_help_commands_parse() {
+        with_large_cli_stack(|| {
+            let task_lines: Vec<&str> = TASKS_HELP
+                .lines()
+                .filter(|line| line.starts_with("  "))
+                .collect();
+            assert!(
+                (5..=15).contains(&task_lines.len()),
+                "keep the task list short: {} task lines",
+                task_lines.len()
+            );
+            let mut parsed = 0;
+            for line in task_lines {
+                let mut on_line = 0;
+                for segment in line.split(['|', ';', '(', ')']) {
+                    let Some(start) = segment.find("tirith ") else {
+                        continue;
+                    };
+                    let argv: Vec<&str> = segment[start..].split_whitespace().collect();
+                    match Cli::try_parse_from(&argv) {
+                        Ok(_) => {}
+                        Err(error)
+                            if argv.last() == Some(&"--help")
+                                && error.kind() == clap::error::ErrorKind::DisplayHelp => {}
+                        Err(error) => panic!("task list command {argv:?} does not parse: {error}"),
+                    }
+                    on_line += 1;
+                }
+                assert!(on_line > 0, "task line names no command: {line:?}");
+                parsed += on_line;
+            }
+            // The onboarding and dashboard entry points stay in the list.
+            assert!(TASKS_HELP.contains("tirith onboard"));
+            assert!(TASKS_HELP.contains("tirith dashboard"));
+            assert!(parsed >= 12, "only {parsed} task commands parsed");
+        });
+    }
+
+    /// Bare `tirith`, `tirith -h` and `tirith --help` all show the task list;
+    /// the long help also keeps the categorized command overview.
+    #[test]
+    fn task_list_shows_on_bare_short_and_long_help() {
+        with_large_cli_stack(|| {
+            let bare = Cli::try_parse_from(["tirith"])
+                .err()
+                .expect("bare tirith must not parse");
+            assert_eq!(
+                bare.kind(),
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            assert!(bare.to_string().contains(TASKS_HELP));
+            assert!(!bare.to_string().contains("COMMANDS BY CATEGORY"));
+
+            let short = Cli::try_parse_from(["tirith", "-h"])
+                .err()
+                .expect("-h shows help");
+            assert_eq!(short.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(short.to_string().contains(TASKS_HELP));
+
+            let long = Cli::try_parse_from(["tirith", "--help"])
+                .err()
+                .expect("--help shows help");
+            assert_eq!(long.kind(), clap::error::ErrorKind::DisplayHelp);
+            let long = long.to_string();
+            assert!(long.contains(TASKS_LIST));
+            assert!(long.contains(COMMANDS_BY_CATEGORY));
+            // The long help already holds the categories, so it drops the
+            // short help's pointer to `--help`.
+            assert!(!long.contains("Run `tirith --help`"));
+            assert_eq!(
+                LONG_AFTER_HELP,
+                format!("{TASKS_LIST}\n\n{COMMANDS_BY_CATEGORY}")
+            );
+            assert!(TASKS_HELP.starts_with(TASKS_LIST));
         });
     }
 

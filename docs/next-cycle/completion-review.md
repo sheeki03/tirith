@@ -47,7 +47,7 @@ their original checkpoint and are superseded by later applicable results.
 | A18: documentation and release use | Six routes and seventeen command smoke checks mapped; consented beginner pilot and final package/channel acceptance remain open |
 | A20, A21, A23: project/npm inspection and comparison | Bounded no-execution readers, corpus/fuzz, exact identities and CLI/browser evidence mapped for G2 review |
 | A24: task modelling and optional team server | Conservative effects and 35 actual HTTPS/browser cases mapped; publication does not prove fleet adoption |
-| A26: npm installation and selected ARM backend | GNU/musl backend qualified on the recorded canonical PR archives. The narrow GNU Linux AArch64 npm contract passes exact installation, cancellation, post-completion unwinds, lifecycle suppression, implicit-build refusal and public CLI history/retry checks with an explicitly isolated key. Ordinary use still requires production-signed v2 data; general npm/Python execution stays disabled |
+| A26: npm installation and selected ARM backend | GNU/musl backend qualified on the recorded canonical PR archives. The narrow GNU Linux AArch64 npm contract passes exact installation, cancellation, post-completion unwinds, lifecycle suppression, implicit-build refusal and public CLI history/retry checks with an explicitly isolated key. Ordinary use still requires production-signed v2 data; general npm/Python execution stays disabled. (Historical: the local-leaf npm routes were retired before release.) |
 
 The six [everyday routes](user-journeys.md) have concrete observed components:
 recommended terminal setup, actual agent hook/reload behavior,

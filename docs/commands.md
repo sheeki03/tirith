@@ -1,7 +1,9 @@
 # Command reference
 
-`tirith --help` prints the available top-level commands
-grouped by category, and `tirith <command> --help` documents any one in detail.
+Running `tirith` with no command (or `tirith -h`) prints a short list of common
+tasks and the command for each. `tirith --help` prints that list followed by the
+available top-level commands grouped by category, and `tirith <command> --help`
+documents any one in detail.
 The groups below mirror that built-in grouping. The [README](../README.md)
 covers the everyday subset; this is the complete reference. The unreleased
 [cycle journeys](next-cycle/user-journeys.md) cover terminal and agent setup,

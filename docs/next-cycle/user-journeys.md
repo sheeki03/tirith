@@ -4,9 +4,47 @@ These commands describe the unreleased cycle candidate based on 0.4.2. Use
 `tirith version --provenance` to identify the binary being tested. Native
 certification and release acceptance are tracked in [verification](verification.md).
 
-On first use, run `tirith onboard`. Run `tirith --help` to see all commands by
-category. Scripts and redirected sessions use the same direct commands, such as
+Run `tirith` (or `tirith onboard` on first use) to see the common tasks.
+`tirith -h` shows the same short task list, and `tirith --help` adds every
+command by category. The list only prints commands; it never runs them. Scripts
+and redirected sessions use the same direct commands, such as
 `tirith status --json` or `tirith audit recent --limit 25 --json`.
+
+## Find the right command
+
+Every command below is an inspection or a preview unless it says otherwise;
+changes need their own explicit command.
+
+- **Check protection:** `tirith status`; add `--require-verified-blocking` to
+  succeed only on fresh evidence of blocking. `tirith doctor --verify-shell`
+  prints the harmless checks to run in the actual shell.
+- **Change profile:** `tirith policy profile NAME --dry-run` previews a
+  profile. To compare it against your own commands first, prepare a rollout
+  (`tirith policy rollout prepare --help`), inspect it with
+  `tirith policy rollout show OPERATION_ID`, then deliberately run
+  `tirith policy rollout activate OPERATION_ID`; `tirith policy rollout undo
+  OPERATION_ID` undoes it.
+- **See recent activity:** `tirith audit recent --action block` lists recent
+  blocks; `tirith why` explains the last one and `tirith explain --help`
+  documents a rule. `tirith audit feedback --help` records whether you intended
+  an operation; feedback is a review signal and never grants trust.
+- **Resolve an exception:** `tirith trust explain PATTERN` shows an entry's
+  scope and expiry; `tirith trust add --help` lists the narrow target, rule,
+  expiry and reason options. `tirith trust revoke GRANT_ID` revokes one grant
+  and reports any broader permissions that remain.
+- **Set up shells and agents:** `tirith setup recommended --help` covers the
+  shell, profile and agent choices. `--plan-only` saves a review;
+  `tirith policy operation OPERATION_ID` inspects it and `--action apply`
+  applies it deliberately. Open a fresh terminal when asked, then verify the
+  actual shell.
+- **Open the dashboard:** `tirith dashboard`.
+- **Upgrade:** `tirith update --dry-run` previews the update (network access);
+  `tirith update` starts the confirmed workflow. See [Upgrade](#upgrade).
+- **Support and retention:** `tirith doctor --bundle` saves a reviewed support
+  bundle privately and uploads nothing. `tirith audit rotate` saves a retention
+  plan; `tirith audit rotate --operation-id OPERATION_ID --apply` applies it.
+- **Remove shell hooks:** `tirith setup shell --remove --dry-run` previews
+  removal; `tirith setup shell --remove` applies it. See [Remove](#remove).
 
 ## Protect a terminal
 
