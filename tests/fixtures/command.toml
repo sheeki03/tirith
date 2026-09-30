@@ -2480,6 +2480,25 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["pipe_to_interpreter"]
 
+# A subshell inherits the enclosing export, so the nested python -c pipe is
+# not a plain data pipeline either.
+[[fixture]]
+name = "python_inspect_exported_before_subshell_dash_c_pipe"
+min_milestone = 1
+input = "export PYTHONINSPECT=1; (echo payload | python3 -c 'print(1)')"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# allexport exports a dynamically named assignment such as printf -v "$N".
+[[fixture]]
+name = "python_inspect_allexport_dynamic_assignment_dash_c_pipe"
+min_milestone = 1
+input = "set -a; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
 # curl's empty-hex host is a DNS name for curl 8.7.1 but 10.0.0.5 for resolvers
 # that parse it with libc inet_aton; the numeric reading is checked too.
 [[fixture]]

