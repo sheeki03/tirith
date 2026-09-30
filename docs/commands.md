@@ -54,7 +54,7 @@ qualification remains tracked separately.
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
 | `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
 | `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
-| `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
+| `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--agent claude-code` also configures the Claude Code Bash hook in the same undoable plan (macOS and Linux); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
 | `tirith setup shell` | Set up, repair (`--force`) or remove owned startup blocks (`--remove`) for an explicit `--shell`; activation and verified blocking are separate |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |

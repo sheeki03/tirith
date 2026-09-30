@@ -569,20 +569,29 @@ FAILURE_CASES = ("interpreter-unavailable", "checker-unavailable", "hook-crash",
 BOUNDARY_CASES = ("hook-disabled", "shortened-host-timeout", "unmatched-write")
 
 
-def combined_parts(command):
-    if not command.startswith("TIRITH_BIN="):
-        return None
-    parts = shlex.split(command)
-    if len(parts) != 8 or not parts[0].startswith("TIRITH_BIN=") or parts[2:4] != ["-I", "-S"] or parts[5:] != ["||", "exit", "2"]:
-        raise ValueError("combined launcher changed from the exact fixture contract")
-    binary = parts[0].split("=", 1)[1]
-    if not all(Path(value).is_absolute() for value in [binary, parts[1], parts[4]]) or not parts[4].endswith("/.claude/hooks/tirith-check.py"):
-        raise ValueError("combined launcher paths are not fixed absolute inputs")
-    return [binary, parts[1], parts[4]]
+USER_HOOK_SUFFIX = ' "$HOME/.claude/hooks/tirith-check.py"'
+FAIL_CLOSED = " || exit 2"
 
 
-def combined_command(parts):
-    return f"TIRITH_BIN={shlex.quote(parts[0])} {shlex.quote(parts[1])} -I -S {shlex.quote(parts[2])} || exit 2"
+def user_hook_interpreter(command):
+    """Parse the one personal hook command form.
+
+    `tirith setup claude-code --scope user` and `tirith setup recommended
+    --agent claude-code` write the same command: one quoted python3 launcher,
+    the fixed `$HOME` hook path and (on POSIX) the `|| exit 2` fail-closed
+    guard. Returns (interpreter, guarded)."""
+    for guard in (FAIL_CLOSED, ""):
+        end = USER_HOOK_SUFFIX + guard
+        if command.endswith(end):
+            parts = shlex.split(command[:-len(end)])
+            if len(parts) != 1 or not Path(parts[0]).is_absolute():
+                raise ValueError("generated interpreter is not one quoted absolute executable")
+            return parts[0], bool(guard)
+    raise ValueError("generated user hook launcher no longer matches the fixture contract")
+
+
+def user_hook_command(interpreter, guarded=True):
+    return shlex.quote(str(interpreter)) + USER_HOOK_SUFFIX + (FAIL_CLOSED if guarded else "")
 
 
 def apply_control(root, env, settings, hook, case):
@@ -594,32 +603,14 @@ def apply_control(root, env, settings, hook, case):
         control["configuration_mutated"] = True
     elif case == "interpreter-unavailable":
         entry = document["hooks"]["PreToolUse"][0]["hooks"][0]
-        command = entry["command"]
-        parts = combined_parts(command)
-        if parts is not None:
-            parts[1] = str(root / "missing-python")
-            entry["command"] = combined_command(parts)
-            control.update(configuration_mutated=True, generated_blocking_guard=True)
-        else:
-            suffix = ' "$HOME/.claude/hooks/tirith-check.py"'
-            guard = " || exit 2" if command.endswith(" || exit 2") else ""
-            expected_end = suffix + guard
-            if not command.endswith(expected_end):
-                raise ValueError("generated user hook launcher no longer matches the fixture contract")
-            interpreter = command[:-len(expected_end)]
-            if len(shlex.split(interpreter)) != 1:
-                raise ValueError("generated interpreter is not one quoted executable")
-            entry["command"] = shlex.quote(str(root / "missing-python")) + expected_end
-            control.update(configuration_mutated=True, generated_blocking_guard=bool(guard))
+        _, guarded = user_hook_interpreter(entry["command"])
+        entry["command"] = user_hook_command(root / "missing-python", guarded)
+        control.update(configuration_mutated=True, generated_blocking_guard=guarded)
     elif case == "checker-unavailable":
+        # The generated command carries no checker path; the hook resolves
+        # tirith from the host environment, so only the environment changes.
         env["TIRITH_BIN"] = str(root / "missing-tirith")
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-        entry = document["hooks"]["PreToolUse"][0]["hooks"][0]
-        parts = combined_parts(entry["command"])
-        if parts is not None:
-            parts[0] = env["TIRITH_BIN"]
-            entry["command"] = combined_command(parts)
-            control["configuration_mutated"] = True
     elif case == "hook-crash":
         hook.write_text("import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
         control["configuration_mutated"] = True
@@ -633,14 +624,6 @@ def apply_control(root, env, settings, hook, case):
         env["TIRITH_BIN"] = str(checker)
         control["controlled_checker_sha256"] = digest(checker)
         control["deadline_source"] = "unchanged_installed_hook"
-        entries = document["hooks"]["PreToolUse"]
-        if entries:
-            entry = entries[0]["hooks"][0]
-            parts = combined_parts(entry["command"])
-            if parts is not None:
-                parts[0] = str(checker)
-                entry["command"] = combined_command(parts)
-                control["configuration_mutated"] = True
     elif case == "shortened-host-timeout":
         hook.write_text("import time\ntime.sleep(8)\n")
         document["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = 1
@@ -651,8 +634,7 @@ def apply_control(root, env, settings, hook, case):
     return control
 
 
-def run_case(binary, host, case, setup_mode="legacy", python=None, claude_invocation=None, runtime=None, settings_loading="explicit", mcp_only=False):
-    runtime = runtime or python
+def run_case(binary, host, case, setup_mode="legacy", python=None, claude_invocation=None, settings_loading="explicit", mcp_only=False):
     with fixture_directory(prefix=f"tirith-native-claude-{case}-") as root:
         env = isolated_env(root, binary, python, claude_invocation)
         project = root / "project"
@@ -666,14 +648,11 @@ def run_case(binary, host, case, setup_mode="legacy", python=None, claude_invoca
         hook = settings.parent / "hooks/tirith-check.py"
         before = {"settings_sha256": digest(settings), "hook_sha256": digest(hook)}
         policy_hash_before = digest(root / "config/tirith/policy.yaml")
-        if setup_mode == "candidate-command":
-            proposed = json.loads(settings.read_text())
-            proposed["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = combined_command([str(binary), str(runtime), str(hook)])
-            settings.write_text(json.dumps(proposed))
-        installed_command = json.loads(settings.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        parts = combined_parts(installed_command)
-        if setup_mode in ("recommended", "candidate-command") and (parts is None or Path(parts[0]).resolve() != binary or Path(parts[1]).resolve() != runtime.resolve() or Path(parts[2]) != hook):
-            return {"case":case, "passed":False, "stage":"installed_command_identity"}
+        if setup_mode == "recommended":
+            try:
+                installed_recommended_identity(settings, python)
+            except (ValueError, KeyError, IndexError, TypeError):
+                return {"case":case, "passed":False, "stage":"installed_command_identity"}
         token = "TIRITH_AGENT_ALLOW_MARKER" if case == "allowed" else "TIRITH_AGENT_BLOCK_MARKER"
         marker = project / "execution-marker.txt"
         command = f"printf '%s\\n' {token} >> {shlex.quote(str(marker))}"
@@ -768,14 +747,13 @@ def configuration_evidence(settings):
             "hook_sha256": digest(settings.parent / "hooks/tirith-check.py")}
 
 
-def installed_recommended_identity(settings, binary, runtime):
+def installed_recommended_identity(settings, python):
+    """Recommended setup must install the explicit personal command (same bytes)."""
     document = json.loads(settings.read_text())
     command = document["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    parts = combined_parts(command)
-    hook = settings.parent / "hooks/tirith-check.py"
-    if (parts is None or Path(parts[0]).resolve() != binary
-            or Path(parts[1]).resolve() != runtime.resolve() or Path(parts[2]) != hook):
-        raise ValueError("recommended setup did not install the exact candidate/interpreter/hook tuple")
+    interpreter, guarded = user_hook_interpreter(command)
+    if python is None or Path(interpreter).resolve() != Path(python).resolve() or not guarded:
+        raise ValueError("recommended setup did not install the explicit personal hook command")
 
 
 def reload_observation(events, before, after, facts):
@@ -800,7 +778,7 @@ def begin_provider_turn(provider, tool_name):
         provider.expected_tool_id = None
 
 
-def run_reload(binary, host, python, claude_invocation, runtime):
+def run_reload(binary, host, python, claude_invocation):
     report = {"case": "retained-host-reload", "passed": False,
               "evidence_scope": "retained_host_visibility_and_fresh_host_blocking",
               "setup_mode": "recommended", "settings_loading": "default-user",
@@ -858,7 +836,7 @@ def run_reload(binary, host, python, claude_invocation, runtime):
                         or not steps or not all(step.get("state") in ("applied", "applied-with-recovery")
                                                 for step in steps)):
                     raise RuntimeError("recommended setup did not complete every requested step")
-                installed_recommended_identity(settings, binary, runtime)
+                installed_recommended_identity(settings, python)
                 report["setup_operation"] = {key: status.get(key) for key in ("operation_id", "kind", "state", "no_op")}
                 report["setup_step_states"] = [{"activation": step.get("activation"), "state": step.get("state")}
                                                 for step in steps]
@@ -938,7 +916,8 @@ def main():
                         help="hooks preserves the baseline/failure cases; boundary routes require recommended setup and default-user settings")
     parser.add_argument("--settings-loading", choices=["explicit", "default-user"], default="explicit")
     parser.add_argument("--case", choices=BASELINE_CASES + FAILURE_CASES, action="append", dest="cases")
-    parser.add_argument("--setup-mode", choices=["legacy", "recommended", "candidate-command"], default="legacy")
+    parser.add_argument("--setup-mode", choices=["legacy", "recommended"], default="legacy",
+                        help="legacy runs `setup claude-code --scope user`; recommended runs `setup recommended --agent claude-code`")
     parser.add_argument("--python", type=Path, help="exact installed python3 invocation to select on the isolated PATH")
     parser.add_argument("--claude-invocation", type=Path, help="installed claude PATH alias resolving to --claude")
     parser.add_argument("--failure-controls", action="store_true",
@@ -962,9 +941,8 @@ def main():
     if python.name != "python3" or not python.is_file():
         parser.error("--python must be an existing installed python3 invocation")
     claude_invocation = args.claude_invocation.absolute() if args.claude_invocation else None
-    if args.setup_mode == "recommended":
-        if claude_invocation is None or claude_invocation.name != "claude" or claude_invocation.resolve() != host:
-            parser.error("recommended setup requires --claude-invocation selecting the same native host")
+    if claude_invocation is not None and (claude_invocation.name != "claude" or claude_invocation.resolve() != host):
+        parser.error("--claude-invocation must be a claude PATH alias selecting the same host")
     with fixture_directory(prefix="tirith-native-claude-version-") as temp:
         root = Path(temp)
         env = isolated_env(root, binary, python, claude_invocation)
@@ -994,10 +972,10 @@ def main():
     for case in selected_cases:
         try:
             if args.route == "retained-host-reload":
-                result = run_reload(binary, host, python, claude_invocation, runtime)
+                result = run_reload(binary, host, python, claude_invocation)
             else:
                 result = run_case(binary, host, "hook-disabled" if args.route == "mcp-only" else case,
-                                  args.setup_mode, python, claude_invocation, runtime, args.settings_loading,
+                                  args.setup_mode, python, claude_invocation, args.settings_loading,
                                   mcp_only=args.route == "mcp-only")
             result["fixture_cleanup_completed"] = True
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:

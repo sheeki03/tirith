@@ -72,20 +72,27 @@ Restart the host and inspect its configured hook or MCP integration. Run a
 harmless check through that actual host and inspect its returned decision.
 Only an integration that can withhold the real operation may report observed
 blocking. A diagnostic child process or a warn-only host does not establish
-that capability. The current combined personal setup supports a narrow native
-Claude host and interpreter tuple on macOS ARM:
+that capability. Personal setup can also configure the Claude Code Bash hook in
+the same undoable plan:
 
 ```sh
 tirith setup recommended --scope user --shell zsh --agent claude-code --dry-run
 tirith setup recommended --scope user --shell zsh --agent claude-code
 ```
 
-Setup checks the actual host, interpreter and owned configuration before applying
-the reviewed operation. Start a fresh host after publication: an existing host
-can miss the hook on its next turn. The supported tuple and actual host evidence
-are recorded in [Claude qualification](claude-native-evidence.md). Other combined
-agent selections remain unavailable; use their explicit workflow with its
-documented limits. An MCP connection alone does not intercept terminal commands.
+This writes the same hook script and `~/.claude/settings.json` handler as
+`tirith setup claude-code`, so the two commands can be used interchangeably,
+and undoing the operation (`tirith policy operation OPERATION_UUID --action undo`)
+removes only the owned handler. It needs a trusted `python3`
+and works on macOS and Linux; on Windows it refuses, so run
+`tirith setup claude-code` there. Setup refuses, before changing anything, when
+Claude managed settings are present, `CLAUDE_CONFIG_DIR` points elsewhere,
+hooks are disabled, the existing hook script was edited by hand, or the owned
+handler was customized. Reload Claude Code after applying, then verify the hook:
+saved configuration does not prove a running agent is protected. Claude Code is
+the only agent that personal setup can include; use the explicit
+`tirith setup <tool>` workflow for other hosts. An MCP connection alone does not
+intercept terminal commands.
 
 ## Inspect a project
 

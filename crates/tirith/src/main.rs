@@ -1285,8 +1285,8 @@ Examples:
         #[arg(long, value_parser = ["comfortable", "balanced", "strict"])]
         profile: Option<String>,
 
-        /// Explicit agent selection for tool 'recommended'; uncertified hosts refuse before changes
-        #[arg(long = "agent", value_parser = ["claude-code", "codex", "cursor", "windsurf"])]
+        /// For tool 'recommended': also configure the Claude Code Bash hook in the same undoable plan
+        #[arg(long = "agent", value_parser = ["claude-code"])]
         agents: Vec<String>,
 
         /// Save a recommended setup review without applying it

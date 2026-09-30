@@ -402,19 +402,40 @@ where
 
 fn claude_hook_command(opts: &SetupOpts) -> Result<String, String> {
     let python = quoted_python_bin(opts)?;
-    let command = match opts.scope {
-        Scope::Project => {
-            format!(r#"{python} "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/tirith-check.py""#)
-        }
-        Scope::User => format!(r#"{python} "$HOME/.claude/hooks/tirith-check.py""#),
-    };
+    Ok(match opts.scope {
+        Scope::Project => claude_fail_closed(format!(
+            r#"{python} "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/tirith-check.py""#
+        )),
+        Scope::User => claude_user_hook_command(&python),
+    })
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn claude_hook_command_for_test(opts: &SetupOpts) -> Result<String, String> {
+    claude_hook_command(opts)
+}
+
+/// The personal Claude Bash hook command. Explicit `tirith setup claude-code`
+/// and the recommended setup plan both use this one helper, so the two paths
+/// write identical bytes. `quoted_python` is already shell-quoted for bash.
+pub(super) fn claude_user_hook_command(quoted_python: &str) -> String {
+    claude_fail_closed(claude_user_hook_command_without_wrapper(quoted_python))
+}
+
+/// The shipped v0.4.1/v0.4.2 personal command, before the fail-closed wrapper.
+/// Recommended setup upgrades exactly this form in place.
+pub(super) fn claude_user_hook_command_without_wrapper(quoted_python: &str) -> String {
+    format!(r#"{quoted_python} "$HOME/.claude/hooks/tirith-check.py""#)
+}
+
+fn claude_fail_closed(command: String) -> String {
     // Claude treats launch errors and other nonzero exits as nonblocking.
     // Keep the fixed POSIX shell alive so a missing interpreter or crashed
     // hook maps to its documented PreToolUse blocking exit code. Windows
     // launch semantics require native qualification before adding a wrapper.
     #[cfg(unix)]
     let command = format!("{command} || exit 2");
-    Ok(command)
+    command
 }
 
 pub fn setup_claude_code(opts: &SetupOpts) -> Result<(), String> {

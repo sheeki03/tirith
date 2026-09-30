@@ -30,3 +30,10 @@ additions separately. Inherited status never becomes verified blocking in the
 candidate. Use `tools/qualification/compatibility_capture.py` for a new capture;
 the report pins both binaries and the runner and process-helper sources before
 and after execution. It refuses a baseline other than 0.4.2.
+
+`claude-tirith-check.py` is the Claude hook script exactly as
+`tirith setup claude-code` wrote it in v0.4.0, v0.4.1 and v0.4.2 (SHA-256
+`78363cadc752fcf26fa20aa6cf34c215403d9905f555b33743cdb4fd032772af`, from
+`git show v0.4.2:crates/tirith/assets/hooks/tirith-check.py`). A setup unit test
+uses it to prove that recommended setup upgrades it in place and that undo
+restores it byte for byte.

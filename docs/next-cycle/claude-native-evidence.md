@@ -1,5 +1,14 @@
 # Native Claude Code qualification checkpoints
 
+> **Historical record.** These checkpoints were last exercised with Claude Code
+> 2.1.268 and 2.1.283 on macOS ARM. At the time, `tirith setup recommended
+> --agent claude-code` accepted only an exact list of Claude versions and one
+> Python runtime. That pin has been removed: the combined step now writes the
+> same hook script and `~/.claude/settings.json` handler as
+> `tirith setup claude-code` on any macOS or Linux host with a trusted `python3`,
+> and refuses on Windows. The observations below are not a supported-version
+> list, and the runs have not been repeated for the unpinned step.
+
 Observed on macOS 27 arm64 (September 12, 2026) with Claude Code 2.1.268 (`06a96d5423f83770f120859f1c58e60d7252cc4c122aa13043b7e7cd716bc76a`) and Tirith 0.4.2 checkpoint `b2ba2d23c8091eaac111cbaefa3fa877617d2716aca20be808a92db838f360de`. The real host invoked its real setup-installed PreToolUse hook. A deterministic loopback provider issued one inert tool call; no paid model credentials or real user/project configuration were used. This records exercised behavior, not a beginner pilot or qualification of other platforms.
 
 The later unguarded Tirith candidate `11fde156220c6e9bf2cbfd7e26af0b7929b3850bc6c3cdabbdbb37f38bc04172` repeated all three baseline cases successfully with the same native host: allowed once, blocked never, and hook-disabled execution once. That report also verifies unchanged configuration hashes before and after each native host run, and distinguishes the installed settings from the altered disabled configuration. Its harness SHA256 is `59dd8651a5de072597b44550fbda6d364776e3d7057aa395acd1c59701b44e00`. This candidate does not contain the launcher guard.
@@ -101,16 +110,16 @@ candidate they qualify.
 
 ## Claude Code 2.1.283 checkpoint, September 28, 2026
 
-The exact-version combined-setup list now retains 2.1.268 and adds 2.1.283. The
-native scope remains macOS ARM, personal configuration, and the selected Python
+At the time, the (since removed) exact-version combined-setup list retained
+2.1.268 and added 2.1.283. The native scope remains macOS ARM, personal configuration, and the selected Python
 3.9.6 invocation/runtime. This checkpoint used Claude executable SHA256
 `d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e`,
 fresh private HOME/configuration roots, and the scripted loopback provider.
 
 The earlier PR CI package
 `076d6d457a42c76bb6227e7aeadd1a0bdb369020de6c4e6c3b9fa0af308368dc`
-passed all nine explicit-setup controls but correctly refused combined setup for
-this then-unqualified version. That refusal is retained. A first development
+passed all nine explicit-setup controls but refused combined setup for this
+then-unlisted version, as the since-removed version pin required. A first development
 candidate passed the nine behavior controls but failed the outer cleanup
 postcheck: an asynchronous `hook-event` writer recreated a removed private
 fixture. Its behavior result is not accepted as complete qualification.

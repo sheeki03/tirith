@@ -23,7 +23,6 @@ pub(crate) mod recommended;
 mod fs_helpers_windows_path;
 
 mod claude_config;
-mod claude_service;
 mod merge;
 mod shell_profile;
 pub(crate) mod shell_service;
@@ -474,7 +473,7 @@ mod run_impl {
     /// Resolve a dependency that generated security configuration will execute
     /// later. The first PATH hit is authoritative: a project/temp shadow is an
     /// error, not a reason to skip ahead to a more convenient interpreter.
-    fn resolve_hook_dependency(
+    pub(super) fn resolve_hook_dependency(
         names: &[&str],
         label: &str,
         dry_run: bool,

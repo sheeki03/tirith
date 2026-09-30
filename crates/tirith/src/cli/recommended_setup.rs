@@ -21,9 +21,6 @@ pub fn run(
             .iter()
             .map(|agent| match agent.as_str() {
                 "claude-code" => Ok(SelectedAgent::ClaudeCode),
-                "codex" => Ok(SelectedAgent::Codex),
-                "cursor" => Ok(SelectedAgent::Cursor),
-                "windsurf" => Ok(SelectedAgent::Windsurf),
                 _ => Err("unknown selected agent".to_string()),
             })
             .collect::<Result<Vec<_>, _>>()?;

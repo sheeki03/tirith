@@ -710,31 +710,42 @@ def run(binary, output):
                     page.get_by_label("Personal setup shell", exact=True).select_option("bash")
                     selected_agent = page.get_by_label("Include Claude Code", exact=True)
                     assert not selected_agent.is_checked(), "agent configuration requires explicit selection"
-                    # This real-backend case deliberately has no Claude host.
-                    # It qualifies browser selection/refusal, not installed-agent
-                    # activation or successful native Claude configuration.
-                    assert shutil.which("claude", path=env["PATH"]) is None, "refusal fixture unexpectedly has a Claude host"
+                    # Combined Claude setup has no host-version or platform pin:
+                    # it needs only a trusted python3 (the fixture PATH has the
+                    # system one) and writes the explicit personal hook command.
+                    # Configuration only; this proves no running agent is protected.
+                    assert shutil.which("python3", path=env["PATH"]), "fixture needs a system python3"
                     before_agent_policy = policy.read_bytes()
-                    before_agent_profiles = {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()}
                     assert not (root / "home/.claude").exists()
                     selected_agent.check()
-                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as refused_plan:
+                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as agent_plan:
                         page.get_by_role("button", name="Review personal setup", exact=True).click()
-                    refused_response = refused_plan.value
-                    refused_request = refused_response.request.post_data_json
-                    assert refused_request["kind"] == "recommended_setup"
-                    assert refused_request["change"] == {"scope":"user", "shell":"bash", "profile":"balanced", "agents":["claude-code"]}
-                    assert str(uuid.UUID(refused_request["operation_id"])) == refused_request["operation_id"]
-                    assert refused_response.status == 409, "unsupported agent must refuse the whole plan"
-                    refused_body = refused_response.json()
-                    assert "agent executable" in refused_body["error"] or "qualified native macOS host evidence" in refused_body["error"], refused_body
-                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).wait_for()
-                    assert page.get_by_role("button", name="Apply reviewed change", exact=True).count() == 0
+                    agent_response = agent_plan.value
+                    agent_request = agent_response.request.post_data_json
+                    assert agent_request["kind"] == "recommended_setup"
+                    assert agent_request["change"] == {"scope":"user", "shell":"bash", "profile":"balanced", "agents":["claude-code"]}
+                    assert str(uuid.UUID(agent_request["operation_id"])) == agent_request["operation_id"]
+                    assert agent_response.status == 200, agent_response.text()
+                    agent_preview = agent_response.json()["preview"]["agent"]
+                    assert agent_preview["kind"] == "claude_setup_preview" and agent_preview["applied"] is False, agent_preview
+                    assert "host_version" not in agent_preview and agent_preview["verified_blocking"] is False
+                    assert not (root / "home/.claude").exists(), "review must not write Claude configuration"
+                    agent_started = time.monotonic()
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
+                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=120000)
+                    report["operation_observations"].append({"kind":"combined_personal_setup_with_claude_apply",
+                        "elapsed_seconds":time.monotonic() - agent_started, "fixture_deadline_seconds":120})
+                    claude_settings = json.loads((root / "home/.claude/settings.json").read_text())
+                    claude_command = claude_settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                    assert claude_command.endswith(' "$HOME/.claude/hooks/tirith-check.py" || exit 2'), claude_command
+                    assert (root / "home/.claude/hooks/tirith-check.py").is_file()
+                    page.get_by_role("button", name="Undo owned change", exact=True).click()
+                    page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=120000)
+                    assert json.loads((root / "home/.claude/settings.json").read_text()) == {}
                     assert policy.read_bytes() == before_agent_policy
-                    assert {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()} == before_agent_profiles
-                    assert not (root / "home/.claude").exists()
-                    report["checks"].append("explicit_claude_selection_reaches_real_backend_and_unavailable_host_preserves_all_configuration")
-                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).click()
+                    assert all("BEGIN tirith-hook" not in path.read_text() for path in (root / "home").glob(".bash*"))
+                    report["checks"].append("explicit_claude_selection_plans_applies_and_undoes_the_personal_claude_hook")
+                    page.get_by_role("button", name="Close change details").click()
                     selected_agent.uncheck()
                     with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as shell_only_plan:
                         page.get_by_role("button", name="Review personal setup", exact=True).click()

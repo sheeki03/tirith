@@ -1,5 +1,19 @@
 # Implementation verification
 
+## September 30: combined Claude setup is no longer version-pinned
+
+`tirith setup recommended --agent claude-code` no longer checks the installed
+Claude Code or Python version, the platform or the Mach-O format. On macOS and
+Linux it writes the same hook script and settings handler as
+`tirith setup claude-code` and refuses on Windows. Unit tests assert identical
+bytes and modes for both paths, an in-place upgrade of the shipped v0.4.0-v0.4.2
+hook script and command, exact undo, and the managed-settings,
+`CLAUDE_CONFIG_DIR`, disabled-hooks, edited-script and customized-handler
+refusals. Entries below that mention exact Claude tuples, qualified versions or
+an exact-version refusal describe the removed pin. They are historical, and no
+native host run has been repeated for the unpinned step. See the
+[historical Claude record](claude-native-evidence.md).
+
 ## September 29: integrated product checks pass
 
 All five workflows pass on `e2c94439786d2d2abf87bd50a17b227f8e632c12`, each

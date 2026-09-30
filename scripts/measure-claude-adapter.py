@@ -506,7 +506,7 @@ def run(args):
                             'actual recommended setup did not finish all steps')
                     batch['setup'] = setup
                     settings = root / 'home/.claude/settings.json'
-                    h.installed_recommended_identity(settings, args.tirith, args.python_runtime)
+                    h.installed_recommended_identity(settings, args.python)
                     with contextlib.ExitStack() as config_stack:
                         configs = [config_stack.enter_context(Input(path, cap=MIB)) for path in
                                    (settings, settings.parent / 'hooks/tirith-check.py', root / 'config/tirith/policy.yaml')]
@@ -515,7 +515,7 @@ def run(args):
                             check_inputs()
                             for item in configs:
                                 item.revalidate(full=True)
-                            h.installed_recommended_identity(settings, args.tirith, args.python_runtime)
+                            h.installed_recommended_identity(settings, args.python)
                         def preflights(pair):
                             for action, command in COMMANDS.items():
                                 raw, _ = runner.execute(f'preflight-{index + 1}-{pair}-{action}',

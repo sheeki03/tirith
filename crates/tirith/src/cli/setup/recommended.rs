@@ -11,13 +11,12 @@ use tirith_core::protection_profiles::ProtectionProfile;
 pub(crate) enum SetupScope {
     User,
 }
+/// Agent integrations recommended setup can include in the same undoable
+/// plan. Other hosts keep their explicit `tirith setup <tool>` workflow.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SelectedAgent {
     ClaudeCode,
-    Codex,
-    Cursor,
-    Windsurf,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,9 +42,6 @@ pub(crate) fn prepare(
     if !uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id) {
         return Err("recommended setup ID must be a canonical UUID".into());
     }
-    if request.agents.len() > 4 {
-        return Err("select at most four agent integrations".into());
-    }
     let cwd = cwd.map(str::to_owned).or_else(|| {
         std::env::current_dir()
             .ok()
@@ -59,13 +55,6 @@ pub(crate) fn prepare(
         {
             return result(status, None, cwd.as_deref());
         }
-    }
-    if request
-        .agents
-        .iter()
-        .any(|agent| *agent != SelectedAgent::ClaudeCode)
-    {
-        return Err("selected agent hosts lack current combined-setup certification; preserve their explicit setup workflow".into());
     }
     if request.agents.len() > 1 {
         return Err(
@@ -104,7 +93,7 @@ pub(crate) fn prepare(
     let agent = if request.agents.is_empty() {
         None
     } else {
-        Some(super::claude_service::PreparedClaude::capture(
+        Some(super::claude_config::PreparedClaude::capture(
             cwd.as_deref(),
         )?)
     };
@@ -132,18 +121,15 @@ pub(crate) fn prepare(
             return Err("recommended setup targets overlap".into());
         }
     }
-    let agent_precondition = if let Some(agent) = &agent {
-        let (agent_changes, agent_expected, precondition) = agent.setup_parts()?;
+    if let Some(agent) = &agent {
+        let (agent_changes, agent_expected) = agent.setup_parts()?;
         changes.extend(agent_changes);
         for (path, bytes) in agent_expected {
             if expected.insert(path, bytes).is_some() {
                 return Err("recommended setup targets overlap".into());
             }
         }
-        Some(precondition)
-    } else {
-        None
-    };
+    }
     let preview = serde_json::json!({"schema_version":1,"kind":"recommended_setup_preview",
         "scope":"user","profile":profile.projection(),"shell":shell.projection(),
         "selected_agents":request.agents,"agent":agent.as_ref().map(|agent| agent.projection()),"step_count":changes.len(),"applied":false,
@@ -160,18 +146,16 @@ pub(crate) fn prepare(
             &intent,
         )?
     } else {
-        service.plan_integrations_with_intent(
+        service.plan_shell_change_with_intent(
             id,
+            OperationKind::RecommendedSetup,
             super::change_plan::PlanChanges {
                 requests: changes,
                 preimages: &expected,
             },
             &profile.snapshot,
             &intent,
-            super::change_plan::IntegrationPreconditions {
-                shell: Some(precondition),
-                agent: agent_precondition,
-            },
+            precondition,
         )?
     };
     result(status, Some(preview), cwd.as_deref())
@@ -194,10 +178,13 @@ fn result(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::change_plan::JobState;
     use super::*;
+    #[cfg(unix)]
     use crate::cli::test_harness::with_fake_env;
 
+    #[cfg(unix)]
     fn request() -> RecommendedSetup {
         RecommendedSetup {
             scope: SetupScope::User,
@@ -213,6 +200,10 @@ mod tests {
             serde_json::json!({"scope":"user","path":"/tmp/unowned"}),
             serde_json::json!({"scope":"user","command":"echo changed"}),
             serde_json::json!({"scope":"user","agents":["unknown-agent"]}),
+            // Hosts without a combined step keep their explicit workflow.
+            serde_json::json!({"scope":"user","agents":["codex"]}),
+            serde_json::json!({"scope":"user","agents":["cursor"]}),
+            serde_json::json!({"scope":"user","agents":["windsurf"]}),
         ] {
             assert!(serde_json::from_value::<RecommendedSetup>(value).is_err());
         }
@@ -254,20 +245,57 @@ mod tests {
                 .contains("tirith-hook v1"));
         });
     }
+    #[cfg(unix)]
     #[test]
-    fn unsupported_selected_agent_refuses_before_any_component_is_planned() {
+    fn recommended_claude_step_plans_applies_and_undoes_with_the_explicit_command() {
         with_fake_env(true, |home, _| {
+            // Uses the real trusted python3 resolver, as the CLI does.
+            let Some(python) =
+                super::super::run_impl::resolve_hook_dependency(&["python3"], "Python", true)
+                    .ok()
+                    .flatten()
+            else {
+                eprintln!("skipping: no trusted python3 on PATH");
+                return;
+            };
             let mut request = request();
-            request.agents.push(SelectedAgent::Codex);
+            request.agents.push(SelectedAgent::ClaudeCode);
             let id = uuid::Uuid::new_v4().to_string();
-            assert!(prepare(&id, request, None, false)
-                .unwrap_err()
-                .contains("certification"));
-            assert!(!home.join(".zshrc").exists());
-            assert!(MutationService::current()
-                .unwrap()
-                .read_status(&id)
-                .is_err());
+            let preview = prepare(&id, request.clone(), None, true).unwrap();
+            assert_eq!(preview["agent"]["kind"], "claude_setup_preview");
+            assert!(preview["agent"].get("host_version").is_none());
+            assert!(!home.join(".claude").exists());
+            prepare(&id, request, None, false).unwrap();
+            let cwd = std::env::current_dir().unwrap().display().to_string();
+            let snapshot = EffectivePolicySnapshot::resolve(Some(&cwd), ResolutionMode::Runtime);
+            let service = MutationService::current().unwrap();
+            assert_eq!(
+                service.apply(&id, &snapshot).unwrap().state,
+                JobState::Completed
+            );
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(home.join(".claude/settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+                super::super::tools::claude_user_hook_command(&super::super::shell_quote(
+                    &python, "bash"
+                ))
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join(".claude/hooks/tirith-check.py")).unwrap(),
+                crate::assets::TIRITH_CHECK_PY
+            );
+            service
+                .undo(
+                    &id,
+                    &EffectivePolicySnapshot::resolve(Some(&cwd), ResolutionMode::Runtime),
+                )
+                .unwrap();
+            let undone: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(home.join(".claude/settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(undone, serde_json::json!({}));
         });
     }
 

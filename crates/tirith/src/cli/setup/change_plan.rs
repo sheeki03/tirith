@@ -169,6 +169,9 @@ pub(crate) enum Edit {
     AuditRotation(tirith_core::audit::retention::RotationPlan),
     AuditSegment(super::audit_segments::SegmentPlan),
     WholeFile(String),
+    /// A whole file published with the exact executable mode `tirith setup`
+    /// uses for hook scripts (0755 on Unix).
+    ExecutableFile(String),
     ClaudeHandler(super::claude_config::OwnedClaudeHandler),
     PrivateFile(String),
     #[cfg(test)]
@@ -195,6 +198,8 @@ enum OwnedEdit {
     WholeFile {
         before: Option<String>,
         after: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        executable: bool,
     },
     Field {
         yaml: bool,
@@ -353,8 +358,6 @@ struct Journal {
     resolution_cwd: Option<String>,
     undo_external_authorization: Option<PrivatePolicyReplayGuard>,
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    agent_precondition: Option<super::claude_service::AgentPrecondition>,
     created_at: u64,
     updated_at: u64,
     state: JobState,
@@ -514,11 +517,6 @@ fn same_request(record: &Journal, request_digest: &str, caller_intent: Option<&s
     }
 }
 
-pub(crate) struct IntegrationPreconditions {
-    pub shell: Option<super::shell_service::ShellPrecondition>,
-    pub agent: Option<super::claude_service::AgentPrecondition>,
-}
-
 /// Exact caller preimages travel with their prepared owned transformations.
 pub(crate) struct PlanChanges<'a> {
     pub requests: Vec<RequestedChange>,
@@ -529,7 +527,6 @@ pub(crate) struct PlanChanges<'a> {
 struct PlanMetadata {
     caller_intent_digest: Option<String>,
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
-    agent_precondition: Option<super::claude_service::AgentPrecondition>,
     no_op: bool,
     impact_review: Option<ImpactReport>,
 }
@@ -738,7 +735,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: None,
                 shell_precondition: None,
-                agent_precondition: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -801,7 +797,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
-                agent_precondition: None,
                 no_op: false,
                 impact_review: None,
             },
@@ -838,33 +833,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: Some(precondition),
-                agent_precondition: None,
-                no_op: false,
-                impact_review: None,
-            },
-        )
-    }
-
-    pub(crate) fn plan_integrations_with_intent(
-        &self,
-        operation_id: &str,
-        changes: PlanChanges<'_>,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-        preconditions: IntegrationPreconditions,
-    ) -> Result<OperationStatus, String> {
-        self.plan_inner(
-            operation_id,
-            OperationKind::RecommendedSetup,
-            changes.requests,
-            policy,
-            changes.preimages,
-            PlanMetadata {
-                caller_intent_digest: Some(
-                    self.intent_digest(OperationKind::RecommendedSetup, intent)?,
-                ),
-                shell_precondition: preconditions.shell,
-                agent_precondition: preconditions.agent,
                 no_op: false,
                 impact_review: None,
             },
@@ -897,7 +865,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
-                agent_precondition: None,
                 no_op: true,
                 impact_review: None,
             },
@@ -928,7 +895,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
-                agent_precondition: None,
                 no_op: false,
                 impact_review: Some(review),
             },
@@ -952,7 +918,6 @@ impl MutationService {
             PlanMetadata {
                 caller_intent_digest: Some(self.intent_digest(kind, intent)?),
                 shell_precondition: None,
-                agent_precondition: None,
                 no_op: true,
                 impact_review: Some(review),
             },
@@ -984,7 +949,6 @@ impl MutationService {
         let PlanMetadata {
             caller_intent_digest,
             shell_precondition,
-            agent_precondition,
             no_op,
             impact_review,
         } = metadata;
@@ -1016,10 +980,7 @@ impl MutationService {
         } else {
             original_request_digest
         };
-        let request_digest = bind_agent_digest(
-            bind_review_digest(request_digest, &impact_review)?,
-            &agent_precondition,
-        )?;
+        let request_digest = bind_review_digest(request_digest, &impact_review)?;
         if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
             let record: Journal = serde_json::from_str(&existing)
                 .map_err(|_| "existing operation journal is malformed")?;
@@ -1037,11 +998,6 @@ impl MutationService {
         validate_review(&impact_review, operation_id, kind, &policy.identity)?;
         policy.revalidate_for_mutation().map_err(refresh)?;
         let shell_inputs = shell_precondition
-            .as_ref()
-            .map(|value| value.retain())
-            .transpose()
-            .map_err(refresh)?;
-        let agent_inputs = agent_precondition
             .as_ref()
             .map(|value| value.retain())
             .transpose()
@@ -1136,17 +1092,38 @@ impl MutationService {
                 Edit::AuditRotation(_) | Edit::AuditSegment(_) => {
                     unreachable!("handled by retained audit backend")
                 }
-                Edit::WholeFile(after) => OwnedEdit::WholeFile { before, after },
+                Edit::WholeFile(after) => OwnedEdit::WholeFile {
+                    before,
+                    after,
+                    executable: false,
+                },
+                Edit::ExecutableFile(after) => OwnedEdit::WholeFile {
+                    before,
+                    after,
+                    executable: true,
+                },
                 Edit::ClaudeHandler(handler) => {
-                    if kind != OperationKind::RecommendedSetup || agent_precondition.is_none() {
+                    if kind != OperationKind::RecommendedSetup {
+                        return Err("Claude handler edits require a recommended setup plan".into());
+                    }
+                    // The fixed personal destination only: the current
+                    // operator's home and its `.claude/settings.json`.
+                    let operator = crate::cli::shell_target::resolve_for_shell("unknown")?;
+                    crate::cli::shell_target::require_personal_writer(&operator)?;
+                    if request.scope_root != operator.operator_home
+                        || request.target
+                            != super::claude_config::personal_settings_path(&operator.operator_home)
+                    {
                         return Err(
-                            "Claude handler edits require typed agent setup preconditions".into(),
+                            "Claude handler target is not the fixed personal settings destination"
+                                .into(),
                         );
                     }
-                    agent_precondition
-                        .as_ref()
-                        .expect("required above")
-                        .validate_handler_target(&request.target, &request.scope_root)?;
+                    super::claude_config::personal_activation_allowed(
+                        &request.scope_root,
+                        before.as_deref(),
+                    )
+                    .map_err(refresh)?;
                     if !handler.matches(before.as_deref(), false)? {
                         return Err(refresh("Claude handler preimage changed before planning"));
                     }
@@ -1237,10 +1214,7 @@ impl MutationService {
         } else {
             original_payload_digest
         };
-        let payload_digest = bind_agent_digest(
-            bind_review_digest(payload_digest, &impact_review)?,
-            &agent_precondition,
-        )?;
+        let payload_digest = bind_review_digest(payload_digest, &impact_review)?;
         let record = Journal {
             schema_version: SCHEMA,
             operation_id: operation_id.into(),
@@ -1260,7 +1234,6 @@ impl MutationService {
             resolution_cwd: policy.resolution_cwd().map(str::to_owned),
             undo_external_authorization: None,
             shell_precondition,
-            agent_precondition,
             created_at: now(),
             updated_at: now(),
             state: if no_op {
@@ -1327,8 +1300,7 @@ impl MutationService {
                 policy.revalidate_for_mutation().map_err(refresh)?;
                 validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs.as_ref())
                     .map_err(refresh)?;
-                validate_agent_lease(record.agent_precondition.as_ref(), agent_inputs.as_ref())
-                    .map_err(refresh)?;
+                validate_claude_activation(&record).map_err(refresh)?;
                 for step in &record.steps {
                     preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
                     step.scope_identity.validate()?;
@@ -1452,15 +1424,6 @@ impl MutationService {
             Ok(inputs) => inputs,
             Err(error) => return self.refuse_apply(operation_id, refresh(error)),
         };
-        let agent_inputs = match record
-            .agent_precondition
-            .as_ref()
-            .map(|value| value.retain())
-            .transpose()
-        {
-            Ok(inputs) => inputs,
-            Err(error) => return self.refuse_apply(operation_id, refresh(error)),
-        };
         if record.undo_external_authorization.is_some() {
             return Err(refresh(
                 "undo has begun; finish recovery or create a new plan",
@@ -1472,12 +1435,7 @@ impl MutationService {
             .any(|step| step.state != StepState::Pending)
             .then(|| policy.refresh_runtime());
         let initial_policy = refreshed.as_ref().unwrap_or(policy);
-        if let Err(error) = self.authorize(
-            &record,
-            initial_policy,
-            shell_inputs.as_ref(),
-            agent_inputs.as_ref(),
-        ) {
+        if let Err(error) = self.authorize(&record, initial_policy, shell_inputs.as_ref()) {
             return self.refuse_apply(operation_id, error);
         }
         let record = self.read(operation_id)?;
@@ -1493,12 +1451,7 @@ impl MutationService {
                 record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
                 for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } Ok(()) })?.public());
         }
-        if let Err(error) = self.authorize(
-            &record,
-            initial_policy,
-            shell_inputs.as_ref(),
-            agent_inputs.as_ref(),
-        ) {
+        if let Err(error) = self.authorize(&record, initial_policy, shell_inputs.as_ref()) {
             return self.refuse_apply(operation_id, error);
         }
         self.update(operation_id, |record| {
@@ -1553,12 +1506,7 @@ impl MutationService {
                 .any(|step| step.state != StepState::Pending)
                 .then(|| policy.refresh_runtime());
             let step_policy = refreshed_step.as_ref().unwrap_or(initial_policy);
-            if let Err(error) = self.authorize(
-                &live,
-                step_policy,
-                shell_inputs.as_ref(),
-                agent_inputs.as_ref(),
-            ) {
+            if let Err(error) = self.authorize(&live, step_policy, shell_inputs.as_ref()) {
                 return self.refuse_apply(operation_id, error);
             }
             self.update(operation_id, |record| {
@@ -1590,7 +1538,6 @@ impl MutationService {
                             step_policy,
                             Some(index),
                             shell_inputs.as_ref(),
-                            agent_inputs.as_ref(),
                         )
                     },
                 )
@@ -1606,13 +1553,7 @@ impl MutationService {
                     if started.elapsed() >= JOB_TIMEOUT {
                         return Err("operation deadline reached before publication".into());
                     }
-                    self.authorize_except(
-                        &current,
-                        step_policy,
-                        Some(index),
-                        shell_inputs.as_ref(),
-                        agent_inputs.as_ref(),
-                    )
+                    self.authorize_except(&current, step_policy, Some(index), shell_inputs.as_ref())
                 })
             } else {
                 super::fs_transaction::transactional_update_authorized(
@@ -1642,12 +1583,7 @@ impl MutationService {
                         if started.elapsed() >= JOB_TIMEOUT {
                             return Err("operation deadline reached before publication".into());
                         }
-                        self.authorize(
-                            &current,
-                            step_policy,
-                            shell_inputs.as_ref(),
-                            agent_inputs.as_ref(),
-                        )
+                        self.authorize(&current, step_policy, shell_inputs.as_ref())
                     },
                     |bytes| {
                         authorize_publication(
@@ -1723,9 +1659,8 @@ impl MutationService {
         record: &Journal,
         policy: &EffectivePolicySnapshot,
         shell_inputs: Option<&super::shell_service::RetainedShellInputs>,
-        agent_inputs: Option<&super::claude_service::RetainedAgentInputs>,
     ) -> Result<(), String> {
-        self.authorize_except(record, policy, None, shell_inputs, agent_inputs)
+        self.authorize_except(record, policy, None, shell_inputs)
     }
 
     fn authorize_except(
@@ -1734,10 +1669,9 @@ impl MutationService {
         policy: &EffectivePolicySnapshot,
         except: Option<usize>,
         shell_inputs: Option<&super::shell_service::RetainedShellInputs>,
-        agent_inputs: Option<&super::claude_service::RetainedAgentInputs>,
     ) -> Result<(), String> {
         validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs).map_err(refresh)?;
-        validate_agent_lease(record.agent_precondition.as_ref(), agent_inputs).map_err(refresh)?;
+        validate_claude_activation(record).map_err(refresh)?;
         if let Some(review) = &record.impact_review {
             let age = chrono::Utc::now()
                 .signed_duration_since(review.evaluated_at)
@@ -2008,9 +1942,6 @@ impl MutationService {
         if let Some(precondition) = &record.shell_precondition {
             precondition.validate_undo().map_err(refresh)?;
         }
-        if let Some(precondition) = &record.agent_precondition {
-            precondition.validate_undo().map_err(refresh)?;
-        }
         initial_policy.revalidate_for_mutation().map_err(refresh)?;
         if record.resolution_cwd.as_deref() != initial_policy.resolution_cwd() {
             return Err(refresh("policy resolution scope changed"));
@@ -2230,9 +2161,6 @@ impl MutationService {
         except: Option<usize>,
     ) -> Result<(), String> {
         if let Some(precondition) = &record.shell_precondition {
-            precondition.validate_undo().map_err(refresh)?;
-        }
-        if let Some(precondition) = &record.agent_precondition {
             precondition.validate_undo().map_err(refresh)?;
         }
         if matches!(
@@ -2617,13 +2545,27 @@ fn read_step(step: &Step) -> Result<Option<String>, String> {
 }
 
 fn step_update(step: &Step, text: String) -> FileUpdate {
-    let update = FileUpdate::write_text(text, 0o600).with_backup(true);
+    // Claude settings and hook scripts use the same modes as `tirith setup
+    // claude-code` (0644 for new settings, exactly 0755 for the hook script).
+    let mode = match &step.edit {
+        OwnedEdit::ClaudeHandler(_) => 0o644,
+        OwnedEdit::WholeFile {
+            executable: true, ..
+        } => 0o755,
+        _ => 0o600,
+    };
+    let update = FileUpdate::write_text(text, mode).with_backup(true);
     #[cfg(unix)]
-    if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
+    if matches!(
+        &step.edit,
+        OwnedEdit::PrivateFile { .. }
+            | OwnedEdit::WholeFile {
+                executable: true,
+                ..
+            }
+    ) {
         return update.with_exact_mode();
     }
-    #[cfg(not(unix))]
-    let _ = step;
     update
 }
 
@@ -2655,17 +2597,6 @@ fn audit_state_matches(
     }
 }
 
-fn bind_agent_digest(
-    original: String,
-    precondition: &Option<super::claude_service::AgentPrecondition>,
-) -> Result<String, String> {
-    if let Some(precondition) = precondition {
-        digest(&("tirith-agent-activation-v1", original, precondition))
-    } else {
-        Ok(original)
-    }
-}
-
 fn validate_shell_lease(
     expected: Option<&super::shell_service::ShellPrecondition>,
     held: Option<&super::shell_service::RetainedShellInputs>,
@@ -2677,15 +2608,21 @@ fn validate_shell_lease(
     }
 }
 
-fn validate_agent_lease(
-    expected: Option<&super::claude_service::AgentPrecondition>,
-    held: Option<&super::claude_service::RetainedAgentInputs>,
-) -> Result<(), String> {
-    match (expected, held) {
-        (None, None) => Ok(()),
-        (Some(expected), Some(held)) => held.revalidate_for(expected),
-        _ => Err("agent input lease is missing or does not match the operation".into()),
+/// Apply-time Claude host boundary: repeated by every apply authorization so a
+/// managed policy, configuration-directory override or manual hook disable
+/// that appears after planning refuses before any step (including the inactive
+/// hook script) is staged. Undo never runs this; compensation stays possible.
+fn validate_claude_activation(record: &Journal) -> Result<(), String> {
+    for step in &record.steps {
+        if matches!(step.edit, OwnedEdit::ClaudeHandler(_)) {
+            let current = fs_helpers::read_to_string_scoped(&step.target, &step.scope_root)?;
+            super::claude_config::personal_activation_allowed(
+                &step.scope_root,
+                current.as_deref(),
+            )?;
+        }
     }
+    Ok(())
 }
 
 fn owned_matches(edit: &OwnedEdit, current: Option<&str>, after: bool) -> Result<bool, String> {
@@ -2704,6 +2641,7 @@ fn owned_matches(edit: &OwnedEdit, current: Option<&str>, after: bool) -> Result
         OwnedEdit::WholeFile {
             before,
             after: output,
+            ..
         }
         | OwnedEdit::PrivateFile {
             before,
@@ -2784,7 +2722,7 @@ fn transform(
             }
             output
         }
-        OwnedEdit::WholeFile { before, after } | OwnedEdit::PrivateFile { before, after } => {
+        OwnedEdit::WholeFile { before, after, .. } | OwnedEdit::PrivateFile { before, after } => {
             if undo {
                 before.clone().unwrap_or_default()
             } else {
