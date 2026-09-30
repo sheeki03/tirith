@@ -859,12 +859,28 @@ fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
     }
 }
 
-/// Run command-shape rules.
+/// Run command-shape rules for a command whose environment has no inherited
+/// `PYTHONINSPECT` (see [`check_with_inherited_python_inspect`]).
 pub fn check(
     input: &str,
     shell: ShellType,
     cwd: Option<&str>,
     scan_context: ScanContext,
+) -> Vec<Finding> {
+    check_with_inherited_python_inspect(input, shell, cwd, scan_context, false)
+}
+
+/// Run command-shape rules. `inherited_python_inspect` says whether the
+/// environment the command will run in already has a non-empty
+/// `PYTHONINSPECT`. The caller decides it (a daemon analyzes for other
+/// processes, so its own environment is irrelevant); rules never read the
+/// process environment themselves.
+pub fn check_with_inherited_python_inspect(
+    input: &str,
+    shell: ShellType,
+    cwd: Option<&str>,
+    scan_context: ScanContext,
+    inherited_python_inspect: bool,
 ) -> Vec<Finding> {
     check_depth(
         input,
@@ -873,7 +889,10 @@ pub fn check(
         scan_context,
         0,
         true,
-        PythonInspectContext::default(),
+        PythonInspectContext {
+            may_enable: inherited_python_inspect,
+            allexport: false,
+        },
     )
 }
 
@@ -3289,9 +3308,8 @@ impl PythonInspectContext {
     /// This context plus whatever `segments` may do.
     fn extend(self, segments: &[tokenize::Segment], shell: ShellType) -> Self {
         let allexport = self.allexport || segments_may_enable_allexport(segments, shell);
-        let may_enable = self.may_enable
-            || std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
-            || segments_may_enable_python_inspect(segments, shell, 0, allexport);
+        let may_enable =
+            self.may_enable || segments_may_enable_python_inspect(segments, shell, 0, allexport);
         Self {
             may_enable,
             allexport,
@@ -3346,12 +3364,14 @@ fn segments_may_enable_allexport(segments: &[tokenize::Segment], shell: ShellTyp
 /// exemption must not apply.
 ///
 /// Conservative by design: a literal `PYTHONINSPECT` anywhere, a dynamic
-/// command name, `eval`/`source`/`.`/`alias`/`enable`, an exporting or
+/// command name, `eval`/`trap` with a dynamic word (a literal body is checked
+/// recursively), `source`/`.`/`alias`/`enable` at a command start, an exporting or
 /// name-assigning builtin with any non-literal word, or any non-literal word
 /// while allexport may be on all refuse the exemption. Pipeline stages run in
 /// subshells, but the check does not rely on that. Shell state from before
 /// this input was typed (functions, aliases, an already-on allexport) cannot
-/// be seen here, apart from an inherited PYTHONINSPECT (checked by the caller).
+/// be seen here, apart from an inherited PYTHONINSPECT (the caller's
+/// `inherited_python_inspect`, carried in [`PythonInspectContext`]).
 fn segments_may_enable_python_inspect(
     segments: &[tokenize::Segment],
     shell: ShellType,
@@ -3369,6 +3389,13 @@ fn segment_may_enable_python_inspect(
     depth: usize,
     allexport: bool,
 ) -> bool {
+    // A direct `python -c` with an inert literal body (the issue #136 proof)
+    // and a literal `unset` run nothing that could change the shell's
+    // environment, even when they mention PYTHONINSPECT (`unset PYTHONINSPECT`
+    // turns inspect mode off).
+    if is_python_dash_c_data_pipeline(seg, shell) || segment_is_literal_unset(seg, shell) {
+        return false;
+    }
     if seg.raw.contains("PYTHONINSPECT") {
         return true;
     }
@@ -3391,7 +3418,11 @@ fn segment_may_enable_python_inspect(
     if allexport && has_dynamic_word {
         return true;
     }
-    let mut assigning = false;
+    // `strict`: any non-literal word may name the assigned variable.
+    // `exporting_at`: only a non-literal NAME may (`export PATH="$HOME/bin"`
+    // exports PATH whatever its value).
+    let mut strict = false;
+    let mut exporting_at = None;
     let mut eval_at = None;
     for (index, word) in words.iter().enumerate() {
         if !command_word_is_statically_bound(word, shell) {
@@ -3401,35 +3432,57 @@ fn segment_may_enable_python_inspect(
         if normalized.contains("PYTHONINSPECT") {
             return true;
         }
+        // A word ending in `)` before this one is a case pattern (`*)`), a
+        // function header (`f()`, `f ()`), or the end of a group; each starts a
+        // new command. `{` was trimmed above, so `f () { . x; }` lands here too.
         let at_command_start = index == 0 || {
             let previous = normalize_shell_token(words[index - 1], shell);
             COMMAND_START_WORDS.contains(&previous.as_str())
                 || ENV_EXPORTING_BUILTINS.contains(&previous.as_str())
-                || previous.ends_with("()")
+                || previous.ends_with(')')
         };
         match normalized.as_str() {
             "source" | "." | "alias" | "enable" if at_command_start => return true,
-            "eval" => {
+            // `trap` runs its action like `eval` (a DEBUG trap runs it before
+            // every later command), so its body is checked the same way.
+            "eval" | "trap" => {
                 eval_at.get_or_insert(index);
             }
-            base if ENV_EXPORTING_BUILTINS.contains(&base)
-                || NAME_ASSIGNING_BUILTINS.contains(&base) =>
-            {
-                assigning = true
+            base if ENV_EXPORTING_BUILTINS.contains(&base) => {
+                exporting_at.get_or_insert(index);
             }
+            base if NAME_ASSIGNING_BUILTINS.contains(&base) => strict = true,
             base => {
                 if let Some((_, option)) = OPTION_ASSIGNING_BUILTINS
                     .iter()
                     .find(|(builtin, _)| *builtin == base)
                 {
-                    assigning |= words[index + 1..]
+                    strict |= words[index + 1..]
                         .iter()
                         .any(|arg| normalize_shell_token(arg, shell).starts_with(option));
                 }
             }
         }
     }
-    if !assigning && eval_at.is_none() {
+    if let Some(exporting_at) = exporting_at {
+        let after = &words[exporting_at + 1..];
+        // A nameref (`declare -n r="$V"`) makes later assignments to `r` set
+        // the variable named by the value, so its value is a name too.
+        let nameref = after.iter().any(|word| {
+            command_word_is_statically_bound(word, shell) && {
+                let word = normalize_shell_token(word, shell);
+                word.starts_with(['-', '+']) && !word.starts_with("--") && word.contains('n')
+            }
+        });
+        let dynamic_name = words.iter().any(|word| {
+            !command_word_is_statically_bound(word, shell)
+                && (nameref || !word_assigns_literal_name(word))
+        });
+        if dynamic_name {
+            return true;
+        }
+    }
+    if !strict && eval_at.is_none() {
         return false;
     }
     if has_dynamic_word {
@@ -3441,14 +3494,41 @@ fn segment_may_enable_python_inspect(
     if depth >= MAX_PYTHON_INSPECT_EVAL_DEPTH {
         return true;
     }
+    // Leading option words (`eval --`, `trap -- ...`) are not part of the body.
     let body = words[eval_at + 1..]
         .iter()
         .map(|word| normalize_shell_token(word, shell))
+        .skip_while(|word| word.starts_with('-'))
         .collect::<Vec<_>>()
         .join(" ");
     let body_segments = tokenize::tokenize(&body, shell);
     let allexport = allexport || segments_may_enable_allexport(&body_segments, shell);
     segments_may_enable_python_inspect(&body_segments, shell, depth + 1, allexport)
+}
+
+/// `NAME=value` or `NAME+=value` with a literal identifier NAME, whatever
+/// the value (`PATH="$HOME/bin:$PATH"`). Quoted or expanded names do not count.
+fn word_assigns_literal_name(word: &str) -> bool {
+    let name_len = word
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    let (name, rest) = word.split_at(name_len);
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name != "PYTHONINSPECT"
+        && (rest.starts_with('=') || rest.starts_with("+="))
+}
+
+/// A plain `unset` of literal names (no prefix assignment, no expansion). It
+/// can only remove variables, never set one.
+fn segment_is_literal_unset(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    seg.command.as_deref() == Some("unset")
+        && tokenize::leading_env_assignments(&seg.raw).is_empty()
+        && seg
+            .args
+            .iter()
+            .all(|arg| command_word_is_statically_bound(arg, shell) && !arg.contains('='))
 }
 
 fn check_pipe_to_interpreter(
@@ -12257,6 +12337,116 @@ mod tests {
         ] {
             assert!(!fires_pipe_to_interpreter(input), "{input:?}");
         }
+    }
+
+    /// Bug 4 follow-up: `alias`, `source` and `.` also start a command after a
+    /// case pattern (`*)`) or a spaced function header (`f () {`), and a `trap`
+    /// action runs like `eval` (a DEBUG trap before every later command). Each
+    /// can make the later `python3 -c` run with `-i` or PYTHONINSPECT set.
+    #[test]
+    fn python_inspect_sources_after_case_patterns_function_headers_and_in_traps() {
+        for input in [
+            "case x in *) alias python3='python3 -i';; esac\necho hi | python3 -c 'print(1)'",
+            "case x in *) . ./env.sh;; esac; echo hi | python3 -c 'print(1)'",
+            "case x in *) source ./env.sh;; esac; echo hi | python3 -c 'print(1)'",
+            "case x in a|b) alias python3='python3 -i';; esac; echo hi | python3 -c 'print(1)'",
+            "f () { . ./env.sh; }; f; echo hi | python3 -c 'print(1)'",
+            "f() { source ./env.sh; }; f; echo hi | python3 -c 'print(1)'",
+            "trap 'alias python3=\"python3 -i\"' DEBUG; true\necho hi | python3 -c 'print(1)'",
+            "trap 'python3(){ command python3 -i \"$@\"; }' DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "S=$(printf 'python3(){ command python3 -%s \"$@\"; }' i); trap \"$S\" DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "trap -- '. ./env.sh' DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "trap \"$ACTION\" DEBUG; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT/-i source was not refused: {input:?}"
+            );
+        }
+        // Plain case arms, function bodies and literal traps that change
+        // nothing about python keep the issue #136 exemption.
+        for input in [
+            "case x in *) echo hi;; esac; echo hi | python3 -c 'print(1)'",
+            "f () { echo hi; }; f; echo hi | python3 -c 'print(1)'",
+            "trap 'rm -f \"$tmp\"' EXIT; echo hi | python3 -c 'print(1)'",
+            "trap - DEBUG; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
+    /// The inherited PYTHONINSPECT decision is the caller's, passed in; the
+    /// rule never reads the analyzing process's environment (a daemon analyzes
+    /// for other shells).
+    #[test]
+    /// The PYTHONINSPECT guard refuses the issue #136 exemption only for
+    /// inputs that may actually set it: a literal NAME with a dynamic value,
+    /// `unset PYTHONINSPECT`, and the string inside an inert `python -c` body
+    /// keep the exemption, while dynamic names, namerefs, a prefix assignment
+    /// on `unset`, and an assignment of PYTHONINSPECT itself still refuse it.
+    fn python_inspect_guard_allows_literal_names_with_dynamic_values() {
+        for input in [
+            "export PATH=\"$HOME/bin:$PATH\"; cat data.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "local x=\"$1\"; echo hi | python3 -c 'print(1)'",
+            "export FOO=\"$BAR\"; echo hi | python3 -c 'print(1)'",
+            "declare -x FOO+=\"$BAR\"; echo hi | python3 -c 'print(1)'",
+            "readonly V=$(date); echo hi | python3 -c 'print(1)'",
+            "unset PYTHONINSPECT; echo hi | python3 -c 'print(1)'",
+            "unset -v PYTHONINSPECT FOO; echo hi | python3 -c 'print(1)'",
+            "cat data.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"PYTHONINSPECT\"])'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+        for input in [
+            "export \"$N\"=1; echo hi | python3 -c 'print(1)'",
+            "export \"$N=1\"; echo hi | python3 -c 'print(1)'",
+            "export ${N}=1; echo hi | python3 -c 'print(1)'",
+            "export $N; echo hi | python3 -c 'print(1)'",
+            "declare -n r=\"$V\"; r=1; export r; echo hi | python3 -c 'print(1)'",
+            "local -n r=\"$V\"; echo hi | python3 -c 'print(1)'",
+            "PYTHONINSPECT=1 unset X; echo hi | python3 -c 'print(1)'",
+            "unset \"$X\"; export PYTHONINSPECT=1; echo hi | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=\"$V\"; echo hi | python3 -c 'print(1)'",
+            "echo hi | python3 -c 'import os; os.environ[\"PYTHONINSPECT\"]=\"1\"'",
+            "read -r \"$N\" <<< 1; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT source was not refused: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_python_inspect_is_the_callers_decision() {
+        let input = "echo payload | python3 -c 'print(1)'";
+        let fires = |inherited: bool| {
+            check_with_inherited_python_inspect(
+                input,
+                ShellType::Posix,
+                None,
+                ScanContext::Exec,
+                inherited,
+            )
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PipeToInterpreter)
+        };
+        assert!(
+            fires(true),
+            "an inherited PYTHONINSPECT refuses the exemption"
+        );
+        assert!(!fires(false), "#136 exemption applies without it");
+        // Nested bodies inherit the caller's decision too.
+        let nested = check_with_inherited_python_inspect(
+            "(echo payload | python3 -c 'print(1)')",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            true,
+        );
+        assert!(nested
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PipeToInterpreter));
     }
 
     #[test]

@@ -1849,6 +1849,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         crate::engine::analyze_with_policy_without_bypass(
             &context,

@@ -126,6 +126,7 @@ pub fn run(
         clipboard_html,
         card_ref: None,
         clipboard_source: clipboard_source_state,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
     };
 
     // PR #121 item 18: one policy snapshot for analysis + enforcement + audit, to

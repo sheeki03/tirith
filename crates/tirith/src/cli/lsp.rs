@@ -362,6 +362,9 @@ fn analysis_context(path: &Path, text: &str, context: ScanContext) -> AnalysisCo
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        // Scanned file content runs later, in some other process's
+        // environment, so the scanner's own PYTHONINSPECT is irrelevant.
+        python_inspect_inherited: false,
     }
 }
 
@@ -585,6 +588,24 @@ mod tests {
     /// never appears verbatim in the source (would trip tirith's own hook).
     fn suspicious_host() -> String {
         ["xn--g", "thub-cua.com"].concat()
+    }
+
+    /// The document is edited here but runs later in some other shell, so the
+    /// server's own PYTHONINSPECT must not decide the issue #136 exemption.
+    #[test]
+    fn analysis_context_ignores_the_servers_python_inspect() {
+        let _lock = crate::cli::test_harness::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cli::test_harness::EnvGuard::set("PYTHONINSPECT", Path::new("1"));
+        for context in [ScanContext::Paste, ScanContext::FileScan] {
+            let ctx = analysis_context(
+                Path::new("run.sh"),
+                "echo hi | python3 -c 'print(1)'",
+                context,
+            );
+            assert!(!ctx.python_inspect_inherited, "{context:?}");
+        }
     }
 
     /// ACCEPTANCE: a `CLAUDE.md` (AiConfig) with a suspicious URL yields ≥1

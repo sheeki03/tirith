@@ -22958,3 +22958,115 @@ fn inherited_python_inspect_keeps_pipe_to_interpreter() {
         "inherited PYTHONINSPECT must refuse the exemption"
     );
 }
+
+/// Bug 4 follow-up: `tirith check` answers through the persistent daemon by
+/// default, and the daemon analyzes for other shells. The inherited
+/// PYTHONINSPECT decision must come from the CLIENT's environment (it rides
+/// the request), never from the environment the daemon was started with.
+#[cfg(unix)]
+#[test]
+fn daemon_check_uses_the_clients_python_inspect_not_the_daemons() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The daemon socket lives in the state dir; client and daemon share it.
+    // A short path keeps the socket under the platform's sun_path limit.
+    let state = tmp.path().join("s");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    // A daemon-only policy root: `policy_path_used` naming it proves that the
+    // daemon, not a local fallback, produced the verdict.
+    let org = tmp.path().join("org");
+    fs::create_dir_all(org.join(".tirith")).expect("org policy dir");
+    fs::write(org.join(".tirith/policy.yaml"), "fail_mode: open\n").expect("org policy");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("git marker");
+
+    let mut daemon_cmd = tirith();
+    daemon_cmd
+        .env("XDG_STATE_HOME", &state)
+        .env("TIRITH_POLICY_ROOT", &org)
+        .env("PYTHONINSPECT", "1")
+        .args(["daemon", "start"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = KillOnDrop(daemon_cmd.spawn().expect("spawn daemon"));
+    let socket = state.join("tirith").join("daemon.sock");
+    let started = std::time::Instant::now();
+    while !socket.exists() {
+        assert!(
+            daemon.0.try_wait().expect("poll daemon").is_none(),
+            "daemon exited before binding its socket"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "daemon did not bind {}",
+            socket.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let check = |client_inspect: Option<&str>| -> serde_json::Value {
+        let mut cmd = tirith_in_proj(&project);
+        cmd.env("XDG_STATE_HOME", &state)
+            .env_remove("PYTHONINSPECT");
+        if let Some(value) = client_inspect {
+            cmd.env("PYTHONINSPECT", value);
+        }
+        let out = cmd
+            .args([
+                "check",
+                "--json",
+                "--offline",
+                "--shell",
+                "posix",
+                "--non-interactive",
+                "--",
+                "echo payload | python3 -c 'print(1)'",
+            ])
+            .output()
+            .expect("tirith check");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "check output must be JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+    let answered_by_daemon = |json: &serde_json::Value| {
+        json["policy_path_used"]
+            .as_str()
+            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
+    };
+    let has_pipe = |json: &serde_json::Value| {
+        json["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|f| f["rule_id"].as_str() == Some("pipe_to_interpreter"))
+        })
+    };
+
+    let without = check(None);
+    assert!(
+        answered_by_daemon(&without),
+        "daemon did not answer: {without}"
+    );
+    assert!(
+        !has_pipe(&without),
+        "the daemon's own PYTHONINSPECT must not refuse the exemption: {without}"
+    );
+    let with = check(Some("1"));
+    assert!(answered_by_daemon(&with), "daemon did not answer: {with}");
+    assert!(
+        has_pipe(&with),
+        "the client's PYTHONINSPECT must refuse the exemption: {with}"
+    );
+}

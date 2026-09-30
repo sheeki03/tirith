@@ -80,6 +80,7 @@ fn default_exec_context(cmd: &str, shell: ShellType) -> AnalysisContext {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
     }
 }
 
@@ -437,6 +438,7 @@ fn context_with_input(ctx: &AnalysisContext, input: String) -> AnalysisContext {
         clipboard_html: ctx.clipboard_html.clone(),
         card_ref: ctx.card_ref.clone(),
         clipboard_source: ctx.clipboard_source.clone(),
+        python_inspect_inherited: ctx.python_inspect_inherited,
     }
 }
 

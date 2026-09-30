@@ -64,6 +64,7 @@ fn capture(snapshot: &EffectivePolicySnapshot) -> FrozenEvaluation {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         },
         snapshot,
         CallerContext::Cli,

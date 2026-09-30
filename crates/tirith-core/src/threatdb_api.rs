@@ -1945,6 +1945,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
             context,

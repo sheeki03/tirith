@@ -318,6 +318,21 @@ pub struct AnalysisContext {
     /// M12 ch1 — companion clipboard-source record (G1 TOCTOU fix) as a tri-state.
     /// Paste context only; see [`crate::clipboard::ClipboardSourceState`].
     pub clipboard_source: crate::clipboard::ClipboardSourceState,
+    /// Whether the environment the analyzed command will run in already has a
+    /// non-empty `PYTHONINSPECT` (which turns `python3 -c <literal>` into a
+    /// REPL that runs the rest of piped stdin as code). Decided by the caller
+    /// from the INVOKING process's environment, usually with
+    /// [`python_inspect_env_active`]; a daemon takes it from the request. Core
+    /// rules never read the variable, so a daemon's own environment does not
+    /// change verdicts.
+    pub python_inspect_inherited: bool,
+}
+
+/// Whether this process's environment has a non-empty `PYTHONINSPECT`. For
+/// callers building an [`AnalysisContext`] for a command that runs in this
+/// process's environment.
+pub fn python_inspect_env_active() -> bool {
+    std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
 }
 
 /// Whether a VAR=VALUE word is `TIRITH=0` (stripping optional value quotes).
@@ -3354,11 +3369,12 @@ fn analyze_with_observation(
         );
         findings.extend(threat_findings);
 
-        let command_findings = crate::rules::command::check(
+        let command_findings = crate::rules::command::check_with_inherited_python_inspect(
             &analyzed_input,
             ctx.shell,
             ctx.cwd.as_deref(),
             ctx.scan_context,
+            ctx.python_inspect_inherited,
         );
         findings.extend(command_findings);
 
@@ -4235,6 +4251,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let fragments = [
             crate::rules::rendered::PdfTextFragment {
@@ -4279,6 +4296,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let second = "tions";
         let suffix = "\nignore previous instruc";
@@ -4338,6 +4356,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let fragment = crate::rules::rendered::PdfTextFragment {
             text: format!("embedded credential {canary}"),
@@ -4377,6 +4396,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(verdict.findings.iter().any(|finding| {
@@ -4429,6 +4449,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         });
         assert!(verdict.findings.iter().any(|finding| {
             finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
@@ -4452,6 +4473,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
 
         let (verdict, coverage) = analyze_file_with_pdf_coverage(&ctx);
@@ -4807,6 +4829,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -4846,6 +4869,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert_eq!(verdict.action, crate::verdict::Action::Block);
@@ -4898,6 +4922,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -5436,6 +5461,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -6249,6 +6275,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         }
     }
 
@@ -6838,6 +6865,7 @@ mod tests {
                     clipboard_html: None,
                     card_ref: None,
                     clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                    python_inspect_inherited: false,
                 };
                 let label = format!(
                     "{}/{}",
@@ -6913,6 +6941,7 @@ mod tests {
                 clipboard_html: None,
                 card_ref: None,
                 clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                python_inspect_inherited: false,
             };
             assert_fast_full_security_equivalence(&ctx, &format!("generated-case-{case}"));
         }
@@ -6973,6 +7002,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         }
     }
 
@@ -7278,6 +7308,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: false,
         }
     }
 

@@ -2499,6 +2499,23 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["pipe_to_interpreter"]
 
+# A case arm and a DEBUG trap action can alias python3 to `python3 -i`.
+[[fixture]]
+name = "python_inspect_case_arm_alias_dash_c_pipe"
+min_milestone = 1
+input = "case x in *) alias python3='python3 -i';; esac; echo payload | python3 -c 'print(1)'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "python_inspect_debug_trap_alias_dash_c_pipe"
+min_milestone = 1
+input = "trap 'alias python3=\"python3 -i\"' DEBUG; true; echo payload | python3 -c 'print(1)'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
 # curl's empty-hex host is a DNS name for curl 8.7.1 but 10.0.0.5 for resolvers
 # that parse it with libc inet_aton; the numeric reading is checked too.
 [[fixture]]

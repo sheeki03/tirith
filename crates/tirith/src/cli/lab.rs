@@ -224,6 +224,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             // deterministic, so it must skip the ambient `clipboard_source.json`
             // disk read.
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         };
 
         // Interactive prelude — prompt before revealing the verdict; `q` aborts.
@@ -699,6 +700,7 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         assert!(evaluate_scenario(&s, &ctx).is_err());
     }

@@ -505,6 +505,7 @@ impl TeamRolloutService {
                         card_ref: None,
                         clipboard_source:
                             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                     },
                     &baseline,
                     tirith_core::escalation::CallerContext::Cli,

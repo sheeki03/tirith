@@ -361,6 +361,7 @@ fn run_fixture(fixture: &Fixture) {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2026,6 +2027,7 @@ fn test_tier1_does_not_gate_findings() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2079,6 +2081,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -2249,6 +2252,7 @@ fn test_lab_corpus_reaches_tier3() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2351,6 +2355,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2416,6 +2421,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2476,6 +2482,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2526,6 +2533,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2578,6 +2586,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2635,6 +2644,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2691,6 +2701,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2755,6 +2766,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -2850,6 +2862,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -2951,6 +2964,7 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -3042,6 +3056,7 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
         };
         engine::analyze(&ctx)
     };

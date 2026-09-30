@@ -137,6 +137,7 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
     };
     let (mut raw_verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
     let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
@@ -541,6 +542,7 @@ mod tests {
                 clipboard_html: None,
                 card_ref: None,
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                python_inspect_inherited: false,
             };
             let verdict = engine::analyze(&ctx);
             assert!(

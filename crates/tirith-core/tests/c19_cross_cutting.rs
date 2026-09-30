@@ -1317,6 +1317,7 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 clipboard_html: None,
                 card_ref: None,
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                python_inspect_inherited: false,
             };
             let verdict = engine::analyze(&ctx);
             if verdict.tier_reached < 3 {
@@ -1508,6 +1509,7 @@ fn no_rendered_surface_carries_a_raw_secret() {
                     clipboard_html: None,
                     card_ref: None,
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                    python_inspect_inherited: false,
                 };
                 let verdict = engine::analyze(&ctx);
                 cells += 1;
@@ -1699,6 +1701,7 @@ fn no_benign_fixture_produces_a_high_or_critical_finding() {
                 clipboard_html: None,
                 card_ref: None,
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                python_inspect_inherited: false,
             };
             let verdict = engine::analyze(&ctx);
             for finding in &verdict.findings {

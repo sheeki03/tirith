@@ -1059,6 +1059,7 @@ fn analyze_command(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
     };
     engine::analyze_returning_policy(&ctx)
 }

@@ -2503,6 +2503,7 @@ mod tests {
         use extrasafe::builtins::{BasicCapabilities, SystemIO};
         use extrasafe::syscalls::Sysno;
         use extrasafe::RuleSet as _;
+        use extrasafe::{SeccompArgumentFilter, SeccompilerComparator};
 
         let simple = ProcessCreation.simple_rules();
         assert!(simple.contains(&Sysno::clone3));
@@ -2513,10 +2514,16 @@ mod tests {
         assert_eq!(clone.len(), table.len());
         for (rule, conditions) in clone.iter().zip(table) {
             assert_eq!(rule.argument_filters.len(), conditions.len());
-            for (filter, (_, value)) in rule.argument_filters.iter().zip(conditions) {
+            for (filter, (mask, value)) in rule.argument_filters.iter().zip(conditions) {
                 assert_eq!(filter.arg_idx, 0);
                 assert!(filter.is_64bit);
                 assert_eq!(filter.value, value);
+                // The comparator is private; equality pins it (and its mask)
+                // to the reviewed `flags & mask == value` condition.
+                assert_eq!(
+                    *filter,
+                    SeccompArgumentFilter::new64(0, SeccompilerComparator::MaskedEq(mask), value)
+                );
             }
         }
         let others: [Vec<Sysno>; 4] = [

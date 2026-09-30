@@ -4159,6 +4159,7 @@ fn preflight_url(url: &str, cwd: Option<&str>, interactive: bool) -> (Verdict, P
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
     };
     // M4 PR #120 fix-6 (CodeRabbit Major TOCTOU): return the engine-discovered
     // policy so the caller's bypass/agent-rules/audit calls share one snapshot.

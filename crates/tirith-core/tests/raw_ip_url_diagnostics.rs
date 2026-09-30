@@ -21,6 +21,7 @@ fn analyze(input: &str) -> Verdict {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
     })
 }
 

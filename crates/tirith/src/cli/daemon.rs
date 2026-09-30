@@ -315,6 +315,13 @@ pub struct DaemonRequest {
     /// server ignores the unknown field (serde's default) (repo-0373).
     #[serde(default)]
     pub offline: bool,
+    /// Client-side decision: the invoking shell has a non-empty
+    /// `PYTHONINSPECT`, so `python3 -c <literal>` pipe sinks may run piped
+    /// stdin as code. Like `offline`, only the CALLER's environment matters;
+    /// the daemon's own environment is never consulted. `#[serde(default)]`
+    /// keeps old clients and servers compatible.
+    #[serde(default)]
+    pub python_inspect_inherited: bool,
 }
 
 fn default_context() -> String {
@@ -405,6 +412,7 @@ pub fn try_daemon_check(
         // INVOKING shell both force offline analysis; the daemon's own env
         // (set at server start) is deliberately irrelevant (repo-0373).
         offline: offline || super::offline_env_active(),
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
     };
 
     let mut payload = serde_json::to_string(&req).ok()?;
@@ -536,6 +544,7 @@ fn handle_request_with_analysis(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: req.python_inspect_inherited,
     };
 
     // Retain the engine's resolved policy, including remote policy and local
@@ -1330,6 +1339,7 @@ pub fn status() -> i32 {
         interactive: false,
         bypass_requested: false,
         offline: false,
+        python_inspect_inherited: false,
     };
 
     let ok = (|| -> Option<()> {
@@ -1412,6 +1422,7 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         assert!(wire.contains("\"offline\":true"), "got: {wire}");
@@ -1438,6 +1449,7 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
         };
         let resp = super::handle_request(&req);
         let mut disclosed_package_skip = false;
@@ -1461,6 +1473,38 @@ mod tests {
         assert!(
             disclosed_package_skip,
             "offline daemon package enrichment must stop at cache miss and disclose it: {resp:?}"
+        );
+    }
+
+    /// Bug 4 follow-up: an inherited PYTHONINSPECT is the CLIENT's decision
+    /// and rides the request, like `offline`. The daemon analyzes for other
+    /// shells, so its own environment must not decide the issue #136
+    /// `python3 -c` exemption. The request is read from the wire so an old
+    /// client (no field) keeps the exemption.
+    #[cfg(unix)]
+    #[test]
+    fn python_inspect_inherited_rides_the_daemon_request() {
+        let _global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let fires = |wire: &str| {
+            let req: super::DaemonRequest = serde_json::from_str(wire).expect("deserialize");
+            let resp = super::handle_request(&req);
+            resp.findings
+                .iter()
+                .chain(resp.raw_findings.as_deref().unwrap_or(&[]).iter())
+                .any(|f| f.rule_id == tirith_core::verdict::RuleId::PipeToInterpreter)
+        };
+        let base = r#""command":"check","input":"echo payload | python3 -c 'print(1)'","context":"exec","cwd":null,"shell":"posix","interactive":false,"bypass_requested":false,"offline":true"#;
+        assert!(
+            fires(&format!(r#"{{{base},"python_inspect_inherited":true}}"#)),
+            "a client with PYTHONINSPECT set must refuse the exemption"
+        );
+        assert!(
+            !fires(&format!(r#"{{{base},"python_inspect_inherited":false}}"#)),
+            "a client without PYTHONINSPECT keeps the #136 exemption"
+        );
+        assert!(
+            !fires(&format!("{{{base}}}")),
+            "an old client without the field keeps the #136 exemption"
         );
     }
 
@@ -1490,6 +1534,7 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
         };
         let resp = super::handle_request(&req);
         let runtime = resp
@@ -1524,6 +1569,7 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
         };
 
         let response = super::handle_request_with_analysis(&req, |ctx| {
