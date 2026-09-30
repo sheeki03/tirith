@@ -251,9 +251,33 @@ fn explicit_curl_non_special_schemes_keep_numeric_ip_detection() {
         }
         let verdict = analyze(&format!("curl '{scheme}://2130706433/path'"));
         assert!(raw_ip_findings(&verdict).is_empty(), "{verdict:?}");
-        for domain in ["0x", "0X", "0x.1", "8.0x", "0x7f.0x", "0x.0x.0x.0x"] {
+        // curl 8.7.1 resolves these empty-hex spellings as DNS names, but a
+        // libc `inet_aton` resolver reads them numerically. Both readings are
+        // evaluated (bug 5), so the numeric one is reported unless it is
+        // loopback, exactly as for the dotted spelling.
+        for (domain, numeric) in [
+            ("0x", Some("0.0.0.0")),
+            ("0X", Some("0.0.0.0")),
+            ("0x.1", Some("0.0.0.1")),
+            ("8.0x", Some("8.0.0.0")),
+            ("0x7f.0x", None),
+            ("0x.0x.0x.0x", Some("0.0.0.0")),
+        ] {
             let verdict = analyze(&format!("curl '{scheme}://{domain}/path'"));
-            assert!(raw_ip_findings(&verdict).is_empty(), "{verdict:?}");
+            let findings = raw_ip_findings(&verdict);
+            let Some(numeric) = numeric else {
+                assert!(findings.is_empty(), "{verdict:?}");
+                continue;
+            };
+            assert_eq!(findings.len(), 1, "{domain}: {verdict:?}");
+            assert_raw_evidence(findings[0], domain);
+            assert_eq!(
+                findings[0].description,
+                format!(
+                    "URL host '{domain}' is read as IP address {numeric} by resolvers that \
+                     parse it numerically, instead of a domain name"
+                )
+            );
         }
     }
 }

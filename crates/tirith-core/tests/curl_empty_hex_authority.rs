@@ -255,3 +255,68 @@ fn nested_shell_delimiter_does_not_consume_independent_parenthesis_url_data() {
         "literal closing parenthesis remains URL data: {urls:?}"
     );
 }
+
+/// Bug 5 (dual reading): curl 8.7.1 treats an empty `0x` component as a DNS
+/// name, but other curl builds hand the host to a libc resolver whose
+/// `inet_aton` reads it as a numeric address. Deny if EITHER reading matches a
+/// deny entry or CIDR; allow only if BOTH readings are allowed.
+#[test]
+fn curl_empty_hex_host_is_also_evaluated_as_its_numeric_address() {
+    let denied = |input: &str, deny: &[&str], allow: &[&str]| {
+        let deny: Vec<String> = deny.iter().map(|s| s.to_string()).collect();
+        let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        rules::command::check_network_policy(input, ShellType::Posix, &deny, &allow)
+            .iter()
+            .any(|f| f.rule_id == RuleId::CommandNetworkDeny)
+    };
+    for (input, deny) in [
+        ("curl http://0x7f.0x/path", "127.0.0.0/8"),
+        ("curl http://0x7f.0x/path", "127.0.0.0"),
+        ("curl 0x7f.0x/path", "127.0.0.0/8"),
+        ("curl http://0x7f.%30x/path", "127.0.0.0/8"),
+        ("curl http://0xa.0x.0x.0x5/", "10.0.0.5"),
+        ("curl http://0xa.0x.0x.0x5/", "10.0.0.0/8"),
+        (
+            "curl --resolve allowed.example:443:0xa.0x.0x.0x5 https://allowed.example/",
+            "10.0.0.0/8",
+        ),
+    ] {
+        assert!(denied(input, &[deny], &[]), "{input} vs {deny}");
+    }
+    // A DNS-only allow entry cannot admit the numeric reading.
+    assert!(denied(
+        "curl http://0x7f.0x/path",
+        &["127.0.0.0/8"],
+        &[".0x"]
+    ));
+    // An allow entry that matches both readings still allows.
+    assert!(!denied(
+        "curl http://0x7f.0x/path",
+        &["127.0.0.0/8"],
+        &["0x7f.0x"]
+    ));
+    // Neither reading is in the deny list.
+    assert!(!denied("curl http://0x7f.0x/path", &["10.0.0.0/8"], &[]));
+    assert!(!denied("curl http://0x7f.0x/path", &["example.com"], &[]));
+}
+
+#[test]
+fn curl_empty_hex_numeric_reading_reports_raw_ip() {
+    let urls = extract::extract_urls("curl http://0xa.0x.0x.0x5/p", ShellType::Posix);
+    assert_eq!(urls.len(), 1, "{urls:?}");
+    assert_eq!(urls[0].parsed.host(), Some("0xa.0x.0x.0x5"));
+    let findings = rules::hostname::check(&urls[0].parsed, &Policy::default());
+    let raw_ip = findings
+        .iter()
+        .find(|f| f.rule_id == RuleId::RawIpUrl)
+        .expect("numeric reading is a raw IP");
+    assert!(raw_ip.description.contains("10.0.0.5"), "{raw_ip:?}");
+    assert!(raw_ip.description.contains("0xa.0x.0x.0x5"), "{raw_ip:?}");
+    // The loopback numeric reading stays benign, as for `127.0.0.0`.
+    let loopback = extract::extract_urls("curl http://0x7f.0x/p", ShellType::Posix);
+    assert!(
+        rules::hostname::check(&loopback[0].parsed, &Policy::default())
+            .iter()
+            .all(|f| f.rule_id != RuleId::RawIpUrl)
+    );
+}

@@ -22918,3 +22918,43 @@ fn ecosystem_scan_human_output_neutralizes_attacker_scan_root() {
 
     assert_attack_codepoints_stripped(&out.stderr);
 }
+
+/// Bug 4: an inherited, exported PYTHONINSPECT makes `python3 -c <literal>`
+/// run the rest of the piped stdin as code once the fixed program exits, so the
+/// issue #136 data-pipeline exemption must not apply when the caller's
+/// environment carries it.
+#[test]
+fn inherited_python_inspect_keeps_pipe_to_interpreter() {
+    let input = "echo payload | python3 -c 'print(1)'";
+    let rule_ids = |inspect: Option<&str>| -> Vec<String> {
+        let mut cmd = tirith();
+        cmd.env_remove("PYTHONINSPECT");
+        if let Some(value) = inspect {
+            cmd.env("PYTHONINSPECT", value);
+        }
+        let out = cmd
+            .args(["check", "--json", "--shell", "posix", "--", input])
+            .output()
+            .expect("tirith check");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse JSON");
+        v["findings"]
+            .as_array()
+            .map(|findings| {
+                findings
+                    .iter()
+                    .filter_map(|f| f["rule_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let has_pipe = |ids: &[String]| ids.iter().any(|id| id == "pipe_to_interpreter");
+    assert!(
+        !has_pipe(&rule_ids(None)),
+        "#136 exemption must still apply"
+    );
+    assert!(!has_pipe(&rule_ids(Some(""))), "empty PYTHONINSPECT is off");
+    assert!(
+        has_pipe(&rule_ids(Some("1"))),
+        "inherited PYTHONINSPECT must refuse the exemption"
+    );
+}

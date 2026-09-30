@@ -1094,8 +1094,13 @@ pub fn check(
                 }
             }
 
-            // URL host may itself be an IP literal.
-            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            // URL host may itself be an IP literal, or a curl empty-hex DNS
+            // name that a libc resolver reads as one.
+            if let Some(ip) = host
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .or_else(|| crate::parse::curl_empty_hex_numeric_reading(host))
+            {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
                         let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
@@ -1533,6 +1538,27 @@ mod tests {
             assert_eq!(pkgs[0].alias.as_deref(), Some(alias));
             assert_eq!(pkgs[0].version, VersionIntent::Exact("1.2.3".to_string()));
         }
+    }
+
+    /// Bug 5: the numeric reading of a curl empty-hex host is looked up as an IP.
+    #[test]
+    fn curl_empty_hex_host_numeric_reading_is_checked_against_ip_indicators() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 87);
+        writer.add_ip(
+            std::net::Ipv4Addr::new(10, 0, 0, 5),
+            ThreatSource::FeodoTracker,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let input = "curl http://0xa.0x.0x.0x5/payload";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        let findings = check(input, ShellType::Posix, &extracted, Some(&db));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatMaliciousIp),
+            "{findings:?}"
+        );
     }
 
     #[test]

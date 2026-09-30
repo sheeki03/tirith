@@ -163,6 +163,8 @@ windows = { version = "0.62", default-features = false, features = [
 # compile-errors outside linux-x86_64, so keep that dependency gated to the only
 # architecture where `capsule::linux::apply_seccomp` uses it. AArch64 uses a
 # separately reviewed seccompiler policy with a native kernel capability probe.
+# Both architectures use seccompiler directly for the shared clone policy
+# (`capsule/linux/clone_policy.rs`: clone flag table + clone3 ENOSYS filter).
 # Other architectures still report no raw-network enforcement.
 # Proven to resolve + build on MSRV 1.83. Licenses: landlock MIT/Apache-2.0,
 # extrasafe MIT.
@@ -172,7 +174,7 @@ landlock = "0.4"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
 
-[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 seccompiler = { version = "0.4", default-features = false }
 
 # arboard has no Android backend. The clipboard wrapper reports NoBackend

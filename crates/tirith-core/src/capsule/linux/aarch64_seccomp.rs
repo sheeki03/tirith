@@ -252,23 +252,15 @@ fn policy_rules() -> Result<Rules, String> {
     // A separate ENOSYS rule below permits libc's fallback to inspectable clone.
     // Restrict clone to reviewed fork/vfork/thread flags, without CLONE_PARENT,
     // CLONE_UNTRACED or any namespace flags; child-exit signals are 0 or SIGCHLD.
-    let flags = (libc::CLONE_VM
-        | libc::CLONE_FS
-        | libc::CLONE_FILES
-        | libc::CLONE_SIGHAND
-        | libc::CLONE_VFORK
-        | libc::CLONE_THREAD
-        | libc::CLONE_SYSVSEM
-        | libc::CLONE_SETTLS
-        | libc::CLONE_PARENT_SETTID
-        | libc::CLONE_CHILD_CLEARTID
-        | libc::CLONE_CHILD_SETTID) as u64;
+    // The table is shared with the x86_64 policy.
     let mut clone = Vec::new();
-    for signal in [0, libc::SIGCHLD as u64] {
-        clone.push(rule(vec![
-            condition(0, SeccompCmpOp::MaskedEq(!(flags | 0xff)), 0)?,
-            condition(0, SeccompCmpOp::MaskedEq(0xff), signal)?,
-        ])?);
+    for conditions in super::clone_policy::clone_allow_rules() {
+        clone.push(rule(
+            conditions
+                .into_iter()
+                .map(|(mask, value)| condition(0, SeccompCmpOp::MaskedEq(mask), value))
+                .collect::<Result<_, _>>()?,
+        )?);
     }
     rules.insert(libc::SYS_clone, clone);
     Ok(rules)
@@ -276,15 +268,8 @@ fn policy_rules() -> Result<Rules, String> {
 
 pub(super) fn build_filters() -> Result<(BpfProgram, BpfProgram), String> {
     // Both filters validate AUDIT_ARCH_AARCH64 through the reviewed compiler.
-    let clone_fallback = SeccompFilter::new(
-        [(libc::SYS_clone3, Vec::new())].into_iter().collect(),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::ENOSYS as u32),
-        TargetArch::aarch64,
-    )
-    .map_err(|error| error.to_string())?
-    .try_into()
-    .map_err(|error: seccompiler::BackendError| error.to_string())?;
+    let clone_fallback =
+        super::clone_policy::clone3_enosys_filter(TargetArch::aarch64, libc::SYS_clone3)?;
     let default_deny = SeccompFilter::new(
         policy_rules()?,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -312,45 +297,7 @@ mod tests {
 
     // Evaluate the compiled, architecture-checking BPF, so argument-boundary
     // assertions test actual emitted branches rather than the input rule list.
-    fn evaluate(program: &BpfProgram, arch: u32, syscall: i64, args: [u64; 6]) -> u32 {
-        let mut data = [0u8; 64];
-        data[0..4].copy_from_slice(&(syscall as u32).to_le_bytes());
-        data[4..8].copy_from_slice(&arch.to_le_bytes());
-        for (index, arg) in args.into_iter().enumerate() {
-            data[16 + index * 8..24 + index * 8].copy_from_slice(&arg.to_le_bytes());
-        }
-        let mut accumulator = 0;
-        let mut pc = 0;
-        for _ in 0..4096 {
-            let instruction = &program[pc];
-            pc += 1;
-            match instruction.code {
-                0x20 => {
-                    let start = instruction.k as usize;
-                    accumulator = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
-                }
-                0x54 => accumulator &= instruction.k,
-                0x05 => pc += instruction.k as usize,
-                0x06 => return instruction.k,
-                0x15 | 0x25 | 0x35 | 0x45 => {
-                    let matches = match instruction.code {
-                        0x15 => accumulator == instruction.k,
-                        0x25 => accumulator > instruction.k,
-                        0x35 => accumulator >= instruction.k,
-                        0x45 => accumulator & instruction.k != 0,
-                        _ => unreachable!(),
-                    };
-                    pc += if matches {
-                        instruction.jt
-                    } else {
-                        instruction.jf
-                    } as usize;
-                }
-                code => panic!("unrecognized compiled BPF instruction {code:x}"),
-            }
-        }
-        panic!("BPF did not terminate within its instruction bound")
-    }
+    use super::super::clone_policy::evaluate_bpf as evaluate;
 
     #[test]
     fn compiled_filters_allow_only_stdio_nonblocking_mode_changes() {

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{bounded_text, Member, NpmFileKind, NpmInspection, NpmIssueKind};
+use crate::tokenize::ShellType;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmMetadata {
@@ -485,145 +486,61 @@ fn package_relative(path: &str) -> Option<String> {
 }
 
 /// Only literal node/sh file invocations have a direct member edge. Flags,
-/// substitutions, chains and npm-provided executable resolution remain explicit
-/// unknowns. This narrow edge never controls whether other code files are read.
+/// substitutions, chains, redirections and npm-provided executable resolution
+/// remain explicit unknowns. This narrow edge never controls whether other code
+/// files are read.
 fn literal_script_target(command: &str) -> Option<String> {
-    let (tokens, complete) = shell_words(command);
-    if !complete || tokens.len() != 2 || tokens.iter().any(|word| word.operator) {
-        return None;
-    }
-    if !matches!(
-        tokens[0].value.as_str(),
-        "node" | "nodejs" | "sh" | "bash" | "zsh"
-    ) || tokens[1].value.starts_with('-')
+    use crate::rules::command::{command_word_is_statically_bound, normalize_shell_token};
+    let shell = ShellType::Posix;
+    // Anything that can expand, redirect, group or start a comment keeps the
+    // edge unknown, even inside quotes.
+    if command.contains(['$', '`', '\\', '(', ')', '<', '>'])
+        || command.split_whitespace().any(|word| word.starts_with('#'))
     {
         return None;
     }
-    package_relative(&tokens[1].value)
+    let segments = crate::tokenize::tokenize(command, shell);
+    let [segment] = segments.as_slice() else {
+        return None;
+    };
+    let (Some(program), [target]) = (segment.command.as_deref(), segment.args.as_slice()) else {
+        return None;
+    };
+    if !command_word_is_statically_bound(program, shell)
+        || !command_word_is_statically_bound(target, shell)
+    {
+        return None;
+    }
+    let target = normalize_shell_token(target, shell);
+    if !matches!(
+        normalize_shell_token(program, shell).as_str(),
+        "node" | "nodejs" | "sh" | "bash" | "zsh"
+    ) || target.starts_with('-')
+    {
+        return None;
+    }
+    package_relative(&target)
 }
 
+/// A download command piped straight into a shell. Uses the core tokenizer and
+/// the pipe-to-interpreter resolution, so variables (`curl $U | bash`),
+/// wrappers (`| sudo bash`) and redirections (`| sh >/dev/null`) are handled.
+/// Only a literal downloader as the pipe source qualifies: `echo curl … | sh` is
+/// not a download claim.
 fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
-    let (words, complete) = shell_words(text);
-    if !complete {
-        return;
-    }
-    // Only a literal downloader at the beginning of a pipeline and a shell at
-    // its next stage qualifies. "echo curl ... | sh" is not a download claim.
-    let mut start = 0usize;
-    for (index, word) in words.iter().enumerate() {
-        if word.operator && matches!(word.value.as_str(), ";" | "&&" | "||" | "\n") {
-            start = index + 1;
-            continue;
-        }
-        if word.operator
-            && word.value == "|"
-            && words
-                .get(start)
-                .is_some_and(|w| !w.operator && matches!(w.value.as_str(), "curl" | "wget"))
-            && words
-                .get(index + 1)
-                .is_some_and(|w| !w.operator && matches!(w.value.as_str(), "sh" | "bash" | "zsh"))
-        {
-            push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
-                vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,
-                "A literal curl/wget pipeline feeds a shell interpreter. Review the downloaded code; no network request or script was executed."));
-            break;
-        }
-        if word.operator && word.value == "|" {
-            start = index + 1;
-        }
-    }
-}
-
-struct ShellWord {
-    value: String,
-    operator: bool,
-}
-
-fn shell_words(text: &str) -> (Vec<ShellWord>, bool) {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut word_started = false;
-    let mut quote = None;
-    let mut complete = true;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if words.len() >= 4096 || current.len() > 8192 {
-            complete = false;
-            break;
-        }
-        if let Some(q) = quote {
-            if ch == q {
-                quote = None;
-            } else {
-                if q == '"' && matches!(ch, '$' | '`' | '\\') {
-                    complete = false;
-                }
-                current.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => {
-                quote = Some(ch);
-                word_started = true;
-            }
-            '$' | '`' | '\\' | '(' | ')' | '<' | '>' => {
-                complete = false;
-                current.push(ch);
-                word_started = true;
-            }
-            '#' if !word_started => {
-                for ch in chars.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-                words.push(ShellWord {
-                    value: "\n".to_owned(),
-                    operator: true,
-                });
-            }
-            '|' | '&' | ';' | '\n' => {
-                if word_started {
-                    words.push(ShellWord {
-                        value: std::mem::take(&mut current),
-                        operator: false,
-                    });
-                    word_started = false;
-                }
-                let mut op = ch.to_string();
-                if matches!(ch, '|' | '&') && chars.peek() == Some(&ch) {
-                    chars.next();
-                    op.push(ch);
-                }
-                words.push(ShellWord {
-                    value: op,
-                    operator: true,
-                });
-            }
-            ch if ch.is_whitespace() => {
-                if word_started {
-                    words.push(ShellWord {
-                        value: std::mem::take(&mut current),
-                        operator: false,
-                    });
-                    word_started = false;
-                }
-            }
-            _ => {
-                current.push(ch);
-                word_started = true;
-            }
-        }
-    }
-    if word_started {
-        words.push(ShellWord {
-            value: current,
-            operator: false,
+    let feeds_shell = crate::rules::command::fetch_piped_interpreters(text, ShellType::Posix)
+        .iter()
+        .any(|interpreter| {
+            matches!(
+                interpreter.as_str(),
+                "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
+            )
         });
+    if feeds_shell {
+        push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
+            vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,
+            "A literal curl/wget pipeline feeds a shell interpreter. Review the downloaded code; no network request or script was executed."));
     }
-    (words, complete && quote.is_none())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

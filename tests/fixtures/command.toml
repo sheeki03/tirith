@@ -2468,3 +2468,24 @@ expected_rules = ["curl_pipe_shell"]
 # `dangerous[]` elevation rule does NOT fire (and must never be REQUIRED for the
 # block — the engine stands on its own).
 forbidden_rules = ["repo_command_dangerous_pattern", "repo_command_unknown"]
+
+# PYTHONINSPECT set earlier in the input makes `python3 -c <literal>` run the
+# rest of the piped stdin as code, so the issue #136 data-pipeline exemption
+# must not apply.
+[[fixture]]
+name = "python_inspect_exported_before_dash_c_pipe"
+min_milestone = 1
+input = "export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+# curl's empty-hex host is a DNS name for curl 8.7.1 but 10.0.0.5 for resolvers
+# that parse it with libc inet_aton; the numeric reading is checked too.
+[[fixture]]
+name = "curl_empty_hex_host_numeric_private_reading"
+min_milestone = 1
+input = "curl http://0xa.0x.0x.0x5/internal"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access", "raw_ip_url"]

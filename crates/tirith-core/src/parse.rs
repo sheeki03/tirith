@@ -260,6 +260,18 @@ pub(crate) fn curl_empty_hex_dns_host(raw_host: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// The second reading of a curl empty-hex DNS name. curl 8.7.1 resolves the
+/// spelling as a DNS name, but builds that hand it to a libc resolver read it
+/// with `inet_aton`, which (like WHATWG) accepts an empty `0x` component as 0.
+/// Policy evaluates both readings: deny if either matches, allow only if both do.
+pub(crate) fn curl_empty_hex_numeric_reading(raw_host: &str) -> Option<std::net::Ipv4Addr> {
+    let decoded = curl_empty_hex_dns_host(raw_host)?;
+    match url::Host::parse(&decoded) {
+        Ok(url::Host::Ipv4(address)) => Some(address),
+        _ => None,
+    }
+}
+
 /// Apply the client exception only to a completely validated authority. This
 /// also separates an accepted empty port without loosening hostname feed or
 /// network-list validation, which use the bare-host helper above.

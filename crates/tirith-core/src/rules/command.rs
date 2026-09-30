@@ -3161,10 +3161,13 @@ fn python_body_is_known_data_parser(body: &str) -> bool {
 /// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
 /// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
 fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
-    // This proof is for an actual POSIX pipe, whose stdin is not a terminal.
-    // Other shells and any redirection keep the ordinary interpreter finding.
-    // In particular, do not let stdin be redirected to a terminal where
-    // PYTHONINSPECT can enable a REPL after the fixed program exits.
+    // This proof is for an actual POSIX pipe with no redirection. Other shells
+    // and any redirection keep the ordinary interpreter finding. A leading
+    // assignment is refused because it may set PYTHONINSPECT (or another
+    // interpreter-control variable) for this one process: inspect mode starts a
+    // REPL after the fixed program exits, and that REPL reads the REST OF THE
+    // PIPE as code. Assignments elsewhere in the input are checked by the
+    // caller (`input_may_enable_python_inspect`).
     if shell != ShellType::Posix
         || !tokenize::leading_env_assignments(&seg.raw).is_empty()
         || seg.args.iter().any(|arg| {
@@ -3189,11 +3192,145 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
 }
 
+/// Interpreters that directly receive a URL-fetch command's output through a
+/// pipe (`curl … | sh`), with the same tokenizer and interpreter resolution
+/// (`sudo`/`env` wrappers, flags, redirections) as the pipe-to-interpreter rule.
+/// The fetch command must be the literal pipe source: `echo curl … | sh` is not
+/// a download.
+pub(crate) fn fetch_piped_interpreters(input: &str, shell: ShellType) -> Vec<String> {
+    let segments = tokenize::tokenize(input, shell);
+    let mut interpreters = Vec::new();
+    for (index, seg) in segments.iter().enumerate().skip(1) {
+        if !matches!(seg.preceding_separator.as_deref(), Some("|" | "|&")) {
+            continue;
+        }
+        let source_is_fetch = segments[index - 1]
+            .command
+            .as_deref()
+            .is_some_and(|command| is_url_fetch_command(&normalize_cmd_base(command, shell)));
+        if !source_is_fetch {
+            continue;
+        }
+        if let (Some(interpreter), _) = resolve_interpreter_name_tracking(seg, shell) {
+            interpreters.push(interpreter);
+        }
+    }
+    interpreters
+}
+
+/// Shell builtins that can put a variable into the environment of later
+/// commands in the same shell.
+const ENV_EXPORTING_BUILTINS: &[&str] = &[
+    "export", "declare", "typeset", "readonly", "local", "integer", "float", "builtin", "command",
+];
+
+/// Words that start a new command inside the same tokenizer segment.
+const COMMAND_START_WORDS: &[&str] = &[
+    "!", "time", "if", "then", "elif", "else", "do", "while", "until", "function",
+];
+
+const MAX_PYTHON_INSPECT_EVAL_DEPTH: usize = 2;
+
+/// Whether anything in the input (or the inherited environment) may turn on
+/// Python's inspect mode for a later `python -c` pipe sink. Inspect mode runs
+/// the rest of the piped stdin as code after the fixed program exits, so the
+/// issue #136 data-pipeline exemption must not apply.
+///
+/// Conservative by design: a literal `PYTHONINSPECT` anywhere, a dynamic
+/// command name, `eval`/`source`/`.`/`alias`/`enable`, or an exporting builtin
+/// with any non-literal word all refuse the exemption. Pipeline stages run in
+/// subshells, but the check does not rely on that. A shell function or alias
+/// defined before this input was typed cannot be seen here.
+fn input_may_enable_python_inspect(segments: &[tokenize::Segment], shell: ShellType) -> bool {
+    std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
+        || segments_may_enable_python_inspect(segments, shell, 0)
+}
+
+fn segments_may_enable_python_inspect(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    depth: usize,
+) -> bool {
+    segments
+        .iter()
+        .any(|seg| segment_may_enable_python_inspect(seg, shell, depth))
+}
+
+fn segment_may_enable_python_inspect(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    depth: usize,
+) -> bool {
+    if seg.raw.contains("PYTHONINSPECT") {
+        return true;
+    }
+    let words: Vec<&str> = seg
+        .command
+        .iter()
+        .chain(seg.args.iter())
+        .map(|word| word.trim_start_matches(['(', '{']))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words
+        .first()
+        .is_some_and(|first| !command_name_is_statically_bound(first, shell))
+    {
+        return true;
+    }
+    let mut exporting = false;
+    let mut eval_at = None;
+    for (index, word) in words.iter().enumerate() {
+        if !command_word_is_statically_bound(word, shell) {
+            continue;
+        }
+        let normalized = normalize_shell_token(word, shell);
+        if normalized.contains("PYTHONINSPECT") {
+            return true;
+        }
+        let at_command_start = index == 0 || {
+            let previous = normalize_shell_token(words[index - 1], shell);
+            COMMAND_START_WORDS.contains(&previous.as_str())
+                || ENV_EXPORTING_BUILTINS.contains(&previous.as_str())
+                || previous.ends_with("()")
+        };
+        match normalized.as_str() {
+            "source" | "." | "alias" | "enable" if at_command_start => return true,
+            "eval" => {
+                eval_at.get_or_insert(index);
+            }
+            base if ENV_EXPORTING_BUILTINS.contains(&base) => exporting = true,
+            _ => {}
+        }
+    }
+    if !exporting && eval_at.is_none() {
+        return false;
+    }
+    if words
+        .iter()
+        .any(|word| !command_word_is_statically_bound(word, shell))
+    {
+        return true;
+    }
+    let Some(eval_at) = eval_at else {
+        return false;
+    };
+    if depth >= MAX_PYTHON_INSPECT_EVAL_DEPTH {
+        return true;
+    }
+    let body = words[eval_at + 1..]
+        .iter()
+        .map(|word| normalize_shell_token(word, shell))
+        .collect::<Vec<_>>()
+        .join(" ");
+    segments_may_enable_python_inspect(&tokenize::tokenize(&body, shell), shell, depth + 1)
+}
+
 fn check_pipe_to_interpreter(
     segments: &[tokenize::Segment],
     shell: ShellType,
     findings: &mut Vec<Finding>,
 ) {
+    let mut inspect_may_be_enabled = None;
     for (i, seg) in segments.iter().enumerate() {
         if i == 0 {
             continue;
@@ -3215,6 +3352,8 @@ fn check_pipe_to_interpreter(
                     // blocking via the fetch-source path below.
                     if !is_url_fetch_command(&source_base)
                         && is_python_dash_c_data_pipeline(seg, shell)
+                        && !*inspect_may_be_enabled
+                            .get_or_insert_with(|| input_may_enable_python_inspect(segments, shell))
                     {
                         continue;
                     }
@@ -3947,7 +4086,16 @@ fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Fin
     } else {
         extract_host_from_arg(arg)
     };
-    if let Some(host) = host {
+    let Some(host) = host else {
+        return;
+    };
+    // A curl empty-hex host is also evaluated as the numeric address that a
+    // libc `inet_aton` resolver reads from the same spelling.
+    let numeric_reading = (client == "curl")
+        .then(|| crate::parse::curl_empty_hex_numeric_reading(&host))
+        .flatten()
+        .map(|address| address.to_string());
+    for host in std::iter::once(host).chain(numeric_reading) {
         if METADATA_ENDPOINTS.contains(&host.as_str()) {
             findings.push(Finding {
                 rule_id: RuleId::MetadataEndpoint,
@@ -4062,16 +4210,43 @@ fn extract_client_destination_host(client: &str, arg: &str) -> Option<String> {
     }
 }
 
+/// How a network list is used, which decides how two readings of one host
+/// combine: a deny list matches if EITHER reading matches, an allow list only
+/// if BOTH do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkListUse {
+    Allow,
+    Deny,
+}
+
 /// The raw policy entry is interpreted in the same client authority context.
-/// A DNS name containing an empty hex component must not inherit a numeric
-/// loopback/CIDR allow entry, or lose an exact DNS deny entry, during matching.
-fn matches_client_network_list(client: &str, host: &str, list: &[String]) -> bool {
+/// A curl host with an empty hex component is a DNS name for curl 8.7.1 and a
+/// numeric address for resolvers that use libc `inet_aton`. Both readings are
+/// evaluated: a numeric CIDR/IP deny still applies, a DNS deny is not lost, and
+/// an allow entry admits the destination only if it covers both readings.
+fn matches_client_network_list(
+    client: &str,
+    host: &str,
+    list: &[String],
+    list_use: NetworkListUse,
+) -> bool {
     let dns_host = (client == "curl")
         .then(|| crate::parse::curl_empty_hex_dns_host(host))
         .flatten();
-    let Some(host) = dns_host else {
+    let Some(dns_host) = dns_host else {
         return matches_network_list(host, list);
     };
+    let numeric_match = crate::parse::curl_empty_hex_numeric_reading(host)
+        .is_some_and(|address| matches_network_list(&address.to_string(), list));
+    let dns_match = matches_dns_reading(&dns_host, list);
+    match list_use {
+        NetworkListUse::Allow => dns_match && numeric_match,
+        NetworkListUse::Deny => dns_match || numeric_match,
+    }
+}
+
+/// DNS reading of a curl empty-hex host against a network list.
+fn matches_dns_reading(host: &str, list: &[String]) -> bool {
     let host = host.trim_end_matches('.');
     list.iter().any(|entry| {
         let entry = entry.trim().trim_start_matches('.');
@@ -4796,10 +4971,10 @@ pub fn check_network_policy(
                 let Some(host) = extract_client_destination_host(&cmd_base, &destination) else {
                     continue;
                 };
-                if matches_client_network_list(&cmd_base, &host, allow) {
+                if matches_client_network_list(&cmd_base, &host, allow, NetworkListUse::Allow) {
                     continue;
                 }
-                if matches_client_network_list(&cmd_base, &host, deny) {
+                if matches_client_network_list(&cmd_base, &host, deny, NetworkListUse::Deny) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -4829,10 +5004,10 @@ pub fn check_network_policy(
             }
             if let Some(spec) = crate::extract::parse_scp_remote_spec(trimmed, shell) {
                 let host = spec.host;
-                if matches_client_network_list(&cmd_base, &host, allow) {
+                if matches_client_network_list(&cmd_base, &host, allow, NetworkListUse::Allow) {
                     continue;
                 }
-                if matches_client_network_list(&cmd_base, &host, deny) {
+                if matches_client_network_list(&cmd_base, &host, deny, NetworkListUse::Deny) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -11857,6 +12032,49 @@ mod tests {
             .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
     }
 
+    /// Bug 4: PYTHONINSPECT (or `-i`) turns `python3 -c <literal>` into a REPL
+    /// that reads the rest of the piped stdin as code once the fixed program
+    /// exits. Any input that may set it must keep the pipe-to-interpreter finding.
+    #[test]
+    fn python_inspect_set_anywhere_in_the_input_keeps_pipe_to_interpreter() {
+        for input in [
+            "export PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=1 && echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=1\necho payload | python3 -c 'print(1)'",
+            "PYTHONINSPECT=1; export PYTHONINSPECT; echo payload | python3 -c 'print(1)'",
+            "set -a; PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "declare -x PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "typeset -x PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSP${E}CT=1; echo payload | python3 -c 'print(1)'",
+            "export $'PYTHON\\x49NSPECT=1'; echo payload | python3 -c 'print(1)'",
+            "builtin export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "command export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "{ export PYTHON\"INSPECT\"=1; }; echo payload | python3 -c 'print(1)'",
+            "if true; then export PYTHON\"INSPECT\"=1; fi; echo payload | python3 -c 'print(1)'",
+            "eval \"$SETUP\"; echo payload | python3 -c 'print(1)'",
+            ". ./env.sh; echo payload | python3 -c 'print(1)'",
+            "source ./env.sh; echo payload | python3 -c 'print(1)'",
+            "alias python3='python3 -i'\necho payload | python3 -c 'print(1)'",
+            "echo payload | env PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | python3 -i -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT/-i source was not refused: {input:?}"
+            );
+        }
+        // Unrelated environment changes keep the issue #136 data-pipeline exemption.
+        for input in [
+            "echo hi | python3 -c 'print(1)'",
+            "export FOO=bar; echo hi | python3 -c 'print(1)'",
+            "cd /tmp && printf '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
     #[test]
     fn issue_264_python_program_selection_cannot_be_changed_by_later_dash_c() {
         for input in [
@@ -15870,6 +16088,23 @@ mod tests {
                 .any(|f| f.rule_id == RuleId::MetadataEndpoint),
             "should detect metadata endpoint in --flag=URL"
         );
+    }
+
+    /// Bug 5: an empty-hex curl host is a DNS name for curl 8.7.1 but a
+    /// numeric address for builds that resolve through libc `inet_aton`.
+    #[test]
+    fn curl_empty_hex_numeric_reading_is_checked_for_private_network() {
+        let findings = check_default("curl http://0xa.0x.0x.0x5/internal", ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PrivateNetworkAccess),
+            "{findings:?}"
+        );
+        let loopback = check_default("curl http://0x7f.0x/internal", ShellType::Posix);
+        assert!(loopback
+            .iter()
+            .all(|f| f.rule_id != RuleId::PrivateNetworkAccess));
     }
 
     #[test]

@@ -84,6 +84,8 @@ const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_seccomp;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod clone_policy;
 
 /// Report only an architecture with an implemented filter and, on AArch64,
 /// observed kernel seccomp support. User-mode emulators that cannot install a
@@ -1097,6 +1099,60 @@ impl extrasafe::RuleSet for PostExecRuntime {
     }
 }
 
+/// Process and thread creation. Replaces extrasafe's `ForkAndExec` and
+/// `Threads::allow_create`, which allow `clone` and `clone3` with ANY flags
+/// (extrasafe 0.5.1 leaves its flag filters commented out). `clone` is limited
+/// to the reviewed fork/vfork/thread flags shared with aarch64; `clone3` is
+/// allowed here only so the ENOSYS answer of the filter installed before this
+/// one reaches libc, which then falls back to the inspectable `clone`.
+#[cfg(target_arch = "x86_64")]
+struct ProcessCreation;
+
+#[cfg(target_arch = "x86_64")]
+impl extrasafe::RuleSet for ProcessCreation {
+    fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
+        use extrasafe::syscalls::Sysno;
+
+        vec![
+            Sysno::fork,
+            Sysno::vfork,
+            Sysno::execve,
+            Sysno::execveat,
+            Sysno::wait4,
+            Sysno::waitid,
+            Sysno::clone3,
+        ]
+    }
+
+    fn conditional_rules(
+        &self,
+    ) -> std::collections::HashMap<extrasafe::syscalls::Sysno, Vec<extrasafe::SeccompRule>> {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::{SeccompArgumentFilter, SeccompRule, SeccompilerComparator};
+
+        let clone = clone_policy::clone_allow_rules()
+            .into_iter()
+            .map(|conditions| {
+                conditions.into_iter().fold(
+                    SeccompRule::new(Sysno::clone),
+                    |rule, (mask, value)| {
+                        rule.and_condition(SeccompArgumentFilter::new64(
+                            0,
+                            SeccompilerComparator::MaskedEq(mask),
+                            value,
+                        ))
+                    },
+                )
+            })
+            .collect();
+        [(Sysno::clone, clone)].into_iter().collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "ProcessCreation"
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl extrasafe::RuleSet for SafeDescriptorControls {
     fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
@@ -1203,9 +1259,16 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
 
 #[cfg(target_arch = "x86_64")]
 fn apply_seccomp() -> Result<bool, ContainError> {
-    use extrasafe::builtins::danger_zone::{ForkAndExec, Threads};
     use extrasafe::builtins::{BasicCapabilities, SystemIO};
     use extrasafe::SafetyContext;
+
+    // First filter: clone3 -> ENOSYS, so libc falls back to the flag-checked
+    // clone of `ProcessCreation` (same order as aarch64).
+    let clone3_fallback =
+        clone_policy::clone3_enosys_filter(seccompiler::TargetArch::x86_64, libc::SYS_clone3)
+            .map_err(ContainError::Seccomp)?;
+    seccompiler::apply_filter(&clone3_fallback)
+        .map_err(|error| ContainError::Seccomp(error.to_string()))?;
 
     SafetyContext::new()
         .enable(BasicCapabilities)
@@ -1228,8 +1291,7 @@ fn apply_seccomp() -> Result<bool, ContainError> {
         // EPERM by the default action.
         .and_then(|ctx| ctx.enable(SafeDescriptorControls))
         .and_then(|ctx| ctx.enable(PostExecRuntime))
-        .and_then(|ctx| ctx.enable(Threads::nothing().allow_create()))
-        .and_then(|ctx| ctx.enable(ForkAndExec))
+        .and_then(|ctx| ctx.enable(ProcessCreation))
         .map_err(|e| ContainError::Seccomp(e.to_string()))?
         .apply_to_current_thread()
         .map_err(|e| ContainError::Seccomp(e.to_string()))?;
@@ -2361,6 +2423,118 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// 14f: the installed production policy limits `clone` flags and answers
+    /// `clone3` with ENOSYS on BOTH architectures. x86_64 previously used
+    /// extrasafe's `ForkAndExec`/`Threads`, which allow `clone`/`clone3` with any
+    /// flags (CLONE_PARENT, CLONE_UNTRACED, namespace flags).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_clone_policy_subprocess() {
+        if std::env::var_os("TIRITH_CLONE_POLICY_FIXTURE").is_none() {
+            return;
+        }
+        assert!(apply_seccomp().expect("apply production syscall policy"));
+        for flags in [
+            libc::CLONE_PARENT | libc::SIGCHLD,
+            libc::CLONE_UNTRACED | libc::SIGCHLD,
+            libc::CLONE_NEWUSER | libc::SIGCHLD,
+            libc::SIGKILL,
+        ] {
+            // SAFETY: a fork-style clone (no new stack). If the policy wrongly
+            // allows it, the child exits at once without running test code.
+            let result =
+                unsafe { libc::syscall(libc::SYS_clone, flags as libc::c_long, 0, 0, 0, 0) };
+            if result == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if result > 0 {
+                unsafe { libc::waitpid(result as libc::pid_t, std::ptr::null_mut(), 0) };
+            }
+            assert_eq!((result, error), (-1, Some(libc::EPERM)), "clone {flags:#x}");
+        }
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS)
+        );
+        // Ordinary process and thread creation still work through libc's
+        // clone fallback.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("spawn a shell under the production policy");
+        assert!(status.success(), "{status:?}");
+        assert_eq!(std::thread::spawn(|| 7).join().unwrap(), 7);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_policy_restricts_clone_flags_on_every_architecture() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::production_clone_policy_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_CLONE_POLICY_FIXTURE", "1")
+            .output()
+            .expect("run isolated production clone policy fixture");
+        assert!(
+            output.status.success(),
+            "clone policy fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// No x86_64 ruleset may grant `clone` or `clone3` unconditionally again
+    /// (extrasafe would then reject the conditional clone rules, or, if the
+    /// conditional rules were dropped, allow every flag).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_process_creation_is_the_only_clone_grant() {
+        use extrasafe::builtins::{BasicCapabilities, SystemIO};
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::RuleSet as _;
+
+        let simple = ProcessCreation.simple_rules();
+        assert!(simple.contains(&Sysno::clone3));
+        assert!(!simple.contains(&Sysno::clone));
+        let conditional = ProcessCreation.conditional_rules();
+        let clone = conditional.get(&Sysno::clone).expect("conditional clone");
+        let table = clone_policy::clone_allow_rules();
+        assert_eq!(clone.len(), table.len());
+        for (rule, conditions) in clone.iter().zip(table) {
+            assert_eq!(rule.argument_filters.len(), conditions.len());
+            for (filter, (_, value)) in rule.argument_filters.iter().zip(conditions) {
+                assert_eq!(filter.arg_idx, 0);
+                assert!(filter.is_64bit);
+                assert_eq!(filter.value, value);
+            }
+        }
+        let others: [Vec<Sysno>; 4] = [
+            BasicCapabilities.simple_rules(),
+            SystemIO::nothing()
+                .allow_read()
+                .allow_write()
+                .allow_open()
+                .yes_really()
+                .allow_metadata()
+                .allow_close()
+                .simple_rules(),
+            SafeDescriptorControls.simple_rules(),
+            PostExecRuntime.simple_rules(),
+        ];
+        for rules in others {
+            assert!(!rules.contains(&Sysno::clone) && !rules.contains(&Sysno::clone3));
+        }
     }
 
     #[test]
