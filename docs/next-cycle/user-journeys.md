@@ -85,6 +85,8 @@ This writes the same hook script and `~/.claude/settings.json` handler as
 and undoing the operation (`tirith policy operation OPERATION_UUID --action undo`)
 removes only the owned handler. If the plan created the hook script, undo leaves
 it as an empty file; either setup command replaces that file without `--force`.
+If the settings already run the Tirith hook but the script is missing,
+recommended setup refuses; run `tirith setup claude-code` to restore it first.
 It needs a trusted `python3`
 and works on macOS and Linux; on Windows it refuses, so run
 `tirith setup claude-code` there. Setup refuses, before changing anything, when

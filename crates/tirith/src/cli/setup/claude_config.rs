@@ -415,6 +415,14 @@ impl PreparedClaude {
             &python,
         )];
         let handler = OwnedClaudeHandler::capture(before_settings.as_deref(), &intended, &legacy)?;
+        // A Tirith handler whose script is missing fails closed today (the
+        // interpreter exits 2, Claude blocks). Undo keeps that pre-existing
+        // handler but publishes an empty script for a created file, which
+        // would exit 0 and silently allow every Bash call. Leave the state
+        // alone and point at the explicit repair instead.
+        if handler.before.is_some() && before_hook.is_none() {
+            return Err("Claude settings already run the Tirith hook script, but the script is missing (Claude is blocking every Bash call); run `tirith setup claude-code` to restore it, then retry".into());
+        }
         snapshot.revalidate_inputs().map_err(|e| e.to_string())?;
         Ok(Self {
             snapshot,
@@ -607,6 +615,11 @@ mod tests {
 
     #[cfg(unix)]
     fn explicit_setup(python: &str) {
+        try_explicit_setup(python).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn try_explicit_setup(python: &str) -> Result<(), String> {
         use super::super::run_impl::{Scope, SetupOpts};
         super::super::tools::setup_claude_code(&SetupOpts {
             scope: Scope::User,
@@ -618,7 +631,6 @@ mod tests {
             python_bin: Some(python.into()),
             update_configs: false,
         })
-        .unwrap();
     }
 
     /// (settings bytes, settings mode, hook bytes, hook mode)
@@ -759,6 +771,54 @@ mod tests {
             apply(&prepared(home).unwrap());
             assert_eq!(written(home), fresh_explicit);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_handler_with_a_missing_hook_is_refused_so_undo_cannot_fail_open() {
+        // A Tirith handler whose script is missing blocks every Bash call
+        // (the interpreter exits 2). Undo of a recommended plan would keep that
+        // pre-existing handler and publish an EMPTY script beside it, which
+        // exits 0 and silently allows everything. Recommended setup must refuse
+        // this state and leave it (fail-closed) for explicit repair.
+        let fresh_explicit = crate::cli::test_harness::with_fake_env(true, |home, _| {
+            explicit_setup(PYTHON);
+            written(home)
+        });
+        let legacy = format!(r#"{PYTHON} "$HOME/.claude/hooks/tirith-check.py""#);
+        for command in [None, Some(legacy)] {
+            crate::cli::test_harness::with_fake_env(true, |home, _| {
+                explicit_setup(PYTHON);
+                let settings = home.join(".claude/settings.json");
+                if let Some(command) = &command {
+                    let document = json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":command}]}]}});
+                    std::fs::write(&settings, document.to_string()).unwrap();
+                }
+                let hook = home.join(".claude/hooks/tirith-check.py");
+                std::fs::remove_file(&hook).unwrap();
+                let settings_before = std::fs::read(&settings).unwrap();
+                let error = match prepared(home) {
+                    Ok(_) => {
+                        panic!("recommended setup accepted an active handler without its script")
+                    }
+                    Err(error) => error,
+                };
+                assert!(error.contains("tirith setup claude-code"), "{error}");
+                // Nothing was touched: the handler still fails closed.
+                assert_eq!(std::fs::read(&settings).unwrap(), settings_before);
+                assert!(!hook.exists());
+                // The explicit command restores the script without --force.
+                // It keeps a pre-wrapper handler (asking for --force), after
+                // which the retried recommended setup upgrades it in place.
+                let explicit = try_explicit_setup(PYTHON);
+                assert_eq!(explicit.is_ok(), command.is_none(), "{explicit:?}");
+                assert_eq!(std::fs::read(&hook).unwrap(), fresh_explicit.2);
+                if command.is_some() {
+                    apply(&prepared(home).unwrap());
+                }
+                assert_eq!(written(home), fresh_explicit);
+            });
+        }
     }
 
     #[cfg(unix)]
