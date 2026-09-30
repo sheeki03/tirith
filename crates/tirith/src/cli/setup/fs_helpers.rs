@@ -2164,7 +2164,9 @@ pub fn write_hook_script(
                 action = Action::FixMode;
                 return Ok(FileUpdate::write_text(content.to_string(), 0o755).with_exact_mode());
             }
-            if !force {
+            // An empty file holds no content to preserve. Undo of a journaled step
+            // that created the hook leaves exactly such a placeholder.
+            if !force && !existing.is_empty() {
                 if dry_run {
                     action = Action::WouldError;
                     return Ok(FileUpdate::unchanged());
@@ -2619,6 +2621,19 @@ mod tests {
         let result = write_hook_script(&path, dir.path(), "new content", false, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("content differs"));
+    }
+
+    #[test]
+    fn write_hook_script_replaces_an_empty_placeholder_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sh");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_hook_script(&path, dir.path(), "new content", false, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

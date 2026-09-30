@@ -359,6 +359,24 @@ pub(crate) struct PreparedClaude {
 
 pub(crate) type PreparedClaudeParts = (Vec<RequestedChange>, BTreeMap<PathBuf, Option<String>>);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the hook interpreter. Tests that drive the full
+    /// recommended path set it so they run on hosts whose `python3` is not a
+    /// trusted executable, instead of silently skipping.
+    pub(crate) static TEST_HOOK_PYTHON: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn hook_python() -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(python) = TEST_HOOK_PYTHON.with(|python| python.borrow().clone()) {
+        return Ok(python);
+    }
+    super::run_impl::resolve_hook_dependency(&["python3"], "Python", false)?
+        .ok_or_else(|| "Python is required — install Python and retry".into())
+}
+
 impl PreparedClaude {
     pub(crate) fn capture(cwd: Option<&str>) -> Result<Self, String> {
         if cfg!(not(unix)) {
@@ -372,8 +390,7 @@ impl PreparedClaude {
             .revalidate_for_mutation()
             .map_err(|e| e.to_string())?;
         // Same trusted, upgrade-stable launcher the explicit setup persists.
-        let python = super::run_impl::resolve_hook_dependency(&["python3"], "Python", false)?
-            .ok_or("Python is required — install Python and retry")?;
+        let python = hook_python()?;
         Self::prepare(snapshot, target.operator_home, &python)
     }
 
@@ -690,6 +707,57 @@ mod tests {
             assert_eq!(written(home), before);
             let (requests, _) = prepared(home).unwrap().setup_parts().unwrap();
             assert!(requests.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_of_a_created_hook_lets_either_setup_command_take_over_again() {
+        use super::super::change_plan::{JobState, MutationService};
+        // Fresh home: recommended apply, then undo. Undo leaves an empty
+        // placeholder hook script; neither command may then demand --force.
+        let fresh_explicit = crate::cli::test_harness::with_fake_env(true, |home, _| {
+            explicit_setup(PYTHON);
+            written(home)
+        });
+        crate::cli::test_harness::with_fake_env(true, |home, _| {
+            let prepared = prepared(home).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            plan(&prepared, &id);
+            let service = MutationService::current().unwrap();
+            assert_eq!(
+                service.apply(&id, &prepared.snapshot).unwrap().state,
+                JobState::Completed
+            );
+            assert_eq!(
+                service
+                    .undo(
+                        &id,
+                        &EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime)
+                    )
+                    .unwrap()
+                    .state,
+                JobState::Undone
+            );
+            assert_eq!(std::fs::read(&prepared.hook).unwrap(), b"");
+            explicit_setup(PYTHON);
+            assert_eq!(written(home), fresh_explicit);
+        });
+        crate::cli::test_harness::with_fake_env(true, |home, _| {
+            let first = prepared(home).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            plan(&first, &id);
+            let service = MutationService::current().unwrap();
+            service.apply(&id, &first.snapshot).unwrap();
+            service
+                .undo(
+                    &id,
+                    &EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime),
+                )
+                .unwrap();
+            // Recommended setup can be planned and applied again, too.
+            apply(&prepared(home).unwrap());
+            assert_eq!(written(home), fresh_explicit);
         });
     }
 

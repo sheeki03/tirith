@@ -249,15 +249,11 @@ mod tests {
     #[test]
     fn recommended_claude_step_plans_applies_and_undoes_with_the_explicit_command() {
         with_fake_env(true, |home, _| {
-            // Uses the real trusted python3 resolver, as the CLI does.
-            let Some(python) =
-                super::super::run_impl::resolve_hook_dependency(&["python3"], "Python", true)
-                    .ok()
-                    .flatten()
-            else {
-                eprintln!("skipping: no trusted python3 on PATH");
-                return;
-            };
+            // Pin the interpreter through the test seam so this test always
+            // runs, including on hosts without a trusted python3 on PATH.
+            let python = "/usr/bin/python3".to_string();
+            super::super::claude_config::TEST_HOOK_PYTHON
+                .with(|slot| *slot.borrow_mut() = Some(python.clone()));
             let mut request = request();
             request.agents.push(SelectedAgent::ClaudeCode);
             let id = uuid::Uuid::new_v4().to_string();
@@ -296,6 +292,26 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(home.join(".claude/settings.json")).unwrap())
                     .unwrap();
             assert_eq!(undone, serde_json::json!({}));
+            // Undo of a created hook leaves an empty placeholder. The explicit
+            // command must still take over without --force afterwards.
+            let hook = home.join(".claude/hooks/tirith-check.py");
+            assert_eq!(std::fs::read(&hook).unwrap(), b"");
+            super::super::tools::setup_claude_code(&super::super::run_impl::SetupOpts {
+                scope: super::super::run_impl::Scope::User,
+                with_mcp: false,
+                install_zshenv: false,
+                dry_run: false,
+                force: false,
+                tirith_bin: "/opt/tirith/bin/tirith".into(),
+                python_bin: Some(python.clone()),
+                update_configs: false,
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&hook).unwrap(),
+                crate::assets::TIRITH_CHECK_PY
+            );
+            super::super::claude_config::TEST_HOOK_PYTHON.with(|slot| *slot.borrow_mut() = None);
         });
     }
 

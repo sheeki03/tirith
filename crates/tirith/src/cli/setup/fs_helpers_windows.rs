@@ -2825,7 +2825,9 @@ pub fn write_hook_script(
                 }
                 return Ok(FileUpdate::unchanged());
             }
-            if !force {
+            // An empty file holds no content to preserve. Undo of a journaled step
+            // that created the hook leaves exactly such a placeholder.
+            if !force && !existing.is_empty() {
                 if dry_run {
                     eprintln!(
                         "[dry-run] would error: {} exists but content differs — use --force to update",

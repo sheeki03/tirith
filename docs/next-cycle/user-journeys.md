@@ -83,7 +83,9 @@ tirith setup recommended --scope user --shell zsh --agent claude-code
 This writes the same hook script and `~/.claude/settings.json` handler as
 `tirith setup claude-code`, so the two commands can be used interchangeably,
 and undoing the operation (`tirith policy operation OPERATION_UUID --action undo`)
-removes only the owned handler. It needs a trusted `python3`
+removes only the owned handler. If the plan created the hook script, undo leaves
+it as an empty file; either setup command replaces that file without `--force`.
+It needs a trusted `python3`
 and works on macOS and Linux; on Windows it refuses, so run
 `tirith setup claude-code` there. Setup refuses, before changing anything, when
 Claude managed settings are present, `CLAUDE_CONFIG_DIR` points elsewhere,
