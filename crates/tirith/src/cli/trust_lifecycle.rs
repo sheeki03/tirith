@@ -394,15 +394,14 @@ fn removal_rule_matches(own: Option<&str>, requested: Option<&str>) -> bool {
 }
 
 /// Make a revocation fit the trust store size cap. Revoking normally keeps the
-/// record as a tombstone (`revoked_at`), which grows the store; when that would
-/// push it past the read cap, the newly revoked records are deleted instead, so
-/// a revocation is never refused (the store it came from was read under the
-/// same cap, so deleting records always fits).
+/// record as a tombstone (`revoked_at`), which grows the store; when even the
+/// compact form would then pass the read cap, the newly revoked records are
+/// deleted instead, so a revocation is never refused: the store was read under
+/// the same cap, and `perform` writes a shrinking change compactly when the
+/// indented form would not fit.
 fn fit_revocations(store: &mut TrustGrantStore, revoked: &[usize]) {
-    let fits = serde_json::to_value(&*store)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .is_some_and(|text| text.len() as u64 <= trust_grants::STORE_READ_CAP);
+    let fits = serde_json::to_string(&*store)
+        .is_ok_and(|text| text.len() as u64 <= trust_grants::STORE_READ_CAP);
     if fits {
         return;
     }
@@ -416,6 +415,25 @@ fn fit_revocations(store: &mut TrustGrantStore, revoked: &[usize]) {
     }
 }
 
+/// Serialize a trust store for writing. Stores are written indented; a
+/// revocation, `remove` or `gc` (which only ever shrink the store) falls back to
+/// the compact form when the indented one would pass the 1 MiB read cap, so a
+/// store kept compact on disk can always be revoked from or pruned.
+fn store_text(after: &Value, shrinking: bool) -> Result<Option<String>, String> {
+    let fits = |text: &String| text.len() as u64 <= trust_grants::STORE_READ_CAP;
+    let pretty = serde_json::to_string_pretty(after).map_err(|_| "cannot serialize grant edit")?;
+    if fits(&pretty) {
+        return Ok(Some(pretty));
+    }
+    if shrinking {
+        let compact = serde_json::to_string(after).map_err(|_| "cannot serialize grant edit")?;
+        if fits(&compact) {
+            return Ok(Some(compact));
+        }
+    }
+    Ok(None)
+}
+
 fn perform(
     context: &Context,
     kind: OperationKind,
@@ -426,11 +444,9 @@ fn perform(
     let mut expected = BTreeMap::new();
     let mut requests = Vec::new();
     for (target, root, before, after) in changes {
-        let text =
-            serde_json::to_string_pretty(&after).map_err(|_| "cannot serialize grant edit")?;
         // Every trust store is read with a 1 MiB cap; a larger file would make
         // the whole store unreadable, so refuse instead of writing it.
-        if text.len() as u64 > trust_grants::STORE_READ_CAP {
+        let Some(text) = store_text(&after, matches!(kind, OperationKind::RevokeTrust))? else {
             return Err(format!(
                 "trust store {} would exceed its 1 MiB size limit; run tirith trust gc --scope all to prune expired grants and old revocations, or revoke grants you no longer need",
                 target
@@ -438,7 +454,7 @@ fn perform(
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ));
-        }
+        };
         super::preflight_config_write_authorization(
             &root,
             &target,
@@ -1891,35 +1907,35 @@ mod tests {
     #[test]
     fn revocation_is_never_refused_by_the_store_size_cap() {
         let _state = GlobalStateGuard::new().unwrap();
-        let pretty_len = |grants: &[TrustGrant]| {
-            let store = TrustGrantStore {
-                schema_version: trust_grants::STORE_VERSION,
-                grants: grants
-                    .iter()
-                    .map(|grant| serde_json::to_value(grant).unwrap())
-                    .collect(),
-            };
-            serde_json::to_string_pretty(&serde_json::to_value(&store).unwrap())
-                .unwrap()
-                .len()
+        let config = tirith_core::policy::config_dir().unwrap();
+        let store_path = config.join(trust_grants::STORE_FILE);
+        let compact_len = |grants: &[TrustGrant]| {
+            let mut store = TrustGrantStore::default();
+            for grant in grants {
+                store.insert(grant).unwrap();
+            }
+            serde_json::to_vec(&store).unwrap().len()
         };
         let cap = trust_grants::STORE_READ_CAP as usize;
-        // Only active grants, written as `trust add` would leave them: just
-        // under the cap, with no room for a `revoked_at` tombstone.
+        // Only active grants, written compactly (hand-edited, `jq -c`, config
+        // management): just under the cap, so the indented form is far over
+        // it and there is no room for a `revoked_at` tombstone either way.
         let mut grants = Vec::new();
-        while pretty_len(&grants) < cap - 4_000 {
-            grants.push(TrustGrant {
-                reason: Some("x".repeat(400)),
+        let mut estimate = compact_len(&[]);
+        while estimate < cap - 4_000 {
+            let grant = TrustGrant {
+                reason: Some("x".repeat(100)),
                 ..user_grant(
                     &format!("https://mirror.example/{}", grants.len()),
                     Some("shortened_url"),
                 )
-            });
+            };
+            estimate += serde_json::to_vec(&grant).unwrap().len() + 1;
+            grants.push(grant);
         }
-        let pad = cap - 10 - pretty_len(&grants);
-        grants.last_mut().unwrap().reason = Some("x".repeat(400 + pad));
-        assert_eq!(pretty_len(&grants), cap - 10);
-        write_grants(&grants);
+        let pad = cap - 10 - compact_len(&grants);
+        grants.last_mut().unwrap().reason = Some("x".repeat(100 + pad));
+        assert_eq!(compact_len(&grants), cap - 10);
         let first = grants[0].clone();
         let second = grants[1].clone();
         let third = grants[2].clone();
@@ -1930,10 +1946,26 @@ mod tests {
                 .flatten()
                 .find(|grant| grant.id == id)
         };
+        let effective = |target: &str| {
+            let explained = explain_value(&mut Context::capture().unwrap(), target, "all").unwrap();
+            // The target itself is still trusted by an effective grant.
+            usize::from(
+                explained["matching_effective_grants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["pattern"] == target),
+            )
+        };
+        let size = || std::fs::metadata(&store_path).unwrap().len();
 
         // `trust remove` at the cap: the record is deleted instead of tombstoned.
+        write_grants(&grants);
+        assert_eq!(effective(&third.pattern), 1);
         assert_eq!(remove(&third.pattern, None, "user"), 0);
         assert!(present(&third.id).is_none());
+        assert_eq!(effective(&third.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
 
         // `trust revoke` at the cap, same store again.
         write_grants(&grants);
@@ -1943,18 +1975,50 @@ mod tests {
             present(&first.id).is_none(),
             "a revocation that cannot fit as a tombstone deletes the record"
         );
+        assert_eq!(effective(&first.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
         // With room again, a revocation keeps its tombstone.
         let revoked = revoke_value(&mut Context::capture().unwrap(), &second.id).unwrap();
         assert_eq!(revoked["state"], "revoked", "{revoked}");
         assert!(present(&second.id).unwrap().revoked_at.is_some());
-        let size = std::fs::metadata(
-            tirith_core::policy::config_dir()
-                .unwrap()
-                .join(trust_grants::STORE_FILE),
-        )
-        .unwrap()
-        .len();
-        assert!(size <= trust_grants::STORE_READ_CAP, "{size}");
+        assert_eq!(effective(&second.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+
+        // `trust gc` prunes an expired grant from the same compact store.
+        // (Shorten the last reason by the bytes the expiry adds, so the
+        // written store stays at cap - 10.)
+        let mut expiring = grants.clone();
+        expiring[3].expires_at = Some("2020-01-01T00:00:00Z".into());
+        let grown = compact_len(&expiring) - (cap - 10);
+        let last = expiring.last_mut().unwrap();
+        let reason = last.reason.as_mut().unwrap();
+        reason.truncate(reason.len() - grown);
+        assert_eq!(compact_len(&expiring), cap - 10);
+        write_grants(&expiring);
+        assert_eq!(gc("user", true), 0);
+        assert!(present(&expiring[3].id).is_none());
+        assert!(present(&first.id).is_some());
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+
+        // A compact legacy trust.json near the cap: `trust remove` succeeds.
+        std::fs::remove_file(&store_path).unwrap();
+        let legacy = config.join("trust.json");
+        let entry = |index: usize| json!({"pattern":format!("https://legacy.example/{index}"),"rule_id":"shortened_url","added":"2026-01-01T00:00:00Z","source":"cli"});
+        let mut entries = Vec::new();
+        let mut estimate = 0;
+        while estimate < cap - 1_000 {
+            estimate += serde_json::to_vec(&entry(entries.len())).unwrap().len() + 1;
+            entries.push(entry(entries.len()));
+        }
+        let written = serde_json::to_vec(&json!({"version":1,"entries":entries})).unwrap();
+        assert!(written.len() <= cap, "{}", written.len());
+        std::fs::write(&legacy, &written).unwrap();
+        assert_eq!(effective("https://legacy.example/5"), 1);
+        assert_eq!(remove("https://legacy.example/5", None, "user"), 0);
+        assert_eq!(effective("https://legacy.example/5"), 0);
+        assert_eq!(effective("https://legacy.example/6"), 1);
+        let legacy_size = std::fs::metadata(&legacy).unwrap().len();
+        assert!(legacy_size <= trust_grants::STORE_READ_CAP, "{legacy_size}");
     }
 
     #[test]

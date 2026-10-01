@@ -54,9 +54,11 @@ the target; `--rule` compares rule IDs case-insensitively, like `add`.
 30 days; younger revocations stay as tombstones so retries and `explain ID`
 still resolve them. When the store is still above 768 KiB, gc also prunes the
 oldest remaining revocations. Every trust store is read with a 1 MiB cap, so a
-change that would write a larger store is refused, except a revocation: when a
-revoked record no longer fits as a tombstone it is deleted instead, so `revoke`
-and `remove` always succeed. `tirith trust diff` covers the grant store as well
+change that would write a larger store is refused, except a revocation. Stores
+are written indented; `revoke`, `remove` and `gc` write the compact form when
+the indented one would not fit (for example a store kept compact on disk), and
+when a revoked record no longer fits even as a compact tombstone it is deleted
+instead, so `revoke` and `remove` always succeed. `tirith trust diff` covers the grant store as well
 as the legacy stores; revoked grants are not part of the trust set. When the
 grant store cannot be read (corrupted, oversized, or written by a newer
 version) its grants are left out, the other sources still appear, a note says
