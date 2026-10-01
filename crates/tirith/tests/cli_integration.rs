@@ -90,6 +90,114 @@ fn ordinary_cli_tests_cannot_bypass_the_hermetic_command_builder() {
     );
 }
 
+/// Run `tirith output wrap <action>` as a zsh user whose HOME is `home`.
+#[cfg(unix)]
+fn output_wrap_zsh(
+    home: &std::path::Path,
+    zdotdir: Option<&std::path::Path>,
+    xdg_config_home: &std::ffi::OsStr,
+    action: &str,
+) -> std::process::Output {
+    let mut cmd = tirith();
+    cmd.env("HOME", home)
+        .env("SHELL", "/bin/zsh")
+        .env("XDG_CONFIG_HOME", xdg_config_home)
+        .args(["output", "wrap", action]);
+    match zdotdir {
+        Some(dir) => cmd.env("ZDOTDIR", dir),
+        None => cmd.env_remove("ZDOTDIR"),
+    };
+    cmd.output()
+        .unwrap_or_else(|error| panic!("run output wrap {action}: {error}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn output_wrap_status_and_off_ignore_an_invalid_variable_the_shell_does_not_use() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let ok = output_wrap_zsh(home.path(), None, config.as_os_str(), "on");
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let zshrc = home.path().join(".zshrc");
+    assert!(fs::read_to_string(&zshrc)
+        .unwrap()
+        .contains("# BEGIN tirith-output-wrap"));
+
+    // zsh never reads XDG_CONFIG_HOME; a relative value (invalid per the XDG
+    // spec) must not stop status/off from finding the wrapper in ~/.zshrc.
+    let relative = std::ffi::OsStr::new("rel/cfg");
+    let status = output_wrap_zsh(home.path(), None, relative, "status");
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("enabled:   yes"));
+    let off = output_wrap_zsh(home.path(), None, relative, "off");
+    assert!(
+        off.status.success(),
+        "off failed: {}",
+        String::from_utf8_lossy(&off.stderr)
+    );
+    assert!(!fs::read_to_string(&zshrc)
+        .unwrap()
+        .contains("# BEGIN tirith-output-wrap"));
+}
+
+#[cfg(unix)]
+#[test]
+fn output_wrap_treats_a_symlinked_old_path_as_the_same_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let zdotdir = home.path().join("dotfiles/zsh");
+    fs::create_dir_all(&zdotdir).unwrap();
+    let real = zdotdir.join(".zshrc");
+    fs::write(&real, "export KEEP_ME=1\n").unwrap();
+    // A common dotfile layout: ~/.zshrc is a symlink to $ZDOTDIR/.zshrc.
+    std::os::unix::fs::symlink(&real, home.path().join(".zshrc")).unwrap();
+
+    // A second layout: ZDOTDIR names HOME through a symlinked directory.
+    let other_home = tempfile::tempdir().unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let home_link = links.path().join("home-link");
+    std::os::unix::fs::symlink(other_home.path(), &home_link).unwrap();
+    let other_real = other_home.path().join(".zshrc");
+    fs::write(&other_real, "export KEEP_ME=1\n").unwrap();
+
+    for (home, zdotdir, real) in [
+        (home.path(), zdotdir.as_path(), real.as_path()),
+        (other_home.path(), home_link.as_path(), other_real.as_path()),
+    ] {
+        let run = |action: &str| output_wrap_zsh(home, Some(zdotdir), config.as_os_str(), action);
+        for action in ["on", "status", "on", "status"] {
+            let out = run(action);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{action} failed: {stderr}");
+            assert!(
+                !stdout.contains("older copy") && !stderr.contains("older copy"),
+                "{action} reported the live profile as an older copy:\n{stdout}{stderr}"
+            );
+        }
+        let content = fs::read_to_string(real).unwrap();
+        assert!(content.contains("# BEGIN tirith-output-wrap"));
+        assert!(content.contains("export KEEP_ME=1"));
+        let off = run("off");
+        assert!(
+            off.status.success(),
+            "off failed: {}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+        let content = fs::read_to_string(real).unwrap();
+        assert!(!content.contains("# BEGIN tirith-output-wrap"));
+        assert!(content.contains("export KEEP_ME=1"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn output_wrap_actions_never_execute_a_path_shadowed_ps() {

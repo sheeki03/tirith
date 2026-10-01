@@ -490,33 +490,104 @@ struct ProfileTarget {
     stale: Option<PathBuf>,
 }
 
-/// The old fixed path is only stale when it differs from the resolved profile
-/// (the one the shell reads); then a block there is never loaded, so it is
-/// reported and cleaned up rather than treated as the active wrapper.
+/// The old fixed path is only stale when it is a different file from the
+/// resolved profile (the one the shell reads); then a block there is never
+/// loaded, so it is reported and cleaned up rather than treated as the active
+/// wrapper. A symlink to the resolved profile (or a path reaching it through a
+/// symlinked directory) is the same file, not a stale copy.
 fn stale_legacy_copy(
     resolved: &std::path::Path,
     legacy: Option<PathBuf>,
     has_block: impl Fn(&std::path::Path) -> bool,
+    same_file: impl Fn(&std::path::Path, &std::path::Path) -> bool,
 ) -> Option<PathBuf> {
-    legacy.filter(|legacy| legacy != resolved && has_block(legacy))
+    legacy.filter(|legacy| legacy != resolved && !same_file(legacy, resolved) && has_block(legacy))
+}
+
+/// Pick the profile for `shell`. When the shared resolution has no native
+/// location for it here (zsh and Fish on Windows, PowerShell on Windows
+/// without a Documents directory), keep the fixed path older releases used,
+/// so an existing wrapper can still be found and removed. When the old path
+/// is the resolved profile under another name (ZDOTDIR reaching HOME through
+/// a symlinked directory), use whichever name reaches the file directly,
+/// since profile edits refuse to go through a symlink.
+fn resolve_target(
+    shell: &'static str,
+    inputs: &super::shell_target::TargetInputs,
+    files: &impl ProfileFiles,
+) -> Result<ProfileTarget, String> {
+    let legacy = legacy_profile_for(shell, &inputs.home, |path| files.exists(path));
+    match profile_for(shell, inputs, |path| files.exists(path)) {
+        Ok(Some(resolved)) => {
+            let profile = match &legacy {
+                Some(legacy)
+                    if legacy != &resolved
+                        && files.same_file(legacy, &resolved)
+                        && !files.direct(&resolved)
+                        && files.direct(legacy) =>
+                {
+                    legacy.clone()
+                }
+                _ => resolved.clone(),
+            };
+            Ok(ProfileTarget {
+                shell,
+                stale: stale_legacy_copy(
+                    &resolved,
+                    legacy,
+                    |path| files.has_block(path),
+                    |a, b| files.same_file(a, b),
+                ),
+                profile,
+            })
+        }
+        unresolved => legacy
+            .map(|profile| ProfileTarget {
+                shell,
+                profile,
+                stale: None,
+            })
+            .ok_or_else(|| unresolved.err().unwrap_or_default()),
+    }
+}
+
+/// The file-system questions profile selection asks, injectable for tests.
+trait ProfileFiles {
+    fn exists(&self, path: &std::path::Path) -> bool;
+    fn has_block(&self, path: &std::path::Path) -> bool;
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool;
+    /// Neither the file nor its directory is a symlink.
+    fn direct(&self, path: &std::path::Path) -> bool;
+}
+
+struct RealProfileFiles;
+
+impl ProfileFiles for RealProfileFiles {
+    fn exists(&self, path: &std::path::Path) -> bool {
+        path.exists()
+    }
+    fn has_block(&self, path: &std::path::Path) -> bool {
+        fs::read_to_string(path).is_ok_and(|content| content.contains(BEGIN_MARKER))
+    }
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool {
+        matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+    }
+    fn direct(&self, path: &std::path::Path) -> bool {
+        let not_link = |path: &std::path::Path| {
+            fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_symlink())
+        };
+        not_link(path) && path.parent().is_some_and(not_link)
+    }
 }
 
 /// `Err` carries an optional reason shown under the caller's message.
 fn detect_profile() -> Result<ProfileTarget, String> {
     let home = home::home_dir().ok_or_else(String::new)?;
     let shell = crate::cli::init::detect_shell();
-    let inputs = super::shell_target::TargetInputs::current(home.clone())?;
-    let resolved = profile_for(shell, &inputs, |path| path.exists())?.ok_or_else(String::new)?;
-    let legacy = legacy_profile_for(shell, &home, |path| path.exists());
-    let has_block = |path: &std::path::Path| {
-        fs::read_to_string(path).is_ok_and(|content| content.contains(BEGIN_MARKER))
-    };
-    let stale = stale_legacy_copy(&resolved, legacy, has_block);
-    Ok(ProfileTarget {
-        shell,
-        profile: resolved,
-        stale,
-    })
+    // A malformed variable is ignored rather than fatal: it may be one this
+    // shell never reads, and `off` must still be able to remove the wrapper.
+    let inputs = super::shell_target::TargetInputs::current_ignoring_invalid(home);
+    resolve_target(shell, &inputs, &RealProfileFiles)
 }
 
 fn print_profile_reason(reason: &str) {
@@ -586,28 +657,118 @@ mod tests {
         assert_eq!(legacy, Some(PathBuf::from("/home/op/.zshrc")));
         let only =
             |with: &'static str| move |path: &std::path::Path| path == std::path::Path::new(with);
+        let differ = |_: &std::path::Path, _: &std::path::Path| false;
         // Left only at the old fixed path that zsh skips while ZDOTDIR is set:
         // it is stale, and the wrapper still goes to the resolved profile.
         assert_eq!(
-            stale_legacy_copy(&resolved, legacy.clone(), only("/home/op/.zshrc")),
+            stale_legacy_copy(&resolved, legacy.clone(), only("/home/op/.zshrc"), differ),
             Some(PathBuf::from("/home/op/.zshrc"))
         );
         assert_eq!(
-            stale_legacy_copy(&resolved, legacy.clone(), |_| true),
+            stale_legacy_copy(&resolved, legacy.clone(), |_| true, differ),
             Some(PathBuf::from("/home/op/.zshrc"))
         );
         // Nothing at the old path: nothing stale.
         assert_eq!(
-            stale_legacy_copy(&resolved, legacy.clone(), only("/zdot/.zshrc")),
+            stale_legacy_copy(&resolved, legacy.clone(), only("/zdot/.zshrc"), differ),
             None
         );
-        assert_eq!(stale_legacy_copy(&resolved, legacy, |_| false), None);
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), |_| false, differ),
+            None
+        );
+        // The old path names the resolved profile through a symlink: it is
+        // the live wrapper, not a stale copy.
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy, |_| true, |_, _| true),
+            None
+        );
         // When the old path is the file the shell reads, it is the profile.
         let home_zshrc = PathBuf::from("/home/op/.zshrc");
         assert_eq!(
-            stale_legacy_copy(&home_zshrc, Some(home_zshrc.clone()), |_| true),
+            stale_legacy_copy(&home_zshrc, Some(home_zshrc.clone()), |_| true, differ),
             None
         );
+    }
+
+    #[test]
+    fn shells_without_a_native_location_keep_the_old_fixed_path() {
+        use super::super::shell_target::Platform::Windows;
+        let windows = inputs(Windows, None, None);
+        for (shell, expected) in [
+            ("zsh", "/home/op/.zshrc"),
+            ("fish", "/home/op/.config/fish/config.fish"),
+            // No native Documents directory.
+            (
+                "pwsh",
+                "/home/op/.config/powershell/Microsoft.PowerShell_profile.ps1",
+            ),
+        ] {
+            let target = resolve_target(shell, &windows, &FakeFiles::default())
+                .unwrap_or_else(|reason| panic!("{shell}: {reason}"));
+            assert_eq!(target.profile, PathBuf::from(expected), "{shell}");
+            assert_eq!(target.stale, None, "{shell}");
+        }
+        assert!(resolve_target("unknown", &windows, &FakeFiles::default()).is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeFiles {
+        with_block: Vec<&'static str>,
+        same: bool,
+        indirect: Vec<&'static str>,
+    }
+
+    impl ProfileFiles for FakeFiles {
+        fn exists(&self, path: &std::path::Path) -> bool {
+            self.with_block
+                .iter()
+                .any(|p| path == std::path::Path::new(p))
+        }
+        fn has_block(&self, path: &std::path::Path) -> bool {
+            self.exists(path)
+        }
+        fn same_file(&self, _: &std::path::Path, _: &std::path::Path) -> bool {
+            self.same
+        }
+        fn direct(&self, path: &std::path::Path) -> bool {
+            !self
+                .indirect
+                .iter()
+                .any(|p| path == std::path::Path::new(p))
+        }
+    }
+
+    #[test]
+    fn an_old_path_naming_the_resolved_file_is_never_stale() {
+        use super::super::shell_target::Platform::Unix;
+        let zdot = inputs(Unix, None, Some("/zdot"));
+        // ~/.zshrc is a symlink to $ZDOTDIR/.zshrc: edit the real file.
+        let linked_rc = FakeFiles {
+            with_block: vec!["/home/op/.zshrc", "/zdot/.zshrc"],
+            same: true,
+            indirect: vec!["/home/op/.zshrc"],
+        };
+        let target = resolve_target("zsh", &zdot, &linked_rc).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/zdot/.zshrc"));
+        assert_eq!(target.stale, None);
+        // ZDOTDIR is HOME through a symlinked directory: edit ~/.zshrc.
+        let linked_dir = FakeFiles {
+            with_block: vec!["/home/op/.zshrc", "/zdot/.zshrc"],
+            same: true,
+            indirect: vec!["/zdot/.zshrc"],
+        };
+        let target = resolve_target("zsh", &zdot, &linked_dir).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/home/op/.zshrc"));
+        assert_eq!(target.stale, None);
+        // Different files: the old copy is stale, the resolved path is used.
+        let separate = FakeFiles {
+            with_block: vec!["/home/op/.zshrc"],
+            ..FakeFiles::default()
+        };
+        let target = resolve_target("zsh", &zdot, &separate).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/zdot/.zshrc"));
+        assert_eq!(target.stale, Some(PathBuf::from("/home/op/.zshrc")));
     }
 
     #[test]
