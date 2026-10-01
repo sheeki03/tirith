@@ -28,6 +28,8 @@ unset TIRITH_INTEGRATION_VERSION TIRITH_INTEGRATION_SHELL
 # shell or terminal multiplexer must not join independent receipt ledgers.
 # The double-source guard above preserves this ID in the same live shell;
 # ordinary child commands still inherit it for that shell's correlation.
+# This shell-built value is the fallback; once the executable is pinned below,
+# `tirith __session-id` replaces its random part with an unpredictable one.
 builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
   "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
 export TIRITH_SESSION_ID
@@ -49,6 +51,12 @@ if [[ -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ]]; then
   TIRITH_STATUS=off
   return
 fi
+_tirith_session_suffix="$(command "$_TIRITH_BIN" __session-id 2>/dev/null)" \
+  || _tirith_session_suffix=""
+if [[ ${#_tirith_session_suffix} -eq 36 && "$_tirith_session_suffix" != *[^0-9a-f-]* ]]; then
+  builtin printf -v TIRITH_SESSION_ID '%x-%s' "$$" "$_tirith_session_suffix"
+fi
+unset _tirith_session_suffix
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
 # Prefer system helpers, then search the source-time PATH for non-FHS systems
@@ -78,10 +86,9 @@ _TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)
 _TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
 _TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
 _TIRITH_ENV_BIN="$(_tirith_resolve_helper env /usr/bin/env /bin/env)" || _TIRITH_ENV_BIN=""
-_TIRITH_SH_BIN="$(_tirith_resolve_helper sh /bin/sh /usr/bin/sh)" || _TIRITH_SH_BIN=""
 _TIRITH_V3_HELPERS_READY=1
 for _tirith_helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
-  "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"; do
+  "$_TIRITH_ENV_BIN"; do
   [[ "$_tirith_helper" == /* && -f "$_tirith_helper" && -x "$_tirith_helper" ]] \
     || _TIRITH_V3_HELPERS_READY=0
 done
@@ -150,82 +157,36 @@ _tirith_escape_preview() {
   printf '%q' -- "$1"
 }
 
-# Best-effort retirement after the caller observes a successful terminal
-# transition. An unavailable ACK route cannot change that known outcome.
-_tirith_receipt_acknowledge_at() {
+# One protocol-v3 receipt operation (consume, discard or reconcile):
+#   _tirith_receipt_call <action> <token> <original-cwd> [<exact command>]
+# The token, and consume's exact command, travel on stdin and never in argv or
+# the environment. `--cwd` makes Tirith enter the receipt's working directory
+# itself, so it stays this shell's direct child without an `sh -c cd` hop, and
+# a successful operation also retires the receipt inside the same call.
+_tirith_receipt_call() {
   builtin setopt localoptions noxtrace noallexport
-  local -h +x token="$1" original_cwd="$2"
-  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
-    || return 0
-  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt acknowledge --channel zsh' \
-    >/dev/null 2>&1 || true
-  return 0
-}
-
-_tirith_receipt_reconcile_at() {
-  builtin setopt localoptions noxtrace noallexport
-  local -h +x token="$1" original_cwd="$2"
+  local -h +x action="$1" token="$2" original_cwd="$3" expected="$4"
   [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
     || return 1
-  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel zsh' \
-    >/dev/null 2>&1
-  local rc=$?
-  if (( rc == 0 )); then
-    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
-  fi
-  return "$rc"
-}
-
-_tirith_receipt_consume_at() {
-  builtin setopt localoptions noxtrace noallexport
-  local -h +x token="$1" expected="$2" original_cwd="$3"
-  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
-    || return 1
-  builtin printf '%s\n%s' "$token" "$expected" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel zsh' \
-    >/dev/null
-  local rc=$?
-  if (( rc == 0 )); then
-    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
-  fi
-  return "$rc"
-}
-
-_tirith_receipt_discard_at() {
-  builtin setopt localoptions noxtrace noallexport
-  local -h +x token="$1" original_cwd="$2"
-  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
-    || return 1
-  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel zsh' \
-    >/dev/null 2>&1
-  local rc=$?
-  if (( rc == 0 )); then
-    _tirith_receipt_acknowledge_at "$token" "$original_cwd" || true
-  fi
-  return "$rc"
+  case "$action" in
+    consume)
+      builtin printf '%s\n%s' "$token" "$expected" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        "$_TIRITH_BIN" __execution-receipt consume --cwd "$original_cwd" --channel zsh \
+        >/dev/null
+      ;;
+    discard|reconcile)
+      builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        "$_TIRITH_BIN" __execution-receipt "$action" --cwd "$original_cwd" --channel zsh \
+        >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 _tirith_unresolved_receipt_cleanup() {
@@ -233,8 +194,8 @@ _tirith_unresolved_receipt_cleanup() {
   local -h +x token="${_TIRITH_UNRESOLVED_RECEIPT:-}"
   local original_cwd="${_TIRITH_UNRESOLVED_RECEIPT_CWD:-}"
   [[ -n "$token" ]] || return 0
-  if _tirith_receipt_reconcile_at "$token" "$original_cwd" \
-     || _tirith_receipt_discard_at "$token" "$original_cwd"; then
+  if _tirith_receipt_call reconcile "$token" "$original_cwd" \
+     || _tirith_receipt_call discard "$token" "$original_cwd"; then
     unset _TIRITH_UNRESOLVED_RECEIPT _TIRITH_UNRESOLVED_RECEIPT_CWD
     return 0
   fi
@@ -245,7 +206,7 @@ _tirith_receipt_discard_or_retain() {
   builtin setopt localoptions noxtrace noallexport
   local -h +x token="$1" original_cwd="$2"
   [[ -n "$token" && -n "$original_cwd" ]] || return 1
-  if _tirith_receipt_discard_at "$token" "$original_cwd"; then
+  if _tirith_receipt_call discard "$token" "$original_cwd"; then
     return 0
   fi
   if [[ -z "${_TIRITH_UNRESOLVED_RECEIPT:-}" ]]; then
@@ -496,8 +457,8 @@ _tirith_accept_line() {
         zle redisplay
         return
       fi
-      if ! _tirith_receipt_consume_at "$receipt_token" "$buf" "$receipt_cwd"; then
-        if _tirith_receipt_reconcile_at "$receipt_token" "$receipt_cwd"; then
+      if ! _tirith_receipt_call consume "$receipt_token" "$receipt_cwd" "$buf"; then
+        if _tirith_receipt_call reconcile "$receipt_token" "$receipt_cwd"; then
           _tirith_output "tirith: receipt recovery completed but cannot authorize replay; command not executed — press Enter for a fresh check"
         else
           _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1

@@ -169,7 +169,7 @@ jobs:
       - name: Native shell private state stays out of child environments
         if: matrix.name == 'Linux'
         run: python3 tests/shell-private-environment.py --require-shell bash --require-shell zsh --require-shell fish --report "$RUNNER_TEMP/tirith-shell-private-environment.json"
-      - name: Receipt acknowledgment preserves observed outcomes
+      - name: Receipt calls are single launches that preserve observed outcomes
         if: matrix.name == 'Linux'
         run: python3 scripts/test-shell-receipt-ack.py --report "$RUNNER_TEMP/tirith-shell-receipt-ack.json"
       - name: Retain shell privacy and acknowledgment evidence
@@ -285,7 +285,7 @@ jobs:
             'scripts/certify-powershell-hook.py',
             '--binary', (Join-Path $PWD 'target/debug/tirith'),
             '--powershell', (Get-Process -Id $PID).Path,
-            '--hook', (Join-Path $PWD 'shell/lib/powershell-hook.ps1'),
+            '--hook', (Join-Path $PWD 'crates/tirith/assets/shell/lib/powershell-hook.ps1'),
             '--output', (Join-Path $env:RUNNER_TEMP 'tirith-powershell-native')
           )
           if ($IsWindows) {
@@ -542,7 +542,7 @@ jobs:
           mkdir -p docker-ci-smoke/bin docker-ci-smoke/shell
           printf '#!/bin/sh\nprintf "tirith-ci-smoke\\n"\n' > docker-ci-smoke/bin/tirith
           chmod +x docker-ci-smoke/bin/tirith
-          cp -R shell/. docker-ci-smoke/shell/
+          cp -R crates/tirith/assets/shell/. docker-ci-smoke/shell/
           cp Dockerfile docker-ci-smoke/
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0

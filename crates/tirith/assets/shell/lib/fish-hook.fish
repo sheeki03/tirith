@@ -18,6 +18,8 @@ set -e TIRITH_INTEGRATION_VERSION; set -e TIRITH_INTEGRATION_SHELL
 # Each freshly loaded shell owns its session, even when its parent exported
 # an ID. The double-source guard preserves this value in the same live shell;
 # ordinary child commands still inherit it for that shell's correlation.
+# This shell-built value is the fallback; once the executable is pinned below,
+# `tirith __session-id` replaces its random part with an unpredictable one.
 set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
     "$fish_pid" (builtin random) (builtin random) (builtin random))
 # Pin the executable before any repository command can mutate PATH. Refuse an
@@ -36,6 +38,14 @@ if not string match -q '/*' -- "$_TIRITH_BIN"; or not test -f "$_TIRITH_BIN"; or
         return
     end
     set -g _TIRITH_BIN tirith
+end
+if string match -q '/*' -- "$_TIRITH_BIN"
+    set -g _tirith_session_suffix (command "$_TIRITH_BIN" __session-id 2>/dev/null)
+    if test (count $_tirith_session_suffix) -eq 1
+        and string match -qr '^[0-9a-f-]{36}$' -- "$_tirith_session_suffix"
+        set -gx TIRITH_SESSION_ID (builtin printf '%x-%s' "$fish_pid" "$_tirith_session_suffix")
+    end
+    set -e _tirith_session_suffix
 end
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
@@ -135,87 +145,37 @@ function _tirith_escape_preview
     string escape -- $argv[1]
 end
 
-# Retirement is best effort after observing a successful terminal transition;
-# older binaries without this route cannot change that known outcome.
-function _tirith_receipt_acknowledge_at
+# One protocol-v3 receipt operation (consume, discard or reconcile):
+#   _tirith_receipt_call <action> <token> <original-cwd> [<exact command>]
+# The token, and consume's exact command, travel on stdin and never in argv or
+# the environment. `--cwd` makes Tirith enter the receipt's working directory
+# itself, so it stays this shell's direct child without an `sh -c cd` hop, and
+# a successful operation also retires the receipt inside the same call.
+function _tirith_receipt_call
     set -l fish_trace
-    set -l token "$argv[1]"
-    set -l original_cwd "$argv[2]"
-    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 0
-    test -n "$token"; and test -n "$original_cwd"; or return 0
-    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        _TIRITH_RECEIPT_CWD="$original_cwd" \
-        _TIRITH_BIN="$_TIRITH_BIN" \
-        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt acknowledge --channel fish' \
-        >/dev/null 2>&1
-    return 0
-end
-
-function _tirith_receipt_consume_at
-    set -l fish_trace
-    set -l token "$argv[1]"
-    set -l command_text "$argv[2]"
+    set -l action "$argv[1]"
+    set -l token "$argv[2]"
     set -l original_cwd "$argv[3]"
     test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
     test -n "$token"; and test -n "$original_cwd"; or return 1
-    builtin printf '%s\n%s' "$token" "$command_text" | command "$_TIRITH_ENV_BIN" \
-        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        _TIRITH_RECEIPT_CWD="$original_cwd" \
-        _TIRITH_BIN="$_TIRITH_BIN" \
-        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel fish' \
-        >/dev/null
-    set -l receipt_status $status
-    if test $receipt_status -eq 0
-        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
+    switch "$action"
+        case consume
+            builtin printf '%s\n%s' "$token" "$argv[4]" | command "$_TIRITH_ENV_BIN" \
+                _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+                _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+                _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+                "$_TIRITH_BIN" __execution-receipt consume --cwd "$original_cwd" --channel fish \
+                >/dev/null
+        case discard reconcile
+            builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+                _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+                _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+                _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+                "$_TIRITH_BIN" __execution-receipt "$action" --cwd "$original_cwd" --channel fish \
+                >/dev/null 2>&1
+        case '*'
+            return 1
     end
-    return $receipt_status
-end
-
-function _tirith_receipt_reconcile_at
-    set -l fish_trace
-    set -l token "$argv[1]"
-    set -l original_cwd "$argv[2]"
-    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
-    test -n "$token"; and test -n "$original_cwd"; or return 1
-    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        _TIRITH_RECEIPT_CWD="$original_cwd" \
-        _TIRITH_BIN="$_TIRITH_BIN" \
-        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel fish' \
-        >/dev/null 2>&1
-    set -l receipt_status $status
-    if test $receipt_status -eq 0
-        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
-    end
-    return $receipt_status
-end
-
-function _tirith_receipt_discard_at
-    set -l fish_trace
-    set -l token "$argv[1]"
-    set -l original_cwd "$argv[2]"
-    test $_TIRITH_V3_HELPERS_READY -eq 1; or return 1
-    test -n "$token"; and test -n "$original_cwd"; or return 1
-    builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        _TIRITH_RECEIPT_CWD="$original_cwd" \
-        _TIRITH_BIN="$_TIRITH_BIN" \
-        "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel fish' \
-        >/dev/null 2>&1
-    set -l receipt_status $status
-    if test $receipt_status -eq 0
-        _tirith_receipt_acknowledge_at "$token" "$original_cwd"
-    end
-    return $receipt_status
 end
 
 function _tirith_unresolved_receipt_cleanup
@@ -223,8 +183,8 @@ function _tirith_unresolved_receipt_cleanup
     set -l token "$_TIRITH_UNRESOLVED_RECEIPT"
     set -l original_cwd "$_TIRITH_UNRESOLVED_RECEIPT_CWD"
     test -n "$token"; or return 0
-    if _tirith_receipt_reconcile_at "$token" "$original_cwd"
-        or _tirith_receipt_discard_at "$token" "$original_cwd"
+    if _tirith_receipt_call reconcile "$token" "$original_cwd"
+        or _tirith_receipt_call discard "$token" "$original_cwd"
         set -e _TIRITH_UNRESOLVED_RECEIPT _TIRITH_UNRESOLVED_RECEIPT_CWD
         return 0
     end
@@ -236,7 +196,7 @@ function _tirith_receipt_discard_or_retain
     set -l token "$argv[1]"
     set -l original_cwd "$argv[2]"
     test -n "$token"; and test -n "$original_cwd"; or return 1
-    if _tirith_receipt_discard_at "$token" "$original_cwd"
+    if _tirith_receipt_call discard "$token" "$original_cwd"
         return 0
     end
     if not set -q _TIRITH_UNRESOLVED_RECEIPT; or test -z "$_TIRITH_UNRESOLVED_RECEIPT"
@@ -578,8 +538,8 @@ function _tirith_check_command
                 commandline -f repaint
                 return 1
             end
-            if not _tirith_receipt_consume_at "$receipt_token" "$cmd" "$receipt_cwd"
-                if _tirith_receipt_reconcile_at "$receipt_token" "$receipt_cwd"
+            if not _tirith_receipt_call consume "$receipt_token" "$receipt_cwd" "$cmd"
+                if _tirith_receipt_call reconcile "$receipt_token" "$receipt_cwd"
                     _tirith_output "tirith: receipt recovery completed but cannot authorize replay; command not executed — press Enter for a fresh check"
                 else
                     _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1

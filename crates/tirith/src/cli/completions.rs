@@ -25,6 +25,7 @@ fn sanitize_completion_subcommand_names(command: Command) -> Command {
         let completion_alias = match subcommand.get_name() {
             "__execution-receipt" => Some("_execution-receipt"),
             "__shell-verification" => Some("_shell-verification"),
+            "__session-id" => Some("_session-id"),
             _ => None,
         };
         let contains_path_delimiter = subcommand.get_name().contains("__");
@@ -81,6 +82,7 @@ mod tests {
                 for (internal, alias) in [
                     ("__execution-receipt", "_execution-receipt"),
                     ("__shell-verification", "_shell-verification"),
+                    ("__session-id", "_session-id"),
                 ] {
                     assert!(parser_command
                         .find_subcommand(internal)

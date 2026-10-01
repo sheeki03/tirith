@@ -3447,7 +3447,7 @@ fn sourced_bash_hook_keeps_using_pinned_or_builtin_helpers_after_path_changes() 
 export PATH='{}:/usr/bin:/bin'
 _TIRITH_RECEIPT_PROTOCOL=1
 _TIRITH_RECEIPT_INSTANCE={}
-_tirith_receipt_discard bash-enter {} >/dev/null 2>&1 || :
+_tirith_receipt_call discard bash-enter {} >/dev/null 2>&1 || :
 _TIRITH_ENTER_CAP_FILE="$HOME/helper-capability"
 builtin printf 'x' >"$_TIRITH_ENTER_CAP_FILE"
 _tirith_enter_capability_proven >/dev/null 2>&1 || :
@@ -3522,9 +3522,9 @@ fn root_zsh_and_fish_hook_helpers_ignore_path_shadow_after_source() {
         real_dir.display(),
         fake_bin.display()
     );
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let zsh_hook = root.join("shell/lib/zsh-hook.zsh");
-    let fish_hook = root.join("shell/lib/fish-hook.fish");
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib");
+    let zsh_hook = hooks.join("zsh-hook.zsh");
+    let fish_hook = hooks.join("fish-hook.fish");
 
     let zsh_script = format!(
         r#"source '{}'
@@ -3532,11 +3532,11 @@ PATH='{}'
 export PATH
 capture="$(_tirith_v3_new_capture_file)" || exit 61
 command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null || exit 62
-command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':' || exit 63
+command "$_TIRITH_ENV_BIN" "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 63
 _tirith_v3_cleanup_registration_files "" "$capture" || exit 64
 [[ ! -e "$capture" ]] || exit 66
 command "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 65
-print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN|$_TIRITH_SH_BIN"
+print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN"
 "#,
         zsh_hook.display(),
         fake_bin.display(),
@@ -3608,7 +3608,7 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
     );
 
     for hook in [zsh_hook, fish_hook] {
-        let source = fs::read_to_string(&hook).expect("read root receipt hook");
+        let source = fs::read_to_string(&hook).expect("read receipt hook");
         let forbidden: &[&str] = if hook.ends_with("zsh-hook.zsh") {
             &[
                 "$(date +%s)",
@@ -3638,11 +3638,21 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
         }
         assert!(
             source.contains("command \"$_TIRITH_ENV_BIN\"")
-                && source.contains("\"$_TIRITH_SH_BIN\" -c")
                 && source.contains("_tirith_v3_new_capture_file")
                 && source.contains("_tirith_v3_remove_capture_files")
                 && source.contains("_tirith_v3_cleanup_registration_files"),
             "v3 transport must route through pinned helpers: {}",
+            hook.display()
+        );
+        // Receipt operations pass the bound directory to Tirith itself: no
+        // `sh -c cd` hop between the shell and Tirith, and no separate
+        // acknowledgement process after a successful operation.
+        assert!(
+            source.contains("__execution-receipt \"$action\" --cwd \"$original_cwd\"")
+                && source.contains("__execution-receipt consume --cwd \"$original_cwd\"")
+                && !source.contains("_TIRITH_RECEIPT_CWD")
+                && !source.contains("__execution-receipt acknowledge"),
+            "v3 receipt calls must be single direct-child launches: {}",
             hook.display()
         );
         assert!(
@@ -3671,7 +3681,7 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
             .find("command changed before receipt commit")
             .expect("pre-commit drift guard");
         let consume = v3
-            .find("_tirith_receipt_consume_at")
+            .find("_tirith_receipt_call consume")
             .expect("synchronous receipt consume");
         let native_handoff = if hook.ends_with("zsh-hook.zsh") {
             v3.rfind("zle .accept-line").expect("zsh native handoff")
@@ -3749,18 +3759,30 @@ fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
     );
 }
 
+/// The hooks have one source of truth: `crates/tirith/assets/shell`, which the
+/// binary embeds and every package installs. The top-level `shell` path is only
+/// a compatibility symlink to it, so a second, drifting copy cannot reappear.
+#[cfg(unix)]
 #[test]
-fn embedded_shell_hooks_match_repo_hooks() {
+fn repo_shell_path_is_the_embedded_hook_directory() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let embedded_dir = manifest_dir.join("assets/shell/lib");
-    let repo_dir = manifest_dir.join("../../shell/lib");
-
-    if !repo_dir.exists() {
-        // Skip when running outside the workspace (e.g. a crate-only
-        // package test where shell/lib is not present).
+    let repo_shell = manifest_dir.join("../../shell");
+    let Ok(metadata) = fs::symlink_metadata(&repo_shell) else {
+        // Skip when running outside the workspace (e.g. a crate-only package test).
         return;
-    }
-
+    };
+    assert!(
+        metadata.file_type().is_symlink(),
+        "top-level shell/ must stay a symlink to crates/tirith/assets/shell, not a copy"
+    );
+    assert_eq!(
+        fs::read_link(&repo_shell).expect("read shell symlink"),
+        PathBuf::from("crates/tirith/assets/shell")
+    );
+    assert_eq!(
+        fs::canonicalize(&repo_shell).expect("resolve shell symlink"),
+        fs::canonicalize(manifest_dir.join("assets/shell")).expect("resolve embedded hooks")
+    );
     for hook in [
         "zsh-hook.zsh",
         "bash-hook.bash",
@@ -3768,13 +3790,9 @@ fn embedded_shell_hooks_match_repo_hooks() {
         "powershell-hook.ps1",
         "nushell-hook.nu",
     ] {
-        let embedded = fs::read_to_string(embedded_dir.join(hook))
-            .unwrap_or_else(|e| panic!("failed reading embedded hook {hook}: {e}"));
-        let repo = fs::read_to_string(repo_dir.join(hook))
-            .unwrap_or_else(|e| panic!("failed reading repo hook {hook}: {e}"));
-        assert_eq!(
-            embedded, repo,
-            "embedded hook {hook} must stay in sync with shell/lib/{hook}"
+        assert!(
+            repo_shell.join("lib").join(hook).is_file(),
+            "compatibility path must expose {hook}"
         );
     }
 }
@@ -5103,6 +5121,103 @@ fn shell_execution_receipt_capability_reports_protocol_v3() {
     assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
 }
 
+/// Hooks loaded before consume/discard/reconcile retired receipts themselves
+/// still send `acknowledge` after each success. It must keep succeeding, as a
+/// no-op that trusts nothing it is given, so such a shell keeps working.
+#[test]
+fn shell_execution_receipt_acknowledge_is_a_compatibility_no_op() {
+    use std::io::Write as _;
+    for frame in [
+        "a".repeat(64),
+        "not a receipt token".to_string(),
+        String::new(),
+    ] {
+        let mut child = tirith()
+            .args(["__execution-receipt", "acknowledge", "--channel", "zsh"])
+            .env_remove("_TIRITH_RECEIPT_INSTANCE")
+            .env_remove("_TIRITH_RECEIPT_SHELL_PID")
+            .env_remove("_TIRITH_RECEIPT_FAMILY")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run compatibility acknowledge");
+        child
+            .stdin
+            .take()
+            .expect("acknowledge stdin")
+            .write_all(frame.as_bytes())
+            .expect("write acknowledge frame");
+        let out = child.wait_with_output().expect("wait for acknowledge");
+        assert_eq!(out.status.code(), Some(0), "frame {frame:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "frame {frame:?}"
+        );
+    }
+}
+
+/// `--cwd` replaces the hooks' `sh -c 'cd …; exec tirith …'` hop. A directory
+/// that cannot be entered fails like that silenced `cd`: exit 1, no output, and
+/// nothing is read or authorized.
+#[test]
+fn shell_execution_receipt_operations_accept_cwd_and_fail_closed_when_missing() {
+    let missing = tempfile::tempdir().expect("tempdir");
+    let gone = missing.path().join("removed");
+    for action in ["consume", "discard", "reconcile"] {
+        let out = tirith()
+            .args(["__execution-receipt", action, "--cwd"])
+            .arg(&gone)
+            .args(["--channel", "zsh"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run receipt operation with --cwd");
+        assert_eq!(out.status.code(), Some(1), "{action}");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{action}");
+    }
+    // An enterable directory proceeds to the ordinary receipt checks, which
+    // refuse a caller that is not a registered hook.
+    let out = tirith()
+        .args(["__execution-receipt", "discard", "--cwd"])
+        .arg(missing.path())
+        .args(["--channel", "zsh"])
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run receipt discard in an existing directory");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("receipt"));
+}
+
+/// Shell hooks take their per-shell session ID from `tirith __session-id`: a
+/// fresh, unpredictable UUID on every call (PowerShell and Nushell hooks had no
+/// random source of their own).
+#[test]
+fn session_id_helper_prints_a_fresh_uuid_each_call() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let out = tirith()
+            .arg("__session-id")
+            .env("TIRITH_SESSION_ID", "inherited-parent-session")
+            .output()
+            .expect("run __session-id");
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8(out.stdout).expect("UTF-8 session ID");
+        let id = text
+            .strip_suffix('\n')
+            .expect("one newline-terminated line");
+        assert_eq!(id.len(), 36, "{id:?}");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'),
+            "{id:?}"
+        );
+        assert_eq!(id.matches('-').count(), 4, "{id:?}");
+        assert!(seen.insert(id.to_owned()), "session IDs must not repeat");
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn shell_execution_receipt_legacy_new_instance_fails_without_bearer() {
@@ -5355,8 +5470,8 @@ fn root_bash_hook_protocol_v3_response_parser_is_fail_closed() {
     fs::write(&trailing_nul, trailing_nul_bytes)
         .expect("write valid line plus trailing NUL byte response");
 
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
-    let hook_source = fs::read_to_string(&hook).expect("read root Bash hook");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
+    let hook_source = fs::read_to_string(&hook).expect("read Bash hook");
     assert!(
         !hook_source.contains("__execution-receipt arm")
             && !hook_source.contains("_tirith_receipt_arm"),
@@ -5457,7 +5572,7 @@ fn root_bash_hook_repeated_complex_delivery_and_exact_pipe_are_bash32_safe() {
     fs::create_dir(&capture_dir).expect("create private capture directory");
     let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
     let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
     let script = format!(
         r#"_TIRITH_BASH_INTERNAL=1
 _TIRITH_TEST_SKIP_HEALTH=1
@@ -5514,8 +5629,13 @@ IFS= builtin read -r second <&"$frame_fd" || second_rc=$?
 IFS= builtin read -r third <&"$frame_fd" || third_rc=$?
 _tirith_close_pending_fd "$frame_fd" || exit 73
 
-_tirith_receipt_consume() {{ TIRITH_CONSUMED_TOKEN="$2"; return 0; }}
-_tirith_receipt_discard() {{ TIRITH_DISCARDED_TOKEN="$2"; return 0; }}
+_tirith_receipt_call() {{
+  case "$1" in
+    consume) TIRITH_CONSUMED_TOKEN="$3" ;;
+    discard) TIRITH_DISCARDED_TOKEN="$3" ;;
+    *) return 1 ;;
+  esac
+}}
 _tirith_degrade_to_preexec() {{ TIRITH_DEGRADE_REASON="$1"; return 0; }}
 
 TIRITH_PARTIAL_EXECUTED=0
@@ -5643,7 +5763,7 @@ fn root_bash_hook_protocol_v3_runs_receipt_commands_as_direct_children() {
         .expect("make PATH-shadow Tirith executable");
     let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
     let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
     let script = format!(
         "_TIRITH_BASH_INTERNAL=1; \
          source '{}'; \

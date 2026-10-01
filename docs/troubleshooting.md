@@ -117,7 +117,7 @@ compound command executed.
 
 **Who this affects.** zsh and fish. Bash is not affected: on the same failure it
 calls `_tirith_degrade_to_preexec` and keeps working in warn-only mode
-(`shell/lib/bash-hook.bash:2277-2281`). PowerShell has no strict receipt channel
+(`_tirith_enter` in `crates/tirith/assets/shell/lib/bash-hook.bash`). PowerShell has no strict receipt channel
 and is not affected either.
 
 **Symptom.** Every command you press Enter on is refused with
@@ -146,11 +146,11 @@ runs the tirith binary, and fails closed when that fails. A full or read-only
 `TMPDIR` makes `mktemp` fail, so the block happens without the binary ever being
 consulted.
 
-- zsh: `shell/lib/zsh-hook.zsh:314` and `:354` for the accept-line widget,
-  `:578` and `:595` for the bracketed-paste widget.
-- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:198-212`)
-  returns 1, and both the protocol-v3 and legacy branches then block
-  (`:434` and `:457`); the paste widget does the same at `:356`. Unlike bash,
+- zsh: `_tirith_accept_line` (the accept-line widget) and `_tirith_bracketed_paste`
+  (the bracketed-paste widget) in `crates/tirith/assets/shell/lib/zsh-hook.zsh`.
+- fish: `_tirith_v3_new_capture_file` (in `crates/tirith/assets/shell/lib/fish-hook.fish`)
+  returns 1, and both the protocol-v3 and preflight branches of
+  `_tirith_check_command` then block; the paste widget does the same. Unlike bash,
   fish has no degrade path.
 
 Failing closed is right for an ANALYSIS failure. It is the wrong answer for an

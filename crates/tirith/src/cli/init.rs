@@ -925,9 +925,17 @@ fn detect_shell_from_parent() -> Option<ShellIdentity> {
 /// 2. ../share/tirith/shell relative to binary (Homebrew layout)
 /// 3. /usr/share/tirith/shell (.deb layout)
 /// 4. ../shell relative to binary (cargo install / dev layout)
-/// 5. ../../shell relative to binary (workspace dev layout)
+/// 5. ../../shell relative to binary (workspace dev layout; a symlink to the
+///    embedded hook sources), then ../../crates/tirith/assets/shell for
+///    checkouts where that symlink is not materialized (e.g. Windows)
 /// 6. Fallback: materialize embedded hooks to data dir
 pub fn find_hook_dir() -> Option<PathBuf> {
+    installed_hook_dir().or_else(materialize_hooks)
+}
+
+/// Steps 1-5 of [`find_hook_dir`]: an explicit, packaged or development hook
+/// directory. Never creates anything.
+fn installed_hook_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("TIRITH_SHELL_DIR") {
         let p = PathBuf::from(&dir);
         if p.join("lib").exists() {
@@ -935,70 +943,38 @@ pub fn find_hook_dir() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            let brew_dir = bin_dir.join("../share/tirith/shell");
-            if brew_dir.join("lib").exists() {
-                return Some(brew_dir.canonicalize().unwrap_or(brew_dir));
-            }
+    let exe = std::env::current_exe().ok()?;
+    let bin_dir = exe.parent()?;
+    let brew_dir = bin_dir.join("../share/tirith/shell");
+    if brew_dir.join("lib").exists() {
+        return Some(brew_dir.canonicalize().unwrap_or(brew_dir));
+    }
 
-            #[cfg(unix)]
-            {
-                let sys_dir = PathBuf::from("/usr/share/tirith/shell");
-                if sys_dir.join("lib").exists() {
-                    return Some(sys_dir);
-                }
-            }
-
-            let cargo_dir = bin_dir.join("../shell");
-            if cargo_dir.join("lib").exists() {
-                return Some(cargo_dir.canonicalize().unwrap_or(cargo_dir));
-            }
-
-            let dev_dir = bin_dir.join("../../shell");
-            if dev_dir.join("lib").exists() {
-                return Some(dev_dir.canonicalize().unwrap_or(dev_dir));
-            }
+    #[cfg(unix)]
+    {
+        let sys_dir = PathBuf::from("/usr/share/tirith/shell");
+        if sys_dir.join("lib").exists() {
+            return Some(sys_dir);
         }
     }
 
-    materialize_hooks()
+    for relative in [
+        "../shell",
+        "../../shell",
+        "../../crates/tirith/assets/shell",
+    ] {
+        let dir = bin_dir.join(relative);
+        if dir.join("lib").exists() {
+            return Some(dir.canonicalize().unwrap_or(dir));
+        }
+    }
+    None
 }
 
 /// Find the shell hooks directory without materializing (read-only variant for diagnostics).
 pub fn find_hook_dir_readonly() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("TIRITH_SHELL_DIR") {
-        let p = PathBuf::from(&dir);
-        if p.join("lib").exists() {
-            return Some(p);
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            let brew_dir = bin_dir.join("../share/tirith/shell");
-            if brew_dir.join("lib").exists() {
-                return Some(brew_dir.canonicalize().unwrap_or(brew_dir));
-            }
-
-            #[cfg(unix)]
-            {
-                let sys_dir = PathBuf::from("/usr/share/tirith/shell");
-                if sys_dir.join("lib").exists() {
-                    return Some(sys_dir);
-                }
-            }
-
-            let cargo_dir = bin_dir.join("../shell");
-            if cargo_dir.join("lib").exists() {
-                return Some(cargo_dir.canonicalize().unwrap_or(cargo_dir));
-            }
-
-            let dev_dir = bin_dir.join("../../shell");
-            if dev_dir.join("lib").exists() {
-                return Some(dev_dir.canonicalize().unwrap_or(dev_dir));
-            }
-        }
+    if let Some(dir) = installed_hook_dir() {
+        return Some(dir);
     }
 
     // Check if hooks were previously materialized, but do not create or trust a

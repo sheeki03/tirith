@@ -18,7 +18,7 @@ on:
       - "scripts/install.sh"
       - "scripts/prepare-npm-packages.sh"
       - "scripts/validate-npm-packages.mjs"
-      - "shell/**"
+      - "shell"
   # Manual dispatch builds and smoke-tests only. It takes no inputs on purpose:
   # every publishing job requires `github.event_name == 'push'`, so no dispatch
   # option could enable publication and offering one would only imply otherwise.
@@ -1186,13 +1186,13 @@ jobs:
           # amd64
           mkdir -p docker-amd64/bin docker-amd64/shell
           tar xzf artifacts/tirith-x86_64-unknown-linux-gnu/tirith-x86_64-unknown-linux-gnu.tar.gz -C docker-amd64/bin tirith
-          cp -r shell/* docker-amd64/shell/
+          cp -r crates/tirith/assets/shell/* docker-amd64/shell/
           cp Dockerfile docker-amd64/
 
           # arm64
           mkdir -p docker-arm64/bin docker-arm64/shell
           tar xzf artifacts/tirith-aarch64-unknown-linux-gnu/tirith-aarch64-unknown-linux-gnu.tar.gz -C docker-arm64/bin tirith
-          cp -r shell/* docker-arm64/shell/
+          cp -r crates/tirith/assets/shell/* docker-arm64/shell/
           cp Dockerfile docker-arm64/
 
       - name: Set up QEMU
@@ -1315,17 +1315,6 @@ jobs:
             exit 1
           fi
           echo "$install_root/bin" >> "$GITHUB_PATH"
-
-      # cargo-deb requires assets relative to crates/tirith/, but shell hooks
-      # live at repo root. This directory is gitignored and only exists in CI.
-      - name: Copy shell hooks to assets
-        run: |
-          mkdir -p crates/tirith/assets/shell/lib
-          cp shell/tirith.sh crates/tirith/assets/shell/
-          cp shell/lib/*.zsh crates/tirith/assets/shell/lib/
-          cp shell/lib/*.bash crates/tirith/assets/shell/lib/
-          cp shell/lib/*.fish crates/tirith/assets/shell/lib/
-          cp shell/lib/*.ps1 crates/tirith/assets/shell/lib/
 
       - name: Download canonical Linux x64 release artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1538,8 +1527,8 @@ jobs:
             test -s "$package_build/completions/_tirith"
             test -s "$package_build/completions/tirith.fish"
             test -s "$package_build/man/tirith.1"
-            cp shell/tirith.sh "$package_build/shell/"
-            cp shell/lib/* "$package_build/shell/lib/"
+            cp crates/tirith/assets/shell/tirith.sh "$package_build/shell/"
+            cp crates/tirith/assets/shell/lib/* "$package_build/shell/lib/"
 
             # Prepare RPM build
             mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS}

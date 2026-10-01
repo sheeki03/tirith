@@ -82,9 +82,10 @@ The harness drives a **disposable** shell through a real pseudo-terminal:
 1. Spawn the shell through a PTY with a fully isolated environment
    (`HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME` all point at
    fresh temp dirs — a test never touches the developer's real tirith state).
-2. Source the *embedded* hook copy under `crates/tirith/assets/shell/lib/`
-   (kept byte-identical to `shell/lib/` by the
-   `embedded_shell_hooks_match_repo_hooks` test).
+2. Source the hook under `crates/tirith/assets/shell/lib/`, the single hook
+   source the binary embeds and every package installs (the top-level `shell`
+   path is a symlink to it, checked by the
+   `repo_shell_path_is_the_embedded_hook_directory` test).
 3. Send bytes — commands followed by a carriage return, the byte a real
    terminal delivers when you press Enter.
 4. Read terminal output and assert the invariants.

@@ -438,8 +438,8 @@ fn failed_enter_accept_arm_rolls_back_pending_delivery() {
         r#"source '{}'
 _TIRITH_RECEIPT_PROTOCOL=3
 _tirith_enter_arm_accept() {{ return 1; }}
-_tirith_receipt_discard() {{
-  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+_tirith_receipt_call() {{
+  [[ "$1:$2:$3" == "discard:bash-enter:{}" ]] || return 9
   TIRITH_TEST_DISCARDED=yes
 }}
 _tirith_degrade_to_preexec() {{
@@ -551,8 +551,8 @@ fn failed_accept_disarm_drops_pending_delivery_before_degrading() {
         r#"source '{}'
 _TIRITH_RECEIPT_PROTOCOL=3
 _tirith_enter_disarm_accept() {{ return 1; }}
-_tirith_receipt_discard() {{
-  [[ "$1:$2" == "bash-enter:{}" ]] || return 9
+_tirith_receipt_call() {{
+  [[ "$1:$2:$3" == "discard:bash-enter:{}" ]] || return 9
   TIRITH_TEST_DISCARDED=yes
 }}
 _tirith_degrade_to_preexec() {{

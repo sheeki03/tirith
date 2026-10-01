@@ -251,18 +251,32 @@ enum ExecutionReceiptAction {
         #[arg(long)]
         warn_acknowledged: bool,
     },
+    /// Consume an armed receipt; a success also retires (acknowledges) it.
     Consume {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Reconcile a prior consume; a durable commit is also retired (acknowledged).
     Reconcile {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Discard a receipt; a success also retires (acknowledges) it.
     Discard {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Compatibility no-op for hooks loaded before consume/discard/reconcile
+    /// retired receipts themselves. Always succeeds; any token sent is drained, never used.
     Acknowledge {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
@@ -296,6 +310,9 @@ enum Commands {
         #[command(subcommand)]
         action: ExecutionReceiptAction,
     },
+    /// Internal: print a fresh random session ID for a newly loaded shell hook.
+    #[command(name = "__session-id", hide = true)]
+    SessionIdInternal,
 
     /// Manage the tirith background daemon
     #[command(after_help = "\
@@ -8202,19 +8219,23 @@ fn run() {
                 approval.map(tirith_core::execution_state::ShellApprovalOutcome::from),
                 warn_acknowledged,
             ),
-            ExecutionReceiptAction::Consume { channel } => {
-                cli::check::consume_receipt(channel.into())
+            ExecutionReceiptAction::Consume { channel, cwd } => {
+                cli::check::consume_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Reconcile { channel } => {
-                cli::check::reconcile_receipt(channel.into())
+            ExecutionReceiptAction::Reconcile { channel, cwd } => {
+                cli::check::reconcile_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Discard { channel } => {
-                cli::check::discard_receipt(channel.into())
+            ExecutionReceiptAction::Discard { channel, cwd } => {
+                cli::check::discard_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Acknowledge { channel } => {
-                cli::check::acknowledge_receipt(channel.into())
+            ExecutionReceiptAction::Acknowledge { channel: _ } => {
+                cli::check::acknowledge_receipt_compat()
             }
         },
+        Commands::SessionIdInternal => {
+            println!("{}", tirith_core::session::new_session_id());
+            0
+        }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { detach } => cli::daemon::start(detach),
             DaemonAction::Stop => cli::daemon::stop(),

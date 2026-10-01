@@ -366,6 +366,24 @@ mod tests {
         }
     }
 
+    /// Shell hooks build `TIRITH_SESSION_ID` as `<hex shell pid>-<uuid>` from
+    /// `tirith __session-id` (Nushell uses the bare UUID). Every such value must
+    /// pass the shared predicate, or the hook's ID would be silently replaced by
+    /// a per-process one and the shell would lose its warning history.
+    #[test]
+    fn hook_built_session_ids_are_valid_and_storable() {
+        for pid in [1u32, 0x2a, 0xffff, 0x7fff_ffff, u32::MAX] {
+            for _ in 0..200 {
+                let uuid = new_session_id();
+                for id in [format!("{pid:x}-{uuid}"), uuid.clone()] {
+                    assert!(is_valid_session_id(&id), "{id}");
+                    assert!(crate::session_warnings::session_state_path(&id).is_some());
+                    assert_eq!(select_process_session_id(Some(id.clone())), id);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_resolve_session_id_returns_non_empty() {
         // Whether env var is set or not, resolve should return something

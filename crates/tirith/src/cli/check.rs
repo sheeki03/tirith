@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write as _};
+use std::path::Path;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -2456,7 +2457,32 @@ pub fn arm_receipt(
     1
 }
 
-pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
+/// Run a receipt operation in the working directory its hook bound the receipt
+/// to. `--cwd` replaces the hook's former `sh -c 'cd …; exec tirith …'` hop, so
+/// Tirith stays the shell's direct child with one process launch. A directory
+/// that cannot be entered fails exactly like that silenced `cd` did: exit 1
+/// without a diagnostic. The receipt's sealed working-directory binding is
+/// still checked against the directory actually entered.
+fn enter_receipt_cwd(cwd: Option<&Path>) -> Result<(), i32> {
+    match cwd {
+        Some(cwd) => std::env::set_current_dir(cwd).map_err(|_| 1),
+        None => Ok(()),
+    }
+}
+
+/// Retire a receipt whose terminal outcome this process just observed. Hooks
+/// used to send a separate `acknowledge` call after every successful consume,
+/// discard or reconcile; doing it here saves that process launch. It stays best
+/// effort: a failed retirement never changes the operation's own result, and an
+/// unretired receipt still answers reconciliation and refuses replay.
+fn retire_receipt_best_effort(token: &str, channel: ShellReceiptChannel) {
+    let _ = execution_state::acknowledge_shell_execution_receipt(token, channel);
+}
+
+pub fn discard_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2472,7 +2498,10 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
         }
     };
     match execution_state::discard_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
+        Ok(()) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to discard shell execution receipt: {error}");
             1
@@ -2480,31 +2509,19 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
     }
 }
 
-pub fn acknowledge_receipt(channel: ShellReceiptChannel) -> i32 {
-    let bytes = match read_receipt_stdin() {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    let token = match parse_receipt_token_frame(&bytes) {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    match execution_state::acknowledge_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("tirith: failed to acknowledge shell execution receipt: {error}");
-            1
-        }
-    }
+/// `__execution-receipt acknowledge` from a hook loaded before this binary
+/// retired receipts itself. The preceding consume/discard/reconcile already did
+/// the work, so succeed without reading or trusting anything. The token frame
+/// is drained so an older hook's writer never sees a broken pipe.
+pub fn acknowledge_receipt_compat() -> i32 {
+    let _ = read_receipt_stdin();
+    0
 }
 
-pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn reconcile_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2524,7 +2541,10 @@ pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
         channel,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(true) => 0,
+        Ok(true) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Ok(false) => 1,
         Err(error) => {
             eprintln!("tirith: failed to reconcile shell execution receipt: {error}");
@@ -2598,7 +2618,10 @@ pub(super) fn prepare_receipt_consumption_with_network(
     )
 }
 
-pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn consume_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2634,7 +2657,10 @@ pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
         prepared,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to consume shell execution receipt: {error}");
             1
