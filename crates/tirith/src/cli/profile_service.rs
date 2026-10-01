@@ -819,11 +819,7 @@ pub(crate) fn setting_cli(
                 return Ok(1);
             }
         } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output)
-                    .map_err(|_| "cannot display setting result")?
-            );
+            print!("{}", setting_human_text(name, dry_run, &output));
         }
         Ok(
             if output["state"].as_str().is_some_and(|state| {
@@ -843,6 +839,29 @@ pub(crate) fn setting_cli(
         );
         1
     })
+}
+
+/// Human text for `tirith policy setting` without `--json`.
+fn setting_human_text(name: &str, dry_run: bool, output: &serde_json::Value) -> String {
+    use super::profile::human_value;
+    let name = tirith_core::output::sanitize_human_field(name, &[]);
+    if dry_run {
+        let field = output["field"]
+            .as_str()
+            .map(|field| tirith_core::output::sanitize_human_field(field, &[]));
+        return format!(
+            "Setting preview (not applied): {}: {} -> {}\n  Effective now: {}\n  {}\n",
+            field.as_deref().unwrap_or(&name),
+            human_value(&output["before"]),
+            human_value(&output["after"]),
+            human_value(&output["effective_before"]),
+            human_value(&output["constraints"]),
+        );
+    }
+    if output["kind"] == "personal_setting_change" && output["state"] == "unchanged" {
+        return format!("Setting {name} already has the requested value; nothing changed.\n");
+    }
+    super::profile::operation_human_text(output)
 }
 
 #[cfg(test)]

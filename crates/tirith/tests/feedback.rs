@@ -265,3 +265,46 @@ fn feedback_rejects_absent_incidents_and_preserves_unknown_future_records() {
     .success());
     assert_eq!(std::fs::read(&destination).unwrap(), before);
 }
+
+/// Without `--json`, `audit feedback` prints human text, never the JSON object.
+#[test]
+fn feedback_without_json_prints_human_text() {
+    let (state, id, _) = fixture();
+    let base = [
+        "audit",
+        "feedback",
+        "--event-id",
+        &id,
+        "--expectation",
+        "expected",
+    ];
+    let human = |extra: &[&str]| {
+        let mut args = base.to_vec();
+        args.extend_from_slice(extra);
+        let output = run(&state, &args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            serde_json::from_str::<Value>(&stdout).is_err(),
+            "human mode printed JSON: {stdout}"
+        );
+        stdout
+    };
+    let preview = human(&["--dry-run"]);
+    assert!(
+        preview.starts_with(&format!(
+            "Feedback preview (not applied): incident {id} marked expected\n  This records"
+        )),
+        "{preview}"
+    );
+    let applied = human(&[]);
+    assert!(applied.starts_with("Operation "), "{applied}");
+    assert!(applied.contains(": completed"), "{applied}");
+    let mut json_args = base.to_vec();
+    json_args.extend_from_slice(&["--dry-run", "--json"]);
+    assert_eq!(success(run(&state, &json_args))["kind"], "feedback_preview");
+}

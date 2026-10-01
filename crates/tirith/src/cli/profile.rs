@@ -147,6 +147,37 @@ pub(crate) fn status_projection(
     Ok(output)
 }
 
+/// Human text for a projected operation status (the `status_projection` JSON).
+/// Used by commands whose `--json` mode prints that projection, so the
+/// default mode reads as prose instead of the same JSON.
+pub(crate) fn operation_human_text(output: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        tirith_core::output::sanitize_human_field(output[key].as_str().unwrap_or("unknown"), &[])
+    };
+    let id = field("operation_id");
+    let mut text = format!(
+        "Operation {id}: {}\n  Inspect: tirith policy operation {id}\n",
+        field("state")
+    );
+    if let Some(detail) = output["detail"].as_str() {
+        text.push_str(&format!(
+            "  {}\n",
+            tirith_core::output::sanitize_human_field(detail, &[])
+        ));
+    }
+    text
+}
+
+/// Compact one-line rendering of a JSON value for human output.
+pub(crate) fn human_value(value: &serde_json::Value) -> String {
+    let text = match value {
+        serde_json::Value::Null => "(unset)".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    tirith_core::output::sanitize_human_field(&text, &[])
+}
+
 fn show_status(
     status: &OperationStatus,
     compiled: &tirith_core::redact::CompiledCustomPatterns,

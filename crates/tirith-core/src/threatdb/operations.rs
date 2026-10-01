@@ -276,6 +276,17 @@ pub fn source_freshness(document: &Value, built: u64, now: u64) -> Result<Freshn
     Ok(report)
 }
 
+/// Total attempts `send_with_retry` makes (one request plus two retries).
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Timeout for one attempt: an equal share of what is left for the attempts
+/// still allowed, so a stalled first attempt leaves budget for a retry; the
+/// last attempt gets everything that remains. Reqwest's blocking client applies
+/// it to the response headers and to each body read, not the whole download.
+fn attempt_timeout(remaining: Duration, attempt: u32) -> Duration {
+    remaining / MAX_ATTEMPTS.saturating_sub(attempt).max(1)
+}
+
 /// Retry only transient status codes; caller still validates identity, schema,
 /// size and integrity exactly once after receiving a successful response.
 pub fn retry_delay(
@@ -285,7 +296,7 @@ pub fn retry_delay(
     remaining: Duration,
     now: u64,
 ) -> Option<Duration> {
-    if attempt >= 2 || !matches!(status, 408 | 429 | 500 | 502 | 503 | 504) {
+    if attempt + 1 >= MAX_ATTEMPTS || !matches!(status, 408 | 429 | 500 | 502 | 503 | 504) {
         return None;
     }
     let seconds = match retry_after {
@@ -329,7 +340,7 @@ pub fn send_with_retry(
         let next = request
             .try_clone()
             .ok_or("transport request cannot be retried safely")?;
-        let result = next.timeout(remaining).send();
+        let result = next.timeout(attempt_timeout(remaining, attempt)).send();
         let (status, retry_after) = match &result {
             Ok(response) => (
                 response.status().as_u16(),
@@ -537,6 +548,49 @@ mod tests {
             retry_delay(429, Some("Thu, 01 Jan 1970 00:00:10 GMT"), 0, budget, 0),
             Some(Duration::from_secs(10))
         );
+    }
+
+    #[test]
+    fn attempt_timeout_leaves_budget_for_the_allowed_retries() {
+        let budget = Duration::from_secs(30);
+        assert_eq!(attempt_timeout(budget, 0), Duration::from_secs(10));
+        assert_eq!(attempt_timeout(budget, 1), Duration::from_secs(15));
+        assert_eq!(attempt_timeout(budget, 2), budget);
+        assert_eq!(attempt_timeout(budget, 7), budget);
+    }
+
+    /// A first attempt that never answers must not consume the whole budget:
+    /// the retry happens and its answer is returned.
+    #[test]
+    fn stalled_first_attempt_is_retried_within_the_budget() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // First connection: read the request, never answer, hold it open.
+            let (mut stalled, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stalled.read(&mut buffer);
+            // Second connection: answer immediately.
+            let (mut answered, _) = listener.accept().unwrap();
+            let _ = answered.read(&mut buffer);
+            answered
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .unwrap();
+            drop(stalled);
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = send_with_retry(
+            client.get(format!("http://{address}/manifest")),
+            Duration::from_secs(4),
+        )
+        .expect("the retry must run after a stalled first attempt");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.text().unwrap(), "ok");
+        server.join().unwrap();
     }
 
     #[test]

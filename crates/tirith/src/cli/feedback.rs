@@ -183,6 +183,20 @@ pub(crate) fn prepare(
     )
 }
 
+/// Human text for `tirith audit feedback` without `--json`.
+fn human_text(value: &Value) -> String {
+    if value["kind"] == "feedback_preview" {
+        let record = &value["record"];
+        return format!(
+            "Feedback preview (not applied): incident {} marked {}\n  {}\n",
+            super::profile::human_value(&record["event_id"]),
+            super::profile::human_value(&record["expectation"]),
+            super::profile::human_value(&value["notice"]),
+        );
+    }
+    super::profile::operation_human_text(value)
+}
+
 pub(crate) fn run(
     event_id: String,
     expectation: Expectation,
@@ -224,10 +238,7 @@ pub(crate) fn run(
                     return 1;
                 }
             } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
+                print!("{}", human_text(&value));
             }
             if value
                 .get("state")

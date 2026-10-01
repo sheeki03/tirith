@@ -557,3 +557,44 @@ fn dry_run_reports_the_in_place_refusal_the_real_run_would_hit() {
     ));
     assert_eq!(preview["kind"], "profile_preview");
 }
+
+/// Without `--json`, `policy setting` prints human text, never the JSON object.
+#[test]
+fn setting_without_json_prints_human_text() {
+    let state = state();
+    let human = |args: &[&str]| {
+        let output = run(&state, args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            serde_json::from_str::<Value>(&stdout).is_err(),
+            "human mode printed JSON: {stdout}"
+        );
+        stdout
+    };
+    let preview = human(&["policy", "setting", "strict_warn", "true", "--dry-run"]);
+    assert!(
+        preview.starts_with("Setting preview (not applied): strict_warn: (unset) -> true\n"),
+        "{preview}"
+    );
+    let applied = human(&["policy", "setting", "strict_warn", "true"]);
+    assert!(applied.starts_with("Operation "), "{applied}");
+    assert!(applied.contains(": completed"), "{applied}");
+    assert!(
+        applied.contains("  Inspect: tirith policy operation "),
+        "{applied}"
+    );
+    let unchanged = human(&["policy", "setting", "strict_warn", "true"]);
+    assert!(unchanged.starts_with("Operation "), "{unchanged}");
+    assert!(unchanged.contains("  No settings changed"), "{unchanged}");
+    // `--json` keeps the machine-readable object.
+    let json = success(run(
+        &state,
+        &["policy", "setting", "strict_warn", "true", "--json"],
+    ));
+    assert_eq!(json["no_op"], true);
+}

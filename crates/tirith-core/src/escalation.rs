@@ -634,7 +634,7 @@ fn clear_approval_metadata(verdict: &mut Verdict) {
 /// Keep the action and approval channel as one invariant at every return seam:
 /// a Block is never approvable, and a caller without a prompt channel must turn
 /// a live approval requirement into an unambiguous Block.
-fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
+pub(crate) fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
     if verdict.action == Action::Block {
         clear_approval_metadata(verdict);
         return;
@@ -736,14 +736,47 @@ fn post_process_verdict_for_verification_with_urls(
 ) -> Verdict {
     let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
     let session = crate::session_warnings::load(session_id);
+    apply_read_only_session_effects(
+        &mut effective,
+        policy,
+        caller,
+        &session,
+        chrono::Utc::now(),
+        (cmd, shell, urls),
+        |provisional_events| {
+            crate::session_warnings::correlate_session_with_provisional(
+                session_id,
+                provisional_events,
+            )
+        },
+    );
+    effective
+}
 
+/// The read-only session stages that follow [`apply_stateless_policy_effects`]:
+/// escalation against the session's warning history, cross-event correlation
+/// of THIS command's provisional typed events (no events, no correlation, as in
+/// the live pipeline), the monotonic re-pass when correlation added findings,
+/// and the final approval-contract normalization. Candidate verification and
+/// the frozen preview (`evaluation::FrozenEvaluation`) both use it, so the
+/// preview cannot drift from what verification enforces. `correlate` receives
+/// the non-empty provisional events and returns the hits against the session.
+pub(crate) fn apply_read_only_session_effects(
+    effective: &mut Verdict,
+    policy: &crate::policy::Policy,
+    caller: CallerContext,
+    session: &SessionWarnings,
+    now: chrono::DateTime<chrono::Utc>,
+    (cmd, shell, urls): (&str, ShellType, &[crate::extract::ExtractedUrl]),
+    correlate: impl FnOnce(&[TypedEvent]) -> Vec<crate::event_buffer::CorrelationHit>,
+) {
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let (new_action, _caused_by, _hits, reason) = apply_escalation_at_with_urls(
             effective.action,
             &effective.findings,
-            &session,
+            session,
             &policy.escalation,
-            chrono::Utc::now(),
+            now,
             urls,
         );
         if new_action != effective.action {
@@ -752,19 +785,30 @@ fn post_process_verdict_for_verification_with_urls(
         effective.action = new_action;
     }
 
-    let provisional_events = derive_typed_events_with_urls(cmd, &effective, shell, urls);
+    let timestamp = now.to_rfc3339();
+    let provisional_events: Vec<TypedEvent> =
+        derive_event_prototypes_with_urls(cmd, effective, shell, urls)
+            .into_iter()
+            .map(|prototype| {
+                prototype.materialize(
+                    String::new(),
+                    0,
+                    timestamp.clone(),
+                    crate::event_buffer::EventProvenance::Confirmed,
+                )
+            })
+            .collect();
     let correlation_hits = if provisional_events.is_empty() {
         Vec::new()
     } else {
-        crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
+        correlate(&provisional_events)
     };
-    apply_correlation_findings(&mut effective, policy, &correlation_hits);
+    apply_correlation_findings(effective, policy, &correlation_hits);
     if !correlation_hits.is_empty() {
-        reapply_monotonic_policy_effects(&mut effective, policy, caller);
+        reapply_monotonic_policy_effects(effective, policy, caller);
     }
 
-    normalize_approval_contract(&mut effective, caller);
-    effective
+    normalize_approval_contract(effective, caller);
 }
 
 /// Re-run the monotonic policy controls (action overrides, approval, paranoia

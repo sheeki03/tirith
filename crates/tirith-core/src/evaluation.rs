@@ -185,49 +185,28 @@ impl FrozenEvaluation {
             crate::escalation::apply_stateless_policy_effects(&raw, policy, self.caller);
         match &self.session {
             SessionEvidence::Captured(session) => {
-                if matches!(verdict.action, Action::Warn | Action::WarnAck) {
-                    let (action, _, _, reason) = crate::escalation::apply_escalation_at_with_urls(
-                        verdict.action,
-                        &verdict.findings,
-                        session,
-                        &policy.escalation,
-                        self.captured_at,
-                        self.observed.extracted_urls(),
-                    );
-                    if action != verdict.action {
-                        verdict.escalation_reason = reason;
-                    }
-                    verdict.action = action;
-                }
-                let mut events = session.typed_events.iter().cloned().collect::<Vec<_>>();
-                events.extend(
-                    crate::escalation::derive_event_prototypes_with_urls(
+                crate::escalation::apply_read_only_session_effects(
+                    &mut verdict,
+                    policy,
+                    self.caller,
+                    session,
+                    self.captured_at,
+                    (
                         &self.context.input,
-                        &verdict,
                         self.context.shell,
                         self.observed.extracted_urls(),
-                    )
-                    .into_iter()
-                    .map(|event| {
-                        event.materialize(
-                            String::new(),
-                            0,
-                            self.captured_at.to_rfc3339(),
-                            crate::event_buffer::EventProvenance::Confirmed,
-                        )
-                    }),
+                    ),
+                    |provisional_events| {
+                        let mut events = session.typed_events.iter().cloned().collect::<Vec<_>>();
+                        events.extend_from_slice(provisional_events);
+                        crate::event_buffer::correlate(&events, &self.captured_at.to_rfc3339())
+                    },
                 );
-                let hits = crate::event_buffer::correlate(&events, &self.captured_at.to_rfc3339());
-                crate::escalation::apply_correlation_findings(&mut verdict, policy, &hits);
-                if !hits.is_empty() {
-                    crate::escalation::reapply_monotonic_policy_effects(
-                        &mut verdict,
-                        policy,
-                        self.caller,
-                    );
-                }
             }
-            SessionEvidence::Unavailable => gaps.push(EvidenceGap::SessionUnavailable),
+            SessionEvidence::Unavailable => {
+                gaps.push(EvidenceGap::SessionUnavailable);
+                crate::escalation::normalize_approval_contract(&mut verdict, self.caller);
+            }
         }
         // Strict warnings are an acknowledgement contract even though legacy
         // CLI integrations represent that contract as Warn plus exit code 3.
@@ -426,6 +405,62 @@ mod tests {
             None,
             SessionEvidence::Captured(Box::new(SessionWarnings::new("preview-test"))),
         )
+    }
+
+    /// The frozen preview shares the live/verification session pipeline: a
+    /// correlation needs an event from THIS command, so history alone (a past
+    /// secret write and network call still inside the window) must not turn a
+    /// command that derives no typed events into a correlation Block.
+    #[test]
+    fn session_history_alone_does_not_correlate_a_command_without_events() {
+        use crate::event_buffer::{EventKind, TypedEvent};
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let now = chrono::Utc::now();
+        let mut session = SessionWarnings::new("preview-history");
+        for (sequence, (offset, kind)) in [(-5, EventKind::SecretWrite), (-2, EventKind::Network)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut event = TypedEvent::new(
+                &(now + chrono::Duration::seconds(offset)).to_rfc3339(),
+                kind,
+                "history",
+            );
+            event.sequence = sequence as u64 + 1;
+            session.typed_events.push_back(event);
+        }
+        session.next_typed_event_sequence = 3;
+        let frozen = FrozenEvaluation::capture_with_policy(
+            AnalysisContext {
+                input: "printf hello".to_string(),
+                shell: ShellType::Posix,
+                scan_context: ScanContext::Exec,
+                raw_bytes: None,
+                interactive: true,
+                cwd: Some(state.roots().cwd.display().to_string()),
+                file_path: None,
+                repo_root: None,
+                is_config_override: false,
+                clipboard_html: None,
+                card_ref: None,
+                clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                python_inspect_inherited: false,
+            },
+            &Policy::default(),
+            CallerContext::Cli,
+            None,
+            SessionEvidence::Captured(Box::new(session)),
+        );
+        let verdict = frozen.evaluate_current().verdict;
+        assert!(
+            !verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::SecretWriteThenNetwork),
+            "{:?}",
+            verdict.findings
+        );
+        assert_ne!(verdict.action, Action::Block);
     }
 
     #[test]

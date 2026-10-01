@@ -113,9 +113,13 @@ pub fn run(action: &str) -> i32 {
 }
 
 fn enable() -> i32 {
-    let Some((shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: could not detect shell profile (set SHELL or run again with --shell)");
-        return 1;
+    let (shell, profile) = match detect_profile() {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("tirith output wrap: could not detect shell profile (set SHELL or run again with --shell)");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
 
     // repo-0224: only a MISSING file means "empty profile". Any other read
@@ -219,9 +223,13 @@ fn enable() -> i32 {
 }
 
 fn disable() -> i32 {
-    let Some((_shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: could not detect shell profile");
-        return 1;
+    let profile = match detect_profile() {
+        Ok((_shell, profile)) => profile,
+        Err(reason) => {
+            eprintln!("tirith output wrap: could not detect shell profile");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
 
     let (root, destination, current, existed) = match read_profile_retained(&profile) {
@@ -273,9 +281,13 @@ fn disable() -> i32 {
 }
 
 fn status() -> i32 {
-    let Some((shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: status — could not detect shell profile");
-        return 1;
+    let (shell, profile) = match detect_profile() {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("tirith output wrap: status — could not detect shell profile");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
     let current = fs::read_to_string(&profile).unwrap_or_default();
     let enabled = current.contains(BEGIN_MARKER);
@@ -356,36 +368,185 @@ fn build_snippet(shell: &str) -> String {
     }
 }
 
-fn detect_profile() -> Option<(&'static str, PathBuf)> {
-    let home = home::home_dir()?;
-    let shell = crate::cli::init::detect_shell();
-    let profile = match shell {
+/// The profile the wrapper is written to, from the shared shell-target
+/// resolution (honours ZDOTDIR and XDG_CONFIG_HOME, and the platform's native
+/// locations). Bash prefers an existing `.bashrc`, then the existing login
+/// profile Bash would read, and otherwise creates `.bashrc`.
+fn profile_for(
+    shell: &str,
+    inputs: &super::shell_target::TargetInputs,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> Result<Option<PathBuf>, String> {
+    let profiles = super::shell_target::profiles_for(shell, inputs, |path| Ok(exists(path)))?;
+    let Some(first) = profiles.first() else {
+        return Ok(None);
+    };
+    if shell == "bash" {
+        if let Some(existing) = profiles.iter().find(|profile| exists(&profile.path)) {
+            return Ok(Some(existing.path.clone()));
+        }
+    }
+    Ok(Some(first.path.clone()))
+}
+
+/// Where releases before the shared resolution put the wrapper: fixed paths
+/// under HOME that ignored ZDOTDIR and XDG_CONFIG_HOME.
+fn legacy_profile_for(
+    shell: &str,
+    home: &std::path::Path,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    Some(match shell {
         "zsh" => home.join(".zshrc"),
         "bash" => {
             let bashrc = home.join(".bashrc");
             let bash_profile = home.join(".bash_profile");
-            if bashrc.exists() {
-                bashrc
-            } else if bash_profile.exists() {
+            if !exists(&bashrc) && exists(&bash_profile) {
                 bash_profile
             } else {
                 bashrc
             }
         }
-        "fish" => home.join(".config").join("fish").join("config.fish"),
-        "nushell" => home.join(".config").join("nushell").join("config.nu"),
-        "powershell" | "pwsh" => home
-            .join(".config")
-            .join("powershell")
-            .join("Microsoft.PowerShell_profile.ps1"),
+        "fish" => home.join(".config/fish/config.fish"),
+        "nushell" => home.join(".config/nushell/config.nu"),
+        "powershell" | "pwsh" => home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
         _ => return None,
+    })
+}
+
+/// A wrapper an older release already installed keeps being found where it
+/// is (so `off` and `status` still see it and `on` does not add a second
+/// copy); otherwise the resolved profile is used.
+fn choose_profile(
+    resolved: PathBuf,
+    legacy: Option<PathBuf>,
+    has_block: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    match legacy {
+        Some(legacy) if legacy != resolved && !has_block(&resolved) && has_block(&legacy) => legacy,
+        _ => resolved,
+    }
+}
+
+/// `Err` carries an optional reason shown under the caller's message.
+fn detect_profile() -> Result<(&'static str, PathBuf), String> {
+    let home = home::home_dir().ok_or_else(String::new)?;
+    let shell = crate::cli::init::detect_shell();
+    let inputs = super::shell_target::TargetInputs::current(home.clone())?;
+    let resolved = profile_for(shell, &inputs, |path| path.exists())?.ok_or_else(String::new)?;
+    let legacy = legacy_profile_for(shell, &home, |path| path.exists());
+    let has_block = |path: &std::path::Path| {
+        fs::read_to_string(path).is_ok_and(|content| content.contains(BEGIN_MARKER))
     };
-    Some((shell, profile))
+    Ok((shell, choose_profile(resolved, legacy, has_block)))
+}
+
+fn print_profile_reason(reason: &str) {
+    if !reason.is_empty() {
+        eprintln!("  {reason}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inputs(
+        platform: super::super::shell_target::Platform,
+        xdg: Option<&str>,
+        zdotdir: Option<&str>,
+    ) -> super::super::shell_target::TargetInputs {
+        super::super::shell_target::TargetInputs {
+            platform,
+            home: PathBuf::from("/home/op"),
+            xdg_config: xdg.map(PathBuf::from),
+            zdotdir: zdotdir.map(PathBuf::from),
+            appdata: None,
+            documents: None,
+        }
+    }
+
+    #[test]
+    fn profile_follows_zdotdir_and_xdg_config_home() {
+        use super::super::shell_target::Platform::Unix;
+        let none = |_: &std::path::Path| false;
+        let custom = inputs(Unix, Some("/cfg"), Some("/zdot"));
+        assert_eq!(
+            profile_for("zsh", &custom, none).unwrap(),
+            Some(PathBuf::from("/zdot/.zshrc"))
+        );
+        assert_eq!(
+            profile_for("fish", &custom, none).unwrap(),
+            Some(PathBuf::from("/cfg/fish/config.fish"))
+        );
+        assert_eq!(
+            profile_for("nushell", &custom, none).unwrap(),
+            Some(PathBuf::from("/cfg/nushell/config.nu"))
+        );
+        assert_eq!(
+            profile_for("pwsh", &custom, none).unwrap(),
+            Some(PathBuf::from(
+                "/cfg/powershell/Microsoft.PowerShell_profile.ps1"
+            ))
+        );
+        let plain = inputs(Unix, None, None);
+        assert_eq!(
+            profile_for("zsh", &plain, none).unwrap(),
+            Some(PathBuf::from("/home/op/.zshrc"))
+        );
+        assert_eq!(
+            profile_for("fish", &plain, none).unwrap(),
+            Some(PathBuf::from("/home/op/.config/fish/config.fish"))
+        );
+        assert_eq!(profile_for("unknown", &plain, none).unwrap(), None);
+    }
+
+    #[test]
+    fn a_wrapper_installed_at_the_legacy_location_is_still_found() {
+        let resolved = PathBuf::from("/zdot/.zshrc");
+        let legacy = legacy_profile_for("zsh", std::path::Path::new("/home/op"), |_| false);
+        assert_eq!(legacy, Some(PathBuf::from("/home/op/.zshrc")));
+        let only =
+            |with: &'static str| move |path: &std::path::Path| path == std::path::Path::new(with);
+        // Installed only at the old fixed path: keep using it.
+        assert_eq!(
+            choose_profile(resolved.clone(), legacy.clone(), only("/home/op/.zshrc")),
+            PathBuf::from("/home/op/.zshrc")
+        );
+        // Installed at the resolved path, or nowhere yet: the resolved path.
+        assert_eq!(
+            choose_profile(resolved.clone(), legacy.clone(), only("/zdot/.zshrc")),
+            resolved
+        );
+        assert_eq!(
+            choose_profile(resolved.clone(), legacy.clone(), |_| false),
+            resolved
+        );
+        assert_eq!(choose_profile(resolved.clone(), legacy, |_| true), resolved);
+    }
+
+    #[test]
+    fn bash_profile_prefers_bashrc_then_the_existing_login_profile() {
+        use super::super::shell_target::Platform::Unix;
+        let plain = inputs(Unix, None, None);
+        let only = |name: &'static str| move |path: &std::path::Path| path.ends_with(name);
+        assert_eq!(
+            profile_for("bash", &plain, |_| false).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, |_| true).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, only(".bash_profile")).unwrap(),
+            Some(PathBuf::from("/home/op/.bash_profile"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, only(".profile")).unwrap(),
+            Some(PathBuf::from("/home/op/.profile"))
+        );
+    }
 
     #[test]
     fn strip_block_removes_inserted_section() {
