@@ -1,15 +1,20 @@
 //! Owner check for accepted loopback connections.
 //!
 //! Linux: the connecting socket's owner is read from `/proc/net/tcp` (and
-//! `tcp6` for IPv4-mapped sockets), and a connection from another account is
-//! dropped before it takes a connection slot or sees any response.
+//! `tcp6` for IPv4-mapped sockets), and a connection from another ordinary
+//! account is dropped before it takes a connection slot or sees any response.
+//! A root-owned client or one with no row in this kernel's tables is let
+//! through: that is how a forwarded loopback connection looks (on WSL2 a
+//! Windows browser arrives through a relay owned by root in NAT mode and
+//! leaves no row in mirrored mode; WSL1 lists no sockets at all), and root
+//! can read the service record anyway.
 //! Other platforms have no stable public API that names the owner of the
 //! other end of a TCP connection, so this check is not available there; the
 //! per-request credential checks still apply everywhere.
 use std::net::TcpStream;
 
-/// False only when the platform shows the other end belongs to a different
-/// account (or, on Linux, when no owner can be found for it).
+/// False only when the platform shows the other end belongs to a different,
+/// non-root account.
 #[cfg(target_os = "linux")]
 pub(super) fn same_user(stream: &TcpStream) -> bool {
     let (Ok(std::net::SocketAddr::V4(local)), Ok(std::net::SocketAddr::V4(peer))) =
@@ -19,21 +24,29 @@ pub(super) fn same_user(stream: &TcpStream) -> bool {
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    let mut readable = false;
-    for (table, mapped) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
-        let Ok(text) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        readable = true;
+    let tables = ["/proc/net/tcp", "/proc/net/tcp6"].map(|path| std::fs::read_to_string(path).ok());
+    owner_allows(&tables, peer, local, me)
+}
+
+/// Decides from the IPv4 and IPv6 socket tables (`None` = unreadable).
+#[cfg(any(test, target_os = "linux"))]
+fn owner_allows(
+    tables: &[Option<String>; 2],
+    peer: std::net::SocketAddrV4,
+    local: std::net::SocketAddrV4,
+    me: u32,
+) -> bool {
+    for (text, mapped) in tables.iter().zip([false, true]) {
         // The connecting socket is the row whose local end is the peer and
         // whose remote end is this service.
-        if let Some(uid) = find_uid(&text, &key(peer, mapped), &key(local, mapped)) {
-            return uid == me;
+        if let Some(uid) = text
+            .as_deref()
+            .and_then(|text| find_uid(text, &key(peer, mapped), &key(local, mapped)))
+        {
+            return uid == me || uid == 0;
         }
     }
-    // Without procfs this platform cannot tell; with it, a missing row
-    // (for example a client that already closed) is refused.
-    !readable
+    true
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -109,6 +122,35 @@ mod tests {
         let mapped = key(client, true);
         assert_eq!(mapped.len(), 32 + 1 + 4);
         assert!(mapped.ends_with(":C350"));
+    }
+
+    #[test]
+    fn relayed_or_unlisted_loopback_peers_are_not_dropped() {
+        // WSL2 NAT relays a Windows browser through /init (uid 0); mirrored
+        // mode and WSL1 leave no row for the client in this kernel's tables.
+        let client = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50000);
+        let service = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let row = |uid: u32| {
+            Some(format!(
+                "{header}   0: {} {} 01 00000000:00000000 00:00000000 00000000 {uid:>5}        0 1 1 0\n",
+                key(client, false),
+                key(service, false)
+            ))
+        };
+        let empty = Some(header.to_string());
+        let decide = |v4: Option<String>| owner_allows(&[v4, empty.clone()], client, service, 1000);
+        assert!(decide(row(1000)), "same account");
+        assert!(!decide(row(2000)), "another ordinary account is dropped");
+        assert!(decide(row(0)), "root-owned relay (WSL2 NAT) is kept");
+        assert!(
+            decide(empty.clone()),
+            "no row (WSL1, WSL2 mirrored) is kept"
+        );
+        assert!(
+            owner_allows(&[None, None], client, service, 1000),
+            "no procfs"
+        );
     }
 
     #[cfg(target_os = "linux")]
