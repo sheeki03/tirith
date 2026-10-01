@@ -62,3 +62,12 @@ and Settings → Saved changes and recovery use the shared journal. Undo checks
 owned postimages and fresh authorization, preserves unrelated changes made before
 undo preparation, and refuses a concurrent change to its compensation baseline.
 It never restores an entire stale policy document over newer user settings.
+
+Saving a setting or profile edits only the lines of the fields it owns: comments,
+blank lines, key order, quoting, indentation and CRLF line endings elsewhere in
+the policy file are kept. Undo restores the exact original bytes when the file
+still holds exactly what the change wrote; otherwise it restores only the owned
+fields. When a field cannot be edited in place safely (a flow-style `{...}`
+parent, an anchor or alias, tab indentation, several YAML documents), the change
+is refused before anything is saved, and the error shows the requested change as
+a diff to make by hand.

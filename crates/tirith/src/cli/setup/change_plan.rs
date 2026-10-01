@@ -190,7 +190,13 @@ enum OwnedEdit {
     ClaudeHandler(super::claude_config::OwnedClaudeHandler),
     AuditRotation(tirith_core::audit::retention::RotationPlan),
     AuditSegment(super::audit_segments::SegmentPlan),
-    Compound(Vec<OwnedEdit>),
+    /// Owned fields of one document. `original` holds the exact planned
+    /// preimage so undo can restore it byte for byte while the file still holds
+    /// exactly what apply wrote.
+    Compound {
+        original: Option<String>,
+        edits: Vec<OwnedEdit>,
+    },
     PrivateFile {
         before: Option<String>,
         after: String,
@@ -2441,8 +2447,9 @@ fn capture_fields(
             return Err("owned field pointers must not overlap".into());
         }
     }
-    Ok(OwnedEdit::Compound(
-        values
+    Ok(OwnedEdit::Compound {
+        original: text.map(str::to_owned),
+        edits: values
             .into_iter()
             .map(|(pointer, after)| OwnedEdit::Field {
                 yaml,
@@ -2451,7 +2458,7 @@ fn capture_fields(
                 after,
             })
             .collect(),
-    ))
+    })
 }
 
 fn validate_pointer(pointer: &str) -> Result<(), String> {
@@ -2631,7 +2638,7 @@ fn owned_matches(edit: &OwnedEdit, current: Option<&str>, after: bool) -> Result
         OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_) => {
             return Err("audit rotation requires the retained native log backend".into())
         }
-        OwnedEdit::Compound(edits) => {
+        OwnedEdit::Compound { edits, .. } => {
             let mut matches = true;
             for edit in edits {
                 matches &= owned_matches(edit, current, after)?;
@@ -2713,14 +2720,15 @@ fn transform(
         OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_) => {
             return Err("audit rotation cannot use a file replacement".into())
         }
-        OwnedEdit::Compound(edits) => {
-            let mut output = current.unwrap_or_default().to_owned();
-            for edit in edits {
-                if let Some(next) = transform(edit, Some(&output), undo)? {
-                    output = next;
+        OwnedEdit::Compound { original, edits } => {
+            // Exact-bytes undo: the file still holds exactly what applying the
+            // fields to the planned preimage writes, so restore that preimage.
+            if let (true, Some(original)) = (undo, original) {
+                if transform_fields(edits, original, false).ok().as_deref() == current {
+                    return Ok(Some(original.clone()));
                 }
             }
-            output
+            transform_fields(edits, current.unwrap_or_default(), undo)?
         }
         OwnedEdit::WholeFile { before, after, .. } | OwnedEdit::PrivateFile { before, after } => {
             if undo {
@@ -2735,11 +2743,14 @@ fn transform(
             before,
             after,
         } => {
-            let mut document = parse_document(current, *yaml)?;
-            set_field(&mut document, pointer, if undo { before } else { after })?;
+            let value = if undo { before } else { after };
             if *yaml {
-                serde_yaml::to_string(&document).map_err(|e| e.to_string())?
+                // Edit only the owned field's lines; comments, blank lines, key
+                // order and quoting elsewhere are kept, or the edit is refused.
+                super::yaml_edit::set_field(current.unwrap_or_default(), pointer, value.as_ref())?
             } else {
+                let mut document = parse_document(current, false)?;
+                set_field(&mut document, pointer, value)?;
                 format!(
                     "{}\n",
                     serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?
@@ -2762,6 +2773,16 @@ fn transform(
         }
     };
     Ok(Some(output))
+}
+
+fn transform_fields(edits: &[OwnedEdit], text: &str, undo: bool) -> Result<String, String> {
+    let mut output = text.to_owned();
+    for edit in edits {
+        if let Some(next) = transform(edit, Some(&output), undo)? {
+            output = next;
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -4091,6 +4112,162 @@ mod tests {
             assert!(std::fs::read_to_string(&target)
                 .unwrap()
                 .contains("changed after undo began"));
+        });
+    }
+
+    #[test]
+    fn yaml_field_edits_keep_comments_and_layout_and_undo_restores_exact_bytes() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let target = config.join("policy.yaml");
+            let original = "# My personal policy\n\nfail_mode: open   # keep it open for now\n\n# Overrides I chose\nseverity_overrides:\n  # quoted on purpose\n  'pipe_to_interpreter': medium\n\nparanoia: 2\n";
+            std::fs::write(&target, original).unwrap();
+            let fields = std::collections::BTreeMap::from([
+                ("/fail_mode".into(), Some(serde_json::json!("closed"))),
+                (
+                    "/severity_overrides/shortened_url".into(),
+                    Some(serde_json::json!("high")),
+                ),
+                ("/strict_warn".into(), Some(serde_json::json!(true))),
+            ]);
+            service
+                .plan(
+                    "keep-layout",
+                    OperationKind::SetProfile,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: config,
+                        edit: Edit::YamlFields(fields),
+                        activation: true,
+                        description: "Change owned policy fields".into(),
+                    }],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("keep-layout", &policy()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "# My personal policy\n\nfail_mode: closed   # keep it open for now\n\n# Overrides I chose\nseverity_overrides:\n  # quoted on purpose\n  'pipe_to_interpreter': medium\n  shortened_url: high\n\nparanoia: 2\nstrict_warn: true\n"
+            );
+            assert_eq!(
+                service.undo("keep-layout", &policy()).unwrap().state,
+                EXPECTED_UNDONE
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn yaml_field_undo_round_trips_exact_bytes_and_keeps_later_unrelated_edits() {
+        let fields = |pairs: &[(&str, Option<Value>)]| {
+            pairs
+                .iter()
+                .map(|(pointer, value)| ((*pointer).to_owned(), value.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let cases = [
+            (
+                "# crlf\r\nfail_mode: \"open\"\r\nseverity_overrides:\r\n  shortened_url: low\r\n",
+                fields(&[
+                    ("/fail_mode", Some(serde_json::json!("closed"))),
+                    ("/severity_overrides/shortened_url", None),
+                ]),
+            ),
+            (
+                "paranoia: 2   # mine\n\n# removed and re-added on undo\nstrict_warn: True\nzeta: 1\n",
+                fields(&[
+                    ("/strict_warn", None),
+                    ("/paranoia", Some(serde_json::json!(3))),
+                ]),
+            ),
+            (
+                "protection_profile:\n    name: balanced\n    version: 1\nscan:\n    require_complete: false # x\n",
+                fields(&[
+                    (
+                        "/protection_profile",
+                        Some(serde_json::json!({"name": "strict", "version": 1})),
+                    ),
+                    ("/scan/require_complete", Some(serde_json::json!(true))),
+                    ("/action_overrides/shortened_url", Some(serde_json::json!("warn"))),
+                ]),
+            ),
+        ];
+        for (original, values) in cases {
+            let edit = capture_fields(Some(original), true, values).unwrap();
+            let applied = transform(&edit, Some(original), false).unwrap().unwrap();
+            assert_ne!(applied, original);
+            assert_eq!(
+                transform(&edit, Some(&applied), true).unwrap().as_deref(),
+                Some(original),
+                "exact undo of {original:?}"
+            );
+            // After an unrelated later edit, undo restores only the owned
+            // fields and keeps the later edit and the file's layout.
+            let eol = if original.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let later = format!("{applied}# added later{eol}note: keep{eol}");
+            let undone = transform(&edit, Some(&later), true).unwrap().unwrap();
+            assert!(undone.contains(&format!("# added later{eol}note: keep{eol}")));
+            let restored: Value = serde_yaml::from_str(&undone).unwrap();
+            let mut expected: Value = serde_yaml::from_str(original).unwrap();
+            expected["note"] = serde_json::json!("keep");
+            if original.starts_with("protection_profile") {
+                // As before, removing an owned leaf keeps a parent that apply
+                // created, as an empty mapping.
+                expected["action_overrides"] = serde_json::json!({});
+            }
+            assert_eq!(restored, expected, "semantic undo of {original:?}");
+        }
+        // The new-file case still compensates to an empty mapping.
+        let edit = capture_fields(
+            None,
+            true,
+            fields(&[("/strict_warn", Some(serde_json::json!(true)))]),
+        )
+        .unwrap();
+        let applied = transform(&edit, None, false).unwrap().unwrap();
+        assert_eq!(applied, "strict_warn: true\n");
+        assert_eq!(
+            transform(&edit, Some(&applied), true).unwrap().as_deref(),
+            Some("{}\n")
+        );
+    }
+
+    #[test]
+    fn yaml_field_plan_refuses_unsafe_in_place_edit_with_a_diff_and_changes_nothing() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let target = config.join("policy.yaml");
+            let original = "# flow style parent\nseverity_overrides: {shortened_url: low}\n";
+            std::fs::write(&target, original).unwrap();
+            let Err(error) = service.plan(
+                "refuse-flow",
+                OperationKind::SetProfile,
+                vec![RequestedChange {
+                    target: target.clone(),
+                    scope_root: config,
+                    edit: Edit::YamlFields(std::collections::BTreeMap::from([(
+                        "/severity_overrides/plain_http_to_sink".into(),
+                        Some(serde_json::json!("high")),
+                    )])),
+                    activation: true,
+                    description: "Change one owned policy field".into(),
+                }],
+                &policy(),
+            ) else {
+                panic!("flow-style parent must be refused");
+            };
+            assert!(error.contains("in place"), "{error}");
+            assert!(error.contains("+   plain_http_to_sink: high"), "{error}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+            assert!(service.read("refuse-flow").is_err());
         });
     }
 

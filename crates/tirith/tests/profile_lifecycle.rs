@@ -406,3 +406,81 @@ fn empty_personal_document_accepts_a_typed_setting_without_shadowing() {
     let doc: serde_yaml::Value = serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(doc["strict_warn"], true);
 }
+
+#[test]
+fn profile_and_setting_edits_keep_comments_and_undo_restores_exact_bytes() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# My tirith policy -- keep these notes\n\n# Why: I review every pipe.\nstrict_warn: false   # set by hand\n\ncustom_operator_note: 'keep my quoting'\nseverity_overrides:\n  # chosen after an incident\n  non_standard_port: HIGH\n";
+    std::fs::write(&path, original).unwrap();
+
+    let profile = success(run(&state, &["policy", "profile", "balanced", "--json"]));
+    let after_profile = std::fs::read_to_string(&path).unwrap();
+    for kept in [
+        "# My tirith policy -- keep these notes\n\n# Why: I review every pipe.\n",
+        "custom_operator_note: 'keep my quoting'\nseverity_overrides:\n  # chosen after an incident\n  non_standard_port: HIGH\n",
+    ] {
+        assert!(after_profile.contains(kept), "{after_profile}");
+    }
+    let setting = success(run(
+        &state,
+        &["policy", "setting", "strict_warn", "true", "--json"],
+    ));
+    let after_setting = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after_setting.contains("\nstrict_warn: true   # set by hand\n"),
+        "{after_setting}"
+    );
+    assert!(
+        after_setting.contains("# My tirith policy -- keep these notes\n"),
+        "{after_setting}"
+    );
+
+    let undo = |id: &Value| {
+        success(run(
+            &state,
+            &[
+                "policy",
+                "operation",
+                id.as_str().unwrap(),
+                "--action",
+                "undo",
+                "--json",
+            ],
+        ))
+    };
+    undo(&setting["operation_id"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), after_profile);
+    undo(&profile["operation_id"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn setting_under_a_flow_style_parent_is_refused_with_a_diff_and_no_write() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# compact on purpose\nscan: {require_complete: false}\n";
+    std::fs::write(&path, original).unwrap();
+    let output = run(
+        &state,
+        &["policy", "setting", "scan_require_complete", "true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cannot change `scan.require_complete` in place"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\n- "), "{stderr}");
+    assert!(
+        stderr.contains("\n+   require_complete: true\n"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}

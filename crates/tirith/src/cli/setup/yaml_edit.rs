@@ -1,0 +1,871 @@
+//! Comment- and layout-preserving edits of one owned field in a YAML policy.
+//!
+//! Profile and setting operations own a few fields of the user's policy file.
+//! Instead of re-serializing the whole document (which drops comments, blank
+//! lines, key order and quoting), an edit rewrites only the lines of the owned
+//! field: the scalar on its line, the field's own block, a new line at the end
+//! of its parent mapping, or the removal of its lines.
+//!
+//! Only block-style mappings are navigated. Anything else on the path (flow
+//! collections, anchors, tags, multi-line scalars, sequences, tabs, several
+//! documents, mixed line endings) is refused with the requested change shown as
+//! a diff, so nothing is ever rewritten that the user did not ask for.
+//!
+//! Every edit is checked: the edited text must parse to exactly the original
+//! document with only the owned field changed. A failed check is a refusal.
+
+use serde_json::Value;
+
+/// Set (`Some`) or remove (`None`) the field named by `pointer` (a validated
+/// JSON pointer of plain object keys) in `text`, touching only its lines.
+pub(super) fn set_field(
+    text: &str,
+    pointer: &str,
+    value: Option<&Value>,
+) -> Result<String, String> {
+    let keys: Vec<&str> = pointer.split('/').skip(1).collect();
+    let original = parse(text).map_err(|_| "target is not a valid YAML object".to_string())?;
+    if !original.is_object() {
+        return Err("target is not a valid YAML object".into());
+    }
+    let mut expected = original.clone();
+    set_value(&mut expected, &keys, value);
+    let refuse = |reason: &str| refusal(&keys, reason, &original, &expected);
+    let edited = edit(text, &keys, value).map_err(&refuse)?;
+    match parse(&edited) {
+        Ok(actual) if actual == expected => Ok(edited),
+        _ => Err(refuse("the in-place edit could not be verified")),
+    }
+}
+
+/// Parse like the change journal does: blank or comment-only text is `{}`.
+fn parse(text: &str) -> Result<Value, serde_yaml::Error> {
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: Value = serde_yaml::from_str(text)?;
+    Ok(if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    })
+}
+
+/// The semantic result the text edit must reach. Removing a missing field is a
+/// no-op and never creates its parents.
+fn set_value(document: &mut Value, keys: &[&str], value: Option<&Value>) {
+    let Some((last, parents)) = keys.split_last() else {
+        return;
+    };
+    let mut current = document;
+    for key in parents {
+        let Some(object) = current.as_object_mut() else {
+            return;
+        };
+        if value.is_none() && !object.contains_key(*key) {
+            return;
+        }
+        current = object
+            .entry((*key).to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        // An empty `parent:` (null) becomes the mapping that holds the field.
+        if value.is_some() && current.is_null() {
+            *current = serde_json::json!({});
+        }
+    }
+    let Some(object) = current.as_object_mut() else {
+        return;
+    };
+    match value {
+        Some(value) => {
+            object.insert((*last).to_owned(), value.clone());
+        }
+        None => {
+            object.remove(*last);
+        }
+    }
+}
+
+fn refusal(keys: &[&str], reason: &str, before: &Value, after: &Value) -> String {
+    let render = |value: &Value| serde_yaml::to_string(value).unwrap_or_default();
+    let (before, after) = (render(before), render(after));
+    let before: Vec<&str> = before.lines().collect();
+    let after: Vec<&str> = after.lines().collect();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    const CONTEXT: usize = 2;
+    let mut diff = String::from("--- current (normalized)\n+++ requested (normalized)\n");
+    for line in &before[prefix.saturating_sub(CONTEXT)..prefix] {
+        diff.push_str(&format!("  {line}\n"));
+    }
+    for line in &before[prefix..before.len() - suffix] {
+        diff.push_str(&format!("- {line}\n"));
+    }
+    for line in &after[prefix..after.len() - suffix] {
+        diff.push_str(&format!("+ {line}\n"));
+    }
+    let tail = before.len() - suffix;
+    for line in &before[tail..(tail + CONTEXT).min(before.len())] {
+        diff.push_str(&format!("  {line}\n"));
+    }
+    format!(
+        "cannot change `{}` in place without rewriting other parts of the policy file ({reason}); \
+         nothing was changed. Make this change by hand, or rewrite that part of the file in plain \
+         block style, then retry:\n{diff}",
+        keys.join(".")
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Plain,
+    Single,
+    Double,
+}
+
+/// What follows `key:` on a key line.
+enum Rest {
+    /// Nothing, or only a comment starting at the given column.
+    Empty {
+        comment: Option<usize>,
+    },
+    /// `{}` with an optional comment.
+    EmptyMap {
+        comment: Option<usize>,
+    },
+    /// `[]` with an optional comment.
+    EmptySeq {
+        comment: Option<usize>,
+    },
+    /// A one-line scalar ending before the given comment column.
+    Scalar {
+        style: Style,
+        comment: Option<usize>,
+    },
+    Complex,
+}
+
+struct Entry {
+    key: String,
+    /// The key line.
+    line: usize,
+    /// One past the last content line of the entry (comments after the last
+    /// content line belong to whatever follows).
+    end: usize,
+    /// Byte column just past the `:`.
+    colon: usize,
+}
+
+struct Document {
+    lines: Vec<String>,
+    eol: &'static str,
+    final_newline: bool,
+    /// First line of the root mapping (after a leading `---`).
+    root: usize,
+    step: usize,
+}
+
+type Refusal = &'static str;
+
+fn edit(text: &str, keys: &[&str], value: Option<&Value>) -> Result<String, Refusal> {
+    let mut document = Document::read(text)?;
+    document.edit(keys, value)?;
+    Ok(document.write())
+}
+
+impl Document {
+    fn read(text: &str) -> Result<Self, Refusal> {
+        let crlf = text.matches("\r\n").count();
+        let lf = text.matches('\n').count();
+        let cr = text.matches('\r').count();
+        let eol = if crlf > 0 { "\r\n" } else { "\n" };
+        if (crlf > 0 && crlf != lf) || cr != crlf {
+            return Err("the file mixes line endings");
+        }
+        let mut lines: Vec<String> = text.split(eol).map(str::to_owned).collect();
+        let final_newline = text.is_empty() || text.ends_with(eol);
+        if final_newline {
+            lines.pop();
+        }
+        if lines
+            .iter()
+            .any(|line| line.trim_start_matches(' ').starts_with('\t'))
+        {
+            return Err("tab indentation is not supported");
+        }
+        // A single leading `---` is allowed; directives and further documents are not.
+        let root = lines
+            .iter()
+            .position(|line| !is_blank_or_comment(line))
+            .filter(|at| lines[*at].trim_end_matches(' ') == "---")
+            .map_or(0, |at| at + 1);
+        if lines.iter().enumerate().any(|(at, line)| {
+            line.starts_with('%')
+                || (at >= root && (line.starts_with("---") || line.starts_with("...")))
+        }) {
+            return Err("directives or several YAML documents are not supported");
+        }
+        let step = detect_step(&lines[root..]);
+        Ok(Self {
+            lines,
+            eol,
+            final_newline,
+            root,
+            step,
+        })
+    }
+
+    fn write(&self) -> String {
+        let mut text = self.lines.join(self.eol);
+        if self.final_newline && !self.lines.is_empty() {
+            text.push_str(self.eol);
+        }
+        text
+    }
+
+    fn edit(&mut self, keys: &[&str], value: Option<&Value>) -> Result<(), Refusal> {
+        if let Some(line) = self.empty_flow_root() {
+            // `{}` as the whole document: the first field replaces it.
+            let Some(value) = value else {
+                return Ok(());
+            };
+            let comment = rest_comment(&self.lines[line], &classify(&self.lines[line], 0));
+            let rendered =
+                self.render_entry(&render_key(keys[0])?, &nest(&keys[1..], value), 0, comment)?;
+            self.splice(line, line + 1, rendered);
+            return Ok(());
+        }
+        let (mut start, mut end, mut indent) = (self.root, self.lines.len(), 0usize);
+        let mut parent: Option<usize> = None;
+        for (depth, key) in keys.iter().enumerate() {
+            let entries = self.entries(start, end, indent)?;
+            let Some(entry) = entries.iter().find(|entry| entry.key == *key) else {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                // Insert the missing remainder at the end of this mapping.
+                let at = entries
+                    .last()
+                    .map(|entry| entry.end)
+                    .or(parent.map(|line| line + 1))
+                    .unwrap_or(self.lines.len());
+                let nested = nest(&keys[depth + 1..], value);
+                let rendered = self.render_entry(&render_key(key)?, &nested, indent, None)?;
+                self.insert(at, rendered);
+                return Ok(());
+            };
+            let rest = classify(&self.lines[entry.line][entry.colon..], entry.colon);
+            if depth + 1 == keys.len() {
+                return self.replace(entry, &entries, indent, parent, value);
+            }
+            let has_children = entry.end > entry.line + 1;
+            match rest {
+                Rest::Empty { .. } if has_children => {
+                    let first = (entry.line + 1..entry.end)
+                        .find(|line| !is_blank_or_comment(&self.lines[*line]))
+                        .ok_or("unexpected empty block")?;
+                    let child = indent_of(&self.lines[first]);
+                    if child <= indent || is_sequence_item(&self.lines[first][child..]) {
+                        return Err("a parent on the path is not a block mapping");
+                    }
+                    parent = Some(entry.line);
+                    start = entry.line + 1;
+                    end = entry.end;
+                    indent = child;
+                }
+                Rest::Empty { .. } | Rest::EmptyMap { .. } => {
+                    let Some(value) = value else {
+                        return Ok(());
+                    };
+                    let nested = nest(&keys[depth + 1..], value);
+                    let raw_key = self.lines[entry.line][..entry.colon - 1]
+                        .trim_start()
+                        .to_owned();
+                    let comment = rest_comment(&self.lines[entry.line], &rest);
+                    let rendered = self.render_entry(&raw_key, &nested, indent, comment)?;
+                    self.splice(entry.line, entry.end, rendered);
+                    return Ok(());
+                }
+                _ => return Err("a parent on the path is not a block mapping"),
+            }
+        }
+        Ok(())
+    }
+
+    fn replace(
+        &mut self,
+        entry: &Entry,
+        entries: &[Entry],
+        indent: usize,
+        parent: Option<usize>,
+        value: Option<&Value>,
+    ) -> Result<(), Refusal> {
+        let line = &self.lines[entry.line];
+        let rest = classify(&line[entry.colon..], entry.colon);
+        let Some(value) = value else {
+            self.splice(entry.line, entry.end, Vec::new());
+            if entries.len() == 1 {
+                match parent {
+                    Some(parent) => self.fill_empty_map(parent)?,
+                    None => self.fill_empty_root(),
+                }
+            }
+            return Ok(());
+        };
+        let raw_key = line[..entry.colon - 1].trim_start().to_owned();
+        let comment = rest_comment(line, &rest);
+        let mut rendered = self.render_entry(&raw_key, value, indent, comment)?;
+        // Keep the quoting style of a one-line string value.
+        if let (Rest::Scalar { style, .. }, Value::String(text)) = (&rest, value) {
+            if entry.end == entry.line + 1 && rendered.len() == 1 {
+                if let Some(quoted) = quote(text, *style) {
+                    let mut first = format!("{}{raw_key}: {quoted}", " ".repeat(indent));
+                    if let Some(comment) = comment {
+                        first.push_str(comment);
+                    }
+                    rendered = vec![first];
+                }
+            }
+        }
+        self.splice(entry.line, entry.end, rendered);
+        Ok(())
+    }
+
+    /// The entries of the block mapping at `indent` in `start..end`.
+    fn entries(&self, start: usize, end: usize, indent: usize) -> Result<Vec<Entry>, Refusal> {
+        let mut entries: Vec<Entry> = Vec::new();
+        for index in start..end {
+            let line = &self.lines[index];
+            if is_blank_or_comment(line) {
+                continue;
+            }
+            let column = indent_of(line);
+            if column > indent {
+                let entry = entries.last_mut().ok_or("unexpected indentation")?;
+                entry.end = index + 1;
+                continue;
+            }
+            if column < indent {
+                return Err("unexpected indentation");
+            }
+            let content = &line[column..];
+            if is_sequence_item(content) {
+                // `key:` followed by a sequence at the same indentation.
+                let entry = entries.last_mut().ok_or("the document is not a mapping")?;
+                let rest = &self.lines[entry.line][entry.colon..];
+                if !matches!(classify(rest, entry.colon), Rest::Empty { .. }) {
+                    return Err("the document is not a block mapping");
+                }
+                entry.end = index + 1;
+                continue;
+            }
+            let (key, colon) = parse_key(content).ok_or("a key is not a plain or quoted key")?;
+            entries.push(Entry {
+                key,
+                line: index,
+                end: index + 1,
+                colon: column + colon,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn render_entry(
+        &self,
+        raw_key: &str,
+        value: &Value,
+        indent: usize,
+        comment: Option<&str>,
+    ) -> Result<Vec<String>, Refusal> {
+        let pad = " ".repeat(indent);
+        let block = match value {
+            Value::Object(map) => !map.is_empty(),
+            Value::Array(items) => !items.is_empty(),
+            _ => false,
+        };
+        let rendered = match value {
+            Value::Object(map) if map.is_empty() => "{}\n".to_owned(),
+            Value::Array(items) if items.is_empty() => "[]\n".to_owned(),
+            value => serde_yaml::to_string(value).map_err(|_| "the value cannot be written")?,
+        };
+        let mut lines = Vec::new();
+        let mut rendered_lines = rendered.lines();
+        let mut first = format!("{pad}{raw_key}:");
+        if !block {
+            first.push(' ');
+            first.push_str(rendered_lines.next().unwrap_or("null"));
+        }
+        if let Some(comment) = comment {
+            first.push_str(comment);
+        }
+        lines.push(first);
+        let child = if block {
+            " ".repeat(indent + self.step)
+        } else {
+            pad
+        };
+        for line in rendered_lines {
+            lines.push(if line.is_empty() {
+                String::new()
+            } else {
+                format!("{child}{line}")
+            });
+        }
+        Ok(lines)
+    }
+
+    fn splice(&mut self, start: usize, end: usize, lines: Vec<String>) {
+        self.lines.splice(start..end, lines);
+    }
+
+    fn insert(&mut self, at: usize, lines: Vec<String>) {
+        self.splice(at, at, lines);
+    }
+
+    /// `parent:` lost its last child: keep it a mapping as `parent: {}`.
+    fn fill_empty_map(&mut self, parent: usize) -> Result<(), Refusal> {
+        let line = &self.lines[parent];
+        let column = indent_of(line);
+        let (_, colon) = parse_key(&line[column..]).ok_or("unexpected parent line")?;
+        let colon = column + colon;
+        let comment = rest_comment(line, &classify(&line[colon..], colon)).unwrap_or("");
+        self.lines[parent] = format!("{}: {{}}{comment}", &line[..colon - 1]);
+        Ok(())
+    }
+
+    /// The line of a document that is only `{}` (plus comments).
+    fn empty_flow_root(&self) -> Option<usize> {
+        let mut content =
+            (self.root..self.lines.len()).filter(|line| !is_blank_or_comment(&self.lines[*line]));
+        let line = content.next()?;
+        (content.next().is_none()
+            && matches!(classify(&self.lines[line], 0), Rest::EmptyMap { .. }))
+        .then_some(line)
+    }
+
+    /// Removing the last root key must leave a mapping, not an empty document.
+    fn fill_empty_root(&mut self) {
+        if self.lines[self.root..]
+            .iter()
+            .all(|line| is_blank_or_comment(line))
+        {
+            self.lines.push("{}".into());
+            self.final_newline = true;
+        }
+    }
+}
+
+/// The text from the whitespace before a comment to the end of the line.
+fn rest_comment<'a>(line: &'a str, rest: &Rest) -> Option<&'a str> {
+    let at = match rest {
+        Rest::Empty { comment }
+        | Rest::EmptyMap { comment }
+        | Rest::EmptySeq { comment }
+        | Rest::Scalar { comment, .. } => (*comment)?,
+        Rest::Complex => return None,
+    };
+    let before = &line[..at];
+    Some(&line[before.trim_end_matches(' ').len()..])
+}
+
+fn nest(keys: &[&str], value: &Value) -> Value {
+    keys.iter().rev().fold(value.clone(), |inner, key| {
+        let mut map = serde_json::Map::new();
+        map.insert((*key).to_owned(), inner);
+        Value::Object(map)
+    })
+}
+
+fn render_key(key: &str) -> Result<String, Refusal> {
+    let rendered = serde_yaml::to_string(&Value::String(key.to_owned()))
+        .map_err(|_| "the key cannot be written")?;
+    let rendered = rendered.trim_end_matches('\n');
+    if rendered.contains('\n') {
+        return Err("the key cannot be written on one line");
+    }
+    Ok(rendered.to_owned())
+}
+
+fn quote(text: &str, style: Style) -> Option<String> {
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    match style {
+        Style::Plain => None,
+        Style::Single => Some(format!("'{}'", text.replace('\'', "''"))),
+        Style::Double => serde_json::to_string(text).ok(),
+    }
+}
+
+fn detect_step(lines: &[String]) -> usize {
+    let mut previous: Option<usize> = None;
+    for line in lines {
+        if is_blank_or_comment(line) {
+            continue;
+        }
+        let column = indent_of(line);
+        if let Some(parent) = previous {
+            if column > parent && !is_sequence_item(&line[column..]) {
+                return column - parent;
+            }
+        }
+        let content = &line[column..];
+        previous = parse_key(content)
+            .filter(|(_, colon)| {
+                matches!(
+                    classify(&content[*colon..], column + colon),
+                    Rest::Empty { .. }
+                )
+            })
+            .map(|_| column);
+    }
+    2
+}
+
+fn is_blank_or_comment(line: &str) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+fn is_sequence_item(content: &str) -> bool {
+    content == "-" || content.starts_with("- ")
+}
+
+/// A plain or quoted key followed by `:`. Returns the decoded key and the byte
+/// offset just past the colon.
+fn parse_key(content: &str) -> Option<(String, usize)> {
+    let followed_by_separator = |at: usize| {
+        content[at..].starts_with(':')
+            && content[at + 1..]
+                .chars()
+                .next()
+                .is_none_or(|next| next == ' ')
+    };
+    let first = content.chars().next()?;
+    let (key, end) = match first {
+        '\'' | '"' => {
+            let close = closing_quote(content)?;
+            let raw = &content[..close];
+            let key: String = serde_yaml::from_str(raw).ok()?;
+            let after = raw.len();
+            let spaces = content[after..].len() - content[after..].trim_start_matches(' ').len();
+            (key, after + spaces)
+        }
+        _ => {
+            if "-?:,[]{}#&*!|>%@`".contains(first) {
+                return None;
+            }
+            let at = content
+                .char_indices()
+                .find(|(at, _)| followed_by_separator(*at))
+                .map(|(at, _)| at)?;
+            let key = content[..at].trim_end_matches(' ');
+            if key.contains(" #") {
+                return None;
+            }
+            (key.to_owned(), at)
+        }
+    };
+    followed_by_separator(end).then_some((key, end + 1))
+}
+
+/// Byte offset just past the closing quote of a quoted scalar at the start.
+fn closing_quote(text: &str) -> Option<usize> {
+    let quote = text.chars().next()?;
+    let mut chars = text.char_indices().skip(1).peekable();
+    while let Some((at, ch)) = chars.next() {
+        if quote == '"' && ch == '\\' {
+            chars.next();
+        } else if ch == quote {
+            if quote == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                chars.next();
+            } else {
+                return Some(at + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Classify the text after `key:`; `offset` is its column in the line.
+fn classify(rest: &str, offset: usize) -> Rest {
+    let value_start = rest.len() - rest.trim_start_matches(' ').len();
+    let value = &rest[value_start..];
+    let comment_at = |at: usize| Some(offset + value_start + at);
+    if value.is_empty() {
+        return Rest::Empty { comment: None };
+    }
+    if value.starts_with('#') {
+        return Rest::Empty {
+            comment: comment_at(0),
+        };
+    }
+    // After a value: spaces, then nothing or a comment.
+    let tail = |after: usize| -> Option<Option<usize>> {
+        let tail = &value[after..];
+        let trimmed = tail.trim_start_matches(' ');
+        if trimmed.is_empty() {
+            Some(None)
+        } else if trimmed.starts_with('#') && trimmed.len() < tail.len() {
+            Some(comment_at(after + tail.len() - trimmed.len()))
+        } else {
+            None
+        }
+    };
+    if let Some(after) = value.strip_prefix("{}") {
+        return match tail(value.len() - after.len()) {
+            Some(comment) => Rest::EmptyMap { comment },
+            None => Rest::Complex,
+        };
+    }
+    if let Some(after) = value.strip_prefix("[]") {
+        return match tail(value.len() - after.len()) {
+            Some(comment) => Rest::EmptySeq { comment },
+            None => Rest::Complex,
+        };
+    }
+    let first = value.chars().next().unwrap_or(' ');
+    if first == '\'' || first == '"' {
+        let style = if first == '\'' {
+            Style::Single
+        } else {
+            Style::Double
+        };
+        return match closing_quote(value).and_then(tail) {
+            Some(comment) => Rest::Scalar { style, comment },
+            None => Rest::Complex,
+        };
+    }
+    if "{[|>&*!%@`".contains(first) || is_sequence_item(value) || value.starts_with("? ") {
+        return Rest::Complex;
+    }
+    let end = value.find(" #").map(|at| at + 1).unwrap_or(value.len());
+    Rest::Scalar {
+        style: Style::Plain,
+        comment: (end < value.len()).then(|| offset + value_start + end),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn set(text: &str, pointer: &str, value: Value) -> String {
+        set_field(text, pointer, Some(&value)).unwrap()
+    }
+
+    fn remove(text: &str, pointer: &str) -> String {
+        set_field(text, pointer, None).unwrap()
+    }
+
+    #[test]
+    fn scalar_edits_keep_comments_blank_lines_and_key_order() {
+        let text = "# header\n\nzeta: 1   # z first\n\n# about fail mode\nfail_mode: open # inline\nalpha: true\n";
+        assert_eq!(
+            set(text, "/fail_mode", json!("closed")),
+            "# header\n\nzeta: 1   # z first\n\n# about fail mode\nfail_mode: closed # inline\nalpha: true\n"
+        );
+        assert_eq!(
+            set(text, "/zeta", json!(3)),
+            "# header\n\nzeta: 3   # z first\n\n# about fail mode\nfail_mode: open # inline\nalpha: true\n"
+        );
+        assert_eq!(
+            set(text, "/strict_warn", json!(false)),
+            format!("{text}strict_warn: false\n")
+        );
+    }
+
+    #[test]
+    fn quoting_styles_of_values_and_keys_are_kept() {
+        let text = "'fail_mode': 'open'\n\"paranoia\": 2\nmode: \"warn\"   # dq\nplain: text\n";
+        let edited = set(text, "/fail_mode", json!("closed"));
+        assert_eq!(
+            edited,
+            "'fail_mode': 'closed'\n\"paranoia\": 2\nmode: \"warn\"   # dq\nplain: text\n"
+        );
+        assert_eq!(
+            set(&edited, "/mode", json!("it's \"x\"")),
+            "'fail_mode': 'closed'\n\"paranoia\": 2\nmode: \"it's \\\"x\\\"\"   # dq\nplain: text\n"
+        );
+        assert_eq!(
+            set(text, "/paranoia", json!(4)),
+            "'fail_mode': 'open'\n\"paranoia\": 4\nmode: \"warn\"   # dq\nplain: text\n"
+        );
+        // A string that would read as another type is quoted, not left plain.
+        assert_eq!(
+            set(text, "/plain", json!("true")),
+            "'fail_mode': 'open'\n\"paranoia\": 2\nmode: \"warn\"   # dq\nplain: 'true'\n"
+        );
+    }
+
+    #[test]
+    fn nested_maps_insert_replace_and_remove_inside_their_block() {
+        let text = "severity_overrides:   # mine\n    # four-space indentation\n    shortened_url: low\n\nscan:\n    require_complete: false\nlast: 1\n";
+        let added = set(
+            text,
+            "/severity_overrides/plain_http_to_sink",
+            json!("high"),
+        );
+        assert_eq!(
+            added,
+            "severity_overrides:   # mine\n    # four-space indentation\n    shortened_url: low\n    plain_http_to_sink: high\n\nscan:\n    require_complete: false\nlast: 1\n"
+        );
+        // Removing what was inserted restores the exact bytes.
+        assert_eq!(
+            remove(&added, "/severity_overrides/plain_http_to_sink"),
+            text
+        );
+        assert_eq!(
+            set(text, "/scan/require_complete", json!(true)),
+            text.replace("require_complete: false", "require_complete: true")
+        );
+        // A missing parent is created with the file's own indentation step.
+        assert_eq!(
+            set(text, "/action_overrides/shortened_url", json!("warn")),
+            format!("{text}action_overrides:\n    shortened_url: warn\n")
+        );
+        // Removing the last child keeps the parent a mapping and its comment.
+        assert_eq!(
+            remove(text, "/severity_overrides/shortened_url"),
+            "severity_overrides: {}   # mine\n    # four-space indentation\n\nscan:\n    require_complete: false\nlast: 1\n"
+        );
+        // Removing a missing field changes nothing.
+        assert_eq!(remove(text, "/action_overrides/x"), text);
+        assert_eq!(remove(text, "/scan/missing"), text);
+    }
+
+    #[test]
+    fn empty_mapping_parent_gains_a_block_child() {
+        assert_eq!(
+            set(
+                "severity_overrides: {}  # none yet\nb: 1\n",
+                "/severity_overrides/x",
+                json!("low")
+            ),
+            "severity_overrides:  # none yet\n  x: low\nb: 1\n"
+        );
+        assert_eq!(
+            set(
+                "severity_overrides:\nb: 1\n",
+                "/severity_overrides/x",
+                json!("low")
+            ),
+            "severity_overrides:\n  x: low\nb: 1\n"
+        );
+    }
+
+    #[test]
+    fn owned_block_values_are_replaced_whole_and_neighbours_kept() {
+        let text = "# top\nprotection_profile:  # managed by tirith\n  name: comfortable\n  version: 1\n  owned_fields:\n  - fail_mode\n# next section\nparanoia: 2\n";
+        let profile =
+            json!({"name": "strict", "version": 1, "owned_fields": ["fail_mode", "paranoia"]});
+        assert_eq!(
+            set(text, "/protection_profile", profile),
+            "# top\nprotection_profile:  # managed by tirith\n  name: strict\n  owned_fields:\n  - fail_mode\n  - paranoia\n  version: 1\n# next section\nparanoia: 2\n"
+        );
+        assert_eq!(
+            remove(text, "/protection_profile"),
+            "# top\n# next section\nparanoia: 2\n"
+        );
+        // A one-line flow value of the owned field itself is simply replaced.
+        assert_eq!(
+            set(
+                "approval_rules: []  # none\nx: 1\n",
+                "/approval_rules",
+                json!([])
+            ),
+            "approval_rules: []  # none\nx: 1\n"
+        );
+    }
+
+    #[test]
+    fn crlf_missing_final_newline_and_document_marker_are_kept() {
+        let text = "# windows\r\nfail_mode: open\r\nscan:\r\n  require_complete: false\r\n";
+        assert_eq!(
+            set(text, "/scan/require_complete", json!(true)),
+            "# windows\r\nfail_mode: open\r\nscan:\r\n  require_complete: true\r\n"
+        );
+        assert_eq!(
+            set(text, "/strict_warn", json!(true)),
+            format!("{text}strict_warn: true\r\n")
+        );
+        assert_eq!(
+            set("---\nfail_mode: open", "/fail_mode", json!("closed")),
+            "---\nfail_mode: closed"
+        );
+        assert_eq!(
+            set("---\nfail_mode: open", "/paranoia", json!(3)),
+            "---\nfail_mode: open\nparanoia: 3"
+        );
+    }
+
+    #[test]
+    fn empty_flow_document_takes_its_first_field() {
+        assert_eq!(
+            set("{}\n", "/allow_bypass_env", json!(true)),
+            "allow_bypass_env: true\n"
+        );
+        assert_eq!(
+            set("# org\n{}   # empty for now\n", "/a/b", json!("x")),
+            "# org\na:   # empty for now\n  b: x\n"
+        );
+        assert_eq!(remove("{}\n", "/a"), "{}\n");
+    }
+
+    #[test]
+    fn new_and_emptied_documents_stay_mappings() {
+        assert_eq!(set("", "/strict_warn", json!(true)), "strict_warn: true\n");
+        assert_eq!(
+            set("# only a comment\n", "/a/b", json!(1)),
+            "# only a comment\na:\n  b: 1\n"
+        );
+        assert_eq!(remove("strict_warn: true\n", "/strict_warn"), "{}\n");
+        assert_eq!(
+            remove("# keep\nstrict_warn: true\n", "/strict_warn"),
+            "# keep\n{}\n"
+        );
+    }
+
+    #[test]
+    fn unsupported_structure_is_refused_with_the_requested_change_shown() {
+        let flow = "severity_overrides: {shortened_url: low}\nfail_mode: open\n";
+        let error = set_field(flow, "/severity_overrides/x", Some(&json!("high"))).unwrap_err();
+        assert!(
+            error.contains("cannot change `severity_overrides.x` in place"),
+            "{error}"
+        );
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert!(error.contains("+   x: high"), "{error}");
+        assert!(error.contains("  severity_overrides:"), "{error}");
+
+        for (text, pointer) in [
+            ("a: &anchor\n  b: 1\nc: *anchor\n", "/a/b"),
+            ("a:\n  b: 1\n", "/a/b/c"),
+            ("list:\n- a\n- b\n", "/list/x"),
+            ("a: 1\r\nb: 2\n", "/a"),
+            ("a:\n\tb: 1\n", "/a/b"),
+            ("%YAML 1.2\n---\na: 1\n", "/a"),
+            ("a: 1\n---\nb: 2\n", "/a"),
+            ("? complex\n: 1\n", "/a"),
+        ] {
+            let result = set_field(text, pointer, Some(&json!(2)));
+            assert!(result.is_err(), "{text:?} {pointer} -> {result:?}");
+        }
+        // An alias to an owned anchored value cannot be silently detached.
+        assert!(set_field("a: &x 1\nb: *x\n", "/a", Some(&json!(2))).is_err());
+    }
+}
