@@ -47,16 +47,20 @@ that grant's expiry instead of appending beside a permanent copy. Ambiguous
 duplicates require an explicit ID. `tirith trust revoke ID` retains a revoked
 record and reports remaining broader grants. Pattern-based `remove` preserves
 its legacy selection behavior while revoking selected new records and showing
-remaining matching permission; `--rule` compares rule IDs case-insensitively,
-like `add`. A rule-scoped grant never counts as covering an all-rules query.
+remaining matching permission, including rule-scoped grants that still cover
+the target; `--rule` compares rule IDs case-insensitively, like `add`.
 
 `tirith trust gc` prunes selected expired grants and revoked grants older than
 30 days; younger revocations stay as tombstones so retries and `explain ID`
 still resolve them. When the store is still above 768 KiB, gc also prunes the
 oldest remaining revocations. Every trust store is read with a 1 MiB cap, so a
-change that would write a larger store is refused. `tirith trust diff` covers
-the grant store as well as the legacy stores; revoked grants are not part of
-the trust set. `list --expired` includes expired and revoked
+change that would write a larger store is refused, except a revocation: when a
+revoked record no longer fits as a tombstone it is deleted instead, so `revoke`
+and `remove` always succeed. `tirith trust diff` covers the grant store as well
+as the legacy stores; revoked grants are not part of the trust set. When the
+grant store cannot be read (corrupted, oversized, or written by a newer
+version) its grants are left out, the other sources still appear, a note says
+so, and that partial snapshot is not recorded as the next baseline. `list --expired` includes expired and revoked
 records; malformed and inactive repository records remain visible.
 
 `explain ID` resolves the private target and selected rule from the stable grant

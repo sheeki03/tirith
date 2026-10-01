@@ -393,6 +393,29 @@ fn removal_rule_matches(own: Option<&str>, requested: Option<&str>) -> bool {
     requested.is_none() || same_rule(own, requested)
 }
 
+/// Make a revocation fit the trust store size cap. Revoking normally keeps the
+/// record as a tombstone (`revoked_at`), which grows the store; when that would
+/// push it past the read cap, the newly revoked records are deleted instead, so
+/// a revocation is never refused (the store it came from was read under the
+/// same cap, so deleting records always fits).
+fn fit_revocations(store: &mut TrustGrantStore, revoked: &[usize]) {
+    let fits = serde_json::to_value(&*store)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .is_some_and(|text| text.len() as u64 <= trust_grants::STORE_READ_CAP);
+    if fits {
+        return;
+    }
+    let mut revoked = revoked.to_vec();
+    revoked.sort_unstable();
+    revoked.dedup();
+    for index in revoked.into_iter().rev() {
+        if index < store.grants.len() {
+            store.grants.remove(index);
+        }
+    }
+}
+
 fn perform(
     context: &Context,
     kind: OperationKind,
@@ -409,7 +432,7 @@ fn perform(
         // the whole store unreadable, so refuse instead of writing it.
         if text.len() as u64 > trust_grants::STORE_READ_CAP {
             return Err(format!(
-                "trust store {} would exceed its 1 MiB size limit; run tirith trust gc --scope all to prune expired grants and old revocations",
+                "trust store {} would exceed its 1 MiB size limit; run tirith trust gc --scope all to prune expired grants and old revocations, or revoke grants you no longer need",
                 target
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -486,8 +509,11 @@ impl Row {
     fn project(&self, context: &Context) -> Value {
         json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v))})
     }
-    /// Same rule semantics as [`TrustGrant::matches`]: a rule-scoped row covers
-    /// only that rule (case-insensitive), never an all-rules query.
+    /// Whether this row still trusts `target` for the queried rule. Unlike the
+    /// runtime [`TrustGrant::matches`] (one finding, one rule), callers here
+    /// list residual trust: `rule = None` means "any rule", so a rule-scoped
+    /// row that covers the target is included. Rule IDs compare
+    /// case-insensitively.
     fn matches(&self, target: &str, rule: Option<&str>) -> bool {
         self.pattern
             .as_deref()
@@ -495,7 +521,7 @@ impl Row {
             && self
                 .rule_id
                 .as_deref()
-                .is_none_or(|own| rule.is_some_and(|rule| own.eq_ignore_ascii_case(rule)))
+                .is_none_or(|own| rule.is_none_or(|rule| own.eq_ignore_ascii_case(rule)))
     }
 }
 
@@ -1019,6 +1045,7 @@ fn revoke_value(context: &mut Context, id: &str) -> Result<Value, String> {
     }
     grant.revoked_at = Some(Utc::now().to_rfc3339());
     store.replace(index, &grant)?;
+    fit_revocations(&mut store, &[index]);
     let operation_id = perform(
         context,
         OperationKind::RevokeTrust,
@@ -1122,6 +1149,7 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
         let mut removed = 0usize;
         if scope != "repo" {
             let (path, before, mut store) = read_store(&context.config)?;
+            let mut revoked = Vec::new();
             for (index, decoded) in store.records().into_iter().enumerate() {
                 let Ok(mut grant) = decoded else {
                     continue;
@@ -1140,10 +1168,12 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
                 {
                     grant.revoked_at = Some(Utc::now().to_rfc3339());
                     store.replace(index, &grant)?;
+                    revoked.push(index);
                     removed += 1;
                 }
             }
             if removed > 0 {
+                fit_revocations(&mut store, &revoked);
                 changes.push((
                     path,
                     context.config.clone(),
@@ -1812,34 +1842,119 @@ mod tests {
     }
 
     #[test]
-    fn row_rule_scope_agrees_with_runtime_grant_matching() {
+    fn residual_trust_listings_include_rule_scoped_grants_for_any_rule_queries() {
         let _state = GlobalStateGuard::new().unwrap();
-        let context = Context::capture().unwrap();
         let target = "https://mirror.example/install.sh";
-        for grant in [
-            user_grant(target, Some("pipe_to_interpreter")),
-            user_grant(target, None),
-        ] {
-            let row = grant_row(&grant, &context);
-            for rule in [
-                None,
-                Some("pipe_to_interpreter"),
-                Some("PIPE_TO_INTERPRETER"),
-                Some("shortened_url"),
-            ] {
-                assert_eq!(
-                    row.matches(target, rule),
-                    grant.matches(target, rule),
-                    "rule {:?} vs query {rule:?}",
-                    grant.rule_id
-                );
-            }
-        }
-        let scoped = grant_row(&user_grant(target, Some("pipe_to_interpreter")), &context);
-        assert!(
-            !scoped.matches(target, None),
-            "a rule-scoped grant does not cover an all-rules query"
+        let all_rules = user_grant(target, None);
+        let broad = user_grant("mirror.example", Some("pipe_to_interpreter"));
+        write_grants(&[all_rules.clone(), broad.clone()]);
+        let ids = |value: &Value| -> Vec<String> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        // Rows: `None` asks "any rule", a named rule compares case-insensitively.
+        let context = Context::capture().unwrap();
+        let row = grant_row(&broad, &context);
+        assert!(row.matches(target, None));
+        assert!(row.matches(target, Some("PIPE_TO_INTERPRETER")));
+        assert!(!row.matches(target, Some("shortened_url")));
+
+        // Revoking the all-rules grant still reports the rule-scoped broad grant.
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &all_rules.id).unwrap();
+        assert_eq!(
+            ids(&revoked["remaining_grants"]),
+            vec![broad.id.clone()],
+            "{revoked}"
         );
+        // `trust remove` without --rule reports it too.
+        let mut context = Context::capture().unwrap();
+        assert_eq!(
+            ids(&Value::Array(remaining(&context, target, None).unwrap())),
+            vec![broad.id.clone()]
+        );
+        // `trust explain <url>` lists the broad grant that covers the URL.
+        let explained =
+            explain_value(&mut context, "https://mirror.example/other.sh", "all").unwrap();
+        assert_eq!(
+            ids(&explained["matching_effective_grants"]),
+            vec![broad.id.clone()],
+            "{explained}"
+        );
+        assert!(ids(&explained["grants"]).contains(&broad.id));
+    }
+
+    #[test]
+    fn revocation_is_never_refused_by_the_store_size_cap() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let pretty_len = |grants: &[TrustGrant]| {
+            let store = TrustGrantStore {
+                schema_version: trust_grants::STORE_VERSION,
+                grants: grants
+                    .iter()
+                    .map(|grant| serde_json::to_value(grant).unwrap())
+                    .collect(),
+            };
+            serde_json::to_string_pretty(&serde_json::to_value(&store).unwrap())
+                .unwrap()
+                .len()
+        };
+        let cap = trust_grants::STORE_READ_CAP as usize;
+        // Only active grants, written as `trust add` would leave them: just
+        // under the cap, with no room for a `revoked_at` tombstone.
+        let mut grants = Vec::new();
+        while pretty_len(&grants) < cap - 4_000 {
+            grants.push(TrustGrant {
+                reason: Some("x".repeat(400)),
+                ..user_grant(
+                    &format!("https://mirror.example/{}", grants.len()),
+                    Some("shortened_url"),
+                )
+            });
+        }
+        let pad = cap - 10 - pretty_len(&grants);
+        grants.last_mut().unwrap().reason = Some("x".repeat(400 + pad));
+        assert_eq!(pretty_len(&grants), cap - 10);
+        write_grants(&grants);
+        let first = grants[0].clone();
+        let second = grants[1].clone();
+        let third = grants[2].clone();
+        let present = |id: &str| {
+            saved()
+                .records()
+                .into_iter()
+                .flatten()
+                .find(|grant| grant.id == id)
+        };
+
+        // `trust remove` at the cap: the record is deleted instead of tombstoned.
+        assert_eq!(remove(&third.pattern, None, "user"), 0);
+        assert!(present(&third.id).is_none());
+
+        // `trust revoke` at the cap, same store again.
+        write_grants(&grants);
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &first.id).unwrap();
+        assert_eq!(revoked["state"], "revoked", "{revoked}");
+        assert!(
+            present(&first.id).is_none(),
+            "a revocation that cannot fit as a tombstone deletes the record"
+        );
+        // With room again, a revocation keeps its tombstone.
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &second.id).unwrap();
+        assert_eq!(revoked["state"], "revoked", "{revoked}");
+        assert!(present(&second.id).unwrap().revoked_at.is_some());
+        let size = std::fs::metadata(
+            tirith_core::policy::config_dir()
+                .unwrap()
+                .join(trust_grants::STORE_FILE),
+        )
+        .unwrap()
+        .len();
+        assert!(size <= trust_grants::STORE_READ_CAP, "{size}");
     }
 
     #[test]

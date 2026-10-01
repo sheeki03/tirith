@@ -1125,9 +1125,15 @@ pub fn add(
 
 /// Collect trust-style rows (legacy stores, operator grants, allowlists) for
 /// `trust diff`. `show_expired` controls whether expired
-/// TTL-bearing entries are included.
-fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, String> {
+/// TTL-bearing entries are included. An unreadable operator grant store grants
+/// nothing at runtime, so its rows are left out and the reason is returned
+/// next to the other rows instead of failing the whole collection.
+fn collect_rows(
+    scope: &str,
+    show_expired: bool,
+) -> Result<(Vec<TrustListRow>, Option<String>), String> {
     let mut rows: Vec<TrustListRow> = Vec::new();
+    let mut grant_store_error = None;
 
     let scopes_to_load: Vec<&str> = match scope {
         "all" => vec!["user", "repo"],
@@ -1164,7 +1170,10 @@ fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, St
     }
 
     if scope == "all" {
-        rows.extend(operator_grant_rows(show_expired)?);
+        match operator_grant_rows(show_expired) {
+            Ok(grants) => rows.extend(grants),
+            Err(error) => grant_store_error = Some(error),
+        }
         if let Some(config) = tirith_core::policy::config_dir() {
             let allowlist_path = config.join("allowlist");
             if let Ok(content) = fs::read_to_string(&allowlist_path) {
@@ -1230,7 +1239,7 @@ fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, St
         }
     }
 
-    Ok(rows)
+    Ok((rows, grant_store_error))
 }
 
 /// Rows for the operator grant store (`trust-grants.json`). Revoked and
@@ -1626,19 +1635,27 @@ fn split_key(key: &str) -> (String, String, Option<String>) {
 }
 
 /// Build a snapshot of the current full trust set (all scopes, including
-/// expired entries — diff cares about set membership, not expiry).
-fn current_trust_snapshot() -> TrustSnapshot {
-    let mut entries: Vec<String> = collect_rows("all", true)
-        .unwrap_or_default()
-        .iter()
-        .map(row_key)
-        .collect();
+/// expired entries — diff cares about set membership, not expiry). The second
+/// value explains why the snapshot is incomplete (an unreadable operator grant
+/// store), in which case it must not become a recorded baseline.
+fn current_trust_snapshot() -> (TrustSnapshot, Option<String>) {
+    let (rows, incomplete) = collect_rows("all", true).unwrap_or_default();
+    let mut entries: Vec<String> = rows.iter().map(row_key).collect();
     entries.sort();
     entries.dedup();
-    TrustSnapshot {
-        recorded_at: chrono::Utc::now().to_rfc3339(),
-        entries,
-    }
+    let incomplete = incomplete.map(|error| {
+        format!(
+            "{error}; its grants are not applied and are left out of this diff, \
+             and this snapshot was not recorded as a baseline"
+        )
+    });
+    (
+        TrustSnapshot {
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+            entries,
+        },
+        incomplete,
+    )
 }
 
 /// Load all retained trust snapshots, oldest first (unparseable lines skipped).
@@ -1740,7 +1757,8 @@ struct TrustDiffReport {
     removed: Vec<DiffEntry>,
     /// True when nothing changed.
     unchanged: bool,
-    /// Set when the diff could not be produced against a real baseline.
+    /// Set when the diff could not be produced against a real baseline, or
+    /// when the current trust set could only be read in part.
     note: Option<String>,
 }
 
@@ -1925,7 +1943,7 @@ fn parse_relative_duration(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Str
 /// recorded snapshot.
 pub fn diff(json: bool) -> i32 {
     let (history, history_read_error) = load_trust_history();
-    let current = current_trust_snapshot();
+    let (current, incomplete) = current_trust_snapshot();
 
     // Baseline = the literal last recorded snapshot (not "last that differs"),
     // which keeps repeated `trust diff` calls idempotent.
@@ -1939,12 +1957,17 @@ pub fn diff(json: bool) -> i32 {
             unchanged: true,
             // A history file that exists but could not be read must not be
             // reported as "first observation" — surface the read failure.
-            note: Some(history_read_error.clone().unwrap_or_else(|| {
-                "No earlier trust snapshot to compare against — this is the first \
+            note: Some(
+                history_read_error
+                    .clone()
+                    .or_else(|| incomplete.clone())
+                    .unwrap_or_else(|| {
+                        "No earlier trust snapshot to compare against — this is the first \
                  observation. Run a 'tirith trust' command again later to build a \
                  diff trail."
-                    .to_string()
-            })),
+                            .to_string()
+                    }),
+            ),
         },
         Some(base) => {
             let base_set: std::collections::BTreeSet<&String> = base.entries.iter().collect();
@@ -1964,14 +1987,18 @@ pub fn diff(json: bool) -> i32 {
                 added,
                 removed,
                 unchanged,
-                note: None,
+                note: incomplete.clone(),
             }
         }
     };
 
     // Record the current snapshot AFTER computing the diff so the next `diff`
-    // has a fresh baseline.
-    record_trust_snapshot(&current);
+    // has a fresh baseline. A partial snapshot never becomes the baseline:
+    // the next diff after the store is readable again compares to the last
+    // complete one.
+    if incomplete.is_none() {
+        record_trust_snapshot(&current);
+    }
 
     if json {
         return print_json(&report);
@@ -1983,7 +2010,9 @@ pub fn diff(json: bool) -> i32 {
     }
     if let Some(note) = &report.note {
         println!("  note: {}", human_multiline(note));
-        return 0;
+        if report.baseline_recorded_at.is_none() {
+            return 0;
+        }
     }
     if report.unchanged {
         println!("  no changes since the last snapshot");
@@ -3277,6 +3306,44 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_grant_store_keeps_other_rows_and_is_never_recorded_as_baseline() {
+        use tirith_core::trust_grants::STORE_FILE;
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("allowlist"), "allowed.example\n").unwrap();
+        let key = "allowlist-user\u{1f}allowed.example\u{1f}";
+        let (complete, incomplete) = current_trust_snapshot();
+        assert!(incomplete.is_none());
+        assert!(complete.entries.iter().any(|entry| entry == key));
+        record_trust_snapshot(&complete);
+
+        // A store written by a newer client (or corrupted) cannot be read.
+        fs::write(
+            config.join(STORE_FILE),
+            r#"{"schema_version":2,"grants":[]}"#,
+        )
+        .unwrap();
+        let (partial, incomplete) = current_trust_snapshot();
+        assert!(incomplete.is_some(), "the unreadable store is reported");
+        assert!(
+            partial.entries.iter().any(|entry| entry == key),
+            "other trust sources stay in the snapshot: {:?}",
+            partial.entries
+        );
+        assert_eq!(diff(true), 0);
+        let (history, _) = load_trust_history();
+        assert_eq!(history.len(), 1, "a partial snapshot is not recorded");
+        assert_eq!(history[0].entries, complete.entries);
+
+        // Once the store is readable again nothing looks added or removed.
+        fs::remove_file(config.join(STORE_FILE)).unwrap();
+        assert_eq!(diff(true), 0);
+        let (history, _) = load_trust_history();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
     fn diff_snapshot_includes_operator_grants_and_drops_revoked_ones() {
         use tirith_core::trust_grants::{GrantScope, TrustGrant, TrustGrantStore, STORE_FILE};
         let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
@@ -3299,7 +3366,7 @@ mod tests {
         };
         let key = "grant-user\u{1f}https://mirror.example/install.sh\u{1f}pipe_to_interpreter";
         write(&grant);
-        let before = current_trust_snapshot();
+        let (before, _) = current_trust_snapshot();
         assert!(
             before.entries.iter().any(|entry| entry == key),
             "trust diff must see trust-grants.json: {:?}",
@@ -3308,7 +3375,7 @@ mod tests {
         record_trust_snapshot(&before);
         grant.revoked_at = Some(chrono::Utc::now().to_rfc3339());
         write(&grant);
-        let after = current_trust_snapshot();
+        let (after, _) = current_trust_snapshot();
         assert!(!after.entries.iter().any(|entry| entry == key));
         let (history, _) = load_trust_history();
         let baseline = history.last().unwrap();
