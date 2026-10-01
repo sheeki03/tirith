@@ -113,7 +113,7 @@ pub fn run(action: &str) -> i32 {
 }
 
 fn enable() -> i32 {
-    let (shell, profile) = match detect_profile() {
+    let target = match detect_profile() {
         Ok(found) => found,
         Err(reason) => {
             eprintln!("tirith output wrap: could not detect shell profile (set SHELL or run again with --shell)");
@@ -121,11 +121,22 @@ fn enable() -> i32 {
             return 1;
         }
     };
+    let code = enable_at(target.shell, &target.profile);
+    if code == 0 {
+        if let Some(stale) = &target.stale {
+            // The wrapper now lives where the shell reads it; the old copy is
+            // only clutter, so a failure to remove it is reported, not fatal.
+            let _ = remove_stale_copy(target.shell, stale);
+        }
+    }
+    code
+}
 
+fn enable_at(shell: &str, profile: &std::path::Path) -> i32 {
     // repo-0224: only a MISSING file means "empty profile". Any other read
     // failure (invalid UTF-8, permissions, transient I/O) must abort rather
     // than replacing the real profile with just our snippet.
-    let (root, mut destination, current, _) = match read_profile_retained(&profile) {
+    let (root, mut destination, current, _) = match read_profile_retained(profile) {
         Ok(profile) => profile,
         Err(e) => {
             eprintln!(
@@ -174,7 +185,7 @@ fn enable() -> i32 {
             return 1;
         };
         let new_content = format!("{stripped}{expected}");
-        if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes())
+        if let Err(e) = publish_profile(&root, profile, destination.take(), new_content.as_bytes())
         {
             eprintln!(
                 "tirith output wrap: failed to repair {}: {e}",
@@ -198,7 +209,7 @@ fn enable() -> i32 {
     let new_content = format!("{current}{separator}{snippet}");
     // Atomic write: a crash mid read-modify-write of the user's rc file must
     // never truncate or corrupt their shell config.
-    if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes()) {
+    if let Err(e) = publish_profile(&root, profile, destination.take(), new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -223,16 +234,58 @@ fn enable() -> i32 {
 }
 
 fn disable() -> i32 {
-    let profile = match detect_profile() {
-        Ok((_shell, profile)) => profile,
+    let target = match detect_profile() {
+        Ok(found) => found,
         Err(reason) => {
             eprintln!("tirith output wrap: could not detect shell profile");
             print_profile_reason(&reason);
             return 1;
         }
     };
+    let code = disable_at(&target.profile);
+    match &target.stale {
+        Some(stale) if !remove_stale_copy(target.shell, stale) => 1,
+        _ => code,
+    }
+}
 
-    let (root, destination, current, existed) = match read_profile_retained(&profile) {
+/// Remove an older release's wrapper block from a profile the shell does not
+/// read at startup. Prints the outcome; returns false when the block remains.
+fn remove_stale_copy(shell: &str, stale: &std::path::Path) -> bool {
+    let (root, destination, current, existed) = match read_profile_retained(stale) {
+        Ok(found) => found,
+        Err(error) => {
+            print_stale_left(shell, stale, &format!("cannot read it: {error}"));
+            return false;
+        }
+    };
+    if !existed || !current.contains(BEGIN_MARKER) {
+        return true;
+    }
+    let Some(new_content) = strip_block(&current) else {
+        print_stale_left(shell, stale, "its block is missing the END marker");
+        return false;
+    };
+    if let Err(error) = publish_profile(&root, stale, destination, new_content.as_bytes()) {
+        print_stale_left(shell, stale, &format!("write failed: {error}"));
+        return false;
+    }
+    eprintln!(
+        "tirith output wrap: removed the older copy from {} ({shell} does not read that file at startup)",
+        stale.display()
+    );
+    true
+}
+
+fn print_stale_left(shell: &str, stale: &std::path::Path, reason: &str) {
+    eprintln!(
+        "tirith output wrap: an older copy remains in {}, which {shell} does not read at startup; could not remove it ({reason}). Delete the lines from `{BEGIN_MARKER}` to `{END_MARKER}` there.",
+        stale.display()
+    );
+}
+
+fn disable_at(profile: &std::path::Path) -> i32 {
+    let (root, destination, current, existed) = match read_profile_retained(profile) {
         Ok(profile) => profile,
         Err(error) => {
             eprintln!(
@@ -268,7 +321,7 @@ fn disable() -> i32 {
         return 1;
     };
     // Atomic write (see `enable`): removing the block also rewrites the rc file.
-    if let Err(e) = publish_profile(&root, &profile, destination, new_content.as_bytes()) {
+    if let Err(e) = publish_profile(&root, profile, destination, new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -281,7 +334,11 @@ fn disable() -> i32 {
 }
 
 fn status() -> i32 {
-    let (shell, profile) = match detect_profile() {
+    let ProfileTarget {
+        shell,
+        profile,
+        stale,
+    } = match detect_profile() {
         Ok(found) => found,
         Err(reason) => {
             eprintln!("tirith output wrap: status — could not detect shell profile");
@@ -298,6 +355,15 @@ fn status() -> i32 {
     if enabled {
         println!("  function:  tirith-output-guard-wrap");
         println!("  alias:     tirith-out");
+    }
+    if let Some(stale) = stale {
+        println!(
+            "  older copy: {} (not loaded: {shell} does not read that file at startup;",
+            stale.display()
+        );
+        println!(
+            "             `tirith output wrap on` moves it to the profile above, `off` removes it)"
+        );
     }
     println!("  scope:     wraps INDIVIDUAL commands invoked via `tirith-out <cmd>`;");
     println!("             does NOT intercept output from commands run outside the wrapper.");
@@ -416,22 +482,27 @@ fn legacy_profile_for(
     })
 }
 
-/// A wrapper an older release already installed keeps being found where it
-/// is (so `off` and `status` still see it and `on` does not add a second
-/// copy); otherwise the resolved profile is used.
-fn choose_profile(
-    resolved: PathBuf,
+/// The profile the wrapper belongs in, and a copy an older release left at a
+/// path this shell does not read at startup.
+struct ProfileTarget {
+    shell: &'static str,
+    profile: PathBuf,
+    stale: Option<PathBuf>,
+}
+
+/// The old fixed path is only stale when it differs from the resolved profile
+/// (the one the shell reads); then a block there is never loaded, so it is
+/// reported and cleaned up rather than treated as the active wrapper.
+fn stale_legacy_copy(
+    resolved: &std::path::Path,
     legacy: Option<PathBuf>,
     has_block: impl Fn(&std::path::Path) -> bool,
-) -> PathBuf {
-    match legacy {
-        Some(legacy) if legacy != resolved && !has_block(&resolved) && has_block(&legacy) => legacy,
-        _ => resolved,
-    }
+) -> Option<PathBuf> {
+    legacy.filter(|legacy| legacy != resolved && has_block(legacy))
 }
 
 /// `Err` carries an optional reason shown under the caller's message.
-fn detect_profile() -> Result<(&'static str, PathBuf), String> {
+fn detect_profile() -> Result<ProfileTarget, String> {
     let home = home::home_dir().ok_or_else(String::new)?;
     let shell = crate::cli::init::detect_shell();
     let inputs = super::shell_target::TargetInputs::current(home.clone())?;
@@ -440,7 +511,12 @@ fn detect_profile() -> Result<(&'static str, PathBuf), String> {
     let has_block = |path: &std::path::Path| {
         fs::read_to_string(path).is_ok_and(|content| content.contains(BEGIN_MARKER))
     };
-    Ok((shell, choose_profile(resolved, legacy, has_block)))
+    let stale = stale_legacy_copy(&resolved, legacy, has_block);
+    Ok(ProfileTarget {
+        shell,
+        profile: resolved,
+        stale,
+    })
 }
 
 fn print_profile_reason(reason: &str) {
@@ -504,27 +580,34 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapper_installed_at_the_legacy_location_is_still_found() {
+    fn a_legacy_copy_the_shell_does_not_read_is_stale_not_the_target() {
         let resolved = PathBuf::from("/zdot/.zshrc");
         let legacy = legacy_profile_for("zsh", std::path::Path::new("/home/op"), |_| false);
         assert_eq!(legacy, Some(PathBuf::from("/home/op/.zshrc")));
         let only =
             |with: &'static str| move |path: &std::path::Path| path == std::path::Path::new(with);
-        // Installed only at the old fixed path: keep using it.
+        // Left only at the old fixed path that zsh skips while ZDOTDIR is set:
+        // it is stale, and the wrapper still goes to the resolved profile.
         assert_eq!(
-            choose_profile(resolved.clone(), legacy.clone(), only("/home/op/.zshrc")),
-            PathBuf::from("/home/op/.zshrc")
-        );
-        // Installed at the resolved path, or nowhere yet: the resolved path.
-        assert_eq!(
-            choose_profile(resolved.clone(), legacy.clone(), only("/zdot/.zshrc")),
-            resolved
+            stale_legacy_copy(&resolved, legacy.clone(), only("/home/op/.zshrc")),
+            Some(PathBuf::from("/home/op/.zshrc"))
         );
         assert_eq!(
-            choose_profile(resolved.clone(), legacy.clone(), |_| false),
-            resolved
+            stale_legacy_copy(&resolved, legacy.clone(), |_| true),
+            Some(PathBuf::from("/home/op/.zshrc"))
         );
-        assert_eq!(choose_profile(resolved.clone(), legacy, |_| true), resolved);
+        // Nothing at the old path: nothing stale.
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), only("/zdot/.zshrc")),
+            None
+        );
+        assert_eq!(stale_legacy_copy(&resolved, legacy, |_| false), None);
+        // When the old path is the file the shell reads, it is the profile.
+        let home_zshrc = PathBuf::from("/home/op/.zshrc");
+        assert_eq!(
+            stale_legacy_copy(&home_zshrc, Some(home_zshrc.clone()), |_| true),
+            None
+        );
     }
 
     #[test]
