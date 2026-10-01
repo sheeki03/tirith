@@ -465,7 +465,10 @@ fn setting_under_a_flow_style_parent_is_refused_with_a_diff_and_no_write() {
         .unwrap()
         .join("policy.yaml");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let original = "# compact on purpose\nscan: {require_complete: false}\n";
+    // The credential sorts right before `scan` in the normalized document; the
+    // refusal must show the owned field only, never neighbouring values.
+    let original = "# compact on purpose\npolicy_server_api_key: sk-live-SECRET123abc\n\
+                    scan: {require_complete: false}\n";
     std::fs::write(&path, original).unwrap();
     let output = run(
         &state,
@@ -482,5 +485,7 @@ fn setting_under_a_flow_style_parent_is_refused_with_a_diff_and_no_write() {
         stderr.contains("\n+   require_complete: true\n"),
         "{stderr}"
     );
+    assert!(!stderr.contains("SECRET123"), "{stderr}");
+    assert!(!stderr.contains("policy_server"), "{stderr}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }

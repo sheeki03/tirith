@@ -30,7 +30,7 @@ pub(super) fn set_field(
     }
     let mut expected = original.clone();
     set_value(&mut expected, &keys, value);
-    let refuse = |reason: &str| refusal(&keys, reason, &original, &expected);
+    let refuse = |reason: &str| refusal(&keys, reason, &original, value);
     let edited = edit(text, &keys, value).map_err(&refuse)?;
     match parse(&edited) {
         Ok(actual) if actual == expected => Ok(edited),
@@ -86,9 +86,19 @@ fn set_value(document: &mut Value, keys: &[&str], value: Option<&Value>) {
     }
 }
 
-fn refusal(keys: &[&str], reason: &str, before: &Value, after: &Value) -> String {
-    let render = |value: &Value| serde_yaml::to_string(value).unwrap_or_default();
-    let (before, after) = (render(before), render(after));
+/// The refusal shows the requested change as a diff of the owned field alone:
+/// its current and requested value nested under its key path. Other fields of
+/// the policy (credentials such as `policy_server_api_key` or webhook headers
+/// may sort right next to an owned field) never appear in the message.
+fn refusal(keys: &[&str], reason: &str, document: &Value, requested: Option<&Value>) -> String {
+    let render = |value: Option<&Value>| match value {
+        Some(value) => serde_yaml::to_string(&nest(keys, value)).unwrap_or_default(),
+        None => String::new(),
+    };
+    let current = keys
+        .iter()
+        .try_fold(document, |value, key| value.as_object()?.get(*key));
+    let (before, after) = (render(current), render(requested));
     let before: Vec<&str> = before.lines().collect();
     let after: Vec<&str> = after.lines().collect();
     let prefix = before
@@ -102,9 +112,8 @@ fn refusal(keys: &[&str], reason: &str, before: &Value, after: &Value) -> String
         .zip(after[prefix..].iter().rev())
         .take_while(|(left, right)| left == right)
         .count();
-    const CONTEXT: usize = 2;
     let mut diff = String::from("--- current (normalized)\n+++ requested (normalized)\n");
-    for line in &before[prefix.saturating_sub(CONTEXT)..prefix] {
+    for line in &before[..prefix] {
         diff.push_str(&format!("  {line}\n"));
     }
     for line in &before[prefix..before.len() - suffix] {
@@ -114,7 +123,7 @@ fn refusal(keys: &[&str], reason: &str, before: &Value, after: &Value) -> String
         diff.push_str(&format!("+ {line}\n"));
     }
     let tail = before.len() - suffix;
-    for line in &before[tail..(tail + CONTEXT).min(before.len())] {
+    for line in &before[tail..] {
         diff.push_str(&format!("  {line}\n"));
     }
     format!(
@@ -850,7 +859,11 @@ mod tests {
         );
         assert!(error.contains("nothing was changed"), "{error}");
         assert!(error.contains("+   x: high"), "{error}");
-        assert!(error.contains("  severity_overrides:"), "{error}");
+        // A field that does not exist yet is shown whole as an addition; other
+        // entries of its parent are not part of the message.
+        assert!(error.contains("+ severity_overrides:\n"), "{error}");
+        assert!(!error.contains("shortened_url"), "{error}");
+        assert!(!error.contains("fail_mode"), "{error}");
 
         for (text, pointer) in [
             ("a: &anchor\n  b: 1\nc: *anchor\n", "/a/b"),
@@ -867,5 +880,44 @@ mod tests {
         }
         // An alias to an owned anchored value cannot be silently detached.
         assert!(set_field("a: &x 1\nb: *x\n", "/a", Some(&json!(2))).is_err());
+    }
+
+    #[test]
+    fn refusal_diff_shows_only_the_owned_field_never_neighbouring_values() {
+        // Keys of the normalized document are sorted, so credentials sort right
+        // next to owned fields such as `protection_profile` and `scan`.
+        let text = "policy_server_api_key: sk-live-SECRET123abc\r\n\
+                    policy_server_url: https://policy.example-cli.dev/secret-path\n\
+                    protection_profile:\n  name: balanced\n  version: 1\n\
+                    scan: {require_complete: false}\n\
+                    webhooks:\n- url: https://hooks.example-cli.dev\n  headers:\n    \
+                    Authorization: Bearer HEADER-SECRET\n";
+        for (pointer, value) in [
+            (
+                "/protection_profile",
+                Some(json!({"name": "strict", "version": 1})),
+            ),
+            ("/protection_profile", None),
+            ("/paranoia", Some(json!(3))),
+            ("/scan/require_complete", Some(json!(true))),
+            ("/strict_warn", Some(json!(true))),
+        ] {
+            let error = set_field(text, pointer, value.as_ref()).unwrap_err();
+            for secret in ["SECRET123", "secret-path", "HEADER-SECRET", "example-cli"] {
+                assert!(!error.contains(secret), "{pointer}: {error}");
+            }
+            assert!(error.contains("nothing was changed"), "{error}");
+        }
+        let error = set_field(
+            text,
+            "/protection_profile",
+            Some(&json!({"name": "strict", "version": 1})),
+        )
+        .unwrap_err();
+        assert!(error.contains("  protection_profile:\n"), "{error}");
+        assert!(error.contains("-   name: balanced\n"), "{error}");
+        assert!(error.contains("+   name: strict\n"), "{error}");
+        assert!(!error.contains("policy_server"), "{error}");
+        assert!(!error.contains("webhooks"), "{error}");
     }
 }
