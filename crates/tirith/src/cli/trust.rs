@@ -1123,7 +1123,8 @@ pub fn add(
     )
 }
 
-/// Collect trust-style rows for the retained legacy diff format. `show_expired` controls whether expired
+/// Collect trust-style rows (legacy stores, operator grants, allowlists) for
+/// `trust diff`. `show_expired` controls whether expired
 /// TTL-bearing entries are included.
 fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, String> {
     let mut rows: Vec<TrustListRow> = Vec::new();
@@ -1163,6 +1164,7 @@ fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, St
     }
 
     if scope == "all" {
+        rows.extend(operator_grant_rows(show_expired)?);
         if let Some(config) = tirith_core::policy::config_dir() {
             let allowlist_path = config.join("allowlist");
             if let Ok(content) = fs::read_to_string(&allowlist_path) {
@@ -1228,6 +1230,58 @@ fn collect_rows(scope: &str, show_expired: bool) -> Result<Vec<TrustListRow>, St
         }
     }
 
+    Ok(rows)
+}
+
+/// Rows for the operator grant store (`trust-grants.json`). Revoked and
+/// undecodable records grant nothing and are left out; a project grant's
+/// source names its checkout so grants for different checkouts stay distinct.
+fn operator_grant_rows(show_expired: bool) -> Result<Vec<TrustListRow>, String> {
+    use tirith_core::trust_grants::{self, Expiry, GrantScope, TrustGrantStore};
+    let Some(config) = tirith_core::policy::config_dir() else {
+        return Ok(Vec::new());
+    };
+    let path = config.join(trust_grants::STORE_FILE);
+    let bytes =
+        match tirith_core::util::read_text_no_follow_capped(&path, trust_grants::STORE_READ_CAP) {
+            Ok(bytes) => bytes,
+            Err(tirith_core::util::OpenRegularError::NotFound) => return Ok(Vec::new()),
+            Err(_) => {
+                return Err(format!(
+                    "trust grant store at {} is unreadable, non-regular, linked, or oversized",
+                    path.display()
+                ))
+            }
+        };
+    let store = TrustGrantStore::parse(&bytes).map_err(str::to_string)?;
+    let now = chrono::Utc::now();
+    let mut rows = Vec::new();
+    for grant in store.records().into_iter().flatten() {
+        if grant.revoked_at.is_some() {
+            continue;
+        }
+        let expired = match trust_grants::expiry(grant.expires_at.as_deref(), now) {
+            Expiry::Invalid => continue,
+            Expiry::Expired => true,
+            Expiry::Permanent | Expiry::Active(_) => false,
+        };
+        if expired && !show_expired {
+            continue;
+        }
+        let source = match &grant.scope {
+            GrantScope::User => "grant-user".to_string(),
+            GrantScope::Project { project } => {
+                format!("grant-project {}", project.canonical_root.display())
+            }
+        };
+        rows.push(make_row(
+            grant.pattern,
+            grant.rule_id,
+            source,
+            grant.expires_at,
+            expired,
+        ));
+    }
     Ok(rows)
 }
 
@@ -3220,5 +3274,45 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap());
         contender.join().unwrap();
+    }
+
+    #[test]
+    fn diff_snapshot_includes_operator_grants_and_drops_revoked_ones() {
+        use tirith_core::trust_grants::{GrantScope, TrustGrant, TrustGrantStore, STORE_FILE};
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        fs::create_dir_all(&config).unwrap();
+        let mut grant = TrustGrant {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern: "https://mirror.example/install.sh".into(),
+            rule_id: Some("pipe_to_interpreter".into()),
+            scope: GrantScope::User,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: None,
+            revoked_at: None,
+            reason: None,
+        };
+        let write = |grant: &TrustGrant| {
+            let mut store = TrustGrantStore::default();
+            store.insert(grant).unwrap();
+            fs::write(config.join(STORE_FILE), serde_json::to_vec(&store).unwrap()).unwrap();
+        };
+        let key = "grant-user\u{1f}https://mirror.example/install.sh\u{1f}pipe_to_interpreter";
+        write(&grant);
+        let before = current_trust_snapshot();
+        assert!(
+            before.entries.iter().any(|entry| entry == key),
+            "trust diff must see trust-grants.json: {:?}",
+            before.entries
+        );
+        record_trust_snapshot(&before);
+        grant.revoked_at = Some(chrono::Utc::now().to_rfc3339());
+        write(&grant);
+        let after = current_trust_snapshot();
+        assert!(!after.entries.iter().any(|entry| entry == key));
+        let (history, _) = load_trust_history();
+        let baseline = history.last().unwrap();
+        assert!(baseline.entries.iter().any(|entry| entry == key));
+        assert!(diff(true) == 0);
     }
 }

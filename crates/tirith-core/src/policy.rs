@@ -3432,13 +3432,9 @@ impl Policy {
                 None,
                 "valid unexpired operator trust grant",
             );
-            let project = crate::trust_grants::ProjectIdentity::capture(cwd).ok();
-            if let Some(project) = &project {
-                snapshot::observe_project_identity(project);
-            }
             let grants_path = config.join(crate::trust_grants::STORE_FILE);
             let before = snapshot::values(self);
-            self.merge_operator_grants(&grants_path, project.as_ref());
+            self.merge_operator_grants(&grants_path, cwd);
             snapshot::observe_overlay(
                 before,
                 self,
@@ -3449,11 +3445,11 @@ impl Policy {
         }
     }
 
-    fn merge_operator_grants(
-        &mut self,
-        path: &Path,
-        project: Option<&crate::trust_grants::ProjectIdentity>,
-    ) {
+    /// The checkout identity (several directory opens and metadata reads) is
+    /// captured only when the store holds a project-scoped record: with no
+    /// store, an empty store or only user grants it cannot change the result,
+    /// and the store's own read witness already covers a later project grant.
+    fn merge_operator_grants(&mut self, path: &Path, cwd: Option<&str>) {
         use crate::trust_grants::{Expiry, TrustGrantStore, STORE_READ_CAP};
         let read = crate::util::read_text_no_follow_capped(path, STORE_READ_CAP);
         snapshot::observe_read(
@@ -3479,8 +3475,17 @@ impl Policy {
                 return;
             }
         };
+        let project = if store.has_project_records() {
+            let project = crate::trust_grants::ProjectIdentity::capture(cwd).ok();
+            if let Some(project) = &project {
+                snapshot::observe_project_identity(project);
+            }
+            project
+        } else {
+            None
+        };
         let now = chrono::Utc::now();
-        for grant in store.applicable(project, now) {
+        for grant in store.applicable(project.as_ref(), now) {
             if let Expiry::Active(deadline) =
                 crate::trust_grants::expiry(grant.expires_at.as_deref(), now)
             {

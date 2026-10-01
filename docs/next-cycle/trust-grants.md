@@ -47,7 +47,16 @@ that grant's expiry instead of appending beside a permanent copy. Ambiguous
 duplicates require an explicit ID. `tirith trust revoke ID` retains a revoked
 record and reports remaining broader grants. Pattern-based `remove` preserves
 its legacy selection behavior while revoking selected new records and showing
-remaining matching permission. `list --expired` includes expired and revoked
+remaining matching permission; `--rule` compares rule IDs case-insensitively,
+like `add`. A rule-scoped grant never counts as covering an all-rules query.
+
+`tirith trust gc` prunes selected expired grants and revoked grants older than
+30 days; younger revocations stay as tombstones so retries and `explain ID`
+still resolve them. When the store is still above 768 KiB, gc also prunes the
+oldest remaining revocations. Every trust store is read with a 1 MiB cap, so a
+change that would write a larger store is refused. `tirith trust diff` covers
+the grant store as well as the legacy stores; revoked grants are not part of
+the trust set. `list --expired` includes expired and revoked
 records; malformed and inactive repository records remain visible.
 
 `explain ID` resolves the private target and selected rule from the stable grant
@@ -59,7 +68,9 @@ eligibility only: it does not evaluate a command or clear independent blockers.
 Legacy user entries keep their existing scope until an explicit
 `tirith trust migrate --scope user`. Migration assigns UUIDs, preserves expiry
 and rule scope, retains malformed raw records for repair, and removes migrated
-entries from the legacy envelope. Older clients then lose those migrated
+entries from the legacy envelope. Expired legacy entries are dropped, not
+migrated (enforcement already ignores them); blocklisted entries stay in the
+legacy envelope unchanged. Older clients then lose those migrated
 exceptions. Repository entries cannot be globally migrated; create individual
 operator-owned project grants after review. A matching legacy entry must be
 migrated before adding or shortening its new counterpart, so a permanent
@@ -72,7 +83,8 @@ authority changes. Multi-file migration removes legacy applicability before
 activating the new envelope, so interruption can temporarily narrow trust but
 cannot widen it. Runtime resolves both stores for every request, including
 daemon requests, and snapshots retain the earliest accepted expiry plus input
-revisions. Removing a grant or reaching its deadline needs no cache-file
+revisions. The checkout identity is captured only when the grant store holds a
+project-scoped record. Removing a grant or reaching its deadline needs no cache-file
 rewrite to affect the next request.
 
 Regression coverage resides in `trust_grants` core tests and the

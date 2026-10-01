@@ -387,6 +387,12 @@ fn same_rule(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 
+/// `trust remove` selection: no `--rule` selects every rule of the pattern;
+/// `--rule` selects that rule with the same case-insensitive identity as `add`.
+fn removal_rule_matches(own: Option<&str>, requested: Option<&str>) -> bool {
+    requested.is_none() || same_rule(own, requested)
+}
+
 fn perform(
     context: &Context,
     kind: OperationKind,
@@ -397,6 +403,19 @@ fn perform(
     let mut expected = BTreeMap::new();
     let mut requests = Vec::new();
     for (target, root, before, after) in changes {
+        let text =
+            serde_json::to_string_pretty(&after).map_err(|_| "cannot serialize grant edit")?;
+        // Every trust store is read with a 1 MiB cap; a larger file would make
+        // the whole store unreadable, so refuse instead of writing it.
+        if text.len() as u64 > trust_grants::STORE_READ_CAP {
+            return Err(format!(
+                "trust store {} would exceed its 1 MiB size limit; run tirith trust gc --scope all to prune expired grants and old revocations",
+                target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        }
         super::preflight_config_write_authorization(
             &root,
             &target,
@@ -409,9 +428,7 @@ fn perform(
         requests.push(RequestedChange {
             target,
             scope_root: root,
-            edit: Edit::WholeFile(
-                serde_json::to_string_pretty(&after).map_err(|_| "cannot serialize grant edit")?,
-            ),
+            edit: Edit::WholeFile(text),
             activation: true,
             description: "Update selected operator trust grants".into(),
         });
@@ -469,6 +486,8 @@ impl Row {
     fn project(&self, context: &Context) -> Value {
         json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v))})
     }
+    /// Same rule semantics as [`TrustGrant::matches`]: a rule-scoped row covers
+    /// only that rule (case-insensitive), never an all-rules query.
     fn matches(&self, target: &str, rule: Option<&str>) -> bool {
         self.pattern
             .as_deref()
@@ -476,7 +495,7 @@ impl Row {
             && self
                 .rule_id
                 .as_deref()
-                .is_none_or(|own| rule.is_none_or(|rule| own.eq_ignore_ascii_case(rule)))
+                .is_none_or(|own| rule.is_some_and(|rule| own.eq_ignore_ascii_case(rule)))
     }
 }
 
@@ -1031,11 +1050,31 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
     let (path, before, mut store) = read_store(&context.config)?;
     let mut migrated = Vec::new();
     let mut retained = Vec::new();
+    let mut invalid_retained = 0usize;
+    let mut overridden_retained = 0usize;
+    let mut expired_dropped = 0usize;
     for value in legacy["entries"].as_array().unwrap() {
         let row = legacy_row(value, "legacy_user", "user", &context.snapshot.policy);
-        if row.state == GrantState::Invalid {
-            retained.push(value.clone());
-            continue;
+        match row.state {
+            GrantState::Invalid => {
+                invalid_retained += 1;
+                retained.push(value.clone());
+                continue;
+            }
+            // Enforcement already ignores an expired legacy entry; dropping it
+            // keeps applicability identical and never re-issues it as a grant.
+            GrantState::Expired => {
+                expired_dropped += 1;
+                continue;
+            }
+            // A blocklisted entry stays in the legacy store exactly as 0.4.2
+            // sees it, instead of becoming a newly created grant.
+            GrantState::Overridden => {
+                overridden_retained += 1;
+                retained.push(value.clone());
+                continue;
+            }
+            _ => {}
         }
         let grant = TrustGrant {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1050,31 +1089,27 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
         store.insert(&grant)?;
         migrated.push(grant.id);
     }
-    if migrated.is_empty() {
+    if migrated.is_empty() && expired_dropped == 0 {
         return Ok(
-            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":retained.len()}),
+            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":0}),
         );
     }
-    let retained_count = retained.len();
     legacy["entries"] = Value::Array(retained);
     // Remove legacy applicability before activating the new envelope. An
     // interrupted migration can temporarily narrow trust, never globalize
     // or extend a project/expiring grant. The journal supports recovery.
-    let operation_id = perform(
-        context,
-        OperationKind::AddTrust,
-        vec![
-            (legacy_path, legacy_root, legacy_before, legacy),
-            (
-                path,
-                context.config.clone(),
-                before,
-                serde_json::to_value(store).unwrap(),
-            ),
-        ],
-    )?;
+    let mut changes = vec![(legacy_path, legacy_root, legacy_before, legacy)];
+    if !migrated.is_empty() {
+        changes.push((
+            path,
+            context.config.clone(),
+            before,
+            serde_json::to_value(store).unwrap(),
+        ));
+    }
+    let operation_id = perform(context, OperationKind::AddTrust, changes)?;
     Ok(
-        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":retained_count,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
+        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":expired_dropped,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
     )
 }
 
@@ -1100,7 +1135,7 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
                 };
                 if scope_matches
                     && grant.pattern == pattern
-                    && rule.is_none_or(|rule| grant.rule_id.as_deref() == Some(rule))
+                    && removal_rule_matches(grant.rule_id.as_deref(), rule)
                     && grant.revoked_at.is_none()
                 {
                     grant.revoked_at = Some(Utc::now().to_rfc3339());
@@ -1126,7 +1161,7 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
                 let len = entries.len();
                 entries.retain(|entry| {
                     !(entry["pattern"].as_str() == Some(pattern)
-                        && rule.is_none_or(|rule| entry["rule_id"].as_str() == Some(rule)))
+                        && removal_rule_matches(entry["rule_id"].as_str(), rule))
                 });
                 let count = len - entries.len();
                 removed += count;
@@ -1146,6 +1181,86 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
     })
 }
 
+/// Revoked records stay as tombstones this long, so a retried `trust revoke`
+/// or `trust explain <id>` still resolves them; later `trust gc` prunes them.
+const REVOKED_RETENTION_DAYS: i64 = 30;
+/// `trust gc` compacts the grant store to at most this size (three quarters
+/// of the read cap) by also pruning the oldest younger tombstones.
+const STORE_COMPACT_BYTES: usize = trust_grants::STORE_READ_CAP as usize / 4 * 3;
+
+/// Raw records `trust gc` keeps, and how many it pruned. Among the selected
+/// valid grants it prunes expired ones and revocations older than the
+/// retention window; while the store is still above [`STORE_COMPACT_BYTES`]
+/// it also prunes the oldest remaining revocations. Active grants and
+/// undecodable records are never pruned.
+fn prune_grants(
+    store: &TrustGrantStore,
+    now: chrono::DateTime<Utc>,
+    selected: impl Fn(&TrustGrant) -> bool,
+) -> (Vec<Value>, usize) {
+    let retention = chrono::Duration::days(REVOKED_RETENTION_DAYS);
+    let mut keep = Vec::new();
+    let mut tombstones = Vec::new();
+    let mut pruned = 0usize;
+    for (raw, decoded) in store.grants.iter().zip(store.records()) {
+        let Some(grant) = decoded.ok().filter(|grant| selected(grant)) else {
+            keep.push(Some(raw.clone()));
+            continue;
+        };
+        if matches!(
+            trust_grants::expiry(grant.expires_at.as_deref(), now),
+            Expiry::Expired
+        ) {
+            pruned += 1;
+            continue;
+        }
+        let revoked = grant
+            .revoked_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        match revoked {
+            Some(revoked)
+                if revoked
+                    .checked_add_signed(retention)
+                    .is_none_or(|end| end <= now) =>
+            {
+                pruned += 1;
+            }
+            Some(revoked) => {
+                tombstones.push((revoked, keep.len()));
+                keep.push(Some(raw.clone()));
+            }
+            None => keep.push(Some(raw.clone())),
+        }
+    }
+    let size = |records: &[Option<Value>]| {
+        let grants: Vec<&Value> = records.iter().flatten().collect();
+        serde_json::to_string_pretty(
+            &json!({"schema_version":store.schema_version,"grants":grants}),
+        )
+        .map_or(usize::MAX, |text| text.len())
+    };
+    let mut excess = size(&keep).saturating_sub(STORE_COMPACT_BYTES);
+    if excess > 0 {
+        tombstones.sort();
+        for (_, index) in tombstones {
+            if excess == 0 {
+                break;
+            }
+            // A record's standalone size never exceeds what removing it
+            // saves from the indented store, so this cannot undershoot.
+            let saved = keep[index]
+                .take()
+                .and_then(|raw| serde_json::to_string_pretty(&raw).ok())
+                .map_or(0, |text| text.len());
+            excess = excess.saturating_sub(saved);
+            pruned += 1;
+        }
+    }
+    (keep.into_iter().flatten().collect(), pruned)
+}
+
 pub fn gc(scope: &str, json_output: bool) -> i32 {
     run(json_output, |context| {
         if !matches!(scope, "user" | "repo" | "project" | "all") {
@@ -1155,32 +1270,19 @@ pub fn gc(scope: &str, json_output: bool) -> i32 {
         let mut pruned = 0usize;
         if scope != "repo" {
             let (path, before, mut store) = read_store(&context.config)?;
-            let records = store.records();
-            let mut keep = Vec::new();
-            for (raw, decoded) in store.grants.into_iter().zip(records) {
-                let remove = decoded.ok().is_some_and(|grant| {
-                    let selected = scope == "all"
-                        || match (&grant.scope, scope) {
-                            (GrantScope::User, "user") => true,
-                            (GrantScope::Project { project }, "project") => {
-                                Some(project) == context.project.as_ref()
-                            }
-                            _ => false,
-                        };
-                    selected
-                        && matches!(
-                            trust_grants::expiry(grant.expires_at.as_deref(), Utc::now()),
-                            Expiry::Expired
-                        )
-                });
-                if remove {
-                    pruned += 1;
-                } else {
-                    keep.push(raw);
-                }
-            }
-            store.grants = keep;
-            if pruned > 0 {
+            let (keep, count) = prune_grants(&store, Utc::now(), |grant| {
+                scope == "all"
+                    || match (&grant.scope, scope) {
+                        (GrantScope::User, "user") => true,
+                        (GrantScope::Project { project }, "project") => {
+                            Some(project) == context.project.as_ref()
+                        }
+                        _ => false,
+                    }
+            });
+            if count > 0 {
+                pruned += count;
+                store.grants = keep;
                 changes.push((
                     path,
                     context.config.clone(),
@@ -1680,5 +1782,254 @@ mod tests {
         assert_eq!(value["command_evaluated"], false);
         assert!(!value.to_string().contains("mirror.example"));
         assert!(explain_value(&mut context, &selected.id, "user").is_err());
+    }
+
+    fn user_grant(pattern: &str, rule: Option<&str>) -> TrustGrant {
+        TrustGrant {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern: pattern.into(),
+            rule_id: rule.map(str::to_string),
+            scope: GrantScope::User,
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: None,
+            revoked_at: None,
+            reason: None,
+        }
+    }
+
+    fn write_grants(grants: &[TrustGrant]) {
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let mut store = TrustGrantStore::default();
+        for grant in grants {
+            store.insert(grant).unwrap();
+        }
+        std::fs::write(
+            config.join(trust_grants::STORE_FILE),
+            serde_json::to_vec(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn row_rule_scope_agrees_with_runtime_grant_matching() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let context = Context::capture().unwrap();
+        let target = "https://mirror.example/install.sh";
+        for grant in [
+            user_grant(target, Some("pipe_to_interpreter")),
+            user_grant(target, None),
+        ] {
+            let row = grant_row(&grant, &context);
+            for rule in [
+                None,
+                Some("pipe_to_interpreter"),
+                Some("PIPE_TO_INTERPRETER"),
+                Some("shortened_url"),
+            ] {
+                assert_eq!(
+                    row.matches(target, rule),
+                    grant.matches(target, rule),
+                    "rule {:?} vs query {rule:?}",
+                    grant.rule_id
+                );
+            }
+        }
+        let scoped = grant_row(&user_grant(target, Some("pipe_to_interpreter")), &context);
+        assert!(
+            !scoped.matches(target, None),
+            "a rule-scoped grant does not cover an all-rules query"
+        );
+    }
+
+    #[test]
+    fn remove_matches_rules_case_insensitively_like_add() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        let target = "https://mirror.example/install.sh";
+        write_grants(&[user_grant(target, Some("pipe_to_interpreter"))]);
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&json!({"version":1,"entries":[{"pattern":"https://mirror.example/legacy","rule_id":"shortened_url","added":"2026-01-01T00:00:00Z","source":"cli"}]})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remove(target, Some("PIPE_TO_INTERPRETER"), "user"), 0);
+        assert!(saved().decode(0).unwrap().revoked_at.is_some());
+        assert_eq!(
+            remove(
+                "https://mirror.example/legacy",
+                Some("Shortened_URL"),
+                "user"
+            ),
+            0
+        );
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert!(legacy["entries"].as_array().unwrap().is_empty());
+        assert_eq!(remove(target, Some("shortened_url"), "user"), 1);
+    }
+
+    #[test]
+    fn migration_skips_expired_and_blocklisted_legacy_entries() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "blocklist:\n  - blocked.example\n",
+        )
+        .unwrap();
+        let active = trust_grants::expiry_from_ttl("7d", Utc::now()).unwrap();
+        let blocked = json!({"pattern":"https://blocked.example/x","rule_id":"shortened_url"});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&json!({"version":1,"entries":[
+                {"pattern":"https://mirror.example/active","rule_id":"shortened_url","ttl_expires":active},
+                {"pattern":"https://mirror.example/expired","rule_id":"shortened_url","ttl_expires":"2020-01-01T00:00:00Z"},
+                blocked,
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut context = Context::capture().unwrap();
+        assert!(context
+            .snapshot
+            .policy
+            .is_blocklisted("https://blocked.example/x"));
+        let value = migrate_value(&mut context, "user").unwrap();
+        assert_eq!(value["state"], "completed");
+        assert_eq!(value["migrated_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(value["expired_dropped"], 1);
+        assert_eq!(value["overridden_retained"], 1);
+        assert_eq!(value["invalid_retained"], 0);
+        let store = saved();
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(
+            store.decode(0).unwrap().pattern,
+            "https://mirror.example/active"
+        );
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert_eq!(legacy["entries"], json!([blocked]));
+        // Only the retained blocklisted entry is left: a second run changes nothing.
+        let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
+        assert_eq!(again["state"], "unchanged");
+        assert_eq!(saved().grants.len(), 1);
+    }
+
+    #[test]
+    fn gc_prunes_old_revocations_and_keeps_recent_tombstones_and_active_grants() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let now = Utc::now();
+        let ago = |days: i64| (now - chrono::Duration::days(days)).to_rfc3339();
+        let active = user_grant("https://mirror.example/active", Some("shortened_url"));
+        let recent = TrustGrant {
+            revoked_at: Some(ago(1)),
+            ..user_grant("https://mirror.example/recent", Some("shortened_url"))
+        };
+        let old = TrustGrant {
+            revoked_at: Some(ago(REVOKED_RETENTION_DAYS + 1)),
+            ..user_grant("https://mirror.example/old", Some("shortened_url"))
+        };
+        let expired = TrustGrant {
+            expires_at: Some(ago(1)),
+            ..user_grant("https://mirror.example/expired", Some("shortened_url"))
+        };
+        write_grants(&[active.clone(), recent.clone(), old, expired]);
+        assert_eq!(gc("user", true), 0);
+        let ids: Vec<String> = saved()
+            .records()
+            .into_iter()
+            .map(|grant| grant.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec![active.id.clone(), recent.id.clone()]);
+        // A recent tombstone still answers an idempotent revoke.
+        assert_eq!(revoke(&recent.id, true), 0);
+        let stored: Value = serde_json::to_value(saved()).unwrap();
+        assert!(
+            stored.get("entries").is_none(),
+            "0.4.2 readers must still see no global entries"
+        );
+    }
+
+    #[test]
+    fn near_cap_store_is_compacted_by_gc_and_never_written_past_the_read_cap() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let now = Utc::now();
+        let active = user_grant("https://mirror.example/active", Some("shortened_url"));
+        let mut grants = vec![active.clone()];
+        let mut serialized = 0usize;
+        let mut minutes = 0i64;
+        while serialized <= trust_grants::STORE_READ_CAP as usize - 2_000 {
+            minutes += 1;
+            let grant = TrustGrant {
+                revoked_at: Some((now - chrono::Duration::minutes(minutes)).to_rfc3339()),
+                reason: Some("x".repeat(400)),
+                ..user_grant(
+                    &format!("https://mirror.example/{minutes}"),
+                    Some("shortened_url"),
+                )
+            };
+            serialized += serde_json::to_string_pretty(&grant).unwrap().len() + 8;
+            grants.push(grant);
+        }
+        write_grants(&grants);
+        let config = tirith_core::policy::config_dir().unwrap();
+        let before = std::fs::read(config.join(trust_grants::STORE_FILE)).unwrap();
+        // An add that would push the store past its read cap is refused, untouched.
+        let big = "x".repeat(4_000);
+        let refused = add_value(
+            &mut Context::capture().unwrap(),
+            "https://mirror.example/new",
+            Some("shortened_url"),
+            None,
+            true,
+            false,
+            false,
+            Some(&big),
+            "user",
+        )
+        .unwrap_err();
+        assert!(refused.contains("1 MiB size limit"), "{refused}");
+        assert_eq!(
+            std::fs::read(config.join(trust_grants::STORE_FILE)).unwrap(),
+            before
+        );
+        // gc keeps every tombstone younger than the retention window except
+        // the oldest ones it needs to drop to get back under the compaction mark.
+        assert_eq!(gc("all", true), 0);
+        let size = std::fs::metadata(config.join(trust_grants::STORE_FILE))
+            .unwrap()
+            .len() as usize;
+        assert!(size <= STORE_COMPACT_BYTES, "{size}");
+        let kept = saved();
+        let ids: Vec<String> = kept
+            .records()
+            .into_iter()
+            .map(|grant| grant.unwrap().id)
+            .collect();
+        assert!(ids.contains(&active.id));
+        assert!(ids.contains(&grants[1].id), "the newest tombstone is kept");
+        assert!(
+            !ids.contains(&grants.last().unwrap().id),
+            "the oldest tombstone is pruned"
+        );
+        assert!(ids.len() < grants.len());
+        assert_eq!(
+            add(
+                "https://mirror.example/new",
+                Some("shortened_url"),
+                None,
+                true,
+                false,
+                false,
+                None,
+                "user",
+                true
+            ),
+            0
+        );
     }
 }
