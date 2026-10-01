@@ -249,11 +249,14 @@ _tirith_v3_cleanup_registration_files() {
 # registration is rejected. Capture stdout/stderr through temp files from a
 # plain foreground command instead, and keep the failure reason for the
 # status warning below instead of discarding it.
+# The probe passes `--require-cwd` because _tirith_receipt_call always sends
+# `--cwd`: a pinned binary older than these hooks rejects the flag, so the hook
+# stays in the legacy flow rather than failing every receipt operation.
 _TIRITH_REGISTER_TRACE=0
 if [[ -o xtrace ]]; then builtin unsetopt xtrace; _TIRITH_REGISTER_TRACE=1; fi
 if [[ -o interactive ]] \
    && [[ $_TIRITH_V3_HELPERS_READY -eq 1 ]] \
-   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
+   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability --require-cwd 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
   _tirith_register_out="$(_tirith_v3_new_capture_file)" || _tirith_register_out=""
   _tirith_register_err="$(_tirith_v3_new_capture_file)" || _tirith_register_err=""
   if [[ -n "$_tirith_register_out" && -n "$_tirith_register_err" ]]; then

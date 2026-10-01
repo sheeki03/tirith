@@ -232,7 +232,14 @@ impl From<ShellApprovalOutcomeArg> for tirith_core::execution_state::ShellApprov
 
 #[derive(Subcommand)]
 enum ExecutionReceiptAction {
-    Capability,
+    Capability {
+        /// Also confirm that consume/discard/reconcile accept `--cwd`. Binaries
+        /// that predate `--cwd` reject this flag, so a newer zsh/fish hook that
+        /// probes with it falls back to the legacy check flow instead of
+        /// failing every receipt operation.
+        #[arg(long)]
+        require_cwd: bool,
+    },
     Register {
         #[arg(long, value_enum)]
         family: ShellHookFamilyArg,
@@ -8205,7 +8212,9 @@ fn run() {
             channel,
         } => cli::shell_verification::run(&action, id.as_deref(), channel.into()),
         Commands::ExecutionReceiptInternal { action } => match action {
-            ExecutionReceiptAction::Capability => cli::check::receipt_capability(),
+            ExecutionReceiptAction::Capability { require_cwd: _ } => {
+                cli::check::receipt_capability()
+            }
             ExecutionReceiptAction::Register { family, shell_pid } => {
                 cli::check::register_receipt_instance(shell_pid, family.into())
             }

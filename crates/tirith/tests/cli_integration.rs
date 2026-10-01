@@ -5227,6 +5227,142 @@ fn shell_execution_receipt_capability_reports_protocol_v3() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
+
+    // zsh/fish hooks probe with `--require-cwd` because they send `--cwd` on
+    // every receipt operation; this binary must answer it identically.
+    let out = tirith()
+        .args(["__execution-receipt", "capability", "--require-cwd"])
+        .output()
+        .expect("run --require-cwd capability probe");
+    assert!(
+        out.status.success(),
+        "--require-cwd capability probe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
+}
+
+/// A packaged hook directory can be newer than the binary it is pinned to
+/// (`tirith init` prefers /usr/share/tirith/shell or TIRITH_SHELL_DIR). A
+/// binary that speaks protocol 3 but predates `--cwd` on consume/discard/
+/// reconcile would reject every receipt operation from these hooks and block
+/// every command, so zsh and fish must stay in the legacy flow against it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_and_fish_hooks_stay_legacy_with_a_binary_without_receipt_cwd() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("old-binary hook test home");
+    let calls = home.path().join("receipt-calls");
+    let old_bin = home.path().join("old-tirith");
+    // Behaves like a protocol-3 binary from before `--cwd`: the bare probe
+    // and registration succeed, and clap rejects any argument it does not know.
+    fs::write(
+        &old_bin,
+        format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+  '__execution-receipt capability')
+    if [ "$#" -eq 2 ]; then echo TIRITH_EXECUTION_RECEIPT_PROTOCOL=3; exit 0; fi
+    echo "error: unexpected argument '$3' found" >&2; exit 2 ;;
+  '__execution-receipt register')
+    echo 45bcb43f30d36c8e1b50d2ecfc3c3ffb8fce9bced081bd331e572e49232402fa; exit 0 ;;
+  '__execution-receipt '*)
+    echo "$2" >> '{calls}'
+    for arg in "$@"; do
+      if [ "$arg" = --cwd ]; then echo "error: unexpected argument '--cwd' found" >&2; exit 2; fi
+    done
+    exit 0 ;;
+  '__session-id '*)
+    echo "error: unrecognized subcommand '__session-id'" >&2; exit 2 ;;
+esac
+exit 0
+"#,
+            calls = calls.display()
+        ),
+    )
+    .expect("write old tirith stub");
+    fs::set_permissions(&old_bin, fs::Permissions::from_mode(0o700))
+        .expect("make old tirith stub executable");
+
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib");
+    let path = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin";
+
+    let zsh_script = format!(
+        r#"source '{}' --tirith-executable '{}'
+builtin print -r -- "protocol=$_TIRITH_RECEIPT_PROTOCOL status=$TIRITH_STATUS"
+"#,
+        hooks.join("zsh-hook.zsh").display(),
+        old_bin.display()
+    );
+    match Command::new("zsh")
+        .args(["-d", "-f", "-i", "-c", &zsh_script])
+        .env("PATH", path)
+        .env("HOME", home.path())
+        .env("ZDOTDIR", home.path())
+        .env("TERM", "xterm")
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_ZSH_LOADED")
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("protocol=0 status=degraded"),
+                "zsh hook entered protocol 3 against a binary without --cwd: \
+                 stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("legacy mode"),
+                "zsh hook must say it is running in legacy mode: {stderr:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping zsh old-binary probe: zsh not available"),
+    }
+
+    let fish_script = format!(
+        r#"source '{}' --tirith-executable '{}'
+builtin printf 'protocol=%s status=%s\n' "$_TIRITH_RECEIPT_PROTOCOL" "$TIRITH_STATUS"
+"#,
+        hooks.join("fish-hook.fish").display(),
+        old_bin.display()
+    );
+    match Command::new("fish")
+        .args(["--no-config", "-i", "-c", &fish_script])
+        .env("PATH", path)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("TERM", "xterm")
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_FISH_LOADED")
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("protocol=0 status=degraded"),
+                "fish hook entered protocol 3 against a binary without --cwd: \
+                 stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("legacy mode"),
+                "fish hook must say it is running in legacy mode: {stderr:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping fish old-binary probe: fish not available"),
+    }
+
+    // Legacy mode never sends a receipt operation the old binary would reject.
+    let sent = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        sent.is_empty(),
+        "legacy-mode hooks sent receipt operations: {sent:?}"
+    );
 }
 
 /// Hooks loaded before consume/discard/reconcile retired receipts themselves

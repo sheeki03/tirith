@@ -246,12 +246,15 @@ end
 # Register with a plain redirected foreground command rather than a command
 # substitution, matching the bash and zsh hooks, and keep the failure reason
 # for the status warning below instead of discarding it.
+# The probe passes `--require-cwd` because _tirith_receipt_call always sends
+# `--cwd`: a pinned binary older than these hooks rejects the flag, so the hook
+# stays in the legacy flow rather than failing every receipt operation.
 # The empty function/block-local value suppresses fish tracing; "0" does not.
 begin
     set -l fish_trace
 if status is-interactive
     and test $_TIRITH_V3_HELPERS_READY -eq 1
-    and test (command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
+    and test (command "$_TIRITH_BIN" __execution-receipt capability --require-cwd 2>/dev/null) = "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3"
     set -l register_out (_tirith_v3_new_capture_file)
     set -l out_status $status
     set -l register_err (_tirith_v3_new_capture_file)
