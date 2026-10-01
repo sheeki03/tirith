@@ -711,6 +711,81 @@ pub fn normalize_path_separators(path: Option<&Path>) -> Option<String> {
     path.map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
+/// Lowercase hex encoding of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// `value` is exactly `len` lowercase hex digits (`0-9a-f`; no uppercase).
+pub fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// `value` is a UUID in canonical form: lowercase, hyphenated, 36 bytes, the
+/// exact spelling `uuid::Uuid::to_string` produces. Uppercase, braced, URN and
+/// simple (unhyphenated) spellings are refused.
+pub fn is_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+/// Milliseconds since the Unix epoch, or `None` when the local clock reads
+/// before the epoch.
+pub fn now_ms() -> Option<u64> {
+    chrono::Utc::now().timestamp_millis().try_into().ok()
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::{hex, is_lower_hex, is_uuid, now_ms, sha256_hex};
+
+    #[test]
+    fn hex_and_sha256_hex_are_lowercase() {
+        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex(&[]), "");
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn is_lower_hex_requires_exact_length_and_lowercase() {
+        assert!(is_lower_hex("0123456789abcdef", 16));
+        assert!(!is_lower_hex("0123456789ABCDEF", 16));
+        assert!(!is_lower_hex("0123456789abcdeg", 16));
+        assert!(!is_lower_hex("abc", 4));
+        assert!(!is_lower_hex("abcd", 3));
+        assert!(is_lower_hex("", 0));
+    }
+
+    #[test]
+    fn is_uuid_accepts_only_the_canonical_spelling() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(is_uuid(&id));
+        assert!(!is_uuid(&id.to_uppercase()));
+        assert!(!is_uuid(&id.replace('-', "")));
+        assert!(!is_uuid(&format!("{{{id}}}")));
+        assert!(!is_uuid(&format!("urn:uuid:{id}")));
+        assert!(!is_uuid("not-a-uuid"));
+    }
+
+    #[test]
+    fn now_ms_reads_the_current_clock() {
+        let now = now_ms().expect("test host clock is after the epoch");
+        // 2020-01-01T00:00:00Z
+        assert!(now > 1_577_836_800_000);
+    }
+}
+
 #[cfg(test)]
 mod open_regular_tests {
     use super::{

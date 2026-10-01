@@ -72,7 +72,7 @@ fn save_notice_with_timeout(
     lock_timeout: Duration,
 ) -> Result<(), String> {
     let paths = locations()?;
-    if paths.log != log || !notice.validate(health::now_unix_ms()) {
+    if paths.log != log || !notice.validate(tirith_core::util::now_ms().unwrap_or(0)) {
         return Err("audit health destination or observation is unavailable".into());
     }
     let stored = PrivateNotice {
@@ -103,7 +103,9 @@ fn save_notice_with_timeout(
 fn valid_stored_notice(bytes: &[u8], log: &Path) -> bool {
     serde_json::from_slice::<PrivateNotice>(bytes).is_ok_and(|stored| {
         stored.schema_version == 1
-            && stored.notice.validate(health::now_unix_ms())
+            && stored
+                .notice
+                .validate(tirith_core::util::now_ms().unwrap_or(0))
             && stored.destination_binding == destination_binding(log)
     })
 }
@@ -174,7 +176,10 @@ pub(crate) fn read() -> AuditHealth {
         return result;
     };
     if let Some(process) = health::latest_process_failure(&paths.log) {
-        if process.notice.validate(health::now_unix_ms()) {
+        if process
+            .notice
+            .validate(tirith_core::util::now_ms().unwrap_or(0))
+        {
             result.state = HealthState::FailureObserved;
             result.source = "current_process";
             result.failure_observation = Some(process.notice);
@@ -199,7 +204,11 @@ pub(crate) fn read() -> AuditHealth {
         result.notice_availability = NoticeAvailability::Invalid;
         return result;
     };
-    if stored.schema_version != 1 || !stored.notice.validate(health::now_unix_ms()) {
+    if stored.schema_version != 1
+        || !stored
+            .notice
+            .validate(tirith_core::util::now_ms().unwrap_or(0))
+    {
         result.notice_availability = NoticeAvailability::Invalid;
         return result;
     }
@@ -251,7 +260,7 @@ mod tests {
         AppendFailureNotice {
             schema_version: 1,
             observation_id: uuid::Uuid::new_v4().to_string(),
-            observed_unix_ms: health::now_unix_ms(),
+            observed_unix_ms: tirith_core::util::now_ms().unwrap_or(0),
         }
     }
 

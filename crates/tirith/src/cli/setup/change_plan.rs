@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tirith_core::policy_rollout::{ImpactReport, RolloutScope};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
 
@@ -467,7 +466,7 @@ fn digest(value: &impl Serialize) -> Result<String, String> {
     let mut canonical = serde_json::to_value(value).map_err(|e| e.to_string())?;
     canonical.sort_all_objects();
     let bytes = serde_json::to_vec(&canonical).map_err(|e| e.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(tirith_core::util::sha256_hex(&bytes))
 }
 
 fn is_false(value: &bool) -> bool {

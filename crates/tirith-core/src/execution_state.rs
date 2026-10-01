@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 
 use crate::agent_origin::AgentOrigin;
@@ -4803,9 +4804,7 @@ pub(crate) fn unix_time_ms() -> Result<u64, String> {
     u64::try_from(millis).map_err(|_| "system clock is outside the supported range".to_string())
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+pub(crate) use crate::util::sha256_hex;
 
 fn validate_stable_id(kind: &str, value: &str) -> Result<(), String> {
     if value.is_empty()

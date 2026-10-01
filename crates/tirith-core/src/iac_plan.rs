@@ -252,17 +252,7 @@ fn record_high_risk(summary: &mut PlanSummary, address: &str, resource_type: &st
 }
 
 /// Compute the SHA-256 of a byte buffer as a lowercase hex string.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let result = hasher.finalize();
-    let mut s = String::with_capacity(result.len() * 2);
-    for b in result {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+pub use crate::util::sha256_hex;
 
 /// Metadata stored alongside the recorded plan-hash (the plan body is NOT
 /// recorded — kept small so the store stays fast to walk).

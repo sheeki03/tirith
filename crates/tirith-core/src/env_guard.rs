@@ -347,14 +347,7 @@ pub fn value_hash8(value: &str) -> String {
     hex.chars().take(VALUE_HASH_PREFIX_LEN).collect()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
+use crate::util::hex as hex_encode;
 
 /// How a sensitive variable differs between the shell-start snapshot and the
 /// current environment.

@@ -15,7 +15,6 @@ use std::io::{self, Read};
 
 use flate2::bufread::GzDecoder;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 #[path = "npm_signals.rs"]
@@ -306,7 +305,7 @@ fn read_npm_tarball_impl<R: Read>(
             return inspection;
         }
     };
-    inspection.artifact.sha256 = Some(hex::encode(Sha256::digest(&compressed)));
+    inspection.artifact.sha256 = Some(crate::util::sha256_hex(&compressed));
     inspection.artifact.compressed_bytes = Some(compressed.len() as u64);
     let ratio_cap = compressed.len().saturating_mul(limits.compression_ratio);
     let decoded_cap = limits.decompressed_bytes.min(ratio_cap);
@@ -360,7 +359,7 @@ fn read_npm_tarball_impl<R: Read>(
         .map(|member| NpmFile {
             path: member.path.clone(),
             size: member.bytes.len() as u64,
-            sha256: hex::encode(Sha256::digest(member.bytes)),
+            sha256: crate::util::sha256_hex(member.bytes),
             executable: member.executable,
             kind: member.kind,
         })

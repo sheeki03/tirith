@@ -56,9 +56,7 @@ pub(crate) fn read_for_history(history: &HistoryQueryResult) -> Value {
         let Some(id) = event.record.event_id.as_deref() else {
             continue;
         };
-        if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
-            || occurrences.get(id) != Some(&1)
-        {
+        if !tirith_core::util::is_uuid(id) || occurrences.get(id) != Some(&1) {
             ambiguous_or_invalid += 1;
             continue;
         }

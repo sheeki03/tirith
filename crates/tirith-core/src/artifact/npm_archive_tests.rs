@@ -1,5 +1,6 @@
 use super::*;
 use flate2::{write::GzEncoder, Compression};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 
 const METADATA: &[u8] = br#"{"name":"fixture-package","version":"1.0.0"}"#;

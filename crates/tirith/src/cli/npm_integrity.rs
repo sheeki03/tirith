@@ -59,7 +59,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sha2::{Digest as _, Sha256};
 use tirith_core::policy::Policy;
 use tirith_core::provenance::npm::{
     self as core_npm, InstalledInventory, NpmAssessment, NpmAttestOutcome, NpmAuditEnvironment,
@@ -852,12 +851,7 @@ fn auth_source_metadata_identity(metadata: &fs::Metadata) -> String {
     )
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
+use tirith_core::util::sha256_hex as hex_sha256;
 
 // ---------------------------------------------------------------------------
 // 6. Trusted executable resolution

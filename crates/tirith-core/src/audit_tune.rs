@@ -95,6 +95,7 @@ pub struct TuneReport {
 }
 
 impl TuneReport {
+    #[cfg(test)]
     /// Repeated blocked checks, kept separate from relaxation suggestions.
     /// Available even with a thin history; counts are observations, not a
     /// conclusion that any finding was a false positive.

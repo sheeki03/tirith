@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{collections::BTreeSet, marker::PhantomData};
 
-use sha2::{Digest, Sha256};
 use tirith_core::selfupdate::{self, InstallMethod, Provenance, SemVer, VerificationStatus};
 
 #[path = "lifecycle.rs"]
@@ -3767,12 +3766,7 @@ fn dir_is_writable(dir: &Path) -> bool {
         .is_ok()
 }
 
-/// SHA-256 of a byte slice, lowercase hex.
-fn hex_sha256(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    format!("{:x}", h.finalize())
-}
+use tirith_core::util::sha256_hex as hex_sha256;
 
 /// SHA-256 of a file's contents, lowercase hex; `None` if it cannot be read.
 fn hash_file_opt(path: &Path) -> Option<String> {

@@ -125,10 +125,7 @@ impl Document {
 }
 
 fn digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    tirith_core::util::is_lower_hex(value, 64)
 }
 
 #[derive(Debug, Serialize)]

@@ -119,6 +119,7 @@ impl ClientObservation {
             state: ClientState::Unavailable,
         }
     }
+    #[cfg(test)]
     pub fn unverified_report(id: RecordId, observed_at: DateTime<Utc>) -> Self {
         Self {
             id,

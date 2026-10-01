@@ -63,14 +63,6 @@ pub fn redact_projection(value: &mut Value, schema: Projection, compiled: &Compi
     });
 }
 
-/// Withhold display content when a producing route cannot capture its privacy
-/// policy. Canonical protocol fields remain usable; signed input is untouched.
-pub fn withhold_projection_content(value: &mut Value, schema: Projection) {
-    project_sensitive_strings(value, schema, &|_| {
-        "[withheld: privacy capture incomplete]".into()
-    });
-}
-
 /// Apply an audience-specific content projection through the same schema.
 /// Callers cannot use this to rewrite protocol tokens or signed representations.
 pub(crate) fn project_sensitive_strings(
@@ -146,11 +138,9 @@ fn token(value: &Value, tokens: &[&str]) -> bool {
 }
 
 fn lower_sha256(value: &Value) -> bool {
-    value.as_str().is_some_and(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
+    value
+        .as_str()
+        .is_some_and(|v| crate::util::is_lower_hex(v, 64))
 }
 
 // Receipt producers emit RFC3339 with at most nanosecond precision. Parsed

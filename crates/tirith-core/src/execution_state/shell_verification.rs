@@ -218,11 +218,7 @@ impl VerificationRecord {
 
     fn validate(&self, secret: &str, now: u64) -> Result<(), String> {
         if self.schema_version != VERIFICATION_SCHEMA
-            || uuid::Uuid::parse_str(&self.id)
-                .map(|id| id.to_string())
-                .ok()
-                .as_deref()
-                != Some(self.id.as_str())
+            || !crate::util::is_uuid(&self.id)
             || !digest_is_valid(&self.hook_binding)
             || !digest_is_valid(&self.cwd_binding)
             || !digest_is_valid(&self.loaded_hook_state)
@@ -755,13 +751,7 @@ fn record_body(
     }
     #[cfg(unix)]
     {
-        if uuid::Uuid::parse_str(id)
-            .map(|id| id.to_string())
-            .ok()
-            .as_deref()
-            != Some(id)
-            || !digest_is_valid(loaded_hook_state)
-        {
+        if !crate::util::is_uuid(id) || !digest_is_valid(loaded_hook_state) {
             return Err("caller-shell verification body has invalid input".into());
         }
         let session = crate::session::resolve_session_id();

@@ -136,15 +136,13 @@ fn display(
     )
 }
 fn canonical_id(id: &str) -> Result<(), String> {
-    if uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id) {
+    if tirith_core::util::is_uuid(id) {
         Ok(())
     } else {
         Err("audit segment and operation IDs must be canonical UUIDs".into())
     }
 }
-fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+use tirith_core::util::sha256_hex as hash;
 fn private_read(path: &Path, root: &Path) -> Result<Option<Vec<u8>>, String> {
     let snapshot = fs_helpers::read_snapshot_scoped(path, root)?;
     snapshot.require_private()?;

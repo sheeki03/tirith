@@ -86,7 +86,7 @@ pub(crate) fn inspect_retained(
 
 pub(crate) fn revalidate(id: &str, cwd: Option<&str>) -> Result<Value, String> {
     let _capture = PolicyDiagnosticCapture::start();
-    if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id) {
+    if !tirith_core::util::is_uuid(id) {
         return Err("report ID must be a canonical UUID".into());
     }
     let root = project_root(cwd)?;

@@ -43,10 +43,7 @@ impl ProtectionEvidence {
         Self,
     ) {
         let mut observation = proof.into_current_observation();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or(0);
+        let now = tirith_core::util::now_ms().unwrap_or(0);
         if observation.status
             == tirith_core::execution_state::ShellVerificationStatus::ObservedBlocking
             && (observation.observed_unix_ms.is_none_or(|at| at > now)

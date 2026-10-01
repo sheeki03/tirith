@@ -42,7 +42,7 @@ struct Intent<'a> {
 }
 
 fn intent<'a>(change: &'a FeedbackRequest, cwd: Option<&str>) -> Result<Intent<'a>, String> {
-    if !uuid::Uuid::parse_str(&change.event_id).is_ok_and(|id| id.to_string() == change.event_id) {
+    if !tirith_core::util::is_uuid(&change.event_id) {
         return Err("feedback requires a canonical incident event UUID".into());
     }
     Ok(Intent {

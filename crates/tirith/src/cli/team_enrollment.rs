@@ -142,10 +142,7 @@ fn id(value: &str) -> Result<Id, String> {
     Id::parse(value).map_err(|_| "a canonical nonzero UUID is required".into())
 }
 fn now_ms() -> Result<u64, String> {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| "local clock is unavailable".into())
+    tirith_core::util::now_ms().ok_or_else(|| "local clock is unavailable".into())
 }
 fn network_allowed() -> Result<(), String> {
     if super::offline_env_active() {

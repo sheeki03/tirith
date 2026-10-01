@@ -786,16 +786,7 @@ fn unsafe_surface_digest() -> String {
     sha256_hex(b"tirith:persistence:unsafe-surface:v1")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
+use crate::util::sha256_hex;
 
 /// Default on-disk snapshot path: `state_dir()/persistence_snapshot.json`.
 pub fn snapshot_path() -> Option<PathBuf> {

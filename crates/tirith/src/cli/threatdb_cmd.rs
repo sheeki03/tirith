@@ -379,10 +379,6 @@ enum UpdateOutcome {
     Installed,
     /// The installed DB is already current; nothing was written.
     AlreadyCurrent,
-    /// The optional v2 channel is unpublished or has no compatible asset, so
-    /// the caller should use the legacy manifest. Never returned by the legacy
-    /// path itself.
-    NoCompatibleAsset,
 }
 
 /// Foreground update. A v2-capable client tries the signed v2 index FIRST
@@ -446,94 +442,7 @@ where
 {
     match outcome {
         UpdateOutcome::Installed | UpdateOutcome::AlreadyCurrent => reconcile(),
-        UpdateOutcome::NoCompatibleAsset => Err(
-            "internal error: supplemental reconciliation reached before primary selection"
-                .to_string(),
-        ),
     }
-}
-
-/// Attempt the v2-index update path. Returns:
-/// - `Ok(Installed)`: a compatible asset was fetched, verified, and installed;
-/// - `Ok(AlreadyCurrent)`: the selected asset is already the installed version;
-/// - `Ok(NoCompatibleAsset)`: both index URLs returned 404, or a valid index
-///   offered no compatible asset; use the legacy manifest;
-/// - `Err(_)`: the index could not be fetched / verified / parsed, also a
-///   fall-back trigger (the caller logs and continues to legacy).
-#[allow(dead_code)]
-fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
-    // `fetch_index_v2` returns only a signature- and schema-validated candidate;
-    // an invalid primary has already caused the independently published release
-    // candidate to be tried.
-    let Some(index) = fetch_index_v2()? else {
-        // Both discovery surfaces returned 404: the optional v2 channel has
-        // not been published (or was retired). This is an expected v1 state.
-        return Ok(UpdateOutcome::NoCompatibleAsset);
-    };
-
-    let current_tirith_version = env!("CARGO_PKG_VERSION");
-    let asset = match index.select_asset(current_tirith_version) {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "tirith: v2 index has no asset compatible with this build (max format {}, tirith {}); using legacy manifest",
-                MAX_FORMAT_VERSION, current_tirith_version
-            );
-            return Ok(UpdateOutcome::NoCompatibleAsset);
-        }
-    };
-
-    // Currentness is `(sequence, format)`, not sequence alone. The v1 manifest
-    // is published before the v2 pointer, so a client can legitimately have v1
-    // sequence N when the index for the same generation becomes visible; that
-    // client must still install v2. The reverse format switch is equally real.
-    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
-    if !index_install_needed(index.sequence, asset.format, current, force)? {
-        eprintln!(
-            "tirith: threat DB is already up to date (v2 index sequence {}, format v{})",
-            index.sequence, asset.format
-        );
-        evidence::refresh(&asset.url, index.sequence, asset.format, &asset.sha256);
-        return Ok(UpdateOutcome::AlreadyCurrent);
-    }
-
-    if asset.size > MAX_DB_SIZE {
-        return Err(format!(
-            "v2 asset too large: {} bytes (max {})",
-            asset.size, MAX_DB_SIZE
-        ));
-    }
-
-    eprintln!(
-        "tirith: downloading threat DB (format v{}, seq {}) from v2 index...",
-        asset.format, index.sequence
-    );
-
-    let data = download_url(&asset.url, asset.size)?;
-
-    // Verify the declared SHA-256 BEFORE trusting the bytes.
-    let computed_hash = hex::encode(Sha256::digest(&data));
-    if computed_hash != asset.sha256 {
-        return Err(format!(
-            "v2 asset SHA-256 mismatch: expected {}, got {}",
-            asset.sha256, computed_hash
-        ));
-    }
-
-    let equal_sequence_format_switch = !force
-        && current
-            .is_some_and(|(sequence, format)| sequence == index.sequence && format != asset.format);
-    install_primary_db(
-        data,
-        asset.format,
-        index.sequence,
-        force || equal_sequence_format_switch,
-    )?;
-    if asset.format == 1 {
-        retire_primary_v2()?;
-    }
-    evidence::refresh(&asset.url, index.sequence, asset.format, &asset.sha256);
-    Ok(UpdateOutcome::Installed)
 }
 
 fn index_install_needed(
@@ -556,82 +465,6 @@ fn index_install_needed(
     Ok(index_sequence > current_sequence || selected_format != current_format)
 }
 
-/// Legacy single-asset update: fetch `threatdb-manifest.json`, verify, download,
-/// install to the v1 path. Always v1. Returns `Installed` when it wrote a new
-/// DB, `AlreadyCurrent` when the installed DB is already at this version.
-#[allow(dead_code)]
-fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
-    let manifest = fetch_manifest()?;
-
-    manifest.verify_signature()?;
-
-    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
-    let install_needed = legacy_install_needed(manifest.version, current, force)?;
-    if !install_needed {
-        eprintln!(
-            "tirith: threat DB is already up to date (version {})",
-            manifest.version
-        );
-        evidence::refresh(&manifest.url, manifest.version, 1, &manifest.sha256);
-        return Ok(UpdateOutcome::AlreadyCurrent);
-    }
-
-    eprintln!(
-        "tirith: downloading threat DB v{} ({} bytes)...",
-        manifest.version, manifest.size
-    );
-
-    let data = download_db(&manifest)?;
-
-    let computed_hash = hex::encode(Sha256::digest(&data));
-    if computed_hash != manifest.sha256 {
-        return Err(format!(
-            "SHA-256 mismatch: expected {}, got {}",
-            manifest.sha256, computed_hash
-        ));
-    }
-
-    // The legacy manifest only ever points at v1. An equal-sequence v2 -> v1
-    // channel retirement is allowed after both signatures and the exact DB
-    // sequence have been checked; it is not a rollback. Only after the v1 bytes
-    // are durably installed do we durably remove the v2 cache. If retirement
-    // fails, return an error before refreshing the process cache so stale v2 is
-    // never silently reported as rolled back.
-    let equal_sequence_format_switch = !force
-        && current.is_some_and(|(sequence, format)| sequence == manifest.version && format == 2);
-    install_primary_db(
-        data,
-        1,
-        manifest.version,
-        force || equal_sequence_format_switch,
-    )?;
-    retire_primary_v2()?;
-    evidence::refresh(&manifest.url, manifest.version, 1, &manifest.sha256);
-    Ok(UpdateOutcome::Installed)
-}
-
-/// Decide whether a verified legacy manifest needs installation. Equality is
-/// current only when the effective DB is already v1. If the effective DB is v2,
-/// the equal-sequence v1 asset must still be installed before retiring v2.
-fn legacy_install_needed(
-    manifest_version: u64,
-    current: Option<(u64, u32)>,
-    force: bool,
-) -> Result<bool, String> {
-    if force {
-        return Ok(true);
-    }
-    let Some((current_sequence, current_format)) = current else {
-        return Ok(true);
-    };
-    if manifest_version < current_sequence {
-        return Err(format!(
-            "rollback protection: manifest version {manifest_version} < current {current_sequence}"
-        ));
-    }
-    Ok(manifest_version > current_sequence || current_format == 2)
-}
-
 /// The on-disk path a primary DB of `format` installs to: a v2 asset goes to
 /// the distinct `tirith-threatdb-v2.dat`, everything else to the canonical
 /// `tirith-threatdb.dat`. The v1 path is NEVER returned for a v2 asset, so a
@@ -645,10 +478,6 @@ fn primary_db_dest(format: u32) -> Result<PathBuf, String> {
 
 /// Validate a downloaded primary DB blob (structure, rollback, internal
 /// signature) and atomically install it to [`primary_db_dest`] for its `format`.
-fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> Result<(), String> {
-    install_primary_db_checked(data, format, version, force, &|| Ok(()))
-}
-
 fn install_primary_db_checked(
     data: Vec<u8>,
     format: u32,
@@ -1721,17 +1550,6 @@ fn persist_cache_files(
         }
         let _ = std::fs::write(bp, body);
     }
-}
-
-/// Download the DB file from the manifest URL.
-fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
-    if manifest.size > MAX_DB_SIZE {
-        return Err(format!(
-            "DB file too large: {} bytes (max {})",
-            manifest.size, MAX_DB_SIZE
-        ));
-    }
-    download_url(&manifest.url, manifest.size)
 }
 
 /// Download a DB blob from an explicit URL, rejecting a declared size or an
@@ -3217,18 +3035,6 @@ mod tests {
             .unwrap();
             assert_eq!(calls, 1, "{outcome:?} must reconcile exactly once");
         }
-        let mut calls = 0usize;
-        assert!(
-            reconcile_supplemental_after_primary(UpdateOutcome::NoCompatibleAsset, || {
-                calls += 1;
-                Ok(())
-            })
-            .is_err()
-        );
-        assert_eq!(
-            calls, 0,
-            "an unresolved primary must not publish an overlay"
-        );
     }
 
     #[test]
@@ -3883,7 +3689,7 @@ mod tests {
         // The format-to-path split: a v2 asset resolves to the distinct
         // `*-v2.dat`, a v1 asset to the canonical path, and the two are never the
         // same file (so a v2 asset can never clobber the v1 path an old binary
-        // reads). `install_primary_db`'s own signature check (against the pinned
+        // reads). `install_primary_db_checked`'s own signature check (against the pinned
         // production key) can't be exercised with a self-signed DB, so the path
         // routing is tested directly here.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3895,15 +3701,6 @@ mod tests {
         assert_eq!(v1_dest, v1_path);
         assert_eq!(v2_dest, tmp.path().join("tirith-threatdb-v2.dat"));
         assert_ne!(v1_dest, v2_dest, "v2 must never resolve to the v1 path");
-    }
-
-    #[test]
-    fn legacy_equal_sequence_v2_requires_install_and_retirement() {
-        assert!(legacy_install_needed(8, Some((8, 2)), false).unwrap());
-        assert!(!legacy_install_needed(8, Some((8, 1)), false).unwrap());
-        assert!(legacy_install_needed(9, Some((8, 2)), false).unwrap());
-        assert!(legacy_install_needed(7, Some((8, 2)), false).is_err());
-        assert!(legacy_install_needed(7, Some((8, 2)), true).unwrap());
     }
 
     #[test]
@@ -3938,7 +3735,7 @@ mod tests {
 
     #[test]
     fn build_format_stamps_distinct_version_per_format() {
-        // The format-mismatch guard in install_primary_db compares the blob's
+        // The format-mismatch guard in install_primary_db_checked compares the blob's
         // stamped version against the declared format; confirm a writer stamps
         // 1 for V1 and 2 for V2 so that guard has a real signal to compare.
         let key = SigningKey::from_bytes(&[5u8; 32]);

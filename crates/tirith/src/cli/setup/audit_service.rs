@@ -179,9 +179,7 @@ struct Store<'a> {
     recovery: bool,
 }
 
-fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+use tirith_core::util::sha256_hex as hash;
 impl Store<'_> {
     fn read_private(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
         let snapshot = fs_helpers::read_snapshot_scoped(path, &self.root)?;

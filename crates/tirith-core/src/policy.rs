@@ -4626,7 +4626,6 @@ fn cache_remote_policy_with_metadata(
     fetch: &crate::policy_client::RemoteFetchMetadata,
     validated_at: &str,
 ) -> std::io::Result<()> {
-    use sha2::{Digest, Sha256};
     if let Some(path) = remote_policy_cache_path() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -4644,7 +4643,7 @@ fn cache_remote_policy_with_metadata(
         })?;
         let receipt = RemotePolicyCacheReceipt {
             schema: 1,
-            cache_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            cache_sha256: crate::util::sha256_hex(&bytes),
             fetch: fetch.clone(),
             validated_at: validated_at.into(),
         };
@@ -4663,7 +4662,6 @@ fn cache_remote_policy_with_metadata(
 }
 
 fn observe_cached_fetch_metadata(path: &Path, cache_bytes: &[u8]) {
-    use sha2::{Digest, Sha256};
     // Metadata never affects enforcement; avoid an extra hot-path read unless
     // a consumer has requested the authoritative diagnostic snapshot.
     if !snapshot::is_capturing() {
@@ -4683,7 +4681,7 @@ fn observe_cached_fetch_metadata(path: &Path, cache_bytes: &[u8]) {
     let Ok(receipt) = serde_json::from_slice::<RemotePolicyCacheReceipt>(&bytes) else {
         return;
     };
-    if receipt.schema != 1 || receipt.cache_sha256 != format!("{:x}", Sha256::digest(cache_bytes)) {
+    if receipt.schema != 1 || receipt.cache_sha256 != crate::util::sha256_hex(cache_bytes) {
         return;
     }
     let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&receipt.fetch.fetched_at) else {

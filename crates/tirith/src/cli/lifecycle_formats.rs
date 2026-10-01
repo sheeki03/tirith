@@ -266,22 +266,15 @@ fn rollout_directory_facts(
         Err(_) => facts.push(unknown(surface, "inventory_changed")),
     }
 }
-fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 fn receipt_auxiliary_name(name: &str) -> bool {
     name == ".receipt-registry.lock"
         || name
             .strip_suffix(".lock")
-            .is_some_and(|stem| lower_hex(stem, 64))
+            .is_some_and(|stem| tirith_core::util::is_lower_hex(stem, 64))
         || name.strip_prefix(".hook-").is_some_and(|rest| {
             rest.strip_suffix(".capability")
                 .or_else(|| rest.strip_suffix(".capability.lock"))
-                .is_some_and(|stem| lower_hex(stem, 64))
+                .is_some_and(|stem| tirith_core::util::is_lower_hex(stem, 64))
         })
 }
 
@@ -319,7 +312,7 @@ fn shell_receipt_facts(scope: &Path, budget: &mut Budget, facts: &mut Vec<Format
         if !name
             .to_str()
             .and_then(|name| name.strip_suffix(".json"))
-            .is_some_and(|stem| lower_hex(stem, 64))
+            .is_some_and(|stem| tirith_core::util::is_lower_hex(stem, 64))
         {
             facts.push(unknown(SURFACE, "unknown_entry"));
             continue;

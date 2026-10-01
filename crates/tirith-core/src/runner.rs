@@ -4,8 +4,6 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use crate::receipt::Receipt;
 use crate::script_analysis;
 use crate::verdict::{Action, Verdict};
@@ -1359,11 +1357,7 @@ fn require_success_status(status: reqwest::StatusCode) -> Result<(), String> {
     }
 }
 
-fn sha256_hex(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    format!("{:x}", hasher.finalize())
-}
+use crate::util::sha256_hex;
 
 fn download_bounded_validated(
     request: ValidatedDownloadRequest,

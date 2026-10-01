@@ -3,6 +3,7 @@
 use super::*;
 use crate::cli::control::identity::DirectoryIdentity;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -69,10 +70,7 @@ fn io(error: std::io::Error) -> String {
     error.to_string()
 }
 fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    tirith_core::util::is_lower_hex(value, 64)
 }
 fn validate_identity(identity: &Identity, cap: u64) -> Result<(), String> {
     require(

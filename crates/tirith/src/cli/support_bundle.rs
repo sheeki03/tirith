@@ -29,9 +29,7 @@ impl Selection {
         for values in [&self.operation_ids, &self.incident_ids] {
             let mut seen = BTreeSet::new();
             for id in values {
-                if !uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == *id)
-                    || !seen.insert(id)
-                {
+                if !tirith_core::util::is_uuid(id) || !seen.insert(id) {
                     return Err("bundle selections must be unique canonical UUIDs".into());
                 }
             }

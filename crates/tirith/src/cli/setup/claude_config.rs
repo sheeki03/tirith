@@ -341,8 +341,7 @@ const SHIPPED_HOOK_SHA256: &str =
     "78363cadc752fcf26fa20aa6cf34c215403d9905f555b33743cdb4fd032772af";
 
 fn is_shipped_hook(text: &str) -> bool {
-    use sha2::{Digest as _, Sha256};
-    format!("{:x}", Sha256::digest(text.as_bytes())) == SHIPPED_HOOK_SHA256
+    tirith_core::util::sha256_hex(text.as_bytes()) == SHIPPED_HOOK_SHA256
 }
 
 /// The personal Claude step of recommended setup: stage the embedded hook

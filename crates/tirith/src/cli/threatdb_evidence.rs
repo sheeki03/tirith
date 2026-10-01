@@ -132,7 +132,7 @@ fn gather_inner(
         &key,
         sequence,
         format,
-        &hex::encode(Sha256::digest(&db_bytes)),
+        &tirith_core::util::sha256_hex(&db_bytes),
     )?;
     operations::source_freshness(&document, built, now)
 }

@@ -201,10 +201,7 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 fn now_ms() -> Result<u64, String> {
-    Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| "invalid local clock".into())
+    tirith_core::util::now_ms().ok_or_else(|| "invalid local clock".into())
 }
 fn network_allowed() -> Result<(), String> {
     if super::offline_env_active() {

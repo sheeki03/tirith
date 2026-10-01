@@ -3231,14 +3231,7 @@ fn load_upstream_observations(
 const GENERATION_MANIFEST_VERSION: u64 = 2;
 const SOURCE_INTEGRITY_MANIFEST_VERSION: u64 = 1;
 
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        encoded.push_str(&format!("{byte:02x}"));
-    }
-    encoded
-}
+use tirith_core::util::sha256_hex;
 
 fn immutable_asset_filename(path: &Path) -> FeedResult<String> {
     let filename = path

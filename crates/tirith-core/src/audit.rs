@@ -18,7 +18,6 @@ use base64::Engine as _;
 #[cfg(test)]
 use fs2::FileExt;
 use serde::{Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::verdict::Verdict;
 
@@ -1044,11 +1043,7 @@ fn canon_write(v: &serde_json::Value, out: &mut String) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
+use crate::util::sha256_hex;
 
 /// Hash of one audit line: parse JSON, drop `sig`, canonicalize, sha256-hex.
 /// `None` if the line is not valid JSON (a legacy/corrupt line yields no hash

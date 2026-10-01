@@ -39,7 +39,7 @@ pub(crate) fn prepare(
     cwd: Option<&str>,
     dry_run: bool,
 ) -> Result<serde_json::Value, String> {
-    if !uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id) {
+    if !tirith_core::util::is_uuid(id) {
         return Err("recommended setup ID must be a canonical UUID".into());
     }
     let cwd = cwd.map(str::to_owned).or_else(|| {

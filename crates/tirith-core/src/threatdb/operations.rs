@@ -11,7 +11,6 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 pub const PROVENANCE_LIMIT: u64 = 1024 * 1024;
 pub const SOURCE_IDS: [&str; 3] = [
@@ -47,10 +46,7 @@ fn timestamp(value: &str) -> Result<u64, String> {
 }
 
 fn digest(value: &str, bytes: usize) -> bool {
-    value.len() == bytes * 2
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::util::is_lower_hex(value, bytes * 2)
 }
 
 impl UpstreamObservations {
@@ -185,7 +181,7 @@ pub fn verify_source_evidence(
         ("source_transaction_sha256", &source_bytes),
         ("compiler_metadata_sha256", &compiler_bytes),
     ] {
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = crate::util::sha256_hex(bytes);
         if sidecar[field].as_str() != Some(actual.as_str()) {
             return Err(format!("source evidence {field} integrity mismatch"));
         }
@@ -415,6 +411,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn fixture() -> (Value, UpstreamObservations) {
         let mut sources = BTreeMap::new();

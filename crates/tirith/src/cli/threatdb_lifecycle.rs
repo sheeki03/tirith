@@ -2,7 +2,6 @@
 //! runs the same update code as `tirith threatdb update`.
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::threatdb::ThreatDb;
 
@@ -109,7 +108,7 @@ pub(super) fn apply_primary(
         return Ok(super::UpdateOutcome::AlreadyCurrent);
     }
     let bytes = super::download_url(asset.url, asset.size)?;
-    if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+    if bytes.len() as u64 != asset.size || tirith_core::util::sha256_hex(&bytes) != asset.sha256 {
         return Err("downloaded ThreatDB differs from its exact signed size/checksum".into());
     }
     let equal_sequence_switch =

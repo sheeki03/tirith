@@ -176,16 +176,7 @@ pub fn source_file_nonempty() -> bool {
 /// Lowercase-hex SHA-256 of `bytes` — the single source of truth for the
 /// clipboard-content hash (Greptile R1 #6) so the record, the rule, and the CLI
 /// displays can never drift apart.
-pub fn content_sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
-}
+pub use crate::util::sha256_hex as content_sha256_hex;
 
 /// Failure modes for clipboard access. `NoBackend` is the soft-fail path —
 /// callers degrade (empty envelope, exit 0 in JSON mode), never panic.

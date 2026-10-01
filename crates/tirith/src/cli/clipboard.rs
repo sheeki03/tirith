@@ -945,11 +945,7 @@ fn no_backend_message() -> &'static str {
     }
 }
 
-/// SHA-256 hex via the shared core helper (Greptile R1 #6), so debounce key,
-/// paste-provenance rule, and `--with-source` all hash content the same way.
-fn sha256_hex(bytes: &[u8]) -> String {
-    tirith_core::clipboard::content_sha256_hex(bytes)
-}
+use tirith_core::util::sha256_hex;
 
 /// Serialize `value` as a single line of JSON to stdout, followed by `\n`.
 /// Used by the daemon's per-event emitter. Returns `Ok(())` on success.

@@ -215,6 +215,7 @@ pub(crate) fn refuse_configured_remote_mutation() -> bool {
 }
 
 impl EffectivePolicySnapshot {
+    #[cfg(test)]
     /// Complete runtime policy for a local mutation that promises no network.
     /// A configured remote authority is refused before fetch; no local-only
     /// diagnostic snapshot is promoted. The ordinary resolver is unchanged.

@@ -791,7 +791,6 @@ fn inspect_js(text: &str, member: &str, events: &[String], inspection: &mut NpmI
 fn inspect_native(member: &Member<'_>, events: &[String], inspection: &mut NpmInspection) {
     use crate::artifact::archive::NativeMemberHandoff;
     use crate::artifact::native::{triage_native, NativeCoverage};
-    use sha2::{Digest, Sha256};
 
     let handoff = NativeMemberHandoff::Buffered {
         location: crate::location::SubjectLocation::member(
@@ -799,7 +798,7 @@ fn inspect_native(member: &Member<'_>, events: &[String], inspection: &mut NpmIn
             &member.path,
         ),
         bytes: member.bytes.to_vec(),
-        sha256: hex::encode(Sha256::digest(member.bytes)),
+        sha256: crate::util::sha256_hex(member.bytes),
     };
     let triage = triage_native(&handoff, false, false);
     let facts = triage.facts;

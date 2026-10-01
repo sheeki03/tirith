@@ -70,10 +70,7 @@ fn storage_error(error: ConnectionError) -> EnrollmentError {
     }
 }
 fn now_ms() -> Result<u64, EnrollmentError> {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| EnrollmentError::FutureCache)
+    crate::util::now_ms().ok_or(EnrollmentError::FutureCache)
 }
 /// How Runtime may use a cached team policy of a given age.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -731,6 +728,7 @@ impl EnrollmentWriteIntent {
     pub fn private_scope(&self) -> &Path {
         self.previous.private_scope()
     }
+    #[cfg(test)]
     pub fn expected_private_bytes(&self) -> Option<&[u8]> {
         self.previous.input.private_bytes()
     }
