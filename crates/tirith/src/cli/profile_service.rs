@@ -50,7 +50,31 @@ impl PreparedProfile {
         Self::capture_scoped(name, cwd, ProfileScope::User)
     }
 
+    /// Capture a profile change and preflight its in-place edit, so every
+    /// preview (CLI `--dry-run`, dashboard, recommended setup, rollout) refuses
+    /// exactly what the real plan would refuse on the same unchanged file.
     pub(crate) fn capture_scoped(
+        name: &str,
+        cwd: Option<&str>,
+        scope: ProfileScope,
+    ) -> Result<Self, String> {
+        let prepared = Self::capture_unchecked(name, cwd, scope)?;
+        prepared.preflight(&prepared.owned_fields()?)?;
+        Ok(prepared)
+    }
+
+    /// Run the plan's in-place edit of `fields` against the captured preimage.
+    fn preflight(
+        &self,
+        fields: &BTreeMap<String, Option<serde_json::Value>>,
+    ) -> Result<(), String> {
+        super::setup::change_plan::preflight_yaml_fields(self.original_text.as_deref(), fields)
+            .map_err(|error| {
+                tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &self.compiled)
+            })
+    }
+
+    fn capture_unchecked(
         name: &str,
         cwd: Option<&str>,
         scope: ProfileScope,
@@ -245,6 +269,30 @@ impl PreparedProfile {
         self.snapshot
             .revalidate_inputs()
             .map_err(|_| "policy changed while preparing profile; refresh the preview")?;
+        let fields = self.owned_fields()?;
+        if fields.is_empty() {
+            return Ok((Vec::new(), BTreeMap::new()));
+        }
+        let expected = BTreeMap::from([(self.path.clone(), self.original_text.clone())]);
+        let changes = vec![RequestedChange {
+            target: self.path.clone(),
+            scope_root: self.config.clone(),
+            edit: Edit::YamlFields(fields),
+            activation: true,
+            description: format!(
+                "Apply {} profile: {}",
+                match self.scope {
+                    ProfileScope::User => "personal",
+                    ProfileScope::Org => "organization",
+                },
+                self.intent.profile
+            ),
+        }];
+        Ok((changes, expected))
+    }
+
+    /// The owned fields this profile change rewrites, with their new values.
+    fn owned_fields(&self) -> Result<BTreeMap<String, Option<serde_json::Value>>, String> {
         let before =
             serde_json::to_value(&self.original).map_err(|_| "cannot project existing policy")?;
         let after = serde_json::to_value(self.preview.document())
@@ -269,25 +317,7 @@ impl PreparedProfile {
                 fields.insert(pointer.clone(), after.pointer(&pointer).cloned());
             }
         }
-        if fields.is_empty() {
-            return Ok((Vec::new(), BTreeMap::new()));
-        }
-        let expected = BTreeMap::from([(self.path.clone(), self.original_text.clone())]);
-        let changes = vec![RequestedChange {
-            target: self.path.clone(),
-            scope_root: self.config.clone(),
-            edit: Edit::YamlFields(fields),
-            activation: true,
-            description: format!(
-                "Apply {} profile: {}",
-                match self.scope {
-                    ProfileScope::User => "personal",
-                    ProfileScope::Org => "organization",
-                },
-                self.intent.profile
-            ),
-        }];
-        Ok((changes, expected))
+        Ok(fields)
     }
 
     /// Apply only the preset-owned changes to the captured effective policy.
@@ -585,7 +615,9 @@ impl PreparedSetting {
         let (field, value) = change.field_value()?;
         // Capture the same operator, named-file precedence, private preimage,
         // effective policy, and DLP union used by profile preparation.
-        let base = PreparedProfile::capture("reset", cwd)?;
+        // The reset profile's own fields are not edited here, so only this
+        // setting's fields are preflighted below.
+        let base = PreparedProfile::capture_unchecked("reset", cwd, ProfileScope::User)?;
         let mut before_document =
             serde_json::to_value(&base.original).map_err(|_| "cannot inspect personal policy")?;
         if before_document.is_null() {
@@ -626,6 +658,8 @@ impl PreparedSetting {
                 document.get("protection_profile").cloned(),
             );
         }
+        // Preview and plan refuse the same in-place edits of this file.
+        base.preflight(&fields)?;
         let intent = SettingIntent {
             scope: "user",
             cwd: base.intent.cwd.clone(),

@@ -489,3 +489,71 @@ fn setting_under_a_flow_style_parent_is_refused_with_a_diff_and_no_write() {
     assert!(!stderr.contains("policy_server"), "{stderr}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
+
+/// A preview must not promise a change the real run refuses: `--dry-run` runs
+/// the same in-place preflight as the plan and reports the same refusal.
+#[test]
+fn dry_run_reports_the_in_place_refusal_the_real_run_would_hit() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let cases: [(&str, &[&str], &str); 2] = [
+        (
+            "severity_overrides: {shortened_url: low}\n",
+            &[
+                "policy",
+                "setting",
+                "rule_severity",
+                "high",
+                "--rule",
+                "plain_http_to_sink",
+            ],
+            "cannot change `severity_overrides.plain_http_to_sink` in place",
+        ),
+        (
+            "action_overrides: {shortened_url: warn}\n",
+            &["policy", "profile", "strict"],
+            "cannot change `action_overrides.",
+        ),
+    ];
+    for (original, args, refusal) in cases {
+        std::fs::write(&path, original).unwrap();
+        for extra in [
+            &["--dry-run", "--json"][..],
+            &["--dry-run"][..],
+            &["--json"][..],
+        ] {
+            let mut command = args.to_vec();
+            command.extend_from_slice(extra);
+            let output = run(&state, &command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{command:?}: {stderr}");
+            assert!(stderr.contains(refusal), "{command:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "{command:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+    // A block-style file still previews and applies normally.
+    std::fs::write(&path, "severity_overrides:\n  shortened_url: low\n").unwrap();
+    let preview = success(run(
+        &state,
+        &[
+            "policy",
+            "setting",
+            "rule_severity",
+            "high",
+            "--rule",
+            "plain_http_to_sink",
+            "--dry-run",
+            "--json",
+        ],
+    ));
+    assert_eq!(preview["kind"], "personal_setting_preview");
+    let preview = success(run(
+        &state,
+        &["policy", "profile", "strict", "--dry-run", "--json"],
+    ));
+    assert_eq!(preview["kind"], "profile_preview");
+}

@@ -2461,6 +2461,23 @@ fn capture_fields(
     })
 }
 
+/// Run the plan's in-place preflight for owned YAML fields against a captured
+/// preimage without journaling anything, so a preview reports the same
+/// refusal (or size limit) the real plan would hit on the unchanged file.
+pub(crate) fn preflight_yaml_fields(
+    text: Option<&str>,
+    fields: &std::collections::BTreeMap<String, Option<Value>>,
+) -> Result<(), String> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let edit = capture_fields(text, true, fields.clone())?;
+    if transform(&edit, text, false)?.is_some_and(|s| s.len() > MAX_SETUP_FILE_BYTES) {
+        return Err("planned output exceeds setup file limit".into());
+    }
+    Ok(())
+}
+
 fn validate_pointer(pointer: &str) -> Result<(), String> {
     if !pointer.starts_with('/')
         || pointer == "/"
