@@ -370,23 +370,25 @@ fn build_snippet(shell: &str) -> String {
 
 /// The profile the wrapper is written to, from the shared shell-target
 /// resolution (honours ZDOTDIR and XDG_CONFIG_HOME, and the platform's native
-/// locations). Bash prefers an existing `.bashrc`, then the existing login
-/// profile Bash would read, and otherwise creates `.bashrc`.
+/// locations). Bash uses `.bashrc`, or an existing `.bash_profile` when there
+/// is no `.bashrc`. It never uses `.profile`: sh and dash login shells read
+/// that file too and reject the snippet's hyphenated function name.
 fn profile_for(
     shell: &str,
     inputs: &super::shell_target::TargetInputs,
     mut exists: impl FnMut(&std::path::Path) -> bool,
 ) -> Result<Option<PathBuf>, String> {
-    let profiles = super::shell_target::profiles_for(shell, inputs, |path| Ok(exists(path)))?;
-    let Some(first) = profiles.first() else {
-        return Ok(None);
-    };
     if shell == "bash" {
-        if let Some(existing) = profiles.iter().find(|profile| exists(&profile.path)) {
-            return Ok(Some(existing.path.clone()));
-        }
+        let bashrc = inputs.home.join(".bashrc");
+        let bash_profile = inputs.home.join(".bash_profile");
+        return Ok(Some(if !exists(&bashrc) && exists(&bash_profile) {
+            bash_profile
+        } else {
+            bashrc
+        }));
     }
-    Ok(Some(first.path.clone()))
+    let profiles = super::shell_target::profiles_for(shell, inputs, |path| Ok(exists(path)))?;
+    Ok(profiles.first().map(|profile| profile.path.clone()))
 }
 
 /// Where releases before the shared resolution put the wrapper: fixed paths
@@ -526,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_profile_prefers_bashrc_then_the_existing_login_profile() {
+    fn bash_profile_is_bashrc_or_an_existing_bash_profile_never_a_posix_sh_file() {
         use super::super::shell_target::Platform::Unix;
         let plain = inputs(Unix, None, None);
         let only = |name: &'static str| move |path: &std::path::Path| path.ends_with(name);
@@ -542,9 +544,23 @@ mod tests {
             profile_for("bash", &plain, only(".bash_profile")).unwrap(),
             Some(PathBuf::from("/home/op/.bash_profile"))
         );
+        // `.profile` is also read by sh/dash login shells, which reject the
+        // snippet's hyphenated function name, and `.bash_login` was never a
+        // target: both fall back to creating `.bashrc`.
         assert_eq!(
             profile_for("bash", &plain, only(".profile")).unwrap(),
-            Some(PathBuf::from("/home/op/.profile"))
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, only(".bash_login")).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, |path: &std::path::Path| {
+                path.ends_with(".bash_profile") || path.ends_with(".profile")
+            })
+            .unwrap(),
+            Some(PathBuf::from("/home/op/.bash_profile"))
         );
     }
 

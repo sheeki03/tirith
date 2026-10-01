@@ -279,10 +279,11 @@ pub fn source_freshness(document: &Value, built: u64, now: u64) -> Result<Freshn
 /// Total attempts `send_with_retry` makes (one request plus two retries).
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Timeout for one attempt: an equal share of what is left for the attempts
-/// still allowed, so a stalled first attempt leaves budget for a retry; the
-/// last attempt gets everything that remains. Reqwest's blocking client applies
-/// it to the response headers and to each body read, not the whole download.
+/// How long one attempt may wait for response headers: an equal share of what
+/// is left for the attempts still allowed, so a stalled first attempt leaves
+/// budget for a retry; the last attempt gets everything that remains. It does
+/// not bound the body: reqwest's request timeout is a total deadline covering
+/// the body, so the request itself keeps the whole remaining budget.
 fn attempt_timeout(remaining: Duration, attempt: u32) -> Duration {
     remaining / MAX_ATTEMPTS.saturating_sub(attempt).max(1)
 }
@@ -340,7 +341,7 @@ pub fn send_with_retry(
         let next = request
             .try_clone()
             .ok_or("transport request cannot be retried safely")?;
-        let result = next.timeout(attempt_timeout(remaining, attempt)).send();
+        let result = send_within(next.timeout(remaining), attempt_timeout(remaining, attempt));
         let (status, retry_after) = match &result {
             Ok(response) => (
                 response.status().as_u16(),
@@ -349,7 +350,7 @@ pub fn send_with_retry(
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok()),
             ),
-            Err(error) if error.is_timeout() => (503, None),
+            Err(SendFailure::TimedOut) => (503, None),
             Err(_) => (0, None),
         };
         let now = std::time::SystemTime::now()
@@ -368,16 +369,44 @@ pub fn send_with_retry(
             attempt += 1;
             continue;
         }
-        // No reqwest Display here: it may include a supplemental feed API key.
-        return result.map_err(|error| {
-            if error.is_timeout() {
-                "transport timed out".into()
-            } else if error.is_connect() {
-                "connection or server identity failed".into()
-            } else {
-                "transport request failed".into()
+        return result.map_err(|failure| {
+            match failure {
+                SendFailure::TimedOut => "transport timed out",
+                SendFailure::Connect => "connection or server identity failed",
+                SendFailure::Other => "transport request failed",
             }
+            .into()
         });
+    }
+}
+
+/// Why one attempt produced no response. No reqwest error is kept: its
+/// Display may include a supplemental feed API key.
+enum SendFailure {
+    TimedOut,
+    Connect,
+    Other,
+}
+
+/// Sends `request` and waits at most `header_wait` for the response headers.
+/// The request carries its own total timeout, which also governs the body the
+/// caller reads later. A send that misses `header_wait` is abandoned on its
+/// thread, which ends by that total timeout at the latest.
+fn send_within(
+    request: reqwest::blocking::RequestBuilder,
+    header_wait: Duration,
+) -> Result<reqwest::blocking::Response, SendFailure> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(request.send());
+    });
+    match receiver.recv_timeout(header_wait) {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_timeout() => Err(SendFailure::TimedOut),
+        Ok(Err(error)) if error.is_connect() => Err(SendFailure::Connect),
+        Ok(Err(_)) => Err(SendFailure::Other),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SendFailure::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SendFailure::Other),
     }
 }
 
@@ -590,6 +619,48 @@ mod tests {
         .expect("the retry must run after a stalled first attempt");
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.text().unwrap(), "ok");
+        server.join().unwrap();
+    }
+
+    /// The per-attempt share bounds only the wait for response headers: a
+    /// healthy response whose body takes longer than that share, but less
+    /// than the whole budget, is read in full.
+    #[test]
+    fn slow_body_may_use_the_whole_budget() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            // 4 bytes over ~2.4 s: longer than budget / 3, shorter than the budget.
+            for byte in b"slow" {
+                std::thread::sleep(Duration::from_millis(600));
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = send_with_retry(
+            client.get(format!("http://{address}/threatdb.bin")),
+            Duration::from_secs(5),
+        )
+        .expect("headers arrive at once");
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response
+            .bytes()
+            .expect("the body may take longer than one attempt's share");
+        assert_eq!(&body[..], b"slow");
         server.join().unwrap();
     }
 
