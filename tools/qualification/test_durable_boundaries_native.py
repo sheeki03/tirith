@@ -106,16 +106,32 @@ class RunnerContracts(unittest.TestCase):
                 runner.crash_profile(self.case, "before-policy-publication")
 
     def test_profile_journal_rejects_noop_or_changed_owned_value(self):
+        # Mirrors the product journal: OwnedEdit::Compound { original, edits }.
         fields = [{"Field": {"yaml": True, "pointer": pointer, "before": None, "after": value}}
                   for pointer, value in runner.STRICT_PROFILE_FIELDS.items()]
-        record = {"kind": "set-profile", "steps": [{"edit": {"Compound": fields}}]}
+        compound = {"original": runner.STRICT_PROFILE_FIXTURE.decode(), "edits": fields}
+        record = {"kind": "set-profile", "steps": [{"edit": {"Compound": compound}}]}
         runner.strict_profile_plan(record)
+        for stale in ({"Compound": fields}, {"Compound": dict(compound, original=None)},
+                      {"Compound": dict(compound, original="strict_warn: false\n")}):
+            with self.subTest(edit=stale), self.assertRaises(AssertionError):
+                runner.strict_profile_plan({"kind": "set-profile", "steps": [{"edit": stale}]})
         fields[0]["Field"]["after"] = None
         with self.assertRaises(AssertionError):
             runner.strict_profile_plan(record)
         record["steps"] = []
         with self.assertRaises(AssertionError):
             runner.strict_profile_plan(record)
+
+    def test_profile_bytes_are_an_in_place_edit_of_the_fixture(self):
+        # Owned fields are edited in place, never re-serialized: every fixture key
+        # keeps its position, and the strict_warn line (not owned) is untouched.
+        fixture = runner.STRICT_PROFILE_FIXTURE.decode().splitlines()
+        published = runner.STRICT_PROFILE_BYTES.decode().splitlines()
+        top_level = [line.split(":")[0] for line in published if line and not line.startswith(" ") and not line.startswith("-")]
+        self.assertEqual(top_level[:3], [line.split(":")[0] for line in fixture])
+        self.assertIn(fixture[-1], published)
+        self.assertLess(published.index(fixture[-1]), published.index("allow_bypass_env: false"))
 
     def test_fingerprint_detects_replaced_inode_with_identical_bytes(self):
         path = self.root / "generation"

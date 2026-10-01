@@ -42,9 +42,17 @@ STRICT_PROFILE_FIELDS = {
         "allow_bypass_env", "allow_bypass_env_noninteractive", "fail_mode", "paranoia", "scan.require_complete"], "version": 1},
     "/scan/require_complete": True,
 }
+# The fixture policy before the profile is applied. Owned-field edits are made in
+# place: existing keys keep their position and layout, flow-style empty parents
+# become block maps holding the new children, and new top-level keys are appended
+# after the last existing key in the order the product plans them.
+STRICT_PROFILE_FIXTURE = b"action_overrides: {}\nscan: {}\nstrict_warn: false\n"
 STRICT_PROFILE_BYTES = b"""action_overrides:
   analysis_incomplete: block
   wrapper_chain_too_deep: block
+scan:
+  require_complete: true
+strict_warn: false
 allow_bypass_env: false
 allow_bypass_env_noninteractive: false
 fail_mode: closed
@@ -60,9 +68,6 @@ protection_profile:
   - paranoia
   - scan.require_complete
   version: 1
-scan:
-  require_complete: true
-strict_warn: false
 """
 
 
@@ -139,8 +144,10 @@ def refusal(row, diagnostic, stream="stderr"):
 def strict_profile_plan(record):
     require(record.get("kind") == "set-profile" and len(record.get("steps", [])) == 1,
             "fixture must capture one strict-profile policy publication")
-    expected = {"Compound": [{"Field": {"yaml": True, "pointer": pointer, "before": None, "after": after}}
-                             for pointer, after in STRICT_PROFILE_FIELDS.items()]}
+    # `original` is the exact planned preimage that byte-exact undo restores.
+    expected = {"Compound": {"original": STRICT_PROFILE_FIXTURE.decode(),
+                             "edits": [{"Field": {"yaml": True, "pointer": pointer, "before": None, "after": after}}
+                                       for pointer, after in STRICT_PROFILE_FIELDS.items()]}}
     # JSON comparison keeps booleans distinct from numbers, unlike Python ==.
     require(json.dumps(record["steps"][0]["edit"], sort_keys=True) == json.dumps(expected, sort_keys=True),
             "saved profile plan does not contain the exact intended version-1 owned values")
@@ -210,7 +217,7 @@ class Case:
 
     def prepare_profile(self):
         self.policy.parent.mkdir(mode=0o700)
-        self.policy.write_bytes(b"action_overrides: {}\nscan: {}\nstrict_warn: false\n")
+        self.policy.write_bytes(STRICT_PROFILE_FIXTURE)
         self.policy.chmod(0o600)
         self.original = read_bytes(self.policy)
         self.original_identity = identity(self.policy)

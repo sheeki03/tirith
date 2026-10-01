@@ -72,6 +72,11 @@ ordinary editor changes an
 owned setting while the original worker is stopped; retry and undo must refuse
 without overwriting that new generation. The fixture starts with canonical empty
 YAML parent maps, because owned-field compensation preserves those parents.
+The expected bytes follow the in-place owned-field edit: fixture keys keep their
+position, the empty parents gain their owned children, and new top-level keys
+are appended after `strict_warn: false`. The planned journal edit is
+`Compound { original, edits }`, where `original` is the exact fixture preimage
+that undo restores byte for byte.
 
 The live audit cancellation route first requires the shared setup writer lock to
 be free. A competing undo must explicitly refuse the existing execution-lock
