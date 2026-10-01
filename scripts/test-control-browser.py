@@ -155,9 +155,15 @@ def await_discovery(path, job, startup_id, binary_sha256, project):
 
 
 def verify_launch(launch, record):
-    expected = f"http://127.0.0.1:{record['port']}/#token={record['token']}"
+    # The launch URL carries a fresh single-use sign-in code, never the
+    # reusable service credential from the private record.
+    prefix = f"http://127.0.0.1:{record['port']}/#code="
     assert launch["kind"] == "dashboard_launch" and launch["service_id"] == record["service_id"]
-    assert launch["url"] == expected, "launcher did not reuse the owned service"
+    url = launch["url"]
+    assert type(url) is str and url.startswith(prefix), "launcher did not reuse the owned service"
+    code = url[len(prefix):]
+    assert len(code) == 64 and all(c in "0123456789abcdef" for c in code), "launch URL lacks a sign-in code"
+    assert code != record["token"] and record["token"] not in url, "launch URL exposes the service credential"
     assert launch["browser_opened"] is False and launch["protection_changed"] is False
 
 
@@ -409,7 +415,7 @@ def run(binary, output):
                     page.wait_for_load_state("networkidle")
                     page.get_by_role("heading", name="Overview", exact=True).wait_for()
                     page.locator('#content[aria-busy="false"]').wait_for()
-                    assert "token=" not in page.url
+                    assert "token=" not in page.url and "code=" not in page.url
                     assert page.get_by_text("Configured. Verify in your shell.").count() or page.get_by_text("Check your integration.").count()
                     page.screenshot(path=str(output / "overview-wide.png"), full_page=True)
                     report["checks"].append("overview_uses_evidence_not_assumed_blocking")
@@ -913,7 +919,7 @@ def run_response_order(binary, output, app_js=None):
                 try:
                     page.goto(launch["url"])
                     page.locator('#content[aria-busy="false"]').wait_for()
-                    assert "token=" not in page.url
+                    assert "token=" not in page.url and "code=" not in page.url
                     first_id = profile("balanced")
                     delay("old-planned-status", "/api/operations", {"operation_id":first_id, "action":"status"})
                     page.get_by_role("button", name="Refresh stored status", exact=True).click()

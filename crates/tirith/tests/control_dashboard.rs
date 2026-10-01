@@ -61,23 +61,69 @@ fn launch(state: &GlobalStateGuard) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// The single-use code from a launch URL.
+fn launch_code(launch: &Value) -> (u16, String) {
+    let url = url::Url::parse(launch["url"].as_str().unwrap()).unwrap();
+    let code = url
+        .fragment()
+        .and_then(|fragment| fragment.strip_prefix("code="))
+        .unwrap_or_else(|| panic!("launch URL must carry a sign-in code: {url}"));
+    (url.port().unwrap(), code.into())
+}
+
+/// Sign in the way the page does: exchange the code once, same origin.
+fn exchange(port: u16, code: &str, origin: Option<&str>) -> (u16, Value) {
+    let body = json!({ "code": code }).to_string();
+    let origin = origin
+        .map(|origin| format!("Origin: {origin}\r\n"))
+        .unwrap_or_default();
+    let probe = Service {
+        port,
+        token: String::new(),
+        csrf: String::new(),
+    };
+    let response = probe.raw(&format!("POST /api/session/exchange HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+    std::mem::forget(probe);
+    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    (
+        status,
+        serde_json::from_str(body).unwrap_or_else(|_| json!({"text":body})),
+    )
+}
+
 fn service(state: &GlobalStateGuard) -> (Service, Value) {
     let launch = launch(state);
-    let url = url::Url::parse(launch["url"].as_str().unwrap()).unwrap();
+    let (port, code) = launch_code(&launch);
+    let (status, session) = exchange(port, &code, Some(&format!("http://127.0.0.1:{port}")));
+    assert_eq!(status, 200, "{session}");
+    let service = Service {
+        port,
+        token: session["token"].as_str().unwrap().into(),
+        csrf: session["csrf"].as_str().unwrap().into(),
+    };
+    let (status, current) = service.request("GET", "/api/session", None);
+    assert_eq!(status, 200);
+    assert_eq!(current["csrf"], session["csrf"]);
+    (service, launch)
+}
+
+/// The private-record service credential (owner-only file), as the CLI uses it.
+fn service_credential(state: &GlobalStateGuard) -> Service {
+    launch(state);
+    let path = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("control/v1/service.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let mut service = Service {
-        port: url.port().unwrap(),
-        token: url
-            .fragment()
-            .unwrap()
-            .strip_prefix("token=")
-            .unwrap()
-            .into(),
+        port: record["port"].as_u64().unwrap() as u16,
+        token: record["token"].as_str().unwrap().into(),
         csrf: String::new(),
     };
     let (status, session) = service.request("GET", "/api/session", None);
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{session}");
     service.csrf = session["csrf"].as_str().unwrap().into();
-    (service, launch)
+    service
 }
 
 fn state() -> GlobalStateGuard {
@@ -143,6 +189,112 @@ fn activity_starts_with_newest_checks_and_pages_older_without_shifting_on_append
         std::fs::read_to_string(path).unwrap(),
         format!("{original}{}", record(600))
     );
+}
+
+#[test]
+fn launch_url_carries_only_a_single_use_code_and_each_reopen_gets_a_fresh_session() {
+    let state = state();
+    let first = launch(&state);
+    let (port, code) = launch_code(&first);
+    assert!(code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first["single_use_code"], true);
+    let record_path = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("control/v1/service.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+    let service_token = record["token"].as_str().unwrap();
+    // The reusable credential never appears in the URL given to a browser launcher.
+    assert!(!first["url"].as_str().unwrap().contains(service_token));
+    assert_ne!(code, service_token);
+    let origin = format!("http://127.0.0.1:{port}");
+    // A code is not a bearer credential.
+    let as_bearer = Service {
+        port,
+        token: code.clone(),
+        csrf: String::new(),
+    };
+    assert_eq!(as_bearer.request("GET", "/api/state", None).0, 401);
+    std::mem::forget(as_bearer);
+    // The exchange is a same-origin write.
+    assert_eq!(exchange(port, &code, None).0, 403);
+    assert_eq!(
+        exchange(port, &code, Some("http://attacker.example")).0,
+        403
+    );
+    let (status, session) = exchange(port, &code, Some(&origin));
+    assert_eq!(status, 200, "{session}");
+    assert_ne!(session["token"], service_token);
+    assert!(session["expires_in_seconds"].as_u64().unwrap() > 3500);
+    // Used once.
+    assert_eq!(exchange(port, &code, Some(&origin)).0, 401);
+    let browser = Service {
+        port,
+        token: session["token"].as_str().unwrap().into(),
+        csrf: session["csrf"].as_str().unwrap().into(),
+    };
+    assert_eq!(browser.request("GET", "/api/state", None).0, 200);
+    // Only the private launcher credential can mint codes.
+    assert_eq!(
+        browser
+            .request("POST", "/api/session/code", Some(json!({})))
+            .0,
+        403
+    );
+    // Reopening reuses the service but issues a new code and a new session.
+    let second = launch(&state);
+    assert_eq!(first["service_id"], second["service_id"]);
+    let (_, second_code) = launch_code(&second);
+    assert_ne!(code, second_code);
+    let (status, reopened) = exchange(port, &second_code, Some(&origin));
+    assert_eq!(status, 200, "{reopened}");
+    assert_ne!(reopened["token"], session["token"]);
+    assert_ne!(reopened["csrf"], session["csrf"]);
+    assert!(reopened["expires_in_seconds"].as_u64().unwrap() > 3500);
+    assert_eq!(browser.request("GET", "/api/state", None).0, 200);
+}
+
+#[test]
+fn read_only_routes_never_resolve_the_remote_policy() {
+    // Every remote fetch attempt reports itself in the route's diagnostics.
+    // A loopback policy server is refused before any connection, so this
+    // fixture observes attempts without network access.
+    let mut state = state();
+    state.set_env("TIRITH_SERVER_URL", "https://127.0.0.1:1");
+    state.set_env("TIRITH_API_KEY", "fixture-remote-policy-key");
+    let server = service_credential(&state);
+    let attempted = |value: &Value| {
+        value["diagnostics"]
+            .to_string()
+            .contains("remote policy fetch")
+    };
+    for (method, path, body) in [
+        ("GET", "/api/jobs", None),
+        ("GET", "/api/state", None),
+        ("GET", "/api/integrations", None),
+        ("GET", "/api/activity/summary", None),
+        ("GET", "/api/freshness", None),
+        ("POST", "/api/history", Some(json!({"limit": 10}))),
+        (
+            "POST",
+            "/api/operations",
+            Some(json!({"operation_id": uuid::Uuid::new_v4().to_string(), "action": "status"})),
+        ),
+    ] {
+        let (status, value) = server.request(method, path, body);
+        assert!(
+            status == 200 || path == "/api/operations",
+            "{path}: {value}"
+        );
+        assert!(
+            !attempted(&value),
+            "{path} resolved the remote policy: {value}"
+        );
+    }
+    // The effective-policy view still resolves Runtime, which also shows the
+    // fixture would have seen an attempt.
+    let (status, policy) = server.request("GET", "/api/policy", None);
+    assert_eq!(status, 200, "{policy}");
+    assert!(attempted(&policy), "{policy}");
 }
 
 #[test]

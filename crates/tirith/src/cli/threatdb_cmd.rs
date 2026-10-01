@@ -2599,11 +2599,19 @@ pub fn health(json: bool) -> i32 {
 }
 
 pub(crate) fn gather_health() -> HealthReport {
+    gather_health_with_interval(
+        policy::Policy::discover(None)
+            .threat_intel
+            .auto_update_hours,
+    )
+}
+
+/// Health with a refresh interval the caller already resolved (the dashboard
+/// reads it without resolving the remote policy again).
+pub(crate) fn gather_health_with_interval(refresh_interval_hours: u64) -> HealthReport {
     // repo-0501: same fix on the health surface.
     let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
-    let policy = policy::Policy::discover(None);
-    let refresh_interval_hours = policy.threat_intel.auto_update_hours;
 
     let supplemental_path = ThreatDb::supplemental_path();
     let supplemental = SupplementalHealth {

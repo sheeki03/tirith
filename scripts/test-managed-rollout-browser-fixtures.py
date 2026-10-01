@@ -115,10 +115,11 @@ class Predicates(unittest.TestCase):
         self.assertEqual(len(HARNESS.safe_diagnostic("x" * 5000, None)), 4096)
     def test_launcher_must_reuse_service_and_exact_local_url(self):
         launch = {"kind": "dashboard_launch", "service_id": self.record["service_id"],
-                  "url": f"http://127.0.0.1:12345/#token={self.record['token']}",
+                  "url": f"http://127.0.0.1:12345/#code={'e' * 64}",
                   "browser_opened": False, "protection_changed": False}
         HARNESS.verify_launch(launch, self.record)
-        for key, bad in (("service_id", str(uuid.uuid4())), ("url", "http://other.example/")):
+        for key, bad in (("service_id", str(uuid.uuid4())), ("url", "http://other.example/"),
+                         ("url", f"http://127.0.0.1:12345/#token={self.record['token']}")):
             with self.subTest(key=key), self.assertRaises(AssertionError):
                 HARNESS.verify_launch({**launch, key: bad}, self.record)
     def test_balanced_requires_materialized_document_and_effective_fields(self):

@@ -178,9 +178,15 @@ def read_discovery(path, job, startup_id, binary_sha256, project):
 
 
 def verify_launch(launch, record):
-    expected = f"http://127.0.0.1:{record['port']}/#token={record['token']}"
+    # The launch URL carries a fresh single-use sign-in code, never the
+    # reusable service credential from the private record.
+    prefix = f"http://127.0.0.1:{record['port']}/#code="
+    url = launch.get("url") if type(launch) is dict else None
+    code = url[len(prefix):] if type(url) is str and url.startswith(prefix) else ""
     if not (type(launch) is dict and launch.get("kind") == "dashboard_launch"
-            and launch.get("service_id") == record["service_id"] and launch.get("url") == expected
+            and launch.get("service_id") == record["service_id"]
+            and len(code) == 64 and all(c in "0123456789abcdef" for c in code)
+            and code != record["token"] and record["token"] not in url
             and launch.get("browser_opened") is False and launch.get("protection_changed") is False):
         raise ValueError("public launcher did not reuse the owned service")
 

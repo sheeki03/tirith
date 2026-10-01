@@ -4,18 +4,32 @@ mod api;
 mod http;
 pub(crate) mod identity;
 mod lifecycle;
+mod peer;
 pub(crate) use lifecycle::quiesce_for_update;
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tirith_core::history::HistoryReader;
 
-const SESSION_TTL: Duration = Duration::from_secs(3600);
 const IDLE_TTL: Duration = Duration::from_secs(1800);
 const MAX_CONNECTIONS: usize = 8;
+/// Upper bound for a read to wait on the one startup Runtime resolution. It
+/// exceeds the policy client's own connect plus total timeout.
+const RUNTIME_PATTERNS_WAIT: Duration = Duration::from_secs(16);
+
+/// DLP patterns seen in full Runtime resolutions (which may contact a remote
+/// policy server). Read-only endpoints never resolve Runtime themselves; they
+/// redact with these plus a fresh no-network resolution. The set only grows.
+#[derive(Default)]
+struct RuntimePatterns {
+    resolved: bool,
+    patterns: Vec<String>,
+    /// ThreatDB refresh interval from the latest full Runtime resolution.
+    refresh_interval_hours: Option<u64>,
+}
 
 struct Service {
     record: lifecycle::ServiceRecord,
@@ -23,6 +37,8 @@ struct Service {
     history: Mutex<HistoryReader>,
     aggregate: Mutex<tirith_core::history_aggregate::HistoryAggregate>,
     last_activity: Mutex<Instant>,
+    runtime_patterns: Mutex<RuntimePatterns>,
+    runtime_resolved: Condvar,
     admission: Mutex<()>,
     quiescing: AtomicBool,
     connections: AtomicUsize,
@@ -51,8 +67,87 @@ impl Service {
             && matches!(request.target.as_str(), "/" | "/app.js" | "/app.css")
         {
             self.auth.check_host(request)
+        } else if request.target == EXCHANGE {
+            self.auth.check_exchange(request)
         } else {
-            self.auth.check(request)
+            self.auth.check(request).map(|_| ())
+        }
+    }
+
+    /// Record what read-only routes need from a full Runtime resolution.
+    fn observe_runtime(
+        &self,
+        snapshot: &tirith_core::policy_snapshot::EffectivePolicySnapshot,
+        patterns: &[String],
+    ) {
+        if let Ok(mut runtime) = self.runtime_patterns.lock() {
+            for pattern in patterns
+                .iter()
+                .chain(snapshot.policy.dlp_custom_patterns.iter())
+            {
+                if !runtime.patterns.contains(pattern) {
+                    runtime.patterns.push(pattern.clone());
+                }
+            }
+            runtime.refresh_interval_hours = Some(snapshot.policy.threat_intel.auto_update_hours);
+            runtime.resolved = true;
+        }
+        self.runtime_resolved.notify_all();
+    }
+
+    /// Runtime DLP patterns and ThreatDB interval for a read-only response,
+    /// after the startup resolution finished (or its bounded wait passed).
+    fn runtime_view(&self) -> (Vec<String>, Option<u64>) {
+        let Ok(guard) = self.runtime_patterns.lock() else {
+            return (Vec::new(), None);
+        };
+        match self
+            .runtime_resolved
+            .wait_timeout_while(guard, RUNTIME_PATTERNS_WAIT, |runtime| !runtime.resolved)
+        {
+            Ok((mut runtime, _)) => {
+                // Wait at most once: later reads use whatever is known.
+                runtime.resolved = true;
+                (runtime.patterns.clone(), runtime.refresh_interval_hours)
+            }
+            Err(_) => (Vec::new(), None),
+        }
+    }
+
+    /// Exchange a single-use launch code for a new browser session.
+    fn exchange(&self, request: &http::Request) -> (u16, serde_json::Value) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Exchange {
+            code: String,
+        }
+        let Ok(body) = serde_json::from_slice::<Exchange>(&request.body) else {
+            return (
+                400,
+                serde_json::json!({"error": "request does not match the endpoint schema"}),
+            );
+        };
+        if self.quiescing.load(Ordering::Acquire) {
+            return (
+                503,
+                serde_json::json!({"error": "the local service is closing; run tirith dashboard again"}),
+            );
+        }
+        let token = lifecycle::secret();
+        match self.auth.exchange(
+            &body.code,
+            token.clone(),
+            lifecycle::secret(),
+            Instant::now(),
+        ) {
+            Ok(grant) => (
+                200,
+                serde_json::json!({"schema_version": 1, "kind": "dashboard_session",
+                "token": token, "csrf": grant.csrf,
+                "expires_in_seconds": grant.expires_in.as_secs(),
+                "service_id": self.record.service_id, "version": self.record.version}),
+            ),
+            Err(error) => (error.status, serde_json::json!({"error": error.message})),
         }
     }
 
@@ -92,7 +187,11 @@ impl Service {
         if let Ok(mut activity) = self.last_activity.lock() {
             *activity = Instant::now();
         }
-        let (status, result) = api::dispatch(self, &request);
+        let (status, result) = if request.method == "POST" && request.target == EXCHANGE {
+            self.exchange(&request)
+        } else {
+            api::dispatch(self, &request)
+        };
         let bytes = serde_json::to_vec(&result)
             .unwrap_or_else(|_| b"{\"error\":\"response encoding failed\"}".to_vec());
         if bytes.len() > http::MAX_RESPONSE {
@@ -108,6 +207,8 @@ impl Service {
     }
 }
 
+const EXCHANGE: &str = "/api/session/exchange";
+
 /// A service identity is public routing context, never a bearer credential.
 pub(crate) fn parse_required_service_id(value: &str) -> Result<String, String> {
     let id = uuid::Uuid::parse_str(value)
@@ -119,16 +220,22 @@ pub(crate) fn parse_required_service_id(value: &str) -> Result<String, String> {
 }
 
 pub(crate) fn open(no_browser: bool, json: bool, required_service_id: Option<&str>) -> i32 {
-    match lifecycle::launch(required_service_id) {
-        Ok(record) => {
-            let url = record.browser_url();
+    match lifecycle::launch(required_service_id).and_then(|record| {
+        // The URL carries only a fresh single-use code, never the service
+        // credential: browser launchers expose their arguments to other users.
+        let url = lifecycle::sign_in_url(&record)?;
+        Ok((record, url))
+    }) {
+        Ok((record, url)) => {
             let browser_opened = !no_browser && lifecycle::open_browser(&url).is_ok();
             if json {
                 if !super::write_json_stdout(
                     &serde_json::json!({"schema_version": 1,
                     "kind": "dashboard_launch", "url": url, "browser_opened": browser_opened,
                     "service_id": record.service_id, "version": record.version,
-                    "authorization": "private_fragment", "protection_changed": false}),
+                    "authorization": "private_fragment", "single_use_code": true,
+                    "code_expires_in_seconds": http::CODE_TTL.as_secs(),
+                    "protection_changed": false}),
                     "tirith dashboard: failed to write launch result",
                 ) {
                     return 1;
@@ -137,6 +244,12 @@ pub(crate) fn open(no_browser: bool, json: bool, required_service_id: Option<&st
                 println!("Tirith dashboard: {url}");
                 if !browser_opened && !no_browser {
                     eprintln!("The browser did not open; use the local URL above.");
+                }
+                if !browser_opened {
+                    eprintln!(
+                        "The link signs in once and expires in {} minutes; run tirith dashboard again for a new one.",
+                        http::CODE_TTL.as_secs() / 60
+                    );
                 }
             }
             0
@@ -188,19 +301,19 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
         let history_path =
             tirith_core::audit::audit_log_path().ok_or("audit log location unavailable")?;
         let service = Arc::new(Service {
-            auth: http::Authorization {
-                host: format!("127.0.0.1:{port}"),
-                origin: format!("http://127.0.0.1:{port}"),
-                token: record.token.clone(),
-                csrf: lifecycle::secret(),
-                issued: Instant::now(),
-                lifetime: SESSION_TTL,
-            },
+            auth: http::Authorization::new(
+                port,
+                record.token.clone(),
+                lifecycle::secret(),
+                Instant::now(),
+            ),
             history: Mutex::new(HistoryReader::new(history_path.clone())),
             aggregate: Mutex::new(tirith_core::history_aggregate::HistoryAggregate::new(
                 history_path,
             )),
             last_activity: Mutex::new(Instant::now()),
+            runtime_patterns: Mutex::new(RuntimePatterns::default()),
+            runtime_resolved: Condvar::new(),
             admission: Mutex::new(()),
             quiescing: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
@@ -210,6 +323,27 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
             project_anchor,
             project_anchor_path,
         });
+        {
+            // One full Runtime resolution (it may contact a remote policy
+            // server) off the accept loop, so reads redact with its patterns.
+            let worker = Arc::clone(&service);
+            let spawned = std::thread::Builder::new()
+                .name("tirith-control-policy".into())
+                .spawn(move || {
+                    let _capture = tirith_core::policy::PolicyDiagnosticCapture::start_silent();
+                    let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+                        Some(&worker.record.cwd),
+                        tirith_core::policy_snapshot::ResolutionMode::Runtime,
+                    );
+                    let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(
+                        &snapshot.policy.dlp_custom_patterns,
+                    );
+                    worker.observe_runtime(&snapshot, &patterns);
+                });
+            if spawned.is_err() {
+                return Err("cannot start the dashboard policy reader".into());
+            }
+        }
         paths.publish(&service.record, &service.directory_identity)?;
         let mut last_identity_check = Instant::now();
         loop {
@@ -218,7 +352,7 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
                 .lock()
                 .map(|last| last.elapsed() >= IDLE_TTL)
                 .unwrap_or(true);
-            let expired = service.auth.issued.elapsed() >= SESSION_TTL;
+            let expired = service.auth.expired(Instant::now());
             // Writes revalidate identity synchronously at admission. Idle
             // detection need not stat/hash the process and ancestors ten
             // times per second while the dashboard is untouched.
@@ -242,7 +376,9 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
             }
             match listener.accept() {
                 Ok((stream, peer)) => {
-                    if !peer.ip().is_loopback() {
+                    // Another account's process is refused before it can take
+                    // a connection slot, where the platform can tell.
+                    if !peer.ip().is_loopback() || !peer::same_user(&stream) {
                         continue;
                     }
                     if service

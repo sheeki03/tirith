@@ -118,10 +118,12 @@ class OwnedDiscovery(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe"): self.read()
     def test_launcher_requires_exact_owned_reuse_without_side_effects(self):
         launch = {"kind": "dashboard_launch", "service_id": self.record["service_id"],
-                  "url": f"http://127.0.0.1:32123/#token={'d' * 64}",
+                  "url": f"http://127.0.0.1:32123/#code={'e' * 64}",
                   "browser_opened": False, "protection_changed": False}
         module.verify_launch(launch, self.record)
         for field, value in [("service_id", "other"), ("url", "http://127.0.0.1:9/#token=secret"),
+                             ("url", f"http://127.0.0.1:32123/#token={'d' * 64}"),
+                             ("url", f"http://127.0.0.1:32123/#code={'d' * 64}"),
                              ("browser_opened", True), ("protection_changed", True)]:
             bad = {**launch, field: value}
             with self.assertRaises(ValueError): module.verify_launch(bad, self.record)
@@ -282,7 +284,7 @@ class CompleteProducerFailurePaths(unittest.TestCase):
                     if stage == "launcher_exit_race":
                         jobs[0].process.poll = lambda: 0
                 value = {"kind": "dashboard_launch", "service_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                         "url": f"http://127.0.0.1:32123/#token={'d' * 64}", "browser_opened": False, "protection_changed": False}
+                         "url": f"http://127.0.0.1:32123/#code={'e' * 64}", "browser_opened": False, "protection_changed": False}
                 if launch and stage == "launch": value["url"] = "private-token"
                 return SimpleNamespace(returncode=0, stdout=json.dumps(value if launch else {}).encode(), stderr=b"")
             def request(origin, token, csrf, route, body=None, timeout=40):

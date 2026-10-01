@@ -43,7 +43,7 @@ qualification remains tracked separately.
 | `tirith status` | "Am I protected?": protection mode, hook health, whether this terminal's loaded hook is current, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
 | `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a static shell/terminal report, `--quick` is a pollable snapshot, and `--verify-shell` gives the actual caller-shell challenge. Use `--bundle --bundle-preview` to review selected diagnostics before private export (`--bundle-incident`, `--bundle-operation`) |
 | `tirith prompt-status` | One-line protection and active-context indicator for your prompt (`--short`, `--json`; 30s cache) |
-| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review, copyable upgrade commands and a guarded ThreatDB refresh (`--no-browser --json` for headless access); `export` retains the static report route |
+| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review, copyable upgrade commands and a guarded ThreatDB refresh (`--no-browser --json` for headless access; each printed URL signs in once and expires after 2 minutes); `export` retains the static report route |
 | `tirith warnings` | Session warnings (`--summary` for shell exit hooks, `--clear`, `--format json`) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith logs {scan,summarize,redact}` | Review agent / CLI logs for injection seeds, secrets, and escape bytes (`summarize --safe-for-agent`) |

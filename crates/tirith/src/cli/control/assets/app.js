@@ -5,9 +5,11 @@
   const dialog = document.querySelector('#operation-dialog');
   const operationContent = document.querySelector('#operation-content');
   const operationActions = document.querySelector('#operation-actions');
-  const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  // The launch URL carries a single-use sign-in code; it is exchanged once for
+  // this tab's session and removed from the address bar and history.
+  const code = new URLSearchParams(location.hash.slice(1)).get('code') || '';
   history.replaceState(null, '', location.pathname);
-  let csrf = '', currentPage = 'overview', generation = 0, dialogGeneration = 0, activeOperation = null, pollTimer = null, pendingPlan = null, planRequest = null, threatDbRefresh = null;
+  let token = '', csrf = '', currentPage = 'overview', generation = 0, dialogGeneration = 0, activeOperation = null, pollTimer = null, pendingPlan = null, planRequest = null, threatDbRefresh = null;
   const pages = {
     overview: ['Overview', 'Protection evidence from this computer.'],
     activity: ['Activity', 'Recorded checks and interruptions, with the limits of the available history.'],
@@ -769,9 +771,17 @@
   for (const node of document.querySelectorAll('[data-page]')) node.addEventListener('click', () => navigate(node.dataset.page));
   document.querySelector('.brand').addEventListener('click', event => { event.preventDefault(); navigate('overview'); });
   document.querySelector('#refresh').addEventListener('click', () => navigate(currentPage));
+  async function signIn() {
+    const response = await fetch('/api/session/exchange', { method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.error || 'This dashboard link was already used or has expired. Run tirith dashboard again.');
+    token = value.token; csrf = value.csrf;
+    return value;
+  }
   async function start() {
-    if (!/^[a-f0-9]{64}$/i.test(token)) throw new Error('Open this dashboard with tirith dashboard. The private session token is missing; it is never requested from another website.');
-    const session = await api('/api/session'); csrf = session.csrf;
+    if (!/^[a-f0-9]{64}$/i.test(code)) throw new Error('Open this dashboard with tirith dashboard. Each link signs in once; it is never requested from another website.');
+    const session = await signIn();
     document.querySelector('#session-state').textContent = `Local service ${session.version} · session expires in ${Math.floor(session.expires_in_seconds / 60)} minutes`;
     await navigate('overview');
   }

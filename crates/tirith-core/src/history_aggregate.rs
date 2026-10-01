@@ -69,6 +69,11 @@ pub struct AggregateReport {
     pub semantics: &'static str,
 }
 
+const AGGREGATE_PAGE_RECORDS: usize = 500;
+/// Bounds one refresh (each page reads at most 2 MiB) while still covering a
+/// whole 2 MiB suffix of ordinary-sized records.
+const MAX_PAGES_PER_REFRESH: usize = 64;
+
 /// This cache intentionally has no serialization API. It can be rebuilt from
 /// the log after restart without duplicating command/secret material on disk.
 pub struct HistoryAggregate {
@@ -118,7 +123,7 @@ impl HistoryAggregate {
         *self = Self::new(self.path.clone());
     }
 
-    /// One bounded page (at most 2 MiB / 500 returned records) per refresh.
+    /// Bounded pages (at most 2 MiB / 500 records each, 64 pages) per refresh.
     /// UTC calendar windows are explicit; clock rollback, window changes and
     /// newly eligible future-dated records rebuild rather than miscounting.
     pub fn refresh(
@@ -142,45 +147,66 @@ impl HistoryAggregate {
         }
         self.window = Some((end, days));
         self.last_time = Some(now);
-        let page = self.reader.query(
-            self.cursor.as_deref(),
-            HistoryFilter::default(),
-            500,
-            logging_enabled,
-        )?;
-        if page.availability == Availability::RefreshRequired
-            || matches!(
-                page.availability,
-                Availability::Absent | Availability::Unreadable | Availability::Disabled
-            )
-        {
-            self.reset();
-            self.window = Some((end, days));
-            self.last_time = Some(now);
-            replace = true;
-        } else if self
-            .source_generation
-            .as_ref()
-            .is_some_and(|generation| generation != &page.generation)
-        {
-            // This page and its cursor belong to the live reader. Retain that
-            // reader while discarding aggregates from the previous source.
-            let reader = std::mem::replace(&mut self.reader, HistoryReader::new(self.path.clone()));
-            self.reset();
-            self.reader = reader;
-            self.window = Some((end, days));
-            self.last_time = Some(now);
-            replace = true;
-        }
-        self.source_generation = Some(page.generation.clone());
-        if page.availability != Availability::RefreshRequired {
-            self.cursor = page.next_cursor.clone();
-            self.malformed = self.malformed.saturating_add(page.malformed_lines as u64);
-            self.oversized = self.oversized.saturating_add(page.oversized_lines as u64);
-            for event in &page.events {
-                self.observe(event, start, now);
+        // Catch up to the end of the log in this refresh. One page holds at
+        // most 500 records; stopping after it would show the oldest records of
+        // the suffix and leave the newest ones for later refreshes.
+        let mut pages = 0;
+        let mut inspected = 0u64;
+        let mut earlier_uninspected = false;
+        let page = loop {
+            let page = self.reader.query(
+                self.cursor.as_deref(),
+                HistoryFilter::default(),
+                AGGREGATE_PAGE_RECORDS,
+                logging_enabled,
+            )?;
+            pages += 1;
+            inspected = inspected.saturating_add(page.inspected_bytes);
+            if page.availability == Availability::RefreshRequired
+                || matches!(
+                    page.availability,
+                    Availability::Absent | Availability::Unreadable | Availability::Disabled
+                )
+            {
+                self.reset();
+                self.window = Some((end, days));
+                self.last_time = Some(now);
+                replace = true;
+            } else if self
+                .source_generation
+                .as_ref()
+                .is_some_and(|generation| generation != &page.generation)
+            {
+                // This page and its cursor belong to the live reader. Retain that
+                // reader while discarding aggregates from the previous source.
+                let reader =
+                    std::mem::replace(&mut self.reader, HistoryReader::new(self.path.clone()));
+                self.reset();
+                self.reader = reader;
+                self.window = Some((end, days));
+                self.last_time = Some(now);
+                replace = true;
             }
-        }
+            self.source_generation = Some(page.generation.clone());
+            if page.availability != Availability::RefreshRequired {
+                self.cursor = page.next_cursor.clone();
+                self.malformed = self.malformed.saturating_add(page.malformed_lines as u64);
+                self.oversized = self.oversized.saturating_add(page.oversized_lines as u64);
+                for event in &page.events {
+                    self.observe(event, start, now);
+                }
+            }
+            earlier_uninspected |= page.earlier_history_uninspected;
+            // A short page reached the end of its byte window (or an
+            // unfinished last line); only a full page can have more after it.
+            if page.availability == Availability::RefreshRequired
+                || !page.more_available
+                || page.events.len() < AGGREGATE_PAGE_RECORDS
+                || pages >= MAX_PAGES_PER_REFRESH
+            {
+                break page;
+            }
+        };
         let mut rules: Vec<_> = self.rules.values().cloned().collect();
         rules.sort_by(|a, b| {
             b.interruptions
@@ -215,9 +241,9 @@ impl HistoryAggregate {
             malformed_lines: self.malformed,
             oversized_lines: self.oversized,
             incomplete_tail: page.incomplete_tail,
-            earlier_history_uninspected: page.earlier_history_uninspected,
+            earlier_history_uninspected: earlier_uninspected,
             more_available: page.more_available,
-            inspected_bytes_this_refresh: page.inspected_bytes,
+            inspected_bytes_this_refresh: inspected,
             rules,
             integrity: "not_verified_by_collector",
             semantics: "recorded_checks_not_confirmed_execution_or_prevented_attacks",
@@ -366,6 +392,31 @@ mod tests {
             serde_json::json!({"timestamp":timestamp,"action":action,"entry_type":kind,"command_redacted":"private fixture","rule_ids":["curl_pipe_shell","curl_pipe_shell"],"bypass_requested":true,"bypass_honored":false})
         )
     }
+    #[test]
+    fn first_refresh_counts_the_newest_records_not_only_the_oldest_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("log");
+        // More than one 500-record page: 550 allowed checks, then the newest
+        // 100 checks are blocks. A first refresh must observe the newest
+        // records instead of stopping after the oldest page of the suffix.
+        let mut log = String::new();
+        for _ in 0..550 {
+            log.push_str(&line("2026-09-12T00:00:00Z", "Allow", "verdict"));
+        }
+        for _ in 0..100 {
+            log.push_str(&line("2026-09-12T00:05:00Z", "Block", "verdict"));
+        }
+        std::fs::write(&path, log).unwrap();
+        let mut cache = HistoryAggregate::new(path.clone());
+        let first = cache.refresh(now(), 7, true).unwrap();
+        assert_eq!(first.counts.recorded_checks, 650);
+        assert_eq!(first.counts.blocked_checks, 100);
+        assert!(!first.more_available);
+        let retry = cache.refresh(now(), 7, true).unwrap();
+        assert_eq!(retry.counts.recorded_checks, 650);
+        assert!(!retry.replace_previous);
+    }
+
     #[test]
     fn append_refresh_and_non_verdict_records_do_not_double_count_checks() {
         let temp = tempfile::tempdir().unwrap();

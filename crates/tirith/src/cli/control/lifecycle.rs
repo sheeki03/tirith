@@ -67,10 +67,6 @@ impl ServiceRecord {
         })
     }
 
-    pub fn browser_url(&self) -> String {
-        format!("http://127.0.0.1:{}/#token={}", self.port, self.token)
-    }
-
     fn validate(&self) -> Result<(), String> {
         if self.port == 0
             || self.token.len() != 64
@@ -268,6 +264,68 @@ pub(crate) fn quiesce_for_update() -> Result<ServiceUpdateGuard, String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn is_secret(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Ask the running service for a fresh single-use sign-in code and build the
+/// browser URL from it. The reusable service credential never leaves the
+/// private record; the URL is safe to pass to a browser launcher.
+pub(super) fn sign_in_url(record: &ServiceRecord) -> Result<String, String> {
+    let failed = "cannot obtain a dashboard sign-in code; retry";
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|_| failed)?;
+    let origin = format!("http://127.0.0.1:{}", record.port);
+    let read = |response: reqwest::blocking::Response| -> Result<serde_json::Value, String> {
+        if !response.status().is_success() {
+            return Err(failed.into());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| failed)?;
+        if bytes.len() > 16 * 1024 {
+            return Err(failed.into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| failed.into())
+    };
+    let session = read(
+        client
+            .get(format!("{origin}/api/session"))
+            .bearer_auth(&record.token)
+            .send()
+            .map_err(|_| failed)?,
+    )?;
+    if session["service_id"] != record.service_id || session["quiescing"] != false {
+        return Err("the dashboard service changed or is closing; retry".into());
+    }
+    let csrf = session["csrf"]
+        .as_str()
+        .filter(|value| is_secret(value))
+        .ok_or(failed)?;
+    let issued = read(
+        client
+            .post(format!("{origin}/api/session/code"))
+            .bearer_auth(&record.token)
+            .header("Origin", &origin)
+            .header("X-Tirith-CSRF", csrf)
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .map_err(|_| failed)?,
+    )?;
+    let code = issued["code"]
+        .as_str()
+        .filter(|value| is_secret(value))
+        .ok_or(failed)?;
+    Ok(format!("{origin}/#code={code}"))
 }
 
 fn probe(record: &ServiceRecord) -> Result<bool, String> {

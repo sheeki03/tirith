@@ -76,8 +76,9 @@ fn preview_with_snapshot(
     } else {
         let path =
             tirith_core::audit::audit_log_path().ok_or("audit history location is unavailable")?;
-        Some(HistoryReader::new(path).query(
-            None,
+        // Newest records first: a selected incident is usually recent, and a
+        // forward read of the suffix would stop after its oldest 500 records.
+        Some(HistoryReader::new(path).recent(
             HistoryFilter::default(),
             500,
             std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
