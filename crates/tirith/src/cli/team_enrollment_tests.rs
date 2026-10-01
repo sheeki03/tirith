@@ -505,3 +505,81 @@ mod native {
         assert!(!parent.join("report.json").exists());
     }
 }
+
+mod background_refresh {
+    use super::*;
+
+    #[test]
+    fn background_refresh_is_claimed_at_most_once_per_interval() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let state = tirith_core::policy::state_dir().unwrap();
+        let now = 10 * REFRESH_CLAIM_INTERVAL_MS;
+        assert!(claim_background_refresh(&state, now));
+        assert!(!claim_background_refresh(&state, now));
+        assert!(!claim_background_refresh(
+            &state,
+            now + REFRESH_CLAIM_INTERVAL_MS - 1
+        ));
+        assert!(claim_background_refresh(
+            &state,
+            now + REFRESH_CLAIM_INTERVAL_MS
+        ));
+        // A clock that moved backwards cannot suppress refresh indefinitely.
+        assert!(claim_background_refresh(&state, now));
+        // Another process holding the claim lock means no claim here.
+        #[cfg(unix)]
+        {
+            let _held = crate::cli::setup::fs_helpers::try_lock_operation(
+                &state.join(REFRESH_CLAIM_LOCK),
+                &state,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!claim_background_refresh(
+                &state,
+                now + 5 * REFRESH_CLAIM_INTERVAL_MS
+            ));
+        }
+    }
+
+    #[test]
+    fn offline_mode_and_missing_enrollment_never_claim_or_spawn() {
+        let mut guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let state = tirith_core::policy::state_dir().unwrap();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        maybe_background_refresh(false);
+        assert!(!state.join(REFRESH_CLAIM_FILE).exists());
+        // Not enrolled: nothing is due, so nothing is claimed.
+        assert!(TeamEnrollment::background_refresh_target(now_ms().unwrap()).is_none());
+    }
+
+    #[test]
+    fn background_child_arguments_parse_as_a_hidden_exact_sync() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            action: Action,
+        }
+        let (connection, activation) = (Id::new(), Id::new());
+        let args = background_sync_args(&connection, &activation);
+        assert_eq!(&args[..4], ["policy", "team", "enrollment", "sync"]);
+        let parsed = Harness::try_parse_from(
+            std::iter::once("enrollment".to_string()).chain(args[3..].iter().cloned()),
+        )
+        .unwrap();
+        match parsed.action {
+            Action::Sync {
+                options,
+                background,
+                json,
+            } => {
+                assert!(background);
+                assert!(!json);
+                assert_eq!(options.expected_connection_id, connection.as_str());
+                assert_eq!(options.expected_activation_id, activation.as_str());
+            }
+            _ => panic!("background child must run the exact sync action"),
+        }
+    }
+}

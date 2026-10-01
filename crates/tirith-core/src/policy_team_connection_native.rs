@@ -193,14 +193,19 @@ impl HeldPath {
         }
         Ok(file)
     }
-    pub(super) fn private_identity(&self) -> Vec<(u64, u64)> {
-        self.dirs.iter().map(|x| x.2).collect()
-    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Facts {
     generation: FileGeneration,
     security: Vec<u8>,
+}
+impl Facts {
+    /// The file's index within its volume (Unix inode, Windows file index).
+    /// Unlike the full generation it survives `touch`, `chmod` and a reboot
+    /// that renumbers devices; a replacement file gets a new index.
+    pub(super) fn file_index(&self) -> u64 {
+        self.generation.identity.1
+    }
 }
 pub(super) fn facts(file: &File, private: bool) -> Result<Facts, E> {
     platform::validate(file, false, private, false).map_err(|_| E::UnsafeStorage)?;

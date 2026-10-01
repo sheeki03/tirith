@@ -297,17 +297,27 @@ impl ConnectionWitness {
         self.input.revalidate()
     }
     /// Private cache/review binding, not a public hash or authorization token.
+    ///
+    /// It is persisted in the enrollment record, so it binds only facts that
+    /// stay stable while the selection is unchanged: the configuration scope,
+    /// the exact record bytes and the file's own index (a replacement file is a
+    /// new selection). Timestamps, permission bits and device numbers are not
+    /// bound: `touch`, `chmod` or a reboot that renumbers a filesystem must not
+    /// invalidate an enrollment. Live retained-handle checks still use the full
+    /// native generation through [`Self::revalidate`].
     pub fn private_selection_commitment(&self) -> Result<PrivateCommitment, ConnectionError> {
         self.revalidate()?;
         let bytes = serde_json::to_vec(&(
             self.scope.to_str().ok_or(ConnectionError::UnsafeStorage)?,
-            self.input.parents.private_identity(),
-            format!("{:?}", self.input.generation),
+            self.input
+                .generation
+                .as_ref()
+                .map(native::Facts::file_index),
             self.input.bytes.as_deref(),
         ))
         .map_err(|_| ConnectionError::InvalidInput)?;
         Ok(PrivateCommitment::of(
-            "tirith.team.selected-connection.v1",
+            "tirith.team.selected-connection.v2",
             &bytes,
         ))
     }

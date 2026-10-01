@@ -4,6 +4,8 @@
 use super::setup::{self, fs_helpers::FileUpdate, TransactionOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tirith_core::policy::{BoundedRuntimePolicyInputs, PolicyDiagnosticCapture};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
@@ -110,6 +112,9 @@ pub enum Action {
         options: SelectedRequest,
         #[arg(long)]
         json: bool,
+        /// Internal: quiet single-flight sync started by `tirith check`
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Withdraw the exact activation offline, even when its cache is stale
     Disable {
@@ -956,7 +961,125 @@ fn report_result(
         "local_write":local,"failure_code":failure,"execution_permitted":false,"notice":REPORT_NOTICE})
 }
 
+/// A background refresh is claimed at most once per this interval, whatever
+/// its outcome, so an unreachable server is not retried on every command.
+const REFRESH_CLAIM_INTERVAL_MS: u64 = 15 * 60 * 1000;
+const REFRESH_CLAIM_LOCK: &str = "team-policy-refresh.lock";
+const REFRESH_CLAIM_FILE: &str = "team-policy-refresh-claimed-at";
+const REFRESH_SYNC_LOCK: &str = "team-policy-sync.lock";
+static REFRESH_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// Called from `tirith check`. When the enrolled team cache is an hour old,
+/// start a detached `enrollment sync --background` child and return at once:
+/// the command never waits for the network. Offline mode, no enrollment, a
+/// recent claim or a busy claim lock all make this a no-op.
+pub(crate) fn maybe_background_refresh(offline_flag: bool) {
+    if offline_flag || super::offline_env_active() {
+        return;
+    }
+    if REFRESH_ATTEMPTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(now) = now_ms() else { return };
+    let Some(target) = TeamEnrollment::background_refresh_target(now) else {
+        return;
+    };
+    let Some(state) = tirith_core::policy::state_dir() else {
+        return;
+    };
+    if !claim_background_refresh(&state, now) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(background_sync_args(
+            target.connection_id(),
+            target.activation_id(),
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Composition checks use the home directory, not whichever repository
+    // the triggering command ran in.
+    if let Some(home) = home::home_dir() {
+        command.current_dir(home);
+    }
+    let _ = command.spawn();
+}
+
+fn background_sync_args(connection: &Id, activation: &Id) -> Vec<String> {
+    [
+        "policy",
+        "team",
+        "enrollment",
+        "sync",
+        "--background",
+        "--expected-connection-id",
+        connection.as_str(),
+        "--expected-activation-id",
+        activation.as_str(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Rate limit shared by every process of this user: under a non-blocking
+/// lock, grant a claim only when none was granted in the last interval.
+fn claim_background_refresh(state: &Path, now: u64) -> bool {
+    use super::setup::fs_helpers::{ensure_private_directory, try_lock_operation};
+    if !state.exists() && ensure_private_directory(state, state).is_err() {
+        return false;
+    }
+    let Ok(Some(_lock)) = try_lock_operation(&state.join(REFRESH_CLAIM_LOCK), state) else {
+        return false;
+    };
+    let claim = state.join(REFRESH_CLAIM_FILE);
+    if std::fs::symlink_metadata(&claim).is_ok_and(|m| !m.is_file()) {
+        return false;
+    }
+    let last = std::fs::read_to_string(&claim)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    // A claim from the future (clock moved back) does not suppress refresh.
+    if last.is_some_and(|last| last <= now && now - last < REFRESH_CLAIM_INTERVAL_MS) {
+        return false;
+    }
+    std::fs::write(&claim, now.to_string()).is_ok()
+}
+
+/// The detached child: one sync at a time, no output. The sync itself is the
+/// explicit compare-and-swap path, so it cannot recreate a withdrawn
+/// activation or rebind a changed connection.
+fn run_background_sync(options: SelectedRequest) -> i32 {
+    let Some(state) = tirith_core::policy::state_dir() else {
+        return 1;
+    };
+    let _lock = match super::setup::fs_helpers::try_lock_operation(
+        &state.join(REFRESH_SYNC_LOCK),
+        &state,
+    ) {
+        Ok(Some(lock)) => lock,
+        _ => return 0,
+    };
+    let _diagnostics = PolicyDiagnosticCapture::start_silent();
+    match TeamEnrollmentService::capture(None).and_then(|service| service.sync(options)) {
+        Ok(value) if value.get("saved_bytes_confirmed") == Some(&Value::Bool(true)) => 0,
+        _ => 1,
+    }
+}
+
 pub(crate) fn run(action: Action) -> i32 {
+    if let Action::Sync {
+        options,
+        background: true,
+        ..
+    } = action
+    {
+        return run_background_sync(options);
+    }
     let json_output = match &action {
         Action::Repair { json, .. }
         | Action::Abandon { json, .. }

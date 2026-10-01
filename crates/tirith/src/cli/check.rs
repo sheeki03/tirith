@@ -250,6 +250,9 @@ pub fn run(
     // Must run before any early return so hooks calling `--approval-check` still
     // trigger updates. `--offline`/`TIRITH_OFFLINE` makes this a guaranteed no-op.
     crate::cli::threatdb_cmd::maybe_background_update(offline);
+    // Same contract for an enrolled team policy cache: a detached, rate-limited
+    // sync child; this command never waits for the team server.
+    crate::cli::team_enrollment::maybe_background_refresh(offline);
 
     let session_id = tirith_core::session::resolve_session_id();
 

@@ -208,6 +208,64 @@ macro_rules! policy_diagnostic {
     };
 }
 
+/// Team-policy notices print once per process on stderr (a command may resolve
+/// policy several times). An explicit capture always receives them.
+fn emit_team_policy_diagnostic(message: String) {
+    let captured = POLICY_DIAGNOSTIC_CAPTURES.with(|captures| !captures.borrow().is_empty());
+    if !captured {
+        static EMITTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut emitted = EMITTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if emitted.contains(&message) {
+            return;
+        }
+        if emitted.len() < 16 {
+            emitted.push(message.clone());
+        }
+    }
+    policy_diagnostic!("{message}");
+}
+
+const TEAM_SYNC_HINT: &str = "Run `tirith policy team enrollment status` for the IDs, then `tirith policy team enrollment sync --expected-connection-id ID --expected-activation-id ID`";
+const TEAM_DISABLE_HINT: &str =
+    "`tirith policy team enrollment disable --expected-activation-id ID` (works offline)";
+
+fn team_enrollment_refusal_message(
+    error: crate::policy_team_enrollment::EnrollmentError,
+) -> String {
+    use crate::policy_team_enrollment::EnrollmentError as E;
+    let next = match error {
+        E::StaleCache => format!(
+            "The team policy server could not be reached for longer than the offline grace period. Reconnect, then: {TEAM_SYNC_HINT}. To leave team policy instead: {TEAM_DISABLE_HINT}."
+        ),
+        E::ChangedConnection => format!(
+            "The selected team connection changed after activation. Re-activate with `tirith policy team enrollment activate`, or leave team policy with {TEAM_DISABLE_HINT}."
+        ),
+        E::InvalidRecord => "Repair it with `tirith policy team enrollment repair --remove-malformed`.".to_string(),
+        _ => format!(
+            "Run `tirith policy team enrollment status` for details; {TEAM_SYNC_HINT}, or leave team policy with {TEAM_DISABLE_HINT}."
+        ),
+    };
+    format!(
+        "tirith: team policy is enrolled but unusable ({error}); every command is blocked (fail closed). {next}"
+    )
+}
+
+fn team_authority_conflict(what: String) -> crate::policy_team::ErrorCode {
+    emit_team_policy_diagnostic(format!(
+        "tirith: team policy is blocked: this device is enrolled in team policy and {what}. Two policy authorities have no defined precedence, so every command is blocked (fail closed). Keep one authority: {} or leave team policy with {TEAM_DISABLE_HINT}.",
+        if what.starts_with("TIRITH_SERVER_URL") {
+            "unset TIRITH_SERVER_URL and TIRITH_API_KEY in this environment,"
+        } else if what.contains("organization") {
+            "ask the organization operator to remove the organization policy,"
+        } else {
+            "remove policy_server_url and policy_server_api_key from that file,"
+        }
+    ));
+    crate::policy_team::ErrorCode::Forbidden
+}
+
 /// A named scan profile for reusable filter configurations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanProfile {
@@ -487,6 +545,14 @@ pub struct Policy {
     /// Whether to enforce the fetch fail mode strictly (ignore local fallback on auth errors).
     #[serde(default)]
     pub enforce_fail_mode: Option<bool>,
+
+    /// Team policy only: hours an enrolled device keeps enforcing this team
+    /// policy after its 24 hour cache has expired and could not be refreshed
+    /// (default 72, maximum 720, 0 = fail closed at 24 hours). Read only from
+    /// the team authority's own document; local and repository values have no
+    /// effect (a repository value is reset like other weakening fields).
+    #[serde(default)]
+    pub team_offline_grace_hours: Option<u32>,
 
     /// Threat intelligence configuration.
     #[serde(default)]
@@ -1429,6 +1495,7 @@ impl Default for Policy {
             policy_server_api_key: None,
             policy_fetch_fail_mode: None,
             enforce_fail_mode: None,
+            team_offline_grace_hours: None,
             threat_intel: ThreatIntelConfig::default(),
             package_policy: PackagePolicy::default(),
             agent_rules: AgentRules::default(),
@@ -1739,6 +1806,7 @@ impl Policy {
             Ok(enrollment) => {
                 snapshot::observe_team_runtime(enrollment.clone());
                 if let Some(document) = enrollment.document() {
+                    let cache_age = enrollment.cache_age();
                     let policy = match Self::team_document_baseline(document, cwd) {
                         Ok(policy) => policy,
                         Err(_) => {
@@ -1754,21 +1822,53 @@ impl Policy {
                         );
                         return Self::fail_closed_policy();
                     }
+                    let fetched_unix_ms = enrollment
+                        .evidence()
+                        .map(|evidence| evidence.fetched_unix_ms());
+                    let age_seconds = fetched_unix_ms.and_then(|fetched| {
+                        u64::try_from(chrono::Utc::now().timestamp_millis())
+                            .ok()
+                            .and_then(|now| now.checked_sub(fetched))
+                            .map(|age| age / 1000)
+                    });
+                    let in_grace = matches!(
+                        cache_age,
+                        Some(crate::policy_team_enrollment::CacheAge::Grace { .. })
+                    );
                     snapshot::observe_remote(|remote| {
                         remote.availability = "team_enrolled_cache".into();
-                        remote.freshness =
-                            "bounded_offline_cache_server_currentness_unknown".into();
-                        remote.fetched_at = enrollment.evidence().and_then(|evidence| {
-                            i64::try_from(evidence.fetched_unix_ms())
+                        remote.freshness = if in_grace {
+                            "team_cache_grace_period".into()
+                        } else {
+                            "bounded_offline_cache_server_currentness_unknown".into()
+                        };
+                        remote.cache_age_seconds = age_seconds;
+                        remote.fetched_at = fetched_unix_ms.and_then(|fetched| {
+                            i64::try_from(fetched)
                                 .ok()
                                 .and_then(chrono::DateTime::from_timestamp_millis)
                                 .map(|time| time.to_rfc3339())
                         });
                     });
+                    if let Some(crate::policy_team_enrollment::CacheAge::Grace {
+                        expires_unix_ms,
+                    }) = cache_age
+                    {
+                        let until = i64::try_from(expires_unix_ms)
+                            .ok()
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .map(|time| time.to_rfc3339())
+                            .unwrap_or_else(|| "the end of its grace period".into());
+                        emit_team_policy_diagnostic(format!(
+                            "tirith: warning: team policy cache is {} hours old and could not be refreshed; enforcing the last-known-good team policy until {until}, after which every command is blocked (fail closed). A background refresh runs automatically when the team server is reachable. {TEAM_SYNC_HINT}.",
+                            age_seconds.unwrap_or(0) / 3600
+                        ));
+                    }
                     return policy;
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                emit_team_policy_diagnostic(team_enrollment_refusal_message(error));
                 snapshot::observe_team_runtime_refusal("enrollment_unavailable");
                 return Self::fail_closed_policy();
             }
@@ -2109,11 +2209,11 @@ impl Policy {
         let trusted = discover_trusted_local_policy_path_scoped();
         // A second managed authority has no defined precedence. Keep the
         // existing organization authority until its operator migrates it.
-        if trusted
-            .as_ref()
-            .is_some_and(|(_, scope)| *scope == PolicyScope::Org)
-        {
-            return Err(crate::policy_team::ErrorCode::Forbidden);
+        if let Some((path, PolicyScope::Org)) = &trusted {
+            return Err(team_authority_conflict(format!(
+                "also has an organization policy ({})",
+                path.display()
+            )));
         }
         // Refuse a competing legacy authority without a request or cache read.
         // Inspect the currently selected trusted local baseline, not repository
@@ -2136,10 +2236,19 @@ impl Policy {
         let env_key = snapshot::observe_env("TIRITH_API_KEY")
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty());
-        if (local_url.is_some() && (local_key.is_some() || env_key.is_some()))
-            || (env_url.is_some() && env_key.is_some())
-        {
-            return Err(crate::policy_team::ErrorCode::Forbidden);
+        if env_url.is_some() && env_key.is_some() {
+            return Err(team_authority_conflict(
+                "TIRITH_SERVER_URL and TIRITH_API_KEY are both set (a legacy policy server)".into(),
+            ));
+        }
+        if local_url.is_some() && (local_key.is_some() || env_key.is_some()) {
+            let path = trusted
+                .as_ref()
+                .map(|(path, _)| path.display().to_string())
+                .unwrap_or_default();
+            return Err(team_authority_conflict(format!(
+                "its local policy ({path}) configures a legacy policy_server_url"
+            )));
         }
         let mut policy = document.parsed_policy()?;
         policy.scope = PolicyScope::Remote;
@@ -2201,6 +2310,7 @@ impl Policy {
             policy_server_api_key: _,
             policy_fetch_fail_mode: _,
             enforce_fail_mode: _,
+            team_offline_grace_hours: _,
             threat_intel: _,
             package_policy,
             agent_rules,
@@ -2478,10 +2588,15 @@ impl Policy {
             self.policy_fetch_fail_mode.is_some()
         );
         record!("enforce_fail_mode", self.enforce_fail_mode.is_some());
+        record!(
+            "team_offline_grace_hours",
+            self.team_offline_grace_hours.is_some()
+        );
         self.allow_bypass_env = false;
         self.allow_bypass_env_noninteractive = false;
         self.policy_fetch_fail_mode = None;
         self.enforce_fail_mode = None;
+        self.team_offline_grace_hours = None;
 
         // Exfil / remote redirection — a repo must not be able to ship findings
         // to its own webhook or point discovery at its own policy server.
@@ -6862,6 +6977,7 @@ custom_rules:
             allow_bypass_env_noninteractive: true,
             policy_fetch_fail_mode: Some("cached".into()),
             enforce_fail_mode: Some(true),
+            team_offline_grace_hours: Some(720),
             webhooks: vec![WebhookConfig {
                 url: "https://attacker.example/exfil".into(),
                 min_severity: Severity::Info,
@@ -6991,6 +7107,7 @@ custom_rules:
             allow_bypass_env_noninteractive,
             policy_fetch_fail_mode,
             enforce_fail_mode,
+            team_offline_grace_hours,
             webhooks,
             policy_server_url,
             policy_server_api_key,
@@ -7104,6 +7221,10 @@ custom_rules:
         assert_eq!(
             enforce_fail_mode, d.enforce_fail_mode,
             "RESET: enforce_fail_mode"
+        );
+        assert_eq!(
+            team_offline_grace_hours, d.team_offline_grace_hours,
+            "RESET: team_offline_grace_hours"
         );
         assert_eq!(webhooks.len(), d.webhooks.len(), "RESET: webhooks");
         assert_eq!(

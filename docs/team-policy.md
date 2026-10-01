@@ -52,7 +52,37 @@ tirith policy team enrollment status
 tirith policy team enrollment sync --expected-connection-id CONNECTION_UUID --expected-activation-id ACTIVATION_UUID
 ```
 
-Activation and sync do not send Applied reports. The command hot path reads the enrolled local cache without contacting the team server. The cache must remain valid and less than 24 hours old. Missing, stale, changed or malformed enrolled policy fails closed; it does not silently return to personal policy. Repository restrictions and the ordinary local overlays remain part of Runtime. A competing organization or legacy remote authority requires an explicit migration instead of undefined precedence.
+Activation and sync do not send Applied reports. The command hot path reads the enrolled local cache without contacting the team server. Missing, changed or malformed enrolled policy fails closed; it does not silently return to personal policy. Repository restrictions and the ordinary local overlays remain part of Runtime.
+
+Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again.
+
+### Automatic refresh and the offline grace period
+
+You do not have to run `sync` by hand to keep the cache current:
+
+1. **Fresh (under 24 hours).** Runtime enforces the cached team policy.
+2. **Background refresh (after 1 hour).** When `tirith check` sees a cache that is at least an hour old, it starts a detached `tirith policy team enrollment sync` child and continues immediately. The command never waits for the network. At most one refresh is started per 15 minutes per user, and only one runs at a time. `--offline` and `TIRITH_OFFLINE=1` disable it. The child uses the same checks as a manual sync: it only refreshes the exact current activation and connection, so it cannot re-enable a withdrawn activation.
+3. **Grace period (24 hours to 24 hours + grace).** If no refresh has succeeded, Runtime keeps enforcing the last-known-good team policy and prints a warning on every command that says how old the cache is and when enforcement ends.
+4. **Expired (after the grace period).** Every command is blocked (fail closed) with a message that explains how to sync or leave team policy.
+
+The grace period is 72 hours by default. The team authority sets it in the published policy with `team_offline_grace_hours` (0 to 720; 0 blocks commands as soon as the cache is 24 hours old). The value is read only from the team policy document; a local or repository policy cannot extend it.
+
+```yaml
+# In the team policy you publish
+team_offline_grace_hours: 24
+```
+
+`tirith policy team enrollment status` shows the activation and connection IDs, and while the cache is usable its `fetched_unix_ms`. To refresh immediately, run `sync` as shown above.
+
+### Competing policy authorities
+
+An enrolled device refuses a second managed authority instead of guessing which one wins, and every command is blocked until one is removed. Each case prints what to change:
+
+- `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are both set: unset them in that environment. `TIRITH_SERVER_URL` on its own is not an authority and does not conflict.
+- The trusted local policy sets `policy_server_url` (with a stored or ambient API key): remove `policy_server_url` and `policy_server_api_key` from that file.
+- An organization policy is installed: the organization operator removes it.
+
+In every case you can instead leave team policy with `tirith policy team enrollment disable --expected-activation-id ACTIVATION_UUID`, which works offline. Tirith does not silently prefer the team policy over the other authority, because that authority's policy may be stricter.
 
 To turn team policy off, withdraw the exact activation. This works offline and does not require a fresh cache or working server connection:
 
