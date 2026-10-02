@@ -40,16 +40,24 @@ that is the intended command, then check that exact command again.
 
 `BIN=/bin/echo; "$BIN" --help` itself is analyzed as
 `BIN=/bin/echo; /bin/echo --help`, with every finding of that literal form
-(POSIX shells only). This needs a literal value assigned unconditionally at the
-top level, the variable quoted as the command word, and nothing else in the
-command that can rebind it: no other builtin except `echo`, `printf`,
-`test`/`[`, `true`, `false`, `:` and `pwd`, no arithmetic, `${...}`
-assignment forms, functions, subshells, heredocs, line continuations or history
-expansion. A failed assignment (a read-only or integer variable inherited from
-the shell) aborts the rest of the line in bash, zsh, sh, dash and ksh, so the
-expansion cannot run with the inherited value. State the command cannot show,
-such as live aliases, functions or variable attributes like `typeset -u`, is
-outside the analysis, exactly as it is for a literal command name.
+(POSIX shells only). This applies to the command line itself, never to a
+nested body such as `bash -c '...'`, `eval` or `$(...)`, because a nested body
+can inherit functions and aliases from the enclosing command. It needs a
+literal value assigned unconditionally at the top level, the variable quoted as
+the command word, and nothing else in the command that can rebind it: no
+function or alias definition, no other builtin except `echo`, `printf`,
+`test`/`[`, `true`, `false`, `:` and `pwd` (zsh module builtins such as `stat`
+count as other builtins), no arithmetic (`((`, `$[`, zsh `$NAME[...]`
+subscripts, a `printf` numeric conversion of a name-like argument, `test`
+integer comparisons), zsh `$~`/`$=`/`$^` expansions, unquoted expansions in a
+command, `${...}` assignment forms, subshells, heredocs, line continuations or
+history expansion. Custom regex rules match both the command as typed and its
+literal form. A failed assignment (a read-only or integer variable inherited
+from the shell) aborts the rest of the line in bash, zsh, sh, dash and ksh, so
+the expansion cannot run with the inherited value. State the command cannot
+show, such as live aliases, functions or variable attributes like
+`typeset -u`, is outside the analysis, exactly as it is for a literal command
+name.
 
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the

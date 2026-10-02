@@ -3102,7 +3102,7 @@ fn analyze_with_observation(
     // Paste/FileScan are unaffected; the `Cow::Borrowed` fallback keeps the
     // no-marker exec path zero-alloc, and the byte scan below still runs on
     // `ctx.input` (offsets/`inert_range` are keyed to it).
-    let analyzed_input: std::borrow::Cow<'_, str> = if ctx.scan_context == ScanContext::Exec {
+    let typed_input: std::borrow::Cow<'_, str> = if ctx.scan_context == ScanContext::Exec {
         crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell)
     } else {
         std::borrow::Cow::Borrowed(ctx.input.as_str())
@@ -3111,13 +3111,14 @@ fn analyze_with_observation(
     // a literal assignment this input makes unconditionally. When every dynamic
     // command word is proven that way, tier 3 analyzes the literal spelling, so
     // the command gets exactly the findings of `BIN=/bin/echo; /bin/echo --help`.
-    let analyzed_input = match ctx.scan_context {
+    // Custom regex rules additionally match `typed_input`, the text as typed.
+    let literal_view = match ctx.scan_context {
         ScanContext::Exec | ScanContext::Paste => {
-            crate::extract::posix_variable_command_literal_view(&analyzed_input, ctx.shell)
-                .map_or(analyzed_input, std::borrow::Cow::Owned)
+            crate::extract::posix_variable_command_literal_view(&typed_input, ctx.shell)
         }
-        _ => analyzed_input,
+        _ => None,
     };
+    let analyzed_input: &str = literal_view.as_deref().unwrap_or(&typed_input);
 
     // M13 ch4 — scanned file path for the DSL `file.path_matches` predicate
     // (FileScan). Backslashes normalized to `/` so the predicate is
@@ -3252,8 +3253,8 @@ fn analyze_with_observation(
         }
     } else {
         let (nested_executable_inputs, nested_execution_incomplete) =
-            collect_nested_executable_inputs(&analyzed_input, ctx.shell);
-        let root_execution_view = crate::extract::shell_execution_view(&analyzed_input, ctx.shell);
+            collect_nested_executable_inputs(analyzed_input, ctx.shell);
+        let root_execution_view = crate::extract::shell_execution_view(analyzed_input, ctx.shell);
         let executable_inputs = || {
             std::iter::once((root_execution_view.as_ref(), ctx.shell)).chain(
                 nested_executable_inputs
@@ -3335,7 +3336,7 @@ fn analyze_with_observation(
             }
         }
 
-        extracted = extract::extract_urls(&analyzed_input, ctx.shell);
+        extracted = extract::extract_urls(analyzed_input, ctx.shell);
 
         for (extraction_index, url_info) in extracted.iter().enumerate() {
             // url::Url percent-encodes non-ASCII on parse, so non-ASCII path rules
@@ -3373,7 +3374,7 @@ fn analyze_with_observation(
 
         // Threat intel: local DB lookup, no network on the hot path.
         let threat_findings = crate::rules::threatintel::check(
-            &analyzed_input,
+            analyzed_input,
             ctx.shell,
             &extracted,
             threat_db.as_deref(),
@@ -3381,7 +3382,7 @@ fn analyze_with_observation(
         findings.extend(threat_findings);
 
         let command_findings = crate::rules::command::check_with_inherited_python_inspect(
-            &analyzed_input,
+            analyzed_input,
             ctx.shell,
             ctx.cwd.as_deref(),
             ctx.scan_context,
@@ -3400,7 +3401,7 @@ fn analyze_with_observation(
                 None => crate::rules::web3::Web3ParseContextV2::without_filesystem(),
             };
             let compiled = crate::rules::web3_gate::CompiledWeb3Guard::new(&policy.web3_guard);
-            let bound = compiled.analyze(&analyzed_input, ctx.shell, web3_context);
+            let bound = compiled.analyze(analyzed_input, ctx.shell, web3_context);
             let card_approved = crate::rules::web3_gate::approval_observation(
                 &bound,
                 &policy.web3_guard,
@@ -3422,7 +3423,7 @@ fn analyze_with_observation(
         // PowerShell-specific rules (M5 item 16). The checker follows
         // shell-tagged wrapper bodies, so a POSIX/Cmd outer command cannot hide
         // a PowerShell `-Command`/`-EncodedCommand` body.
-        let ps_findings = crate::rules::powershell::check(&analyzed_input, ctx.shell);
+        let ps_findings = crate::rules::powershell::check(analyzed_input, ctx.shell);
         findings.extend(ps_findings);
 
         // Install-command rules (unsigned repos, disabled GPG, remote manifests).
@@ -3532,9 +3533,7 @@ fn analyze_with_observation(
                             .to_string(),
                         evidence: vec![crate::verdict::Evidence::CommandPattern {
                             pattern: "unresolved nested executable body".to_string(),
-                            matched: crate::redact::redact_shell_assignments(
-                                analyzed_input.as_ref(),
-                            ),
+                            matched: crate::redact::redact_shell_assignments(analyzed_input),
                         }],
                         human_view: None,
                         agent_view: None,
@@ -3547,7 +3546,7 @@ fn analyze_with_observation(
             // M9 ch6 — repo-hook guard HOT subset (opt-in `hooks_guard_enabled`).
             // See `check_repo_hooks_hot`.
             if policy.hooks_guard_enabled {
-                findings.extend(check_repo_hooks_hot(ctx, &analyzed_input));
+                findings.extend(check_repo_hooks_hot(ctx, analyzed_input));
             }
 
             // M10 ch1 — blast-radius CHEAP subset. Always-on, gated by
@@ -3557,14 +3556,14 @@ fn analyze_with_observation(
             // simulator runs ONLY under `tirith preview`.
             let blast_env = crate::blast_radius::env_snapshot();
             findings.extend(crate::blast_radius::cheap_check(
-                &analyzed_input,
+                analyzed_input,
                 ctx.shell,
                 &blast_env,
             ));
 
             // M10 ch3 — taint check. Always-on but near-noop on an empty store
             // (and `taint_triggered` only fires when non-empty). See `check_taint_hot`.
-            findings.extend(check_taint_hot(ctx, &analyzed_input));
+            findings.extend(check_taint_hot(ctx, analyzed_input));
 
             // M11 ch1 — command-card attestation. ATTESTATION-ONLY: never changes
             // another finding's action. See `check_command_card_hot`.
@@ -3572,7 +3571,7 @@ fn analyze_with_observation(
         }
 
         let cred_findings =
-            crate::rules::credential::check(&analyzed_input, ctx.shell, ctx.scan_context);
+            crate::rules::credential::check(analyzed_input, ctx.shell, ctx.scan_context);
         findings.extend(cred_findings);
 
         // M11 ch3 — canary check. Always-on but near-noop on an empty store (and
@@ -3584,10 +3583,10 @@ fn analyze_with_observation(
         // Exec scans the prelude-stripped command; paste scans the original (Cow
         // borrowed unchanged) — a canary in a `# tirith-card:` line is metadata.
         if runtime_effects {
-            findings.extend(check_canary_hot(&analyzed_input, canary_context));
+            findings.extend(check_canary_hot(analyzed_input, canary_context));
         } else {
             findings.extend(
-                crate::redact::detect_canaries(&analyzed_input)
+                crate::redact::detect_canaries(analyzed_input)
                     .iter()
                     .map(canary_finding),
             );
@@ -3653,12 +3652,22 @@ fn analyze_with_observation(
         // FileScan has no gate compilation; Exec/Paste reuse its exact matchers.
         let compiled = gate_custom_rules
             .unwrap_or_else(|| crate::rules::custom::compile_rules(&policy.custom_rules));
-        // `analyzed_input` is prelude-stripped (Exec) / verbatim (Paste/FileScan),
+        // `typed_input` is prelude-stripped (Exec) / verbatim (Paste/FileScan),
         // so custom regex rules match the real command, not the card wrapper.
+        // A resolved #264 command is also matched as its literal view
+        // (`analyzed_input`), so a rule keyed on either spelling fires; the
+        // dedup below reports each rule once.
         let mut custom_findings =
-            crate::rules::custom::check(&analyzed_input, ctx.scan_context, &compiled);
+            crate::rules::custom::check(&typed_input, ctx.scan_context, &compiled);
+        if literal_view.is_some() {
+            custom_findings.extend(crate::rules::custom::check(
+                analyzed_input,
+                ctx.scan_context,
+                &compiled,
+            ));
+        }
         if ctx.scan_context != ScanContext::FileScan {
-            let (nested, _) = collect_nested_executable_inputs(&analyzed_input, ctx.shell);
+            let (nested, _) = collect_nested_executable_inputs(analyzed_input, ctx.shell);
             for body in nested {
                 custom_findings.extend(crate::rules::custom::check(
                     &body.input,
@@ -3679,7 +3688,7 @@ fn analyze_with_observation(
         // extracted data the engine used (so `tirith rule test` reproduces it).
         if crate::rules::custom::any_dsl_rules(&compiled) {
             let backing = build_dsl_backing(
-                &analyzed_input,
+                analyzed_input,
                 ctx.shell,
                 ctx.scan_context,
                 &extracted,
@@ -3706,7 +3715,7 @@ fn analyze_with_observation(
         apply_baseline(
             ctx,
             &policy,
-            &analyzed_input,
+            analyzed_input,
             &observed.extracted,
             &mut verdict.findings,
         );
@@ -5045,6 +5054,66 @@ mod tests {
                 .map(|f| (&f.rule_id, &f.custom_rule_id))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Issue #264: a resolved variable command word is analyzed as its literal
+    /// spelling, but custom regex rules still see the text the user typed, so a
+    /// rule keyed on `"$BIN"` fires on `BIN=/bin/echo; "$BIN" --help` exactly as
+    /// it does on `echo "$BIN"` (once per rule id).
+    #[test]
+    fn custom_regex_rules_match_the_typed_text_of_a_resolved_variable_command() {
+        let _state = isolate_state();
+        use crate::verdict::RuleId;
+        let dir = tempfile::tempdir().unwrap();
+        write_custom_rules_policy(
+            dir.path(),
+            "custom_rules:\n  \
+             - id: no-var-exec\n    \
+             pattern: '\"\\$\\{?BIN\\}?\"'\n    \
+             severity: high\n    \
+             title: \"Variable executable\"\n    \
+             context: [exec, paste]\n  \
+             - id: literal-echo\n    \
+             pattern: '/bin/echo --help'\n    \
+             severity: low\n    \
+             title: \"Literal echo\"\n    \
+             context: [exec, paste]\n",
+        );
+        let input = r#"BIN=/bin/echo; "$BIN" --help"#;
+        assert_eq!(
+            crate::extract::posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+            Some("BIN=/bin/echo; /bin/echo --help"),
+            "precondition: the input resolves"
+        );
+        for ctx in [
+            exec_ctx_in(input, dir.path()),
+            paste_ctx_in(input, dir.path()),
+        ] {
+            let verdict = analyze(&ctx);
+            let ids: Vec<_> = verdict
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == RuleId::CustomRuleMatch)
+                .filter_map(|f| f.custom_rule_id.clone())
+                .collect();
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .all(|f| f.rule_id != RuleId::AnalysisIncomplete),
+                "{:?}: {:?}",
+                ctx.scan_context,
+                verdict.findings
+            );
+            for id in ["no-var-exec", "literal-echo"] {
+                assert_eq!(
+                    ids.iter().filter(|seen| seen.as_str() == id).count(),
+                    1,
+                    "{:?}: {id} must match exactly once; got {ids:?}",
+                    ctx.scan_context
+                );
+            }
+        }
     }
 
     /// Companion guard for the PASTE context: a `command.cwd_in` DSL rule declared

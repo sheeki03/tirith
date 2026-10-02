@@ -4568,20 +4568,11 @@ fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
     exhausted
 }
 
-/// A proven literal view of an input whose dynamic command words all name the
-/// value of an unconditional literal assignment made earlier in the same input
-/// (issue #264). `rewritten` is the input with each such command word replaced
-/// by the assigned literal; `resolved_segments` are the top-level segment
-/// indexes whose command word was replaced.
-struct PosixVariableCommandView {
-    rewritten: String,
-    resolved_segments: Vec<usize>,
-}
-
 const MAX_VARIABLE_COMMAND_INPUT_BYTES: usize = 16 * 1024;
 
-/// Builtins and reserved words of bash, zsh and POSIX sh (plus zsh module
-/// builtins that can be autoloaded). Any of them may bind or rebind a variable,
+/// Builtins and reserved words of bash, zsh, ksh and POSIX sh (plus zsh module
+/// builtins that can be autoloaded or already be loaded in the live shell,
+/// such as `stat -A NAME`). Any of them may bind or rebind a variable,
 /// change command dispatch, or open a compound the flat segment model below
 /// cannot follow, so an input using one is never resolved, except for the
 /// small set of side-effect-free builtins in `POSIX_INERT_BUILTINS`.
@@ -4604,9 +4595,11 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "builtin",
     "bye",
     "caller",
+    "cap",
     "case",
     "cd",
     "chdir",
+    "clone",
     "command",
     "compadd",
     "comparguments",
@@ -4639,8 +4632,10 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "emulate",
     "enable",
     "end",
+    "enum",
     "esac",
     "eval",
+    "example",
     "exec",
     "exit",
     "export",
@@ -4658,6 +4653,7 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "getopts",
     "hash",
     "help",
+    "hist",
     "history",
     "if",
     "in",
@@ -4670,6 +4666,7 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "log",
     "logout",
     "mapfile",
+    "nameref",
     "nocorrect",
     "noglob",
     "pcre_compile",
@@ -4692,12 +4689,15 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "sched",
     "select",
     "set",
+    "setcap",
     "setopt",
     "shift",
     "shopt",
     "source",
+    "stat",
     "strftime",
     "suspend",
+    "syserror",
     "sysopen",
     "sysread",
     "sysseek",
@@ -4728,8 +4728,10 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "while",
     "zcompile",
     "zcurses",
+    "zdelattr",
     "zformat",
     "zftp",
+    "zgdbmpath",
     "zgetattr",
     "zle",
     "zlistattr",
@@ -4739,15 +4741,18 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "zpty",
     "zregexparse",
     "zselect",
+    "zsetattr",
     "zsocket",
     "zstat",
     "zstyle",
     "zsystem",
     "ztcp",
+    "ztie",
+    "zuntie",
 ];
 
-/// Builtins that neither bind variables nor change dispatch (`printf` only
-/// without `-v`, checked separately).
+/// Builtins that neither bind variables nor change dispatch (`printf` and
+/// `test`/`[` only in the restricted forms checked separately).
 const POSIX_INERT_BUILTINS: &[&str] = &[":", "[", "echo", "false", "printf", "pwd", "test", "true"];
 
 /// Shell-maintained or specially-typed parameters whose expansion can differ
@@ -4933,12 +4938,15 @@ fn posix_quoted_variable_command_name(command: &str) -> Option<&str> {
 
 /// True when executing this word cannot bind a shell variable or change
 /// dispatch in the current shell: an external command (child process) or one
-/// of the inert builtins. zsh evaluates `printf` numeric arguments and
-/// `test`/`[` integer operands as arithmetic, and bash evaluates `test -v`
-/// array subscripts, both of which can assign. So `printf` counts as inert
-/// only with literal arguments and without `-v`, and `test`/`[` only without
-/// subscripts and, when an argument expands, without integer comparisons,
-/// `-v` or `-R`.
+/// of the inert builtins. zsh and ksh evaluate the `printf` arguments of
+/// numeric conversions (`%d`, `%*s`) as arithmetic, so `printf '%d' 'BI''N=9'`
+/// assigns `BIN`; ksh does the same for `test`/`[` integer operands, even
+/// fully literal ones (`[ 'BI''N=9' -eq 9 ]`), and bash evaluates `test -v`
+/// array subscripts. So `printf` counts as inert only
+/// without options and with literal arguments, and then only when its format
+/// has text conversions alone or no argument after the format has a letter or
+/// `_` (the start of an arithmetic name); `test`/`[` only without subscripts,
+/// integer comparisons, `-v` or `-R`.
 fn posix_command_word_is_inert(command: &str, args: &[String]) -> bool {
     if command.contains('/') {
         return true;
@@ -4955,42 +4963,89 @@ fn posix_command_word_is_inert(command: &str, args: &[String]) -> bool {
         .collect();
     match command {
         "printf" => {
-            !words.iter().any(|word| word.starts_with("-v"))
-                && args
-                    .iter()
-                    .all(|arg| shell_word_is_proven_literal(arg, ShellType::Posix))
+            let Some(format) = words.first() else {
+                return true;
+            };
+            args.iter()
+                .all(|arg| shell_word_is_proven_literal(arg, ShellType::Posix))
+                && !format.starts_with('-')
+                && (printf_format_has_only_text_conversions(format)
+                    || words.iter().skip(1).all(|word| {
+                        !word
+                            .bytes()
+                            .any(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+                    }))
         }
         "test" | "[" => {
             !args.iter().any(|arg| arg.contains('['))
-                && (args
-                    .iter()
-                    .all(|arg| !arg.contains('$') && !arg.contains('`'))
-                    || !words.iter().any(|word| {
-                        matches!(
-                            word.as_str(),
-                            "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-v" | "-R"
-                        )
-                    }))
+                && !words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-v" | "-R"
+                    )
+                })
         }
         _ => true,
     }
 }
 
-/// Constructs that can bind a variable without naming it literally: any
-/// `((` (arithmetic), any `${` other than `${NAME}` (parameter-expansion
-/// assignment, zsh `${(P)...::=...}`, bash 5.3 `${ cmd; }`), anywhere in the
-/// text, quoted or not; a backslash-newline (the shell splices it out, so
+/// True when every conversion in a literal `printf` format reads its argument
+/// as text (`%s`, `%b`, `%q`, `%c`, or a literal `%%`), with no `*` width or
+/// precision and no positional `$`, so no argument is evaluated as arithmetic.
+fn printf_format_has_only_text_conversions(format: &str) -> bool {
+    if format.contains('*') || format.contains('$') {
+        return false;
+    }
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            continue;
+        }
+        let conversion = chars
+            .by_ref()
+            .find(|ch| !matches!(ch, '0'..='9' | '.' | '-' | '+' | ' ' | '#'));
+        if !matches!(conversion, Some('s' | 'b' | 'q' | 'c' | '%')) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Constructs that can bind a variable without naming it literally, anywhere
+/// in the text, quoted or not: any `((` or `$[` (arithmetic, so `$[$A$B=9]`
+/// assigns `BIN` through a computed spelling); any `${` other than `${NAME}`
+/// (parameter-expansion assignment, zsh `${(P)...::=...}`, bash 5.3
+/// `${ cmd; }`); a zsh subscript `$NAME[...]` / `${NAME}[...]` / `$1[...]` (evaluated as
+/// arithmetic, even inside double quotes); a zsh `$~` / `$=` / `$^` expansion
+/// flag (`$~X` glob-substitutes a value that can hide an `e:...:` qualifier
+/// behind `$'\x28'`); a backslash-newline (the shell splices it out, so
 /// `BI\<newline>N=x` assigns `BIN` without spelling it); a `!` that can start
-/// an interactive history expansion; and any `(` that is not a command/process
+/// an interactive history expansion; any `(` that is not a command/process
 /// substitution opener (`$(`, `<(`, `>(`) or inside a quoted literal word
 /// (function definitions, zsh glob qualifiers and anonymous functions, arrays,
-/// subshells).
+/// subshells); and any unquoted expansion in a command segment (a live
+/// `GLOB_SUBST` makes an unquoted `$X` behave like `$~X`).
 fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segment]) -> bool {
     let bytes = raw.as_bytes();
     if raw.contains("\\\n") || raw.contains("\\\r") {
         return true;
     }
+    // Characters of a parameter reference after `$`: names, positional and
+    // special parameters, and the zsh `$#NAME` / `$+NAME` prefixes.
+    let parameter_byte = |byte: &u8| byte.is_ascii_alphanumeric() || b"_@*#?$!-+".contains(byte);
     for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'$' {
+            if matches!(bytes.get(index + 1), Some(b'[' | b'~' | b'=' | b'^')) {
+                return true;
+            }
+            let end = bytes[index + 1..]
+                .iter()
+                .position(|byte| !parameter_byte(byte))
+                .map_or(bytes.len(), |offset| index + 1 + offset);
+            if end > index + 1 && bytes.get(end) == Some(&b'[') {
+                return true;
+            }
+        }
         if *byte == b'!'
             && bytes
                 .get(index + 1)
@@ -5011,10 +5066,17 @@ fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segmen
                 .next()
                 .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
                 && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()))
+                || rest.as_bytes().get(end + 1) == Some(&b'[')
             {
                 return true;
             }
         }
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.command.is_some() && posix_text_has_unquoted_expansion(&segment.raw))
+    {
+        return true;
     }
     let parens = |text: &str| text.bytes().filter(|byte| *byte == b'(').count();
     segments.iter().any(|segment| {
@@ -5035,6 +5097,51 @@ fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segmen
         }
         parens(&segment.raw) != accounted
     })
+}
+
+/// True when `text` has a `$` expansion or backtick outside quotes. `$'...'`
+/// and `$"..."` are quoting forms, not expansions.
+fn posix_text_has_unquoted_expansion(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Normal,
+        Single,
+        Double,
+        AnsiC,
+    }
+    let bytes = text.as_bytes();
+    let mut quote = Quote::Normal;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Quote::Normal => match byte {
+                b'\\' => index += 1,
+                b'\'' => quote = Quote::Single,
+                b'"' => quote = Quote::Double,
+                b'`' => return true,
+                b'$' => match bytes.get(index + 1) {
+                    Some(b'\'') => {
+                        quote = Quote::AnsiC;
+                        index += 1;
+                    }
+                    Some(b'"') => {
+                        quote = Quote::Double;
+                        index += 1;
+                    }
+                    _ => return true,
+                },
+                _ => {}
+            },
+            Quote::Single if byte == b'\'' => quote = Quote::Normal,
+            Quote::Double | Quote::AnsiC if byte == b'\\' => index += 1,
+            Quote::Double if byte == b'"' => quote = Quote::Normal,
+            Quote::AnsiC if byte == b'\'' => quote = Quote::Normal,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 /// True when `word` is a proven literal (no expansion of any kind) whose `(`
@@ -5106,7 +5213,7 @@ fn posix_name_only_expanded(raw: &str, name: &str, assignment_start: usize) -> b
 fn resolve_posix_variable_command_words(
     raw: &str,
     segments: &[tokenize::Segment],
-) -> Option<PosixVariableCommandView> {
+) -> Option<String> {
     if raw.len() > MAX_VARIABLE_COMMAND_INPUT_BYTES
         || !raw.contains("\"$")
         || posix_input_has_hidden_binding_syntax(raw, segments)
@@ -5190,10 +5297,7 @@ fn resolve_posix_variable_command_words(
         cursor = start + len;
     }
     rewritten.push_str(raw.get(cursor..)?);
-    Some(PosixVariableCommandView {
-        rewritten,
-        resolved_segments: uses.iter().map(|(index, ..)| *index).collect(),
-    })
+    Some(rewritten)
 }
 
 /// Issue #264: the input with every proven literal variable command word
@@ -5201,7 +5305,9 @@ fn resolve_posix_variable_command_words(
 /// analyzing the command exactly as if it had been typed literally. `None`
 /// unless every dynamic command word in the input is proven; see
 /// [`resolve_posix_variable_command_words`]. Inputs with heredocs are never
-/// resolved.
+/// resolved. Callers pass only the root input: a nested body (`bash -c`,
+/// `$(...)`, `eval`) can inherit functions and aliases from the enclosing
+/// input, so the executable-body scan never resolves.
 pub fn posix_variable_command_literal_view(input: &str, shell: ShellType) -> Option<String> {
     // Cheap pre-checks first: this runs on every exec/paste analysis, and a
     // resolvable command word always contains `"$`.
@@ -5209,7 +5315,7 @@ pub fn posix_variable_command_literal_view(input: &str, shell: ShellType) -> Opt
         return None;
     }
     let segments = tokenize::tokenize(input, shell);
-    resolve_posix_variable_command_words(input, &segments).map(|view| view.rewritten)
+    resolve_posix_variable_command_words(input, &segments)
 }
 
 /// Structured executable-body scan.  Most callers only need the recovered
@@ -5238,24 +5344,12 @@ pub(crate) fn executable_substitution_scan(
         let (bodies, gap) = lexical_executable_substitutions(scan_input, shell);
         ExecutableSubstitutionScan { bodies, gap }
     };
-    let top_segments = tokenize::tokenize(scan_input, shell);
-    // Issue #264: `BIN=/bin/echo; "$BIN" --help` names its executable through
-    // a literal assignment the same input makes unconditionally. When that is
-    // proven for every dynamic command word, the input is re-analyzed with the
-    // literal value in place of each expansion (as an executable body), so
-    // every rule sees the command exactly as if it had been typed literally.
-    // Heredoc bodies are sanitized out of `scan_input`; a rewritten view
-    // would lose them, so inputs with heredocs are never resolved.
-    let variable_command_view = (shell == ShellType::Posix && !raw.contains("<<"))
-        .then(|| resolve_posix_variable_command_words(scan_input, &top_segments))
-        .flatten();
-    for (segment_index, segment) in top_segments.iter().enumerate() {
-        if variable_command_view
-            .as_ref()
-            .is_some_and(|view| view.resolved_segments.contains(&segment_index))
-        {
-            continue;
-        }
+    // Issue #264: a quoted variable command word stays a gap here, at every
+    // depth. Only the root input is resolved, by the callers that analyze it
+    // (`posix_variable_command_literal_view`); a nested body inherits functions,
+    // aliases and variables from the enclosing input (`export -f`, `$(...)`),
+    // which a body-local proof cannot see.
+    for segment in tokenize::tokenize(scan_input, shell) {
         if shell != ShellType::PowerShell
             && segment.command.as_deref().is_some_and(|command| {
                 !crate::rules::command::command_name_is_statically_bound(command, shell)
@@ -5266,23 +5360,13 @@ pub(crate) fn executable_substitution_scan(
                     .as_deref()
                     .and_then(posix_alias_invocation_name)
                     .is_some())
-            && !is_complete_literal_posix_brace_group(segment, shell)
-            && !is_complete_literal_posix_function_definition(segment, shell)
+            && !is_complete_literal_posix_brace_group(&segment, shell)
+            && !is_complete_literal_posix_function_definition(&segment, shell)
         {
             record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
             break;
         }
     }
-    let resolved_variable_commands = match variable_command_view {
-        Some(view) => {
-            scan.bodies.push(ExecutableBody::without_origin(
-                view.rewritten,
-                ShellType::Posix,
-            ));
-            view.resolved_segments
-        }
-        None => Vec::new(),
-    };
     scan.bodies.append(&mut heredoc_bodies);
     if scan.gap.is_none() {
         scan.gap = heredoc_gap;
@@ -5298,7 +5382,7 @@ pub(crate) fn executable_substitution_scan(
         }
     }
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
-        scan_literal_posix_aliases(scan_input, shell, &mut scan, &resolved_variable_commands);
+        scan_literal_posix_aliases(scan_input, shell, &mut scan);
     }
     let body_budget_exhausted = bound_executable_bodies(&mut scan);
     if input_budget_exhausted || candidate_budget_exhausted || body_budget_exhausted {
@@ -7024,15 +7108,7 @@ fn posix_alias_builtin_operands(args: &[String], unalias: bool) -> Result<PosixA
     })
 }
 
-/// `resolved_variable_commands` are top-level segment indexes whose quoted
-/// variable command word was proven to name a literal (issue #264); their
-/// rewritten form is analyzed as a separate body, so they are not gaps here.
-fn scan_literal_posix_aliases(
-    raw: &str,
-    shell: ShellType,
-    scan: &mut ExecutableSubstitutionScan,
-    resolved_variable_commands: &[usize],
-) {
+fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
     let segments = tokenize::tokenize(raw, shell);
     let uncertain_mutations = (shell == ShellType::Posix)
         .then(|| uncertain_posix_state_mutation_segments(raw, &segments));
@@ -7494,9 +7570,7 @@ fn scan_literal_posix_aliases(
             (command_raw == command).then(|| command.clone())
         };
         let Some(alias_command) = alias_command else {
-            if !crate::rules::command::command_name_is_statically_bound(command_raw, shell)
-                && !resolved_variable_commands.contains(&segment_index)
-            {
+            if !crate::rules::command::command_name_is_statically_bound(command_raw, shell) {
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             }
             continue;
@@ -17173,14 +17247,23 @@ mod tests {
                 "BIN=/bin/echo && /bin/echo a | /bin/echo b",
             ),
         ] {
-            let segments = tokenize::tokenize(input, ShellType::Posix);
-            let resolved = resolve_posix_variable_command_words(input, &segments)
-                .unwrap_or_else(|| panic!("{input}: {segments:?}"));
-            assert_eq!(resolved.rewritten, view);
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+                Some(view),
+                "{input}"
+            );
+            // Only the root input is resolved, by its analyzing caller. The
+            // body scan keeps the gap, so the same text nested in `bash -c`
+            // or `$(...)` (which can inherit a rebinding function) stays
+            // incomplete.
             let scan = executable_substitution_scan(input, ShellType::Posix);
-            assert!(scan.gap.is_none(), "{input}: {scan:?}");
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
             assert!(
-                scan.bodies.iter().any(|body| body.input == view),
+                scan.bodies.iter().all(|body| body.input != view),
                 "{input}: {scan:?}"
             );
         }
