@@ -10,6 +10,7 @@ pub mod support_bundle;
 pub(crate) mod team_connection;
 pub(crate) mod team_enrollment;
 pub(crate) mod team_rollout;
+mod team_shared;
 pub mod tuning;
 
 /// Output format for commands that support human and JSON output.

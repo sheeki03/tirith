@@ -2,6 +2,7 @@
 //! A saved cache is never projected as Applied. Only full Runtime resolution can
 //! prepare an Applied self-report, and its exact request precedes every POST.
 use super::setup::{self, fs_helpers::FileUpdate, TransactionOutcome};
+use super::team_shared::{error, id, network_allowed, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -135,22 +136,6 @@ pub enum Action {
 }
 const NOTICE: &str = "Team policy is optional and off until explicit activation. A cached policy is an offline input, not proof of the server's current revision or a fleet Applied report. Activation and sync do not send reports.";
 const REPORT_NOTICE: &str = "Reports are authenticated client self-reports after full local Runtime resolution, not independent enforcement attestation. Retry preserves the exact request. Explicit local abandonment archives its unknown server outcome; it does not cancel a request or prove no commit.";
-fn error(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-fn id(value: &str) -> Result<Id, String> {
-    Id::parse(value).map_err(|_| "a canonical nonzero UUID is required".into())
-}
-fn now_ms() -> Result<u64, String> {
-    tirith_core::util::now_ms().ok_or_else(|| "local clock is unavailable".into())
-}
-fn network_allowed() -> Result<(), String> {
-    if super::offline_env_active() {
-        Err("team authority contact is disabled by offline mode".into())
-    } else {
-        Ok(())
-    }
-}
 fn selected(expected: &Id) -> Result<Arc<ConnectionWitness>, String> {
     let selection = Arc::new(SelectedConnection::capture_current().map_err(error)?);
     if selection.connection_id() != Some(expected) {

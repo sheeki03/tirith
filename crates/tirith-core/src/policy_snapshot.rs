@@ -633,7 +633,7 @@ pub(crate) fn resolve_runtime_policy(cwd: Option<&str>) -> Policy {
     compose_runtime_overlays(Policy::discover(cwd), cwd)
 }
 
-fn compose_runtime_overlays(mut policy: Policy, cwd: Option<&str>) -> Policy {
+pub(crate) fn compose_runtime_overlays(mut policy: Policy, cwd: Option<&str>) -> Policy {
     policy.load_user_lists();
     policy.load_org_lists(cwd);
     policy.load_trust_entries(cwd);
@@ -680,6 +680,16 @@ enum ReadWitness {
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+impl InputState {
+    fn present_if(present: bool) -> Self {
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
 }
 
 impl ReadWitness {
@@ -775,6 +785,29 @@ struct CapturedResolution {
 }
 
 impl CapturedResolution {
+    /// Record one resolution input under a fresh opaque revision, with its
+    /// private replay witness when the input can be re-checked locally.
+    fn record_input(
+        &mut self,
+        source: PolicySource,
+        state: InputState,
+        witness: Option<WitnessKind>,
+    ) -> String {
+        let revision = uuid::Uuid::new_v4().to_string();
+        self.inputs.push(InputRevision {
+            source,
+            revision: revision.clone(),
+            state,
+        });
+        if let Some(kind) = witness {
+            self.witnesses.push(InputWitness {
+                revision: revision.clone(),
+                kind,
+            });
+        }
+        revision
+    }
+
     fn operator_targets(&self, policy: &Policy) -> Vec<OperatorTarget> {
         let mut targets = Vec::new();
         if let Some(config) = &self.config_dir {
@@ -851,21 +884,17 @@ impl ResolutionCapture {
             observe_env(name);
         }
         with_capture(|capture| {
-            let revision = uuid::Uuid::new_v4().to_string();
             let cwd = std::env::current_dir().ok();
-            capture.inputs.push(InputRevision {
-                source: PolicySource::new("working_directory", cwd.as_deref()),
-                revision: revision.clone(),
-                state: if cwd.is_some() {
-                    InputState::Present
-                } else {
-                    InputState::Unreadable
-                },
-            });
-            capture.witnesses.push(InputWitness {
-                revision,
-                kind: WitnessKind::CurrentDirectory(cwd),
-            });
+            let state = if cwd.is_some() {
+                InputState::Present
+            } else {
+                InputState::Unreadable
+            };
+            capture.record_input(
+                PolicySource::new("working_directory", cwd.as_deref()),
+                state,
+                Some(WitnessKind::CurrentDirectory(cwd)),
+            );
         });
         capture
     }
@@ -901,40 +930,22 @@ pub(crate) fn is_capturing() -> bool {
 pub(crate) fn observe_env(name: &str) -> Option<std::ffi::OsString> {
     let value = std::env::var_os(name);
     with_capture(|capture| {
-        let revision = uuid::Uuid::new_v4().to_string();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("environment", Some(Path::new(name))),
-            revision: revision.clone(),
-            state: if value.is_some() {
-                InputState::Present
-            } else {
-                InputState::Absent
-            },
-        });
-        capture.witnesses.push(InputWitness {
-            revision,
-            kind: WitnessKind::Environment(name.into(), value.clone()),
-        });
+        capture.record_input(
+            PolicySource::new("environment", Some(Path::new(name))),
+            InputState::present_if(value.is_some()),
+            Some(WitnessKind::Environment(name.into(), value.clone())),
+        );
     });
     value
 }
 
 pub(crate) fn observe_discovery(path: &Path, follow: bool, exists: bool) {
     with_capture(|capture| {
-        let revision = uuid::Uuid::new_v4().to_string();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("discovery", Some(path)),
-            revision: revision.clone(),
-            state: if exists {
-                InputState::Present
-            } else {
-                InputState::Absent
-            },
-        });
-        capture.witnesses.push(InputWitness {
-            revision,
-            kind: WitnessKind::Discovery(path.into(), follow, exists),
-        });
+        capture.record_input(
+            PolicySource::new("discovery", Some(path)),
+            InputState::present_if(exists),
+            Some(WitnessKind::Discovery(path.into(), follow, exists)),
+        );
     });
 }
 
@@ -946,34 +957,24 @@ pub(crate) fn observe_read(
 ) {
     with_capture(|capture| {
         let witness = ReadWitness::from_result(result);
-        let revision = uuid::Uuid::new_v4().to_string();
+        let revision = capture.record_input(
+            PolicySource::new(kind, Some(path)),
+            witness.state(),
+            Some(WitnessKind::File(path.into(), reader, witness)),
+        );
         if matches!(kind, "user_trust" | "operator_trust") {
-            capture.trust_generation = Some(revision.clone());
+            capture.trust_generation = Some(revision);
         }
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new(kind, Some(path)),
-            revision: revision.clone(),
-            state: witness.state(),
-        });
-        capture.witnesses.push(InputWitness {
-            revision,
-            kind: WitnessKind::File(path.into(), reader, witness),
-        });
     });
 }
 
 pub(crate) fn observe_project_identity(identity: &crate::trust_grants::ProjectIdentity) {
     with_capture(|capture| {
-        let revision = uuid::Uuid::new_v4().to_string();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("project_identity", Some(&identity.canonical_root)),
-            revision: revision.clone(),
-            state: InputState::Present,
-        });
-        capture.witnesses.push(InputWitness {
-            revision,
-            kind: WitnessKind::Project(identity.clone()),
-        });
+        capture.record_input(
+            PolicySource::new("project_identity", Some(&identity.canonical_root)),
+            InputState::Present,
+            Some(WitnessKind::Project(identity.clone())),
+        );
     });
 }
 
@@ -990,16 +991,11 @@ pub(crate) fn observe_config_dir(path: &Path) {
         for name in ["policy.yaml", "policy.yml"] {
             let candidate = path.join(name);
             let state = named_destination_state(&candidate);
-            let revision = uuid::Uuid::new_v4().to_string();
-            capture.inputs.push(InputRevision {
-                source: PolicySource::new("operator_destination", Some(&candidate)),
-                revision: revision.clone(),
+            capture.record_input(
+                PolicySource::new("operator_destination", Some(&candidate)),
                 state,
-            });
-            capture.witnesses.push(InputWitness {
-                revision,
-                kind: WitnessKind::NamedDestination(candidate.clone(), state),
-            });
+                Some(WitnessKind::NamedDestination(candidate.clone(), state)),
+            );
             if capture.user_destination.is_none() && state != InputState::Absent {
                 capture.user_destination = Some(candidate);
             }
@@ -1219,21 +1215,12 @@ pub(crate) fn observe_neutralized(fields: &[&str], source: PolicySource) {
 
 pub(crate) fn observe_incident(state: Option<&crate::incident::IncidentState>) {
     with_capture(|capture| {
-        let revision = uuid::Uuid::new_v4().to_string();
         let path = crate::incident::flag_path();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("incident", path.as_deref()),
-            revision: revision.clone(),
-            state: if state.is_some() {
-                InputState::Present
-            } else {
-                InputState::Absent
-            },
-        });
-        capture.witnesses.push(InputWitness {
-            revision,
-            kind: WitnessKind::Incident(path, state.cloned()),
-        });
+        capture.record_input(
+            PolicySource::new("incident", path.as_deref()),
+            InputState::present_if(state.is_some()),
+            Some(WitnessKind::Incident(path, state.cloned())),
+        );
     });
 }
 
@@ -1269,16 +1256,11 @@ pub(crate) fn observe_trust_expiry(expiry: chrono::DateTime<chrono::Utc>) {
 pub(crate) fn observe_team_runtime(runtime: crate::policy_team_enrollment::RuntimeEnrollment) {
     with_capture(|capture| {
         let present = runtime.document().is_some();
-        let revision = uuid::Uuid::new_v4().to_string();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("team_enrollment", None),
-            revision: revision.clone(),
-            state: if present {
-                InputState::Present
-            } else {
-                InputState::Absent
-            },
-        });
+        let revision = capture.record_input(
+            PolicySource::new("team_enrollment", None),
+            InputState::present_if(present),
+            None,
+        );
         if present {
             capture.primary = Some(revision);
         }
@@ -1301,16 +1283,11 @@ pub(crate) fn observe_remote(update: impl FnOnce(&mut RemotePolicyEvidence)) {
 }
 
 /// A fresh remote response is an input too, although it cannot be rechecked
-/// locally. The opaque token refers to the exact bytes used for parsing.
-pub(crate) fn observe_remote_bytes(bytes: &[u8]) {
+/// locally. Its opaque revision deliberately carries no digest of the response
+/// bytes, which may embed remote credentials.
+pub(crate) fn observe_remote_response() {
     with_capture(|capture| {
-        let _ = bytes; // Deliberately never expose a hash of remote credentials.
-        let revision = uuid::Uuid::new_v4().to_string();
-        capture.inputs.push(InputRevision {
-            source: PolicySource::new("remote", None),
-            revision: revision.clone(),
-            state: InputState::Present,
-        });
+        capture.record_input(PolicySource::new("remote", None), InputState::Present, None);
     });
 }
 

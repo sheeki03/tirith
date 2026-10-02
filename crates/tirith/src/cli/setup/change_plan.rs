@@ -507,11 +507,8 @@ fn validate_review(
             "impact review does not match its profile authority, operation and baseline".into(),
         );
     }
-    review.validate_stored()?;
-    if serde_json::to_vec(review).map_err(|e| e.to_string())?.len() > 256 * 1024 {
-        return Err("impact review exceeds the 256 KiB attachment limit".into());
-    }
-    Ok(())
+    // Also enforces the 256 KiB attachment limit.
+    review.validate_stored()
 }
 
 /// Requests and payloads share one binding: a no-change intent is

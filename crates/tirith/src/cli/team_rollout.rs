@@ -1,6 +1,7 @@
 //! Reviewed publication to an explicitly selected team authority. Private local
 //! history is a precondition record; only the authenticated server commits CAS.
 use super::setup::{self, fs_helpers::FileUpdate};
+use super::team_shared::{error as err, network_allowed, now_ms};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -196,19 +197,6 @@ struct Record {
     intent: Intent,
     phase: Phase,
     observation: Option<OperationStatus>,
-}
-fn err(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-fn now_ms() -> Result<u64, String> {
-    tirith_core::util::now_ms().ok_or_else(|| "invalid local clock".into())
-}
-fn network_allowed() -> Result<(), String> {
-    if super::offline_env_active() {
-        Err("team authority contact is disabled by offline mode".into())
-    } else {
-        Ok(())
-    }
 }
 fn validate_input(input: &ReviewInput) -> Result<(), String> {
     validate_policy(&input.yaml).map_err(err)?;

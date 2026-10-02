@@ -157,108 +157,6 @@ fn load_store(path: &std::path::Path) -> Result<TrustStore, String> {
         .map_err(|e| format!("corrupt trust store at {}: {e}", path.display()))
 }
 
-/// Write a user trust store crash-atomically. Repo stores use the stronger
-/// descriptor-relative implementation below.
-#[cfg(test)]
-fn write_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create directory {}: {e}", parent.display()))?;
-    }
-    let json = serde_json::to_vec_pretty(store)
-        .map_err(|e| format!("failed to serialize trust store: {e}"))?;
-    if json.len() as u64 > TRUST_STORE_MAX_BYTES {
-        return Err(format!(
-            "refusing to write trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
-        ));
-    }
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(format!(
-                "refusing non-regular or symlinked trust store at {}",
-                path.display()
-            ));
-        }
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "trust store has no parent directory".to_string())?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| format!("failed to create trust-store temp file: {e}"))?;
-    tmp.write_all(&json)
-        .and_then(|()| tmp.as_file().sync_all())
-        .map_err(|e| format!("failed to write trust-store temp file: {e}"))?;
-    tmp.persist(path)
-        .map_err(|e| format!("failed to publish {}: {}", path.display(), e.error))?;
-    Ok(())
-}
-
-/// repo-0233: retained-parent cross-process lock for trust-store mutations. The
-/// mutation sites load → modify → write; without a nonreplaceable lock two
-/// processes can lose each other's entries after an atomic sidecar replacement.
-#[cfg(test)]
-struct TrustStoreLock {
-    lock_destination: tirith_core::util::ContainedAtomicFile,
-    data_destination: tirith_core::util::ContainedAtomicFile,
-}
-
-#[cfg(test)]
-impl TrustStoreLock {
-    fn data_destination(&self) -> &tirith_core::util::ContainedAtomicFile {
-        &self.data_destination
-    }
-
-    fn publication_destination(&self) -> std::io::Result<tirith_core::util::ContainedAtomicFile> {
-        let destination = self
-            .lock_destination
-            .prepare_sibling(std::ffi::OsStr::new("trust.json"))?;
-        destination.inherit_observed_preimage(&self.data_destination)?;
-        Ok(destination)
-    }
-}
-
-#[cfg(test)]
-fn trust_store_root<'a>(
-    scope: &str,
-    path: &'a std::path::Path,
-) -> Result<&'a std::path::Path, String> {
-    if scope == "repo" {
-        path.parent().and_then(std::path::Path::parent)
-    } else {
-        path.parent()
-    }
-    .ok_or_else(|| "trust store has no containment root".to_string())
-}
-
-#[cfg(test)]
-fn preflight_trust_store_mutation(scope: &str, path: &std::path::Path) -> Result<(), String> {
-    let root = trust_store_root(scope, path)?;
-    let policy = tirith_core::policy::Policy::discover_local_only(root.to_str());
-    super::preflight_config_write_authorization(root, path, true, &policy, true)
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(test)]
-fn lock_trust_store(scope: &str, path: &std::path::Path) -> Result<TrustStoreLock, String> {
-    // Keep this primitive safe even if a future mutation caller forgets the
-    // command-level preflight: no lock file or parent may be created first.
-    preflight_trust_store_mutation(scope, path)?;
-    let root = trust_store_root(scope, path)?;
-    let lock_path = path.with_extension("lock");
-    let destination = tirith_core::util::ContainedAtomicFile::prepare(root, &lock_path, true)
-        .map_err(|error| format!("cannot bind trust-store lock: {error}"))?;
-    destination
-        .lock_parent_for_mutation()
-        .map_err(|error| format!("cannot lock trust store: {error}"))?;
-    let data_destination = destination
-        .prepare_sibling(std::ffi::OsStr::new("trust.json"))
-        .map_err(|error| format!("cannot bind trust-store data file: {error}"))?;
-    Ok(TrustStoreLock {
-        lock_destination: destination,
-        data_destination,
-    })
-}
-
 fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, String> {
     if scope == "repo" {
         load_repo_store(path)
@@ -267,82 +165,8 @@ fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, 
     }
 }
 
-#[cfg(test)]
-fn serialize_store_for_write(store: &TrustStore) -> Result<Vec<u8>, String> {
-    let bytes = serde_json::to_vec_pretty(store)
-        .map_err(|error| format!("failed to serialize trust store: {error}"))?;
-    if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
-        return Err(format!(
-            "refusing to write trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
-        ));
-    }
-    Ok(bytes)
-}
-
-/// Publish while the caller's cross-process mutation lock remains held, but
-/// require the task permit to bind the exact serialized store first.
-#[cfg(test)]
-fn write_store_scoped_permitted(
-    scope: &str,
-    path: &std::path::Path,
-    store: &TrustStore,
-) -> Result<(), String> {
-    let root = trust_store_root(scope, path)?;
-    let bytes = serialize_store_for_write(store)?;
-    let policy = tirith_core::policy::Policy::discover_local_only(root.to_str());
-    super::preflight_config_write_authorization(root, path, true, &policy, true)
-        .map_err(|error| error.to_string())?;
-    let destination = tirith_core::util::ContainedAtomicFile::prepare(root, path, true)
-        .map_err(|error| error.to_string())?;
-    super::write_prepared_config_file_permitted(
-        root,
-        path,
-        destination,
-        &bytes,
-        true,
-        &policy,
-        true,
-    )
-    .map_err(|error| error.to_string())
-}
-
-#[cfg(test)]
-fn write_store_scoped_permitted_locked(
-    scope: &str,
-    path: &std::path::Path,
-    store: &TrustStore,
-    lock: &TrustStoreLock,
-) -> Result<(), String> {
-    let root = trust_store_root(scope, path)?;
-    let bytes = serialize_store_for_write(store)?;
-    let policy = tirith_core::policy::Policy::discover_local_only(root.to_str());
-    super::preflight_config_write_authorization(root, path, true, &policy, true)
-        .map_err(|error| error.to_string())?;
-    let destination = lock
-        .publication_destination()
-        .map_err(|error| error.to_string())?;
-    super::write_prepared_config_file_permitted(
-        root,
-        path,
-        destination,
-        &bytes,
-        true,
-        &policy,
-        true,
-    )
-    .map_err(|error| error.to_string())?;
-    let read_back = lock
-        .data_destination()
-        .read_capped(bytes.len().saturating_add(1) as u64)
-        .map_err(|_| "written trust store failed exact read-back validation".to_string())?;
-    if read_back != bytes {
-        return Err("written trust store failed exact read-back validation".to_string());
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
-fn open_repo_trust_dir(path: &std::path::Path, create: bool) -> Result<std::fs::File, String> {
+fn open_repo_trust_dir(path: &std::path::Path) -> Result<std::fs::File, String> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -351,7 +175,7 @@ fn open_repo_trust_dir(path: &std::path::Path, create: bool) -> Result<std::fs::
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-    // O_NOFOLLOW on the root too. Both callers derive it from
+    // O_NOFOLLOW on the root too. The caller derives it from
     // `find_repo_root(None)`, which starts at `std::env::current_dir()` —
     // `getcwd()`, whose result POSIX guarantees has no symlink components — and
     // then only ascends with `parent()`. So the root cannot be a symlink here
@@ -363,15 +187,6 @@ fn open_repo_trust_dir(path: &std::path::Path, create: bool) -> Result<std::fs::
         .open(root)
         .map_err(|e| format!("cannot open repository root {}: {e}", root.display()))?;
     let name = CString::new(".tirith").expect("static component has no NUL");
-    if create {
-        let rc = unsafe { libc::mkdirat(root_fd.as_raw_fd(), name.as_ptr(), 0o755) };
-        if rc != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::AlreadyExists {
-                return Err(format!("cannot create repo .tirith directory: {error}"));
-            }
-        }
-    }
     let fd = unsafe {
         libc::openat(
             root_fd.as_raw_fd(),
@@ -394,7 +209,7 @@ fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let dir = match open_repo_trust_dir(path, false) {
+    let dir = match open_repo_trust_dir(path) {
         Ok(dir) => dir,
         Err(error) => match path.parent().map(fs::symlink_metadata) {
             Some(Err(io_error)) if io_error.kind() == io::ErrorKind::NotFound => {
@@ -447,116 +262,23 @@ fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
         .map_err(|e| format!("corrupt trust store at {}: {e}", path.display()))
 }
 
-#[cfg(all(unix, test))]
-fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    let dir = open_repo_trust_dir(path, true)?;
-    let dest = CString::new("trust.json").expect("static component has no NUL");
-
-    // Refuse an existing symlink, directory, FIFO, device, or socket. A later
-    // destination swap is still safe: renameat replaces the directory entry and
-    // never follows it.
-    let existing_fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            dest.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if existing_fd >= 0 {
-        // SAFETY: `openat` returned a fresh owned descriptor.
-        let existing = unsafe { std::fs::File::from_raw_fd(existing_fd) };
-        if !existing
-            .metadata()
-            .map_err(|e| format!("cannot inspect repo trust destination: {e}"))?
-            .is_file()
-        {
-            return Err("repo trust destination is not a regular file".to_string());
-        }
-    } else {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(format!("refusing repo trust destination: {error}"));
-        }
-    }
-
-    let bytes = serde_json::to_vec_pretty(store)
-        .map_err(|e| format!("failed to serialize trust store: {e}"))?;
-    if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
-        return Err(format!(
-            "refusing to write repo trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
-        ));
-    }
-    let temp_name = format!(".trust.json.{}.tmp", uuid::Uuid::new_v4());
-    let temp = CString::new(temp_name.as_str()).expect("UUID temp name has no NUL");
-    let temp_fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            temp.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o666,
-        )
-    };
-    if temp_fd < 0 {
-        return Err(format!(
-            "cannot create repo trust temp file: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `openat` returned a fresh owned descriptor.
-    let mut temp_file = unsafe { std::fs::File::from_raw_fd(temp_fd) };
-    let publish = temp_file
-        .write_all(&bytes)
-        .and_then(|()| temp_file.sync_all())
-        .and_then(|()| {
-            let rc = unsafe {
-                libc::renameat(
-                    dir.as_raw_fd(),
-                    temp.as_ptr(),
-                    dir.as_raw_fd(),
-                    dest.as_ptr(),
-                )
-            };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        });
-    if let Err(error) = publish {
-        unsafe {
-            libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
-        }
-        return Err(format!(
-            "failed to atomically publish repo trust store: {error}"
-        ));
-    }
-    dir.sync_all()
-        .map_err(|e| format!("failed to sync repo trust directory: {e}"))?;
-    Ok(())
-}
-
 #[cfg(windows)]
 mod windows_repo_store {
-    use super::{fs, io, Read, TrustStore, Write, TRUST_STORE_MAX_BYTES};
+    use super::{fs, io, Read, TrustStore, TRUST_STORE_MAX_BYTES};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle,
-        GetFinalPathNameByHandleW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        OPEN_EXISTING,
+        CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_TRAVERSE, OPEN_EXISTING,
     };
 
     struct OwnedHandle(HANDLE);
@@ -579,11 +301,12 @@ mod windows_repo_store {
         }
     }
 
+    /// The held root and `.tirith` handles pin both directories while the
+    /// store is read; only the resolved `.tirith` path is consulted.
     struct RepoTrustDir {
-        path: PathBuf,
         final_path: String,
         _root: OwnedHandle,
-        directory: OwnedHandle,
+        _directory: OwnedHandle,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -594,27 +317,6 @@ mod windows_repo_store {
         last_write: u64,
         attributes: u32,
     }
-
-    #[repr(C)]
-    struct TrustRenameInfo {
-        _anonymous: FILE_RENAME_INFO_0,
-        _root_directory: HANDLE,
-        _file_name_length: u32,
-        _file_name: [u16; 10],
-    }
-
-    const TRUST_FILE_NAME_UTF16: [u16; 10] = [
-        b't' as u16,
-        b'r' as u16,
-        b'u' as u16,
-        b's' as u16,
-        b't' as u16,
-        b'.' as u16,
-        b'j' as u16,
-        b's' as u16,
-        b'o' as u16,
-        b'n' as u16,
-    ];
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
@@ -722,34 +424,14 @@ mod windows_repo_store {
         Ok((root, directory))
     }
 
-    fn open_repo_dir(path: &Path, create: bool) -> Result<Option<RepoTrustDir>, String> {
+    fn open_repo_dir(path: &Path) -> Result<Option<RepoTrustDir>, String> {
         let (root_path, directory_path) = split_path(path)?;
         let root = open_directory(root_path)?
             .ok_or_else(|| format!("repository root {} does not exist", root_path.display()))?;
         let root_final = final_path(root.0)?;
 
-        let directory = match open_directory(directory_path)? {
-            Some(directory) => directory,
-            None if !create => return Ok(None),
-            None => {
-                let directory_wide = wide(directory_path);
-                if let Err(error) =
-                    unsafe { CreateDirectoryW(PCWSTR(directory_wide.as_ptr()), None) }
-                {
-                    if !is_win32(&error, ERROR_ALREADY_EXISTS.0) {
-                        return Err(format!(
-                            "cannot create repo trust directory {}: {error}",
-                            directory_path.display()
-                        ));
-                    }
-                }
-                open_directory(directory_path)?.ok_or_else(|| {
-                    format!(
-                        "repo trust directory {} disappeared after creation",
-                        directory_path.display()
-                    )
-                })?
-            }
+        let Some(directory) = open_directory(directory_path)? else {
+            return Ok(None);
         };
         let directory_final = final_path(directory.0)?;
         if !is_exact_child(&root_final, &directory_final, ".tirith") {
@@ -758,10 +440,9 @@ mod windows_repo_store {
             );
         }
         Ok(Some(RepoTrustDir {
-            path: directory_path.to_path_buf(),
             final_path: directory_final,
             _root: root,
-            directory,
+            _directory: directory,
         }))
     }
 
@@ -827,28 +508,8 @@ mod windows_repo_store {
         Ok(Some((owned.into_file(), identity)))
     }
 
-    fn mark_held_file_for_deletion(file: &fs::File) -> Result<(), String> {
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-        unsafe {
-            SetFileInformationByHandle(
-                HANDLE(file.as_raw_handle()),
-                FileDispositionInfo,
-                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        }
-        .map_err(|error| format!("cannot remove exact repo trust temp identity: {error}"))
-    }
-
-    fn cleanup_suffix(file: &fs::File) -> String {
-        mark_held_file_for_deletion(file)
-            .err()
-            .map(|error| format!("; exact-handle cleanup also failed: {error}"))
-            .unwrap_or_default()
-    }
-
     pub(super) fn load(path: &Path) -> Result<TrustStore, String> {
-        let Some(directory) = open_repo_dir(path, false)? else {
+        let Some(directory) = open_repo_dir(path)? else {
             return Ok(TrustStore::default());
         };
         let Some((mut file, before)) = open_regular_file(&directory, path)? else {
@@ -876,152 +537,11 @@ mod windows_repo_store {
         serde_json::from_slice(&bytes)
             .map_err(|error| format!("corrupt trust store at {}: {error}", path.display()))
     }
-
-    pub(super) fn write(path: &Path, store: &TrustStore) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(store)
-            .map_err(|error| format!("failed to serialize trust store: {error}"))?;
-        if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
-            return Err(format!(
-                "refusing to write repo trust store above the {TRUST_STORE_MAX_BYTES} byte limit"
-            ));
-        }
-
-        let directory = open_repo_dir(path, true)?
-            .ok_or_else(|| "repo trust directory disappeared during creation".to_string())?;
-        // Reject an existing reparse point or non-regular object. A later
-        // destination swap is safe because publication replaces the directory
-        // entry through the held temporary-file and parent-directory handles.
-        drop(open_regular_file(&directory, path)?);
-
-        let temp_name = format!(".trust.json.{}.tmp", uuid::Uuid::new_v4().simple());
-        let temp_path = directory.path.join(&temp_name);
-        let temp_wide = wide(&temp_path);
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(temp_wide.as_ptr()),
-                (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE).0,
-                Default::default(),
-                None,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
-            )
-        }
-        .map_err(|error| format!("cannot create exclusive repo trust temp file: {error}"))?;
-        let owned = OwnedHandle(handle);
-        let temp_final = match final_path(handle) {
-            Ok(path) => path,
-            Err(error) => {
-                let file = owned.into_file();
-                let cleanup = cleanup_suffix(&file);
-                return Err(format!("{error}{cleanup}"));
-            }
-        };
-        if !is_exact_child(&directory.final_path, &temp_final, &temp_name) {
-            let file = owned.into_file();
-            let cleanup = cleanup_suffix(&file);
-            return Err(format!(
-                "repo trust temp file resolves outside the held .tirith directory{cleanup}"
-            ));
-        }
-        let mut file = owned.into_file();
-        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-            let cleanup = cleanup_suffix(&file);
-            return Err(format!(
-                "failed to write and sync repo trust temp file: {error}{cleanup}"
-            ));
-        }
-        let temp_identity = match inspect_regular(HANDLE(file.as_raw_handle()), &temp_path) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let cleanup = cleanup_suffix(&file);
-                return Err(format!("{error}{cleanup}"));
-            }
-        };
-        if temp_identity.size != bytes.len() as u64 {
-            let cleanup = cleanup_suffix(&file);
-            return Err(format!(
-                "repo trust temp file size changed before publication{cleanup}"
-            ));
-        }
-
-        let mut rename_mode = FILE_RENAME_INFO_0::default();
-        rename_mode.ReplaceIfExists = true;
-        let rename = TrustRenameInfo {
-            _anonymous: rename_mode,
-            _root_directory: directory.directory.0,
-            _file_name_length: (TRUST_FILE_NAME_UTF16.len() * std::mem::size_of::<u16>()) as u32,
-            _file_name: TRUST_FILE_NAME_UTF16,
-        };
-        // The Win32 wrapper (SetFileInformationByHandle + FileRenameInfo)
-        // rejects a non-NULL RootDirectory with ERROR_INVALID_PARAMETER: it
-        // accepts full destination paths only. The retained directory handle
-        // IS the anchor of this publish (no by-name re-resolution), so call
-        // the NT service directly — FileRenameInformation honors
-        // handle-relative names, and TrustRenameInfo's layout doubles as the
-        // kernel struct (the pinned layout test below covers the shared
-        // offsets).
-        let mut io_status = windows::Win32::System::IO::IO_STATUS_BLOCK::default();
-        let status = unsafe {
-            windows::Wdk::Storage::FileSystem::NtSetInformationFile(
-                HANDLE(file.as_raw_handle()),
-                &mut io_status,
-                (&rename as *const TrustRenameInfo).cast(),
-                std::mem::size_of::<TrustRenameInfo>() as u32,
-                windows::Wdk::Storage::FileSystem::FileRenameInformation,
-            )
-        };
-        if status.0 < 0 {
-            let code = unsafe { windows::Win32::Foundation::RtlNtStatusToDosError(status) };
-            let error = std::io::Error::from_raw_os_error(code as i32);
-            let cleanup = cleanup_suffix(&file);
-            return Err(format!(
-                "failed to atomically publish repo trust store: {error}{cleanup}"
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
-
-        #[test]
-        fn fixed_rename_buffer_matches_win32_header_layout() {
-            assert_eq!(
-                std::mem::offset_of!(TrustRenameInfo, _anonymous),
-                std::mem::offset_of!(FILE_RENAME_INFO, Anonymous)
-            );
-            assert_eq!(
-                std::mem::offset_of!(TrustRenameInfo, _root_directory),
-                std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory)
-            );
-            assert_eq!(
-                std::mem::offset_of!(TrustRenameInfo, _file_name_length),
-                std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength)
-            );
-            assert_eq!(
-                std::mem::offset_of!(TrustRenameInfo, _file_name),
-                std::mem::offset_of!(FILE_RENAME_INFO, FileName)
-            );
-            assert_eq!(
-                std::mem::size_of::<TrustRenameInfo>(),
-                std::mem::offset_of!(FILE_RENAME_INFO, FileName)
-                    + std::mem::size_of_val(&TRUST_FILE_NAME_UTF16)
-            );
-        }
-    }
 }
 
 #[cfg(windows)]
 fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
     windows_repo_store::load(path)
-}
-
-#[cfg(all(windows, test))]
-fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
-    windows_repo_store::write(path, store)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1040,15 +560,6 @@ fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
     if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound) {
         return Ok(TrustStore::default());
     }
-    Err(
-        "repo-scoped trust requires descriptor-relative no-symlink filesystem operations, which are not available on this platform; use --scope user"
-            .to_string(),
-    )
-}
-
-#[cfg(all(not(unix), not(windows), test))]
-fn write_repo_store(path: &std::path::Path, store: &TrustStore) -> Result<(), String> {
-    let _ = (path, store);
     Err(
         "repo-scoped trust requires descriptor-relative no-symlink filesystem operations, which are not available on this platform; use --scope user"
             .to_string(),
@@ -2087,19 +1598,26 @@ fn extract_host(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Plant a legacy trust.json fixture. Product code only reads this format;
+    /// new trust is written to the grant store by `trust_lifecycle`.
+    fn plant_store(path: &std::path::Path, store: &TrustStore) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(store).unwrap()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn repo_trust_dir_refuses_a_symlinked_tirith_component() {
         use std::os::unix::fs::symlink;
 
         // The root itself is opened O_NOFOLLOW as well, which costs nothing:
-        // both callers derive it from find_repo_root(None) -> current_dir(),
+        // the caller derives it from find_repo_root(None) -> current_dir(),
         // and getcwd() never returns a path with symlink components.
         let holder = tempfile::tempdir().unwrap();
         let root = holder.path().join("checkout");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(root.join(".tirith")).unwrap();
-        open_repo_trust_dir(&root.join(".tirith").join("trust.json"), false)
+        open_repo_trust_dir(&root.join(".tirith").join("trust.json"))
             .expect("an ordinary repository root opens");
 
         // The component that carries repository content refuses a symlink.
@@ -2108,7 +1626,7 @@ mod tests {
         let swapped = holder.path().join("swapped");
         std::fs::create_dir(&swapped).unwrap();
         symlink(&hostile, swapped.join(".tirith")).unwrap();
-        let error = open_repo_trust_dir(&swapped.join(".tirith").join("trust.json"), false)
+        let error = open_repo_trust_dir(&swapped.join(".tirith").join("trust.json"))
             .expect_err("a symlinked .tirith component must be refused");
         assert!(error.contains("symlinked"), "unexpected error: {error}");
     }
@@ -2288,7 +1806,7 @@ mod tests {
             }],
         };
 
-        write_store(&path, &store).unwrap();
+        plant_store(&path, &store);
         let loaded = load_store(&path).unwrap();
 
         assert_eq!(loaded.version, 1);
@@ -2300,7 +1818,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn repo_store_roundtrip_is_atomic_and_leaves_no_temp_files() {
+    fn repo_store_loads_a_planted_store() {
         let _global = crate::cli::test_harness::ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -2318,15 +1836,10 @@ mod tests {
                 reason: None,
             }],
         };
-        write_repo_store(&path, &store).unwrap();
+        plant_store(&path, &store);
         assert_eq!(load_repo_store(&path).unwrap().entries.len(), 1);
-        write_repo_store(&path, &TrustStore::default()).unwrap();
+        plant_store(&path, &TrustStore::default());
         assert!(load_repo_store(&path).unwrap().entries.is_empty());
-        let names: Vec<_> = fs::read_dir(root.path().join(".tirith"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("trust.json")]);
     }
 
     #[cfg(unix)]
@@ -2343,7 +1856,6 @@ mod tests {
         let before = fs::read(&outside_store).unwrap();
 
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert_eq!(fs::read(&outside_store).unwrap(), before);
     }
 
@@ -2361,7 +1873,6 @@ mod tests {
         let before = fs::read(outside.path()).unwrap();
 
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert_eq!(fs::read(outside.path()).unwrap(), before);
     }
 
@@ -2385,7 +1896,6 @@ mod tests {
         let before = fs::read(&outside_store).unwrap();
 
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert_eq!(fs::read(&outside_store).unwrap(), before);
     }
 
@@ -2409,7 +1919,6 @@ mod tests {
         let before = fs::read(outside.path()).unwrap();
 
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert_eq!(fs::read(outside.path()).unwrap(), before);
     }
 
@@ -2425,24 +1934,21 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
     }
 
     #[cfg(all(not(unix), not(windows)))]
     #[test]
-    fn repo_store_is_empty_when_absent_and_mutation_fails_closed() {
+    fn repo_store_is_empty_when_absent_and_refuses_a_present_store() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(".tirith/trust.json");
         assert!(load_repo_store(&path).unwrap().entries.is_empty());
         fs::create_dir(path.parent().unwrap()).unwrap();
         assert!(load_repo_store(&path).unwrap().entries.is_empty());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert!(!path.exists());
 
         fs::write(&path, br#"{"version":1,"entries":[]}"#).unwrap();
         let before = fs::read(&path).unwrap();
         assert!(load_repo_store(&path).is_err());
-        assert!(write_repo_store(&path, &TrustStore::default()).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
@@ -2579,11 +2085,11 @@ mod tests {
             ],
         };
 
-        write_store(&path, &store).unwrap();
+        plant_store(&path, &store);
 
         let mut loaded = load_store(&path).unwrap();
         loaded.entries.retain(|e| !is_expired(e));
-        write_store(&path, &loaded).unwrap();
+        plant_store(&path, &loaded);
 
         let after = load_store(&path).unwrap();
         assert_eq!(after.entries.len(), 2);
@@ -3187,122 +2693,6 @@ mod tests {
         with_empty_data_dir(|| {
             assert_eq!(last(), 1);
         });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn repo_lock_refuses_symlinked_store_directory_without_outside_creation() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join(".tirith")).unwrap();
-        let path = root.path().join(".tirith/trust.json");
-
-        assert!(
-            lock_trust_store("repo", &path).is_err(),
-            "symlinked lock directory must refuse"
-        );
-
-        assert!(!outside.path().join("trust.lock").exists());
-    }
-
-    #[test]
-    fn repo_policy_change_deny_creates_no_trust_lock_or_store() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join(".git")).unwrap();
-        let config = root.path().join(".tirith");
-        fs::create_dir(&config).unwrap();
-        fs::write(
-            config.join("policy.yaml"),
-            b"task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n",
-        )
-        .unwrap();
-        let path = config.join("trust.json");
-
-        if lock_trust_store("repo", &path).is_ok() {
-            panic!("PolicyChange denial must happen before lock creation");
-        }
-
-        assert!(!config.join("trust.lock").exists());
-        assert!(!path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn repo_lock_refuses_a_final_symlink() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        let config = root.path().join(".tirith");
-        fs::create_dir(&config).unwrap();
-        fs::write(outside.path(), b"outside\n").unwrap();
-        std::os::unix::fs::symlink(outside.path(), config.join("trust.lock")).unwrap();
-        let path = config.join("trust.json");
-
-        assert!(lock_trust_store("repo", &path).is_err());
-        assert_eq!(fs::read(outside.path()).unwrap(), b"outside\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn user_store_refuses_symlinked_config_root_without_outside_publication() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let config = root.path().join("tirith-config");
-        std::os::unix::fs::symlink(outside.path(), &config).unwrap();
-        let path = config.join("trust.json");
-
-        write_store_scoped_permitted("user", &path, &TrustStore::default())
-            .expect_err("symlinked user config root must refuse");
-
-        assert!(!outside.path().join("trust.json").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trust_lock_and_data_capability_cannot_split_after_parent_swap() {
-        let root = tempfile::tempdir().unwrap();
-        let config = root.path().join(".tirith");
-        let displaced = root.path().join(".tirith-displaced");
-        fs::create_dir(&config).unwrap();
-        let path = config.join("trust.json");
-        let lock = lock_trust_store("repo", &path).unwrap();
-        fs::rename(&config, &displaced).unwrap();
-        fs::create_dir(&config).unwrap();
-
-        write_store_scoped_permitted_locked("repo", &path, &TrustStore::default(), &lock)
-            .expect_err("a replacement visible parent must not split lock and data authority");
-
-        assert!(!path.exists());
-        assert!(!displaced.join("trust.json").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn trust_lock_remains_serialized_after_legacy_sidecar_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let config = root.path().join(".tirith");
-        fs::create_dir(&config).unwrap();
-        let path = config.join("trust.json");
-        let first = lock_trust_store("repo", &path).unwrap();
-        let sidecar = config.join("trust.lock");
-        fs::write(&sidecar, b"decoy").unwrap();
-        fs::rename(&sidecar, config.join("displaced.lock")).unwrap();
-        fs::write(&sidecar, b"replacement").unwrap();
-
-        let competing_path = path.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let contender = std::thread::spawn(move || {
-            let acquired = lock_trust_store("repo", &competing_path);
-            sender.send(acquired.is_ok()).unwrap();
-        });
-        assert!(matches!(
-            receiver.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(first);
-        assert!(receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap());
-        contender.join().unwrap();
     }
 
     #[test]

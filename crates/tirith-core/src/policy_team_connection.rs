@@ -444,10 +444,7 @@ impl PreparedConnection {
         })
     }
     pub fn revalidate(&self) -> Result<(), ConnectionError> {
-        let now: u64 = chrono::Utc::now()
-            .timestamp_millis()
-            .try_into()
-            .map_err(|_| ConnectionError::AuthenticationFailed)?;
+        let now = crate::util::now_ms().ok_or(ConnectionError::AuthenticationFailed)?;
         self.caps
             .validate(now)
             .map_err(|_| ConnectionError::AuthenticationFailed)?;

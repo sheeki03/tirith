@@ -1826,8 +1826,7 @@ impl Policy {
                         .evidence()
                         .map(|evidence| evidence.fetched_unix_ms());
                     let age_seconds = fetched_unix_ms.and_then(|fetched| {
-                        u64::try_from(chrono::Utc::now().timestamp_millis())
-                            .ok()
+                        crate::util::now_ms()
                             .and_then(|now| now.checked_sub(fetched))
                             .map(|age| age / 1000)
                     });
@@ -1941,8 +1940,6 @@ impl Policy {
             },
         };
 
-        let fail_mode = local.policy_fetch_fail_mode.as_deref().unwrap_or("open");
-
         snapshot::observe_remote(|remote| remote.availability = "fetching".into());
         let resolved = match crate::policy_client::fetch_remote_policy_with_metadata(
             &server_url,
@@ -1950,7 +1947,7 @@ impl Policy {
         ) {
             Ok(response) => {
                 let yaml = response.yaml;
-                snapshot::observe_remote_bytes(yaml.as_bytes());
+                snapshot::observe_remote_response();
                 // Migrations run on remote YAML the same as local (M5.5 F3).
                 match Self::try_parse_yaml(&yaml) {
                     Ok(mut p) => {
@@ -1999,34 +1996,13 @@ impl Policy {
                             remote.availability = "invalid_response".into();
                             remote.failure = Some("policy_parse_failed".into());
                         });
-                        match fail_mode {
-                            "closed" => {
-                                policy_diagnostic!(
-                                "tirith: error: remote policy parse error ({e}), failing closed"
-                            );
-                                Self::fail_closed_policy()
-                            }
-                            "cached" => {
-                                policy_diagnostic!(
-                                "tirith: warning: remote policy parse error ({e}), trying cache"
-                            );
-                                match load_cached_remote_policy(&server_url, &api_key) {
-                                    Some(p) => p,
-                                    None => {
-                                        policy_diagnostic!(
-                                            "tirith: warning: no cached remote policy, using local"
-                                        );
-                                        local
-                                    }
-                                }
-                            }
-                            _ => {
-                                policy_diagnostic!(
-                                    "tirith: warning: remote policy parse error: {e}"
-                                );
-                                local
-                            }
-                        }
+                        remote_failure_fallback(
+                            &format!("remote policy parse error ({e})"),
+                            &format!("remote policy parse error: {e}"),
+                            &server_url,
+                            &api_key,
+                            local,
+                        )
                     }
                 }
             }
@@ -2062,34 +2038,13 @@ impl Policy {
                         .into(),
                     );
                 });
-                match fail_mode {
-                    "closed" => {
-                        policy_diagnostic!(
-                            "tirith: error: remote policy fetch failed ({e}), failing closed"
-                        );
-                        Self::fail_closed_policy()
-                    }
-                    "cached" => {
-                        policy_diagnostic!(
-                            "tirith: warning: remote policy fetch failed ({e}), trying cache"
-                        );
-                        match load_cached_remote_policy(&server_url, &api_key) {
-                            Some(p) => p,
-                            None => {
-                                policy_diagnostic!(
-                                    "tirith: warning: no cached remote policy, using local"
-                                );
-                                local
-                            }
-                        }
-                    }
-                    _ => {
-                        policy_diagnostic!(
-                            "tirith: warning: remote policy fetch failed ({e}), using local policy"
-                        );
-                        local
-                    }
-                }
+                remote_failure_fallback(
+                    &format!("remote policy fetch failed ({e})"),
+                    &format!("remote policy fetch failed ({e}), using local policy"),
+                    &server_url,
+                    &api_key,
+                    local,
+                )
             }
         };
         if resolved.path.as_deref() == Some("fail-closed") {
@@ -2258,7 +2213,7 @@ impl Policy {
             document.policy_id.as_str(),
             document.revision.as_str()
         ));
-        snapshot::observe_remote_bytes(document.yaml.as_bytes());
+        snapshot::observe_remote_response();
         snapshot::observe_replacement(
             &policy,
             PolicySource::new("remote", None),
@@ -4704,6 +4659,37 @@ fn observe_cached_fetch_metadata(path: &Path, cache_bytes: &[u8]) {
             Some((now - fetched.with_timezone(&chrono::Utc)).num_seconds() as u64);
         remote.freshness = "recorded_fetch".into();
     });
+}
+
+/// Apply the local policy's `policy_fetch_fail_mode` after a remote fetch or
+/// parse failure: `closed` fails closed, `cached` tries the endpoint-bound cache
+/// then local, anything else (default `open`) keeps the local policy. `failure`
+/// names the failure in the closed/cached diagnostics; `open_warning` is the
+/// open-mode warning.
+fn remote_failure_fallback(
+    failure: &str,
+    open_warning: &str,
+    server_url: &str,
+    api_key: &str,
+    local: Policy,
+) -> Policy {
+    match local.policy_fetch_fail_mode.as_deref().unwrap_or("open") {
+        "closed" => {
+            policy_diagnostic!("tirith: error: {failure}, failing closed");
+            Policy::fail_closed_policy()
+        }
+        "cached" => {
+            policy_diagnostic!("tirith: warning: {failure}, trying cache");
+            load_cached_remote_policy(server_url, api_key).unwrap_or_else(|| {
+                policy_diagnostic!("tirith: warning: no cached remote policy, using local");
+                local
+            })
+        }
+        _ => {
+            policy_diagnostic!("tirith: warning: {open_warning}");
+            local
+        }
+    }
 }
 
 /// Load a cached remote policy, running the same migrations as the direct

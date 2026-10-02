@@ -344,15 +344,15 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
         }
     }
 
-    // (2) File parsed (or absent): build the effective LOCAL policy as
-    // `analyze_inner` does (local discovery + read-only overlays) so counts
-    // match enforcement, but via `discover_local_only` so the dashboard never
-    // fetches a remote policy (CodeRabbit M13 PR #132 R9-2). Still applies
-    // incident-mode runtime overrides (a local concern).
-    let mut policy = crate::policy::Policy::discover_local_only(cwd);
-    policy.load_user_lists();
-    policy.load_org_lists(cwd);
-    policy.load_trust_entries(cwd);
+    // (2) File parsed (or absent): build the effective LOCAL policy with the
+    // same runtime overlays enforcement composes, so counts match enforcement,
+    // but via `discover_local_only` so the dashboard never fetches a remote
+    // policy (CodeRabbit M13 PR #132 R9-2). Still applies incident-mode runtime
+    // overrides (a local concern).
+    let policy = crate::policy_snapshot::compose_runtime_overlays(
+        crate::policy::Policy::discover_local_only(cwd),
+        cwd,
+    );
 
     policy_summary_from(&policy, policy.path.clone())
 }
