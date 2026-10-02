@@ -582,18 +582,15 @@ mod tests {
 
     #[cfg(unix)]
     fn plan(prepared: &PreparedClaude, id: &str) -> super::super::change_plan::OperationStatus {
-        use super::super::change_plan::{MutationService, OperationKind};
+        use super::super::change_plan::{MutationService, OperationKind, PlanRequest};
         let (requests, preimages) = prepared.setup_parts().unwrap();
+        let request = PlanRequest::change(OperationKind::RecommendedSetup, requests)
+            .preimages(preimages)
+            .intent(&serde_json::json!({"agent":"claude-code"}))
+            .unwrap();
         MutationService::current()
             .unwrap()
-            .plan_with_preimages_and_intent(
-                id,
-                OperationKind::RecommendedSetup,
-                requests,
-                &prepared.snapshot,
-                &preimages,
-                &serde_json::json!({"agent":"claude-code"}),
-            )
+            .submit(id, &prepared.snapshot, request)
             .unwrap()
     }
 

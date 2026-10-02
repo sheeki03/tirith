@@ -14,7 +14,7 @@ use tirith_core::trust_grants::{
 };
 
 use super::setup::change_plan::{
-    Edit, JobState, MutationService, OperationKind, OperationStatus, RequestedChange,
+    Edit, JobState, MutationService, OperationKind, OperationStatus, PlanRequest, RequestedChange,
 };
 
 struct Context {
@@ -203,8 +203,9 @@ impl TrustService {
             if value.get("no_op").and_then(Value::as_bool) != Some(true) {
                 return Err("trust preparation did not produce an operation outcome".into());
             }
-            let status = service
-                .complete_noop_with_intent(operation_id, kind, &self.context.snapshot, &intent)
+            let status = PlanRequest::no_op(kind)
+                .intent(&intent)
+                .and_then(|request| service.submit(operation_id, &self.context.snapshot, request))
                 .map_err(|error| self.context.redact(&error))?;
             return self.project_plan(&status);
         }
@@ -477,18 +478,11 @@ fn perform(
         .plan_only
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut request = PlanRequest::change(kind, requests).preimages(expected);
     if let Some(intent) = &context.intent {
-        service.plan_with_preimages_and_intent(
-            &id,
-            kind,
-            requests,
-            &context.snapshot,
-            &expected,
-            intent,
-        )?;
-    } else {
-        service.plan_with_preimages(&id, kind, requests, &context.snapshot, &expected)?;
+        request = request.intent(intent)?;
     }
+    service.submit(&id, &context.snapshot, request)?;
     if context.plan_only.is_some() {
         return Ok(id);
     }

@@ -405,7 +405,6 @@ pub(crate) struct RecentOperations {
 
 #[derive(Serialize)]
 pub(crate) struct OperationCoverage {
-    pub state_source: &'static str,
     pub entries_examined: usize,
     pub records_examined: usize,
     pub invalid_names: usize,
@@ -505,10 +504,22 @@ fn validate_review(
     Ok(())
 }
 
-fn bind_review_digest(original: String, review: &Option<ImpactReport>) -> Result<String, String> {
+/// Requests and payloads share one binding: a no-change intent is
+/// domain-separated by its policy scope, then any attached review is bound.
+fn bind_digest(
+    original: String,
+    no_op: bool,
+    policy: &EffectivePolicySnapshot,
+    review: &Option<ImpactReport>,
+) -> Result<String, String> {
+    let bound = if no_op {
+        digest(&("tirith-noop-v1", &original, policy.resolution_cwd()))?
+    } else {
+        original
+    };
     match review {
-        Some(review) => digest(&("tirith-impact-review-v1", original, review)),
-        None => Ok(original),
+        Some(review) => digest(&("tirith-impact-review-v1", bound, review)),
+        None => Ok(bound),
     }
 }
 
@@ -522,18 +533,81 @@ fn same_request(record: &Journal, request_digest: &str, caller_intent: Option<&s
     }
 }
 
-/// Exact caller preimages travel with their prepared owned transformations.
-pub(crate) struct PlanChanges<'a> {
-    pub requests: Vec<RequestedChange>,
-    pub preimages: &'a std::collections::BTreeMap<PathBuf, Option<String>>,
+pub(crate) type Preimages = std::collections::BTreeMap<PathBuf, Option<String>>;
+
+/// A concurrently committed journal for the same operator, kind, scope and
+/// request is a replay of `record`, not a different payload.
+fn replays(existing: &Journal, record: &Journal) -> bool {
+    existing.operator == record.operator
+        && existing.kind == record.kind
+        && existing.resolution_cwd == record.resolution_cwd
+        && same_request(
+            existing,
+            &record.request_digest,
+            record.caller_intent_digest.as_deref(),
+        )
 }
 
-#[derive(Default)]
-struct PlanMetadata {
-    caller_intent_digest: Option<String>,
+/// One durable operation request: the owned changes (or an accepted no-change
+/// intent) plus everything the journal binds before any destination changes.
+pub(crate) struct PlanRequest {
+    kind: OperationKind,
+    requests: Vec<RequestedChange>,
+    /// Exact caller preimages travel with their prepared owned transformations.
+    preimages: Preimages,
+    intent: Option<Value>,
     shell_precondition: Option<super::shell_service::ShellPrecondition>,
     no_op: bool,
     impact_review: Option<ImpactReport>,
+}
+
+impl PlanRequest {
+    pub(crate) fn change(kind: OperationKind, requests: Vec<RequestedChange>) -> Self {
+        Self {
+            kind,
+            requests,
+            preimages: Preimages::new(),
+            intent: None,
+            shell_precondition: None,
+            no_op: false,
+            impact_review: None,
+        }
+    }
+
+    /// An accepted no-change intent. A retry cannot turn this UUID into a
+    /// later mutation after configuration drift or a lost response.
+    pub(crate) fn no_op(kind: OperationKind) -> Self {
+        Self {
+            no_op: true,
+            ..Self::change(kind, Vec::new())
+        }
+    }
+
+    /// Bind transformations derived from an earlier caller read to those exact
+    /// owned preimages. Unrelated fields may change without invalidating them.
+    pub(crate) fn preimages(mut self, preimages: Preimages) -> Self {
+        self.preimages = preimages;
+        self
+    }
+
+    /// Intent must include every caller choice and scope; it is serialized
+    /// only into a private digest, never a second metadata file.
+    pub(crate) fn intent(mut self, intent: &impl Serialize) -> Result<Self, String> {
+        self.intent = Some(serde_json::to_value(intent).map_err(|e| e.to_string())?);
+        Ok(self)
+    }
+
+    pub(crate) fn shell(mut self, precondition: super::shell_service::ShellPrecondition) -> Self {
+        self.shell_precondition = Some(precondition);
+        self
+    }
+
+    /// Atomically bind a canonical diagnostic review to the immutable change.
+    /// Review fields cannot grant authorization and are never replacement input.
+    pub(crate) fn review(mut self, review: Option<ImpactReport>) -> Self {
+        self.impact_review = review;
+        self
+    }
 }
 
 impl MutationService {
@@ -609,7 +683,6 @@ impl MutationService {
         let (names, truncated) =
             fs_helpers::private_directory_names(&self.root, &self.scope, 1024)?;
         let mut coverage = OperationCoverage {
-            state_source: "persisted-private-journal",
             entries_examined: names.len(),
             records_examined: 0,
             invalid_names: 0,
@@ -712,38 +785,48 @@ impl MutationService {
         requests: Vec<RequestedChange>,
         policy: &EffectivePolicySnapshot,
     ) -> Result<OperationStatus, String> {
-        self.plan_with_preimages(
-            operation_id,
-            kind,
-            requests,
-            policy,
-            &std::collections::BTreeMap::new(),
-        )
+        self.submit(operation_id, policy, PlanRequest::change(kind, requests))
     }
 
-    /// Bind transformations derived from an earlier caller read to those exact
-    /// owned preimages. Unrelated fields may change without invalidating them.
-    pub(crate) fn plan_with_preimages(
+    /// The single entry point that publishes an operation journal.
+    pub(crate) fn submit(
         &self,
         operation_id: &str,
-        kind: OperationKind,
-        requests: Vec<RequestedChange>,
         policy: &EffectivePolicySnapshot,
-        expected_documents: &std::collections::BTreeMap<PathBuf, Option<String>>,
+        request: PlanRequest,
     ) -> Result<OperationStatus, String> {
-        self.plan_inner(
-            operation_id,
-            kind,
-            requests,
-            policy,
-            expected_documents,
-            PlanMetadata {
-                caller_intent_digest: None,
-                shell_precondition: None,
-                no_op: false,
-                impact_review: None,
-            },
-        )
+        if request.shell_precondition.is_some()
+            && !matches!(
+                request.kind,
+                OperationKind::SetupShell
+                    | OperationKind::RemoveIntegration
+                    | OperationKind::RecommendedSetup
+            )
+        {
+            return Err("shell preconditions require a shell setup/removal operation".into());
+        }
+        if request.no_op && request.impact_review.is_none() {
+            // A replayed no-change intent returns its terminal record before
+            // any fresh validation; a review-bound one is checked by plan_inner.
+            uuid::Uuid::parse_str(operation_id).map_err(|_| "operation ID must be a UUID")?;
+            if let Some(intent) = &request.intent {
+                if let Some(status) = self.status_for_intent(operation_id, request.kind, intent)? {
+                    let record = self.read(operation_id)?;
+                    if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
+                        return Err(
+                            "operation ID already belongs to a different policy scope".into()
+                        );
+                    }
+                    return Ok(status);
+                }
+            }
+        }
+        let caller_intent_digest = request
+            .intent
+            .as_ref()
+            .map(|intent| self.intent_digest(request.kind, intent))
+            .transpose()?;
+        self.plan_inner(operation_id, policy, request, caller_intent_digest)
     }
 
     /// Look up an already prepared high-level request before generating IDs or
@@ -784,151 +867,6 @@ impl MutationService {
         ))
     }
 
-    pub(crate) fn plan_with_preimages_and_intent(
-        &self,
-        operation_id: &str,
-        kind: OperationKind,
-        requests: Vec<RequestedChange>,
-        policy: &EffectivePolicySnapshot,
-        expected_documents: &std::collections::BTreeMap<PathBuf, Option<String>>,
-        intent: &impl Serialize,
-    ) -> Result<OperationStatus, String> {
-        self.plan_inner(
-            operation_id,
-            kind,
-            requests,
-            policy,
-            expected_documents,
-            PlanMetadata {
-                caller_intent_digest: Some(self.intent_digest(kind, intent)?),
-                shell_precondition: None,
-                no_op: false,
-                impact_review: None,
-            },
-        )
-    }
-
-    pub(crate) fn plan_shell_change_with_intent(
-        &self,
-        operation_id: &str,
-        kind: OperationKind,
-        changes: PlanChanges<'_>,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-        precondition: super::shell_service::ShellPrecondition,
-    ) -> Result<OperationStatus, String> {
-        let PlanChanges {
-            requests,
-            preimages: expected_documents,
-        } = changes;
-        if !matches!(
-            kind,
-            OperationKind::SetupShell
-                | OperationKind::RemoveIntegration
-                | OperationKind::RecommendedSetup
-        ) {
-            return Err("shell preconditions require a shell setup/removal operation".into());
-        }
-        self.plan_inner(
-            operation_id,
-            kind,
-            requests,
-            policy,
-            expected_documents,
-            PlanMetadata {
-                caller_intent_digest: Some(self.intent_digest(kind, intent)?),
-                shell_precondition: Some(precondition),
-                no_op: false,
-                impact_review: None,
-            },
-        )
-    }
-
-    /// Persist an accepted no-change intent. A retry cannot turn this UUID
-    /// into a later mutation after configuration drift or a lost response.
-    pub(crate) fn complete_noop_with_intent(
-        &self,
-        operation_id: &str,
-        kind: OperationKind,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-    ) -> Result<OperationStatus, String> {
-        uuid::Uuid::parse_str(operation_id).map_err(|_| "operation ID must be a UUID")?;
-        if let Some(status) = self.status_for_intent(operation_id, kind, intent)? {
-            let record = self.read(operation_id)?;
-            if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
-                return Err("operation ID already belongs to a different policy scope".into());
-            }
-            return Ok(status);
-        }
-        self.plan_inner(
-            operation_id,
-            kind,
-            Vec::new(),
-            policy,
-            &std::collections::BTreeMap::new(),
-            PlanMetadata {
-                caller_intent_digest: Some(self.intent_digest(kind, intent)?),
-                shell_precondition: None,
-                no_op: true,
-                impact_review: None,
-            },
-        )
-    }
-
-    /// Atomically bind a canonical diagnostic review to the immutable change.
-    /// Review fields cannot grant authorization and are never replacement input.
-    pub(crate) fn plan_with_preimages_intent_and_review(
-        &self,
-        operation_id: &str,
-        kind: OperationKind,
-        changes: PlanChanges<'_>,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-        review: ImpactReport,
-    ) -> Result<OperationStatus, String> {
-        let PlanChanges {
-            requests,
-            preimages: expected_documents,
-        } = changes;
-        self.plan_inner(
-            operation_id,
-            kind,
-            requests,
-            policy,
-            expected_documents,
-            PlanMetadata {
-                caller_intent_digest: Some(self.intent_digest(kind, intent)?),
-                shell_precondition: None,
-                no_op: false,
-                impact_review: Some(review),
-            },
-        )
-    }
-
-    pub(crate) fn complete_noop_with_intent_and_review(
-        &self,
-        operation_id: &str,
-        kind: OperationKind,
-        policy: &EffectivePolicySnapshot,
-        intent: &impl Serialize,
-        review: ImpactReport,
-    ) -> Result<OperationStatus, String> {
-        self.plan_inner(
-            operation_id,
-            kind,
-            Vec::new(),
-            policy,
-            &std::collections::BTreeMap::new(),
-            PlanMetadata {
-                caller_intent_digest: Some(self.intent_digest(kind, intent)?),
-                shell_precondition: None,
-                no_op: true,
-                impact_review: Some(review),
-            },
-        )
-    }
-
     /// A typed, validated projection; private preimages and input digests never
     /// escape through this route. Replays retain the originally accepted review.
     pub(crate) fn impact_review(&self, operation_id: &str) -> Result<Option<ImpactReport>, String> {
@@ -945,18 +883,20 @@ impl MutationService {
     fn plan_inner(
         &self,
         operation_id: &str,
-        kind: OperationKind,
-        requests: Vec<RequestedChange>,
         policy: &EffectivePolicySnapshot,
-        expected_documents: &std::collections::BTreeMap<PathBuf, Option<String>>,
-        metadata: PlanMetadata,
+        request: PlanRequest,
+        caller_intent_digest: Option<String>,
     ) -> Result<OperationStatus, String> {
-        let PlanMetadata {
-            caller_intent_digest,
+        let PlanRequest {
+            kind,
+            requests,
+            preimages: expected_documents,
+            intent: _,
             shell_precondition,
             no_op,
             impact_review,
-        } = metadata;
+        } = request;
+        let expected_documents = &expected_documents;
         if expected_documents.iter().any(|(path, document)| {
             !requests.iter().any(|request| &request.target == path)
                 || document
@@ -968,24 +908,19 @@ impl MutationService {
             );
         }
         let path = self.path(operation_id)?;
-        let original_request_digest = digest(&(
-            kind,
-            &self.operator,
-            env!("CARGO_PKG_VERSION"),
-            &requests,
-            expected_documents,
-            &shell_precondition,
-        ))?;
-        let request_digest = if no_op {
+        let request_digest = bind_digest(
             digest(&(
-                "tirith-noop-v1",
-                &original_request_digest,
-                policy.resolution_cwd(),
-            ))?
-        } else {
-            original_request_digest
-        };
-        let request_digest = bind_review_digest(request_digest, &impact_review)?;
+                kind,
+                &self.operator,
+                env!("CARGO_PKG_VERSION"),
+                &requests,
+                expected_documents,
+                &shell_precondition,
+            ))?,
+            no_op,
+            policy,
+            &impact_review,
+        )?;
         if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
             let record: Journal = serde_json::from_str(&existing)
                 .map_err(|_| "existing operation journal is malformed")?;
@@ -1203,23 +1138,18 @@ impl MutationService {
         }
         steps.sort_by_key(|step| step.activation);
         // The digest includes private owned preimages and payload, never public output.
-        let original_payload_digest = digest(&(
-            kind,
-            &self.operator,
-            env!("CARGO_PKG_VERSION"),
-            &steps,
-            &shell_precondition,
-        ))?;
-        let payload_digest = if no_op {
+        let payload_digest = bind_digest(
             digest(&(
-                "tirith-noop-v1",
-                &original_payload_digest,
-                policy.resolution_cwd(),
-            ))?
-        } else {
-            original_payload_digest
-        };
-        let payload_digest = bind_review_digest(payload_digest, &impact_review)?;
+                kind,
+                &self.operator,
+                env!("CARGO_PKG_VERSION"),
+                &steps,
+                &shell_precondition,
+            ))?,
+            no_op,
+            policy,
+            &impact_review,
+        )?;
         let record = Journal {
             schema_version: SCHEMA,
             operation_id: operation_id.into(),
@@ -1262,15 +1192,7 @@ impl MutationService {
                 if let Some(text) = snapshot.text(&path)? {
                     let old: Journal = serde_json::from_str(text)
                         .map_err(|_| "existing operation journal is malformed")?;
-                    if old.operator != record.operator
-                        || old.kind != record.kind
-                        || old.resolution_cwd != record.resolution_cwd
-                        || !same_request(
-                            &old,
-                            &record.request_digest,
-                            record.caller_intent_digest.as_deref(),
-                        )
-                    {
+                    if !replays(&old, &record) {
                         return Err("operation ID already belongs to a different operator, kind or immutable payload".into());
                     }
                     return Ok(FileUpdate::unchanged());
@@ -1287,15 +1209,7 @@ impl MutationService {
                 if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
                     let existing: Journal = serde_json::from_str(&existing)
                         .map_err(|_| "existing operation journal is malformed")?;
-                    if existing.operator == record.operator
-                        && existing.kind == record.kind
-                        && existing.resolution_cwd == record.resolution_cwd
-                        && same_request(
-                            &existing,
-                            &record.request_digest,
-                            record.caller_intent_digest.as_deref(),
-                        )
-                    {
+                    if replays(&existing, &record) {
                         return Ok(());
                     }
                     return Err(
@@ -2524,31 +2438,25 @@ fn set_field(document: &mut Value, pointer: &str, value: &Option<Value>) -> Resu
     Ok(())
 }
 
-const BEGIN: &str = "# BEGIN tirith-hook v1";
-const END: &str = "# END tirith-hook";
+use super::shell_profile::BEGIN_MARKER as BEGIN;
+/// The single current-version managed block, if any. Only the exact v1 BEGIN
+/// line is owned here; the shell service binds whole files for other versions.
 fn hook_block(text: &str) -> Result<Option<String>, String> {
-    let mut start = None;
-    let mut found = None;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed == BEGIN {
-            if start.is_some() || found.is_some() {
-                return Err(refresh("multiple/nested managed shell blocks"));
-            }
-            start = Some(offset);
-        } else if trimmed == END {
-            let begin = start
-                .take()
-                .ok_or_else(|| refresh("unpaired shell END marker"))?;
-            found = Some(text[begin..offset + line.len()].to_owned());
-        }
-        offset += line.len();
+    use super::shell_profile::MarkerError;
+    let blocks = super::shell_profile::hook_blocks_matching(text, |line| line == BEGIN).map_err(
+        |error| {
+            refresh(match error {
+                MarkerError::NestedBegin => "multiple/nested managed shell blocks",
+                MarkerError::EndWithoutBegin => "unpaired shell END marker",
+                MarkerError::MissingEnd => "unpaired shell BEGIN marker",
+            })
+        },
+    )?;
+    match blocks.as_slice() {
+        [] => Ok(None),
+        [(start, end)] => Ok(Some(text[*start..*end].to_owned())),
+        _ => Err(refresh("multiple/nested managed shell blocks")),
     }
-    if start.is_some() {
-        return Err(refresh("unpaired shell BEGIN marker"));
-    }
-    Ok(found)
 }
 fn validate_hook_payload(block: &str) -> Result<(), String> {
     if hook_block(block)?.as_deref() != Some(block) {
@@ -2803,6 +2711,7 @@ fn transform_fields(edits: &[OwnedEdit], text: &str, undo: bool) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
+    use super::super::shell_profile::END_MARKER as END;
     use super::*;
     use crate::cli::test_harness::with_fake_env;
     use tirith_core::policy_snapshot::ResolutionMode;
@@ -2817,6 +2726,98 @@ mod tests {
     } else {
         JobState::Undone
     };
+
+    type Plan = Result<OperationStatus, String>;
+    fn noop(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+    ) -> Plan {
+        service.submit(id, policy, PlanRequest::no_op(kind).intent(intent)?)
+    }
+    fn noop_reviewed(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+        review: ImpactReport,
+    ) -> Plan {
+        let request = PlanRequest::no_op(kind)
+            .intent(intent)?
+            .review(Some(review));
+        service.submit(id, policy, request)
+    }
+    fn change_with_preimages(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        policy: &EffectivePolicySnapshot,
+        preimages: &Preimages,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests).preimages(preimages.clone());
+        service.submit(id, policy, request)
+    }
+    fn change_with_intent(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        policy: &EffectivePolicySnapshot,
+        preimages: &Preimages,
+        intent: &impl Serialize,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests)
+            .preimages(preimages.clone())
+            .intent(intent)?;
+        service.submit(id, policy, request)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn change_reviewed(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        preimages: &Preimages,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+        review: ImpactReport,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests)
+            .preimages(preimages.clone())
+            .intent(intent)?
+            .review(Some(review));
+        service.submit(id, policy, request)
+    }
+
+    #[test]
+    fn plan_request_intent_digest_matches_the_serialized_caller_intent() {
+        // `PlanRequest::intent` stores the intent as a JSON value; the journal
+        // digest must stay exactly the digest of the caller's typed intent.
+        let service = MutationService {
+            scope: PathBuf::from("/fixture"),
+            root: PathBuf::from("/fixture/operations"),
+            operator: "fixture-user".into(),
+        };
+        let intent = (
+            "user",
+            Some("/project"),
+            30u32,
+            serde_json::json!({"b": 1, "a": [2]}),
+        );
+        let stored = serde_json::to_value(intent.clone()).unwrap();
+        assert_eq!(
+            service
+                .intent_digest(OperationKind::SetProfile, &intent)
+                .unwrap(),
+            service
+                .intent_digest(OperationKind::SetProfile, &stored)
+                .unwrap()
+        );
+    }
 
     fn fixture(home: &Path) -> MutationService {
         MutationService {
@@ -3121,56 +3122,54 @@ mod tests {
                 let review = impact_fixture(&id, &snapshot);
                 let report_id = review.id.as_str().to_owned();
                 if no_op {
-                    service
-                        .complete_noop_with_intent_and_review(
-                            &id,
-                            OperationKind::SetProfile,
-                            &snapshot,
-                            &"balanced",
-                            review,
-                        )
-                        .unwrap();
+                    noop_reviewed(
+                        &service,
+                        &id,
+                        OperationKind::SetProfile,
+                        &snapshot,
+                        &"balanced",
+                        review,
+                    )
+                    .unwrap();
                 } else {
-                    service
-                        .plan_with_preimages_intent_and_review(
-                            &id,
-                            OperationKind::SetProfile,
-                            PlanChanges {
-                                requests: vec![field_request(home, "strict")],
-                                preimages: &Default::default(),
-                            },
-                            &snapshot,
-                            &"balanced",
-                            review,
-                        )
-                        .unwrap();
+                    change_reviewed(
+                        &service,
+                        &id,
+                        OperationKind::SetProfile,
+                        vec![field_request(home, "strict")],
+                        &Default::default(),
+                        &snapshot,
+                        &"balanced",
+                        review,
+                    )
+                    .unwrap();
                 }
                 let mut refreshed = policy();
                 refreshed.identity = uuid::Uuid::new_v4().to_string();
                 let new_review = impact_fixture(&id, &refreshed);
-                service
-                    .complete_noop_with_intent_and_review(
-                        &id,
-                        OperationKind::SetProfile,
-                        &refreshed,
-                        &"balanced",
-                        new_review,
-                    )
-                    .unwrap();
+                noop_reviewed(
+                    &service,
+                    &id,
+                    OperationKind::SetProfile,
+                    &refreshed,
+                    &"balanced",
+                    new_review,
+                )
+                .unwrap();
                 assert_eq!(
                     service.impact_review(&id).unwrap().unwrap().id.as_str(),
                     report_id
                 );
                 assert_eq!(service.read_status(&id).unwrap().no_op, no_op);
-                assert!(service
-                    .complete_noop_with_intent_and_review(
-                        &id,
-                        OperationKind::SetProfile,
-                        &snapshot,
-                        &"different",
-                        impact_fixture(&id, &snapshot)
-                    )
-                    .is_err());
+                assert!(noop_reviewed(
+                    &service,
+                    &id,
+                    OperationKind::SetProfile,
+                    &snapshot,
+                    &"different",
+                    impact_fixture(&id, &snapshot)
+                )
+                .is_err());
             }
             assert!(!home.join("settings.json").exists());
         });
@@ -3184,26 +3183,26 @@ mod tests {
             let id = uuid::Uuid::new_v4().to_string();
             let mut report = impact_fixture(&id, &snapshot);
             report.scope = RolloutScope::RemoteManaged;
-            assert!(service
-                .complete_noop_with_intent_and_review(
-                    &id,
-                    OperationKind::SetProfile,
-                    &snapshot,
-                    &"same",
-                    report
-                )
-                .is_err());
+            assert!(noop_reviewed(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &snapshot,
+                &"same",
+                report
+            )
+            .is_err());
             assert!(!service.path(&id).unwrap().exists());
             let report = impact_fixture(&uuid::Uuid::new_v4().to_string(), &snapshot);
-            assert!(service
-                .complete_noop_with_intent_and_review(
-                    &id,
-                    OperationKind::SetProfile,
-                    &snapshot,
-                    &"same",
-                    report
-                )
-                .is_err());
+            assert!(noop_reviewed(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &snapshot,
+                &"same",
+                report
+            )
+            .is_err());
             assert!(!service.path(&id).unwrap().exists());
         });
     }
@@ -3215,9 +3214,8 @@ mod tests {
             let snapshot = policy();
             let id = uuid::Uuid::new_v4().to_string();
             let intent = ("user", "balanced");
-            let accepted = service
-                .complete_noop_with_intent(&id, OperationKind::SetProfile, &snapshot, &intent)
-                .unwrap();
+            let accepted =
+                noop(&service, &id, OperationKind::SetProfile, &snapshot, &intent).unwrap();
             assert!(accepted.no_op);
             assert_eq!(accepted.state, JobState::Completed);
             assert!(accepted.steps.is_empty());
@@ -3226,37 +3224,37 @@ mod tests {
             std::fs::create_dir_all(&config).unwrap();
             std::fs::write(config.join("policy.yaml"), "fail_mode: closed\n").unwrap();
             let refreshed = policy();
-            let retry = service
-                .plan_with_preimages_and_intent(
-                    &id,
-                    OperationKind::SetProfile,
-                    vec![field_request(home, "would-be-a-new-write")],
-                    &refreshed,
-                    &Default::default(),
-                    &intent,
-                )
-                .unwrap();
+            let retry = change_with_intent(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                vec![field_request(home, "would-be-a-new-write")],
+                &refreshed,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
             assert!(retry.no_op);
             assert_eq!(retry.created_at, accepted.created_at);
             assert_eq!(retry.policy_identity, accepted.policy_identity);
-            assert!(service
-                .complete_noop_with_intent(
-                    &id,
-                    OperationKind::SetProfile,
-                    &refreshed,
-                    &("user", "strict")
-                )
-                .is_err());
-            assert!(service
-                .plan_with_preimages_and_intent(
-                    &id,
-                    OperationKind::SetProfile,
-                    vec![field_request(home, "strict")],
-                    &refreshed,
-                    &Default::default(),
-                    &("user", "strict")
-                )
-                .is_err());
+            assert!(noop(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &refreshed,
+                &("user", "strict")
+            )
+            .is_err());
+            assert!(change_with_intent(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &refreshed,
+                &Default::default(),
+                &("user", "strict")
+            )
+            .is_err());
             let baseline = active_job_count();
             assert!(service.apply(&id, &refreshed).unwrap().no_op);
             assert!(service.undo(&id, &refreshed).unwrap().no_op);
@@ -3276,23 +3274,19 @@ mod tests {
     fn no_op_requires_uuid_and_binds_scope_even_when_intent_omits_it() {
         with_fake_env(true, |home, _| {
             let service = fixture(home);
-            assert!(service
-                .complete_noop_with_intent(
-                    "not-a-uuid",
-                    OperationKind::SetProfile,
-                    &policy(),
-                    &"same"
-                )
-                .is_err());
+            assert!(noop(
+                &service,
+                "not-a-uuid",
+                OperationKind::SetProfile,
+                &policy(),
+                &"same"
+            )
+            .is_err());
             assert!(!service.root.exists());
             let id = uuid::Uuid::new_v4().to_string();
-            service
-                .complete_noop_with_intent(&id, OperationKind::SetProfile, &policy(), &"same")
-                .unwrap();
+            noop(&service, &id, OperationKind::SetProfile, &policy(), &"same").unwrap();
             let scoped = EffectivePolicySnapshot::resolve(home.to_str(), ResolutionMode::Runtime);
-            assert!(service
-                .complete_noop_with_intent(&id, OperationKind::SetProfile, &scoped, &"same")
-                .is_err());
+            assert!(noop(&service, &id, OperationKind::SetProfile, &scoped, &"same").is_err());
         });
     }
 
@@ -3306,27 +3300,27 @@ mod tests {
                 .status_for_intent("intent", OperationKind::AddTrust, &intent)
                 .unwrap()
                 .is_none());
-            service
-                .plan_with_preimages_and_intent(
-                    "intent",
-                    OperationKind::AddTrust,
-                    vec![field_request(home, "first-generated-uuid-and-expiry")],
-                    &policy,
-                    &Default::default(),
-                    &intent,
-                )
-                .unwrap();
+            change_with_intent(
+                &service,
+                "intent",
+                OperationKind::AddTrust,
+                vec![field_request(home, "first-generated-uuid-and-expiry")],
+                &policy,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
             let original = service.read("intent").unwrap().payload_digest;
-            service
-                .plan_with_preimages_and_intent(
-                    "intent",
-                    OperationKind::AddTrust,
-                    vec![field_request(home, "regenerated-uuid-and-expiry")],
-                    &policy,
-                    &Default::default(),
-                    &intent,
-                )
-                .unwrap();
+            change_with_intent(
+                &service,
+                "intent",
+                OperationKind::AddTrust,
+                vec![field_request(home, "regenerated-uuid-and-expiry")],
+                &policy,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
             assert_eq!(service.read("intent").unwrap().payload_digest, original);
             assert!(service
                 .status_for_intent(
@@ -3415,7 +3409,8 @@ mod tests {
             let intent = ("user-scope", "30d");
             std::thread::scope(|scope| {
                 let first = scope.spawn(|| {
-                    service.plan_with_preimages_and_intent(
+                    change_with_intent(
+                        &service,
                         "intent-race",
                         OperationKind::AddTrust,
                         vec![field_request(home, "first")],
@@ -3425,7 +3420,8 @@ mod tests {
                     )
                 });
                 let second = scope.spawn(|| {
-                    service.plan_with_preimages_and_intent(
+                    change_with_intent(
+                        &service,
                         "intent-race",
                         OperationKind::AddTrust,
                         vec![field_request(home, "second")],
@@ -3722,15 +3718,15 @@ mod tests {
                 r#"{"tirith":{"profile":"manual"}}"#,
             )
             .unwrap();
-            let error = service
-                .plan_with_preimages(
-                    "caller-race",
-                    OperationKind::SetProfile,
-                    vec![field_request(home, "strict")],
-                    &policy(),
-                    &expected,
-                )
-                .unwrap_err();
+            let error = change_with_preimages(
+                &service,
+                "caller-race",
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &policy(),
+                &expected,
+            )
+            .unwrap_err();
             assert!(error.starts_with("refresh-required:"), "{error}");
             assert!(std::fs::read_to_string(home.join("settings.json"))
                 .unwrap()
@@ -3754,15 +3750,15 @@ mod tests {
             )
             .unwrap();
             let authorization = policy();
-            service
-                .plan_with_preimages(
-                    "caller-unrelated",
-                    OperationKind::SetProfile,
-                    vec![field_request(home, "strict")],
-                    &authorization,
-                    &expected,
-                )
-                .unwrap();
+            change_with_preimages(
+                &service,
+                "caller-unrelated",
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &authorization,
+                &expected,
+            )
+            .unwrap();
             assert_eq!(
                 service
                     .apply("caller-unrelated", &authorization)
@@ -4314,28 +4310,27 @@ mod tests {
                 review.scope = RolloutScope::LocalManaged;
                 let preimages =
                     std::collections::BTreeMap::from([(target.clone(), Some(original.to_owned()))]);
-                let planned = service.plan_with_preimages_intent_and_review(
+                let planned = change_reviewed(
+                    &service,
                     &id,
                     OperationKind::SetManagedProfile,
-                    PlanChanges {
-                        requests: vec![RequestedChange {
-                            target: target.clone(),
-                            scope_root: directory,
-                            edit: Edit::YamlFields(std::collections::BTreeMap::from([
-                                (
-                                    "/protection_profile/name".into(),
-                                    Some(serde_json::json!("balanced")),
-                                ),
-                                (
-                                    "/protection_profile/version".into(),
-                                    Some(serde_json::json!(1)),
-                                ),
-                            ])),
-                            activation: true,
-                            description: "Set the selected organization profile".into(),
-                        }],
-                        preimages: &preimages,
-                    },
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: directory,
+                        edit: Edit::YamlFields(std::collections::BTreeMap::from([
+                            (
+                                "/protection_profile/name".into(),
+                                Some(serde_json::json!("balanced")),
+                            ),
+                            (
+                                "/protection_profile/version".into(),
+                                Some(serde_json::json!(1)),
+                            ),
+                        ])),
+                        activation: true,
+                        description: "Set the selected organization profile".into(),
+                    }],
+                    &preimages,
                     &snapshot,
                     &serde_json::json!({"scope": "org", "profile": "balanced"}),
                     review,

@@ -8,15 +8,15 @@ use serde_json::Value;
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::trusted_child::TrustedExecutable;
 
-use super::change_plan::{Edit, MutationService, OperationKind, OperationStatus, RequestedChange};
+use super::change_plan::{
+    Edit, MutationService, OperationKind, OperationStatus, PlanRequest, RequestedChange,
+};
 use super::shell_profile::{
-    has_executable_tirith_init, is_managed_begin_marker, shell_quote, validate_marker_pairing,
+    has_executable_tirith_init, hook_blocks, shell_quote, without_blocks, BEGIN_MARKER as BEGIN,
+    END_MARKER as END,
 };
 use crate::cli::control::identity::BinaryIdentity;
 use crate::cli::shell_target::{self, ProfileTarget, ShellTarget};
-
-const BEGIN: &str = "# BEGIN tirith-hook v1";
-const END: &str = "# END tirith-hook";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -446,8 +446,7 @@ impl PreparedShell {
         desired: Option<&str>,
     ) -> Result<(), String> {
         let original = before.as_deref().unwrap_or_default();
-        validate_marker_pairing(original)?;
-        let blocks = block_ranges(original);
+        let blocks = hook_blocks(original)?;
         let manual = blocks.is_empty() && has_executable_tirith_init(original);
         let action;
         let edit;
@@ -629,34 +628,22 @@ impl PreparedShell {
         {
             return Ok(Some(status));
         }
-        if !self.changed {
-            return service
-                .complete_noop_with_intent(
-                    id,
-                    self.intent.change.kind(),
-                    &self.snapshot,
-                    &self.intent,
-                )
-                .map(Some);
-        }
-        self.retained.revalidate()?;
-        let expected: BTreeMap<_, _> = self
-            .steps
-            .iter()
-            .map(|step| (step.target.clone(), step.before.clone()))
-            .collect();
+        let kind = self.intent.change.kind();
+        let request = if !self.changed {
+            PlanRequest::no_op(kind)
+        } else {
+            self.retained.revalidate()?;
+            let expected: BTreeMap<_, _> = self
+                .steps
+                .iter()
+                .map(|step| (step.target.clone(), step.before.clone()))
+                .collect();
+            PlanRequest::change(kind, self.steps.iter().map(PreparedStep::request).collect())
+                .preimages(expected)
+                .shell(self.retained.expected.clone())
+        };
         service
-            .plan_shell_change_with_intent(
-                id,
-                self.intent.change.kind(),
-                super::change_plan::PlanChanges {
-                    requests: self.steps.iter().map(PreparedStep::request).collect(),
-                    preimages: &expected,
-                },
-                &self.snapshot,
-                &self.intent,
-                self.retained.expected.clone(),
-            )
+            .submit(id, &self.snapshot, request.intent(&self.intent)?)
             .map(Some)
     }
 }
@@ -693,35 +680,6 @@ fn removal_candidates(target: &ShellTarget, remove: bool) -> Vec<ProfileTarget> 
         }
     }
     profiles
-}
-
-fn block_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = None;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let marker = line.trim_end_matches(['\r', '\n']);
-        if is_managed_begin_marker(marker) {
-            start = Some(offset);
-        } else if marker == END {
-            if let Some(start) = start.take() {
-                ranges.push((start, offset + line.len()));
-            }
-        }
-        offset += line.len();
-    }
-    ranges
-}
-
-fn without_blocks(text: &str, blocks: &[(usize, usize)]) -> String {
-    let mut output = String::new();
-    let mut offset = 0;
-    for &(start, end) in blocks {
-        output.push_str(&text[offset..start]);
-        offset = end;
-    }
-    output.push_str(&text[offset..]);
-    output
 }
 
 /// CLI adapter over the same derived plan used by browser controls.
@@ -849,16 +807,15 @@ pub(crate) fn inspect(shell: ShellKind, cwd: Option<&str>) -> Result<Value, Stri
         .map(|profile| {
             let result = super::fs_helpers::read_to_string_scoped(&profile.path, &profile.scope);
             let state = match result {
-                Ok(Some(text)) if validate_marker_pairing(&text).is_err() => {
-                    "malformed-managed-markers"
-                }
-                Ok(Some(text)) if !block_ranges(&text).is_empty() => {
-                    "managed-block-present-unverified"
-                }
-                Ok(Some(text)) if has_executable_tirith_init(&text) => {
-                    "manual-activation-present-unverified"
-                }
-                Ok(_) => "absent",
+                Ok(Some(text)) => match hook_blocks(&text) {
+                    Err(_) => "malformed-managed-markers",
+                    Ok(blocks) if !blocks.is_empty() => "managed-block-present-unverified",
+                    Ok(_) if has_executable_tirith_init(&text) => {
+                        "manual-activation-present-unverified"
+                    }
+                    Ok(_) => "absent",
+                },
+                Ok(None) => "absent",
                 Err(_) => "unreadable-or-unsafe",
             };
             serde_json::json!({"path":profile.path,"startup":profile.startup,"state":state})
@@ -1058,9 +1015,8 @@ mod tests {
     #[test]
     fn removal_preserves_all_unowned_bytes_and_future_marker_versions() {
         let input = "before\r\n# BEGIN tirith-hook v27\r\nold hook\r\n# END tirith-hook\r\nbetween\n# BEGIN tirith-hook v1\ncurrent hook\n# END tirith-hook\nafter without final newline";
-        validate_marker_pairing(input).unwrap();
         assert_eq!(
-            without_blocks(input, &block_ranges(input)),
+            without_blocks(input, &hook_blocks(input).unwrap()),
             "before\r\nbetween\nafter without final newline"
         );
     }

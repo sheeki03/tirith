@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 use tirith_core::audit::retention::{LockedAuditLog, RotationPlan, RotationState, RotationStore};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 
-use super::change_plan::{Edit, MutationService, OperationKind, OperationStatus, RequestedChange};
+use super::change_plan::{
+    Edit, MutationService, OperationKind, OperationStatus, PlanRequest, RequestedChange,
+};
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome};
 
@@ -43,8 +45,7 @@ pub(crate) fn prepare(
     super::change_plan::preflight_target(OperationKind::RotateAudit, &root, &target, &snapshot)?;
     let plan = capture(id, &target, &root, &snapshot)?;
     let preview = plan.projection();
-    let status = service.plan_with_preimages_and_intent(
-        id,
+    let request = PlanRequest::change(
         OperationKind::RotateAudit,
         vec![RequestedChange {
             target,
@@ -53,10 +54,9 @@ pub(crate) fn prepare(
             activation: true,
             description: "Rotate verified audit history to a private retained segment".into(),
         }],
-        &snapshot,
-        &Default::default(),
-        &intent,
-    )?;
+    )
+    .intent(&intent)?;
+    let status = service.submit(id, &snapshot, request)?;
     projection(status, Some(preview))
 }
 

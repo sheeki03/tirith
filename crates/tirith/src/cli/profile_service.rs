@@ -9,7 +9,7 @@ use tirith_core::protection_profiles::{self, ProfileChange, ProfilePreview, Prot
 
 use super::managed_policy::ProfileScope;
 use super::setup::change_plan::{
-    Edit, MutationService, OperationKind, OperationStatus, RequestedChange,
+    Edit, MutationService, OperationKind, OperationStatus, PlanRequest, RequestedChange,
 };
 
 pub(crate) type PreparedProfileParts = (Vec<RequestedChange>, BTreeMap<PathBuf, Option<String>>);
@@ -219,47 +219,21 @@ impl PreparedProfile {
             return Ok(Some(status));
         }
         let (changes, expected) = self.setup_parts()?;
+        let kind = self.scope.operation_kind();
         if changes.is_empty() {
-            if let Some(review) = review {
-                return service
-                    .complete_noop_with_intent_and_review(
-                        id,
-                        self.scope.operation_kind(),
-                        &self.snapshot,
-                        intent,
-                        review,
-                    )
-                    .map(Some);
-            }
-            return service
-                .complete_noop_with_intent(id, self.scope.operation_kind(), &self.snapshot, intent)
-                .map(Some);
+            let request = PlanRequest::no_op(kind).intent(intent)?.review(review);
+            return service.submit(id, &self.snapshot, request).map(Some);
         }
-        let result = if let Some(review) = review {
-            service.plan_with_preimages_intent_and_review(
-                id,
-                self.scope.operation_kind(),
-                super::setup::change_plan::PlanChanges {
-                    requests: changes,
-                    preimages: &expected,
-                },
-                &self.snapshot,
-                intent,
-                review,
-            )
-        } else {
-            service.plan_with_preimages_and_intent(
-                id,
-                self.scope.operation_kind(),
-                changes,
-                &self.snapshot,
-                &expected,
-                intent,
-            )
-        };
-        result.map(Some).map_err(|error| {
-            tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &self.compiled)
-        })
+        let request = PlanRequest::change(kind, changes)
+            .preimages(expected)
+            .intent(intent)?
+            .review(review);
+        service
+            .submit(id, &self.snapshot, request)
+            .map(Some)
+            .map_err(|error| {
+                tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &self.compiled)
+            })
     }
 
     /// Reuse the exact prepared field materialization in a combined setup
@@ -697,34 +671,33 @@ impl PreparedSetting {
 
     fn plan(&self, id: &str) -> Result<Option<OperationStatus>, String> {
         if self.fields.is_empty() {
+            let request =
+                PlanRequest::no_op(OperationKind::SetPersonalSetting).intent(&self.intent)?;
             return MutationService::current()?
-                .complete_noop_with_intent(
-                    id,
-                    OperationKind::SetPersonalSetting,
-                    &self.base.snapshot,
-                    &self.intent,
-                )
+                .submit(id, &self.base.snapshot, request)
                 .map(Some);
         }
         self.base
             .snapshot
             .revalidate_inputs()
             .map_err(|_| "policy changed; refresh the personal settings plan")?;
+        let request = PlanRequest::change(
+            OperationKind::SetPersonalSetting,
+            vec![RequestedChange {
+                target: self.base.path.clone(),
+                scope_root: self.base.config.clone(),
+                edit: Edit::YamlFields(self.fields.clone()),
+                activation: true,
+                description: format!("Change personal setting: {}", self.field),
+            }],
+        )
+        .preimages(BTreeMap::from([(
+            self.base.path.clone(),
+            self.base.original_text.clone(),
+        )]))
+        .intent(&self.intent)?;
         MutationService::current()?
-            .plan_with_preimages_and_intent(
-                id,
-                OperationKind::SetPersonalSetting,
-                vec![RequestedChange {
-                    target: self.base.path.clone(),
-                    scope_root: self.base.config.clone(),
-                    edit: Edit::YamlFields(self.fields.clone()),
-                    activation: true,
-                    description: format!("Change personal setting: {}", self.field),
-                }],
-                &self.base.snapshot,
-                &BTreeMap::from([(self.base.path.clone(), self.base.original_text.clone())]),
-                &self.intent,
-            )
+            .submit(id, &self.base.snapshot, request)
             .map(Some)
     }
 }
@@ -779,66 +752,51 @@ pub(crate) fn setting_cli(
     dry_run: bool,
     json: bool,
 ) -> i32 {
-    let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
-    let result = (|| -> Result<i32, String> {
-        let value = match value {
-            "reset" => serde_json::Value::Null,
-            "true" => true.into(),
-            "false" => false.into(),
-            value => value
-                .parse::<u8>()
-                .map(serde_json::Value::from)
-                .unwrap_or_else(|_| value.into()),
-        };
-        let mut request = serde_json::json!({"setting":name,"value":value});
-        if let Some(rule) = rule {
-            request["rule"] = rule.into();
-        }
-        let change: PersonalSettingChange = serde_json::from_value(request)
-            .map_err(|_| "unknown setting or invalid typed value")?;
-        let prepared = PreparedSetting::capture(change, None)?;
-        let output = if dry_run {
-            prepared.projection()
-        } else {
-            let id = uuid::Uuid::new_v4().to_string();
-            match prepared.plan(&id)? {
-                None => serde_json::json!({"kind":"personal_setting_change","state":"unchanged"}),
-                Some(_) => {
-                    let status = MutationService::current()?.apply(&id, &prepared.base.snapshot)?;
-                    super::profile::status_projection(&status, &prepared.base.compiled)?
-                }
+    super::profile::run_operation_cli(
+        "tirith policy setting",
+        "tirith policy setting: failed to write result",
+        json,
+        || {
+            let value = match value {
+                "reset" => serde_json::Value::Null,
+                "true" => true.into(),
+                "false" => false.into(),
+                value => value
+                    .parse::<u8>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|_| value.into()),
+            };
+            let mut request = serde_json::json!({"setting":name,"value":value});
+            if let Some(rule) = rule {
+                request["rule"] = rule.into();
             }
-        };
-        for message in tirith_core::policy::drain_captured_policy_diagnostics_for_output(
-            &prepared.base.compiled,
-        ) {
-            eprintln!("{message}");
-        }
-        if json {
-            if !super::write_json_stdout(&output, "tirith policy setting: failed to write result") {
-                return Ok(1);
-            }
-        } else {
-            print!("{}", setting_human_text(name, dry_run, &output));
-        }
-        Ok(
-            if output["state"].as_str().is_some_and(|state| {
-                !matches!(state, "unchanged" | "completed" | "completed-with-recovery")
-            }) {
-                1
+            let change: PersonalSettingChange = serde_json::from_value(request)
+                .map_err(|_| "unknown setting or invalid typed value")?;
+            let prepared = PreparedSetting::capture(change, None)?;
+            let output = if dry_run {
+                prepared.projection()
             } else {
-                0
-            },
-        )
-    })();
-    result.unwrap_or_else(|error| {
-        let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
-        eprintln!(
-            "tirith policy setting: {}",
-            tirith_core::redact::redact_sanitize_redact(&error, &patterns)
-        );
-        1
-    })
+                let id = uuid::Uuid::new_v4().to_string();
+                match prepared.plan(&id)? {
+                    None => {
+                        serde_json::json!({"kind":"personal_setting_change","state":"unchanged"})
+                    }
+                    Some(_) => {
+                        let status =
+                            MutationService::current()?.apply(&id, &prepared.base.snapshot)?;
+                        super::profile::status_projection(&status, &prepared.base.compiled)?
+                    }
+                }
+            };
+            for message in tirith_core::policy::drain_captured_policy_diagnostics_for_output(
+                &prepared.base.compiled,
+            ) {
+                eprintln!("{message}");
+            }
+            Ok(output)
+        },
+        |output| setting_human_text(name, dry_run, output),
+    )
 }
 
 /// Human text for `tirith policy setting` without `--json`.

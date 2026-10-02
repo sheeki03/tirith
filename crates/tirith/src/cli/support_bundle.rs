@@ -216,7 +216,7 @@ fn save(
     cwd: Option<&str>,
 ) -> Result<PathBuf, String> {
     use super::setup::change_plan::{
-        Edit, JobState, MutationService, OperationKind, RequestedChange,
+        Edit, JobState, MutationService, OperationKind, PlanRequest, RequestedChange,
     };
     let root = tirith_core::policy::state_dir().ok_or("private state directory is unavailable")?;
     let dir = root.join("support");
@@ -230,8 +230,7 @@ fn save(
     // The original capture binds the privacy rules used by the report. A policy
     // change refuses publication instead of trying to redact an already altered
     // string under a different policy. The shared writer also enforces task scope.
-    service.plan_with_preimages_and_intent(
-        &id,
+    let request = PlanRequest::change(
         OperationKind::ExportSupport,
         vec![RequestedChange {
             target: path.clone(),
@@ -240,10 +239,10 @@ fn save(
             activation: false,
             description: "Save the selected redacted support report locally".into(),
         }],
-        snapshot,
-        &std::collections::BTreeMap::from([(path.clone(), None)]),
-        &json!({"kind":"support_export_v1","selection":selection,"cwd":cwd,"report":report}),
-    )?;
+    )
+    .preimages(std::collections::BTreeMap::from([(path.clone(), None)]))
+    .intent(&json!({"kind":"support_export_v1","selection":selection,"cwd":cwd,"report":report}))?;
+    service.submit(&id, snapshot, request)?;
     let status = service.apply(&id, snapshot)?;
     if !matches!(
         status.state,

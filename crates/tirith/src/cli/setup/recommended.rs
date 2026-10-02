@@ -1,6 +1,6 @@
 //! One immutable personal setup plan. Defaults are explicit and customization
 //! changes the reviewed payload; package-manager context never selects a home.
-use super::change_plan::{MutationService, OperationKind};
+use super::change_plan::{MutationService, OperationKind, PlanRequest};
 use super::shell_service::{PreparedShell, ShellChange, ShellKind};
 use serde::{Deserialize, Serialize};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
@@ -138,26 +138,14 @@ pub(crate) fn prepare(
     if dry_run {
         return Ok(preview);
     }
-    let status = if changes.is_empty() {
-        service.complete_noop_with_intent(
-            id,
-            OperationKind::RecommendedSetup,
-            &profile.snapshot,
-            &intent,
-        )?
+    let request = if changes.is_empty() {
+        PlanRequest::no_op(OperationKind::RecommendedSetup)
     } else {
-        service.plan_shell_change_with_intent(
-            id,
-            OperationKind::RecommendedSetup,
-            super::change_plan::PlanChanges {
-                requests: changes,
-                preimages: &expected,
-            },
-            &profile.snapshot,
-            &intent,
-            precondition,
-        )?
+        PlanRequest::change(OperationKind::RecommendedSetup, changes)
+            .preimages(expected)
+            .shell(precondition)
     };
+    let status = service.submit(id, &profile.snapshot, request.intent(&intent)?)?;
     result(status, Some(preview), cwd.as_deref())
 }
 fn result(

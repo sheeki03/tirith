@@ -4,12 +4,13 @@
 //! nushell/PowerShell) so the hook installs idempotently and updates/removes
 //! without corrupting user content.
 
-const END_MARKER: &str = "# END tirith-hook";
+pub(super) const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
+pub(super) const END_MARKER: &str = "# END tirith-hook";
 const BEGIN_MARKER_STEM: &str = "# BEGIN tirith-hook v";
 
 /// Match only the managed marker grammar, while still recognizing a future
 /// numeric block version. Prefix-like user comments must remain user content.
-pub(super) fn is_managed_begin_marker(line: &str) -> bool {
+fn is_managed_begin_marker(line: &str) -> bool {
     let Some(version) = line.strip_prefix(BEGIN_MARKER_STEM) else {
         return false;
     };
@@ -94,61 +95,88 @@ pub(super) fn has_executable_tirith_init(content: &str) -> bool {
     })
 }
 
-/// Validate that each BEGIN marker has a matching END marker. Err on unbalanced
-/// or nested markers so `remove_hook_blocks` never silently drops user content.
-pub(super) fn validate_marker_pairing(content: &str) -> Result<(), String> {
-    let mut in_block = false;
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            if in_block {
-                return Err(
-                    "corrupted tirith-hook block — nested BEGIN markers, fix manually".to_string(),
-                );
-            }
-            in_block = true;
-        } else if line == END_MARKER {
-            if !in_block {
-                return Err(
-                    "corrupted tirith-hook block — END marker without BEGIN, fix manually"
-                        .to_string(),
-                );
-            }
-            in_block = false;
-        }
-    }
-    if in_block {
-        return Err("corrupted tirith-hook block — missing END marker, fix manually".to_string());
-    }
-    Ok(())
+/// Why a managed marker sequence cannot be edited safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MarkerError {
+    NestedBegin,
+    EndWithoutBegin,
+    MissingEnd,
 }
 
-/// Extract the full managed block (BEGIN through END, inclusive) from content.
+impl MarkerError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NestedBegin => "corrupted tirith-hook block — nested BEGIN markers, fix manually",
+            Self::EndWithoutBegin => {
+                "corrupted tirith-hook block — END marker without BEGIN, fix manually"
+            }
+            Self::MissingEnd => "corrupted tirith-hook block — missing END marker, fix manually",
+        }
+    }
+}
+
+/// A marker line is compared without its `\n` or `\r\n` terminator.
+fn marker_text(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => line,
+    }
+}
+
+/// The one managed-block parser: byte ranges (BEGIN line through END line,
+/// inclusive of their terminators) of every block whose BEGIN line satisfies
+/// `is_begin`. Nested, unpaired or unterminated markers are refused, so no
+/// caller ever drops user content after a corrupt marker.
+pub(super) fn hook_blocks_matching(
+    text: &str,
+    is_begin: impl Fn(&str) -> bool,
+) -> Result<Vec<(usize, usize)>, MarkerError> {
+    let mut blocks = Vec::new();
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let marker = marker_text(line);
+        if is_begin(marker) {
+            if start.is_some() {
+                return Err(MarkerError::NestedBegin);
+            }
+            start = Some(offset);
+        } else if marker == END_MARKER {
+            let begin = start.take().ok_or(MarkerError::EndWithoutBegin)?;
+            blocks.push((begin, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    if start.is_some() {
+        return Err(MarkerError::MissingEnd);
+    }
+    Ok(blocks)
+}
+
+/// Managed blocks of any numeric marker version.
+pub(super) fn hook_blocks(text: &str) -> Result<Vec<(usize, usize)>, String> {
+    hook_blocks_matching(text, is_managed_begin_marker).map_err(|error| error.message().into())
+}
+
+/// `text` with the given block ranges removed; every other byte is kept.
+pub(super) fn without_blocks(text: &str, blocks: &[(usize, usize)]) -> String {
+    let mut output = String::new();
+    let mut offset = 0;
+    for &(start, end) in blocks {
+        output.push_str(&text[offset..start]);
+        offset = end;
+    }
+    output.push_str(&text[offset..]);
+    output
+}
+
+/// Extract the first managed block (BEGIN through END, inclusive) from content.
 #[cfg(test)]
 fn extract_managed_block(content: &str) -> Option<String> {
-    let mut in_block = false;
-    let mut block_lines = Vec::new();
-
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            in_block = true;
-            block_lines.push(line);
-            continue;
-        }
-        if in_block {
-            block_lines.push(line);
-            if line == END_MARKER {
-                break;
-            }
-        }
-    }
-
-    if block_lines.is_empty() {
-        None
-    } else {
-        let mut out = block_lines.join("\n");
-        out.push('\n');
-        Some(out)
-    }
+    let blocks = hook_blocks(content).ok()?;
+    blocks
+        .first()
+        .map(|&(start, end)| content[start..end].to_owned())
 }
 
 /// Install through the same immutable, journaled plan used by local controls.
@@ -259,33 +287,10 @@ fn nushell_hook_line_for_dir(hook_dir: &std::path::Path) -> Result<String, Strin
     ))
 }
 
-/// Remove all lines between BEGIN/END markers (inclusive). Caller MUST call
-/// `validate_marker_pairing` first — this does not re-validate, and unbalanced
-/// markers would drop trailing content.
+/// Remove every managed block (inclusive) from well-formed content.
 #[cfg(test)]
 fn remove_hook_blocks(content: &str) -> String {
-    let mut result = Vec::new();
-    let mut suppressing = false;
-
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            suppressing = true;
-            continue;
-        }
-        if line == END_MARKER {
-            suppressing = false;
-            continue;
-        }
-        if !suppressing {
-            result.push(line);
-        }
-    }
-
-    let mut out = result.join("\n");
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    without_blocks(content, &hook_blocks(content).unwrap())
 }
 
 #[cfg(test)]
@@ -499,12 +504,12 @@ mod tests {
     #[test]
     fn valid_single_block() {
         let content = "before\n# BEGIN tirith-hook v1\nhook\n# END tirith-hook\nafter\n";
-        assert!(validate_marker_pairing(content).is_ok());
+        assert!(hook_blocks(content).is_ok());
     }
 
     #[test]
     fn valid_no_blocks() {
-        assert!(validate_marker_pairing("just content\n").is_ok());
+        assert!(hook_blocks("just content\n").is_ok());
     }
 
     #[test]
@@ -526,7 +531,7 @@ mod tests {
     #[test]
     fn prefix_like_comments_are_not_extracted_or_removed() {
         let content = "# BEGIN tirith-hook v1 migration notes\nkeep this\n# END tirith-hook migration notes\n";
-        assert!(validate_marker_pairing(content).is_ok());
+        assert!(hook_blocks(content).is_ok());
         assert!(extract_managed_block(content).is_none());
         assert_eq!(remove_hook_blocks(content), content);
     }
@@ -534,21 +539,21 @@ mod tests {
     #[test]
     fn missing_end_marker() {
         let content = "# BEGIN tirith-hook v1\nhook\nno end\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("missing END"), "got: {err}");
     }
 
     #[test]
     fn orphan_end_marker() {
         let content = "stuff\n# END tirith-hook\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("END marker without BEGIN"), "got: {err}");
     }
 
     #[test]
     fn nested_begin_markers() {
         let content = "# BEGIN tirith-hook v1\n# BEGIN tirith-hook v1\n# END tirith-hook\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("nested BEGIN"), "got: {err}");
     }
 

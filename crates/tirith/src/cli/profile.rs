@@ -112,6 +112,41 @@ pub fn operation(id: &str, action: &str, json: bool) -> i32 {
     })
 }
 
+/// Shared shell of the journaled-operation CLIs (`audit feedback`, `policy
+/// setting`): one policy-diagnostic capture held through error reporting, JSON
+/// or human output, and exit 1 when the operation reports an unfinished state.
+pub(crate) fn run_operation_cli(
+    command: &str,
+    write_failure: &str,
+    json: bool,
+    run: impl FnOnce() -> Result<serde_json::Value, String>,
+    human: impl FnOnce(&serde_json::Value) -> String,
+) -> i32 {
+    let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+    match run() {
+        Ok(output) => {
+            if json {
+                if !super::write_json_stdout(&output, write_failure) {
+                    return 1;
+                }
+            } else {
+                print!("{}", human(&output));
+            }
+            i32::from(output["state"].as_str().is_some_and(|state| {
+                !matches!(state, "unchanged" | "completed" | "completed-with-recovery")
+            }))
+        }
+        Err(error) => {
+            let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
+            eprintln!(
+                "{command}: {}",
+                tirith_core::redact::redact_sanitize_redact(&error, &patterns)
+            );
+            1
+        }
+    }
+}
+
 pub(crate) fn status_projection(
     status: &OperationStatus,
     compiled: &tirith_core::redact::CompiledCustomPatterns,

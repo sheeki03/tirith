@@ -1,11 +1,11 @@
 //! Explicit immutable segment export and irreversible retention deletion.
 //! Only server-derived UUID paths are accepted. No active log is modified.
-use super::change_plan::{Edit, MutationService, OperationKind, RequestedChange};
+use super::change_plan::{Edit, MutationService, OperationKind, PlanRequest, RequestedChange};
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+
 use std::path::{Path, PathBuf};
 use tirith_core::audit::retention::RotationPlan;
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
@@ -113,12 +113,13 @@ pub(crate) fn prepare(
     let original = service.rotation_plan(change.source())?;
     let plan = SegmentPlan::capture(id, change.clone(), &original)?;
     let preview = plan.projection();
-    let status = service.plan_with_preimages_and_intent(id, kind, vec![RequestedChange {
+    let request = PlanRequest::change(kind, vec![RequestedChange {
         target: plan.target(), scope_root: plan.root.clone(), edit: Edit::AuditSegment(plan),
         activation: true, description: if matches!(change, SegmentChange::Delete { .. }) {
             "Irreversibly delete the selected retained records; preserve their checkpoint and a deletion record".into()
         } else { "Export the selected exact audit segment into a separate private bundle".into() },
-    }], &snapshot, &BTreeMap::new(), &intent)?;
+    }]).intent(&intent)?;
+    let status = service.submit(id, &snapshot, request)?;
     display(status, Some(preview), cwd)
 }
 fn display(

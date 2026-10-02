@@ -308,50 +308,155 @@ pub(crate) fn write_private_notice_bounded(
     )
 }
 
+/// One fixed native private store: a team record (with its retained witness)
+/// or the selected team connection. The caller never picks a cap; both use
+/// the same bounded, backup-free private transaction and exact-preimage delete.
+struct PrivateStore<'a> {
+    path: &'a Path,
+    scope: &'a Path,
+    cap: usize,
+    witness: Option<&'a tirith_core::policy_team_connection::TeamRecordWitness>,
+    oversize: &'static str,
+}
+
+const PRIVATE_STORE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const TEAM_CONNECTION_CAP: usize = 128 * 1024;
+
+impl PrivateStore<'_> {
+    fn revalidate_witness(&self) -> Result<(), String> {
+        match self.witness {
+            Some(witness) => witness.revalidate().map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    fn witness_matches(&self, bytes: Option<&[u8]>) -> bool {
+        self.witness
+            .is_none_or(|witness| witness.matches_private_bytes(bytes))
+    }
+
+    /// Private mode, no backup, within the fixed bound.
+    fn bounded(&self, update: FileUpdate) -> Result<FileUpdate, String> {
+        match update {
+            FileUpdate::Unchanged => Ok(FileUpdate::Unchanged),
+            FileUpdate::Write { bytes, .. } => {
+                if bytes.len() > self.cap {
+                    return Err(self.oversize.into());
+                }
+                Ok(FileUpdate::Write {
+                    bytes,
+                    mode: 0o600,
+                    preserve_existing_mode: false,
+                    backup: false,
+                })
+            }
+        }
+    }
+
+    fn update<F, V>(
+        &self,
+        mut transform: F,
+        mut revalidate: V,
+    ) -> Result<TransactionOutcome, String>
+    where
+        F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
+        V: FnMut() -> Result<(), String>,
+    {
+        transactional_update_impl(
+            self.path,
+            self.scope,
+            TransactionOptions {
+                dry_run: false,
+                lock_timeout: PRIVATE_STORE_LOCK_TIMEOUT,
+                read_cap: self.cap,
+                quiet: true,
+                retain_artifacts: false,
+                #[cfg(unix)]
+                private_parent: true,
+            },
+            |snapshot| {
+                self.revalidate_witness()?;
+                snapshot.require_private()?;
+                if !self.witness_matches(snapshot.bytes()) {
+                    return Err("private team record changed before publication".into());
+                }
+                let update = self.bounded(transform(snapshot)?)?;
+                self.revalidate_witness()?;
+                Ok(update)
+            },
+            || {
+                self.revalidate_witness()?;
+                revalidate()
+            },
+            |bytes| {
+                if bytes.len() > self.cap {
+                    return Err(self.oversize.into());
+                }
+                Ok(())
+            },
+            #[cfg(test)]
+            |_| Ok(()),
+        )
+    }
+
+    /// Delete only the exact private preimage the caller still matches, under
+    /// the same writer rendezvous, rechecking at every boundary.
+    fn delete<F, V>(&self, matches: F, mut revalidate: V, changed: &str) -> Result<(), String>
+    where
+        F: Fn(Option<&[u8]>) -> bool,
+        V: FnMut() -> Result<(), String>,
+    {
+        let mut recheck = || -> Result<(), String> {
+            revalidate()?;
+            self.revalidate_witness()
+        };
+        recheck()?;
+        let pre =
+            read_transaction_snapshot(self.path, self.scope, self.cap, PRIVATE_STORE_LOCK_TIMEOUT)?;
+        pre.require_private()?;
+        if pre.bytes.is_none()
+            || !matches(pre.bytes.as_deref())
+            || !self.witness_matches(pre.bytes.as_deref())
+        {
+            return Err(changed.into());
+        }
+        let lock =
+            PlatformTransaction::lock_for(self.path, self.scope, PRIVATE_STORE_LOCK_TIMEOUT)?;
+        recheck()?;
+        let tx = PlatformTransaction::begin(self.path, self.scope, lock)?;
+        tx.validate_snapshot(&pre)?;
+        recheck()?;
+        tx.delete_private_expected(&pre, self.cap)
+    }
+}
+
 /// Fixed native stores for optional enrollment and immutable review/state
 /// records. The selector alone determines target and cap; no arbitrary path is
 /// accepted. The caller still supplies actual state-machine/authority checks.
 pub(crate) fn update_private_team_record<F, V>(
     selector: &tirith_core::policy_team_connection::TeamRecord,
-    mut transform: F,
-    mut revalidate: V,
+    transform: F,
+    revalidate: V,
 ) -> Result<TransactionOutcome, String>
 where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
     let witness = selector.capture_current().map_err(|e| e.to_string())?;
-    let cap = selector.cap();
-    transactional_update_impl(witness.private_path(),witness.private_scope(),TransactionOptions{
-        dry_run:false,lock_timeout:std::time::Duration::from_secs(2),read_cap:cap,quiet:true,retain_artifacts:false,
-        #[cfg(unix)] private_parent:true,
-    },|snapshot|{
-        witness.revalidate().map_err(|e|e.to_string())?;snapshot.require_private()?;
-        if !witness.matches_private_bytes(snapshot.bytes()){return Err("private team record changed before publication".into())}
-        let update=private_team_record_update(transform(snapshot)?,cap)?;
-        witness.revalidate().map_err(|e|e.to_string())?;Ok(update)
-    },||{witness.revalidate().map_err(|e|e.to_string())?;revalidate()},|bytes|{
-        if bytes.len()>cap{return Err("private team record exceeds its fixed bound".into())}Ok(())
-    },#[cfg(test)] |_|Ok(()))
+    PrivateStore {
+        path: witness.private_path(),
+        scope: witness.private_scope(),
+        cap: selector.cap(),
+        witness: Some(&witness),
+        oversize: "private team record exceeds its fixed bound",
+    }
+    .update(transform, revalidate)
     // Native errors may carry private paths. Public operation services receive
     // a closed outcome message and must recapture status before retrying.
-    .map_err(|_|"private team record publication was not confirmed; inspect its current state before retrying".into())
-}
-fn private_team_record_update(update: FileUpdate, cap: usize) -> Result<FileUpdate, String> {
-    match update {
-        FileUpdate::Unchanged => Ok(FileUpdate::Unchanged),
-        FileUpdate::Write { bytes, .. } => {
-            if bytes.len() > cap {
-                return Err("private team record exceeds its fixed bound".into());
-            }
-            Ok(FileUpdate::Write {
-                bytes,
-                mode: 0o600,
-                preserve_existing_mode: false,
-                backup: false,
-            })
-        }
-    }
+    .map_err(|_| {
+        "private team record publication was not confirmed; inspect its current state before retrying"
+            .into()
+    })
 }
 
 /// Selected team connections use the existing private transaction with a fixed
@@ -359,64 +464,43 @@ fn private_team_record_update(update: FileUpdate, cap: usize) -> Result<FileUpda
 pub(crate) fn update_private_team_connection<F, V>(
     path: &Path,
     scope: &Path,
-    mut transform: F,
+    transform: F,
     revalidate: V,
 ) -> Result<TransactionOutcome, String>
 where
     F: FnMut(&FileSnapshot) -> Result<FileUpdate, String>,
     V: FnMut() -> Result<(), String>,
 {
-    transactional_update_impl(
+    team_connection_store(path, scope).update(transform, revalidate)
+}
+
+fn team_connection_store<'a>(path: &'a Path, scope: &'a Path) -> PrivateStore<'a> {
+    PrivateStore {
         path,
         scope,
-        TransactionOptions {
-            dry_run: false,
-            lock_timeout: std::time::Duration::from_secs(2),
-            read_cap: 128 * 1024,
-            quiet: true,
-            retain_artifacts: false,
-            #[cfg(unix)]
-            private_parent: true,
-        },
-        |snapshot| {
-            snapshot.require_private()?;
-            let update = transform(snapshot)?;
-            if matches!(&update,FileUpdate::Write{bytes,..} if bytes.len()>128*1024) {
-                return Err("team connection exceeds its fixed bound".into());
-            }
-            Ok(update)
-        },
-        revalidate,
-        |_| Ok(()),
-        #[cfg(test)]
-        |_| Ok(()),
-    )
+        cap: TEAM_CONNECTION_CAP,
+        witness: None,
+        oversize: "team connection exceeds its fixed bound",
+    }
 }
+
 /// Explicit disconnect, under the same writer rendezvous. The caller retains
 /// its stronger owner/ACL source witness until the exact native delete begins.
 pub(crate) fn delete_private_team_connection<F, V>(
     path: &Path,
     scope: &Path,
     matches: F,
-    mut revalidate: V,
+    revalidate: V,
 ) -> Result<(), String>
 where
     F: Fn(Option<&[u8]>) -> bool,
     V: FnMut() -> Result<(), String>,
 {
-    revalidate()?;
-    let lock_timeout = std::time::Duration::from_secs(2);
-    let pre = read_transaction_snapshot(path, scope, 128 * 1024, lock_timeout)?;
-    pre.require_private()?;
-    if pre.bytes.is_none() || !matches(pre.bytes.as_deref()) {
-        return Err("team connection changed before disconnect".into());
-    }
-    let lock = PlatformTransaction::lock_for(path, scope, lock_timeout)?;
-    revalidate()?;
-    let tx = PlatformTransaction::begin(path, scope, lock)?;
-    tx.validate_snapshot(&pre)?;
-    revalidate()?;
-    tx.delete_private_expected(&pre, 128 * 1024)
+    team_connection_store(path, scope).delete(
+        matches,
+        revalidate,
+        "team connection changed before disconnect",
+    )
 }
 
 /// Closed enrollment withdrawal. The connection path retains its independent
@@ -424,7 +508,7 @@ where
 pub(crate) fn delete_private_team_record<F, V>(
     selector: &tirith_core::policy_team_connection::TeamRecord,
     matches: F,
-    mut revalidate: V,
+    revalidate: V,
 ) -> Result<(), String>
 where
     F: Fn(Option<&[u8]>) -> bool,
@@ -434,32 +518,18 @@ where
     if !matches!(selector, TeamRecord::Enrollment) {
         return Err("only an explicit enrollment can be withdrawn by this operation".into());
     }
-    let mut operation = || -> Result<(), String> {
+    (|| -> Result<(), String> {
         let witness = selector.capture_current().map_err(|e| e.to_string())?;
-        let path = witness.private_path();
-        let scope = witness.private_scope();
-        let cap = selector.cap();
-        revalidate()?;
-        witness.revalidate().map_err(|e| e.to_string())?;
-        let lock_timeout = std::time::Duration::from_secs(2);
-        let pre = read_transaction_snapshot(path, scope, cap, lock_timeout)?;
-        pre.require_private()?;
-        if pre.bytes.is_none()
-            || !matches(pre.bytes.as_deref())
-            || !witness.matches_private_bytes(pre.bytes.as_deref())
-        {
-            return Err("enrollment changed before withdrawal".into());
+        PrivateStore {
+            path: witness.private_path(),
+            scope: witness.private_scope(),
+            cap: selector.cap(),
+            witness: Some(&witness),
+            oversize: "private team record exceeds its fixed bound",
         }
-        let lock = PlatformTransaction::lock_for(path, scope, lock_timeout)?;
-        revalidate()?;
-        witness.revalidate().map_err(|e| e.to_string())?;
-        let tx = PlatformTransaction::begin(path, scope, lock)?;
-        tx.validate_snapshot(&pre)?;
-        revalidate()?;
-        witness.revalidate().map_err(|e| e.to_string())?;
-        tx.delete_private_expected(&pre, cap)
-    };
-    operation().map_err(|_| {
+        .delete(matches, revalidate, "enrollment changed before withdrawal")
+    })()
+    .map_err(|_| {
         "enrollment withdrawal was not confirmed; inspect local status before retrying".into()
     })
 }
@@ -1069,12 +1139,19 @@ mod closed_team_record_tests {
         for selector in [TeamRecord::Enrollment, TeamRecord::Rollout(Id::new())] {
             let cap = selector.cap();
             let update = FileUpdate::write_text("x".repeat(cap), 0o666).with_backup(true);
+            let store = PrivateStore {
+                path: Path::new("/fixture"),
+                scope: Path::new("/"),
+                cap,
+                witness: None,
+                oversize: "private team record exceeds its fixed bound",
+            };
             let FileUpdate::Write {
                 bytes,
                 mode,
                 preserve_existing_mode,
                 backup,
-            } = private_team_record_update(update, cap).unwrap()
+            } = store.bounded(update).unwrap()
             else {
                 panic!("write required")
             };
@@ -1082,11 +1159,9 @@ mod closed_team_record_tests {
             assert_eq!(mode, 0o600);
             assert!(!preserve_existing_mode);
             assert!(!backup);
-            assert!(private_team_record_update(
-                FileUpdate::write_text("x".repeat(cap + 1), 0o600),
-                cap
-            )
-            .is_err());
+            assert!(store
+                .bounded(FileUpdate::write_text("x".repeat(cap + 1), 0o600))
+                .is_err());
         }
     }
     #[test]
