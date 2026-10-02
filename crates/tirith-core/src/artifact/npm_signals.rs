@@ -522,35 +522,52 @@ fn literal_script_target(command: &str) -> Option<String> {
     package_relative(&target)
 }
 
+/// Nesting depth and body count for the brace/function/subshell descent in
+/// [`fetch_feeds_shell`]. Package scripts are bounded text, so this only keeps
+/// adversarial nesting from turning one file into unbounded work. Hitting
+/// either bound is incomplete coverage, never "no pipeline".
+const SHELL_BODY_DEPTH: usize = 8;
+const SHELL_BODY_BUDGET: usize = 256;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellFetch {
+    Found,
+    NotFound,
+    /// The descent stopped at its depth or body bound before finishing.
+    Bounded,
+}
+
 /// A download command piped straight into a shell. Uses the core tokenizer and
 /// the pipe-to-interpreter resolution, so variables (`curl $U | bash`),
 /// wrappers (`| sudo bash`) and redirections (`| sh >/dev/null`) are handled.
 /// Only a literal downloader as the pipe source qualifies: `echo curl … | sh` is
 /// not a download claim.
-/// Nesting depth and body count for the brace/function/subshell descent in
-/// [`fetch_feeds_shell`]. Package scripts are bounded text, so this only keeps
-/// adversarial nesting from turning one file into unbounded work.
-const SHELL_BODY_DEPTH: usize = 8;
-const SHELL_BODY_BUDGET: usize = 256;
-
-/// The core tokenizer splits neither `|` nor newlines inside `{ ... }` or
-/// `( ... )`, so a pipeline inside a brace group, function body or subshell
-/// is only visible after descending into that body.
-fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> bool {
-    let feeds_shell = crate::rules::command::fetch_piped_interpreters(text, ShellType::Posix)
+fn feeds_shell(text: &str) -> bool {
+    crate::rules::command::fetch_piped_interpreters(text, ShellType::Posix)
         .iter()
         .any(|interpreter| {
             matches!(
                 interpreter.as_str(),
                 "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
             )
-        });
-    if feeds_shell || depth >= SHELL_BODY_DEPTH {
-        return feeds_shell;
+        })
+}
+
+/// The core tokenizer splits neither `|` nor newlines inside `{ ... }` or
+/// `( ... )`, so a pipeline inside a brace group, function body or subshell
+/// is only visible after descending into that body.
+fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> ShellFetch {
+    if feeds_shell(text) {
+        return ShellFetch::Found;
     }
+    let mut bounded = false;
     for mut segment in crate::tokenize::tokenize(text, ShellType::Posix) {
-        // A `{` followed by a newline comes back as the command word "{\n".
-        if segment.command.as_deref().map(str::trim) == Some("{") {
+        // The tokenizer does not split words at newlines, so a `{` followed by
+        // a newline comes back inside a longer command word ("{\n",
+        // "{\n{\n", "{\ncurl"). A segment that starts with `{` and blank
+        // space is a brace group whatever that word looks like.
+        let raw = segment.raw.trim_start();
+        if raw.starts_with('{') && raw[1..].starts_with(char::is_whitespace) {
             segment.command = Some("{".to_string());
         }
         let body = crate::extract::literal_posix_brace_group_body(&segment)
@@ -571,19 +588,49 @@ fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> bool {
             continue;
         };
         if *budget == 0 {
-            return false;
+            return ShellFetch::Bounded;
+        }
+        if depth >= SHELL_BODY_DEPTH {
+            bounded = true;
+            continue;
         }
         *budget -= 1;
-        if fetch_feeds_shell(&body, depth + 1, budget) {
-            return true;
+        match fetch_feeds_shell(&body, depth + 1, budget) {
+            ShellFetch::Found => return ShellFetch::Found,
+            ShellFetch::Bounded => bounded = true,
+            ShellFetch::NotFound => {}
         }
     }
-    false
+    if bounded {
+        ShellFetch::Bounded
+    } else {
+        ShellFetch::NotFound
+    }
+}
+
+/// Fallback once the descent hit a bound: each line on its own, with group
+/// openers and closers around it removed.
+fn any_line_feeds_shell(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line
+            .trim_start_matches(|c: char| c == '{' || c == '(' || c.is_whitespace())
+            .trim_end_matches(|c: char| c == '}' || c == ')' || c == ';' || c.is_whitespace());
+        !line.is_empty() && feeds_shell(line)
+    })
 }
 
 fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
     let mut budget = SHELL_BODY_BUDGET;
-    if fetch_feeds_shell(text, 0, &mut budget) {
+    let found = match fetch_feeds_shell(text, 0, &mut budget) {
+        ShellFetch::Found => true,
+        ShellFetch::NotFound => false,
+        ShellFetch::Bounded => {
+            inspection.issue(NpmIssueKind::CodeLimit, Some(member),
+                "Shell brace-group, function or subshell nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
+            any_line_feeds_shell(text)
+        }
+    };
+    if found {
         push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
             vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,
             "A literal curl/wget pipeline feeds a shell interpreter. Review the downloaded code; no network request or script was executed."));
