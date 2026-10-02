@@ -1263,9 +1263,15 @@ fn prompt_signal_from_code(code: u8) -> Option<libc::c_int> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 unsafe fn prompt_errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
+}
+
+/// Bionic (Android) exposes this thread's errno slot as `__errno()`.
+#[cfg(target_os = "android")]
+unsafe fn prompt_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
 }
 
 #[cfg(any(
