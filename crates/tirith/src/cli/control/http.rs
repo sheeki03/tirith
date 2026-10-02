@@ -1,7 +1,9 @@
 //! Strict loopback HTTP/1.1 transport for the local control service and the
-//! `dashboard serve` report. One request per connection, explicit lengths,
-//! fixed bounds, and an overall read deadline. This is deliberately not a
-//! proxy or a general-purpose web server.
+//! `dashboard serve` report. The control API takes one request per
+//! connection; the report may answer a bounded run of pipelined requests in
+//! order (see [`read_next`]). Explicit lengths, fixed bounds, and an overall
+//! read deadline. This is deliberately not a proxy or a general-purpose web
+//! server.
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -17,7 +19,7 @@ const READ_DEADLINE: Duration = Duration::from_secs(3);
 /// A loopback client sends its request head at once. A connection that is
 /// still trickling headers after this bound gives its slot back early, so a
 /// few slow clients cannot hold every slot for the whole request deadline.
-const HEADER_DEADLINE: Duration = Duration::from_secs(1);
+pub(crate) const HEADER_DEADLINE: Duration = Duration::from_secs(1);
 /// One browser session lasts this long from its own sign-in, never from the
 /// service start, so reopening late in a service's life gets a full session.
 pub(super) const SESSION_TTL: Duration = Duration::from_secs(3600);
@@ -31,10 +33,15 @@ const MAX_SESSIONS: usize = 8;
 pub(crate) enum Rules {
     /// The control API: HTTP/1.1 GET, or POST with a JSON body.
     Control,
-    /// The read-only `dashboard serve` report: any method and HTTP/1.0 or 1.1.
+    /// The read-only `dashboard serve` report: any method token (RFC 9110
+    /// methods are case-sensitive, so `get` is simply another method and gets
+    /// the same decision), HTTP/1.0 or 1.1, origin-form or absolute-form
+    /// targets (RFC 9112 section 3.2.2; the authority is kept in
+    /// [`Request::authority`] for the caller to check), and `OPTIONS *`.
     /// The decision comes from the head alone: a body is never read, bounded
     /// or framed, so its headers (length, streaming, `Expect`) are not checked,
-    /// and a repeated header keeps its first value. See [`linger`].
+    /// and a repeated header keeps its first value. A request that may carry a
+    /// body ends the connection. See [`linger`].
     Report,
 }
 
@@ -62,7 +69,19 @@ pub(super) const CONTROL_RESPONSE: ResponsePolicy = ResponsePolicy {
 
 pub(crate) struct Request {
     pub method: String,
+    /// The origin-form target (`/path?query`), also for an absolute-form
+    /// request line, or `*` for `OPTIONS *`.
     pub target: String,
+    /// The authority of an absolute-form request target
+    /// (`GET http://authority/path`), which RFC 9112 makes the request's host.
+    pub authority: Option<String>,
+    /// The request line said `HTTP/1.0` (only [`Rules::Report`] allows it).
+    pub http_1_0: bool,
+    /// The head declares or might declare a body: a non-zero or repeated
+    /// `Content-Length`, or any `Transfer-Encoding`. Such a body is never
+    /// framed under [`Rules::Report`], so its connection cannot carry another
+    /// request.
+    pub may_have_body: bool,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -70,6 +89,23 @@ pub(crate) struct Request {
 impl Request {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
+    }
+
+    /// Whether the client asked to keep the connection open (RFC 9112
+    /// section 9.3): HTTP/1.1 unless it sent `Connection: close`; HTTP/1.0
+    /// only with `Connection: keep-alive`.
+    pub fn wants_keep_alive(&self) -> bool {
+        let has = |option: &str| {
+            self.header("connection").is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(option))
+            })
+        };
+        if has("close") {
+            return false;
+        }
+        !self.http_1_0 || has("keep-alive")
     }
 }
 
@@ -99,6 +135,19 @@ pub(crate) fn read<T>(
     rules: Rules,
     authorize: impl Fn(&Request) -> Result<T, Error>,
 ) -> Result<(Request, T), Error> {
+    read_next(stream, rules, &mut Vec::new(), authorize)
+}
+
+/// [`read`] for a connection that may carry more than one request: `carry`
+/// holds bytes already received after the previous request's head (a
+/// pipelined request) and, under [`Rules::Report`], receives the bytes that
+/// follow this head. Each call has its own head deadline.
+pub(crate) fn read_next<T>(
+    stream: &mut TcpStream,
+    rules: Rules,
+    carry: &mut Vec<u8>,
+    authorize: impl Fn(&Request) -> Result<T, Error>,
+) -> Result<(Request, T), Error> {
     #[cfg(windows)]
     {
         // A Windows accepted socket can inherit the nonblocking listener's
@@ -112,7 +161,7 @@ pub(crate) fn read<T>(
         stream
             .set_nonblocking(true)
             .map_err(|_| error(400, "cannot configure request deadline"))?;
-        let result = read_request(stream, rules, authorize);
+        let result = read_request(stream, rules, carry, authorize);
         stream
             .set_nonblocking(false)
             .map_err(|_| error(400, "cannot restore response socket mode"))?;
@@ -126,7 +175,7 @@ pub(crate) fn read<T>(
         stream
             .set_nonblocking(false)
             .map_err(|_| error(400, "cannot configure request deadline"))?;
-        read_request(stream, rules, authorize)
+        read_request(stream, rules, carry, authorize)
     }
 }
 
@@ -165,14 +214,18 @@ fn read_before_deadline(
 fn read_request<T>(
     stream: &mut TcpStream,
     rules: Rules,
+    carry: &mut Vec<u8>,
     authorize: impl Fn(&Request) -> Result<T, Error>,
 ) -> Result<(Request, T), Error> {
     let start = Instant::now();
     let head_limit = rules.head_limit();
     // Read the head in chunks rather than one byte per system call. Bytes
-    // after the blank line already belong to the body.
+    // after the blank line already belong to the body (or, for the report,
+    // to the next pipelined request).
     let mut buffer = vec![0; head_limit];
-    let mut filled = 0;
+    let mut filled = carry.len().min(head_limit);
+    buffer[..filled].copy_from_slice(&carry[..filled]);
+    carry.clear();
     let head_end = loop {
         if let Some(end) = buffer[..filled]
             .windows(4)
@@ -202,6 +255,7 @@ fn read_request<T>(
     // Reject unauthenticated writes before waiting for or allocating their body.
     let decision = authorize(&request)?;
     if rules == Rules::Report {
+        carry.extend_from_slice(&buffer[head_end..filled]);
         return Ok((request, decision));
     }
     request.body.resize(length, 0);
@@ -248,29 +302,37 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
     let method_supported = match rules {
         Rules::Control => matches!(method, "GET" | "POST"),
         Rules::Report => {
-            !method.is_empty()
-                && method.len() <= 16
-                && method.bytes().all(|byte| byte.is_ascii_uppercase())
+            !method.is_empty() && method.len() <= 16 && method.bytes().all(is_token_byte)
         }
     };
     if !method_supported {
         return Err(error(405, "only GET and POST are supported"));
     }
-    let version_supported = match first.next() {
+    let version = first.next();
+    let version_supported = match version {
         Some("HTTP/1.1") => true,
         Some("HTTP/1.0") => rules == Rules::Report,
         _ => false,
     };
+    let invalid_target = || error(400, "invalid request target or HTTP version");
     if !version_supported
         || first.next().is_some()
-        || !target.starts_with('/')
-        || target.starts_with("//")
         || target.len() > 2048
         || target.contains(['#', '\r', '\n', '\\'])
     {
-        return Err(error(400, "invalid request target or HTTP version"));
+        return Err(invalid_target());
+    }
+    // `OPTIONS *` (asterisk-form) is the one target that is not a path.
+    let asterisk = rules == Rules::Report && target == "*" && method == "OPTIONS";
+    let (target, authority) = match rules {
+        Rules::Report if !asterisk => split_absolute_form(target).ok_or_else(invalid_target)?,
+        _ => (target.to_string(), None),
+    };
+    if !asterisk && (!target.starts_with('/') || target.starts_with("//")) {
+        return Err(invalid_target());
     }
     let mut headers = BTreeMap::new();
+    let mut repeated_length = false;
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -286,15 +348,24 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
         let name = name.to_ascii_lowercase();
         if headers.contains_key(&name) {
             if rules == Rules::Report {
+                repeated_length |= name == "content-length";
                 continue;
             }
             return Err(error(400, "duplicate headers are not supported"));
         }
         headers.insert(name, value.trim().to_string());
     }
+    let may_have_body = repeated_length
+        || headers.contains_key("transfer-encoding")
+        || headers.get("content-length").is_some_and(|value: &String| {
+            !value.bytes().all(|byte| byte == b'0') || value.is_empty()
+        });
     let request = Request {
         method: method.into(),
-        target: target.into(),
+        target,
+        authority,
+        http_1_0: version == Some("HTTP/1.0"),
+        may_have_body,
         headers,
         body: Vec::new(),
     };
@@ -336,6 +407,37 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
         return Err(error(415, "a JSON request body is required"));
     }
     Ok((request, length))
+}
+
+/// An RFC 9110 `tchar` (the bytes a method token may use).
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// Split an absolute-form target (`http://authority/path?query`, scheme in
+/// any case, `http` or `https`) into its origin-form path and authority. An
+/// origin-form target passes through unchanged. A missing authority, user
+/// info (RFC 9110 section 4.2.4), or another scheme is refused.
+fn split_absolute_form(target: &str) -> Option<(String, Option<String>)> {
+    if target.starts_with('/') {
+        return Some((target.to_string(), None));
+    }
+    let (scheme, rest) = target.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    // An empty path is `/` (RFC 9112 section 3.2.1), also before a query.
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some((path, Some(authority.to_string())))
 }
 
 /// How long a report connection stays open after its response to take what
@@ -607,12 +709,45 @@ pub(super) fn respond(
     respond_with(stream, status, content_type, &CONTROL_RESPONSE, bytes)
 }
 
+/// How a response is framed for the request it answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Framing {
+    /// Answer with an `HTTP/1.0` status line (the request was HTTP/1.0).
+    pub http_1_0: bool,
+    /// A `HEAD` response: the same headers, including `Content-Length`, but
+    /// no body (RFC 9110 section 9.3.2).
+    pub head: bool,
+    /// Keep the connection open for another request instead of announcing
+    /// `Connection: close`.
+    pub keep_alive: bool,
+}
+
+impl Framing {
+    /// HTTP/1.1, a body, and `Connection: close`: every control response.
+    pub const CLOSE: Self = Self {
+        http_1_0: false,
+        head: false,
+        keep_alive: false,
+    };
+}
+
 pub(crate) fn respond_with(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
     policy: &ResponsePolicy,
     bytes: &[u8],
+) -> std::io::Result<()> {
+    respond_framed(stream, status, content_type, policy, bytes, Framing::CLOSE)
+}
+
+pub(crate) fn respond_framed(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    policy: &ResponsePolicy,
+    bytes: &[u8],
+    framing: Framing,
 ) -> std::io::Result<()> {
     if bytes.len() > policy.max_bytes {
         return Err(std::io::Error::new(
@@ -642,8 +777,15 @@ pub(crate) fn respond_with(
         431 => "Request Header Fields Too Large",
         _ => "Service Unavailable",
     };
-    let headers = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\r\n", bytes.len(), policy.content_security_policy);
-    for mut remaining_bytes in [headers.as_bytes(), bytes] {
+    let version = if framing.http_1_0 { "1.0" } else { "1.1" };
+    let connection = if framing.keep_alive {
+        "keep-alive"
+    } else {
+        "close"
+    };
+    let headers = format!("HTTP/{version} {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\r\n", bytes.len(), policy.content_security_policy);
+    let body = if framing.head { &[][..] } else { bytes };
+    for mut remaining_bytes in [headers.as_bytes(), body] {
         while !remaining_bytes.is_empty() {
             let remaining = policy
                 .deadline
@@ -977,6 +1119,7 @@ mod tests {
             "POST / HTTP/1.1\r\nContent-Length: 999999\r\nContent-Type: application/json\r\n\r\n",
             "POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n",
             "GET http://evil.example/ HTTP/1.1\r\nHost: one\r\n\r\n",
+            "GET * HTTP/1.1\r\nHost: one\r\n\r\n",
             "GET / HTTP/1.1\r\nHost: one\r\n folded\r\n\r\n",
             "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Type: text/plain\r\n\r\n",
         ] {
@@ -984,11 +1127,13 @@ mod tests {
                 parse_headers(bytes.as_bytes(), Rules::Control).is_err(),
                 "{bytes:?}"
             );
-            // The report never reads a body, so only a malformed head or
-            // target is refused there; body framing and repeats are not.
+            // The report never reads a body, so only a malformed head is
+            // refused there; body framing and repeats are not, and an
+            // absolute-form target is parsed (its authority is the
+            // dashboard's to check).
             let malformed_head = bytes.contains("Host : ")
                 || bytes.contains(" folded")
-                || bytes.starts_with("GET http:");
+                || bytes.starts_with("GET * ");
             assert_eq!(
                 parse_headers(bytes.as_bytes(), Rules::Report).is_err(),
                 malformed_head,
@@ -1028,6 +1173,12 @@ mod tests {
         for bytes in [
             "HEAD /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             "GET /?token=x HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+            // RFC 9110 methods are case-sensitive: `get` is another method
+            // token, which 0.4.2 also answered.
+            "get /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "M-SEARCH /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET http://127.0.0.1/?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "OPTIONS * HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             "POST /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
             "GET /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
             "POST / HTTP/1.1\r\nContent-Length: 999999\r\n\r\n",
@@ -1042,8 +1193,10 @@ mod tests {
             );
         }
         for bytes in [
-            "get / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "G(T / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "SEVENTEENCHARSXYZ / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             "GET / HTTP/2\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET * HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
         ] {
             assert!(
                 parse_headers(bytes.as_bytes(), Rules::Report).is_err(),
@@ -1056,5 +1209,158 @@ mod tests {
         );
         assert!(parse_headers(cookies.as_bytes(), Rules::Report).is_ok());
         assert!(parse_headers(cookies.as_bytes(), Rules::Control).is_err());
+    }
+
+    fn report(bytes: &str) -> Result<Request, Error> {
+        parse_headers(bytes.as_bytes(), Rules::Report).map(|(request, _)| request)
+    }
+
+    // RFC 9112 section 3.2.2: an origin server accepts absolute-form. The
+    // target becomes origin-form and its authority is kept for the host check.
+    #[test]
+    fn report_absolute_form_targets_become_origin_form_with_their_authority() {
+        for (target, path, authority) in [
+            ("http://127.0.0.1:9/?token=x", "/?token=x", "127.0.0.1:9"),
+            ("HTTP://localhost/a/b", "/a/b", "localhost"),
+            ("https://127.0.0.1:9", "/", "127.0.0.1:9"),
+            ("http://127.0.0.1:9?token=x", "/?token=x", "127.0.0.1:9"),
+            ("http://evil.example/?token=x", "/?token=x", "evil.example"),
+        ] {
+            let request = report(&format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n"))
+                .unwrap_or_else(|e| panic!("{target}: {e:?}"));
+            assert_eq!(request.target, path, "{target}");
+            assert_eq!(request.authority.as_deref(), Some(authority), "{target}");
+            assert!(parse_headers(
+                format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n").as_bytes(),
+                Rules::Control
+            )
+            .is_err());
+        }
+        let origin = report("GET /?token=x HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert_eq!(origin.authority, None);
+        let options = report("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert_eq!((options.target.as_str(), options.authority), ("*", None));
+        for target in [
+            "http://u@127.0.0.1/",
+            "http:///path",
+            "ftp://127.0.0.1/",
+            "http://127.0.0.1//x",
+            "127.0.0.1/",
+            "//127.0.0.1/",
+        ] {
+            assert_eq!(
+                report(&format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n"))
+                    .err()
+                    .map(|e| e.status),
+                Some(400),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_requests_know_their_version_persistence_and_possible_body() {
+        let r = |head: &str| report(&format!("{head}\r\n\r\n")).unwrap();
+        let plain = r("GET / HTTP/1.1\r\nHost: h");
+        assert!(!plain.http_1_0 && plain.wants_keep_alive() && !plain.may_have_body);
+        assert!(!r("GET / HTTP/1.1\r\nConnection: Keep-Alive, CLOSE").wants_keep_alive());
+        let old = r("GET / HTTP/1.0\r\nHost: h");
+        assert!(old.http_1_0 && !old.wants_keep_alive());
+        assert!(r("GET / HTTP/1.0\r\nConnection: keep-alive").wants_keep_alive());
+        assert!(!r("GET / HTTP/1.1\r\nContent-Length: 0").may_have_body);
+        assert!(!r("GET / HTTP/1.1\r\nContent-Length: 000").may_have_body);
+        for head in [
+            "POST / HTTP/1.1\r\nContent-Length: 3",
+            "POST / HTTP/1.1\r\nContent-Length: x",
+            "POST / HTTP/1.1\r\nContent-Length:",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 5",
+        ] {
+            assert!(r(head).may_have_body, "{head:?}");
+        }
+    }
+
+    // Pipelined requests that arrive in one segment are read one after the
+    // other: the bytes after a head are carried to the next read.
+    #[test]
+    fn report_reads_pipelined_requests_in_order_through_the_carry() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(b"GET /one HTTP/1.1\r\nHost: a\r\n\r\nHEAD /two HTTP/1.1\r\nHost: b\r\n\r\nGET /thr")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            stream.write_all(b"ee HTTP/1.1\r\nHost: c\r\n\r\n").unwrap();
+            stream
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut carry = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (request, ()) =
+                read_next(&mut stream, Rules::Report, &mut carry, |_| Ok(())).unwrap();
+            seen.push((
+                request.method,
+                request.target,
+                request.headers["host"].clone(),
+            ));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("GET".into(), "/one".into(), "a".into()),
+                ("HEAD".into(), "/two".into(), "b".into()),
+                ("GET".into(), "/three".into(), "c".into()),
+            ]
+        );
+        assert!(carry.is_empty());
+        drop(client.join().unwrap());
+    }
+
+    fn framed(framing: Framing) -> Vec<u8> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        respond_framed(
+            &mut stream,
+            200,
+            "text/html",
+            &CONTROL_RESPONSE,
+            b"hello",
+            framing,
+        )
+        .unwrap();
+        drop(stream);
+        client.join().unwrap()
+    }
+
+    #[test]
+    fn responses_answer_in_the_request_version_and_head_gets_headers_only() {
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap();
+        let plain = text(framed(Framing::CLOSE));
+        assert!(plain.starts_with("HTTP/1.1 200 OK\r\n"), "{plain:?}");
+        assert!(plain.contains("\r\nConnection: close\r\n"));
+        assert!(plain.ends_with("\r\n\r\nhello"));
+        let old = text(framed(Framing {
+            http_1_0: true,
+            ..Framing::CLOSE
+        }));
+        assert!(old.starts_with("HTTP/1.0 200 OK\r\n"), "{old:?}");
+        let head = text(framed(Framing {
+            head: true,
+            keep_alive: true,
+            ..Framing::CLOSE
+        }));
+        assert!(head.contains("\r\nContent-Length: 5\r\n"), "{head:?}");
+        assert!(head.contains("\r\nConnection: keep-alive\r\n"), "{head:?}");
+        assert!(head.ends_with("\r\n\r\n"), "{head:?}");
     }
 }

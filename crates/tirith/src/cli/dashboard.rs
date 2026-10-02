@@ -55,6 +55,15 @@ const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// transport's request deadline; further connections are closed immediately.
 const MAX_CONNECTIONS: usize = 8;
 
+/// At most this many requests are answered on one connection (pipelined or
+/// keep-alive); the last of them announces `Connection: close`.
+const MAX_REQUESTS_PER_CONNECTION: usize = 8;
+
+/// A connection holds its slot for at most this long in total, however many
+/// requests it carries: the first request's head deadline (1 s) plus the
+/// report's response deadline, the same bound as a single request.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(31);
+
 /// The report has no scripts; inline styles only.
 const REPORT_RESPONSE: http::ResponsePolicy = http::ResponsePolicy {
     content_security_policy: "default-src 'none'; style-src 'unsafe-inline'",
@@ -563,6 +572,16 @@ fn respond_to(
     if mono_ttl_expired(issued_mono.elapsed()) {
         return (401, "401 Unauthorized".into());
     }
+    // An absolute-form target names the request's host (RFC 9112 section
+    // 3.2.2). It must be loopback too, and the Host header is still checked
+    // below, so neither can be used to get around the other.
+    if request
+        .authority
+        .as_deref()
+        .is_some_and(|authority| !is_loopback_host(authority))
+    {
+        return (403, "403 Forbidden".into());
+    }
     let query_token = token_from_target(&request.target);
     match authorize(
         request.header("host"),
@@ -579,29 +598,75 @@ fn respond_to(
     }
 }
 
-/// Read one request head and answer it. Authorization is decided from the head
-/// before any body is touched (finding K), and the body is never read before
-/// the response, even when authorized (finding R12-4); afterwards the
-/// transport briefly discards what the client still sends so the response is
-/// not lost to a connection reset. Every response, including transport
+/// Read request heads and answer them in order. Authorization is decided
+/// from each head before any body is touched (finding K), and a body is never
+/// read before the response, even when authorized (finding R12-4); afterwards
+/// the transport briefly discards what the client still sends so the response
+/// is not lost to a connection reset. Every response, including transport
 /// errors, carries the same hardening headers (finding D6-3).
+///
+/// Like the 0.4.2 server, a persistent HTTP/1.1 (or `keep-alive` HTTP/1.0)
+/// connection may carry further, possibly pipelined, requests. That run is
+/// bounded: at most [`MAX_REQUESTS_PER_CONNECTION`] requests within
+/// [`CONNECTION_DEADLINE`], each next head within the transport's head
+/// deadline. A request that may carry a body ends the connection, because the
+/// report never frames a body; so does any transport error.
 fn handle_connection(
     mut stream: TcpStream,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
 ) {
-    let (status, body) = match http::read(&mut stream, http::Rules::Report, |_| Ok(())) {
-        Ok((request, ())) => respond_to(&request, token, issued_at, issued_mono),
-        Err(error) => (error.status, format!("{} {}", error.status, error.message)),
-    };
-    let _ = http::respond_with(
-        &mut stream,
-        status,
-        "text/html; charset=utf-8",
-        &REPORT_RESPONSE,
-        body.as_bytes(),
-    );
+    let opened = Instant::now();
+    let mut carry = Vec::new();
+    for served in 0..MAX_REQUESTS_PER_CONNECTION {
+        let (status, body, framing) =
+            match http::read_next(&mut stream, http::Rules::Report, &mut carry, |_| Ok(())) {
+                Ok((request, ())) => {
+                    let (status, body) = respond_to(&request, token, issued_at, issued_mono);
+                    let framing = http::Framing {
+                        http_1_0: request.http_1_0,
+                        head: request.method == "HEAD",
+                        // Only when the next head's whole deadline still fits.
+                        keep_alive: served + 1 < MAX_REQUESTS_PER_CONNECTION
+                            && request.wants_keep_alive()
+                            && !request.may_have_body
+                            && opened.elapsed() + http::HEADER_DEADLINE < CONNECTION_DEADLINE,
+                    };
+                    (status, body, framing)
+                }
+                // An idle persistent connection that sends nothing more (or
+                // closes) is simply closed, without an error response.
+                Err(error) if served > 0 && error.status == 408 => break,
+                Err(error) => (
+                    error.status,
+                    format!("{} {}", error.status, error.message),
+                    http::Framing::CLOSE,
+                ),
+            };
+        let Some(deadline) = CONNECTION_DEADLINE
+            .checked_sub(opened.elapsed())
+            .map(|left| left.min(REPORT_RESPONSE.deadline))
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        let policy = http::ResponsePolicy {
+            deadline,
+            ..REPORT_RESPONSE
+        };
+        let written = http::respond_framed(
+            &mut stream,
+            status,
+            "text/html; charset=utf-8",
+            &policy,
+            body.as_bytes(),
+            framing,
+        );
+        if written.is_err() || !framing.keep_alive {
+            break;
+        }
+    }
     http::linger(&mut stream);
 }
 
@@ -1429,7 +1494,7 @@ mod tests {
         let http10 = send(format!(
             "GET /?token={token} HTTP/1.0\r\nHost: evil.example.com\r\n\r\n"
         ));
-        assert!(http10.starts_with("HTTP/1.1 403"), "{http10:?}");
+        assert!(http10.starts_with("HTTP/1.0 403"), "{http10:?}");
         let head = send(format!(
             "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
         ));
@@ -1530,6 +1595,263 @@ mod tests {
             );
             handle.join().expect("server thread");
         }
+    }
+
+    /// One response read off a connection.
+    #[derive(Debug)]
+    struct Answer {
+        status_line: String,
+        headers: std::collections::BTreeMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    /// Send `raw` on one connection and split everything the server sends
+    /// until it closes into responses. `head[i]` marks a response to `HEAD`,
+    /// which carries a `Content-Length` but no body.
+    fn exchange(port: u16, raw: &str, head: &[bool]) -> (Vec<Answer>, usize) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(raw.as_bytes()).expect("write request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .expect("set read timeout");
+        let mut bytes = Vec::new();
+        let _ = stream.read_to_end(&mut bytes);
+        let mut answers = Vec::new();
+        let mut rest = bytes.as_slice();
+        while let Some(end) = rest.windows(4).position(|w| w == b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&rest[..end]).into_owned();
+            let mut lines = text.split("\r\n");
+            let status_line = lines.next().unwrap_or_default().to_string();
+            let headers: std::collections::BTreeMap<_, _> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            rest = &rest[end + 4..];
+            let length: usize = headers
+                .get("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let take = if head.get(answers.len()).copied().unwrap_or(false) {
+                0
+            } else {
+                length.min(rest.len())
+            };
+            let body = rest[..take].to_vec();
+            rest = &rest[take..];
+            answers.push(Answer {
+                status_line,
+                headers,
+                body,
+            });
+        }
+        (answers, rest.len())
+    }
+
+    // `dashboard serve` shipped in 0.4.2 on tiny_http. Its observable HTTP
+    // behaviour (recorded with a raw-socket probe against the e2527aba build and
+    // the 0.4.2 release, identical) is kept where it is RFC-correct: HEAD gets
+    // the GET headers without a body, HTTP/1.0 is answered in HTTP/1.0, an
+    // absolute-form target is accepted, method tokens are not upper-case only,
+    // and pipelined keep-alive requests are answered in order. Stricter than
+    // 0.4.2: an absolute-form authority must be loopback like the Host header,
+    // user info is refused, and a request that may carry a body ends the
+    // connection with `Connection: close`.
+    #[test]
+    fn serve_matches_rfc_and_0_4_2_http_edge_cases() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let statuses = |answers: &[Answer]| {
+            answers
+                .iter()
+                .map(|a| a.status_line.clone())
+                .collect::<Vec<_>>()
+        };
+        let run = |raw: &str, head: &[bool]| {
+            let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+            let raw = raw
+                .replace("{port}", &port.to_string())
+                .replace("{token}", token);
+            let out = exchange(port, &raw, head);
+            handle.join().expect("server thread");
+            out
+        };
+        let get = "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
+        let bad = "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
+
+        // HEAD: the GET status and headers, no body.
+        let (full, _) = run(
+            &get.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"),
+            &[],
+        );
+        let (head, trailing) = run(
+            "HEAD /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            &[true],
+        );
+        assert_eq!(statuses(&head), ["HTTP/1.1 200 OK"]);
+        assert_eq!(trailing, 0, "HEAD must not send a body");
+        assert_eq!(
+            head[0].headers.get("content-length"),
+            full[0].headers.get("content-length")
+        );
+        assert!(!full[0].body.is_empty());
+        let (head401, trailing) = run(
+            "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            &[true],
+        );
+        assert_eq!(statuses(&head401), ["HTTP/1.1 401 Unauthorized"]);
+        assert_eq!(trailing, 0);
+
+        // HTTP/1.0: answered in HTTP/1.0, closed unless keep-alive was asked.
+        let (old, _) = run(
+            "GET /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            &[],
+        );
+        assert_eq!(statuses(&old), ["HTTP/1.0 200 OK"]);
+        assert_eq!(old[0].headers["connection"], "close");
+        let (old_ka, _) = run(
+            "GET /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\nGET /?token=wrong HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            &[],
+        );
+        assert_eq!(
+            statuses(&old_ka),
+            ["HTTP/1.0 200 OK", "HTTP/1.0 401 Unauthorized"]
+        );
+
+        // Method tokens other than upper case get the report decision.
+        for method in ["get", "Get", "POST"] {
+            let (answers, _) = run(
+                &format!("{method} /?token={{token}} HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            assert_eq!(statuses(&answers), ["HTTP/1.1 200 OK"], "{method}");
+        }
+        // `head` is not HEAD (methods are case-sensitive): it gets the body.
+        let (lower_head, _) = run(
+            "head /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            &[false],
+        );
+        assert_eq!(lower_head[0].body.len(), full[0].body.len());
+
+        // Absolute-form: accepted with a loopback authority; the authority and
+        // the Host header must both be loopback.
+        for (target, host, expected) in [
+            (
+                "http://127.0.0.1:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "HTTP://localhost:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "http://127.0.0.1:{port}/?token=wrong",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 401 Unauthorized",
+            ),
+            (
+                "http://evil.example/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "http://127.0.0.1:{port}/?token={token}",
+                "evil.example",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "http://u@127.0.0.1:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 400 Bad Request",
+            ),
+        ] {
+            let (answers, _) = run(
+                &format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            assert_eq!(statuses(&answers), [expected], "{target} / {host}");
+        }
+
+        // Pipelined keep-alive requests are answered in order, each decided on
+        // its own head.
+        let (two, _) = run(&format!("{get}{bad}"), &[]);
+        assert_eq!(
+            statuses(&two),
+            ["HTTP/1.1 200 OK", "HTTP/1.1 401 Unauthorized"]
+        );
+        assert_eq!(two[0].headers["connection"], "keep-alive");
+        let (mixed, _) = run(
+            &format!(
+                "{bad}HEAD /?token={{token}} HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\n\r\n{get}"
+            ),
+            &[false, true, false],
+        );
+        assert_eq!(
+            statuses(&mixed),
+            [
+                "HTTP/1.1 401 Unauthorized",
+                "HTTP/1.1 200 OK",
+                "HTTP/1.1 200 OK"
+            ]
+        );
+        assert!(mixed[1].body.is_empty() && !mixed[2].body.is_empty());
+        // `Connection: close` ends the run after its response.
+        let (closed, _) = run(
+            &format!("GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n{get}"),
+            &[],
+        );
+        assert_eq!(statuses(&closed), ["HTTP/1.1 401 Unauthorized"]);
+        // A body is never framed, so a request that may carry one ends the
+        // connection, announced with `Connection: close`.
+        let (body, _) = run(
+            &format!("POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nContent-Length: 3\r\n\r\nabc{get}"),
+            &[],
+        );
+        assert_eq!(statuses(&body), ["HTTP/1.1 401 Unauthorized"]);
+        assert_eq!(body[0].headers["connection"], "close");
+        // The run is bounded; the last allowed response says so.
+        let (capped, _) = run(&bad.repeat(MAX_REQUESTS_PER_CONNECTION + 2), &[]);
+        assert_eq!(capped.len(), MAX_REQUESTS_PER_CONNECTION);
+        assert!(capped[..MAX_REQUESTS_PER_CONNECTION - 1]
+            .iter()
+            .all(|a| a.headers["connection"] == "keep-alive"));
+        assert_eq!(
+            capped[MAX_REQUESTS_PER_CONNECTION - 1].headers["connection"],
+            "close"
+        );
+        // A malformed pipelined request gets its error and the connection ends.
+        let (malformed, _) = run(
+            &format!("{bad}GET nope HTTP/1.1\r\nHost: x\r\n\r\n{get}"),
+            &[],
+        );
+        assert_eq!(
+            statuses(&malformed),
+            ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 400 Bad Request"]
+        );
+    }
+
+    // An idle keep-alive connection gives its slot back after the head
+    // deadline, without an error response.
+    #[test]
+    fn idle_keep_alive_connection_is_closed_quietly_after_the_head_deadline() {
+        let (port, handle) = serve_connections(1, "token", Utc::now(), Instant::now());
+        let started = Instant::now();
+        let (answers, trailing) = exchange(
+            port,
+            &format!("GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+            &[],
+        );
+        handle.join().expect("server thread");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status_line, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(trailing, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     // The accept loop ends at the monotonic TTL (exit 0) without needing a
