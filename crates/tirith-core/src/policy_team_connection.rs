@@ -300,24 +300,34 @@ impl ConnectionWitness {
     ///
     /// It is persisted in the enrollment record, so it binds only facts that
     /// stay stable while the selection is unchanged: the configuration scope,
-    /// the exact record bytes and the file's own index (a replacement file is a
-    /// new selection). Timestamps, permission bits and device numbers are not
-    /// bound: `touch`, `chmod` or a reboot that renumbers a filesystem must not
-    /// invalidate an enrollment. Live retained-handle checks still use the full
-    /// native generation through [`Self::revalidate`].
+    /// the exact record bytes and the file's own stable identity (its index
+    /// plus, on Linux, its birth time; see `native::Facts::stable_identity`),
+    /// so a replacement file is a new selection even when it reuses a freed
+    /// inode number. Modification and change times, permission bits and device
+    /// numbers are not bound: `touch`, `chmod` or a reboot that renumbers a
+    /// filesystem must not invalidate an enrollment. Live retained-handle
+    /// checks still use the full native generation through [`Self::revalidate`].
     pub fn private_selection_commitment(&self) -> Result<PrivateCommitment, ConnectionError> {
         self.revalidate()?;
-        let bytes = serde_json::to_vec(&(
-            self.scope.to_str().ok_or(ConnectionError::UnsafeStorage)?,
-            self.input
-                .generation
-                .as_ref()
-                .map(native::Facts::file_index),
+        Self::selection_commitment(
+            &self.scope,
+            self.input.generation.as_ref(),
             self.input.bytes.as_deref(),
+        )
+    }
+    fn selection_commitment(
+        scope: &Path,
+        generation: Option<&native::Facts>,
+        bytes: Option<&[u8]>,
+    ) -> Result<PrivateCommitment, ConnectionError> {
+        let bytes = serde_json::to_vec(&(
+            scope.to_str().ok_or(ConnectionError::UnsafeStorage)?,
+            generation.map(native::Facts::stable_identity),
+            bytes,
         ))
         .map_err(|_| ConnectionError::InvalidInput)?;
         Ok(PrivateCommitment::of(
-            "tirith.team.selected-connection.v2",
+            "tirith.team.selected-connection.v3",
             &bytes,
         ))
     }
@@ -488,6 +498,58 @@ impl PreparedConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// ext4 hands a freed inode number to the next file created, so a
+    /// same-bytes replacement can carry the old index. Its birth time differs,
+    /// and the persisted commitment binds it.
+    #[test]
+    fn a_replacement_that_reuses_the_file_index_is_a_new_selection() {
+        let scope = Path::new("/home/user/.config/tirith");
+        let bytes = Some(b"identical connection bytes".as_slice());
+        let commit = |facts: &native::Facts| {
+            ConnectionWitness::selection_commitment(scope, Some(facts), bytes).unwrap()
+        };
+        let original = native::Facts::for_test(42, Some((1_700_000_000, 5)));
+        assert_eq!(
+            commit(&original),
+            commit(&native::Facts::for_test(42, Some((1_700_000_000, 5))))
+        );
+        let reused_index = native::Facts::for_test(42, Some((1_700_000_100, 7)));
+        assert_ne!(commit(&original), commit(&reused_index));
+        let new_index = native::Facts::for_test(43, Some((1_700_000_000, 5)));
+        assert_ne!(commit(&original), commit(&new_index));
+        // Where no birth time exists the index alone is bound, as before.
+        assert_ne!(
+            commit(&native::Facts::for_test(42, None)),
+            commit(&native::Facts::for_test(43, None))
+        );
+    }
+    /// The birth time the commitment binds is read from the live file on
+    /// Linux, and it does not move with `touch`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_birth_time_is_bound_and_survives_touch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection.json");
+        std::fs::write(&path, b"bytes").unwrap();
+        let file = File::open(&path).unwrap();
+        let Ok(created) = file.metadata().unwrap().created() else {
+            // This filesystem records no birth time; the index alone is bound.
+            return;
+        };
+        let (_, birth) = native::Facts::for_live_test(&file).stable_identity();
+        let since = created.duration_since(std::time::UNIX_EPOCH).unwrap();
+        assert_eq!(birth, Some((since.as_secs(), since.subsec_nanos())));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            native::Facts::for_live_test(&file).stable_identity().1,
+            birth
+        );
+    }
     fn record() -> Record {
         Record {
             schema_version: SCHEMA_VERSION,

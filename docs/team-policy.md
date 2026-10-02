@@ -54,7 +54,7 @@ tirith policy team enrollment sync --expected-connection-id CONNECTION_UUID --ex
 
 Activation and sync do not send Applied reports. Commands read the enrolled local cache and never contact the team server. Repository restrictions and the ordinary local overlays still apply.
 
-Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again.
+Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again. The activation binds the file's index on its volume and, on Linux, its birth time, so a replacement that reuses a freed inode number (as ext4 does) is still a different file. On macOS, setting the file's modification time to before its creation time also moves its birth time; tirith does not bind birth time there, so this does not matter.
 
 ### Automatic refresh and the offline grace period
 
@@ -62,7 +62,7 @@ You do not have to run `sync` by hand to keep the cache current:
 
 1. **Fresh (under 24 hours).** Runtime enforces the cached team policy.
 2. **Background refresh (after 1 hour).** When `tirith check` sees a cache that is at least an hour old, it starts a detached `tirith policy team enrollment sync` child and continues immediately. The command never waits for the network. At most one refresh is started per 15 minutes per user, and only one runs at a time. `--offline` and `TIRITH_OFFLINE=1` disable it. The child uses the same checks as a manual sync: it only refreshes the exact current activation and connection, so it cannot re-enable a withdrawn activation.
-3. **Grace period (24 hours to 24 hours + grace).** If no refresh has succeeded, Runtime keeps enforcing the last-known-good team policy and prints a warning on every command that says how old the cache is and when enforcement ends.
+3. **Grace period (24 hours to 24 hours + grace).** If no refresh has succeeded, Runtime keeps enforcing the last-known-good team policy and prints a warning on every command that says how old the cache is and when enforcement ends. A long-running process (the MCP server or gateway) prints it once.
 4. **Expired (after the grace period).** Every command is blocked (fail closed) with a message that explains how to sync or leave team policy.
 
 The grace period is 72 hours by default. The team authority sets it in the published policy with `team_offline_grace_hours` (0 to 720; 0 blocks commands as soon as the cache is 24 hours old). The value is read only from the team policy document; a local or repository policy cannot extend it.
@@ -72,7 +72,7 @@ The grace period is 72 hours by default. The team authority sets it in the publi
 team_offline_grace_hours: 24
 ```
 
-`tirith policy team enrollment status` shows the activation and connection IDs, and while the cache is usable its `fetched_unix_ms`. To refresh immediately, run `sync` as shown above.
+`tirith policy team enrollment status` shows the activation and connection IDs, and while the cache is usable its `fetched_unix_ms`. Its `offline_cache` field says which of the stages above applies: `state` is `fresh`, `grace`, `expired` (fail closed), or `future_timestamp` / `missing` / `invalid` (also fail closed), with `fresh_until_unix_ms`, `grace_hours`, `grace_until_unix_ms`, `time_left_ms` (until the next stage, or until fail closed during grace), `refresh_due`, `fails_closed` and a one-line `summary`. Without `--json` the summary is also printed on stderr. To refresh immediately, run `sync` as shown above.
 
 ### Competing policy authorities
 

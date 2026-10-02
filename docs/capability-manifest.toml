@@ -253,7 +253,7 @@ policy_complete = true
 name = "onboard"
 group = "Setup & onboarding"
 inspected = "none"
-coverage = "Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface."
+coverage = "Guided first-run wizard: detects the environment, lists the integrations it found and recommends the personal Balanced protection profile (a legacy policy template only with --team or --ai-agent-heavy). Configuration surface."
 policy_complete = true
 
 [[command]]

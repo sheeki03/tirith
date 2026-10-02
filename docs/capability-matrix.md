@@ -54,7 +54,7 @@ Inspected:
 | Command | Inspected | Coverage | Policy-complete |
 |---------|-----------|----------|-----------------|
 | `tirith init` | None | Prints the shell hook for the active profile. Configuration surface. | Yes |
-| `tirith onboard` | None | Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface. | Yes |
+| `tirith onboard` | None | Guided first-run wizard: detects the environment, lists the integrations it found and recommends the personal Balanced protection profile (a legacy policy template only with --team or --ai-agent-heavy). Configuration surface. | Yes |
 | `tirith setup` | None | Personal recommended setup combines a selected shell and profile in one owned journal; explicit host setup writes selected integration configuration. Configuration does not establish observed interception. Unsupported or uncertified automatic selections refuse. | Yes |
 | `tirith install` | Partial | Records and risk-analyzes an install. npm/pip/cargo get content and registry signals; apt/brew/dnf/yum/pacman/scoop/docker/go are signal-weak (threat-DB name match plus install-command rules) and say so on every run. For npm, --online also reports registry identity facts (origin, registry-bound tarball URL, parsed dist.integrity SRI, legacy shasum status, signature and provenance-attestation state) and, on an unpinned spec, a name-existence probe; those facts are parsed, never verified, and tirith does not download, inspect, or bind the tarball bytes npm installs. | Partial |
 | `tirith verify-self` | Full | Verifies the running binary and its build/install provenance against signed checksums. | Yes |

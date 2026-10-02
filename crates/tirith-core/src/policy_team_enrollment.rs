@@ -150,6 +150,13 @@ fn document(
     record: &Record,
     now: u64,
 ) -> Result<(&PolicyDocument, CacheAge, u64), EnrollmentError> {
+    let (document, grace) = checked_document(record)?;
+    let age = cache_time(record.fetched_unix_ms, now, grace)?;
+    Ok((document, age, grace))
+}
+/// Every cached-document check except its age; returns the grace period the
+/// document selected.
+fn checked_document(record: &Record) -> Result<(&PolicyDocument, u64), EnrollmentError> {
     if record.fetched_unix_ms == 0 {
         return Err(EnrollmentError::InvalidCache);
     }
@@ -169,9 +176,81 @@ fn document(
     let policy = document
         .parsed_policy()
         .map_err(|_| EnrollmentError::InvalidCache)?;
-    let grace = grace_ms(&policy);
-    let age = cache_time(record.fetched_unix_ms, now, grace)?;
-    Ok((document, age, grace))
+    Ok((document, grace_ms(&policy)))
+}
+
+/// How Runtime treats the cached team policy right now, for status displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheState {
+    /// Younger than [`CACHE_MAX_AGE_MS`]: enforced.
+    Fresh,
+    /// Past the fresh window but inside the offline grace period: the
+    /// last-known-good policy is still enforced, with a warning.
+    Grace,
+    /// Beyond the grace period: Runtime fails closed until a sync.
+    Expired,
+    /// Fetched "in the future" (the clock moved back): Runtime fails closed.
+    FutureTimestamp,
+    /// No cached document: Runtime fails closed.
+    Missing,
+    /// The cached document does not validate: Runtime fails closed.
+    Invalid,
+}
+impl CacheState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Grace => "grace",
+            Self::Expired => "expired",
+            Self::FutureTimestamp => "future_timestamp",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+        }
+    }
+    /// Whether Runtime still enforces the cached team policy in this state.
+    pub fn enforced(self) -> bool {
+        matches!(self, Self::Fresh | Self::Grace)
+    }
+}
+/// Offline age facts about the enrolled cache. Read-only; nothing here
+/// authorizes Runtime, which applies the same rules on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheStatus {
+    pub state: CacheState,
+    pub fetched_unix_ms: u64,
+    /// End of the fresh window.
+    pub fresh_until_unix_ms: u64,
+    /// The grace period the cached document selected, when it validates.
+    pub grace_ms: Option<u64>,
+    /// End of the grace period (Runtime fails closed from then on).
+    pub grace_until_unix_ms: Option<u64>,
+    /// A background refresh is due (the cache is at least an hour old).
+    pub refresh_due: bool,
+}
+fn cache_status(record: &Record, now: u64) -> CacheStatus {
+    let fetched = record.fetched_unix_ms;
+    let fresh_until_unix_ms = fetched.saturating_add(CACHE_MAX_AGE_MS);
+    let (state, grace) = match checked_document(record) {
+        Err(EnrollmentError::MissingCache) => (CacheState::Missing, None),
+        Err(_) => (CacheState::Invalid, None),
+        Ok((_, grace)) => (
+            match cache_time(fetched, now, grace) {
+                Ok(CacheAge::Fresh) => CacheState::Fresh,
+                Ok(CacheAge::Grace { .. }) => CacheState::Grace,
+                Err(EnrollmentError::FutureCache) => CacheState::FutureTimestamp,
+                Err(_) => CacheState::Expired,
+            },
+            Some(grace),
+        ),
+    };
+    CacheStatus {
+        state,
+        fetched_unix_ms: fetched,
+        fresh_until_unix_ms,
+        grace_ms: grace,
+        grace_until_unix_ms: grace.map(|grace| fresh_until_unix_ms.saturating_add(grace)),
+        refresh_due: refresh_due(fetched, now),
+    }
 }
 fn selected(record: &Record, connection: &ConnectionWitness) -> Result<(), EnrollmentError> {
     connection
@@ -281,6 +360,11 @@ impl EnrollmentWitness {
     }
     pub fn activation_id(&self) -> Option<&Id> {
         self.record().ok().map(|record| &record.activation_id)
+    }
+    /// Offline age of the captured cache at `now`; `None` when nothing is
+    /// enrolled or the record is malformed.
+    pub fn cache_status(&self, now: u64) -> Option<CacheStatus> {
+        self.record().ok().map(|record| cache_status(record, now))
     }
     pub fn private_path(&self) -> &Path {
         self.input.private_path()

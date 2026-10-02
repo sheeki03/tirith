@@ -113,7 +113,6 @@ rust-mcp-schema = { version = "0.10", default-features = false, features = ["202
 # (verified in the PR-0 spike); the consuming code (C2) bounds size/depth/branch/
 # $ref/regex/cache/error. License MIT.
 jsonschema = { version = "0.46", default-features = false }
-walkdir = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -192,7 +191,6 @@ tirith-test-support = { workspace = true }
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-rand = "0.9.2"
 
 [[bench]]
 name = "perf"

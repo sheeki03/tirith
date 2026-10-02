@@ -18,7 +18,8 @@ use tirith_core::policy_team_connection::{
     ConnectionWitness, SelectedConnection, TeamRecord, TeamRecordWitness,
 };
 use tirith_core::policy_team_enrollment::{
-    EnrollmentWriteIntent, FetchedTeamPolicy, TeamEnrollment, TeamRuntimeEvidence,
+    CacheState, CacheStatus, EnrollmentWriteIntent, FetchedTeamPolicy, TeamEnrollment,
+    TeamRuntimeEvidence,
 };
 
 #[derive(clap::Args, Deserialize)]
@@ -226,10 +227,13 @@ impl TeamEnrollmentService {
         let selection_id = SelectedConnection::capture_current()
             .ok()
             .and_then(|c| c.connection_id().cloned());
+        let now = now_ms().ok();
+        let mut cache = None;
         let (state, activation, evidence) = match TeamEnrollment::capture_current() {
             Err(_) => ("storage_unavailable", None, None),
             Ok(witness) if !witness.configured() => ("off", None, None),
             Ok(witness) => {
+                cache = now.and_then(|now| witness.cache_status(now));
                 let activation = witness.activation_id().cloned();
                 if activation.is_none() {
                     ("malformed", activation, None)
@@ -256,6 +260,7 @@ impl TeamEnrollmentService {
         Ok(
             json!({"schema_version":1,"state":state,"activation_id":activation,
             "selected_connection_id":selection_id,"runtime_evidence":evidence,
+            "offline_cache":cache.zip(now).map(|(cache, now)| offline_cache_projection(&cache, now)),
             "report":report_status(),"local_write":"observed","execution_permitted":false,"notice":NOTICE}),
         )
     }
@@ -992,6 +997,90 @@ pub(crate) fn maybe_background_refresh(offline_flag: bool) {
     let _ = command.spawn();
 }
 
+/// Additive `offline_cache` status field: how Runtime treats the cached team
+/// policy now, the deadlines, and a one-line human summary. Offline facts
+/// only; Runtime applies the same rules itself.
+fn offline_cache_projection(cache: &CacheStatus, now: u64) -> Value {
+    let left = |until: u64| until.saturating_sub(now);
+    let grace_hours = cache.grace_ms.map(|grace| grace / 3_600_000);
+    let sync =
+        "run `tirith policy team enrollment sync` (IDs above) when the team server is reachable";
+    let (time_left_ms, summary) = match cache.state {
+        CacheState::Fresh => {
+            let left = left(cache.fresh_until_unix_ms);
+            (
+                Some(left),
+                format!(
+                    "team policy cache is fresh (fetched {} ago); it is enforced for {} more{}, then an offline grace period of {}h begins.",
+                    duration(now.saturating_sub(cache.fetched_unix_ms)),
+                    duration(left),
+                    if cache.refresh_due {
+                        " and a background refresh is due"
+                    } else {
+                        ""
+                    },
+                    grace_hours.unwrap_or(0)
+                ),
+            )
+        }
+        CacheState::Grace => {
+            let left = cache.grace_until_unix_ms.map_or(0, left);
+            (
+                Some(left),
+                format!(
+                    "team policy cache is stale ({} old) but inside its {}h offline grace period: the last-known-good team policy is enforced for {} more, then every command is blocked (fail closed); {sync}.",
+                    duration(now.saturating_sub(cache.fetched_unix_ms)),
+                    grace_hours.unwrap_or(0),
+                    duration(left)
+                ),
+            )
+        }
+        CacheState::Expired => (
+            Some(0),
+            format!(
+                "team policy cache expired after its {}h offline grace period: every command is blocked (fail closed) until a sync succeeds; {sync}.",
+                grace_hours.unwrap_or(0)
+            ),
+        ),
+        CacheState::FutureTimestamp => (
+            None,
+            format!("team policy cache has a future fetch time (the clock moved back): every command is blocked (fail closed); {sync}."),
+        ),
+        CacheState::Missing | CacheState::Invalid => (
+            None,
+            format!(
+                "team policy cache is {}: every command is blocked (fail closed); {sync}.",
+                cache.state.as_str()
+            ),
+        ),
+    };
+    json!({
+        "state": cache.state.as_str(),
+        "enforced": cache.state.enforced(),
+        "fails_closed": !cache.state.enforced(),
+        "fetched_unix_ms": cache.fetched_unix_ms,
+        "fresh_until_unix_ms": cache.fresh_until_unix_ms,
+        "grace_hours": grace_hours,
+        "grace_until_unix_ms": cache.grace_until_unix_ms,
+        "time_left_ms": time_left_ms,
+        "refresh_due": cache.refresh_due,
+        "summary": summary,
+    })
+}
+
+/// "2d 3h", "5h 12m" or "7m".
+fn duration(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 fn background_sync_args(connection: &Id, activation: &Id) -> Vec<String> {
     [
         "policy",
@@ -1140,6 +1229,13 @@ pub(crate) fn run(action: Action) -> i32 {
             let emitted = if json_output {
                 super::write_json_stdout(&value, "cannot write team enrollment result")
             } else {
+                if let Some(summary) = value
+                    .get("offline_cache")
+                    .and_then(|cache| cache.get("summary"))
+                    .and_then(Value::as_str)
+                {
+                    eprintln!("tirith policy team enrollment: {summary}");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&value)

@@ -198,13 +198,68 @@ impl HeldPath {
 pub(super) struct Facts {
     generation: FileGeneration,
     security: Vec<u8>,
+    /// Linux birth time `(seconds, nanoseconds)` since the epoch, when the
+    /// filesystem records one. See [`Facts::stable_identity`].
+    birth: Option<(u64, u32)>,
 }
 impl Facts {
-    /// The file's index within its volume (Unix inode, Windows file index).
+    /// What identifies this file, and only this file, for as long as it is not
+    /// replaced: its index within its volume (Unix inode, Windows file index)
+    /// plus, on Linux, its birth time.
+    ///
     /// Unlike the full generation it survives `touch`, `chmod` and a reboot
-    /// that renumbers devices; a replacement file gets a new index.
-    pub(super) fn file_index(&self) -> u64 {
-        self.generation.identity.1
+    /// that renumbers devices. A replacement file normally gets a new index,
+    /// but Linux filesystems such as ext4 hand a freed inode number to the
+    /// next file created, so a same-bytes replacement could reuse it. Its
+    /// birth time still differs: Linux sets it once at creation and offers no
+    /// call to change it (utimensat changes only atime and mtime). APFS file
+    /// IDs are not reused and the NTFS file index carries a reuse sequence
+    /// number, so other platforms bind the index alone. Never mtime or ctime.
+    pub(super) fn stable_identity(&self) -> (u64, Option<(u64, u32)>) {
+        (self.generation.identity.1, self.birth)
+    }
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    pub(super) fn for_live_test(file: &File) -> Self {
+        Self {
+            generation: file_generation(file).unwrap(),
+            security: Vec::new(),
+            birth: birth_time(file).unwrap(),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn for_test(index: u64, birth: Option<(u64, u32)>) -> Self {
+        Self {
+            generation: FileGeneration {
+                identity: (1, index),
+                size: 0,
+                links: 1,
+                modified_seconds: 0,
+                modified_nanos: 0,
+                changed_seconds: 0,
+                changed_nanos: 0,
+            },
+            security: Vec::new(),
+            birth,
+        }
+    }
+}
+/// The birth time of the open file on Linux, `None` where the filesystem
+/// keeps none or on other platforms (see [`Facts::stable_identity`]).
+fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let metadata = file.metadata().map_err(|_| E::UnsafeStorage)?;
+        // `created` fails only when this filesystem records no birth time.
+        Ok(metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|time| (time.as_secs(), time.subsec_nanos())))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = file;
+        Ok(None)
     }
 }
 pub(super) fn facts(file: &File, private: bool) -> Result<Facts, E> {
@@ -216,6 +271,7 @@ pub(super) fn facts(file: &File, private: bool) -> Result<Facts, E> {
     Ok(Facts {
         generation: g,
         security: platform::security(file).map_err(|_| E::UnsafeStorage)?,
+        birth: birth_time(file)?,
     })
 }
 

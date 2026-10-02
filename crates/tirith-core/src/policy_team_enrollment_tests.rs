@@ -75,6 +75,58 @@ fn cache_age_is_fresh_for_a_day_then_in_grace_then_refused() {
     assert!(!refresh_due(now + 1, now));
 }
 #[test]
+fn cache_status_reports_fresh_grace_and_fail_closed_states_with_their_deadlines() {
+    let grace = DEFAULT_GRACE_MS;
+    let now = (CACHE_MAX_AGE_MS + grace) * 3;
+    let at = |age: u64| {
+        let mut r = record(now - age);
+        r.cached_policy.as_mut().unwrap().created_unix_ms = r.fetched_unix_ms;
+        cache_status(&r, now)
+    };
+    let fresh = at(2 * HOUR_MS);
+    assert_eq!(fresh.state, CacheState::Fresh);
+    assert!(fresh.state.enforced() && fresh.refresh_due);
+    assert_eq!(
+        fresh.fresh_until_unix_ms,
+        now - 2 * HOUR_MS + CACHE_MAX_AGE_MS
+    );
+    assert_eq!(fresh.grace_ms, Some(grace));
+    assert_eq!(
+        fresh.grace_until_unix_ms,
+        Some(fresh.fresh_until_unix_ms + grace)
+    );
+    assert!(!at(0).refresh_due);
+    let in_grace = at(CACHE_MAX_AGE_MS + HOUR_MS);
+    assert_eq!(in_grace.state, CacheState::Grace);
+    assert!(in_grace.state.enforced());
+    assert_eq!(in_grace.grace_until_unix_ms, Some(now + grace - HOUR_MS));
+    let expired = at(CACHE_MAX_AGE_MS + grace);
+    assert_eq!(expired.state, CacheState::Expired);
+    assert!(!expired.state.enforced());
+    assert_eq!(expired.grace_until_unix_ms, Some(now));
+    let mut future = record(now + 1);
+    future.cached_policy.as_mut().unwrap().created_unix_ms = now;
+    assert_eq!(
+        cache_status(&future, now).state,
+        CacheState::FutureTimestamp
+    );
+    let mut missing = record(now);
+    missing.cached_policy = None;
+    let missing = cache_status(&missing, now);
+    assert_eq!(missing.state, CacheState::Missing);
+    assert_eq!(missing.grace_until_unix_ms, None);
+    let mut invalid = record(now);
+    invalid.cached_policy.as_mut().unwrap().yaml = "team_offline_grace_hours: 721\n".into();
+    assert_eq!(cache_status(&invalid, now).state, CacheState::Invalid);
+    // The authority's grace period is the one reported.
+    let mut short = record(now - CACHE_MAX_AGE_MS - HOUR_MS);
+    short.cached_policy.as_mut().unwrap().created_unix_ms = short.fetched_unix_ms;
+    short.cached_policy.as_mut().unwrap().yaml = "team_offline_grace_hours: 0\n".into();
+    let short = cache_status(&short, now);
+    assert_eq!(short.state, CacheState::Expired);
+    assert_eq!(short.grace_ms, Some(0));
+}
+#[test]
 fn cached_document_is_bound_to_authority_policy_schema_and_fetch_time() {
     let now = CACHE_MAX_AGE_MS * 3;
     let encoded = serde_json::to_vec(&record(now)).unwrap();
@@ -652,6 +704,42 @@ mod native {
                 .any(|m| m.contains("TIRITH_SERVER_URL and TIRITH_API_KEY")
                     && m.contains("unset TIRITH_SERVER_URL and TIRITH_API_KEY")
                     && m.contains("tirith policy team enrollment disable")),
+            "{messages:?}"
+        );
+        assert!(!messages.iter().any(|m| m.contains("legacy-secret")));
+    }
+    /// A legacy policy_server_url in the user's policy gets the "remove it
+    /// from that file" hint even when the policy path contains the word
+    /// "organization".
+    #[test]
+    fn competing_local_policy_server_hint_ignores_the_words_in_its_path() {
+        let mut guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let home = home::home_dir().unwrap();
+        let config = home.join("organization-settings");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        guard.set_env("XDG_CONFIG_HOME", config.as_os_str());
+        let scope = crate::policy::config_dir().unwrap();
+        assert!(scope.starts_with(&config), "{scope:?}");
+        let parent = scope.join("team-policy");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let connection = connection(&parent);
+        let r = enrollment(&connection, now_ms().unwrap());
+        let _witness = install(&parent, &r);
+        private_file(
+            &scope.join("policy.yaml"),
+            b"policy_server_url: https://legacy.example.invalid\npolicy_server_api_key: legacy-secret\n",
+        );
+        let (snapshot, messages) = runtime_snapshot_with_diagnostics();
+        assert_eq!(snapshot.policy.path.as_deref(), Some("fail-closed"));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("legacy policy_server_url")
+                    && m.contains("remove policy_server_url and policy_server_api_key")
+                    && !m.contains("organization operator")),
             "{messages:?}"
         );
         assert!(!messages.iter().any(|m| m.contains("legacy-secret")));

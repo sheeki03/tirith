@@ -208,20 +208,50 @@ macro_rules! policy_diagnostic {
     };
 }
 
-/// Team-policy notices print once per process on stderr (a command may resolve
-/// policy several times). An explicit capture always receives them.
-fn emit_team_policy_diagnostic(message: String) {
+/// How many distinct team notices one process remembers as already printed.
+const TEAM_DIAGNOSTIC_MEMORY: usize = 64;
+
+/// Bounded memory of the team notices this process already printed, keyed by
+/// what the notice is about rather than its text (the grace warning's text
+/// carries an hour count that changes while the process runs).
+struct EmittedTeamDiagnostics {
+    keys: std::collections::VecDeque<String>,
+}
+impl EmittedTeamDiagnostics {
+    const fn new() -> Self {
+        Self {
+            keys: std::collections::VecDeque::new(),
+        }
+    }
+    /// `true` the first time `key` is seen. A full memory forgets its oldest
+    /// key, so a new distinct failure is always printed while memory stays
+    /// bounded.
+    fn first(&mut self, key: &str) -> bool {
+        if self.keys.iter().any(|seen| seen == key) {
+            return false;
+        }
+        if self.keys.len() >= TEAM_DIAGNOSTIC_MEMORY {
+            self.keys.pop_front();
+        }
+        self.keys.push_back(key.to_owned());
+        true
+    }
+}
+
+/// Team-policy notices print once per process on stderr (a command, or a
+/// long-lived MCP server or gateway, may resolve policy many times). `key`
+/// names what the notice is about. An explicit capture always receives them.
+fn emit_team_policy_diagnostic(key: String, message: String) {
     let captured = POLICY_DIAGNOSTIC_CAPTURES.with(|captures| !captures.borrow().is_empty());
     if !captured {
-        static EMITTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let mut emitted = EMITTED
+        static EMITTED: std::sync::Mutex<EmittedTeamDiagnostics> =
+            std::sync::Mutex::new(EmittedTeamDiagnostics::new());
+        let first = EMITTED
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if emitted.contains(&message) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first(&key);
+        if !first {
             return;
-        }
-        if emitted.len() < 16 {
-            emitted.push(message.clone());
         }
     }
     policy_diagnostic!("{message}");
@@ -230,6 +260,24 @@ fn emit_team_policy_diagnostic(message: String) {
 const TEAM_SYNC_HINT: &str = "Run `tirith policy team enrollment status` for the IDs, then `tirith policy team enrollment sync --expected-connection-id ID --expected-activation-id ID`";
 const TEAM_DISABLE_HINT: &str =
     "`tirith policy team enrollment disable --expected-activation-id ID` (works offline)";
+
+/// The grace-period warning and its once-per-process key. The key is the
+/// expiry, which is fixed for one cached document, while the text reports the
+/// current age.
+fn team_grace_diagnostic(expires_unix_ms: u64, age_seconds: u64) -> (String, String) {
+    let until = i64::try_from(expires_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "the end of its grace period".into());
+    (
+        format!("grace:{expires_unix_ms}"),
+        format!(
+            "tirith: warning: team policy cache is {} hours old and could not be refreshed; enforcing the last-known-good team policy until {until}, after which every command is blocked (fail closed). A background refresh runs automatically when the team server is reachable. {TEAM_SYNC_HINT}.",
+            age_seconds / 3600
+        ),
+    )
+}
 
 fn team_enrollment_refusal_message(
     error: crate::policy_team_enrollment::EnrollmentError,
@@ -252,17 +300,46 @@ fn team_enrollment_refusal_message(
     )
 }
 
-fn team_authority_conflict(what: String) -> crate::policy_team::ErrorCode {
-    emit_team_policy_diagnostic(format!(
-        "tirith: team policy is blocked: this device is enrolled in team policy and {what}. Two policy authorities have no defined precedence, so every command is blocked (fail closed). Keep one authority: {} or leave team policy with {TEAM_DISABLE_HINT}.",
-        if what.starts_with("TIRITH_SERVER_URL") {
-            "unset TIRITH_SERVER_URL and TIRITH_API_KEY in this environment,"
-        } else if what.contains("organization") {
-            "ask the organization operator to remove the organization policy,"
-        } else {
-            "remove policy_server_url and policy_server_api_key from that file,"
-        }
-    ));
+/// The second policy authority found next to an enrolled team policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompetingAuthority {
+    /// An organization policy at this path.
+    Organization(String),
+    /// TIRITH_SERVER_URL and TIRITH_API_KEY in the environment.
+    Environment,
+    /// A trusted local policy at this path that configures a legacy server.
+    LocalPolicyServer(String),
+}
+
+/// The message names the competing authority and how to remove it. The hint
+/// is chosen by the authority's kind, never by searching the message text
+/// (a path can contain any word).
+fn team_authority_conflict_message(authority: &CompetingAuthority) -> String {
+    let (what, keep) = match authority {
+        CompetingAuthority::Organization(path) => (
+            format!("also has an organization policy ({path})"),
+            "ask the organization operator to remove the organization policy,",
+        ),
+        CompetingAuthority::Environment => (
+            "TIRITH_SERVER_URL and TIRITH_API_KEY are both set (a legacy policy server)"
+                .to_string(),
+            "unset TIRITH_SERVER_URL and TIRITH_API_KEY in this environment,",
+        ),
+        CompetingAuthority::LocalPolicyServer(path) => (
+            format!("its local policy ({path}) configures a legacy policy_server_url"),
+            "remove policy_server_url and policy_server_api_key from that file,",
+        ),
+    };
+    format!(
+        "tirith: team policy is blocked: this device is enrolled in team policy and {what}. Two policy authorities have no defined precedence, so every command is blocked (fail closed). Keep one authority: {keep} or leave team policy with {TEAM_DISABLE_HINT}."
+    )
+}
+
+fn team_authority_conflict(authority: CompetingAuthority) -> crate::policy_team::ErrorCode {
+    emit_team_policy_diagnostic(
+        format!("conflict:{authority:?}"),
+        team_authority_conflict_message(&authority),
+    );
     crate::policy_team::ErrorCode::Forbidden
 }
 
@@ -1853,21 +1930,18 @@ impl Policy {
                         expires_unix_ms,
                     }) = cache_age
                     {
-                        let until = i64::try_from(expires_unix_ms)
-                            .ok()
-                            .and_then(chrono::DateTime::from_timestamp_millis)
-                            .map(|time| time.to_rfc3339())
-                            .unwrap_or_else(|| "the end of its grace period".into());
-                        emit_team_policy_diagnostic(format!(
-                            "tirith: warning: team policy cache is {} hours old and could not be refreshed; enforcing the last-known-good team policy until {until}, after which every command is blocked (fail closed). A background refresh runs automatically when the team server is reachable. {TEAM_SYNC_HINT}.",
-                            age_seconds.unwrap_or(0) / 3600
-                        ));
+                        let (key, message) =
+                            team_grace_diagnostic(expires_unix_ms, age_seconds.unwrap_or(0));
+                        emit_team_policy_diagnostic(key, message);
                     }
                     return policy;
                 }
             }
             Err(error) => {
-                emit_team_policy_diagnostic(team_enrollment_refusal_message(error));
+                emit_team_policy_diagnostic(
+                    format!("refusal:{error:?}"),
+                    team_enrollment_refusal_message(error),
+                );
                 snapshot::observe_team_runtime_refusal("enrollment_unavailable");
                 return Self::fail_closed_policy();
             }
@@ -2165,9 +2239,8 @@ impl Policy {
         // A second managed authority has no defined precedence. Keep the
         // existing organization authority until its operator migrates it.
         if let Some((path, PolicyScope::Org)) = &trusted {
-            return Err(team_authority_conflict(format!(
-                "also has an organization policy ({})",
-                path.display()
+            return Err(team_authority_conflict(CompetingAuthority::Organization(
+                path.display().to_string(),
             )));
         }
         // Refuse a competing legacy authority without a request or cache read.
@@ -2192,18 +2265,16 @@ impl Policy {
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty());
         if env_url.is_some() && env_key.is_some() {
-            return Err(team_authority_conflict(
-                "TIRITH_SERVER_URL and TIRITH_API_KEY are both set (a legacy policy server)".into(),
-            ));
+            return Err(team_authority_conflict(CompetingAuthority::Environment));
         }
         if local_url.is_some() && (local_key.is_some() || env_key.is_some()) {
             let path = trusted
                 .as_ref()
                 .map(|(path, _)| path.display().to_string())
                 .unwrap_or_default();
-            return Err(team_authority_conflict(format!(
-                "its local policy ({path}) configures a legacy policy_server_url"
-            )));
+            return Err(team_authority_conflict(
+                CompetingAuthority::LocalPolicyServer(path),
+            ));
         }
         let mut policy = document.parsed_policy()?;
         policy.scope = PolicyScope::Remote;
@@ -4765,6 +4836,58 @@ fn load_cached_remote_policy(server_url: &str, api_key: &str) -> Option<Policy> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_diagnostic_memory_is_bounded_and_never_drops_a_new_failure() {
+        let mut emitted = EmittedTeamDiagnostics::new();
+        // More distinct notices than the old 16-entry set held: each prints
+        // once, and a repeat of any recent one is suppressed.
+        for index in 0..40 {
+            assert!(emitted.first(&format!("refusal:{index}")));
+        }
+        for index in 0..40 {
+            assert!(!emitted.first(&format!("refusal:{index}")), "{index}");
+        }
+        // Memory stays bounded; a new distinct failure always prints.
+        for index in 40..1000 {
+            assert!(emitted.first(&format!("refusal:{index}")));
+            assert!(emitted.keys.len() <= TEAM_DIAGNOSTIC_MEMORY);
+        }
+        assert!(!emitted.first("refusal:999"));
+    }
+
+    #[test]
+    fn team_grace_warning_is_keyed_by_its_expiry_not_its_hour_count() {
+        let expires = 1_700_000_000_000;
+        let (first_key, first) = team_grace_diagnostic(expires, 25 * 3600);
+        let (later_key, later) = team_grace_diagnostic(expires, 40 * 3600);
+        assert_ne!(first, later, "the text carries the current age");
+        assert_eq!(first_key, later_key);
+        let mut emitted = EmittedTeamDiagnostics::new();
+        assert!(emitted.first(&first_key));
+        // A long-lived process does not print it again every hour.
+        assert!(!emitted.first(&later_key));
+        assert_ne!(team_grace_diagnostic(expires + 1, 25 * 3600).0, first_key);
+    }
+
+    #[test]
+    fn competing_authority_hint_follows_the_authority_kind_not_the_path_text() {
+        let local = team_authority_conflict_message(&CompetingAuthority::LocalPolicyServer(
+            "/home/organization/.config/tirith/policy.yaml".into(),
+        ));
+        assert!(local.contains("remove policy_server_url"), "{local}");
+        assert!(!local.contains("organization operator"), "{local}");
+        let org = team_authority_conflict_message(&CompetingAuthority::Organization(
+            "/etc/tirith/policy.yaml".into(),
+        ));
+        assert!(org.contains("organization operator"), "{org}");
+        let env = team_authority_conflict_message(&CompetingAuthority::Environment);
+        assert!(env.contains("unset TIRITH_SERVER_URL"), "{env}");
+        for message in [local, org, env] {
+            assert!(message.contains("fail closed"));
+            assert!(message.contains("tirith policy team enrollment disable"));
+        }
+    }
 
     #[test]
     fn policy_diagnostic_capture_drains_without_ending_the_sink() {

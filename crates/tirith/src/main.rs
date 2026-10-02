@@ -621,13 +621,12 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Inspect Python packages and verify installed environments.
-    /// Contained package installation is currently disabled.
+    /// Inspect local npm and Python package artifacts and verify installed
+    /// Python environments. Contained package installation is currently disabled.
     #[command(after_help = "\
 Examples:
-  tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg install pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg install pip flask --target .venv --yes
+  tirith pkg inspect package-1.0.0.tgz --format json
+  tirith pkg diff old.whl new.whl
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
@@ -895,15 +894,18 @@ Examples:
 Scans the current repo for the signals that should shape your tirith setup —
 shell, IDE configs (.cursor/.vscode), AI-config files (CLAUDE.md, .cursorrules,
 AGENTS.md, .claude/, .cursor/rules/), package managers on PATH, lockfiles, a
-.github/workflows CI pipeline, and MCP configs — then RECOMMENDS one of the
-shipping policy templates (individual / ci-strict / ai-agent-heavy) and the
-next steps to get protected.
+.github/workflows CI pipeline, and MCP configs — and lists them as an
+integration inventory. It then RECOMMENDS the personal Balanced protection
+profile (`tirith policy profile balanced`) and the next steps to get protected.
+The detected integrations do not change that recommendation.
 
 Detection is read-only and never materializes hooks. --apply performs the
-recommended SAFE steps (policy init, the init hook line) with per-step
-confirmation on stdin; it refuses to act when run non-interactively (piped /
-CI), printing what it WOULD do instead. The mode flags bias the recommendation:
---repo / --team / --ai-agent-heavy (mutually exclusive); omit them to auto-detect.
+recommended SAFE steps (the init hook line, then the recommended profile or
+template when no policy exists) with per-step confirmation on stdin; it refuses to act when run
+non-interactively (piped / CI), printing what it WOULD do instead. The mode
+flags are mutually exclusive: --repo gives the same recommendation as the
+default, while --team and --ai-agent-heavy select the legacy `startup` and
+`ai-agent-heavy` policy templates (`tirith policy init --template <name>`).
 
 Examples:
   tirith onboard
@@ -918,13 +920,13 @@ Examples:
             .required(false)
     )]
     Onboard {
-        /// Bias the recommendation toward a single-repo setup.
+        /// Single-repo setup (same recommendation as the default: Balanced).
         #[arg(long)]
         repo: bool,
-        /// Bias the recommendation toward a locked-down team / shared setup.
+        /// Recommend the legacy `startup` policy template for a shared setup.
         #[arg(long)]
         team: bool,
-        /// Bias the recommendation toward an AI-agent-heavy setup.
+        /// Recommend the legacy `ai-agent-heavy` policy template.
         #[arg(long = "ai-agent-heavy")]
         ai_agent_heavy: bool,
         /// Perform the recommended SAFE actions (with per-step stdin
@@ -6416,12 +6418,16 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// List or show the package-firewall tamper-evident receipts.
+    /// List or show stored tamper-evident artifact-scan receipts.
     #[command(after_help = "\
 Examples:
   tirith pkg receipt list
   tirith pkg receipt last
-  tirith pkg receipt show <receipt-id>")]
+  tirith pkg receipt show <receipt-id>
+
+These receipts were written by contained `tirith pkg install` runs. That
+command is disabled, so no new receipts are written; receipts recorded by
+earlier releases stay readable here.")]
     Receipt {
         #[command(subcommand)]
         query: PkgReceiptQuery,
@@ -10706,6 +10712,68 @@ mod help_category_tests {
             assert!(TASKS_HELP.contains("tirith onboard"));
             assert!(TASKS_HELP.contains("tirith dashboard"));
             assert!(parsed >= 12, "only {parsed} task commands parsed");
+        });
+    }
+
+    fn help_text(argv: &[&str]) -> String {
+        let error = Cli::try_parse_from(argv).err().expect("--help shows help");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        error.to_string()
+    }
+
+    /// `tirith pkg --help` lists only examples that work: `pkg approve` and
+    /// `pkg install` refuse on every host, so they are not offered as
+    /// examples, and `pkg receipt` no longer names the removed package
+    /// firewall.
+    #[test]
+    fn pkg_help_examples_and_receipt_text_match_behaviour() {
+        with_large_cli_stack(|| {
+            let help = help_text(&["tirith", "pkg", "--help"]);
+            let examples: Vec<&str> = help
+                .lines()
+                .skip_while(|line| line.trim() != "Examples:")
+                .skip(1)
+                .take_while(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .collect();
+            assert!(examples.len() >= 3, "pkg examples: {examples:?}");
+            for example in &examples {
+                assert!(
+                    !example.starts_with("tirith pkg approve")
+                        && !example.starts_with("tirith pkg install"),
+                    "pkg --help offers a refusing example: {example}"
+                );
+                let argv: Vec<&str> = example.split_whitespace().collect();
+                Cli::try_parse_from(&argv)
+                    .unwrap_or_else(|error| panic!("example {argv:?} does not parse: {error}"));
+            }
+            // The refusal itself stays documented.
+            assert!(help.contains("private_input_execution_unqualified"));
+            assert!(!help.contains("package-firewall"));
+
+            let receipt = help_text(&["tirith", "pkg", "receipt", "--help"]);
+            assert!(!receipt.contains("package-firewall"), "{receipt}");
+            assert!(receipt.contains("artifact-scan receipts"), "{receipt}");
+            assert!(receipt.contains("no new receipts are written"), "{receipt}");
+        });
+    }
+
+    /// `tirith onboard --help` describes the real recommendation: the personal
+    /// Balanced profile by default and with --repo, a legacy template only for
+    /// --team / --ai-agent-heavy.
+    #[test]
+    fn onboard_help_describes_the_profile_recommendation() {
+        with_large_cli_stack(|| {
+            let help = help_text(&["tirith", "onboard", "--help"]);
+            assert!(!help.contains("shipping policy templates"), "{help}");
+            assert!(!help.contains("ci-strict"), "{help}");
+            assert!(help.contains("Balanced protection"), "{help}");
+            assert!(help.contains("tirith policy profile balanced"), "{help}");
+            assert!(help.contains("legacy `startup`"), "{help}");
+            for template in ["startup", "ai-agent-heavy"] {
+                Cli::try_parse_from(["tirith", "policy", "init", "--template", template])
+                    .unwrap_or_else(|error| panic!("template {template}: {error}"));
+            }
         });
     }
 

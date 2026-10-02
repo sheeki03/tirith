@@ -583,3 +583,65 @@ mod background_refresh {
         }
     }
 }
+#[test]
+fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
+    const HOUR: u64 = 3_600_000;
+    let now = 1_000 * HOUR;
+    let status = |state, fetched_age: u64| CacheStatus {
+        state,
+        fetched_unix_ms: now - fetched_age,
+        fresh_until_unix_ms: now - fetched_age + 24 * HOUR,
+        grace_ms: Some(72 * HOUR),
+        grace_until_unix_ms: Some(now - fetched_age + 96 * HOUR),
+        refresh_due: fetched_age >= HOUR,
+    };
+    let fresh = offline_cache_projection(&status(CacheState::Fresh, 2 * HOUR), now);
+    assert_eq!(fresh["state"], "fresh");
+    assert_eq!(fresh["enforced"], true);
+    assert_eq!(fresh["fails_closed"], false);
+    assert_eq!(fresh["time_left_ms"], 22 * HOUR);
+    assert_eq!(fresh["grace_hours"], 72);
+    assert_eq!(fresh["refresh_due"], true);
+    let summary = fresh["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("fresh") && summary.contains("22h 0m more"),
+        "{summary}"
+    );
+    assert!(summary.contains("background refresh is due"), "{summary}");
+
+    let grace = offline_cache_projection(&status(CacheState::Grace, 30 * HOUR + 90_000), now);
+    assert_eq!(grace["state"], "grace");
+    assert_eq!(grace["enforced"], true);
+    assert_eq!(grace["time_left_ms"], 66 * HOUR - 90_000);
+    let summary = grace["summary"].as_str().unwrap();
+    assert!(summary.contains("grace period"), "{summary}");
+    assert!(summary.contains("2d 17h more"), "{summary}");
+    assert!(summary.contains("fail closed"), "{summary}");
+    assert!(
+        summary.contains("tirith policy team enrollment sync"),
+        "{summary}"
+    );
+
+    let expired = offline_cache_projection(&status(CacheState::Expired, 97 * HOUR), now);
+    assert_eq!(expired["state"], "expired");
+    assert_eq!(expired["enforced"], false);
+    assert_eq!(expired["fails_closed"], true);
+    assert_eq!(expired["time_left_ms"], 0);
+    let summary = expired["summary"].as_str().unwrap();
+    assert!(summary.contains("expired after its 72h"), "{summary}");
+    assert!(summary.contains("blocked (fail closed)"), "{summary}");
+
+    for state in [
+        CacheState::FutureTimestamp,
+        CacheState::Missing,
+        CacheState::Invalid,
+    ] {
+        let value = offline_cache_projection(&status(state, 0), now);
+        assert_eq!(value["fails_closed"], true, "{state:?}");
+        assert!(value["time_left_ms"].is_null());
+        assert!(value["summary"].as_str().unwrap().contains("fail closed"));
+    }
+    assert_eq!(duration(59_999), "0m");
+    assert_eq!(duration(HOUR + 60_000), "1h 1m");
+    assert_eq!(duration(49 * HOUR), "2d 1h");
+}

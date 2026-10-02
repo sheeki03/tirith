@@ -162,7 +162,16 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # every inspected value and every policy_complete flag stay unchanged. It
 # replaces digest
 # 3f6aa6a786787e6bb734d60b9fd23dc2083cb97cd1ad2649b08a58392ba6046e.
-sha256 = "9bc4e04b0aacc1bd0da755da03ab42bd5d52147ef3a3a14e6ff5f29df131ddd0"
+#
+# Onboarding truthfulness (simplify/cycle-cleanup): only the `onboard` coverage
+# prose changes. It said the wizard "recommends a policy template"; it lists
+# the detected integrations and recommends the personal Balanced protection
+# profile, with a legacy template only for --team or --ai-agent-heavy. No
+# entry is added, removed, renamed, regrouped or reordered; manifest_version,
+# every inspected value and every policy_complete flag stay unchanged. It
+# replaces digest
+# 9bc4e04b0aacc1bd0da755da03ab42bd5d52147ef3a3a14e6ff5f29df131ddd0.
+sha256 = "2c6beaf4148a87f79b86d1ae6503cd4fe44fc6b3dd983cd7e5c82a8255a795a2"
 
 [mcp]
 default_tools = [

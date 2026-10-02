@@ -3167,12 +3167,8 @@ dependencies = [
  "csv",
  "ed25519-dalek",
  "etcetera",
- "flate2",
  "fs2",
  "home",
- "http-body-util",
- "hyper",
- "hyper-util",
  "is-terminal",
  "libc",
  "mockito",
@@ -3225,7 +3221,6 @@ dependencies = [
  "once_cell",
  "owo-colors",
  "percent-encoding",
- "rand 0.9.3",
  "rand_core 0.6.4",
  "regex",
  "regex-syntax",
@@ -3245,7 +3240,6 @@ dependencies = [
  "unicode-script",
  "url",
  "uuid",
- "walkdir",
  "windows",
  "windows-sys 0.61.2",
  "zip",
@@ -3273,7 +3267,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

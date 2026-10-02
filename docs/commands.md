@@ -53,7 +53,7 @@ project review, interruptions, upgrade and removal.
 | Command | What it does |
 |---------|-------------|
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
-| `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
+| `tirith onboard` | Guided first-run wizard: detect the environment and recommend the personal Balanced profile, or a legacy template with `--team` / `--ai-agent-heavy` (`--apply`) |
 | `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
 | `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--agent claude-code` also configures the Claude Code Bash hook in the same undoable plan (macOS and Linux); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
 | `tirith setup shell` | Set up, repair (`--force`) or remove owned startup blocks (`--remove`) for an explicit `--shell`; activation and verified blocking are separate |
@@ -120,7 +120,7 @@ project review, interruptions, upgrade and removal.
 | `tirith pkg diff <old> <new>` | Compare two local npm tarballs or Python wheels. [npm comparison](npm-inspection.md) retains exact artifact hashes and separates byte changes from analyzer/coverage changes; it grants no installation authority (`--ecosystem`, `--format json`, npm `--format sarif`) |
 | `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |
 | `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures and provenance attestations, bound to the exact `package-lock.json` and `node_modules` inventory, and emit a signed receipt. Tirith does not download, inspect, or bind the tarball bytes npm installs (`--project`, `--require-provenance`, `--out`, `--format json`) |
-| `tirith pkg receipt {list,last,show}` | List or show the package-firewall tamper-evident receipts |
+| `tirith pkg receipt {list,last,show}` | List or show stored tamper-evident artifact-scan receipts |
 
 ## AI-agent integrations
 
