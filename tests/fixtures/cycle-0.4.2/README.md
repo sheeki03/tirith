@@ -27,9 +27,8 @@ authenticated release recorded by `macos-release-contracts.json`.
 The compact projection omits test-root paths, full policy values and timing
 noise. It records the default schema-3 check contract and policy-envelope
 additions separately. Inherited status never becomes verified blocking in the
-candidate. Use `tools/qualification/compatibility_capture.py` for a new capture;
-the report pins both binaries and the runner and process-helper sources before
-and after execution. It refuses a baseline other than 0.4.2.
+candidate. The capture harness that produced these files was removed from the
+repository after the capture; the fixtures are frozen and are not regenerated.
 
 `claude-tirith-check.py` is the Claude hook script exactly as
 `tirith setup claude-code` wrote it in v0.4.0, v0.4.1 and v0.4.2 (SHA-256

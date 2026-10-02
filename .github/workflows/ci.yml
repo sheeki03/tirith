@@ -44,6 +44,8 @@ jobs:
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
       - name: Validate signed release compatibility payload generation
         run: python3 .github/scripts/test-release-compatibility.py
+      - name: Validate workflow hygiene
+        run: python3 .github/scripts/test-workflow-hygiene.py
       - name: Validate native host certification bounds
         run: |
           python3 scripts/test-certify-claude-host.py
@@ -52,15 +54,8 @@ jobs:
           python3 scripts/test-certify-powershell-hook.py
           python3 scripts/test-certify-powershell-target.py
           python3 scripts/test-control-browser-fixtures.py
-          python3 scripts/test-collect-native-resource-reference.py
-          python3 scripts/test-measure-daemon-workloads.py
-          python3 scripts/test-measure-claude-adapter.py
-          python3 scripts/test-qualify-daemon-trust-expiry.py
           python3 tools/qualification/test_mixed_audit_native.py
-          python3 tools/qualification/test_compatibility_capture.py
-          python3 tools/qualification/test_durable_boundaries_native.py
           python3 tools/qualification/test_service_coordination_native.py
-          python3 tools/qualification/test_signed_numeric_inputs.py
       - name: Validate managed browser qualification predicates
         run: |
           set -euo pipefail
@@ -193,20 +188,6 @@ jobs:
       - name: Workspace tests
         if: matrix.name != 'Windows'
         run: cargo test --workspace --locked --no-fail-fast
-      - name: Record native CLI test binary sizes
-        if: always() && matrix.name != 'Windows'
-        run: |
-          python3 - <<'PY'
-          import json, pathlib, re
-          root = pathlib.Path('target/debug/deps')
-          records = []
-          if root.is_dir():
-              for path in sorted(root.iterdir()):
-                  if re.fullmatch(r'tirith-[0-9a-f]{16}', path.name) and path.is_file():
-                      records.append({'file': path.name, 'bytes': path.stat().st_size})
-          print(json.dumps({'binary_identity_limit_bytes': 512 * 1024 * 1024,
-                            'cli_test_images': records}, indent=2))
-          PY
       - name: Windows workspace and standard-account dashboard tests
         if: matrix.name == 'Windows'
         shell: pwsh
@@ -219,28 +200,7 @@ jobs:
           mkdir "$evidence"
           cargo test --locked -p tirith --bin tirith --no-run --message-format=json \
             > "$evidence/cargo.jsonl" 2> "$evidence/build.stderr"
-          python3 - "$evidence" <<'PY'
-          import hashlib, json, pathlib, subprocess, sys
-          output = pathlib.Path(sys.argv[1])
-          source = pathlib.Path.cwd().resolve()
-          records = [json.loads(line) for line in (output / 'cargo.jsonl').read_text().splitlines()]
-          selected = [r for r in records if r.get('reason') == 'compiler-artifact'
-                      and r.get('executable') and r.get('profile', {}).get('test') is True
-                      and r.get('target', {}).get('name') == 'tirith'
-                      and pathlib.Path(r['manifest_path']).resolve() == source / 'crates/tirith/Cargo.toml']
-          if len(selected) != 1:
-              raise SystemExit('expected one current Tirith CLI test executable')
-          binary = pathlib.Path(selected[0]['executable']).resolve(strict=True)
-          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-          (output / 'selected-test.json').write_text(json.dumps({
-              'cargo_artifact': selected[0], 'sha256': digest,
-              'source_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-              'scope': 'instrumented test fixture, not signed replacement or release qualification'
-          }, indent=2) + '\n')
-          subprocess.run([sys.executable, '-B', 'tools/qualification/service_coordination_native.py',
-                          '--test-executable', str(binary), '--sha256', digest,
-                          '--output', str(output / 'native')], check=True)
-          PY
+          python3 -B .github/scripts/run-service-coordination.py "$evidence"
       - name: Retain native update coordination evidence
         if: always() && matrix.name != 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

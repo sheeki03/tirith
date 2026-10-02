@@ -1,0 +1,128 @@
+{
+  "measurement": "Rust global-allocator requests per workload from crates/tirith-core/benches/resource_counts.rs (allocation_requests = allocation + zeroed allocation + reallocation calls; requested_bytes includes the full new size of each reallocation). first_sample gates the first sample (one-time initialization); steady gates the largest later sample.",
+  "derivation": "Measured 2026-10-02 at 10 samples on macOS 27 aarch64 and Linux (rust:1.98-bookworm, Docker) aarch64 with rustc 1.98; took the larger value of the two, added 25% (at least 16 requests or 1024 bytes), and rounded up to two significant digits. Counts were identical on every later sample. CI runs on ubuntu-latest x86_64. Raise a ceiling only for intended growth, about 25% above the new measurement, and say why in the commit.",
+  "measured_maximum": {
+    "tier1_clean": {
+      "first_sample": {
+        "allocation_requests": 56142,
+        "requested_bytes": 8084875
+      },
+      "steady": {
+        "allocation_requests": 0,
+        "requested_bytes": 0
+      }
+    },
+    "analysis_clean": {
+      "first_sample": {
+        "allocation_requests": 356775,
+        "requested_bytes": 48306088
+      },
+      "steady": {
+        "allocation_requests": 925,
+        "requested_bytes": 119087
+      }
+    },
+    "analysis_url_pipeline": {
+      "first_sample": {
+        "allocation_requests": 496099,
+        "requested_bytes": 72034048
+      },
+      "steady": {
+        "allocation_requests": 9312,
+        "requested_bytes": 1644446
+      }
+    },
+    "output_obfuscated": {
+      "first_sample": {
+        "allocation_requests": 110412,
+        "requested_bytes": 24953635
+      },
+      "steady": {
+        "allocation_requests": 418,
+        "requested_bytes": 20058
+      }
+    },
+    "analysis_custom_policy": {
+      "first_sample": {
+        "allocation_requests": 999,
+        "requested_bytes": 193006
+      },
+      "steady": {
+        "allocation_requests": 999,
+        "requested_bytes": 193006
+      }
+    },
+    "history_recent_100": {
+      "first_sample": {
+        "allocation_requests": 1035,
+        "requested_bytes": 8643384
+      },
+      "steady": {
+        "allocation_requests": 1035,
+        "requested_bytes": 8643384
+      }
+    }
+  },
+  "workloads": {
+    "tier1_clean": {
+      "first_sample": {
+        "allocation_requests": 71000,
+        "requested_bytes": 11000000
+      },
+      "steady": {
+        "allocation_requests": 16,
+        "requested_bytes": 1100
+      }
+    },
+    "analysis_clean": {
+      "first_sample": {
+        "allocation_requests": 450000,
+        "requested_bytes": 61000000
+      },
+      "steady": {
+        "allocation_requests": 1200,
+        "requested_bytes": 150000
+      }
+    },
+    "analysis_url_pipeline": {
+      "first_sample": {
+        "allocation_requests": 630000,
+        "requested_bytes": 91000000
+      },
+      "steady": {
+        "allocation_requests": 12000,
+        "requested_bytes": 2100000
+      }
+    },
+    "output_obfuscated": {
+      "first_sample": {
+        "allocation_requests": 140000,
+        "requested_bytes": 32000000
+      },
+      "steady": {
+        "allocation_requests": 530,
+        "requested_bytes": 26000
+      }
+    },
+    "analysis_custom_policy": {
+      "first_sample": {
+        "allocation_requests": 1300,
+        "requested_bytes": 250000
+      },
+      "steady": {
+        "allocation_requests": 1300,
+        "requested_bytes": 250000
+      }
+    },
+    "history_recent_100": {
+      "first_sample": {
+        "allocation_requests": 1300,
+        "requested_bytes": 11000000
+      },
+      "steady": {
+        "allocation_requests": 1300,
+        "requested_bytes": 11000000
+      }
+    }
+  }
+}

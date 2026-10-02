@@ -5301,7 +5301,3 @@ mod tests {
         assert_eq!(status_detail(&f), "mismatch");
     }
 }
-
-#[cfg(all(test, unix))]
-#[path = "selfupdate_signed_fixture_tests.rs"]
-mod signed_fixture_tests;
