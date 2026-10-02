@@ -183,18 +183,23 @@ fn read_patterns(service: &Service) -> Vec<String> {
     read_view(service).patterns
 }
 
-/// The policy a read-only route evaluates against, without any network
-/// request: a fresh no-network Runtime resolution or, when a legacy remote
-/// policy server makes that resolution refuse, the service's latest full
-/// Runtime resolution.
+/// The policy a read-only route evaluates against: a fresh no-network
+/// Runtime resolution or, when a legacy remote policy server makes that
+/// resolution refuse, the service's latest full Runtime resolution while its
+/// local inputs (policy files, trust store, trust expiry) are still current.
+/// When they changed, or no full resolution finished, resolve again as
+/// GET /api/policy does (which may contact that server) and keep the result:
+/// a stale snapshot would make every list/explain refuse, and the no-network
+/// result in that mode is only the fail-closed placeholder.
 fn read_snapshot(service: &Service) -> EffectivePolicySnapshot {
     let local = EffectivePolicySnapshot::resolve_runtime_without_network(Some(&service.record.cwd));
-    if local.remote.availability == "refused_local_mutation" {
-        if let Some(runtime) = service.runtime_snapshot() {
-            return runtime;
-        }
+    if local.remote.availability != "refused_local_mutation" {
+        return local;
     }
-    local
+    match service.runtime_snapshot() {
+        Some(runtime) if runtime.revalidate_inputs().is_ok() => runtime,
+        _ => snapshot(service).0,
+    }
 }
 
 /// Route an authorized request. `grant` is the credential decision made

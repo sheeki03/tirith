@@ -308,6 +308,43 @@ fn read_only_routes_never_resolve_the_remote_policy() {
     assert!(attempted(&policy), "{policy}");
 }
 
+/// With a legacy remote policy server configured, the exception views use
+/// the service's latest full Runtime resolution. Once a local input changed
+/// (here the user policy), that snapshot no longer revalidates, and every
+/// list/explain answered 409 "refresh the list" until something called
+/// GET /api/policy. They now resolve again and show the current rows.
+#[test]
+fn exception_views_follow_local_policy_edits_with_a_legacy_remote_server() {
+    let mut state = state();
+    state.set_env("TIRITH_SERVER_URL", "https://127.0.0.1:1");
+    state.set_env("TIRITH_API_KEY", "fixture-remote-policy-key");
+    let server = service_credential(&state);
+    let (status, before) = server.request("GET", "/api/exceptions", None);
+    assert_eq!(status, 200, "{before}");
+    assert!(!before.to_string().contains("example-cli.dev"), "{before}");
+    let config = tirith_core::policy::config_dir().unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.yaml"),
+        "allowlist:\n  - example-cli.dev\n",
+    )
+    .unwrap();
+    for attempt in 0..2 {
+        let (status, after) = server.request("GET", "/api/exceptions", None);
+        assert_eq!(status, 200, "attempt {attempt}: {after}");
+        assert!(
+            after.to_string().contains("example-cli.dev"),
+            "attempt {attempt}: {after}"
+        );
+    }
+    let (status, explain) = server.request(
+        "POST",
+        "/api/exceptions/explain",
+        Some(json!({"target": "example-cli.dev", "scope": "user"})),
+    );
+    assert_eq!(status, 200, "{explain}");
+}
+
 #[test]
 fn real_service_reuses_identity_and_rejects_unauthorized_mutations() {
     let state = state();
