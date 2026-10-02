@@ -374,6 +374,19 @@ fn browser_profile_plan_is_read_only_until_apply_and_retries_keep_identity() {
         policy["protection_profile"]["name"].as_str(),
         Some("balanced")
     );
+    // The inventory row carries the recovery flag next to the stored state so
+    // a reopened dashboard can still label retained recovery material.
+    let (status, jobs) = server.request("GET", "/api/jobs", None);
+    assert_eq!(status, 200, "{jobs}");
+    let row = jobs["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["operation_id"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["state"], "completed", "{row}");
+    assert_eq!(row["recovery"], cfg!(windows), "{row}");
     let (status, changed_intent) = server.request(
         "POST",
         "/api/plans",

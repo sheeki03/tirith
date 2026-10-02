@@ -367,7 +367,7 @@
     approval.append(row('Native package approval', state.package_approval.detail, state.package_approval.state), paragraph(state.package_approval.next_action), paragraph('Ordinary command checks and shell protection do not require sudo. This dashboard never requests administrator credentials.'));
     const recent = panel('Saved changes and recovery'); recent.append(paragraph('These are saved operation states. Open an operation to reconcile its current status; closing the browser does not cancel submitted work.'));
     if (!jobs.operations.length) recent.append(paragraph('No saved operations in the bounded inventory.', 'empty'));
-    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : operation.state, [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
+    for (const operation of jobs.operations) recent.append(row(operation.kind || 'Saved change', operation.operation_id, operation.no_op ? 'unchanged' : shownState(operation), [button('Open saved operation', () => requestDialog(() => api('/api/operations', {operation_id:operation.operation_id, action:'status'}), stored => { showDialog('Saved operation', stored); displayOperation(stored); }))]));
     recent.append(rawDetails('Inspect inventory coverage', jobs.coverage));
     return [install, approval, sources, await teamConnectionPanel(), await teamEnrollmentPanel(), teamRolloutPanel(), retention, recent, supportPanel(), local, exportPanel];
   }
@@ -677,12 +677,15 @@
       pendingPlanActions(pending);
     } finally { if (planRequest === request) planRequest = null; }
   }
+  // A finished apply or undo (and each of its steps) that retained platform
+  // recovery material carries `recovery`; show it as part of the state label.
+  function shownState(item) { return item.recovery ? `${item.state}-with-recovery` : item.state; }
   function displayOperation(operation, preview) {
-    const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : operation.state)); operationActions.replaceChildren();
+    const context = operationContext('settings', operation.operation_id); clearTimeout(pollTimer); operationContent.replaceChildren(badge(operation.no_op ? 'unchanged' : shownState(operation))); operationActions.replaceChildren();
     context.readbackSequence = (context.readbackSequence || 0) + 1;
     if (preview) context.policyFields = preview.field ? [preview.field] : (preview.field_changes || []).map(change => change.field);
     const descriptions = { planned: 'Review the destinations and changes below before applying.', running: 'The change continues if you close this page.', completed: 'The change was saved. Reload the relevant shell or host where required.', 'completed-with-recovery': 'The change was saved, with recovery material retained. Inspect the details before cleanup.', undone: 'The owned change was undone. Unrelated settings were preserved.', 'undone-with-recovery': 'Undo completed with recovery material retained.', 'refresh-required': 'Inputs changed. Refresh and review a new plan before continuing.', 'recovery-required': 'The operation needs recovery. Inspect its steps; do not assume every change was applied.', 'partially-applied': 'Only some steps completed. Inspect the recorded result before another action.', cancelled: 'The operation was cancelled.', 'cancel-requested': 'Cancellation was requested. Already completed steps remain recorded.' };
-    operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[operation.state] || 'Inspect the stored operation state.'));
+    operationContent.append(paragraph(operation.no_op ? 'No settings needed changing. This result is saved so retries cannot turn it into a different change.' : descriptions[shownState(operation)] || 'Inspect the stored operation state.'));
     if (operation.detail) operationContent.append(paragraph(operation.detail, 'notice'));
     if (operation.irreversible) operationContent.append(paragraph('This operation permanently deletes retained records. A checkpoint and tombstone remain, but these records cannot be restored by undo.', 'notice'));
     if (operation.impact_review) {
@@ -702,15 +705,15 @@
         operationContent.append(paragraph('Read-time evidence age is unavailable. Inspect the captured timestamps; current exceptions and client adoption have not been rechecked.', 'notice'));
       }
     }
-    for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, step.state));
+    for (const step of operation.steps || []) operationContent.append(row(step.description, step.target, shownState(step)));
     operationContent.append(rawDetails('Stored operation and recovery details', operation), paragraph(`Operation ID: ${context.id}`, 'muted'));
-    if (['set-profile','set-managed-profile','set-personal-setting','recommended-setup','import-policy'].includes(operation.kind) && ['completed','completed-with-recovery','undone','undone-with-recovery'].includes(operation.state)) {
+    if (['set-profile','set-managed-profile','set-personal-setting','recommended-setup','import-policy'].includes(operation.kind) && ['completed','undone'].includes(operation.state)) {
       const readback = panel('Current effective readback'); readback.append(paragraph('Reading current policy…', 'muted')); operationContent.append(readback);
       readEffectivePolicy(context, context.readbackSequence, readback);
     }
     if (!operation.no_op && !operation.presentation_incomplete && operation.state === 'planned') operationActions.append(button('Apply reviewed change', () => act(context, 'apply'), 'primary'));
     if (['planned','running','waiting','queued','cancel-requested'].includes(operation.state)) operationActions.append(button('Request cancellation', () => act(context, 'cancel')));
-    if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && ['completed','completed-with-recovery'].includes(operation.state)) operationActions.append(button('Undo owned change', () => act(context, 'undo')));
+    if (!operation.irreversible && !operation.no_op && !operation.presentation_incomplete && operation.state === 'completed') operationActions.append(button('Undo owned change', () => act(context, 'undo')));
     operationActions.append(button('Refresh stored status', () => act(context, 'status')));
     if (['running','waiting','queued','cancel-requested'].includes(operation.state)) pollTimer = setTimeout(() => act(context, 'status').catch(showError), 1500);
   }

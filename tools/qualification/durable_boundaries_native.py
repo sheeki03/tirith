@@ -26,7 +26,7 @@ read_bytes = shared.read_bytes
 save_json = shared.save_json
 sha = shared.sha
 OBSERVE_SECONDS = 20
-SUCCESS_STATES = {"planned", "completed", "completed-with-recovery", "undone", "undone-with-recovery", "cancelled"}
+SUCCESS_STATES = {"planned", "completed", "undone", "cancelled"}
 # A closed version-1 strict-profile fixture, checked independently against both
 # the immutable planned fields and the bytes actually published. This is not a
 # general YAML parser or a reproduction of the product's mutation algorithm.
@@ -250,7 +250,7 @@ class Case:
         deadline = time.monotonic() + OBSERVE_SECONDS
         while job.process.poll() is None and time.monotonic() < deadline:
             current = self.journal_value()
-            active = current["steps"][0]["state"] in ("applying", "applied", "applied-with-recovery")
+            active = current["steps"][0]["state"] in ("applying", "applied")
             stage = self.rotation_stage() if kind == "audit" else (
                 "before-policy-publication" if read_bytes(self.policy) == self.original else "policy-published")
             if active and stage == requested and lock.exists() and lock_busy(lock):
@@ -340,21 +340,21 @@ def crash_rotation(case, stage):
     case.kill_stopped(job)
     require(case.snapshot() == boundary["snapshot"], "process death changed durable bytes")
     require(not lock_busy(case.log), "audit lock survived owner process death")
-    status = operation_state(case.operation("status"), {"recovery-required", "completed", "completed-with-recovery"})
+    status = operation_state(case.operation("status"), {"recovery-required", "completed"})
     case.observations["reopened_status"] = status["state"]
-    operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    operation_state(case.operation("apply"), {"completed"})
     require(identity(case.log) == case.original_identity, "recovery replaced the active audit inode")
     case.verify_archive()
     case.verify(1)
     completed = case.snapshot()
-    operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    operation_state(case.operation("apply"), {"completed"})
     require(case.snapshot() == completed, "identical retry rewrote committed bytes or inode")
-    operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    operation_state(case.operation("undo"), {"undone"})
     require(read_bytes(case.log) == case.original and read_bytes(case.head) == case.original_head,
             "undo did not restore exact original audit bytes/head")
     require(identity(case.log) == case.original_identity, "undo replaced active audit inode")
     undone = case.snapshot()
-    operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    operation_state(case.operation("undo"), {"undone"})
     require(case.snapshot() == undone, "repeated undo changed bytes or inode")
     case.verify(1)
 
@@ -379,7 +379,7 @@ def concurrent_rotation_cancel(case):
     require(case.snapshot() == boundary["snapshot"], "cancelled worker published audit bytes")
     require(not (case.archive / "manifest.json").exists(), "cancelled worker completed archive publication")
     case.observations["cancel_resolution"] = state["state"]
-    operation_state(case.operation("undo"), {"undone", "undone-with-recovery", "cancelled"})
+    operation_state(case.operation("undo"), {"undone", "cancelled"})
     require(case.snapshot() == boundary["snapshot"], "compensation after cancellation changed original bytes")
     case.verify(1)
 
@@ -389,7 +389,7 @@ def crash_profile(case, stage, concurrent=None):
     job = case.start("apply-interrupted", ["policy", "operation", case.id, "--action", "apply", "--json"])
     boundary = case.capture_stopped(job, "profile", stage)
     if concurrent == "cancel" and not boundary["shared_setup_lock_busy"]:
-        operation_state(case.operation("cancel"), {"cancel-requested", "cancelled", "completed", "completed-with-recovery"})
+        operation_state(case.operation("cancel"), {"cancel-requested", "cancelled", "completed"})
         case.observations["cancel_requested_while_owner_stopped"] = True
     if concurrent == "edit":
         # An ordinary editor changes an owned setting while the original worker
@@ -398,7 +398,7 @@ def crash_profile(case, stage, concurrent=None):
         case.policy.chmod(0o600)
         case.observations["edited_generation"] = fingerprint(case.policy)
     case.kill_stopped(job)
-    operation_state(case.operation("status"), {"recovery-required", "completed", "completed-with-recovery"})
+    operation_state(case.operation("status"), {"recovery-required", "completed"})
     if concurrent == "edit":
         after_edit = fingerprint(case.policy)
         row = case.operation("apply")
@@ -413,23 +413,23 @@ def crash_profile(case, stage, concurrent=None):
         return
     if concurrent == "cancel":
         if not case.observations.get("cancel_requested_while_owner_stopped"):
-            operation_state(case.operation("cancel"), {"cancel-requested", "cancelled", "completed", "completed-with-recovery"})
+            operation_state(case.operation("cancel"), {"cancel-requested", "cancelled", "completed"})
             case.observations["cancel_after_death_only"] = True
-        state = operation_state(case.operation("apply"), {"cancelled", "partially-applied", "completed", "completed-with-recovery"})
+        state = operation_state(case.operation("apply"), {"cancelled", "partially-applied", "completed"})
         case.observations["cancel_resolution"] = state["state"]
         require(fingerprint(case.policy) == boundary["snapshot"]["policy"], "cancel replay introduced another policy publication")
         return
-    operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    operation_state(case.operation("apply"), {"completed"})
     strict_profile_published(case.policy)
     completed = fingerprint(case.policy)
     if boundary["observed_stage"] == "policy-published":
         require(completed == boundary["snapshot"]["policy"], "recovery replaced an already-published intended generation")
-    operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    operation_state(case.operation("apply"), {"completed"})
     require(fingerprint(case.policy) == completed, "profile replay republished a committed generation")
-    operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    operation_state(case.operation("undo"), {"undone"})
     require(read_bytes(case.policy) == case.original, "profile undo failed exact simple fixture restoration")
     undone = fingerprint(case.policy)
-    operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    operation_state(case.operation("undo"), {"undone"})
     require(fingerprint(case.policy) == undone, "profile undo replay republished content")
 
 

@@ -560,10 +560,7 @@ mod tests {
                 &EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime),
             )
             .unwrap();
-        assert!(matches!(
-            state.state,
-            JobState::Completed | JobState::CompletedWithRecovery
-        ));
+        assert_eq!(state.state, JobState::Completed);
         (id, active, original)
     }
     #[test]

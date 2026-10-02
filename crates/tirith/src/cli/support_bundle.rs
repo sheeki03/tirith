@@ -244,10 +244,7 @@ fn save(
     .intent(&json!({"kind":"support_export_v1","selection":selection,"cwd":cwd,"report":report}))?;
     service.submit(&id, snapshot, request)?;
     let status = service.apply(&id, snapshot)?;
-    if !matches!(
-        status.state,
-        JobState::Completed | JobState::CompletedWithRecovery
-    ) {
+    if status.state != JobState::Completed {
         return Err(format!(
             "support export did not complete; inspect saved operation {id}"
         ));

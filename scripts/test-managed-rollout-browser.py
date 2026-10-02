@@ -281,7 +281,7 @@ def run(binary, output):
                     def activate():
                         page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                         page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=40000)
-                        assert stored()["state"] in ("completed", "completed-with-recovery")
+                        assert stored()["state"] == "completed"
 
                     try:
                         page.goto(launch["url"])

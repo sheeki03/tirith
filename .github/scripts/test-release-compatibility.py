@@ -43,33 +43,38 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(set(result["targets"]), set(MODULE.TARGETS))
         self.assertEqual(result["version"], VERSION)
         self.assertEqual(result["mcp_lock_authorize_versions"], [8])
-        self.assertEqual(result["operation_journal_client_rule"], "exact_client_version_required")
+        self.assertEqual(result["state_contract_versions"], [1])
         self.assertTrue(all(len(target["binary_sha256"]) == 64 for target in result["targets"].values()))
         self.assertEqual(result, MODULE.build(ROOT, self.artifacts, VERSION))
         with self.assertRaisesRegex(ValueError, "workspace"):
             MODULE.build(ROOT, self.artifacts, "999.0.0")
 
-    def test_persisted_readers_and_recovery_capabilities_are_bound_to_source(self):
+    def test_state_contract_is_bound_to_persisted_format_source(self):
         result = MODULE.contract(ROOT, VERSION)
-        readers = result["persisted_formats"]
-        self.assertEqual(set(readers), {
-            "team_connection", "team_enrollment", "team_report", "team_rollout",
-            "team_policy_document", "team_policy_semantics", "shell_execution_receipt",
+        self.assertEqual(set(result), {
+            "schema_version", "version", "policy_read_versions", "mcp_lock_read_versions",
+            "mcp_lock_authorize_versions", "legacy_trust_read_versions",
+            "scoped_grant_read_versions", "state_contract_versions",
         })
-        self.assertTrue(all(value == [1] for name, value in readers.items()
-                            if name != "shell_execution_receipt"))
-        self.assertEqual(readers["shell_execution_receipt"], [3, 4])
-        self.assertTrue({"team_policy_runtime_v1", "team_policy_recovery_v1"} <= set(result["features"]))
-        # The retired local-leaf npm routes carry no compatibility contract.
-        self.assertFalse([name for name in readers if name.startswith("npm_")])
-        self.assertFalse([name for name in result["features"] if name.startswith("npm_")])
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["state_contract_versions"], [1])
+        # The retired per-surface inventory, feature and rule fields (including
+        # local-leaf npm routes) carry no compatibility contract.
+        self.assertFalse([name for name in result if name.startswith(("npm_", "persisted", "features"))])
         original = MODULE.source_constant
-        for changed in ("SCHEMA_VERSION", "POLICY_SEMANTICS_VERSION",
-                        "RECEIPT_SCHEMA_VERSION", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION"):
+        for changed in ("SCHEMA", "PROTOCOL", "SCHEMA_VERSION", "POLICY_SEMANTICS_VERSION",
+                        "RECEIPT_SCHEMA_VERSION", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION",
+                        "STATE_CONTRACT_VERSION"):
             def replaced(root, path, name):
                 return 99 if name == changed else original(root, path, name)
             with self.subTest(changed=changed), patch.object(MODULE, "source_constant", replaced):
-                with self.assertRaisesRegex(ValueError, "persisted format implementation changed"):
+                with self.assertRaisesRegex(ValueError, "persisted state implementation changed"):
+                    MODULE.contract(ROOT, VERSION)
+        for changed in ("CURRENT_SCHEMA_VERSION", "MCP_LOCK_FORMAT_VERSION", "STORE_VERSION"):
+            def replaced(root, path, name):
+                return 99 if name == changed else original(root, path, name)
+            with self.subTest(changed=changed), patch.object(MODULE, "source_constant", replaced):
+                with self.assertRaisesRegex(ValueError, "format implementation changed"):
                     MODULE.contract(ROOT, VERSION)
 
     def test_signed_fixture_holds_every_literal_generator_source_dependency(self):

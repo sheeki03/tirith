@@ -46,10 +46,11 @@ Release publication creates `release-compatibility.json` before generating
 `checksums.txt`; the existing exact-tag Sigstore signature covers its checksum
 alongside every other payload. The document binds the release version, each
 canonical target archive SHA-256, the exact root CLI executable SHA-256, readable
-format versions, lock formats that can authorize execution, and service/journal
-contracts. Generation reads archive members without executing candidates. It
-rejects missing targets, duplicate or escaping members, links, special files,
-and oversized archives. Changed format constants require review of the contract
+policy, MCP lock and trust versions, lock formats that can authorize execution,
+and the readable persisted-state contract versions (`state_contract_versions`).
+Generation reads archive members without executing candidates. It rejects
+missing targets, duplicate or escaping members, links, special files, and
+oversized archives. Changed format constants require review of the contract
 before another publication.
 
 | Stored surface | Current reader | Compatibility consequence |
@@ -63,10 +64,17 @@ before another publication.
 | Team connection, enrollment, report and rollout records | Each schema 1; team policy semantics 1 | Candidates must retain team Runtime enforcement and explicit report/rollout recovery. A missing reader or capability refuses update and rollback, even if the old binary has the same package version. |
 | Shell execution receipts | Schema 3 active/unacknowledged records; schema 4 acknowledged terminal records | A receipt is acknowledged only after an observed terminal result: the same `consume`, `discard` or `reconcile` call that succeeds retires it (best effort), and a separate `acknowledge` call from an older hook is accepted as a no-op. Schema 4 is non-authorizing and eligible for the next locked cleanup; schema 3 recovery windows are preserved. Schema 1/2 are authenticated retirement inputs only. Older readers reject schema 4; missing reader declarations refuse update/rollback. Hook capability schema 3 is unchanged. Explicit ACK may end only its own exact clean shell-boundary record's retention at the actual acknowledgment time, advancing the ledger generation without upgrading its unresolved evidence. The observation remains available to normal reads until existing pressure or stale-session cleanup reclaims it; warnings, escalation, typed events and later transitions keep their existing retention. |
 
-The closed `persisted_formats` contract names these readers separately. A missing
-contract in older signed metadata or rollback evidence means unsupported; it is
-not filled from the running client's capabilities. Publication checks the actual
-writer/reader constants and refuses an unreviewed format change.
+One persisted-state contract version (currently 1) covers every row above except
+policy, MCP lock and trust, which keep their own reader lists: the operation
+journal, the local control service, the team records with Runtime enforcement
+and recovery, shell execution receipts, and byte-preserving configuration
+updates. A candidate or rollback point must declare that it reads the current
+contract version; a missing or different declaration means unsupported and is
+not filled from the running client's capabilities. Local team and receipt stores
+are checked against this binary's own contract readers, so a store written by a
+newer contract is refused. Publication checks the actual writer/reader constants
+against the contract and refuses an unreviewed format change; changing any of
+them requires a new contract version.
 
 Inventory reads only fixed private team files, the bounded team rollout directory,
 and shell receipt declarations in the private session receipt directory. Known receipt locks and hook capability

@@ -901,7 +901,7 @@ def run_response_order(binary, output, app_js=None):
                     page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
                     return stored()["operation_id"]
 
-                def terminal(operation_id, allowed=("completed", "completed-with-recovery")):
+                def terminal(operation_id, allowed=("completed",)):
                     latest = None
                     def finished():
                         nonlocal latest
@@ -981,7 +981,7 @@ def run_response_order(binary, output, app_js=None):
                     page.get_by_role("button", name="Request cancellation", exact=True).click()
                     page.locator("#operation-content > .badge").filter(has_text="cancelled").wait_for(timeout=40000)
                     assert terminal(new_id, ("cancelled",))["operation_id"] == new_id
-                    assert terminal(old_id)["state"] in ("completed", "completed-with-recovery")
+                    assert terminal(old_id)["state"] == "completed"
                     close()
                     report["checks"].append("late_apply_response_cannot_replace_or_redirect_a_new_settings_operation")
 

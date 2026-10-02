@@ -194,15 +194,15 @@ def enospc_profile(case):
     finally:
         case.volume.release()
     durable.operation_state(case.operation("status"), {"recovery-required"})
-    durable.operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    durable.operation_state(case.operation("apply"), {"completed"})
     durable.strict_profile_published(case.policy)
     completed = durable.fingerprint(case.policy)
-    durable.operation_state(case.operation("apply"), {"completed", "completed-with-recovery"})
+    durable.operation_state(case.operation("apply"), {"completed"})
     require(durable.fingerprint(case.policy) == completed, "completed replay rewrote policy generation")
-    durable.operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    durable.operation_state(case.operation("undo"), {"undone"})
     require(shared.read_bytes(case.policy) == case.original, "undo did not restore exact original policy")
     undone = durable.fingerprint(case.policy)
-    durable.operation_state(case.operation("undo"), {"undone", "undone-with-recovery"})
+    durable.operation_state(case.operation("undo"), {"undone"})
     require(durable.fingerprint(case.policy) == undone, "undo replay rewrote policy generation")
     case.observations["reopen"] = "exact intended policy published after freeing space; replay stable and undo exact"
 

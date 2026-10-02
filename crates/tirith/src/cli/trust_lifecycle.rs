@@ -487,10 +487,7 @@ fn perform(
         return Ok(id);
     }
     let status = service.apply(&id, &context.snapshot)?;
-    if !matches!(
-        status.state,
-        JobState::Completed | JobState::CompletedWithRecovery
-    ) {
+    if status.state != JobState::Completed {
         return Err(format!(
             "trust operation {} requires attention: {:?}; inspect tirith policy operation status",
             id, status.state

@@ -364,7 +364,7 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
                     value["operation"]["operation_id"]
                         .as_str()
                         .unwrap_or("unknown"),
-                    value["operation"]["state"].as_str().unwrap_or("unknown")
+                    super::profile::human_state(&value["operation"])
                 );
                 for (index, workflow) in value["impact"]["workflows"]
                     .as_array()
@@ -411,14 +411,7 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
 fn operation_exit(value: &serde_json::Value) -> i32 {
     use super::setup::change_plan::JobState;
     match serde_json::from_value::<JobState>(value.clone()) {
-        Ok(
-            JobState::Planned
-            | JobState::Completed
-            | JobState::CompletedWithRecovery
-            | JobState::Undone
-            | JobState::UndoneWithRecovery
-            | JobState::Cancelled,
-        ) => 0,
+        Ok(JobState::Planned | JobState::Completed | JobState::Undone | JobState::Cancelled) => 0,
         _ => 1,
     }
 }
@@ -461,9 +454,7 @@ mod tests {
         for state in [
             JobState::Planned,
             JobState::Completed,
-            JobState::CompletedWithRecovery,
             JobState::Undone,
-            JobState::UndoneWithRecovery,
             JobState::Cancelled,
         ] {
             assert_eq!(
@@ -542,6 +533,7 @@ mod tests {
             client_version: env!("CARGO_PKG_VERSION").into(),
             policy_identity: snapshot.identity.clone(),
             state: JobState::Planned,
+            recovery: false,
             no_op: false,
             irreversible: false,
             active_action: None,
@@ -553,6 +545,7 @@ mod tests {
                 description: "d".repeat(120000),
                 activation: true,
                 state: StepState::Pending,
+                recovery: false,
             }],
         };
         let value = project_output(

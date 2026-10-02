@@ -832,8 +832,8 @@ def run_reload(binary, host, python, claude_invocation):
                 status = json.loads(stdout)
                 steps = status.get("steps", [])
                 if (status.get("kind") != "recommended-setup"
-                        or status.get("state") not in ("completed", "completed-with-recovery")
-                        or not steps or not all(step.get("state") in ("applied", "applied-with-recovery")
+                        or status.get("state") != "completed"
+                        or not steps or not all(step.get("state") == "applied"
                                                 for step in steps)):
                     raise RuntimeError("recommended setup did not complete every requested step")
                 installed_recommended_identity(settings, python)

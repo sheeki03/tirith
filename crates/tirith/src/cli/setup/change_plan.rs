@@ -226,6 +226,10 @@ struct Step {
     activation: bool,
     description: String,
     state: StepState,
+    /// The last publication of this step (apply or compensation) retained
+    /// platform recovery material; reset by every later publication.
+    #[serde(default, skip_serializing_if = "is_false")]
+    recovery: bool,
     scope_identity: ScopeIdentity,
     /// Authority inputs need full-document bindings: an unrelated policy key
     /// may itself alter authorization even when our owned leaf is unchanged.
@@ -296,10 +300,8 @@ pub(crate) enum StepState {
     Pending,
     Applying,
     Applied,
-    AppliedWithRecovery,
     Compensating,
     Compensated,
-    CompensatedWithRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,11 +313,9 @@ pub(crate) enum JobState {
     Cancelled,
     PartiallyApplied,
     Completed,
-    CompletedWithRecovery,
     RefreshRequired,
     RecoveryRequired,
     Undone,
-    UndoneWithRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,17 +329,14 @@ impl JobAction {
     fn already_finished(self, state: JobState) -> bool {
         match self {
             Self::Apply => state.completed() || state == JobState::Cancelled,
-            Self::Undo => matches!(state, JobState::Undone | JobState::UndoneWithRecovery),
+            Self::Undo => state == JobState::Undone,
         }
     }
 }
 
 impl JobState {
     fn completed(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::CompletedWithRecovery | Self::Undone | Self::UndoneWithRecovery
-        )
+        matches!(self, Self::Completed | Self::Undone)
     }
 }
 
@@ -377,6 +374,8 @@ pub(crate) struct StepStatus {
     pub description: String,
     pub activation: bool,
     pub state: StepState,
+    /// The step's last publication retained platform recovery material.
+    pub recovery: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,6 +386,9 @@ pub(crate) struct OperationStatus {
     pub client_version: String,
     pub policy_identity: String,
     pub state: JobState,
+    /// A completed apply or undo retained platform recovery material; inspect
+    /// the operation before cleanup.
+    pub recovery: bool,
     pub no_op: bool,
     pub irreversible: bool,
     pub active_action: Option<JobAction>,
@@ -415,6 +417,12 @@ pub(crate) struct OperationCoverage {
 }
 
 impl Journal {
+    /// Recovery is a property of the finished apply or undo only: every
+    /// publication rewrites its step's flag, and Pending steps never carry it.
+    fn recovery(&self) -> bool {
+        self.state.completed() && self.steps.iter().any(|step| step.recovery)
+    }
+
     fn public(&self) -> OperationStatus {
         OperationStatus {
             schema_version: self.schema_version,
@@ -423,6 +431,7 @@ impl Journal {
             client_version: self.client_version.clone(),
             policy_identity: self.policy_identity.clone(),
             state: self.state,
+            recovery: self.recovery(),
             no_op: self.no_op,
             irreversible: self.kind == OperationKind::DeleteAuditSegment,
             active_action: matches!(self.state, JobState::Running | JobState::CancelRequested)
@@ -439,6 +448,7 @@ impl Journal {
                     description: step.description.clone(),
                     activation: step.activation,
                     state: step.state,
+                    recovery: step.recovery,
                 })
                 .collect(),
         }
@@ -993,6 +1003,7 @@ impl MutationService {
                     activation: true,
                     description: request.description,
                     state: StepState::Pending,
+                    recovery: false,
                     authority_document: None,
                     undo_document: None,
                 });
@@ -1014,6 +1025,7 @@ impl MutationService {
                     activation: true,
                     description: request.description,
                     state: StepState::Pending,
+                    recovery: false,
                     authority_document: None,
                     undo_document: None,
                 });
@@ -1101,6 +1113,7 @@ impl MutationService {
                 activation: request.activation,
                 description: request.description,
                 state: StepState::Pending,
+                recovery: false,
                 authority_document: None,
                 undo_document: None,
             };
@@ -1223,10 +1236,7 @@ impl MutationService {
                 for step in &record.steps {
                     preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
                     step.scope_identity.validate()?;
-                    if matches!(
-                        step.edit,
-                        OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_)
-                    ) {
+                    if step.backend().locks_own_generation() {
                         // Plan is only a preview. Apply rechecks exact bytes under
                         // the native log lock before any archive or active write.
                         continue;
@@ -1324,6 +1334,8 @@ impl MutationService {
 
     /// The caller retains the execution lock on this thread. Authorization and
     /// all journal state changes occur only after that lock has been acquired.
+    /// Authorization runs once before the step loop and again at every step's
+    /// commit boundary (inside its publication lock), never fewer.
     fn apply_locked(
         &self,
         operation_id: &str,
@@ -1343,6 +1355,7 @@ impl MutationService {
             Ok(inputs) => inputs,
             Err(error) => return self.refuse_apply(operation_id, refresh(error)),
         };
+        let phase = Phase::Apply(shell_inputs.as_ref());
         if record.undo_external_authorization.is_some() {
             return Err(refresh(
                 "undo has begun; finish recovery or create a new plan",
@@ -1354,7 +1367,7 @@ impl MutationService {
             .any(|step| step.state != StepState::Pending)
             .then(|| policy.refresh_runtime());
         let initial_policy = refreshed.as_ref().unwrap_or(policy);
-        if let Err(error) = self.authorize(&record, initial_policy, shell_inputs.as_ref()) {
+        if let Err(error) = self.authorize(&record, initial_policy, phase, None) {
             return self.refuse_apply(operation_id, error);
         }
         let record = self.read(operation_id)?;
@@ -1365,13 +1378,21 @@ impl MutationService {
             return Err(refresh("client changed; create a compatible plan"));
         }
         if self.all_postconditions(&record)? {
-            return Ok(self.update(operation_id, |record| { let recovery = record.steps.iter().any(|s| matches!(s.state, StepState::Applying | StepState::AppliedWithRecovery));
-                record.state = if recovery { JobState::CompletedWithRecovery } else { JobState::Completed };
-                record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
-                for step in &mut record.steps { step.state = if recovery { StepState::AppliedWithRecovery } else { StepState::Applied }; } Ok(()) })?.public());
-        }
-        if let Err(error) = self.authorize(&record, initial_policy, shell_inputs.as_ref()) {
-            return self.refuse_apply(operation_id, error);
+            return Ok(self
+                .update(operation_id, |record| {
+                    let recovery = record.steps.iter().any(|s| {
+                        s.state == StepState::Applying
+                            || (s.state == StepState::Applied && s.recovery)
+                    });
+                    record.state = JobState::Completed;
+                    record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
+                    for step in &mut record.steps {
+                        step.state = StepState::Applied;
+                        step.recovery = recovery;
+                    }
+                    Ok(())
+                })?
+                .public());
         }
         self.update(operation_id, |record| {
             if !matches!(
@@ -1390,9 +1411,7 @@ impl MutationService {
             {
                 return Ok(self
                     .update(operation_id, |record| {
-                        let applied = record.steps.iter().any(|s| {
-                            matches!(s.state, StepState::Applied | StepState::AppliedWithRecovery)
-                        });
+                        let applied = record.steps.iter().any(|s| s.state == StepState::Applied);
                         record.state = if applied {
                             JobState::PartiallyApplied
                         } else {
@@ -1411,10 +1430,7 @@ impl MutationService {
                     .public());
             }
             let step = live.steps[index].clone();
-            if matches!(
-                step.state,
-                StepState::Applied | StepState::AppliedWithRecovery
-            ) {
+            if step.state == StepState::Applied {
                 continue;
             }
             // Resolve after prior owned publications and outside the retained
@@ -1425,43 +1441,14 @@ impl MutationService {
                 .any(|step| step.state != StepState::Pending)
                 .then(|| policy.refresh_runtime());
             let step_policy = refreshed_step.as_ref().unwrap_or(initial_policy);
-            if let Err(error) = self.authorize(&live, step_policy, shell_inputs.as_ref()) {
-                return self.refuse_apply(operation_id, error);
-            }
             self.update(operation_id, |record| {
                 record.steps[index].state = StepState::Applying;
                 Ok(())
             })?;
-            let outcome = if let OwnedEdit::AuditRotation(plan) = &step.edit {
-                super::audit_service::mutate(
-                    plan,
-                    &step.target,
-                    &step.scope_root,
-                    step_policy,
-                    false,
-                    || {
-                        let current = self.read(operation_id)?;
-                        if matches!(
-                            current.state,
-                            JobState::Cancelled | JobState::CancelRequested
-                        ) {
-                            return Err(
-                                "operation cancellation requested before publication".into()
-                            );
-                        }
-                        if started.elapsed() >= JOB_TIMEOUT {
-                            return Err("operation deadline reached before publication".into());
-                        }
-                        self.authorize_except(
-                            &current,
-                            step_policy,
-                            Some(index),
-                            shell_inputs.as_ref(),
-                        )
-                    },
-                )
-            } else if let OwnedEdit::AuditSegment(plan) = &step.edit {
-                plan.mutate(step_policy, false, || {
+            let except = step.backend().locks_own_generation().then_some(index);
+            let outcome = step
+                .backend()
+                .publish(&step, live.kind, step_policy, false, &mut || {
                     let current = self.read(operation_id)?;
                     if matches!(
                         current.state,
@@ -1472,58 +1459,14 @@ impl MutationService {
                     if started.elapsed() >= JOB_TIMEOUT {
                         return Err("operation deadline reached before publication".into());
                     }
-                    self.authorize_except(&current, step_policy, Some(index), shell_inputs.as_ref())
-                })
-            } else {
-                super::fs_transaction::transactional_update_authorized(
-                    &step.target,
-                    &step.scope_root,
-                    false,
-                    |snapshot| {
-                        if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
-                            snapshot.require_private()?;
-                        }
-                        let current = snapshot.text(&step.target)?;
-                        match transform(&step.edit, current, false)? {
-                            Some(text) => Ok(step_update(&step, text)),
-                            None => Ok(FileUpdate::unchanged()),
-                        }
-                    },
-                    || {
-                        let current = self.read(operation_id)?;
-                        if matches!(
-                            current.state,
-                            JobState::Cancelled | JobState::CancelRequested
-                        ) {
-                            return Err(
-                                "operation cancellation requested before publication".into()
-                            );
-                        }
-                        if started.elapsed() >= JOB_TIMEOUT {
-                            return Err("operation deadline reached before publication".into());
-                        }
-                        self.authorize(&current, step_policy, shell_inputs.as_ref())
-                    },
-                    |bytes| {
-                        authorize_publication(
-                            live.kind,
-                            &step.scope_root,
-                            &step.target,
-                            bytes,
-                            step_policy,
-                        )
-                    },
-                )
-            };
+                    self.authorize(&current, step_policy, phase, except)
+                });
             match outcome {
                 Ok(outcome) => {
                     self.update(operation_id, |record| {
-                        record.steps[index].state =
-                            if outcome == TransactionOutcome::WrittenWithRecovery {
-                                StepState::AppliedWithRecovery
-                            } else {
-                                StepState::Applied
-                            };
+                        record.steps[index].state = StepState::Applied;
+                        record.steps[index].recovery =
+                            outcome == TransactionOutcome::WrittenWithRecovery;
                         Ok(())
                     })?;
                 }
@@ -1535,12 +1478,7 @@ impl MutationService {
                             } else if error == "operation cancellation requested before publication"
                             {
                                 if record.steps.iter().any(|s| {
-                                    matches!(
-                                        s.state,
-                                        StepState::Applying
-                                            | StepState::Applied
-                                            | StepState::AppliedWithRecovery
-                                    )
+                                    matches!(s.state, StepState::Applying | StepState::Applied)
                                 }) {
                                     JobState::PartiallyApplied
                                 } else {
@@ -1558,51 +1496,52 @@ impl MutationService {
         }
         Ok(self
             .update(operation_id, |record| {
-                record.state = if record
-                    .steps
-                    .iter()
-                    .any(|s| s.state == StepState::AppliedWithRecovery)
-                {
-                    JobState::CompletedWithRecovery
-                } else {
-                    JobState::Completed
-                };
+                record.state = JobState::Completed;
                 record.detail = None;
                 Ok(())
             })?
             .public())
     }
 
+    /// The one authorization decision for apply and undo. `except` names a step
+    /// whose backend rechecks its own generation under its native lock.
     fn authorize(
         &self,
         record: &Journal,
         policy: &EffectivePolicySnapshot,
-        shell_inputs: Option<&super::shell_service::RetainedShellInputs>,
-    ) -> Result<(), String> {
-        self.authorize_except(record, policy, None, shell_inputs)
-    }
-
-    fn authorize_except(
-        &self,
-        record: &Journal,
-        policy: &EffectivePolicySnapshot,
+        phase: Phase<'_>,
         except: Option<usize>,
-        shell_inputs: Option<&super::shell_service::RetainedShellInputs>,
     ) -> Result<(), String> {
-        validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs).map_err(refresh)?;
-        validate_claude_activation(record).map_err(refresh)?;
-        if let Some(review) = &record.impact_review {
-            let age = chrono::Utc::now()
-                .signed_duration_since(review.evaluated_at)
-                .num_seconds();
-            if !(0..tirith_core::policy_rollout::EVIDENCE_MAX_AGE_SECONDS).contains(&age) {
-                return Err(refresh(
-                    "policy impact review is stale or future-dated; prepare fresh evidence",
-                ));
+        match phase {
+            Phase::Apply(shell_inputs) => {
+                validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs)
+                    .map_err(refresh)?;
+                validate_claude_activation(record).map_err(refresh)?;
+                if let Some(review) = &record.impact_review {
+                    let age = chrono::Utc::now()
+                        .signed_duration_since(review.evaluated_at)
+                        .num_seconds();
+                    if !(0..tirith_core::policy_rollout::EVIDENCE_MAX_AGE_SECONDS).contains(&age) {
+                        return Err(refresh(
+                            "policy impact review is stale or future-dated; prepare fresh evidence",
+                        ));
+                    }
+                }
+                if record.operator != self.operator {
+                    return Err(refresh("operator changed"));
+                }
             }
-        }
-        if record.operator != self.operator {
-            return Err(refresh("operator changed"));
+            Phase::Undo => {
+                if let Some(precondition) = &record.shell_precondition {
+                    precondition.validate_undo().map_err(refresh)?;
+                }
+                if matches!(
+                    record.state,
+                    JobState::CancelRequested | JobState::Cancelled
+                ) {
+                    return Err("undo cancellation requested before publication".into());
+                }
+            }
         }
         policy.revalidate_for_mutation().map_err(refresh)?;
         if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
@@ -1613,10 +1552,17 @@ impl MutationService {
             .iter()
             .map(|step| step.target.clone())
             .collect();
-        if record.external_authorization != policy.private_external_inputs_guard(&excluded) {
-            return Err(refresh("external policy inputs changed since planning"));
+        let external = policy.private_external_inputs_guard(&excluded);
+        match phase {
+            Phase::Apply(_) if record.external_authorization != external => {
+                return Err(refresh("external policy inputs changed since planning"));
+            }
+            Phase::Undo if record.undo_external_authorization.as_ref() != Some(&external) => {
+                return Err(refresh("external policy inputs changed since undo began"));
+            }
+            _ => {}
         }
-        self.validate_owned_generations_except(record, except)?;
+        self.validate_owned_generations(record, except)?;
         for step in &record.steps {
             preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
         }
@@ -1633,88 +1579,19 @@ impl MutationService {
             .public())
     }
 
-    fn validate_owned_generations(&self, record: &Journal) -> Result<(), String> {
-        self.validate_owned_generations_except(record, None)
-    }
-
-    fn validate_owned_generations_except(
+    fn validate_owned_generations(
         &self,
         record: &Journal,
         except: Option<usize>,
     ) -> Result<(), String> {
+        let undo_started = record.undo_external_authorization.is_some();
         for (index, step) in record.steps.iter().enumerate() {
-            if except == Some(index)
-                && matches!(
-                    step.edit,
-                    OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_)
-                )
-            {
-                step.scope_identity.validate()?;
-                continue;
-            }
-            if let OwnedEdit::AuditSegment(plan) = &step.edit {
-                step.scope_identity.validate()?;
-                plan.validate_target(&step.target, &step.scope_root)?;
-                if !segment_state_matches(step.state, plan.observe()?) {
-                    return Err(refresh("owned segment generation changed"));
-                }
-                continue;
-            }
-            if let OwnedEdit::AuditRotation(plan) = &step.edit {
-                step.scope_identity.validate()?;
-                let observed = super::audit_service::observe(plan, &step.target, &step.scope_root)?;
-                if !audit_state_matches(step.state, observed) {
-                    return Err(refresh("audit generation changed"));
-                }
-                continue;
-            }
             step.scope_identity.validate()?;
-            let current = read_step(step)?;
-            let authority = if record.undo_external_authorization.is_some() {
-                step.undo_document
-                    .as_ref()
-                    .or(step.authority_document.as_ref())
-            } else {
-                step.authority_document.as_ref()
-            };
-            let accepts = |after| -> Result<bool, String> {
-                if let Some(authority) = authority {
-                    Ok(current
-                        == if after {
-                            authority.after.clone()
-                        } else {
-                            authority.before.clone()
-                        })
-                } else {
-                    owned_matches(&step.edit, current.as_deref(), after)
-                }
-            };
-            let valid = match step.state {
-                StepState::Pending => accepts(false)?,
-                StepState::Applied | StepState::AppliedWithRecovery => accepts(true)?,
-                StepState::Applying => accepts(false)? || accepts(true)?,
-                StepState::Compensated
-                | StepState::CompensatedWithRecovery
-                | StepState::Compensating => {
-                    let compensated = if let Some(authority) = authority {
-                        current == authority.compensation
-                    } else if matches!(
-                        &step.edit,
-                        OwnedEdit::WholeFile { before: None, .. }
-                            | OwnedEdit::PrivateFile { before: None, .. }
-                    ) {
-                        current.as_deref() == Some("")
-                    } else {
-                        accepts(false)?
-                    };
-                    compensated || (step.state == StepState::Compensating && accepts(true)?)
-                }
-            };
-            if !valid {
-                return Err(refresh(
-                    "owned generation or authorization document changed",
-                ));
+            let backend = step.backend();
+            if except == Some(index) && backend.locks_own_generation() {
+                continue;
             }
+            backend.check_generation(step, undo_started)?;
         }
         Ok(())
     }
@@ -1728,62 +1605,7 @@ impl MutationService {
             .iter()
             .map(|step| {
                 step.scope_identity.validate()?;
-                if let OwnedEdit::AuditSegment(plan) = &step.edit {
-                    plan.validate_target(&step.target, &step.scope_root)?;
-                    if plan.irreversible() { return Err("segment deletion is irreversible; checkpoint and deletion record remain".into()); }
-                    if !segment_state_matches(step.state, plan.observe()?) { return Err(refresh("owned exported segment changed before undo")); }
-                    return Ok(None);
-                }
-                if let OwnedEdit::AuditRotation(plan) = &step.edit {
-                    let observed = super::audit_service::observe(plan, &step.target, &step.scope_root)?;
-                    if !audit_state_matches(step.state, observed)
-                        || observed == tirith_core::audit::retention::RotationState::AppliedWithAdditionalRecords {
-                        return Err(refresh("later audit records prevent compensation"));
-                    }
-                    return Ok(None);
-                }
-                let current = read_step(step)?;
-                if record.kind == OperationKind::SetManagedProfile {
-                    let authority = step.authority_document.as_ref()
-                        .ok_or_else(|| refresh("managed operation lacks its authority document"))?;
-                    let unchanged = match step.state {
-                        StepState::Pending => current == authority.before,
-                        StepState::Applying => current == authority.before || current == authority.after,
-                        StepState::Applied | StepState::AppliedWithRecovery => current == authority.after,
-                        _ => false,
-                    };
-                    if !unchanged {
-                        return Err(refresh("newer managed authority document prevents rollback"));
-                    }
-                }
-                let valid = match step.state {
-                    StepState::Pending => owned_matches(&step.edit, current.as_deref(), false)?,
-                    StepState::Applying => {
-                        owned_matches(&step.edit, current.as_deref(), false)?
-                            || owned_matches(&step.edit, current.as_deref(), true)?
-                    }
-                    StepState::Applied | StepState::AppliedWithRecovery => {
-                        owned_matches(&step.edit, current.as_deref(), true)?
-                    }
-                    _ => false,
-                };
-                if !valid {
-                    return Err(refresh("owned fields changed before undo authorization"));
-                }
-                let compensation = if record.kind == OperationKind::SetManagedProfile {
-                    step.authority_document.as_ref()
-                        .ok_or_else(|| refresh("managed operation lacks its authority document"))?
-                        .before.clone()
-                } else if step.state == StepState::Pending {
-                    current.clone()
-                } else {
-                    transform(&step.edit, current.as_deref(), true)?.or(current.clone())
-                };
-                Ok(Some(AuthorityDocument {
-                    before: current.clone(),
-                    after: current,
-                    compensation,
-                }))
+                step.backend().undo_baseline(step, record.kind)
             })
             .collect()
     }
@@ -1791,24 +1613,7 @@ impl MutationService {
     fn all_postconditions(&self, record: &Journal) -> Result<bool, String> {
         for step in &record.steps {
             step.scope_identity.validate()?;
-            if let OwnedEdit::AuditSegment(plan) = &step.edit {
-                plan.validate_target(&step.target, &step.scope_root)?;
-                if plan.observe()? != super::audit_segments::SegmentState::Applied {
-                    return Ok(false);
-                }
-                continue;
-            }
-            if let OwnedEdit::AuditRotation(plan) = &step.edit {
-                if !matches!(super::audit_service::observe(plan, &step.target, &step.scope_root)?,
-                    tirith_core::audit::retention::RotationState::Applied |
-                    tirith_core::audit::retention::RotationState::AppliedWithAdditionalRecords)
-                {
-                    return Ok(false);
-                }
-                continue;
-            }
-            let current = read_step(step)?;
-            if !owned_matches(&step.edit, current.as_deref(), true)? {
+            if !step.backend().applied(step)? {
                 return Ok(false);
             }
         }
@@ -1838,6 +1643,8 @@ impl MutationService {
         self.undo_locked(operation_id, policy)
     }
 
+    /// Like apply: the undo decision is authorized once before the step loop
+    /// and again at every compensation's commit boundary.
     fn undo_locked(
         &self,
         operation_id: &str,
@@ -1845,12 +1652,7 @@ impl MutationService {
     ) -> Result<OperationStatus, String> {
         let started = Instant::now();
         let record = self.read(operation_id)?;
-        if record.no_op
-            || matches!(
-                record.state,
-                JobState::Undone | JobState::UndoneWithRecovery | JobState::Cancelled
-            )
-        {
+        if record.no_op || matches!(record.state, JobState::Undone | JobState::Cancelled) {
             return Ok(record.public());
         }
         let refreshed = record
@@ -1866,7 +1668,7 @@ impl MutationService {
             return Err(refresh("policy resolution scope changed"));
         }
         let undo_documents = if record.undo_external_authorization.is_some() {
-            self.validate_owned_generations(&record)?;
+            self.validate_owned_generations(&record, None)?;
             None
         } else {
             Some(self.capture_undo_documents(&record)?)
@@ -1875,10 +1677,7 @@ impl MutationService {
             preflight_target(record.kind, &step.scope_root, &step.target, initial_policy)?;
         }
         let record = self.read(operation_id)?;
-        if matches!(
-            record.state,
-            JobState::Undone | JobState::UndoneWithRecovery
-        ) {
+        if record.state == JobState::Undone {
             return Ok(record.public());
         }
         // Undo starts a new authorization decision, then pins external inputs
@@ -1916,27 +1715,16 @@ impl MutationService {
         for index in (0..record.steps.len()).rev() {
             let live = self.read(operation_id)?;
             let step = live.steps[index].clone();
-            if matches!(
-                step.state,
-                StepState::Pending | StepState::Compensated | StepState::CompensatedWithRecovery
-            ) {
+            if matches!(step.state, StepState::Pending | StepState::Compensated) {
                 continue;
             }
             let refreshed_step = live
                 .steps
                 .iter()
-                .any(|step| {
-                    matches!(
-                        step.state,
-                        StepState::Compensating
-                            | StepState::Compensated
-                            | StepState::CompensatedWithRecovery
-                    )
-                })
+                .any(|step| matches!(step.state, StepState::Compensating | StepState::Compensated))
                 .then(|| policy.refresh_runtime());
             let step_policy = refreshed_step.as_ref().unwrap_or(initial_policy);
             let outcome = (|| {
-                self.authorize_undo(&live, step_policy)?;
                 if started.elapsed() >= JOB_TIMEOUT {
                     return Err("undo deadline reached before the next compensation".into());
                 }
@@ -1944,96 +1732,21 @@ impl MutationService {
                     record.steps[index].state = StepState::Compensating;
                     Ok(())
                 })?;
-                if let OwnedEdit::AuditRotation(plan) = &step.edit {
-                    return super::audit_service::mutate(
-                        plan,
-                        &step.target,
-                        &step.scope_root,
-                        step_policy,
-                        true,
-                        || {
-                            if started.elapsed() >= JOB_TIMEOUT {
-                                return Err("undo deadline reached before publication".into());
-                            }
-                            self.authorize_undo_except(
-                                &self.read(operation_id)?,
-                                step_policy,
-                                Some(index),
-                            )
-                        },
-                    );
-                }
-                if let OwnedEdit::AuditSegment(plan) = &step.edit {
-                    return plan.mutate(step_policy, true, || {
+                let except = step.backend().locks_own_generation().then_some(index);
+                step.backend()
+                    .publish(&step, live.kind, step_policy, true, &mut || {
                         if started.elapsed() >= JOB_TIMEOUT {
                             return Err("undo deadline reached before publication".into());
                         }
-                        self.authorize_undo_except(
-                            &self.read(operation_id)?,
-                            step_policy,
-                            Some(index),
-                        )
-                    });
-                }
-                super::fs_transaction::transactional_update_authorized(
-                    &step.target,
-                    &step.scope_root,
-                    false,
-                    |snapshot| {
-                        if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
-                            snapshot.require_private()?;
-                        }
-                        if live.kind == OperationKind::SetManagedProfile {
-                            let document = step.undo_document.as_ref().ok_or_else(|| {
-                                refresh("managed rollback lacks its captured document")
-                            })?;
-                            let restored = document.compensation.as_deref().ok_or_else(|| {
-                                refresh("managed rollback cannot remove its authority file")
-                            })?;
-                            let current = snapshot.text(&step.target)?;
-                            if current == Some(restored) {
-                                return Ok(FileUpdate::unchanged());
-                            }
-                            if current != document.after.as_deref() {
-                                return Err(refresh(
-                                    "newer managed authority document prevents rollback",
-                                ));
-                            }
-                            // Whole-document generation checks authorize restoring
-                            // the original bytes, including absent keys and comments.
-                            return Ok(step_update(&step, restored.to_owned()));
-                        }
-                        match transform(&step.edit, snapshot.text(&step.target)?, true)? {
-                            Some(text) => Ok(step_update(&step, text)),
-                            None => Ok(FileUpdate::unchanged()),
-                        }
-                    },
-                    || {
-                        if started.elapsed() >= JOB_TIMEOUT {
-                            return Err("undo deadline reached before publication".into());
-                        }
-                        self.authorize_undo(&self.read(operation_id)?, step_policy)
-                    },
-                    |bytes| {
-                        authorize_publication(
-                            live.kind,
-                            &step.scope_root,
-                            &step.target,
-                            bytes,
-                            step_policy,
-                        )
-                    },
-                )
+                        self.authorize(&self.read(operation_id)?, step_policy, Phase::Undo, except)
+                    })
             })();
             match outcome {
                 Ok(outcome) => {
                     self.update(operation_id, |record| {
-                        record.steps[index].state =
-                            if outcome == TransactionOutcome::WrittenWithRecovery {
-                                StepState::CompensatedWithRecovery
-                            } else {
-                                StepState::Compensated
-                            };
+                        record.steps[index].state = StepState::Compensated;
+                        record.steps[index].recovery =
+                            outcome == TransactionOutcome::WrittenWithRecovery;
                         Ok(())
                     })?;
                 }
@@ -2052,61 +1765,13 @@ impl MutationService {
                 let recovery = record
                     .steps
                     .iter()
-                    .any(|step| step.state == StepState::CompensatedWithRecovery);
-                record.state = if recovery {
-                    JobState::UndoneWithRecovery
-                } else {
-                    JobState::Undone
-                };
+                    .any(|step| step.state == StepState::Compensated && step.recovery);
+                record.state = JobState::Undone;
                 record.detail = recovery
                     .then(|| "undo completed with retained platform recovery material".into());
                 Ok(())
             })?
             .public())
-    }
-
-    fn authorize_undo(
-        &self,
-        record: &Journal,
-        policy: &EffectivePolicySnapshot,
-    ) -> Result<(), String> {
-        self.authorize_undo_except(record, policy, None)
-    }
-
-    fn authorize_undo_except(
-        &self,
-        record: &Journal,
-        policy: &EffectivePolicySnapshot,
-        except: Option<usize>,
-    ) -> Result<(), String> {
-        if let Some(precondition) = &record.shell_precondition {
-            precondition.validate_undo().map_err(refresh)?;
-        }
-        if matches!(
-            record.state,
-            JobState::CancelRequested | JobState::Cancelled
-        ) {
-            return Err("undo cancellation requested before publication".into());
-        }
-        policy.revalidate_for_mutation().map_err(refresh)?;
-        if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
-            return Err(refresh("policy resolution scope changed"));
-        }
-        let excluded = record
-            .steps
-            .iter()
-            .map(|step| step.target.clone())
-            .collect();
-        if record.undo_external_authorization.as_ref()
-            != Some(&policy.private_external_inputs_guard(&excluded))
-        {
-            return Err(refresh("external policy inputs changed since undo began"));
-        }
-        self.validate_owned_generations_except(record, except)?;
-        for step in &record.steps {
-            preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
-        }
-        Ok(())
     }
 
     /// Bounded worker admission keeps long work out of HTTP request handlers.
@@ -2505,8 +2170,8 @@ fn segment_state_matches(step: StepState, state: super::audit_segments::SegmentS
     match step {
         StepState::Pending => state == S::Original,
         StepState::Applying | StepState::Compensating => true,
-        StepState::Applied | StepState::AppliedWithRecovery => state == S::Applied,
-        StepState::Compensated | StepState::CompensatedWithRecovery => state == S::Original,
+        StepState::Applied => state == S::Applied,
+        StepState::Compensated => state == S::Original,
     }
 }
 
@@ -2518,13 +2183,320 @@ fn audit_state_matches(
     match step {
         StepState::Pending => state == R::Original,
         StepState::Applying => !matches!(state, R::Restored),
-        StepState::Applied | StepState::AppliedWithRecovery => {
-            matches!(state, R::Applied | R::AppliedWithAdditionalRecords)
-        }
+        StepState::Applied => matches!(state, R::Applied | R::AppliedWithAdditionalRecords),
         StepState::Compensating => !matches!(state, R::AppliedWithAdditionalRecords),
-        StepState::Compensated | StepState::CompensatedWithRecovery => {
-            matches!(state, R::Original | R::Restored)
+        StepState::Compensated => matches!(state, R::Original | R::Restored),
+    }
+}
+
+/// Which authorization decision a recheck belongs to. Apply binds the planned
+/// external inputs and live shell lease; undo binds the inputs pinned when
+/// undo began.
+#[derive(Clone, Copy)]
+enum Phase<'a> {
+    Apply(Option<&'a super::shell_service::RetainedShellInputs>),
+    Undo,
+}
+
+/// How one journaled step observes, publishes and compensates its target.
+/// Owned file edits publish through the shared file transaction; audit
+/// rotations and segment plans publish through their own native log lock and
+/// recheck their exact generation there.
+trait StepBackend {
+    /// Native backends recheck their own generation under their lock, so the
+    /// commit-time authorization excludes their step (and planning defers to
+    /// apply instead of comparing a preview).
+    fn locks_own_generation(&self) -> bool {
+        false
+    }
+    /// The observed generation agrees with the journaled step state.
+    fn check_generation(&self, step: &Step, undo_started: bool) -> Result<(), String>;
+    /// Apply's owned postcondition already holds.
+    fn applied(&self, step: &Step) -> Result<bool, String>;
+    /// Validate a new undo decision and capture its whole-document baseline.
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String>;
+    /// Publish apply (or compensation) with `authorize` rerun at the commit
+    /// boundary, inside the publication lock.
+    fn publish(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String>;
+}
+
+impl Step {
+    fn backend(&self) -> &dyn StepBackend {
+        match &self.edit {
+            OwnedEdit::AuditRotation(plan) => plan,
+            OwnedEdit::AuditSegment(plan) => plan,
+            _ => &FileEdit,
         }
+    }
+}
+
+/// Every owned edit of one document (fields, hook blocks, whole files).
+struct FileEdit;
+
+impl StepBackend for FileEdit {
+    fn check_generation(&self, step: &Step, undo_started: bool) -> Result<(), String> {
+        let current = read_step(step)?;
+        let authority = if undo_started {
+            step.undo_document
+                .as_ref()
+                .or(step.authority_document.as_ref())
+        } else {
+            step.authority_document.as_ref()
+        };
+        let accepts = |after| -> Result<bool, String> {
+            if let Some(authority) = authority {
+                Ok(current
+                    == if after {
+                        authority.after.clone()
+                    } else {
+                        authority.before.clone()
+                    })
+            } else {
+                owned_matches(&step.edit, current.as_deref(), after)
+            }
+        };
+        let valid = match step.state {
+            StepState::Pending => accepts(false)?,
+            StepState::Applied => accepts(true)?,
+            StepState::Applying => accepts(false)? || accepts(true)?,
+            StepState::Compensated | StepState::Compensating => {
+                let compensated = if let Some(authority) = authority {
+                    current == authority.compensation
+                } else if matches!(
+                    &step.edit,
+                    OwnedEdit::WholeFile { before: None, .. }
+                        | OwnedEdit::PrivateFile { before: None, .. }
+                ) {
+                    current.as_deref() == Some("")
+                } else {
+                    accepts(false)?
+                };
+                compensated || (step.state == StepState::Compensating && accepts(true)?)
+            }
+        };
+        if !valid {
+            return Err(refresh(
+                "owned generation or authorization document changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        owned_matches(&step.edit, read_step(step)?.as_deref(), true)
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        let current = read_step(step)?;
+        if kind == OperationKind::SetManagedProfile {
+            let authority = step
+                .authority_document
+                .as_ref()
+                .ok_or_else(|| refresh("managed operation lacks its authority document"))?;
+            let unchanged = match step.state {
+                StepState::Pending => current == authority.before,
+                StepState::Applying => current == authority.before || current == authority.after,
+                StepState::Applied => current == authority.after,
+                _ => false,
+            };
+            if !unchanged {
+                return Err(refresh(
+                    "newer managed authority document prevents rollback",
+                ));
+            }
+        }
+        let valid = match step.state {
+            StepState::Pending => owned_matches(&step.edit, current.as_deref(), false)?,
+            StepState::Applying => {
+                owned_matches(&step.edit, current.as_deref(), false)?
+                    || owned_matches(&step.edit, current.as_deref(), true)?
+            }
+            StepState::Applied => owned_matches(&step.edit, current.as_deref(), true)?,
+            _ => false,
+        };
+        if !valid {
+            return Err(refresh("owned fields changed before undo authorization"));
+        }
+        let compensation = if kind == OperationKind::SetManagedProfile {
+            step.authority_document
+                .as_ref()
+                .ok_or_else(|| refresh("managed operation lacks its authority document"))?
+                .before
+                .clone()
+        } else if step.state == StepState::Pending {
+            current.clone()
+        } else {
+            transform(&step.edit, current.as_deref(), true)?.or(current.clone())
+        };
+        Ok(Some(AuthorityDocument {
+            before: current.clone(),
+            after: current,
+            compensation,
+        }))
+    }
+
+    fn publish(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        super::fs_transaction::transactional_update_authorized(
+            &step.target,
+            &step.scope_root,
+            false,
+            |snapshot| {
+                if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
+                    snapshot.require_private()?;
+                }
+                if undo && kind == OperationKind::SetManagedProfile {
+                    let document = step
+                        .undo_document
+                        .as_ref()
+                        .ok_or_else(|| refresh("managed rollback lacks its captured document"))?;
+                    let restored = document.compensation.as_deref().ok_or_else(|| {
+                        refresh("managed rollback cannot remove its authority file")
+                    })?;
+                    let current = snapshot.text(&step.target)?;
+                    if current == Some(restored) {
+                        return Ok(FileUpdate::unchanged());
+                    }
+                    if current != document.after.as_deref() {
+                        return Err(refresh(
+                            "newer managed authority document prevents rollback",
+                        ));
+                    }
+                    // Whole-document generation checks authorize restoring
+                    // the original bytes, including absent keys and comments.
+                    return Ok(step_update(step, restored.to_owned()));
+                }
+                match transform(&step.edit, snapshot.text(&step.target)?, undo)? {
+                    Some(text) => Ok(step_update(step, text)),
+                    None => Ok(FileUpdate::unchanged()),
+                }
+            },
+            authorize,
+            |bytes| authorize_publication(kind, &step.scope_root, &step.target, bytes, policy),
+        )
+    }
+}
+
+impl StepBackend for tirith_core::audit::retention::RotationPlan {
+    fn locks_own_generation(&self) -> bool {
+        true
+    }
+
+    fn check_generation(&self, step: &Step, _undo_started: bool) -> Result<(), String> {
+        let observed = super::audit_service::observe(self, &step.target, &step.scope_root)?;
+        if !audit_state_matches(step.state, observed) {
+            return Err(refresh("audit generation changed"));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        use tirith_core::audit::retention::RotationState as R;
+        Ok(matches!(
+            super::audit_service::observe(self, &step.target, &step.scope_root)?,
+            R::Applied | R::AppliedWithAdditionalRecords
+        ))
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        let observed = super::audit_service::observe(self, &step.target, &step.scope_root)?;
+        if !audit_state_matches(step.state, observed)
+            || observed
+                == tirith_core::audit::retention::RotationState::AppliedWithAdditionalRecords
+        {
+            return Err(refresh("later audit records prevent compensation"));
+        }
+        Ok(None)
+    }
+
+    fn publish(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        super::audit_service::mutate(
+            self,
+            &step.target,
+            &step.scope_root,
+            policy,
+            undo,
+            authorize,
+        )
+    }
+}
+
+impl StepBackend for super::audit_segments::SegmentPlan {
+    fn locks_own_generation(&self) -> bool {
+        true
+    }
+
+    fn check_generation(&self, step: &Step, _undo_started: bool) -> Result<(), String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        if !segment_state_matches(step.state, self.observe()?) {
+            return Err(refresh("owned segment generation changed"));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        Ok(self.observe()? == super::audit_segments::SegmentState::Applied)
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        if self.irreversible() {
+            return Err(
+                "segment deletion is irreversible; checkpoint and deletion record remain".into(),
+            );
+        }
+        if !segment_state_matches(step.state, self.observe()?) {
+            return Err(refresh("owned exported segment changed before undo"));
+        }
+        Ok(None)
+    }
+
+    fn publish(
+        &self,
+        _step: &Step,
+        _kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        self.mutate(policy, undo, authorize)
     }
 }
 
@@ -2716,16 +2688,10 @@ mod tests {
     use crate::cli::test_harness::with_fake_env;
     use tirith_core::policy_snapshot::ResolutionMode;
 
-    const EXPECTED_COMPLETED: JobState = if cfg!(windows) {
-        JobState::CompletedWithRecovery
-    } else {
-        JobState::Completed
-    };
-    const EXPECTED_UNDONE: JobState = if cfg!(windows) {
-        JobState::UndoneWithRecovery
-    } else {
-        JobState::Undone
-    };
+    const EXPECTED_COMPLETED: JobState = JobState::Completed;
+    const EXPECTED_UNDONE: JobState = JobState::Undone;
+    /// Windows publication retains platform recovery material.
+    const EXPECTED_RECOVERY: bool = cfg!(windows);
 
     type Plan = Result<OperationStatus, String>;
     fn noop(
@@ -3498,6 +3464,11 @@ mod tests {
             let (service, original, legacy, grants) = migration_fixture(home);
             let result = service.apply("migration", &original).unwrap();
             assert_eq!(result.state, EXPECTED_COMPLETED, "{:?}", result.detail);
+            assert_eq!(result.recovery, EXPECTED_RECOVERY);
+            assert!(result
+                .steps
+                .iter()
+                .all(|step| step.recovery == EXPECTED_RECOVERY));
             assert_eq!(
                 serde_json::from_str::<Value>(&std::fs::read_to_string(&legacy).unwrap()).unwrap()
                     ["entries"],
@@ -3513,6 +3484,7 @@ mod tests {
             );
             let undone = service.undo("migration", &policy()).unwrap();
             assert_eq!(undone.state, EXPECTED_UNDONE);
+            assert_eq!(undone.recovery, EXPECTED_RECOVERY);
             assert_eq!(
                 serde_json::from_str::<Value>(&std::fs::read_to_string(&legacy).unwrap()).unwrap()
                     ["entries"]
@@ -3701,6 +3673,52 @@ mod tests {
             let error = service.undo("undo-recheck", &self::policy()).unwrap_err();
             assert!(error.contains("task gate"), "{error}");
             assert_eq!(std::fs::read(home.join("settings.json")).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn commit_boundary_rechecks_authorization_changed_by_an_earlier_step() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let root = PathBuf::from(std::env::var_os("TIRITH_POLICY_ROOT").unwrap());
+            std::fs::create_dir_all(root.join(".tirith")).unwrap();
+            let policy = policy();
+            // Step 0 (staged first) publishes a policy denying policy changes;
+            // only the commit-time recheck of step 1 can observe it.
+            service
+                .plan(
+                    "commit-recheck",
+                    OperationKind::SetProfile,
+                    vec![
+                        RequestedChange {
+                            target: root.join(".tirith/policy.yaml"),
+                            scope_root: root.clone(),
+                            edit: Edit::WholeFile(
+                                "task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n"
+                                    .into(),
+                            ),
+                            activation: false,
+                            description: "Stage a policy".into(),
+                        },
+                        field_request(home, "strict"),
+                    ],
+                    &policy,
+                )
+                .unwrap();
+            let result = service.apply("commit-recheck", &policy).unwrap();
+            assert_eq!(
+                result.state,
+                JobState::RefreshRequired,
+                "{:?}",
+                result.detail
+            );
+            assert!(result
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("refresh-required:")));
+            assert_eq!(result.steps[0].state, StepState::Applied);
+            assert_ne!(result.steps[1].state, StepState::Applied);
+            assert!(!home.join("settings.json").exists());
         });
     }
 
@@ -4000,8 +4018,28 @@ mod tests {
             .unwrap();
             let before = std::fs::read(home.join("settings.json")).unwrap();
             let recovered = service.apply("interrupted", &authorization).unwrap();
-            assert_eq!(recovered.state, JobState::CompletedWithRecovery);
+            assert_eq!(recovered.state, JobState::Completed);
+            assert!(recovered.recovery && recovered.steps.iter().all(|step| step.recovery));
             assert_eq!(std::fs::read(home.join("settings.json")).unwrap(), before);
+            // The public flag and the journaled step flag describe only the
+            // latest publication: a clean compensation clears both.
+            let undone = service.undo("interrupted", &authorization).unwrap();
+            assert_eq!(undone.state, JobState::Undone, "{:?}", undone.detail);
+            assert_eq!(undone.recovery, EXPECTED_RECOVERY);
+            assert!(undone
+                .steps
+                .iter()
+                .all(|step| step.recovery == EXPECTED_RECOVERY));
+            let raw: Value = serde_json::from_slice(
+                &std::fs::read(service.path("interrupted").unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert!(raw["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["state"] == "compensated"
+                    && step.get("recovery").is_some() == EXPECTED_RECOVERY));
         });
     }
 

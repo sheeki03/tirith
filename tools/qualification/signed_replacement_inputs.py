@@ -33,6 +33,7 @@ GENERATOR_INPUTS = ("Cargo.toml", ".github/scripts/release-compatibility.py",
                     "crates/tirith-core/src/policy_migrations.rs",
                     "crates/tirith-core/src/mcp_lock.rs", "crates/tirith-core/src/trust_grants.rs",
                     "crates/tirith/src/cli/setup/change_plan.rs",
+                    "crates/tirith/src/cli/lifecycle_formats.rs",
                     "crates/tirith/src/cli/control/lifecycle.rs",
                     "crates/tirith-core/src/policy_team.rs",
                     "crates/tirith-core/src/execution_state/shell_receipt.rs")

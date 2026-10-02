@@ -477,10 +477,7 @@ mod tests {
             let policy = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
             let (old, _lease) = fs_helpers::open_existing_in_place(&path, root).unwrap();
             let completed = service.apply(&id, &policy).unwrap();
-            assert!(matches!(
-                completed.state,
-                JobState::Completed | JobState::CompletedWithRecovery
-            ));
+            assert_eq!(completed.state, JobState::Completed);
             assert_eq!(
                 old.metadata().unwrap().len(),
                 std::fs::metadata(&path).unwrap().len()
@@ -491,10 +488,7 @@ mod tests {
                 before
             );
             let undone = service.undo(&id, &policy).unwrap();
-            assert!(matches!(
-                undone.state,
-                JobState::Undone | JobState::UndoneWithRecovery
-            ));
+            assert_eq!(undone.state, JobState::Undone);
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert!(tirith_core::audit::verify_audit_log(&path, None).ok);
         });

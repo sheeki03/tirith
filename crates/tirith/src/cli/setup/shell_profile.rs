@@ -247,10 +247,7 @@ pub(super) fn apply_prepared_shell(
         .map_err(redact)?
         .apply(&id, &prepared.snapshot)
         .map_err(redact)?;
-    if !matches!(
-        outcome.state,
-        JobState::Completed | JobState::CompletedWithRecovery
-    ) {
+    if outcome.state != JobState::Completed {
         return Err(redact(format!(
             "shell operation {id} stopped in {:?}: {}. Inspect with tirith policy operation {id}",
             outcome.state,
@@ -261,7 +258,7 @@ pub(super) fn apply_prepared_shell(
         )));
     }
     eprintln!("tirith: shell configuration operation {id} completed; inspect or undo with tirith policy operation {id}");
-    if outcome.state == JobState::CompletedWithRecovery {
+    if outcome.recovery {
         eprintln!(
             "tirith: platform recovery material was retained; inspect the operation before cleanup"
         );

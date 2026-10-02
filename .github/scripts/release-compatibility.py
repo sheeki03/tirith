@@ -33,6 +33,15 @@ def source_constant(root: Path, path: str, name: str) -> int:
     return int(matches[0])
 
 
+# Every persisted-state contract version and the implementation constants it
+# covers (owned-change journal schema, control-service protocol, team record
+# schema and policy semantics, shell receipt schemas). A changed constant needs
+# a new reviewed contract version, never an automatically widened claim.
+STATE_CONTRACTS = {
+    1: {"journal": 1, "protocol": 1, "team": 1, "semantics": 1, "receipt": 3, "acknowledged_receipt": 4},
+}
+
+
 def contract(root: Path, version: str) -> dict:
     actual = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     if version != actual or not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -40,41 +49,30 @@ def contract(root: Path, version: str) -> dict:
     policy = source_constant(root, "crates/tirith-core/src/policy_migrations.rs", "CURRENT_SCHEMA_VERSION")
     lock = source_constant(root, "crates/tirith-core/src/mcp_lock.rs", "MCP_LOCK_FORMAT_VERSION")
     grants = source_constant(root, "crates/tirith-core/src/trust_grants.rs", "STORE_VERSION")
-    journal = source_constant(root, "crates/tirith/src/cli/setup/change_plan.rs", "SCHEMA")
-    protocol = source_constant(root, "crates/tirith/src/cli/control/lifecycle.rs", "PROTOCOL")
-    team = source_constant(root, "crates/tirith-core/src/policy_team.rs", "SCHEMA_VERSION")
-    semantics = source_constant(root, "crates/tirith-core/src/policy_team.rs", "POLICY_SEMANTICS_VERSION")
-    receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "RECEIPT_SCHEMA_VERSION")
-    acknowledged_receipt = source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION")
-    if (team, semantics, receipt, acknowledged_receipt) != (1, 1, 3, 4):
-        raise ValueError("persisted format implementation changed; review the compatibility contract before release")
+    state = source_constant(root, "crates/tirith/src/cli/lifecycle_formats.rs", "STATE_CONTRACT_VERSION")
+    implementation = {
+        "journal": source_constant(root, "crates/tirith/src/cli/setup/change_plan.rs", "SCHEMA"),
+        "protocol": source_constant(root, "crates/tirith/src/cli/control/lifecycle.rs", "PROTOCOL"),
+        "team": source_constant(root, "crates/tirith-core/src/policy_team.rs", "SCHEMA_VERSION"),
+        "semantics": source_constant(root, "crates/tirith-core/src/policy_team.rs", "POLICY_SEMANTICS_VERSION"),
+        "receipt": source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "RECEIPT_SCHEMA_VERSION"),
+        "acknowledged_receipt": source_constant(root, "crates/tirith-core/src/execution_state/shell_receipt.rs", "ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION"),
+    }
+    if STATE_CONTRACTS.get(state) != implementation:
+        raise ValueError("persisted state implementation changed; bump STATE_CONTRACT_VERSION and review the compatibility contract before release")
     # A changed format needs a reviewed reader/migration contract, not an
     # automatically widened claim that every intervening version is supported.
-    if (policy, lock, grants, journal, protocol) != (2, 8, 1, 1, 1):
+    if (policy, lock, grants) != (2, 8, 1):
         raise ValueError("format implementation changed; review the compatibility contract before release")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "version": version,
         "policy_read_versions": [1, 2],
         "mcp_lock_read_versions": [4, 5, 6, 7, 8],
         "mcp_lock_authorize_versions": [8],
         "legacy_trust_read_versions": [1],
         "scoped_grant_read_versions": [1],
-        "persisted_formats": {
-            "shell_execution_receipt": [receipt, acknowledged_receipt],
-            "team_connection": [team],
-            "team_enrollment": [team],
-            "team_report": [team],
-            "team_rollout": [team],
-            "team_policy_document": [team],
-            "team_policy_semantics": [semantics],
-        },
-        "operation_journal_version": journal,
-        "operation_journal_client_rule": "exact_client_version_required",
-        "control_service_protocol": protocol,
-        "control_service_reuse_rule": "exact_protocol_version_and_binary_sha256_required",
-        "configuration_update_rule": "preserve_existing_bytes",
-        "features": ["effective_policy_snapshot_v1", "scoped_trust_grants_v1", "protection_profiles_v1", "owned_change_journals_v1", "team_policy_runtime_v1", "team_policy_recovery_v1"],
+        "state_contract_versions": [state],
     }
 
 

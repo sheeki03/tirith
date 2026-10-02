@@ -98,14 +98,8 @@ fn reset_preserves_custom_settings_and_undo_preserves_unrelated_edits() {
         &state,
         &["policy", "operation", id, "--action", "undo", "--json"],
     ));
-    assert_eq!(
-        undone["state"],
-        if cfg!(windows) {
-            "undone-with-recovery"
-        } else {
-            "undone"
-        }
-    );
+    assert_eq!(undone["state"], "undone");
+    assert_eq!(undone["recovery"], cfg!(windows));
     let undone: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
@@ -225,14 +219,8 @@ fn explicit_equal_profile_setting_survives_later_profile_reset() {
         &state,
         &["policy", "setting", "strict_warn", "true", "--json"],
     ));
-    assert_eq!(
-        changed["state"],
-        if cfg!(windows) {
-            "completed-with-recovery"
-        } else {
-            "completed"
-        }
-    );
+    assert_eq!(changed["state"], "completed");
+    assert_eq!(changed["recovery"], cfg!(windows));
     let document: serde_yaml::Value =
         serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(!document["protection_profile"]["owned_fields"]
@@ -351,14 +339,8 @@ fn personal_setting_undo_preserves_unrelated_changes_and_typed_limits() {
             "--json",
         ],
     ));
-    assert_eq!(
-        undone["state"],
-        if cfg!(windows) {
-            "undone-with-recovery"
-        } else {
-            "undone"
-        }
-    );
+    assert_eq!(undone["state"], "undone");
+    assert_eq!(undone["recovery"], cfg!(windows));
     let document: serde_yaml::Value =
         serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(document["strict_warn"], true);
@@ -394,14 +376,8 @@ fn empty_personal_document_accepts_a_typed_setting_without_shadowing() {
         &state,
         &["policy", "setting", "strict_warn", "true", "--json"],
     ));
-    assert_eq!(
-        changed["state"],
-        if cfg!(windows) {
-            "completed-with-recovery"
-        } else {
-            "completed"
-        }
-    );
+    assert_eq!(changed["state"], "completed");
+    assert_eq!(changed["recovery"], cfg!(windows));
     assert!(!path.with_file_name("policy.yaml").exists());
     let doc: serde_yaml::Value = serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(doc["strict_warn"], true);

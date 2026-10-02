@@ -2,19 +2,27 @@
 //! declarations, never authority to retry a request or recover a target tree.
 use super::FormatFact;
 use crate::cli::setup::fs_helpers;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub(crate) const INVENTORY_SCOPE: &str =
     "fixed_team_records_and_bounded_rollouts_and_shell_receipts; external_target_checkpoints_not_discovered";
 
-/// Missing contracts deserialize to empty readers and fail compatibility.
-/// Unknown fields are refused: adding a stored surface requires review.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One version for every persisted-state contract this binary owns beyond the
+/// policy, MCP-lock and trust readers (which release metadata lists
+/// separately): the readers in [`PersistedFormats::current`], owned-change
+/// journals (schema 1, exact originating client version), the control-service
+/// protocol (1, exact binary identity), byte-preserving configuration updates,
+/// and team Runtime enforcement with report/rollout recovery. A candidate or
+/// rollback binary is compatible only if it reads this version. Changing any of
+/// these requires a new version and a reviewed release generator contract.
+pub(crate) const STATE_CONTRACT_VERSION: u32 = 1;
+
+/// The stored-surface readers of [`STATE_CONTRACT_VERSION`]. Local stores
+/// whose declared version is outside this table cannot be vouched for.
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct PersistedFormats {
-    #[serde(default)]
     pub shell_execution_receipt: Vec<u32>,
     pub team_connection: Vec<u32>,
     pub team_enrollment: Vec<u32>,
@@ -52,31 +60,6 @@ impl PersistedFormats {
         self.readers()
             .into_iter()
             .find_map(|(name, versions)| (name == surface).then_some(versions))
-    }
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        for (_, versions) in self.readers() {
-            if versions.len() > 32
-                || versions.contains(&0)
-                || versions
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != versions.len()
-            {
-                return Err("candidate persisted-format readers are invalid".into());
-            }
-        }
-        Ok(())
-    }
-    pub(crate) fn supports_current_contract(&self) -> bool {
-        Self::current()
-            .readers()
-            .into_iter()
-            .all(|(surface, required)| {
-                self.versions(surface).is_some_and(|versions| {
-                    required.iter().all(|version| versions.contains(version))
-                })
-            })
     }
 }
 
@@ -409,49 +392,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_reader_contract_is_closed_bounded_and_requires_recovery_semantics() {
+    fn state_contract_v1_pins_every_persisted_reader() {
+        // Independent literals: deriving expectations from the implementation
+        // constants would let a format change slip past the contract version.
+        // Changing a reader means bumping STATE_CONTRACT_VERSION (and the
+        // release generator's contract table) instead of editing this table.
+        assert_eq!(STATE_CONTRACT_VERSION, 1);
         let current = PersistedFormats::current();
-        assert!(current.validate().is_ok());
-        assert!(current.supports_current_contract());
-        assert!(!PersistedFormats::default().supports_current_contract());
-        for (surface, _) in current.readers() {
-            let mut raw = serde_json::to_value(&current).unwrap();
-            raw[surface] = serde_json::json!([]);
-            let missing: PersistedFormats = serde_json::from_value(raw).unwrap();
-            assert!(!missing.supports_current_contract(), "{surface}");
-            for invalid in [
-                serde_json::json!([0]),
-                serde_json::json!([1, 1]),
-                serde_json::json!(vec![1; 33]),
-            ] {
-                let mut raw = serde_json::to_value(&current).unwrap();
-                raw[surface] = invalid;
-                assert!(
-                    serde_json::from_value::<PersistedFormats>(raw)
-                        .unwrap()
-                        .validate()
-                        .is_err(),
-                    "{surface}"
-                );
-            }
-        }
-        let mut old = serde_json::to_value(&current).unwrap();
-        old.as_object_mut()
-            .unwrap()
-            .remove("shell_execution_receipt");
-        let old: PersistedFormats = serde_json::from_value(old).unwrap();
-        assert!(old.shell_execution_receipt.is_empty());
-        assert!(!old.supports_current_contract());
-        let mut schema_three_only = current.clone();
-        schema_three_only.shell_execution_receipt = vec![3];
-        assert!(!schema_three_only.supports_current_contract());
-        let mut raw = serde_json::to_value(&current).unwrap();
-        raw["future_store"] = serde_json::json!([1]);
-        assert!(serde_json::from_value::<PersistedFormats>(raw).is_err());
-        // Retired local-leaf npm readers are no longer part of the contract.
-        let mut raw = serde_json::to_value(&current).unwrap();
-        raw["npm_install_intent"] = serde_json::json!([1]);
-        assert!(serde_json::from_value::<PersistedFormats>(raw).is_err());
+        let readers: Vec<_> = current
+            .readers()
+            .into_iter()
+            .map(|(surface, versions)| (surface, versions.clone()))
+            .collect();
+        assert_eq!(
+            readers,
+            [
+                ("shell_execution_receipt", vec![3, 4]),
+                ("team_connection", vec![1]),
+                ("team_enrollment", vec![1]),
+                ("team_report", vec![1]),
+                ("team_rollout", vec![1]),
+                ("team_policy_document", vec![1]),
+                ("team_policy_semantics", vec![1]),
+            ]
+        );
+        assert_eq!(current.versions("team_rollout"), Some(&vec![1]));
+        // Retired local-leaf npm stores are not part of the contract.
+        assert!(current.versions("npm_install_intent").is_none());
     }
 
     #[cfg(unix)]

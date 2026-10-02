@@ -9,7 +9,7 @@ use tirith_core::selfupdate::SemVer;
 
 #[path = "lifecycle_formats.rs"]
 mod stored_formats;
-pub(crate) use stored_formats::PersistedFormats;
+pub(crate) use stored_formats::{PersistedFormats, STATE_CONTRACT_VERSION};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct VersionObservation {
@@ -41,6 +41,7 @@ pub(crate) struct CompatibilityFacts {
     pub mcp_lock_read_versions: Vec<u32>,
     pub legacy_trust_read_versions: Vec<u32>,
     pub scoped_grant_read_versions: Vec<u32>,
+    pub state_contract_version: u32,
     pub persisted_formats: PersistedFormats,
     pub persisted_inventory_scope: &'static str,
     pub operation_journal_version: u32,
@@ -303,6 +304,7 @@ pub(super) fn gather(
             mcp_lock_read_versions: (4..=tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION).collect(),
             legacy_trust_read_versions: vec![1],
             scoped_grant_read_versions: vec![tirith_core::trust_grants::STORE_VERSION],
+            state_contract_version: STATE_CONTRACT_VERSION,
             persisted_formats: PersistedFormats::current(),
             persisted_inventory_scope: stored_formats::INVENTORY_SCOPE,
             operation_journal_version: 1,

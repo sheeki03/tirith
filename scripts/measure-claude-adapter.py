@@ -501,8 +501,8 @@ def run(args):
                     raw, _ = runner.execute(f'setup-{index + 1}', [args.tirith, 'setup', 'recommended', '--shell', 'zsh', '--agent', 'claude-code', '--json'], env, 120)
                     batch['setup_ns'] = time.perf_counter_ns() - begin
                     setup = json.loads(raw)
-                    require(setup.get('kind') == 'recommended-setup' and setup.get('state') in ('completed', 'completed-with-recovery')
-                            and setup.get('steps') and all(step.get('state') in ('applied', 'applied-with-recovery') for step in setup['steps']),
+                    require(setup.get('kind') == 'recommended-setup' and setup.get('state') == 'completed'
+                            and setup.get('steps') and all(step.get('state') == 'applied' for step in setup['steps']),
                             'actual recommended setup did not finish all steps')
                     batch['setup'] = setup
                     settings = root / 'home/.claude/settings.json'

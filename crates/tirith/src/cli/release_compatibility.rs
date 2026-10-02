@@ -8,14 +8,10 @@ use tirith_core::selfupdate::{self, SemVer};
 
 pub(super) const ASSET: &str = "release-compatibility.json";
 const LIMIT: u64 = 256 * 1024;
-const REQUIRED_FEATURES: &[&str] = &[
-    "effective_policy_snapshot_v1",
-    "scoped_trust_grants_v1",
-    "protection_profiles_v1",
-    "owned_change_journals_v1",
-    "team_policy_runtime_v1",
-    "team_policy_recovery_v1",
-];
+/// Schema 2: one readable state-contract list replaces the per-surface
+/// persisted-format inventory, feature names and rule strings of schema 1.
+const SCHEMA: u32 = 2;
+use super::lifecycle::STATE_CONTRACT_VERSION;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,34 +31,20 @@ struct Document {
     mcp_lock_authorize_versions: Vec<u32>,
     legacy_trust_read_versions: Vec<u32>,
     scoped_grant_read_versions: Vec<u32>,
-    #[serde(default)]
-    persisted_formats: super::lifecycle::PersistedFormats,
-    operation_journal_version: u32,
-    operation_journal_client_rule: String,
-    control_service_protocol: u32,
-    control_service_reuse_rule: String,
-    configuration_update_rule: String,
-    features: Vec<String>,
+    /// Every persisted-state contract version the binary reads; see
+    /// [`STATE_CONTRACT_VERSION`].
+    state_contract_versions: Vec<u32>,
     targets: BTreeMap<String, Target>,
 }
 
 impl Document {
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1
+        if self.schema_version != SCHEMA
             || SemVer::parse(&self.version)
                 .map(|version| version.to_string())
                 .as_deref()
                 != Some(self.version.as_str())
-            || self.operation_journal_version == 0
-            || self.control_service_protocol == 0
             || self.targets.len() > 32
-            || self.features.len() > 64
-            || self.features.iter().any(|feature| {
-                feature.len() > 128
-                    || !feature
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            })
         {
             return Err(
                 "candidate compatibility metadata is invalid or uses an unsupported schema".into(),
@@ -74,6 +56,7 @@ impl Document {
             &self.mcp_lock_authorize_versions,
             &self.legacy_trust_read_versions,
             &self.scoped_grant_read_versions,
+            &self.state_contract_versions,
         ] {
             if versions.len() > 32
                 || versions.contains(&0)
@@ -88,7 +71,6 @@ impl Document {
                 );
             }
         }
-        self.persisted_formats.validate()?;
         if self.targets.iter().any(|(target, identity)| {
             identity.archive != selfupdate::release_archive_name(target)
                 || !digest(&identity.archive_sha256)
@@ -101,7 +83,7 @@ impl Document {
 
     fn current() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: SCHEMA,
             version: env!("CARGO_PKG_VERSION").into(),
             policy_read_versions: (1..=tirith_core::policy_migrations::CURRENT_SCHEMA_VERSION)
                 .collect(),
@@ -109,16 +91,7 @@ impl Document {
             mcp_lock_authorize_versions: vec![tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION],
             legacy_trust_read_versions: vec![1],
             scoped_grant_read_versions: vec![tirith_core::trust_grants::STORE_VERSION],
-            persisted_formats: super::lifecycle::PersistedFormats::current(),
-            operation_journal_version: 1,
-            operation_journal_client_rule: "exact_client_version_required".into(),
-            control_service_protocol: 1,
-            control_service_reuse_rule: "exact_protocol_version_and_binary_sha256_required".into(),
-            configuration_update_rule: "preserve_existing_bytes".into(),
-            features: REQUIRED_FEATURES
-                .iter()
-                .map(|feature| (*feature).into())
-                .collect(),
+            state_contract_versions: vec![STATE_CONTRACT_VERSION],
             targets: BTreeMap::new(),
         }
     }
@@ -149,6 +122,7 @@ fn preview(
 ) -> Preview {
     let mut issues = Vec::new();
     let mut lock_reapproval_required = false;
+    let contract = super::lifecycle::PersistedFormats::current();
     for observed in &formats {
         if observed.state == "absent" {
             continue;
@@ -165,8 +139,14 @@ fn preview(
             "mcp_lock" => &document.mcp_lock_read_versions,
             "legacy_trust" => &document.legacy_trust_read_versions,
             "scoped_grants" => &document.scoped_grant_read_versions,
-            surface if document.persisted_formats.versions(surface).is_some() => {
-                document.persisted_formats.versions(surface).unwrap()
+            // Stored state is vouched for by this binary's own contract; the
+            // candidate must then read that contract (checked below).
+            surface if contract.versions(surface).is_some() => {
+                let readers = contract.versions(surface).unwrap();
+                if !readers.contains(&version) {
+                    issues.push(format!("stored {surface} format {version} is outside this binary's state contract {STATE_CONTRACT_VERSION}; retain this binary or migrate that surface explicitly"));
+                }
+                continue;
             }
             _ => {
                 issues.push(
@@ -184,31 +164,11 @@ fn preview(
             lock_reapproval_required = true;
         }
     }
-    if REQUIRED_FEATURES
-        .iter()
-        .any(|required| !document.features.iter().any(|feature| feature == required))
+    if !document
+        .state_contract_versions
+        .contains(&STATE_CONTRACT_VERSION)
     {
-        issues.push("candidate lacks a required policy, scoped-grant, profile, team Runtime/recovery, or owned-journal capability; automatic downgrade is unsupported".into());
-    }
-    if !document.persisted_formats.supports_current_contract() {
-        issues.push("candidate lacks the current persisted-state reader contract; preserve this binary and retained records for explicit recovery".into());
-    }
-    if document.operation_journal_version != 1
-        || document.operation_journal_client_rule != "exact_client_version_required"
-    {
-        issues.push("candidate operation-journal compatibility is unsupported; retain the originating binary for pending recovery or undo".into());
-    }
-    if document.control_service_protocol != 1
-        || document.control_service_reuse_rule
-            != "exact_protocol_version_and_binary_sha256_required"
-    {
-        issues.push(
-            "candidate control-service protocol or binary-identity negotiation is unsupported"
-                .into(),
-        );
-    }
-    if document.configuration_update_rule != "preserve_existing_bytes" {
-        issues.push("candidate requires an unsupported automatic configuration migration".into());
+        issues.push(format!("candidate {} does not read persisted-state contract {STATE_CONTRACT_VERSION} (team, shell receipt, operation journal and control-service formats); automatic downgrade is unsupported, retain this binary and its records for explicit recovery", document.version));
     }
     Preview {
         candidate_version: document.version.clone(),
@@ -542,36 +502,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_and_older_contracts_cannot_drop_team_recovery() {
+    fn candidates_must_read_the_current_state_contract() {
         let current = Document::current();
+        assert_eq!(current.state_contract_versions, [STATE_CONTRACT_VERSION]);
         assert!(preview(&current, "fixture", vec![])
             .require_compatible()
             .is_ok());
-        for feature in ["team_policy_runtime_v1", "team_policy_recovery_v1"] {
-            let mut missing = current.clone();
-            missing.features.retain(|value| value != feature);
+        // A newer candidate that still reads this contract is compatible; one
+        // (or a captured rollback point) that does not is refused.
+        let mut newer = current.clone();
+        newer.state_contract_versions = vec![STATE_CONTRACT_VERSION, STATE_CONTRACT_VERSION + 1];
+        assert!(preview(&newer, "fixture", vec![])
+            .require_compatible()
+            .is_ok());
+        for readers in [vec![], vec![STATE_CONTRACT_VERSION + 1]] {
+            let mut other = current.clone();
+            other.state_contract_versions = readers.clone();
             assert!(
-                preview(&missing, "fixture", vec![])
+                preview(&other, "captured_previous_running_binary_contract", vec![])
                     .require_compatible()
                     .is_err(),
-                "{feature}"
+                "{readers:?}"
             );
         }
-        // An older signed document or captured rollback receipt can still be
-        // parsed, but absent reader declarations must never imply support.
-        let mut legacy = serde_json::to_value(&current).unwrap();
-        legacy.as_object_mut().unwrap().remove("persisted_formats");
-        let legacy: Document = serde_json::from_value(legacy).unwrap();
-        legacy.validate().unwrap();
-        assert!(
-            preview(&legacy, "captured_previous_running_binary_contract", vec![])
-                .require_compatible()
-                .is_err()
-        );
+        // An absent declaration never implies support: it fails to parse.
+        let mut missing = serde_json::to_value(&current).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("state_contract_versions");
+        assert!(serde_json::from_value::<Document>(missing).is_err());
+        for invalid in [
+            serde_json::json!([0]),
+            serde_json::json!([1, 1]),
+            serde_json::json!(vec![1; 33]),
+        ] {
+            let mut raw = serde_json::to_value(&current).unwrap();
+            raw["state_contract_versions"] = invalid;
+            assert!(serde_json::from_value::<Document>(raw)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        let mut older_schema = current.clone();
+        older_schema.schema_version = 1;
+        assert!(older_schema.validate().is_err());
+    }
+
+    #[test]
+    fn stored_state_is_vouched_for_by_this_binary_contract() {
+        let current = Document::current();
+        let contract = super::super::lifecycle::PersistedFormats::current();
         // Keep an independent assertion for the receipt format transition:
         // deriving every expectation from readers() would miss a stale contract.
-        assert_eq!(current.persisted_formats.shell_execution_receipt, [3, 4]);
-        for (surface, supported) in current.persisted_formats.readers() {
+        assert_eq!(contract.shell_execution_receipt, [3, 4]);
+        for (surface, supported) in contract.readers() {
             assert!(!supported.is_empty(), "{surface} has no declared readers");
             let mut cases: Vec<_> = supported
                 .iter()
@@ -604,53 +589,34 @@ mod tests {
                     "{surface}: {state} {version:?}"
                 );
             }
-            let mut raw = serde_json::to_value(&current).unwrap();
-            raw["persisted_formats"][surface] = serde_json::json!([]);
-            let candidate: Document = serde_json::from_value(raw).unwrap();
-            assert!(
-                preview(&candidate, "fixture", vec![])
-                    .require_compatible()
-                    .is_err(),
-                "empty readers for {surface}"
-            );
-            let mut raw = serde_json::to_value(&current).unwrap();
-            raw["persisted_formats"]
-                .as_object_mut()
-                .unwrap()
-                .remove(surface);
-            // Older receipt contracts deserialize the omitted field as empty;
-            // other required fields can refuse at parsing. Neither is support.
-            if let Ok(candidate) = serde_json::from_value::<Document>(raw) {
-                assert!(
-                    preview(&candidate, "fixture", vec![])
-                        .require_compatible()
-                        .is_err(),
-                    "missing reader declaration for {surface}"
-                );
-            }
         }
+        // A stored surface outside every contract has no compatibility claim.
+        let facts = vec![super::super::lifecycle::FormatFact {
+            surface: "npm_install_intent",
+            declared_version: Some(1),
+            state: "declared_local_unverified",
+        }];
+        assert!(!preview(&current, "fixture", facts).compatible);
     }
 
     #[test]
-    fn retired_local_leaf_npm_contract_is_neither_required_nor_accepted() {
-        let current = Document::current();
-        assert!(!current
-            .features
-            .iter()
-            .any(|feature| feature.starts_with("npm_")));
-        assert!(!REQUIRED_FEATURES
-            .iter()
-            .any(|feature| feature.starts_with("npm_")));
-        // Extra (older) feature claims are ignored, never required.
-        let mut older = current.clone();
-        older.features.push("npm_install_intent_v1".into());
-        assert!(preview(&older, "fixture", vec![])
-            .require_compatible()
-            .is_ok());
-        // A stored-surface declaration this binary no longer knows is refused.
-        let mut raw = serde_json::to_value(&current).unwrap();
-        raw["persisted_formats"]["npm_install_intent"] = serde_json::json!([1]);
-        assert!(serde_json::from_value::<Document>(raw).is_err());
+    fn retired_per_surface_contract_fields_are_refused() {
+        // Schema-1 inventory, feature and rule fields (including the retired
+        // local-leaf npm surfaces) are unknown to schema 2, never ignored.
+        for (field, value) in [
+            (
+                "persisted_formats",
+                serde_json::json!({"team_rollout": [1]}),
+            ),
+            ("features", serde_json::json!(["owned_change_journals_v1"])),
+            ("operation_journal_version", serde_json::json!(1)),
+            ("control_service_reuse_rule", serde_json::json!("x")),
+            ("npm_install_intent", serde_json::json!([1])),
+        ] {
+            let mut raw = serde_json::to_value(Document::current()).unwrap();
+            raw[field] = value;
+            assert!(serde_json::from_value::<Document>(raw).is_err(), "{field}");
+        }
     }
 
     #[test]
@@ -791,7 +757,7 @@ mod tests {
             )
             .lock_reapproval_required
         );
-        document.features.clear();
+        document.state_contract_versions.clear();
         assert!(preview(&document, "fixture", vec![])
             .require_compatible()
             .is_err());

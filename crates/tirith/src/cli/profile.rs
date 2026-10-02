@@ -132,9 +132,11 @@ pub(crate) fn run_operation_cli(
             } else {
                 print!("{}", human(&output));
             }
-            i32::from(output["state"].as_str().is_some_and(|state| {
-                !matches!(state, "unchanged" | "completed" | "completed-with-recovery")
-            }))
+            i32::from(
+                output["state"]
+                    .as_str()
+                    .is_some_and(|state| !matches!(state, "unchanged" | "completed")),
+            )
         }
         Err(error) => {
             let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
@@ -182,17 +184,29 @@ pub(crate) fn status_projection(
     Ok(output)
 }
 
+/// The human state label: a finished apply or undo that retained platform
+/// recovery material reads `<state>-with-recovery`.
+pub(crate) fn human_state(output: &serde_json::Value) -> String {
+    let state = output["state"].as_str().unwrap_or("unknown");
+    let label = if output["recovery"] == true {
+        format!("{state}-with-recovery")
+    } else {
+        state.to_owned()
+    };
+    tirith_core::output::sanitize_human_field(&label, &[])
+}
+
 /// Human text for a projected operation status (the `status_projection` JSON).
 /// Used by commands whose `--json` mode prints that projection, so the
 /// default mode reads as prose instead of the same JSON.
 pub(crate) fn operation_human_text(output: &serde_json::Value) -> String {
-    let field = |key: &str| {
-        tirith_core::output::sanitize_human_field(output[key].as_str().unwrap_or("unknown"), &[])
-    };
-    let id = field("operation_id");
+    let id = tirith_core::output::sanitize_human_field(
+        output["operation_id"].as_str().unwrap_or("unknown"),
+        &[],
+    );
     let mut text = format!(
         "Operation {id}: {}\n  Inspect: tirith policy operation {id}\n",
-        field("state")
+        human_state(output)
     );
     if let Some(detail) = output["detail"].as_str() {
         text.push_str(&format!(
@@ -224,7 +238,12 @@ fn show_status(
             return Ok(1);
         }
     } else {
-        eprintln!("Operation {}: {:?}", status.operation_id, status.state);
+        eprintln!(
+            "Operation {}: {:?}{}",
+            status.operation_id,
+            status.state,
+            if status.recovery { "WithRecovery" } else { "" }
+        );
         eprintln!("  Inspect: tirith policy operation {}", status.operation_id);
         if let Some(detail) = output["detail"].as_str() {
             eprintln!(
@@ -236,12 +255,7 @@ fn show_status(
     Ok(
         if matches!(
             status.state,
-            JobState::Completed
-                | JobState::CompletedWithRecovery
-                | JobState::Undone
-                | JobState::UndoneWithRecovery
-                | JobState::Planned
-                | JobState::Cancelled
+            JobState::Completed | JobState::Undone | JobState::Planned | JobState::Cancelled
         ) {
             0
         } else {
@@ -256,6 +270,24 @@ mod presentation_tests {
     use crate::cli::setup::change_plan::{OperationKind, StepState, StepStatus};
 
     #[test]
+    fn human_state_keeps_the_recovery_label_of_finished_operations() {
+        let label = |state: &str, recovery: bool| {
+            human_state(&serde_json::json!({"state": state, "recovery": recovery}))
+        };
+        assert_eq!(label("completed", true), "completed-with-recovery");
+        assert_eq!(label("undone", true), "undone-with-recovery");
+        assert_eq!(label("completed", false), "completed");
+        assert_eq!(
+            human_state(&serde_json::json!({"state": "planned"})),
+            "planned"
+        );
+        assert!(operation_human_text(
+            &serde_json::json!({"operation_id": "x", "state": "undone", "recovery": true})
+        )
+        .starts_with("Operation x: undone-with-recovery\n"));
+    }
+
+    #[test]
     fn oversized_job_display_keeps_control_identity_and_marks_missing_destinations() {
         let status = OperationStatus {
             schema_version: 1,
@@ -264,6 +296,7 @@ mod presentation_tests {
             client_version: env!("CARGO_PKG_VERSION").into(),
             policy_identity: uuid::Uuid::new_v4().to_string(),
             state: JobState::Planned,
+            recovery: false,
             no_op: false,
             irreversible: false,
             active_action: None,
@@ -276,6 +309,7 @@ mod presentation_tests {
                     description: "Owned setting".repeat(100),
                     activation: false,
                     state: StepState::Pending,
+                    recovery: false,
                 })
                 .collect(),
         };

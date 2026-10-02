@@ -64,7 +64,7 @@ class RunnerContracts(unittest.TestCase):
                 runner.operation_state(dict(self.result(), stdout=text), {"completed"})
 
     def test_completed_json_requires_the_command_success_exit(self):
-        for state in ("completed", "completed-with-recovery", "undone", "cancelled"):
+        for state in ("completed", "undone", "cancelled"):
             for code in (1, 7, -signal.SIGSEGV):
                 with self.subTest(state=state, code=code), self.assertRaises(AssertionError):
                     runner.operation_state(dict(self.result(), exit=code, stdout=json.dumps({"state": state})), {state})
