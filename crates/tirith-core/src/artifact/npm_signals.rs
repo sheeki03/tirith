@@ -527,7 +527,16 @@ fn literal_script_target(command: &str) -> Option<String> {
 /// wrappers (`| sudo bash`) and redirections (`| sh >/dev/null`) are handled.
 /// Only a literal downloader as the pipe source qualifies: `echo curl … | sh` is
 /// not a download claim.
-fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
+/// Nesting depth and body count for the brace/function/subshell descent in
+/// [`fetch_feeds_shell`]. Package scripts are bounded text, so this only keeps
+/// adversarial nesting from turning one file into unbounded work.
+const SHELL_BODY_DEPTH: usize = 8;
+const SHELL_BODY_BUDGET: usize = 256;
+
+/// The core tokenizer splits neither `|` nor newlines inside `{ ... }` or
+/// `( ... )`, so a pipeline inside a brace group, function body or subshell
+/// is only visible after descending into that body.
+fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> bool {
     let feeds_shell = crate::rules::command::fetch_piped_interpreters(text, ShellType::Posix)
         .iter()
         .any(|interpreter| {
@@ -536,7 +545,45 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
                 "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
             )
         });
-    if feeds_shell {
+    if feeds_shell || depth >= SHELL_BODY_DEPTH {
+        return feeds_shell;
+    }
+    for mut segment in crate::tokenize::tokenize(text, ShellType::Posix) {
+        // A `{` followed by a newline comes back as the command word "{\n".
+        if segment.command.as_deref().map(str::trim) == Some("{") {
+            segment.command = Some("{".to_string());
+        }
+        let body = crate::extract::literal_posix_brace_group_body(&segment)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                crate::extract::literal_posix_function_definition(&segment)
+                    .ok()
+                    .flatten()
+                    .map(|(_, body)| body)
+            })
+            .or_else(|| {
+                crate::extract::literal_posix_subshell_group_body(&segment)
+                    .ok()
+                    .flatten()
+            });
+        let Some(body) = body else {
+            continue;
+        };
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if fetch_feeds_shell(&body, depth + 1, budget) {
+            return true;
+        }
+    }
+    false
+}
+
+fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
+    let mut budget = SHELL_BODY_BUDGET;
+    if fetch_feeds_shell(text, 0, &mut budget) {
         push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
             vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,
             "A literal curl/wget pipeline feeds a shell interpreter. Review the downloaded code; no network request or script was executed."));

