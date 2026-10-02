@@ -203,4 +203,40 @@ mod tests {
             }
         }
     }
+
+    /// The pip package firewall and its quarantine store were removed
+    /// (`artifact::firewall`, `artifact::quarantine`). `tirith explain` must not
+    /// describe either as live or tell users to follow a quarantine workflow that
+    /// can no longer be carried out. The retained
+    /// `artifact_download_integrity_mismatch` id must say it has no live emitter.
+    #[test]
+    fn explanations_do_not_describe_removed_package_firewall_as_live() {
+        for entry in list_all() {
+            let prose = [
+                entry.title,
+                entry.severity_rationale,
+                entry.description,
+                entry.false_positive_guidance,
+                entry.remediation,
+            ]
+            .into_iter()
+            .chain(entry.examples_bad.iter().copied())
+            .chain(entry.examples_good.iter().copied())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+            let mentions_removed = prose.contains("quarantine")
+                || (prose.contains("firewall") && !prose.contains("removed pip package firewall"));
+            assert!(
+                !mentions_removed,
+                "{} describes the removed package firewall or quarantine as live",
+                entry.id
+            );
+        }
+        let retained = explain("artifact_download_integrity_mismatch").expect("retained id");
+        assert!(
+            retained.description.contains("no live emitter"),
+            "artifact_download_integrity_mismatch must state it has no live emitter"
+        );
+    }
 }

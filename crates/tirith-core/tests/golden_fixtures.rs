@@ -1475,8 +1475,8 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // digest, never from a command/paste fixture, so it has no PATTERN_TABLE
     // entry. The rule id stays for policy and audit-reader compatibility.
     "artifact_download_integrity_mismatch",
-    // F2: `artifact_release_anomaly` is produced by the package-firewall release
-    // differential (`crate::artifact::release_diff`) comparing two on-disk wheels
+    // F2: `artifact_release_anomaly` is produced by the release differential behind
+    // `tirith pkg diff` (`crate::artifact::release_diff`) comparing two on-disk wheels
     // of the same distribution, never from a command/paste fixture, so it has no
     // PATTERN_TABLE entry. Covered by unit tests in `artifact/release_diff.rs`.
     "artifact_release_anomaly",
