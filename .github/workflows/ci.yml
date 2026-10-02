@@ -46,6 +46,8 @@ jobs:
         run: python3 .github/scripts/test-release-compatibility.py
       - name: Validate workflow hygiene
         run: python3 .github/scripts/test-workflow-hygiene.py
+      - name: Validate documentation links
+        run: python3 .github/scripts/test-check-doc-links.py
       - name: Validate native host certification bounds
         run: |
           python3 scripts/test-certify-claude-host.py

@@ -10,9 +10,7 @@ The trust comparison uses the recorded candidate hash, not the current working
 tree. It records a one-hour project-scoped grant, sibling refusal, old-client
 refusal in both projects and refusal after copying the new envelope into the
 old store location. Neither command check executes the proposed pipeline.
-See [verification](../../../docs/next-cycle/verification.md) for signature and
-scope details. Wider native, expiry, copy/move and final-candidate evidence is
-still required.
+These fixtures do not cover wider native, expiry or copy/move behavior.
 
 `cli-reader-compatibility.json` adds 32 actual baseline/candidate reader cases:
 clean/blocked check contracts, personal and neutralized repository policies,

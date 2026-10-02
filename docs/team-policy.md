@@ -1,10 +1,10 @@
-# Bring your own team policy server
+# Team policy
 
-Personal protection works without a server. Team policy is off until a user explicitly activates a saved connection. Connecting, fetching, reviewing and publishing are separate actions; none automatically enrolls another device.
+Run your own policy server, publish one reviewed policy for your team, and enroll each device explicitly. Personal protection works without a server. Team policy is off until a user activates a saved connection on that device. Connecting, fetching, reviewing and publishing are separate actions; none enrolls another device.
 
 Tirith includes a separate `tirith-policy-server` executable. Run it on infrastructure your team operates, or implement the documented Tirith policy-management API on an existing service. An arbitrary file server is not sufficient: reviewed publication, concurrent-update checks, rollback, authentication and client report reconciliation require the API contract in [the server guide](../tools/policy-server/README.md).
 
-The server runs under an ordinary Linux or macOS account. It does not install a privileged service or require sudo. Its private SQLite storage currently has no Windows server implementation; Windows clients connect to a supported server. Native filesystem and platform qualification limits remain in the server guide.
+The server runs under an ordinary Linux or macOS account. It does not install a privileged service or require sudo. Windows clients connect to a server on a supported host.
 
 ## Host the authority
 
@@ -17,7 +17,7 @@ tirith-policy-server --data-dir /absolute/private/authority serve --listen 127.0
 
 Initialization prints the authority ID, policy ID, revision and roster revision. Keep the authority and policy IDs for connection verification. Put an operator-managed HTTPS reverse proxy in front of the loopback listener. The client requires certificate verification even when the server is on a private network. An ordinary account can use a TLS port above 1024; exposing a system port or configuring a system service follows the host's permission rules.
 
-Do not log bearer credentials or request/response bodies at the proxy. Restrict network access to the intended team. The server has no public registration, browser login, payment or license service. It keeps a bounded set of policies, credentials and clients; capacity exhaustion refuses visibly instead of forgetting replay history.
+Do not log bearer credentials or request/response bodies at the proxy. Restrict network access to the intended team.
 
 ## Choose credentials for each job
 
@@ -52,7 +52,7 @@ tirith policy team enrollment status
 tirith policy team enrollment sync --expected-connection-id CONNECTION_UUID --expected-activation-id ACTIVATION_UUID
 ```
 
-Activation and sync do not send Applied reports. The command hot path reads the enrolled local cache without contacting the team server. Missing, changed or malformed enrolled policy fails closed; it does not silently return to personal policy. Repository restrictions and the ordinary local overlays remain part of Runtime.
+Activation and sync do not send Applied reports. Commands read the enrolled local cache and never contact the team server. Repository restrictions and the ordinary local overlays still apply.
 
 Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again.
 
@@ -98,7 +98,7 @@ tirith policy team enrollment repair --remove-malformed
 
 This offline action captures one bounded private record and retains its native identity through deletion. It refuses a valid enrollment, unsafe storage, or a changed record. It does not salvage fields from malformed JSON, infer an activation ID, or use a status token from an earlier process. The browser requires a separate acknowledgment for this removal. Connection and report records remain intact.
 
-Disconnecting a connection is a separate action and does not withdraw enrollment. Disconnecting while enrolled therefore causes Runtime to refuse until the activation is deliberately withdrawn or repaired.
+Disconnecting a connection is a separate action and does not withdraw enrollment.
 
 ## Review and publish policy
 
@@ -149,7 +149,7 @@ If Runtime has changed or the cache has expired, use read-only reconciliation in
 tirith policy team enrollment reconcile --report-id REPORT_UUID
 ```
 
-Reconciliation authenticates the same selected Client and compares the complete original request with the server's latest retained report. It works without a valid current cache or activation and never submits an Applied observation. A confirmed receipt is a historical fact. `OperationNotFound` can mean the report is absent or was superseded; it does **not** prove that the old request never committed.
+Reconciliation authenticates the same selected Client and compares the complete original request with the server's latest retained report. It works without a valid current cache or activation and never submits an Applied observation. A confirmed receipt is a historical fact.
 
 An unresolved request can be explicitly archived locally before preparing a new report:
 
@@ -157,12 +157,46 @@ An unresolved request can be explicitly archived locally before preparing a new 
 tirith policy team enrollment abandon --report-id REPORT_UUID --acknowledge-unknown-outcome
 ```
 
-Abandonment preserves the exact request and its private context with an unknown server outcome. It neither cancels an in-flight request nor asserts no commit. The same private `report.json` holds at most four historical entries and is capped at 16 KiB total; either limit refuses without evicting history. A new report still requires actual valid Runtime and fresh authenticated server sequence. A late older request can win the server update race, leaving the new request in conflict; Tirith retains that exact request instead of inventing another sequence.
+Abandonment preserves the exact request and its private context with an unknown server outcome. It neither cancels an in-flight request nor asserts no commit. A new report still requires actual valid Runtime and fresh authenticated server sequence. A late older request can win the server update race, leaving the new request in conflict; Tirith retains that exact request instead of inventing another sequence.
 
 Status shows an opaque local archive ID for historical entries. To reconcile one explicitly, use `enrollment reconcile --report-id REPORT_UUID --archive-id ARCHIVE_UUID`. Without an archive ID, reconciliation selects the current stored report. Archive IDs distinguish different retained contexts if a never-confirmed sequence produced the same deterministic report ID again.
 
-Report submission requires a confirmed durable pending write. An unconfirmed storage outcome, including retained Windows recovery, does not permit a report POST. Inspect the reported storage result and retained state before another explicit action. Browser status and the report's initial Runtime resolution cannot fall through to a legacy authority network request after concurrent withdrawal.
+If storage reports an unconfirmed outcome (including retained Windows recovery), inspect the reported storage result and retained state before another explicit action.
 
-A Publisher or Observer can fetch fleet status with `tirith policy team rollout fleet`. The roster includes all explicitly active registered clients and distinguishes unreported, stale, downloaded, applied-current, applied-older and failed reports. An unreported client is not assumed to be offline. Applied means the authenticated client reported its local observation; it is not independent proof of enforcement across the fleet. Publication never claims every client adopted the policy.
+A Publisher or Observer can fetch fleet status with `tirith policy team rollout fleet`. The roster includes all explicitly active registered clients and distinguishes unreported, stale, downloaded, applied-current, applied-older and failed reports.
 
-The local browser's Settings page exposes connection, activation, rollout review and reporting actions under the existing local authentication and CSRF protection. Browser status loads remain local; remote contact requires an explicit action. Private tokens, CA contents, raw pending requests and private review commitments are not projected into the browser.
+The [dashboard](dashboard.md)'s Settings page has the same connection, activation, rollout review and reporting actions.
+
+## Limits
+
+- The server's private SQLite storage has no Windows implementation. Native
+  filesystem and platform limits are listed in the
+  [server guide](../tools/policy-server/README.md).
+- The server has no public registration, browser login, payment or license
+  service. It keeps a bounded set of policies, credentials and clients; when
+  full it refuses visibly instead of forgetting replay history.
+- Missing, changed or malformed enrolled policy fails closed; Tirith never falls
+  back to personal policy silently. Replacing the saved connection file (even
+  with identical bytes) requires a new activation.
+- After the 24-hour cache window plus the grace period, every command is
+  blocked until a sync succeeds or you leave team policy. The background
+  refresh does not run with `--offline` or `TIRITH_OFFLINE=1`.
+- A competing managed authority (`TIRITH_SERVER_URL` with `TIRITH_API_KEY`, a
+  trusted `policy_server_url`, or an organization policy) blocks every command
+  until one is removed. Disconnecting while enrolled also blocks until the
+  activation is withdrawn or repaired.
+- Rollback is available for seven days, and only while the original
+  publication is still the current revision.
+- A client's Applied report is its own observation, not independent proof of
+  enforcement. Publication never claims that every client adopted the policy;
+  an unreported client is not assumed offline.
+- `OperationNotFound` during reconciliation can mean the report is absent or
+  superseded; it does not prove that the old request never committed.
+  Abandoning a report does not cancel an in-flight request.
+- The private `report.json` holds at most four historical entries and 16 KiB;
+  either limit refuses instead of evicting history.
+- A report is sent only after its pending record is confirmed durable; an
+  unconfirmed storage outcome blocks the request.
+- The dashboard never shows private tokens, CA contents, raw pending requests or
+  private review commitments, and contacts the server only on an explicit
+  action.

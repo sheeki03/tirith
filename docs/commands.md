@@ -5,10 +5,9 @@ tasks and the command for each. `tirith --help` prints that list followed by the
 available top-level commands grouped by category, and `tirith <command> --help`
 documents any one in detail.
 The groups below mirror that built-in grouping. The [README](../README.md)
-covers the everyday subset; this is the complete reference. The unreleased
-[cycle journeys](next-cycle/user-journeys.md) cover terminal and agent setup,
-project review, interruptions, upgrade and removal; their final-candidate
-qualification remains tracked separately.
+covers the everyday subset; this is the complete reference.
+[Everyday workflows](user-journeys.md) walk through terminal and agent setup,
+project review, interruptions, upgrade and removal.
 
 ## Scan & analyze
 
@@ -69,9 +68,11 @@ qualification remains tracked separately.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](next-cycle/policy-snapshots.md)) |
+| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](internals.md#effective-policy-snapshot)) |
 | `tirith policy {profile,setting,operation,simulate}` | Preview/apply typed personal changes, inspect/retry/cancel/undo saved operations, and compare effective decisions for a captured command without executing it |
-| `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
+| `tirith trust {add,expiry,revoke,migrate,list,explain,diff,remove,gc,last,from-last-trigger,audit}` | Manage [trust grants](trust-grants.md) (narrow scope, 30-day TTL by default; `add` needs `--rule` or explicit `--all-rules`; `--scope project` binds one checkout); `migrate --scope user` moves legacy entries; `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
+| `tirith policy rollout {prepare,show,activate,undo}` | Measure a profile against representative commands, then activate or undo it as one reviewed operation ([rollouts](policy-rollouts.md)) |
+| `tirith policy team {connect,disconnect,status,enrollment,rollout}` | Optional self-hosted [team policy](team-policy.md): connection, explicit enrollment with background refresh and an offline grace period, reviewed publication, rollback and fleet reports |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
 | `tirith output wrap {on,off,status}` | Install or remove the `tirith-out` wrapper that runs a command's output through `tirith view` |
 

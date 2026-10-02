@@ -53,9 +53,18 @@ tirith init --shell fish | source
 > [!TIP]
 > `eval "$(tirith init)"` auto-detects your current shell (it inspects the parent process and falls back to `$SHELL` if needed). The explicit `--shell` flag is only required when you want to override the detection.
 
+Or let Tirith write the startup file for you, as one reviewed plan you can undo:
+
+```bash
+tirith setup recommended --scope user --shell zsh --dry-run   # preview
+tirith setup recommended --scope user --shell zsh             # apply
+```
+
 That's it for interactive-shell coverage. Commands accepted by that shell are
 checked while the hook is loaded and healthy; exact blocking behavior depends
-on the shell and mode. Run `tirith doctor` after installation and upgrades, and
+on the shell and mode. Run `tirith status` after installation and upgrades: it
+says whether this terminal's loaded hook is current. Run
+`tirith doctor --verify-shell` to observe blocking in the shell itself, and
 read [enforcement by shell](#enforcement-by-shell) before treating the hook as
 an authorization boundary. Clean commands stay silent and normally take the
 fast path.
@@ -932,6 +941,41 @@ tirith daemon stop
 
 ---
 
+## Profiles, dashboard and team policy
+
+Personal changes are previewed first and saved as operations you can inspect,
+apply, cancel or undo (`tirith policy operation ID`). They edit only the lines
+they own in your policy file and keep its comments and layout.
+
+- **Protection profiles:** `tirith policy profile balanced --dry-run` previews
+  Comfortable, Balanced (the default) or Strict; `tirith policy setting` changes
+  one field. `tirith policy rollout prepare` measures a profile against your own
+  commands before you activate it. See
+  [profiles and settings](docs/profiles-and-settings.md).
+- **Is this terminal protected?** `tirith status` and `tirith doctor` report
+  whether the loaded Bash, Zsh or Fish hook is current, stale (for example from
+  before an upgrade) or unregistered. `tirith doctor --verify-shell` observes
+  blocking in the calling shell; see
+  [caller-shell verification](docs/caller-shell-verification.md).
+- **Local dashboard:** `tirith dashboard` opens a loopback-only page with a
+  single-use sign-in code for settings, history, project review, trust grants,
+  team policy, saved changes, support reports, audit retention and a
+  "Refresh threat DB now" button. Binary updates stay in the terminal. See
+  [dashboard](docs/dashboard.md).
+- **Team policy (optional, self-hosted):** run `tirith-policy-server`, publish a
+  reviewed policy, and enroll each device explicitly. Enrolled devices refresh
+  the policy in the background; when offline they keep enforcing the last good
+  team policy, with a warning, for a grace period (72 hours by default) before
+  failing closed. See [team policy](docs/team-policy.md).
+- **Review before you trust:** `tirith review` statically reviews a project's
+  dependency, hook, AI-instruction and MCP files, and `tirith pkg inspect` /
+  `tirith pkg diff` inspect npm tarballs without extracting or running them. See
+  [project review](docs/project-review.md) and
+  [npm inspection](docs/npm-inspection.md).
+
+[Everyday workflows](docs/user-journeys.md) walks through setup, interruptions,
+upgrade and removal.
+
 ## Commands
 
 The everyday commands:
@@ -945,10 +989,14 @@ The everyday commands:
 | `tirith fix -- <cmd>` | Interactively apply a verified fail-closed pipe-runner rewrite when available; otherwise show guidance |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |
-| `tirith status` / `doctor` | Are you protected? Diagnose install, hooks, and policy (`--fix`, `--quick`) |
-| `tirith setup <tool>` / `init` | One-command AI-tool setup, or print the shell hook |
+| `tirith status` / `doctor` | Are you protected? Loaded-hook freshness, install, hooks, and policy (`--verify-shell`, `--fix`, `--quick`) |
+| `tirith setup <tool>` / `init` | Reviewed shell/profile setup (`setup recommended`), one-command AI-tool setup, or print the shell hook |
 | `tirith policy {init,validate,test}` | Scaffold, validate, and dry-run your policy |
-| `tirith trust {add,list,remove}` | Manage trusted patterns (narrow scope, 30-day TTL by default) |
+| `tirith policy {profile,setting,operation,rollout}` | Preview and apply personal profiles and settings; inspect, apply, cancel or undo saved operations |
+| `tirith policy team` | Connect to and enroll in an optional self-hosted team policy |
+| `tirith trust {add,list,explain,revoke,remove}` | Manage trust grants (narrow scope, 30-day TTL by default) |
+| `tirith dashboard` | Local loopback dashboard for settings, history, review, trust and team policy |
+| `tirith review` | Read-only review of a project's dependency, hook, AI and MCP files |
 | `tirith threat-db update` | Download and verify the signed threat database |
 | `tirith package risk <eco> <name>` | Score a package's supply-chain risk |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project |
@@ -1105,18 +1153,22 @@ works, and entries expire after 30 days unless you opt out.
 ```bash
 # Narrowest scope, a specific URL or path is accepted as-is, 30-day TTL.
 # A schemeless host/path is normalized as HTTPS for exact matching.
-tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
 
 # A whole domain / wildcard / bare TLD is broad, it must be opted into.
-tirith trust add get.docker.com --broad --rule curl_pipe_shell
+tirith trust add example-cli.dev --broad --rule shortened_url --ttl 7d
 
-# Opt out of the default TTL, and record why the entry exists.
-tirith trust add example.com --broad --permanent --reason "internal mirror, OPS-42"
+# Every rule needs an explicit --all-rules; opt out of the TTL and record why.
+tirith trust add example.com --broad --all-rules --permanent --reason "internal mirror, OPS-42"
+
+# Only for this checkout (bound to its root and filesystem identity).
+tirith trust add example-tool.sh/install.sh --rule pipe_to_interpreter --scope project
 
 tirith trust list                 # scope class per entry; '!' marks broad ones
 tirith trust explain example.com  # what it covers, when it expires, why added
+tirith trust revoke GRANT_ID      # revoke one grant; reports broader ones that remain
 tirith trust diff                 # what changed in the trust set
-tirith trust gc --expired         # drop expired entries
+tirith trust gc --expired         # drop expired grants and old revocations
 ```
 
 Each entry's **scope** is classified as `exact`, `substring`, `domain`,
@@ -1124,8 +1176,10 @@ Each entry's **scope** is classified as `exact`, `substring`, `domain`,
 `wildcard` / `bare-TLD`) requires `--broad`, so a sweeping allow is always a
 deliberate choice. Exact URLs use normalized URL equality (including scheme,
 host, effective port, path, query, and fragment), never substring matching. All
-subcommands support `--format json`. Trust stores written by older versions of
-tirith keep working unchanged, an entry with no TTL is treated as permanent.
+subcommands support `--format json`. New entries are stable, expiring grants in
+`trust-grants.json`; `trust.json` entries written by older versions keep
+working unchanged (an entry with no TTL is treated as permanent) until you run
+`tirith trust migrate --scope user`. See [trust grants](docs/trust-grants.md).
 
 ### Escalation and action overrides
 
@@ -1249,9 +1303,19 @@ Disable: `export TIRITH_LOG=0`
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager
+- [Internals](docs/internals.md), contracts behind the features below, for maintainers
 
 Feature guides:
 
+- [Everyday workflows](docs/user-journeys.md) (setup, interruptions, upgrade and removal)
+- [Profiles and settings](docs/profiles-and-settings.md) and [reviewed rollouts](docs/policy-rollouts.md)
+- [Trust grants](docs/trust-grants.md) (scoped, expiring exceptions)
+- [Local dashboard](docs/dashboard.md)
+- [Team policy](docs/team-policy.md) (self-hosted server, enrollment, background refresh and offline grace)
+- [Caller-shell verification](docs/caller-shell-verification.md) (hook freshness and observed blocking)
+- [Project review](docs/project-review.md) and [npm tarball inspection](docs/npm-inspection.md)
+- [ThreatDB freshness](docs/threatdb-freshness.md)
+- [Installation privileges](docs/install-privileges.md) and [Android/Termux](docs/android-termux.md)
 - [Web3 command guard](docs/security/web3-command-guard.md) (the `web3_guard` policy, the three Web3 rules, and command-card v2 bindings)
 - [Task envelope](docs/task-envelope.md) (untrusted task provenance, the `task_gate` policy, and the preview MCP tool)
 - [Untrusted projects](docs/untrusted-projects.md) (the "somebody sent me a repo" workflow)

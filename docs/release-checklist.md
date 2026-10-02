@@ -152,8 +152,7 @@ network/filesystem restrictions, resource limits and interruption cleanup.
 Missing required kernel controls still cause a pre-launch refusal. The QEMU
 runtime compatibility checks cannot establish native seccomp enforcement: they
 require an exit-1 refusal naming `network_raw_denied`, and any child output fails
-that gate. Keep both the native containment and emulated compatibility checks;
-see the [ARM capability and evidence record](next-cycle/containment-aarch64.md).
+that gate. Keep both the native containment and emulated compatibility checks.
 The static musl build retains the cleanup walk's exact mount-ID proof through a
 size- and offset-asserted Linux `statx` UAPI buffer because libc hides those
 bindings for its default musl ABI. There is no `st_dev` fallback: an unavailable

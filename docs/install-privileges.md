@@ -1,9 +1,10 @@
 # Installation and administrator privileges
 
-Tirith's ordinary checks, shell integration, agent setup, and doctor do not
-require sudo or administrator privileges. Installing into a protected system
-directory or changing a system package database requires an administrator;
-sudo is one way to obtain that access, and an existing root session also works.
+Install, update and use Tirith without sudo wherever you can. Ordinary checks,
+shell integration, agent setup and doctor never need sudo or administrator
+privileges. Only installing into a protected system directory or changing a
+system package database needs an administrator; sudo is one way to get that
+access, and an existing root session also works.
 
 | Channel | Install, update, and removal | Native package approval |
 | --- | --- | --- |
@@ -21,7 +22,7 @@ sudo is one way to obtain that access, and an existing root session also works.
 | Chocolatey | Follow the permissions of the Chocolatey installation, commonly an administrator-managed system prefix. The Tirith package does not request elevation itself. | Native package-approval issuance is unsupported on Windows. |
 | Docker | Image construction installs system dependencies; the released runtime runs as the `tirith` user and contains no sudo dependency. | The runtime image does not install the native authority. |
 
-## Optional helper for manual Linux installs
+## The package-approval helper on manual Linux installs
 
 Tirith never installs sudo, grants passwordless sudo access, creates a sudoers
 rule, starts an elevated approval service, or invokes the approval authority
@@ -53,11 +54,7 @@ to their owning package manager instead of being overwritten by self-update.
 an installed manual helper, or a helper required by the Debian/RPM package,
 must still match the release.
 
-## Approval, setup, and cleanup
-
-`tirith pkg approve` issues no approvals in this release: after its
-native-authority check it refuses with `private_input_execution_unqualified`,
-whatever the operator, session, or privilege level.
+## Check the approval capability, set up, and clean up
 
 `tirith init` prints shell integration, and `tirith setup` writes the selected
 user/project integration files with ownership and symlink checks. They do not
@@ -82,3 +79,23 @@ binary, then remove the shell/integration entries and user data. Only remove a
 shared privileged helper and `/etc/tirith/package-approval` after all
 installations using them are gone. The [uninstall guide](uninstall.md) lists
 the exact paths.
+
+## Limits
+
+- `tirith pkg approve` issues no approvals in this release. After its
+  native-authority check it refuses with `private_input_execution_unqualified`,
+  whatever the operator, session or privilege level. The packaged helper refuses
+  every operation, so installing sudo or the helper enables nothing.
+- Native package-approval issuance is unsupported on Windows, and the aarch64
+  AUR package has no helper. A helper copied into a home directory, or installed
+  by Cargo, npm, Homebrew, Nix, mise or asdf, is not a trusted native authority.
+- `TIRITH_INSTALL_APPROVAL_HELPER=1` needs a root session or a trusted
+  `/usr/bin/sudo` and is rejected where the helper is not packaged.
+  `TIRITH_INSTALL_APPROVAL_HELPER=0` cannot skip updating an existing helper.
+- Removing or replacing a protected helper needs administrator access. Remove a
+  shared helper and `/etc/tirith/package-approval` only after every installation
+  that uses them is gone.
+- `tirith update` never overwrites a package-managed installation; it prints the
+  owning package manager's command instead.
+- `available_on_explicit_request` means the filesystem prerequisites are
+  present, not that an approval was issued or administrator access was verified.

@@ -4,9 +4,9 @@ This matrix describes Tirith 0.4.2. The
 [0.4.2 release notes](release-notes-0.4.2.md) cover what that patch release
 changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
 0.4 line's published capabilities, compatibility boundaries, and remaining
-limitations. The working tree also contains unreleased cycle features; their
-[task guides](next-cycle/user-journeys.md) and [verification record](next-cycle/verification.md)
-do not establish published-package or final-release qualification.
+limitations. The working tree also contains unreleased features, described in
+[everyday workflows](user-journeys.md) and [internals](internals.md); they are
+not part of a published release yet.
 
 ## Stability Tiers
 

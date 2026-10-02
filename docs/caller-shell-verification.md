@@ -1,8 +1,14 @@
 # Caller-shell verification
 
-Configured startup files and inherited environment markers cannot establish
-that the current shell can stop a command. The Bash, Zsh and Fish protocol-v3
-hooks instead support a short diagnostic sequence in the shell being checked:
+Use these checks to find out whether the shell you are typing in loads a
+current Tirith hook and actually stops commands. Configured startup files and
+inherited environment markers cannot tell you that.
+
+## Observe blocking in this shell
+
+Run `tirith doctor --verify-shell` for the exact instructions. The Bash, Zsh and
+Fish protocol-v3 hooks support this short sequence, run in the shell being
+checked:
 
 1. Run `_tirith_verification_probe start` to obtain a challenge.
 2. Run its exact `allowed` command. The inert binary body records execution.
@@ -53,11 +59,8 @@ original challenge expiry. A public report, a copied environment variable, or a
 saved result cannot mint that proof. A sourced hook can prove this shell's current
 interception while `hook_configured` still reports no configured startup file.
 
-The background dashboard remains a configuration view. Neither a saved success
-nor a surviving shell PID lets it resample that shell's loaded definitions or
-claim current blocking. This sequence does not activate hooks automatically:
-run each exact command separately in the intended interactive shell. Commands
-executed in a disposable child only describe that child's shell.
+Run each exact command separately in the intended interactive shell. The
+sequence does not activate hooks.
 
 ## Is this terminal's hook current?
 
@@ -82,7 +85,22 @@ shells are ignored. This readout never reports verified or blocking protection
 
 ## Limits
 
-The core state-machine tests do not qualify a shell adapter. Each adapter must
-also demonstrate the full sequence in a real interactive shell, including
-helper redefinition, hook disablement, configuration changes and failed
-interception. A child PTY result is evidence for that child shell only.
+- Evidence covers only the shell the challenge ran in: not another terminal, a
+  nested shell (it needs its own challenge), every future command, or changes
+  made and then restored between observations. Commands run in a disposable
+  child describe only that child.
+- PowerShell and Nushell have no strict receipt channel; they report
+  verification as unsupported instead of inheriting another shell's result.
+- Challenges and results expire five minutes after creation; reading the status
+  again does not renew them. Policy, configuration, binary, process or
+  hook-definition changes invalidate the result.
+- Plain `tirith status` cannot authenticate this evidence by reading a marker;
+  use the helper's status step when a machine must require observed blocking.
+- The dashboard is a configuration view. A saved success or a surviving shell
+  PID does not let it claim current blocking.
+- The hook freshness readout is loaded-hook evidence only (`blocking_proof` is
+  always `false`).
+- The core state-machine tests do not qualify a shell adapter. Each adapter must
+  show the full sequence in a real interactive shell, including helper
+  redefinition, hook disablement, configuration changes and failed
+  interception. A child PTY result is evidence for that child shell only.
