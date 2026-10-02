@@ -183,6 +183,20 @@ fn read_patterns(service: &Service) -> Vec<String> {
     read_view(service).patterns
 }
 
+/// The policy a read-only route evaluates against, without any network
+/// request: a fresh no-network Runtime resolution or, when a legacy remote
+/// policy server makes that resolution refuse, the service's latest full
+/// Runtime resolution.
+fn read_snapshot(service: &Service) -> EffectivePolicySnapshot {
+    let local = EffectivePolicySnapshot::resolve_runtime_without_network(Some(&service.record.cwd));
+    if local.remote.availability == "refused_local_mutation" {
+        if let Some(runtime) = service.runtime_snapshot() {
+            return runtime;
+        }
+    }
+    local
+}
+
 /// Route an authorized request. `grant` is the credential decision made
 /// when the request was read; it is not re-derived here.
 pub(super) fn dispatch(
@@ -525,7 +539,9 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             view["omitted_rules_this_view"] = omitted.into();
             Ok(view)
         }
-        ("GET", "/api/policy/tuning") => super::super::tuning::review(cwd),
+        ("GET", "/api/policy/tuning") => {
+            super::super::tuning::review_with_patterns(read_patterns(service))
+        }
         ("POST", "/api/integrations/inspect") => {
             let query: ShellRequest = body(request)?;
             shell_service::inspect(query.shell, cwd)
@@ -554,7 +570,16 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                 .map_err(|_| "cannot project effective policy".into())
         }
         ("GET", "/api/exceptions") => {
-            trust_lifecycle::TrustService::capture(cwd)?.list(None, true, "all")
+            let mut trust = trust_lifecycle::TrustService::capture_read_only(
+                cwd,
+                read_snapshot(service),
+                &read_patterns(service),
+            )?;
+            let mut value = trust.list(None, true, "all")?;
+            // Policy diagnostics from the trust context's own capture are part
+            // of this response (merged with the route's by `dispatch`).
+            value["diagnostics"] = json!(std::mem::take(&mut trust.diagnostics));
+            Ok(value)
         }
         ("GET", "/api/lifecycle") => {
             let value = serde_json::to_value(super::super::selfupdate::gather_lifecycle_facts())
@@ -591,13 +616,20 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
         }
         ("POST", "/api/exceptions/explain") => {
             let query: ExplainTrust = body(request)?;
-            trust_lifecycle::TrustService::capture(cwd)?.explain(
+            let mut trust = trust_lifecycle::TrustService::capture_read_only(
+                cwd,
+                read_snapshot(service),
+                &read_patterns(service),
+            )?;
+            let mut value = trust.explain(
                 &query.target,
                 match query.scope {
                     GrantScope::User => "user",
                     GrantScope::Project => "project",
                 },
-            )
+            )?;
+            value["diagnostics"] = json!(std::mem::take(&mut trust.diagnostics));
+            Ok(value)
         }
         ("POST", "/api/plans") => {
             let query: PlanRequest = body(request)?;

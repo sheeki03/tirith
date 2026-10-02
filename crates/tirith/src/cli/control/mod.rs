@@ -29,6 +29,10 @@ struct RuntimePatterns {
     patterns: Vec<String>,
     /// ThreatDB refresh interval from the latest full Runtime resolution.
     refresh_interval_hours: Option<u64>,
+    /// The latest full Runtime resolution itself, for read-only routes that
+    /// evaluate against the policy while a legacy remote policy server makes
+    /// the no-network resolution refuse.
+    snapshot: Option<tirith_core::policy_snapshot::EffectivePolicySnapshot>,
 }
 
 struct Service {
@@ -92,6 +96,7 @@ impl Service {
                 }
             }
             runtime.refresh_interval_hours = Some(snapshot.policy.threat_intel.auto_update_hours);
+            runtime.snapshot = Some(snapshot.clone());
             runtime.resolved = true;
         }
         self.runtime_resolved.notify_all();
@@ -100,9 +105,18 @@ impl Service {
     /// Runtime DLP patterns and ThreatDB interval for a read-only response,
     /// after the startup resolution finished (or its bounded wait passed).
     fn runtime_view(&self) -> (Vec<String>, Option<u64>) {
-        let Ok(guard) = self.runtime_patterns.lock() else {
-            return (Vec::new(), None);
-        };
+        self.with_runtime(|runtime| (runtime.patterns.clone(), runtime.refresh_interval_hours))
+            .unwrap_or((Vec::new(), None))
+    }
+
+    /// The latest full Runtime resolution, after the same bounded wait.
+    fn runtime_snapshot(&self) -> Option<tirith_core::policy_snapshot::EffectivePolicySnapshot> {
+        self.with_runtime(|runtime| runtime.snapshot.clone())
+            .flatten()
+    }
+
+    fn with_runtime<T>(&self, read: impl FnOnce(&RuntimePatterns) -> T) -> Option<T> {
+        let guard = self.runtime_patterns.lock().ok()?;
         match self
             .runtime_resolved
             .wait_timeout_while(guard, RUNTIME_PATTERNS_WAIT, |runtime| !runtime.resolved)
@@ -110,9 +124,9 @@ impl Service {
             Ok((mut runtime, _)) => {
                 // Wait at most once: later reads use whatever is known.
                 runtime.resolved = true;
-                (runtime.patterns.clone(), runtime.refresh_interval_hours)
+                Some(read(&runtime))
             }
-            Err(_) => (Vec::new(), None),
+            Err(_) => None,
         }
     }
 

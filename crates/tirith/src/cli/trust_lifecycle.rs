@@ -33,6 +33,15 @@ impl Context {
     }
 
     fn capture_at(cwd: Option<&str>) -> Result<Self, String> {
+        Self::capture_at_with(cwd, |cwd| {
+            EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime)
+        })
+    }
+
+    fn capture_at_with(
+        cwd: Option<&str>,
+        resolve: impl FnOnce(Option<&str>) -> EffectivePolicySnapshot,
+    ) -> Result<Self, String> {
         if cwd.is_some_and(|value| !Path::new(value).is_absolute()) {
             return Err("trust service project scope must be absolute".into());
         }
@@ -47,7 +56,7 @@ impl Context {
         let cwd = Some(resolved_cwd.as_str());
         let config =
             tirith_core::policy::config_dir().ok_or("cannot locate operator configuration")?;
-        let snapshot = EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime);
+        let snapshot = resolve(cwd);
         let project = ProjectIdentity::capture(cwd).ok();
         let patterns =
             CompiledCustomPatterns::new(&tirith_core::policy::captured_policy_dlp_patterns_or(
@@ -129,6 +138,29 @@ impl TrustService {
     pub(crate) fn capture(cwd: Option<&str>) -> Result<Self, String> {
         let _capture = PolicyDiagnosticCapture::start();
         let context = Context::capture_at(cwd)?;
+        let diagnostics =
+            tirith_core::policy::drain_captured_policy_diagnostics_for_output(&context.patterns);
+        Ok(Self {
+            context,
+            diagnostics,
+        })
+    }
+
+    /// For read-only callers (list, explain) that already resolved the policy
+    /// without a network request. Output is redacted with the snapshot's DLP
+    /// patterns plus `extra_patterns`. Only a fully resolving `capture` may
+    /// back a prepare or apply.
+    pub(crate) fn capture_read_only(
+        cwd: Option<&str>,
+        snapshot: EffectivePolicySnapshot,
+        extra_patterns: &[String],
+    ) -> Result<Self, String> {
+        let _capture = PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(
+            &snapshot.policy.dlp_custom_patterns,
+        );
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(extra_patterns);
+        let context = Context::capture_at_with(cwd, |_| snapshot)?;
         let diagnostics =
             tirith_core::policy::drain_captured_policy_diagnostics_for_output(&context.patterns);
         Ok(Self {

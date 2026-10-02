@@ -8,6 +8,19 @@ use tirith_core::redact::CompiledCustomPatterns;
 pub(crate) fn review(cwd: Option<&str>) -> Result<Value, String> {
     let _capture = PolicyDiagnosticCapture::start();
     let snapshot = EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime);
+    let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);
+    review_inner(patterns)
+}
+
+/// The review for a read-only caller that already holds the DLP patterns to
+/// redact with (the dashboard service), so no policy is resolved here.
+pub(crate) fn review_with_patterns(patterns: Vec<String>) -> Result<Value, String> {
+    let _capture = PolicyDiagnosticCapture::start();
+    tirith_core::policy::freeze_captured_policy_dlp_patterns(&patterns);
+    review_inner(patterns)
+}
+
+fn review_inner(patterns: Vec<String>) -> Result<Value, String> {
     let path = tirith_core::audit::audit_log_path().ok_or("audit history location unavailable")?;
     let history = HistoryReader::new(path).recent(
         HistoryFilter::default(),
@@ -24,7 +37,6 @@ pub(crate) fn review(cwd: Option<&str>) -> Result<Value, String> {
     let known = known.iter().map(|rule| rule.id).collect::<Vec<_>>();
     let report = tirith_core::audit_tune::analyze(&records, &known);
     let annotations = super::feedback::read_for_history(&history);
-    let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);
     let compiled = CompiledCustomPatterns::new_silent(&patterns);
     let mut value = serde_json::to_value(&report).map_err(|_| "cannot encode tuning review")?;
     let omitted_rules = report.rule_stats.len().saturating_sub(100);

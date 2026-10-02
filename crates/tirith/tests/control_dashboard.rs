@@ -262,17 +262,24 @@ fn read_only_routes_never_resolve_the_remote_policy() {
     state.set_env("TIRITH_SERVER_URL", "https://127.0.0.1:1");
     state.set_env("TIRITH_API_KEY", "fixture-remote-policy-key");
     let server = service_credential(&state);
-    let attempted = |value: &Value| {
-        value["diagnostics"]
-            .to_string()
-            .contains("remote policy fetch")
-    };
+    // Routes that nest their own diagnostic capture report it in a
+    // route-specific field (`policy_diagnostics` for the tuning review), so
+    // look at the whole response.
+    let attempted = |value: &Value| value.to_string().contains("remote policy fetch");
+    let mut resolved_remote = Vec::new();
     for (method, path, body) in [
         ("GET", "/api/jobs", None),
         ("GET", "/api/state", None),
         ("GET", "/api/integrations", None),
         ("GET", "/api/activity/summary", None),
         ("GET", "/api/freshness", None),
+        ("GET", "/api/policy/tuning", None),
+        ("GET", "/api/exceptions", None),
+        (
+            "POST",
+            "/api/exceptions/explain",
+            Some(json!({"target": "example-cli.dev", "scope": "user"})),
+        ),
         ("POST", "/api/history", Some(json!({"limit": 10}))),
         (
             "POST",
@@ -285,11 +292,15 @@ fn read_only_routes_never_resolve_the_remote_policy() {
             status == 200 || path == "/api/operations",
             "{path}: {value}"
         );
-        assert!(
-            !attempted(&value),
-            "{path} resolved the remote policy: {value}"
-        );
+        if attempted(&value) {
+            resolved_remote.push(format!("{path}: {value}"));
+        }
     }
+    assert!(
+        resolved_remote.is_empty(),
+        "read-only routes resolved the remote policy:\n{}",
+        resolved_remote.join("\n")
+    );
     // The effective-policy view still resolves Runtime, which also shows the
     // fixture would have seen an attempt.
     let (status, policy) = server.request("GET", "/api/policy", None);
