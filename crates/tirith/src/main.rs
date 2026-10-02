@@ -439,9 +439,8 @@ after the analysis and your go-ahead.
 
 This is pre-execution install-RISK ANALYSIS plus a recorded transaction. Real
 package-manager installs (`npm`, `pip`, `cargo`, and others) are not sandboxed;
-on x86_64 Linux, use `tirith pkg install` for the enforcing package firewall.
-Other platforms and architectures refuse that enforcing execution. The `url`
-form is different: reviewed scripts execute contained by default and fail closed
+contained package installation (`tirith pkg install`) is currently disabled
+pending qualification of immutable named inputs. The `url` form is different: reviewed scripts execute contained by default and fail closed
 when the Linux capsule cannot provide the required coverage.
 
 The package(s) are scored with the deterministic `tirith package risk`
@@ -525,9 +524,8 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Package firewall: resolve and inspect Python packages; on x86_64 Linux,
-    /// install ONLY the verified bytes inside a containment capsule, with a
-    /// tamper-evident receipt.
+    /// Inspect Python packages and verify installed environments.
+    /// Contained package installation is currently disabled.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
@@ -536,11 +534,16 @@ Examples:
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
-`tirith pkg approve` native approval issuance and `tirith pkg install` enforcing
-execution are supported only on x86_64 Linux. Other platforms and architectures
-fail closed instead of issuing an approval that cannot be redeemed. `pkg
-verify-env` remains a read-only verifier, and `tirith install` remains the
-portable analysis path.")]
+`tirith pkg install` is disabled on every host and refuses with
+private_input_execution_unqualified before resolver, quarantine, checkpoint,
+or package execution. --yes, --allow-degraded, sudo, and administrator access
+do not enable it. Immutable named inputs must be qualified for the complete
+target lifetime before contained package execution can be enabled.
+
+`tirith pkg approve` remains subject to its separate native authority and
+x86_64 Linux requirements; an approval cannot bypass the execution refusal.
+`pkg verify-env` remains a read-only verifier, and `tirith package inspect`
+remains available for local artifact inspection.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -5884,18 +5887,22 @@ platforms fail closed before publishing an approval record.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Resolve + inspect + install ONLY the verified, hash-pinned bytes, inside the
-    /// containment capsule, recording a tamper-evident receipt. Enforcing execution
-    /// is x86_64 Linux-only; every other platform or architecture fails closed
-    /// before pip starts.
+    /// Contained package installation (currently disabled on every host).
+    /// Refuses before resolver, quarantine, checkpoint, or package execution.
     #[command(after_help = "\
 Examples:
   tirith pkg install pip requests==2.31.0 --target .tirith-pkg
   tirith pkg install pip flask --target .venv --yes
 
-Execution is supported only on x86_64 Linux. Unsupported platforms and
-architectures refuse before pip starts; they never fall back to an uncontained
-install.")]
+Execution is disabled on every host. These examples retain the accepted syntax
+but refuse with private_input_execution_unqualified before resolver execution,
+network access, quarantine writes, checkpoint creation, or package launch.
+--yes, --allow-degraded, sudo, and administrator access do not enable it.
+
+The private named-input backend has not been qualified to keep package inputs
+unchanged for the complete target lifetime against another process owned by
+the same user. `tirith package inspect` and `tirith pkg verify-env` remain
+available.")]
     Install {
         /// The ecosystem (only `pip` is enforced).
         #[arg(value_enum)]
@@ -5912,8 +5919,7 @@ install.")]
         /// egress only and is never treated as a package index.
         #[arg(long = "artifact-origin")]
         artifact_origin: Vec<String>,
-        /// Install without a prior `tirith pkg approve` (unattended). The receipt
-        /// still attests the install honestly.
+        /// Retained unattended confirmation flag; cannot enable the disabled backend.
         #[arg(long)]
         yes: bool,
         /// Acknowledge degraded containment (still routes through the fail-closed

@@ -43,7 +43,8 @@ what an experimental command must satisfy to move to stable.
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
 | `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
-| `pkg approve` / `pkg install` | Experimental | Enforcing pip approval/install path on x86_64 Linux only. Unsupported systems refuse before pip starts; npm and Cargo are not enforcing backends. |
+| `pkg approve` | Experimental | Non-installing pip approval flow subject to its native authority and platform requirements. An approval cannot enable the disabled package-install backend. |
+| `pkg install` | Experimental | Disabled on every host: `private_input_execution_unqualified` refuses before resolver, quarantine, checkpoint, or package execution. Flags and elevation cannot enable it. Local inspection, `pkg verify-env`, ordinary command checks, and shell protection remain available. |
 | `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
 | `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
 | `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |
