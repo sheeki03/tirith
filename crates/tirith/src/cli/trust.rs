@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -165,383 +165,49 @@ fn load_store_scoped(scope: &str, path: &std::path::Path) -> Result<TrustStore, 
     }
 }
 
-#[cfg(unix)]
-fn open_repo_trust_dir(path: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::OpenOptionsExt as _;
+/// Read the legacy repo-scoped `<root>/.tirith/trust.json` through retained,
+/// no-follow directory capabilities (`ContainedAtomicFile`), the same reader on
+/// Unix and Windows. A symlinked or reparse `.tirith` or `trust.json` is
+/// refused; an absent repository root, `.tirith` or store reads as empty; and
+/// the bytes come from one regular file whose generation did not change while
+/// it was read.
+#[cfg(any(unix, windows))]
+fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
+    use tirith_core::util::{ContainedAtomicFile, OpenRegularError};
 
     let root = path
         .parent()
+        .filter(|directory| directory.file_name() == Some(std::ffi::OsStr::new(".tirith")))
         .and_then(std::path::Path::parent)
+        .filter(|_| path.file_name() == Some(std::ffi::OsStr::new("trust.json")))
         .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-    // O_NOFOLLOW on the root too. The caller derives it from
-    // `find_repo_root(None)`, which starts at `std::env::current_dir()` —
-    // `getcwd()`, whose result POSIX guarantees has no symlink components — and
-    // then only ascends with `parent()`. So the root cannot be a symlink here
-    // and this never costs a legitimate caller an ELOOP; it is free insurance
-    // for any future caller that does not come from getcwd.
-    let root_fd = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)
-        .map_err(|e| format!("cannot open repository root {}: {e}", root.display()))?;
-    let name = CString::new(".tirith").expect("static component has no NUL");
-    let fd = unsafe {
-        libc::openat(
-            root_fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "refusing repo trust path with a missing, symlinked, or non-directory .tirith component: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `openat` returned a fresh owned descriptor.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    let dir = match open_repo_trust_dir(path) {
-        Ok(dir) => dir,
-        Err(error) => match path.parent().map(fs::symlink_metadata) {
-            Some(Err(io_error)) if io_error.kind() == io::ErrorKind::NotFound => {
-                return Ok(TrustStore::default())
-            }
-            _ => return Err(error),
-        },
-    };
-    let name = CString::new("trust.json").expect("static component has no NUL");
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(TrustStore::default());
+    let file = match ContainedAtomicFile::prepare(root, path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(TrustStore::default()),
+        Err(error) => {
+            return Err(format!(
+                "refusing repo trust store {}: {error}",
+                path.display()
+            ))
         }
-        return Err(format!(
-            "refusing repo trust store {}: {error}",
-            path.display()
-        ));
-    }
-    // SAFETY: `openat` returned a fresh owned descriptor.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("cannot inspect repo trust store: {e}"))?;
-    if !meta.is_file() {
-        return Err("repo trust store is not a regular file".to_string());
-    }
-    if meta.len() > TRUST_STORE_MAX_BYTES {
-        return Err(format!(
-            "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(TRUST_STORE_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read repo trust store: {e}"))?;
-    if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
-        return Err(format!(
-            "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
-        ));
-    }
+    };
+    let bytes = match file.read_capped(TRUST_STORE_MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(OpenRegularError::NotFound) => return Ok(TrustStore::default()),
+        Err(OpenRegularError::TooLarge) => {
+            return Err(format!(
+                "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
+            ))
+        }
+        Err(OpenRegularError::NotRegularFile) => {
+            return Err("repo trust store is not a regular file".to_string())
+        }
+        Err(OpenRegularError::Io(error)) => {
+            return Err(format!("cannot read repo trust store: {error}"))
+        }
+    };
     serde_json::from_slice(&bytes)
-        .map_err(|e| format!("corrupt trust store at {}: {e}", path.display()))
-}
-
-#[cfg(windows)]
-mod windows_repo_store {
-    use super::{fs, io, Read, TrustStore, TRUST_STORE_MAX_BYTES};
-    use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
-    use std::path::Path;
-
-    use windows::core::{HRESULT, PCWSTR};
-    use windows::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE,
-    };
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_TRAVERSE, OPEN_EXISTING,
-    };
-
-    struct OwnedHandle(HANDLE);
-
-    impl OwnedHandle {
-        fn into_file(self) -> fs::File {
-            let raw = self.0 .0 as RawHandle;
-            std::mem::forget(self);
-            // SAFETY: the handle is valid, uniquely owned, and forgotten above.
-            unsafe { fs::File::from_raw_handle(raw) }
-        }
-    }
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            // SAFETY: `OwnedHandle` owns exactly one live Win32 handle.
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    /// The held root and `.tirith` handles pin both directories while the
-    /// store is read; only the resolved `.tirith` path is consulted.
-    struct RepoTrustDir {
-        final_path: String,
-        _root: OwnedHandle,
-        _directory: OwnedHandle,
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    struct FileIdentity {
-        volume: u32,
-        index: u64,
-        size: u64,
-        last_write: u64,
-        attributes: u32,
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
-    }
-
-    fn is_win32(error: &windows::core::Error, code: u32) -> bool {
-        error.code() == HRESULT::from_win32(code)
-    }
-
-    fn final_path(handle: HANDLE) -> Result<String, String> {
-        let mut buffer = vec![0u16; 512];
-        loop {
-            let length =
-                unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, Default::default()) };
-            if length == 0 {
-                return Err(format!(
-                    "cannot resolve path held by repo trust handle: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            if (length as usize) < buffer.len() {
-                return Ok(String::from_utf16_lossy(&buffer[..length as usize]));
-            }
-            buffer.resize(length as usize + 1, 0);
-        }
-    }
-
-    fn normalized_final_path(path: &str) -> String {
-        let path = path.replace('/', "\\");
-        let path = path
-            .strip_prefix(r"\\?\UNC\")
-            .map(|rest| format!(r"\\{rest}"))
-            .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
-            .unwrap_or(path);
-        path.trim_end_matches('\\').to_lowercase()
-    }
-
-    fn is_exact_child(parent: &str, child: &str, name: &str) -> bool {
-        let expected = format!("{}\\{}", normalized_final_path(parent), name.to_lowercase());
-        normalized_final_path(child) == expected
-    }
-
-    fn inspect_directory(handle: HANDLE, path: &Path) -> Result<(), String> {
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|error| {
-            format!(
-                "cannot inspect repo trust directory {}: {error}",
-                path.display()
-            )
-        })?;
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
-        {
-            return Err(format!(
-                "refusing reparse or non-directory repo trust component {}",
-                path.display()
-            ));
-        }
-        Ok(())
-    }
-
-    fn open_directory(path: &Path) -> Result<Option<OwnedHandle>, String> {
-        let path_wide = wide(path);
-        let handle = match unsafe {
-            CreateFileW(
-                PCWSTR(path_wide.as_ptr()),
-                (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES).0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
-            )
-        } {
-            Ok(handle) => handle,
-            Err(error)
-                if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
-                    || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => {
-                return Err(format!(
-                    "cannot open repo trust directory {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        let owned = OwnedHandle(handle);
-        inspect_directory(handle, path)?;
-        Ok(Some(owned))
-    }
-
-    fn split_path(path: &Path) -> Result<(&Path, &Path), String> {
-        if path.file_name() != Some(std::ffi::OsStr::new("trust.json")) {
-            return Err("repo trust path is not <root>/.tirith/trust.json".to_string());
-        }
-        let directory = path
-            .parent()
-            .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".tirith")))
-            .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-        let root = directory
-            .parent()
-            .ok_or_else(|| "repo trust path is not <root>/.tirith/trust.json".to_string())?;
-        Ok((root, directory))
-    }
-
-    fn open_repo_dir(path: &Path) -> Result<Option<RepoTrustDir>, String> {
-        let (root_path, directory_path) = split_path(path)?;
-        let root = open_directory(root_path)?
-            .ok_or_else(|| format!("repository root {} does not exist", root_path.display()))?;
-        let root_final = final_path(root.0)?;
-
-        let Some(directory) = open_directory(directory_path)? else {
-            return Ok(None);
-        };
-        let directory_final = final_path(directory.0)?;
-        if !is_exact_child(&root_final, &directory_final, ".tirith") {
-            return Err(
-                "repo trust directory resolves outside the held repository root".to_string(),
-            );
-        }
-        Ok(Some(RepoTrustDir {
-            final_path: directory_final,
-            _root: root,
-            _directory: directory,
-        }))
-    }
-
-    fn inspect_regular(handle: HANDLE, path: &Path) -> Result<FileIdentity, String> {
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|error| {
-            format!("cannot inspect repo trust file {}: {error}", path.display())
-        })?;
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
-        {
-            return Err(format!(
-                "refusing reparse or non-regular repo trust file {}",
-                path.display()
-            ));
-        }
-        Ok(FileIdentity {
-            volume: info.dwVolumeSerialNumber,
-            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
-            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
-            last_write: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
-                | info.ftLastWriteTime.dwLowDateTime as u64,
-            attributes: info.dwFileAttributes,
-        })
-    }
-
-    fn open_regular_file(
-        directory: &RepoTrustDir,
-        path: &Path,
-    ) -> Result<Option<(fs::File, FileIdentity)>, String> {
-        let path_wide = wide(path);
-        let handle = match unsafe {
-            CreateFileW(
-                PCWSTR(path_wide.as_ptr()),
-                (FILE_GENERIC_READ | FILE_READ_ATTRIBUTES).0,
-                FILE_SHARE_READ,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
-            )
-        } {
-            Ok(handle) => handle,
-            Err(error)
-                if is_win32(&error, ERROR_FILE_NOT_FOUND.0)
-                    || is_win32(&error, ERROR_PATH_NOT_FOUND.0) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => {
-                return Err(format!(
-                    "refusing repo trust file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        let owned = OwnedHandle(handle);
-        let identity = inspect_regular(handle, path)?;
-        let file_final = final_path(handle)?;
-        if !is_exact_child(&directory.final_path, &file_final, "trust.json") {
-            return Err("repo trust file resolves outside the held .tirith directory".to_string());
-        }
-        Ok(Some((owned.into_file(), identity)))
-    }
-
-    pub(super) fn load(path: &Path) -> Result<TrustStore, String> {
-        let Some(directory) = open_repo_dir(path)? else {
-            return Ok(TrustStore::default());
-        };
-        let Some((mut file, before)) = open_regular_file(&directory, path)? else {
-            return Ok(TrustStore::default());
-        };
-        if before.size > TRUST_STORE_MAX_BYTES {
-            return Err(format!(
-                "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
-            ));
-        }
-        let mut bytes = Vec::with_capacity(before.size as usize);
-        (&mut file)
-            .take(TRUST_STORE_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("cannot read repo trust store: {error}"))?;
-        if bytes.len() as u64 > TRUST_STORE_MAX_BYTES {
-            return Err(format!(
-                "repo trust store exceeds the {TRUST_STORE_MAX_BYTES} byte limit"
-            ));
-        }
-        let after = inspect_regular(HANDLE(file.as_raw_handle()), path)?;
-        if before != after || bytes.len() as u64 != after.size {
-            return Err("repo trust store changed while being read".to_string());
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("corrupt trust store at {}: {error}", path.display()))
-    }
-}
-
-#[cfg(windows)]
-fn load_repo_store(path: &std::path::Path) -> Result<TrustStore, String> {
-    windows_repo_store::load(path)
+        .map_err(|error| format!("corrupt trust store at {}: {error}", path.display()))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1610,15 +1276,14 @@ mod tests {
     fn repo_trust_dir_refuses_a_symlinked_tirith_component() {
         use std::os::unix::fs::symlink;
 
-        // The root itself is opened O_NOFOLLOW as well, which costs nothing:
-        // the caller derives it from find_repo_root(None) -> current_dir(),
-        // and getcwd() never returns a path with symlink components.
         let holder = tempfile::tempdir().unwrap();
         let root = holder.path().join("checkout");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(root.join(".tirith")).unwrap();
-        open_repo_trust_dir(&root.join(".tirith").join("trust.json"))
-            .expect("an ordinary repository root opens");
+        assert!(load_repo_store(&root.join(".tirith").join("trust.json"))
+            .expect("an ordinary repository root opens")
+            .entries
+            .is_empty());
 
         // The component that carries repository content refuses a symlink.
         let hostile = holder.path().join("hostile");
@@ -1626,9 +1291,21 @@ mod tests {
         let swapped = holder.path().join("swapped");
         std::fs::create_dir(&swapped).unwrap();
         symlink(&hostile, swapped.join(".tirith")).unwrap();
-        let error = open_repo_trust_dir(&swapped.join(".tirith").join("trust.json"))
+        let error = load_repo_store(&swapped.join(".tirith").join("trust.json"))
             .expect_err("a symlinked .tirith component must be refused");
         assert!(error.contains("symlinked"), "unexpected error: {error}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repo_store_is_empty_without_a_repository_root_and_refuses_other_shapes() {
+        let holder = tempfile::tempdir().unwrap();
+        let missing = holder.path().join("missing-root/.tirith/trust.json");
+        assert!(load_repo_store(&missing).unwrap().entries.is_empty());
+        let error = load_repo_store(&holder.path().join("trust.json")).unwrap_err();
+        assert!(error.contains("<root>/.tirith/trust.json"), "{error}");
+        fs::write(holder.path().join(".tirith"), b"not a directory").unwrap();
+        assert!(load_repo_store(&holder.path().join(".tirith/trust.json")).is_err());
     }
 
     #[test]

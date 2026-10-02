@@ -547,12 +547,7 @@ mod tests {
         let active = tirith_core::audit::audit_log_path().unwrap();
         let original = std::fs::read(&active).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        super::super::audit_service::prepare(
-            &id,
-            super::super::audit_service::AuditChange::Rotate,
-            None,
-        )
-        .unwrap();
+        super::super::audit_service::prepare(&id, None).unwrap();
         let state = MutationService::current()
             .unwrap()
             .apply(

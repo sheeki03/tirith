@@ -36,6 +36,11 @@ pub enum Projection {
     Provenance,
     Agent,
     Diff,
+    /// `tirith threat-db health` as the dashboard shows it.
+    ThreatDbHealth,
+    ThreatDbFreshness,
+    ThreatDbSource,
+    ThreatDbUpdate,
     Content,
 }
 
@@ -115,6 +120,9 @@ pub(crate) fn project_sensitive_strings(
                     (Projection::Cloaking, "task_boundary") => Projection::Task,
                     (Projection::Cloaking, "agents") => Projection::Agent,
                     (Projection::Cloaking, "diffs") => Projection::Diff,
+                    (Projection::ThreatDbHealth, "freshness") => Projection::ThreatDbFreshness,
+                    (Projection::ThreatDbHealth, "last_update") => Projection::ThreatDbUpdate,
+                    (Projection::ThreatDbFreshness, "sources") => Projection::ThreatDbSource,
                     _ => Projection::Content,
                 };
                 project_sensitive_strings(value, child, project);
@@ -155,9 +163,43 @@ fn receipt_timestamp(value: &Value) -> bool {
     })
 }
 
+const THREATDB_UPDATE_PHASES: [&str; 3] = ["primary", "supplemental", "complete"];
+const THREATDB_UPDATE_CATEGORIES: [&str; 7] = [
+    "integrity",
+    "rollback",
+    "rate_limit",
+    "validation",
+    "completeness",
+    "transport",
+    "operation",
+];
+
 fn protocol_field(schema: Projection, key: &str, value: &Value) -> bool {
     use Projection::*;
     match (schema, key) {
+        (ThreatDbHealth, "status") => token(value, &["ok", "stale", "not_installed", "error"]),
+        (ThreatDbFreshness, "publication_time_basis") => token(value, &["signed_build_timestamp"]),
+        (ThreatDbFreshness, "source_evidence") => token(
+            value,
+            &["unavailable", "signature_verified_for_installed_database"],
+        ),
+        (ThreatDbSource, "source") => token(value, &crate::threatdb::operations::SOURCE_IDS),
+        (ThreatDbSource, "revision") => value
+            .as_str()
+            .is_some_and(|v| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit())),
+        (ThreatDbSource, "pin_selected_at") => value
+            .as_str()
+            .is_some_and(|text| chrono::DateTime::parse_from_rfc3339(text).is_ok()),
+        (ThreatDbUpdate, "status") => token(value, &["partial", "failed", "complete"]),
+        (ThreatDbUpdate, "phase") => token(value, &THREATDB_UPDATE_PHASES),
+        (ThreatDbUpdate, "failure_category") => token(value, &THREATDB_UPDATE_CATEGORIES),
+        (ThreatDbUpdate, "incident_key") => value
+            .as_str()
+            .and_then(|key| key.split_once(':'))
+            .is_some_and(|(phase, category)| {
+                THREATDB_UPDATE_PHASES.contains(&phase)
+                    && THREATDB_UPDATE_CATEGORIES.contains(&category)
+            }),
         (Verdict, "action" | "approval_fallback")
         | (Run | InstallUrl | CommandsError, "action") => {
             canonical::<crate::verdict::Action>(value)

@@ -335,7 +335,7 @@
       paragraph('Configures the Claude Code hook in this plan; reload Claude Code, then verify. Saved configuration does not prove a running agent is protected.', 'muted'),
       button('Review personal setup', () => {
         if (!recommendedShell.input.value) throw new Error('Choose the shell whose personal startup configuration you intend to change.');
-        return plan({kind:'recommended_setup', change:{scope:'user', shell:recommendedShell.input.value, profile:recommendedProfile.input.value, agents:recommendedClaude.input.checked ? ['claude-code'] : []}});
+        return plan({kind:'recommended_setup', change:{shell:recommendedShell.input.value, profile:recommendedProfile.input.value, claude_code:recommendedClaude.input.checked}});
       }, 'primary'));
     return [surface, recommended, setup, verify];
   }
@@ -354,7 +354,7 @@
     const sources = panel('Threat intelligence freshness'); sources.append(threatDbFreshness(fresh));
     const local = panel('Local service'); local.append(paragraph('Stop accepting changes and close this dashboard service after its active jobs finish. Shell and agent protection continue independently.'), button('Close local service', () => requestDialog(() => api('/api/quiesce', {}), response => { showDialog('Service is draining', response); document.querySelector('#session-state').textContent = 'Service closing — reopen with tirith dashboard'; }), 'secondary'));
     const exportPanel = panel('Export this redacted view'); exportPanel.append(paragraph('Exports refresh the lifecycle and freshness projections under the current privacy policy. Canonical signed files and private operation journals are not included.'), button('Download JSON', async () => { const [currentLifecycle, freshness] = await Promise.all([api('/api/lifecycle'), api('/api/freshness')]); download('tirith-local-status.json', {lifecycle:currentLifecycle, freshness}); }));
-    const retention = panel('Audit retention'); retention.append(paragraph('Review a rotation of the active audit history into a private retained segment. Rotation preserves exact archived bytes and starts a checkpointed active segment. Undo requires that no further records have been appended.'), button('Review audit rotation', () => plan({kind:'audit_retention', change:'rotate'})));
+    const retention = panel('Audit retention'); retention.append(paragraph('Review a rotation of the active audit history into a private retained segment. Rotation preserves exact archived bytes and starts a checkpointed active segment. Undo requires that no further records have been appended.'), button('Review audit rotation', () => plan({kind:'audit_retention'})));
     const segment = field('Retained segment ID', 'text', '', 'UUID of the completed rotation operation');
     const erase = field('I understand that deleting this segment permanently removes its retained records', 'checkbox');
     retention.append(segment.label, paragraph('Segment export copies exact retained records to a private local directory; it is not a redacted support report. Deletion keeps a checkpoint and tombstone, leaves the active log intact, and cannot be undone.'),

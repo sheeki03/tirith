@@ -91,24 +91,45 @@ fn ordinary_cli_tests_cannot_bypass_the_hermetic_command_builder() {
 }
 
 /// Run `tirith output wrap <action>` as a zsh user whose HOME is `home`.
+/// `output wrap` picks the shell from the nearest ancestor shell process
+/// before `SHELL`, so Tirith runs as a child of zsh: otherwise a test runner
+/// started from bash (CI, containers) would make it edit `.bashrc`. `None`
+/// when zsh is not installed.
 #[cfg(unix)]
 fn output_wrap_zsh(
     home: &std::path::Path,
     zdotdir: Option<&std::path::Path>,
     xdg_config_home: &std::ffi::OsStr,
     action: &str,
-) -> std::process::Output {
-    let mut cmd = tirith();
-    cmd.env("HOME", home)
+) -> Option<std::process::Output> {
+    let mut hermetic = tirith();
+    hermetic
+        .env("HOME", home)
         .env("SHELL", "/bin/zsh")
-        .env("XDG_CONFIG_HOME", xdg_config_home)
-        .args(["output", "wrap", action]);
+        .env("XDG_CONFIG_HOME", xdg_config_home);
     match zdotdir {
-        Some(dir) => cmd.env("ZDOTDIR", dir),
-        None => cmd.env_remove("ZDOTDIR"),
+        Some(dir) => hermetic.env("ZDOTDIR", dir),
+        None => hermetic.env_remove("ZDOTDIR"),
     };
-    cmd.output()
-        .unwrap_or_else(|error| panic!("run output wrap {action}: {error}"))
+    let mut cmd = Command::new("zsh");
+    for (key, value) in hermetic.get_envs() {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        };
+    }
+    // The trailing `exit` keeps zsh from exec-ing Tirith in its own place.
+    cmd.args(["-dfc", r#""$0" output wrap "$1"; rc=$?; exit $rc"#])
+        .arg(hermetic.get_program())
+        .arg(action);
+    match cmd.output() {
+        Ok(output) => Some(output),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping output wrap check: zsh is not installed");
+            None
+        }
+        Err(error) => panic!("run output wrap {action}: {error}"),
+    }
 }
 
 #[cfg(unix)]
@@ -116,7 +137,9 @@ fn output_wrap_zsh(
 fn output_wrap_status_and_off_ignore_an_invalid_variable_the_shell_does_not_use() {
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join("config");
-    let ok = output_wrap_zsh(home.path(), None, config.as_os_str(), "on");
+    let Some(ok) = output_wrap_zsh(home.path(), None, config.as_os_str(), "on") else {
+        return;
+    };
     assert!(
         ok.status.success(),
         "{}",
@@ -130,14 +153,14 @@ fn output_wrap_status_and_off_ignore_an_invalid_variable_the_shell_does_not_use(
     // zsh never reads XDG_CONFIG_HOME; a relative value (invalid per the XDG
     // spec) must not stop status/off from finding the wrapper in ~/.zshrc.
     let relative = std::ffi::OsStr::new("rel/cfg");
-    let status = output_wrap_zsh(home.path(), None, relative, "status");
+    let status = output_wrap_zsh(home.path(), None, relative, "status").unwrap();
     assert!(
         status.status.success(),
         "status failed: {}",
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(String::from_utf8_lossy(&status.stdout).contains("enabled:   yes"));
-    let off = output_wrap_zsh(home.path(), None, relative, "off");
+    let off = output_wrap_zsh(home.path(), None, relative, "off").unwrap();
     assert!(
         off.status.success(),
         "off failed: {}",
@@ -174,7 +197,9 @@ fn output_wrap_treats_a_symlinked_old_path_as_the_same_profile() {
     ] {
         let run = |action: &str| output_wrap_zsh(home, Some(zdotdir), config.as_os_str(), action);
         for action in ["on", "status", "on", "status"] {
-            let out = run(action);
+            let Some(out) = run(action) else {
+                return;
+            };
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{action} failed: {stderr}");
@@ -186,7 +211,7 @@ fn output_wrap_treats_a_symlinked_old_path_as_the_same_profile() {
         let content = fs::read_to_string(real).unwrap();
         assert!(content.contains("# BEGIN tirith-output-wrap"));
         assert!(content.contains("export KEEP_ME=1"));
-        let off = run("off");
+        let off = run("off").unwrap();
         assert!(
             off.status.success(),
             "off failed: {}",
@@ -5431,6 +5456,127 @@ fn shell_execution_receipt_operations_accept_cwd_and_fail_closed_when_missing() 
         .expect("run receipt discard in an existing directory");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("receipt"));
+}
+
+/// The receipt binds the working directory the hook checked the command in.
+/// zsh/fish run consume/discard/reconcile from wherever the shell is now and
+/// pass the original directory with `--cwd`, so the operation must use
+/// `--cwd`, not the process's own working directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_operations_use_cwd_over_the_process_directory() {
+    let isolated = tempfile::tempdir().expect("isolated receipt state");
+    let state_dir = isolated.path().join("state");
+    let bound = isolated.path().join("bound");
+    let elsewhere = isolated.path().join("elsewhere");
+    fs::create_dir(&bound).expect("create receipt directory");
+    fs::create_dir(&elsewhere).expect("create other directory");
+    let session_id = "cli-receipt-cwd-differs";
+    let shell_pid = std::process::id().to_string();
+    let isolated_cmd = |cwd: &std::path::Path| {
+        let mut cmd = tirith_isolated(session_id, &state_dir, cwd);
+        cmd.env("HOME", isolated.path());
+        cmd
+    };
+    let register = isolated_cmd(&bound)
+        .args(["__execution-receipt", "register", "--family", "zsh"])
+        .args(["--shell-pid", shell_pid.as_str()])
+        .output()
+        .expect("register zsh receipt capability");
+    assert!(
+        register.status.success(),
+        "registration failed: {}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let bearer = String::from_utf8(register.stdout)
+        .expect("bearer is UTF-8")
+        .trim()
+        .to_string();
+    let command = "printf receipt-cwd-ok";
+    let hook_env = |cmd: &mut Command| {
+        cmd.env("_TIRITH_RECEIPT_INSTANCE", &bearer)
+            .env("_TIRITH_RECEIPT_SHELL_PID", &shell_pid)
+            .env("_TIRITH_RECEIPT_FAMILY", "zsh");
+    };
+    // Mint a receipt the way the zsh hook does, in `bound`.
+    let mint = || {
+        let mut cmd = isolated_cmd(&bound);
+        hook_env(&mut cmd);
+        let out = cmd
+            .env("_TIRITH_HOOK", "1")
+            .args([
+                "check",
+                "--approval-check",
+                "--non-interactive",
+                "--interactive",
+            ])
+            .args([
+                "--shell",
+                "posix",
+                "--execution-receipt",
+                "zsh",
+                "--",
+                command,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("mint shell execution receipt");
+        let stdout = String::from_utf8(out.stdout).expect("receipt frame is UTF-8");
+        stdout
+            .strip_prefix("TIRITH_EXECUTION_RECEIPT=")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .filter(|token| token.len() == 64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no receipt (code {:?}): {stdout:?} {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .to_string()
+    };
+    let consume = |token: &str, process_cwd: &std::path::Path, flag_cwd: &std::path::Path| {
+        use std::io::Write as _;
+        let mut cmd = isolated_cmd(process_cwd);
+        hook_env(&mut cmd);
+        let mut child = cmd
+            .args(["__execution-receipt", "consume", "--cwd"])
+            .arg(flag_cwd)
+            .args(["--channel", "zsh"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn receipt consume");
+        child
+            .stdin
+            .take()
+            .expect("consume stdin")
+            .write_all(format!("{token}\n{command}").as_bytes())
+            .expect("send consume frame");
+        child.wait_with_output().expect("wait for consume")
+    };
+
+    // The shell has moved on to `elsewhere`; `--cwd` names the bound directory.
+    let token = mint();
+    let out = consume(&token, &elsewhere, &bound);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "consume with --cwd of the bound directory must succeed from another directory: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Run from the bound directory, but `--cwd` names another one: the receipt
+    // is checked against the directory `--cwd` entered and refused.
+    let token = mint();
+    let out = consume(&token, &bound, &elsewhere);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("different working directory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Shell hooks take their per-shell session ID from `tirith __session-id`: a

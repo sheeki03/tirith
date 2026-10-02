@@ -73,8 +73,8 @@ impl ServiceRecord {
             || !self.token.bytes().all(|b| b.is_ascii_hexdigit())
             || self.binary_sha256.len() != 64
             || !self.binary_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-            || uuid::Uuid::parse_str(&self.service_id).is_err()
-            || uuid::Uuid::parse_str(&self.startup_id).is_err()
+            || !tirith_core::util::is_uuid(&self.service_id)
+            || !tirith_core::util::is_uuid(&self.startup_id)
             || !std::path::Path::new(&self.cwd).is_absolute()
         {
             return Err("invalid private service discovery record".into());

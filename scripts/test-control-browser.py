@@ -729,7 +729,7 @@ def run(binary, output):
                     agent_response = agent_plan.value
                     agent_request = agent_response.request.post_data_json
                     assert agent_request["kind"] == "recommended_setup"
-                    assert agent_request["change"] == {"scope":"user", "shell":"bash", "profile":"balanced", "agents":["claude-code"]}
+                    assert agent_request["change"] == {"shell":"bash", "profile":"balanced", "claude_code":True}
                     assert str(uuid.UUID(agent_request["operation_id"])) == agent_request["operation_id"]
                     assert agent_response.status == 200, agent_response.text()
                     agent_preview = agent_response.json()["preview"]["agent"]
@@ -756,7 +756,7 @@ def run(binary, output):
                     with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as shell_only_plan:
                         page.get_by_role("button", name="Review personal setup", exact=True).click()
                     assert shell_only_plan.value.status == 200
-                    assert shell_only_plan.value.request.post_data_json["change"]["agents"] == []
+                    assert shell_only_plan.value.request.post_data_json["change"]["claude_code"] is False
                     combined_started = time.monotonic()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                     # The first three-step debug run was still making recorded

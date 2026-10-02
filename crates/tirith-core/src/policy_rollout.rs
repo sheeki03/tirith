@@ -17,26 +17,14 @@ pub const MAX_CLIENTS: usize = 1024;
 pub const MAX_RULES_PER_WORKFLOW: usize = 32;
 pub const EVIDENCE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
-/// Random record identity only. A credential or command digest cannot be used
-/// as a public record identifier through this API.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(transparent)]
-pub struct RecordId(String);
-impl RecordId {
-    pub fn parse(value: &str) -> Result<Self, &'static str> {
-        uuid::Uuid::parse_str(value)
-            .map(|id| Self(id.to_string()))
-            .map_err(|_| "rollout record identifiers must be UUIDs")
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl<'de> Deserialize<'de> for RecordId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(serde::de::Error::custom)
-    }
+/// Random record identity only: the team policy identity type, a canonical
+/// nonzero UUID. A credential or command digest cannot be used as a public
+/// record identifier through this API.
+pub use crate::policy_team::Id as RecordId;
+
+/// A record identity given in any UUID spelling (except nil), kept canonical.
+pub fn record_id(value: &str) -> Result<RecordId, &'static str> {
+    RecordId::normalize(value).map_err(|_| "rollout record identifiers must be UUIDs")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +56,6 @@ pub struct Workflow<'a> {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExceptionOwner {
     LocalOperator { id: RecordId },
-    DeclaredUnverified { id: RecordId },
     Unavailable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,14 +106,6 @@ impl ClientObservation {
             state: ClientState::Unavailable,
         }
     }
-    #[cfg(test)]
-    pub fn unverified_report(id: RecordId, observed_at: DateTime<Utc>) -> Self {
-        Self {
-            id,
-            observed_at: Some(observed_at),
-            state: ClientState::UnverifiedReport,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,7 +113,6 @@ impl ClientObservation {
 pub enum ClientState {
     LocalPolicyEquivalent,
     LocalPolicyDifferent,
-    UnverifiedReport,
     Stale,
     InvalidTimestamp,
     Unavailable,
@@ -210,7 +188,6 @@ pub struct ImpactCounts {
     pub local_equivalent: usize,
     pub local_different: usize,
     pub stale_clients: usize,
-    pub unverified_clients: usize,
     pub unavailable_clients: usize,
 }
 
@@ -235,10 +212,7 @@ pub struct ImpactReport {
     pub clients: Vec<ClientImpact>,
     pub counts: ImpactCounts,
     pub gaps: Vec<ImpactGap>,
-    pub execution_permitted: bool,
-    pub automatically_approved: bool,
     pub remote_publication_available: bool,
-    pub fleet_adoption_verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -271,9 +245,6 @@ pub struct HistoricalEvidenceStatus {
     pub stale_client_timestamps: usize,
     pub future_client_timestamps: usize,
     pub missing_client_timestamps: usize,
-    pub current_grant_state_observed: bool,
-    pub current_client_policy_observed: bool,
-    pub fleet_adoption_verified: bool,
 }
 
 impl ImpactReport {
@@ -307,9 +278,6 @@ impl ImpactReport {
             stale_client_timestamps: 0,
             future_client_timestamps: 0,
             missing_client_timestamps: 0,
-            current_grant_state_observed: false,
-            current_client_policy_observed: false,
-            fleet_adoption_verified: false,
         };
         for client in &self.clients {
             match client.observed_at {
@@ -324,14 +292,13 @@ impl ImpactReport {
         Ok(result)
     }
 
-    /// Validate a private stored attachment before public projection. No flag in
-    /// a deserialized report may turn historical impact into execution authority.
+    /// Validate a private stored attachment before public projection. The
+    /// report carries no authority flags (unknown fields are refused), and every
+    /// derived value (row changes, client freshness, counts) must equal what the
+    /// same derivation `review` uses gives for the stored rows.
     pub fn validate_stored(&self) -> Result<(), String> {
         if self.schema_version != ROLLOUT_SCHEMA_VERSION
-            || self.execution_permitted
-            || self.automatically_approved
             || (self.remote_publication_available && self.scope != RolloutScope::RemoteManaged)
-            || self.fleet_adoption_verified
         {
             return Err("unsupported rollout report version or authority claim".into());
         }
@@ -363,7 +330,6 @@ impl ImpactReport {
         {
             return Err("stored rollout omits unavailable exception inventory".into());
         }
-        let mut counts = ImpactCounts::default();
         let mut ids = BTreeSet::new();
         let mut evidence_ids = BTreeSet::new();
         for workflow in &self.workflows {
@@ -376,17 +342,9 @@ impl ImpactReport {
             {
                 return Err("stored rollout workflow has duplicate IDs or exceeds limits".into());
             }
-            let expected = if workflow.gaps.is_empty() {
-                match rank(workflow.proposed).cmp(&rank(workflow.before)) {
-                    std::cmp::Ordering::Equal => ImpactChange::Unchanged,
-                    std::cmp::Ordering::Greater => ImpactChange::MoreRestrictive,
-                    std::cmp::Ordering::Less => ImpactChange::LessRestrictive,
-                }
-            } else {
-                ImpactChange::Unavailable
-            };
             if workflow.comparison_available != workflow.gaps.is_empty()
-                || workflow.change != expected
+                || workflow.change
+                    != impact_change(workflow.before, workflow.proposed, &workflow.gaps)
                 || (workflow
                     .before_gaps
                     .contains(&EvidenceGap::DetectorPolicyChanged)
@@ -408,12 +366,6 @@ impl ImpactReport {
             {
                 return Err("stored rollout workflow has inconsistent impact evidence".into());
             }
-            match workflow.change {
-                ImpactChange::Unchanged => counts.unchanged += 1,
-                ImpactChange::MoreRestrictive => counts.more_restrictive += 1,
-                ImpactChange::LessRestrictive => counts.less_restrictive += 1,
-                ImpactChange::Unavailable => counts.unavailable += 1,
-            }
         }
         ids.clear();
         for exception in &self.exceptions {
@@ -428,40 +380,21 @@ impl ImpactReport {
                     "stored rollout exception has inconsistent identity or ownership".into(),
                 );
             }
-            if exception.before == GrantState::Expired {
-                counts.expired_exceptions += 1;
-            }
-            if !exception.owner_verified {
-                counts.unowned_exceptions += 1;
-            }
         }
         ids.clear();
         for client in &self.clients {
             if !ids.insert(&client.id) {
                 return Err("stored rollout has duplicate client IDs".into());
             }
-            let age_state = match client.observed_at {
-                Some(at) if at > self.evaluated_at => Some(ClientState::InvalidTimestamp),
-                Some(at) if (self.evaluated_at - at).num_seconds() >= EVIDENCE_MAX_AGE_SECONDS => {
-                    Some(ClientState::Stale)
-                }
+            let expected = match client.observed_at {
                 None => Some(ClientState::Unavailable),
-                _ => None,
+                observed => client_freshness(observed, self.evaluated_at),
             };
-            if age_state.is_some_and(|expected| client.state != expected) {
+            if expected.is_some_and(|expected| client.state != expected) {
                 return Err("stored rollout client has inconsistent observation freshness".into());
             }
-            match client.state {
-                ClientState::LocalPolicyEquivalent => counts.local_equivalent += 1,
-                ClientState::LocalPolicyDifferent => counts.local_different += 1,
-                ClientState::Stale => counts.stale_clients += 1,
-                ClientState::UnverifiedReport => counts.unverified_clients += 1,
-                ClientState::InvalidTimestamp | ClientState::Unavailable => {
-                    counts.unavailable_clients += 1
-                }
-            }
         }
-        if counts != self.counts {
+        if ImpactCounts::derive(&self.workflows, &self.exceptions, &self.clients) != self.counts {
             return Err("stored rollout aggregate counts disagree with evidence".into());
         }
         if serde_json::to_vec(self)
@@ -529,13 +462,13 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
     let mut client_ids = BTreeSet::new();
     for workflow in request.workflows {
         if !workflow_ids.insert(&workflow.id)
-            || !evidence_ids.insert(RecordId::parse(&workflow.evidence.identity)?)
+            || !evidence_ids.insert(record_id(&workflow.evidence.identity)?)
         {
             return Err("duplicate rollout workflow or evidence identity");
         }
     }
     for exception in request.exceptions {
-        if !exception_ids.insert(RecordId::parse(&exception.grant.id)?) {
+        if !exception_ids.insert(record_id(&exception.grant.id)?) {
             return Err("duplicate rollout exception identity");
         }
     }
@@ -544,7 +477,6 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
             return Err("duplicate rollout client identity");
         }
     }
-    let mut counts = ImpactCounts::default();
     let mut gaps = vec![
         ImpactGap::RemotePublicationUnavailable,
         ImpactGap::FleetAdoptionUnavailable,
@@ -582,21 +514,7 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
             row_gaps.push(ImpactGap::ManagedConstraintsUnresolved);
         }
         let available = row_gaps.is_empty();
-        let change = if !available {
-            ImpactChange::Unavailable
-        } else {
-            match rank(proposed.decision).cmp(&rank(before.decision)) {
-                std::cmp::Ordering::Equal => ImpactChange::Unchanged,
-                std::cmp::Ordering::Greater => ImpactChange::MoreRestrictive,
-                std::cmp::Ordering::Less => ImpactChange::LessRestrictive,
-            }
-        };
-        match change {
-            ImpactChange::Unchanged => counts.unchanged += 1,
-            ImpactChange::MoreRestrictive => counts.more_restrictive += 1,
-            ImpactChange::LessRestrictive => counts.less_restrictive += 1,
-            ImpactChange::Unavailable => counts.unavailable += 1,
-        }
+        let change = impact_change(before.decision, proposed.decision, &row_gaps);
         let mut rules = Vec::new();
         for restriction in before.restrictions.iter().chain(&proposed.restrictions) {
             if !rules.contains(&restriction.rule_id) {
@@ -607,7 +525,7 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
         rules.truncate(MAX_RULES_PER_WORKFLOW);
         workflows.push(WorkflowImpact {
             id: workflow.id.clone(),
-            evidence_id: RecordId::parse(&workflow.evidence.identity)?,
+            evidence_id: record_id(&workflow.evidence.identity)?,
             captured_at: workflow.evidence.captured_at,
             owner: workflow.owner.clone(),
             before: before.decision,
@@ -636,14 +554,8 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
             .status(exception.project, Some(request.candidate), request.now)
             .state;
         let owner_verified = matches!(exception.owner, ExceptionOwner::LocalOperator { .. });
-        if !owner_verified {
-            counts.unowned_exceptions += 1;
-        }
-        if before == GrantState::Expired {
-            counts.expired_exceptions += 1;
-        }
         exceptions.push(ExceptionImpact {
-            id: RecordId::parse(&exception.grant.id)?,
+            id: record_id(&exception.grant.id)?,
             owner: exception.owner.clone(),
             scope: if matches!(exception.grant.scope, GrantScope::User) {
                 ExceptionScope::User
@@ -664,38 +576,24 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
                 == CandidateCoverage::EffectivePolicy,
         });
     }
-    if counts.unowned_exceptions > 0 {
+    if exceptions.iter().any(|exception| !exception.owner_verified) {
         gaps.push(ImpactGap::ExceptionOwnersUnavailable);
     }
-    let mut clients = Vec::with_capacity(request.clients.len());
-    for client in request.clients {
-        let state = match client.observed_at {
-            Some(at) if at > request.now => ClientState::InvalidTimestamp,
-            Some(at) if (request.now - at).num_seconds() >= EVIDENCE_MAX_AGE_SECONDS => {
-                ClientState::Stale
-            }
-            _ => client.state,
-        };
-        match state {
-            ClientState::LocalPolicyEquivalent => counts.local_equivalent += 1,
-            ClientState::LocalPolicyDifferent => counts.local_different += 1,
-            ClientState::Stale => counts.stale_clients += 1,
-            ClientState::UnverifiedReport => counts.unverified_clients += 1,
-            ClientState::InvalidTimestamp | ClientState::Unavailable => {
-                counts.unavailable_clients += 1
-            }
-        }
-        clients.push(ClientImpact {
+    let clients: Vec<ClientImpact> = request
+        .clients
+        .iter()
+        .map(|client| ClientImpact {
             id: client.id.clone(),
-            state,
+            state: client_freshness(client.observed_at, request.now).unwrap_or(client.state),
             observed_at: client.observed_at,
-        });
-    }
+        })
+        .collect();
+    let counts = ImpactCounts::derive(&workflows, &exceptions, &clients);
     let report = ImpactReport {
         schema_version: ROLLOUT_SCHEMA_VERSION,
         id: request.id,
         candidate_id: request.candidate_id,
-        baseline_policy_identity: RecordId::parse(&request.baseline.identity)?,
+        baseline_policy_identity: record_id(&request.baseline.identity)?,
         scope: request.scope,
         candidate_coverage: request.candidate_coverage,
         candidate_profile: request
@@ -715,15 +613,76 @@ pub fn review(request: ImpactRequest<'_>) -> Result<ImpactReport, &'static str> 
         clients,
         counts,
         gaps,
-        execution_permitted: false,
-        automatically_approved: false,
         remote_publication_available: false,
-        fleet_adoption_verified: false,
     };
     report
         .validate_stored()
         .map_err(|_| "rollout report exceeded its canonical evidence contract")?;
     Ok(report)
+}
+
+impl ImpactCounts {
+    /// The one derivation of the aggregate counts, used to build a report and to
+    /// check a stored one.
+    fn derive(
+        workflows: &[WorkflowImpact],
+        exceptions: &[ExceptionImpact],
+        clients: &[ClientImpact],
+    ) -> Self {
+        let mut counts = Self::default();
+        for workflow in workflows {
+            match workflow.change {
+                ImpactChange::Unchanged => counts.unchanged += 1,
+                ImpactChange::MoreRestrictive => counts.more_restrictive += 1,
+                ImpactChange::LessRestrictive => counts.less_restrictive += 1,
+                ImpactChange::Unavailable => counts.unavailable += 1,
+            }
+        }
+        for exception in exceptions {
+            if exception.before == GrantState::Expired {
+                counts.expired_exceptions += 1;
+            }
+            if !exception.owner_verified {
+                counts.unowned_exceptions += 1;
+            }
+        }
+        for client in clients {
+            match client.state {
+                ClientState::LocalPolicyEquivalent => counts.local_equivalent += 1,
+                ClientState::LocalPolicyDifferent => counts.local_different += 1,
+                ClientState::Stale => counts.stale_clients += 1,
+                ClientState::InvalidTimestamp | ClientState::Unavailable => {
+                    counts.unavailable_clients += 1
+                }
+            }
+        }
+        counts
+    }
+}
+
+/// A row's change: unavailable whenever the row has a gap, else the direction
+/// of the decision rank.
+fn impact_change(before: DecisionKind, proposed: DecisionKind, gaps: &[ImpactGap]) -> ImpactChange {
+    if !gaps.is_empty() {
+        return ImpactChange::Unavailable;
+    }
+    match rank(proposed).cmp(&rank(before)) {
+        std::cmp::Ordering::Equal => ImpactChange::Unchanged,
+        std::cmp::Ordering::Greater => ImpactChange::MoreRestrictive,
+        std::cmp::Ordering::Less => ImpactChange::LessRestrictive,
+    }
+}
+
+/// The state an observation's age forces at `at`: a future timestamp is
+/// invalid and one at least `EVIDENCE_MAX_AGE_SECONDS` old is stale.
+fn client_freshness(observed_at: Option<DateTime<Utc>>, at: DateTime<Utc>) -> Option<ClientState> {
+    match observed_at {
+        Some(observed) if observed > at => Some(ClientState::InvalidTimestamp),
+        Some(observed) if (at - observed).num_seconds() >= EVIDENCE_MAX_AGE_SECONDS => {
+            Some(ClientState::Stale)
+        }
+        _ => None,
+    }
 }
 
 fn rank(decision: DecisionKind) -> u8 {

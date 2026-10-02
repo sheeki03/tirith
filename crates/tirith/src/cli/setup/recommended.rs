@@ -6,28 +6,18 @@ use serde::{Deserialize, Serialize};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::protection_profiles::ProtectionProfile;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SetupScope {
-    User,
-}
-/// Agent integrations recommended setup can include in the same undoable
-/// plan. Other hosts keep their explicit `tirith setup <tool>` workflow.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum SelectedAgent {
-    ClaudeCode,
-}
+/// A personal (user-scope) setup plan. Claude Code is the one agent
+/// integration recommended setup can include in the same undoable plan; other
+/// hosts keep their explicit `tirith setup <tool>` workflow.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecommendedSetup {
-    pub scope: SetupScope,
     #[serde(default)]
     pub shell: Option<ShellKind>,
     #[serde(default = "balanced")]
     pub profile: ProtectionProfile,
     #[serde(default)]
-    pub agents: Vec<SelectedAgent>,
+    pub claude_code: bool,
 }
 fn balanced() -> ProtectionProfile {
     ProtectionProfile::Balanced
@@ -55,11 +45,6 @@ pub(crate) fn prepare(
         {
             return result(status, None, cwd.as_deref());
         }
-    }
-    if request.agents.len() > 1 {
-        return Err(
-            "duplicate agent selections are ambiguous; select each supported host once".into(),
-        );
     }
     let shell = if let Some(shell) = request.shell {
         shell
@@ -90,7 +75,7 @@ pub(crate) fn prepare(
     if profile.snapshot.private_replay_guard() != shell.snapshot.private_replay_guard() {
         return Err("policy or operator context changed while capturing recommended setup; refresh the plan".into());
     }
-    let agent = if request.agents.is_empty() {
+    let agent = if !request.claude_code {
         None
     } else {
         Some(super::claude_config::PreparedClaude::capture(
@@ -132,7 +117,7 @@ pub(crate) fn prepare(
     }
     let preview = serde_json::json!({"schema_version":1,"kind":"recommended_setup_preview",
         "scope":"user","profile":profile.projection(),"shell":shell.projection(),
-        "selected_agents":request.agents,"agent":agent.as_ref().map(|agent| agent.projection()),"step_count":changes.len(),"applied":false,
+        "selected_agents":if request.claude_code { &["claude-code"][..] } else { &[] },"agent":agent.as_ref().map(|agent| agent.projection()),"step_count":changes.len(),"applied":false,
         "activation_required":true,"current_shell_verified":false,
         "next_action":"Open a fresh terminal and run the current-shell verification handshake after loading the configured integration."});
     if dry_run {
@@ -175,23 +160,25 @@ mod tests {
     #[cfg(unix)]
     fn request() -> RecommendedSetup {
         RecommendedSetup {
-            scope: SetupScope::User,
             shell: Some(ShellKind::Zsh),
             profile: ProtectionProfile::Balanced,
-            agents: Vec::new(),
+            claude_code: false,
         }
     }
     #[test]
     fn arbitrary_scope_paths_commands_and_unknown_agents_are_not_configuration_inputs() {
         for value in [
+            // The plan is personal only; there is no scope to choose.
             serde_json::json!({"scope":"project","shell":"zsh"}),
-            serde_json::json!({"scope":"user","path":"/tmp/unowned"}),
-            serde_json::json!({"scope":"user","command":"echo changed"}),
-            serde_json::json!({"scope":"user","agents":["unknown-agent"]}),
+            serde_json::json!({"scope":"user","shell":"zsh"}),
+            serde_json::json!({"path":"/tmp/unowned"}),
+            serde_json::json!({"command":"echo changed"}),
+            serde_json::json!({"agents":["unknown-agent"]}),
             // Hosts without a combined step keep their explicit workflow.
-            serde_json::json!({"scope":"user","agents":["codex"]}),
-            serde_json::json!({"scope":"user","agents":["cursor"]}),
-            serde_json::json!({"scope":"user","agents":["windsurf"]}),
+            serde_json::json!({"codex":true}),
+            serde_json::json!({"cursor":true}),
+            serde_json::json!({"windsurf":true}),
+            serde_json::json!({"claude_code":"yes"}),
         ] {
             assert!(serde_json::from_value::<RecommendedSetup>(value).is_err());
         }
@@ -243,7 +230,7 @@ mod tests {
             super::super::claude_config::TEST_HOOK_PYTHON
                 .with(|slot| *slot.borrow_mut() = Some(python.clone()));
             let mut request = request();
-            request.agents.push(SelectedAgent::ClaudeCode);
+            request.claude_code = true;
             let id = uuid::Uuid::new_v4().to_string();
             let preview = prepare(&id, request.clone(), None, true).unwrap();
             assert_eq!(preview["agent"]["kind"], "claude_setup_preview");

@@ -9,8 +9,7 @@ use std::path::Path;
 use tirith_core::evaluation::{FrozenEvaluation, SessionEvidence};
 use tirith_core::policy::{BoundedRuntimePolicyInputs, PolicyDiagnosticCapture};
 use tirith_core::policy_rollout::{
-    self, CandidateCoverage, Exception, ExceptionOwner, ImpactReport, RecordId, RolloutScope,
-    Workflow,
+    self, CandidateCoverage, Exception, ExceptionOwner, ImpactReport, RolloutScope, Workflow,
 };
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
 use tirith_core::policy_team::*;
@@ -499,11 +498,11 @@ impl TeamRolloutService {
                 )
             })
             .collect();
-        let owner = RecordId::parse(Id::new().as_str()).map_err(err)?;
+        let owner = Id::new();
         let workflows: Vec<_> = frozen
             .iter()
             .map(|evidence| Workflow {
-                id: RecordId::parse(Id::new().as_str()).unwrap(),
+                id: Id::new(),
                 evidence,
                 owner: Some(owner.clone()),
             })
@@ -526,8 +525,8 @@ impl TeamRolloutService {
             .map_err(|_| "invalid review clock")?;
         let report = policy_rollout::review_for_publisher(
             policy_rollout::ImpactRequest {
-                id: RecordId::parse(Id::new().as_str()).map_err(err)?,
-                candidate_id: RecordId::parse(id.as_str()).map_err(err)?,
+                id: Id::new(),
+                candidate_id: id.clone(),
                 scope: RolloutScope::RemoteManaged,
                 baseline: &baseline,
                 candidate: &proposed.policy,

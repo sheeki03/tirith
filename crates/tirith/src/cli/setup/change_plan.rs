@@ -3007,8 +3007,8 @@ mod tests {
     fn impact_fixture(id: &str, snapshot: &EffectivePolicySnapshot) -> ImpactReport {
         use tirith_core::policy_rollout::{self, CandidateCoverage, ImpactRequest, RecordId};
         policy_rollout::review(ImpactRequest {
-            id: RecordId::parse(&uuid::Uuid::new_v4().to_string()).unwrap(),
-            candidate_id: RecordId::parse(id).unwrap(),
+            id: RecordId::new(),
+            candidate_id: policy_rollout::record_id(id).unwrap(),
             scope: RolloutScope::PersonalUser,
             baseline: snapshot,
             candidate: &snapshot.policy,

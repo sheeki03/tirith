@@ -220,9 +220,7 @@ const EXCHANGE: &str = "/api/session/exchange";
 
 /// A service identity is public routing context, never a bearer credential.
 pub(crate) fn parse_required_service_id(value: &str) -> Result<String, String> {
-    let id = uuid::Uuid::parse_str(value)
-        .map_err(|_| "required service identity must be a canonical non-nil UUID")?;
-    if id.is_nil() || id.to_string() != value {
+    if !tirith_core::util::is_uuid(value) || value == uuid::Uuid::nil().to_string() {
         return Err("required service identity must be a canonical non-nil UUID".into());
     }
     Ok(value.to_string())
@@ -277,7 +275,9 @@ pub(crate) fn open(no_browser: bool, json: bool, required_service_id: Option<&st
 /// credentials are generated here and written through the private boundary.
 pub(crate) fn serve(startup_id: &str) -> i32 {
     let result = (|| -> Result<(), String> {
-        uuid::Uuid::parse_str(startup_id).map_err(|_| "invalid startup identity")?;
+        if !tirith_core::util::is_uuid(startup_id) {
+            return Err("invalid startup identity".into());
+        }
         lifecycle::require_unprivileged()?;
         let paths = lifecycle::Paths::current()?;
         paths.prepare()?;

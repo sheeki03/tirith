@@ -21,11 +21,14 @@ fn connected_publisher_observation_is_scoped_fresh_and_never_execution_or_adopti
     input.scope = RolloutScope::RemoteManaged;
     let report = review_for_publisher(input, &publisher).unwrap();
     assert!(report.remote_publication_available);
-    assert!(
-        !report.execution_permitted
-            && !report.automatically_approved
-            && !report.fleet_adoption_verified
-    );
+    let value = serde_json::to_value(&report).unwrap();
+    for absent in [
+        "execution_permitted",
+        "automatically_approved",
+        "fleet_adoption_verified",
+    ] {
+        assert!(value.get(absent).is_none(), "{absent}");
+    }
     assert!(report.gaps.contains(&ImpactGap::FleetAdoptionUnavailable));
     assert!(!report
         .gaps
@@ -45,7 +48,7 @@ fn connected_publisher_observation_is_scoped_fresh_and_never_execution_or_adopti
 }
 
 fn id() -> RecordId {
-    RecordId::parse(&uuid::Uuid::new_v4().to_string()).unwrap()
+    RecordId::new()
 }
 fn capture(snapshot: &EffectivePolicySnapshot) -> FrozenEvaluation {
     FrozenEvaluation::capture(
@@ -118,10 +121,7 @@ fn history_fixture() -> ImpactReport {
             ImpactGap::NoWorkflows,
             ImpactGap::ExceptionInventoryUnavailable,
         ],
-        execution_permitted: false,
-        automatically_approved: false,
         remote_publication_available: false,
-        fleet_adoption_verified: false,
     }
 }
 
@@ -137,7 +137,7 @@ fn historical_age_projection_preserves_original_states_and_incomplete_inventory(
         },
         ClientImpact {
             id: id(),
-            state: ClientState::UnverifiedReport,
+            state: ClientState::LocalPolicyDifferent,
             observed_at: Some(now),
         },
         ClientImpact {
@@ -152,7 +152,7 @@ fn historical_age_projection_preserves_original_states_and_incomplete_inventory(
         },
     ];
     report.counts.local_equivalent = 1;
-    report.counts.unverified_clients = 1;
+    report.counts.local_different = 1;
     report.counts.unavailable_clients = 2;
     let original = serde_json::to_vec(&report).unwrap();
     let initial = report.historical_evidence_status(now).unwrap();
@@ -163,9 +163,14 @@ fn historical_age_projection_preserves_original_states_and_incomplete_inventory(
     assert_eq!(next.stale_client_timestamps, 1);
     assert_eq!(next.future_client_timestamps, 1);
     assert_eq!(next.missing_client_timestamps, 1);
-    assert!(!next.current_client_policy_observed);
-    assert!(!next.current_grant_state_observed);
-    assert!(!next.fleet_adoption_verified);
+    let projected = serde_json::to_value(&next).unwrap();
+    for absent in [
+        "current_client_policy_observed",
+        "current_grant_state_observed",
+        "fleet_adoption_verified",
+    ] {
+        assert!(projected.get(absent).is_none(), "{absent}");
+    }
     assert_eq!(serde_json::to_vec(&report).unwrap(), original);
     assert!(!report.exception_inventory_complete);
 }
@@ -215,11 +220,11 @@ fn historical_age_projection_handles_exact_expiry_staleness_and_clock_boundaries
 #[test]
 fn historical_age_projection_rejects_invalid_stored_authority_and_counts() {
     let mut report = history_fixture();
-    report.execution_permitted = true;
+    report.remote_publication_available = true;
     assert!(report
         .historical_evidence_status(report.evaluated_at)
         .is_err());
-    report.execution_permitted = false;
+    report.remote_publication_available = false;
     report.counts.local_equivalent = 1;
     assert!(report
         .historical_evidence_status(report.evaluated_at)
@@ -262,10 +267,7 @@ fn frozen_impact_is_repeatable_and_never_approves_or_serializes_content() {
             serde_json::to_value(&first.workflows).unwrap(),
             serde_json::to_value(&again.workflows).unwrap()
         );
-        assert!(!again.execution_permitted);
-        assert!(!again.automatically_approved);
         assert!(!again.remote_publication_available);
-        assert!(!again.fleet_adoption_verified);
     }
     let text = serde_json::to_string(&first).unwrap();
     assert!(!text.contains("PRIVATE_WORKFLOW"));
@@ -334,7 +336,7 @@ fn stale_and_future_workflow_evidence_are_explicitly_unavailable() {
 }
 
 #[test]
-fn exception_expiry_and_unverified_owner_remain_visible_without_leaking_patterns() {
+fn exception_expiry_and_unavailable_owner_remain_visible_without_leaking_patterns() {
     let _state = GlobalStateGuard::new().unwrap();
     let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
     let now = Utc::now();
@@ -350,7 +352,7 @@ fn exception_expiry_and_unverified_owner_remain_visible_without_leaking_patterns
     };
     let exceptions = [Exception {
         grant: &grant,
-        owner: ExceptionOwner::DeclaredUnverified { id: id() },
+        owner: ExceptionOwner::Unavailable,
         project: None,
     }];
     let mut input = request(&snapshot, &snapshot.policy, &[], now);
@@ -365,7 +367,7 @@ fn exception_expiry_and_unverified_owner_remain_visible_without_leaking_patterns
 }
 
 #[test]
-fn local_equivalence_is_distinct_from_stale_partial_or_unverified_fleet_adoption() {
+fn local_equivalence_is_distinct_from_stale_or_unavailable_clients() {
     let _state = GlobalStateGuard::new().unwrap();
     let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
     let local_only = EffectivePolicySnapshot::resolve(None, ResolutionMode::LocalOnly);
@@ -375,8 +377,18 @@ fn local_equivalence_is_distinct_from_stale_partial_or_unverified_fleet_adoption
     let clients = [
         ClientObservation::local_runtime(id(), &snapshot, &snapshot.policy, now),
         ClientObservation::local_runtime(id(), &snapshot, &other, now),
-        ClientObservation::unverified_report(id(), now),
-        ClientObservation::unverified_report(id(), now - chrono::Duration::days(1)),
+        ClientObservation::local_runtime(
+            id(),
+            &snapshot,
+            &snapshot.policy,
+            now - chrono::Duration::days(1),
+        ),
+        ClientObservation::local_runtime(
+            id(),
+            &snapshot,
+            &snapshot.policy,
+            now + chrono::Duration::seconds(1),
+        ),
         ClientObservation::unavailable(id()),
         ClientObservation::local_runtime(id(), &local_only, &local_only.policy, now),
     ];
@@ -385,10 +397,11 @@ fn local_equivalence_is_distinct_from_stale_partial_or_unverified_fleet_adoption
     let report = review(input).unwrap();
     assert_eq!(report.counts.local_equivalent, 1);
     assert_eq!(report.counts.local_different, 1);
-    assert_eq!(report.counts.unverified_clients, 1);
     assert_eq!(report.counts.stale_clients, 1);
-    assert_eq!(report.counts.unavailable_clients, 2);
-    assert!(!report.fleet_adoption_verified);
+    // A future timestamp, no observation and a non-Runtime snapshot.
+    assert_eq!(report.counts.unavailable_clients, 3);
+    assert_eq!(report.clients[3].state, ClientState::InvalidTimestamp);
+    assert!(report.gaps.contains(&ImpactGap::FleetAdoptionUnavailable));
 }
 
 #[test]
@@ -396,7 +409,10 @@ fn identity_and_collection_limits_fail_before_running_evaluations() {
     let _state = GlobalStateGuard::new().unwrap();
     let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
     let frozen = capture(&snapshot);
-    assert!(RecordId::parse("secret-content-hash").is_err());
+    assert!(record_id("secret-content-hash").is_err());
+    assert!(record_id(&uuid::Uuid::nil().to_string()).is_err());
+    let upper = uuid::Uuid::new_v4().to_string().to_uppercase();
+    assert_eq!(record_id(&upper).unwrap().as_str(), upper.to_lowercase());
     let workflows: Vec<_> = (0..MAX_WORKFLOWS + 1)
         .map(|_| Workflow {
             id: id(),
@@ -440,8 +456,18 @@ fn stored_report_rejects_forged_authority_unknown_fields_and_inconsistent_eviden
     let value = serde_json::to_value(&report).unwrap();
     let parsed: ImpactReport = serde_json::from_value(value.clone()).unwrap();
     parsed.validate_stored().unwrap();
+    // Authority claims are not part of the format at all.
+    for claim in [
+        "execution_permitted",
+        "automatically_approved",
+        "fleet_adoption_verified",
+    ] {
+        let mut forged = value.clone();
+        forged[claim] = true.into();
+        assert!(serde_json::from_value::<ImpactReport>(forged).is_err());
+    }
     let mut forged = value.clone();
-    forged["execution_permitted"] = true.into();
+    forged["remote_publication_available"] = true.into();
     assert!(serde_json::from_value::<ImpactReport>(forged)
         .unwrap()
         .validate_stored()

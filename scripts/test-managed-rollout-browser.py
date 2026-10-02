@@ -292,7 +292,8 @@ def run(binary, output):
                         assert prepared["impact"]["scope"] == "local_managed"
                         assert prepared["impact"]["exception_inventory_complete"] is False
                         assert prepared["impact"]["remote_publication_available"] is False
-                        assert prepared["impact"]["fleet_adoption_verified"] is False
+                        assert "fleet_adoption_verified" not in prepared["impact"]
+                        assert "fleet_adoption_unavailable" in prepared["impact"]["gaps"]
                         assert prepared["live"]["organization_target_effective"] is True
                         assert prepared["live"]["personal_target_effective"] is False
                         verify_restore(managed.read_text())

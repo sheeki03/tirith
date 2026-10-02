@@ -18,20 +18,12 @@ use super::fs_transaction::{FileUpdate, TransactionOutcome};
 const CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHUNKS: usize = 32;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AuditChange {
-    Rotate,
-}
-
-pub(crate) fn prepare(
-    id: &str,
-    change: AuditChange,
-    cwd: Option<&str>,
-) -> Result<serde_json::Value, String> {
+/// Plan a rotation of the active audit history (the one audit retention
+/// change) into a private retained segment.
+pub(crate) fn prepare(id: &str, cwd: Option<&str>) -> Result<serde_json::Value, String> {
     uuid::Uuid::parse_str(id).map_err(|_| "operation ID must be a UUID")?;
     let service = MutationService::current()?;
-    let intent = (cwd, change);
+    let intent = (cwd, "rotate");
     if let Some(status) = service.status_for_intent(id, OperationKind::RotateAudit, &intent)? {
         return projection(status, None);
     }
@@ -469,7 +461,7 @@ mod tests {
             let (path, before) = seed();
             let root = path.parent().unwrap();
             let id = uuid::Uuid::new_v4().to_string();
-            let preview = prepare(&id, AuditChange::Rotate, None).unwrap();
+            let preview = prepare(&id, None).unwrap();
             assert_eq!(preview["preview"]["retained_bytes"], before.len());
             assert_eq!(std::fs::read(&path).unwrap(), before);
             assert!(!root.join("audit-segments").exists());
@@ -499,7 +491,7 @@ mod tests {
         with_fake_env(true, |_, _| {
             let (path, _) = seed();
             let id = uuid::Uuid::new_v4().to_string();
-            prepare(&id, AuditChange::Rotate, None).unwrap();
+            prepare(&id, None).unwrap();
             let service = MutationService::current().unwrap();
             let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
             service.apply(&id, &snapshot).unwrap();
@@ -508,7 +500,7 @@ mod tests {
             assert!(service.undo(&id, &snapshot).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), later);
             assert!(tirith_core::audit::verify_audit_log(&path, None).ok);
-            let replay = prepare(&id, AuditChange::Rotate, None).unwrap();
+            let replay = prepare(&id, None).unwrap();
             assert_eq!(replay["operation"]["operation_id"], id);
         });
     }
@@ -519,7 +511,7 @@ mod tests {
             let (path, _) = seed();
             let root = path.parent().unwrap();
             let id = uuid::Uuid::new_v4().to_string();
-            prepare(&id, AuditChange::Rotate, None).unwrap();
+            prepare(&id, None).unwrap();
             tirith_core::audit::log_hook_event("test", "retention", "intervening", None, None);
             let intervening = std::fs::read(&path).unwrap();
             let service = MutationService::current().unwrap();
@@ -529,7 +521,7 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), intervening);
             assert!(!root.join("audit-segments").exists());
             let id = uuid::Uuid::new_v4().to_string();
-            prepare(&id, AuditChange::Rotate, None).unwrap();
+            prepare(&id, None).unwrap();
             let mut denied = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
             denied.policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
             denied

@@ -47,11 +47,7 @@ pub fn rotate(id: Option<String>, apply: bool, json: bool) -> i32 {
     let cwd = std::env::current_dir()
         .ok()
         .map(|path| path.display().to_string());
-    let result = super::setup::audit_service::prepare(
-        &id,
-        super::setup::audit_service::AuditChange::Rotate,
-        cwd.as_deref(),
-    );
+    let result = super::setup::audit_service::prepare(&id, cwd.as_deref());
     match result {
         Ok(value) => {
             if apply {

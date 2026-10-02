@@ -40,7 +40,6 @@ enum PlanRequest {
     },
     AuditRetention {
         operation_id: String,
-        change: super::super::setup::audit_service::AuditChange,
     },
     PolicyRollout {
         operation_id: String,
@@ -612,10 +611,9 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                     operation_id,
                     change,
                 } => super::super::setup::audit_segments::prepare(&operation_id, change, cwd),
-                PlanRequest::AuditRetention {
-                    operation_id,
-                    change,
-                } => super::super::setup::audit_service::prepare(&operation_id, change, cwd),
+                PlanRequest::AuditRetention { operation_id } => {
+                    super::super::setup::audit_service::prepare(&operation_id, cwd)
+                }
                 PlanRequest::PolicyRollout {
                     operation_id,
                     change,
@@ -759,86 +757,15 @@ fn freshness_projection(service: &Service) -> Result<Value, String> {
     ))
     .map_err(|_| "cannot project ThreatDB health")?;
     // The signed blob stays private; the existing health projection is
-    // display-only and does not mutate verification material.
-    for pointer in [
-        "/path",
-        "/error",
-        "/supplemental/path",
-        "/freshness/source_evidence_error",
-    ] {
-        if let Some(content) = value.pointer_mut(pointer) {
-            tirith_core::redact::redact_json_strings(content, &compiled);
-        }
-    }
-    project_update_record(&mut value["last_update"], &compiled);
-    if let Some(sources) = value
-        .pointer_mut("/freshness/sources")
-        .and_then(Value::as_array_mut)
-    {
-        for source in sources {
-            for (field, canonical) in [
-                (
-                    "source",
-                    source["source"].as_str().is_some_and(|s| {
-                        tirith_core::threatdb::operations::SOURCE_IDS.contains(&s)
-                    }),
-                ),
-                (
-                    "revision",
-                    source["revision"]
-                        .as_str()
-                        .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
-                ),
-                (
-                    "pin_selected_at",
-                    source["pin_selected_at"]
-                        .as_str()
-                        .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
-                ),
-            ] {
-                if !canonical {
-                    if let Some(content) = source.get_mut(field) {
-                        tirith_core::redact::redact_json_strings(content, &compiled);
-                    }
-                }
-            }
-        }
-    }
+    // display-only and does not mutate verification material. Only canonical
+    // protocol values (status tokens, source IDs, revisions, update phases)
+    // stay verbatim; paths, errors and recovery text receive full DLP.
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::ThreatDbHealth,
+        &compiled,
+    );
     Ok(value)
-}
-
-fn project_update_record(value: &mut Value, compiled: &CompiledCustomPatterns) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for (key, value) in object {
-        let canonical = match (key.as_str(), value.as_str()) {
-            ("status", Some("partial" | "failed" | "complete")) => true,
-            ("phase", Some("primary" | "supplemental" | "complete")) => true,
-            ("failure_category", Some(category)) => update_category(category),
-            ("incident_key", Some(key)) => key.split_once(':').is_some_and(|(phase, category)| {
-                matches!(phase, "primary" | "supplemental" | "complete")
-                    && update_category(category)
-            }),
-            _ => false,
-        };
-        if !canonical {
-            tirith_core::redact::redact_json_strings(value, compiled);
-        }
-    }
-}
-
-fn update_category(value: &str) -> bool {
-    matches!(
-        value,
-        "integrity"
-            | "rollback"
-            | "rate_limit"
-            | "validation"
-            | "completeness"
-            | "transport"
-            | "operation"
-    )
 }
 
 fn admission<'a>(
@@ -943,18 +870,38 @@ mod tests {
 
     #[test]
     fn update_display_preserves_canonical_state_under_broad_dlp() {
+        use tirith_core::output_contract::{redact_projection, Projection};
         let compiled = CompiledCustomPatterns::new_silent(&[".+".into()]);
-        let mut value = json!({"status":"failed","phase":"primary","failure_category":"integrity","incident_key":"primary:integrity","next_action":"private content","consecutive_failures":2});
-        project_update_record(&mut value, &compiled);
-        assert_eq!(value["status"], "failed");
-        assert_eq!(value["incident_key"], "primary:integrity");
-        assert_eq!(value["consecutive_failures"], 2);
-        assert!(!value["next_action"]
-            .as_str()
-            .unwrap()
-            .contains("private content"));
-        let mut invalid = json!({"status":"private content","incident_key":"private:token"});
-        project_update_record(&mut invalid, &compiled);
+        let mut value = json!({"status":"error","path":"/private/home/threat.db","error":"private error",
+            "supplemental":{"present":true,"path":"/private/supplemental"},"counts":{"total":3},
+            "freshness":{"publication_time_basis":"signed_build_timestamp","source_evidence":"unavailable",
+                "source_evidence_error":"private evidence","sources":[
+                    {"source":"private source","revision":"0123456789abcdef0123456789abcdef01234567",
+                     "pin_selected_at":"2026-10-01T00:00:00Z","accepted":4}]},
+            "last_update":{"status":"failed","phase":"primary","failure_category":"integrity","incident_key":"primary:integrity","next_action":"private content","consecutive_failures":2}});
+        redact_projection(&mut value, Projection::ThreatDbHealth, &compiled);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["counts"]["total"], 3);
+        assert_eq!(
+            value["freshness"]["publication_time_basis"],
+            "signed_build_timestamp"
+        );
+        assert_eq!(value["freshness"]["source_evidence"], "unavailable");
+        let source = &value["freshness"]["sources"][0];
+        assert_eq!(
+            source["revision"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(source["pin_selected_at"], "2026-10-01T00:00:00Z");
+        assert_eq!(source["accepted"], 4);
+        let update = &value["last_update"];
+        assert_eq!(update["status"], "failed");
+        assert_eq!(update["incident_key"], "primary:integrity");
+        assert_eq!(update["consecutive_failures"], 2);
+        assert!(!value.to_string().contains("private"), "{value}");
+        let mut invalid =
+            json!({"last_update":{"status":"private content","incident_key":"private:token"}});
+        redact_projection(&mut invalid, Projection::ThreatDbHealth, &compiled);
         assert!(!invalid.to_string().contains("private"));
     }
 }
