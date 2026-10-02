@@ -579,11 +579,12 @@ fn respond_to(
     }
 }
 
-/// Read one bounded request and answer it. The decision never depends on the
-/// body: a declared body (at most 16 KiB, within the transport's request
-/// deadline) is read and discarded only so the response is not lost to a
-/// connection reset. Every response, including transport errors, carries the
-/// same hardening headers (finding D6-3).
+/// Read one request head and answer it. Authorization is decided from the head
+/// before any body is touched (finding K), and the body is never read before
+/// the response, even when authorized (finding R12-4); afterwards the
+/// transport briefly discards what the client still sends so the response is
+/// not lost to a connection reset. Every response, including transport
+/// errors, carries the same hardening headers (finding D6-3).
 fn handle_connection(
     mut stream: TcpStream,
     token: &str,
@@ -601,6 +602,7 @@ fn handle_connection(
         &REPORT_RESPONSE,
         body.as_bytes(),
     );
+    http::linger(&mut stream);
 }
 
 #[cfg(test)]
@@ -1190,11 +1192,10 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    // Finding K — authorization happens BEFORE the body is read. We can't
-    // observe "didn't read the body" over a real socket (`respond()` itself
-    // drains for framing), so we assert the observable contract: a body-bearing
-    // POST with a foreign Host is rejected 403 — the verdict never depends on
-    // the body.
+    // Finding K — authorization happens BEFORE the body is read. Here a
+    // body-bearing POST with a foreign Host is rejected 403 (the verdict never
+    // depends on the body); `report_decision_never_waits_for_or_depends_on_the_body`
+    // proves the "before" part with bodies that never arrive.
     #[test]
     fn unauthorized_body_bearing_request_is_rejected_by_auth() {
         use std::time::Duration as StdDuration;
@@ -1247,10 +1248,10 @@ mod tests {
     }
 
     // R12-4 — an authorized request is answered WITHOUT a pre-response body
-    // drain (the deleted drain blocked the single-threaded loop). We assert both
-    // shapes the surface sees — a plain GET and a complete-body POST — return
-    // 200 promptly; a deadline-bounded read turns a re-introduced drain into a
-    // timeout failure rather than a hang. Each request uses its own server so
+    // drain. We assert a plain GET, a complete-body POST, and a POST whose
+    // declared body never arrives all return 200 promptly; the last one is what
+    // turns a re-introduced pre-response drain into a failure (it would answer
+    // 408 at the request deadline). Each request uses its own server so
     // `Connection: close` teardowns don't interact.
     //
     // ENV ISOLATION (fixes a parallel-suite flake): the 200 path runs
@@ -1260,9 +1261,6 @@ mod tests {
     // work, pushing the render past the read deadline (intermittent status-0).
     // We hold `ENV_LOCK` and point every base at fresh empty temp dirs (+ empty
     // cwd, no `.git`) so the build is fast, deterministic, and unraceable.
-    //
-    // (A never-completed body is cut off by the shared transport's bounded
-    // request deadline; see `control::http` tests.)
     #[test]
     fn authorized_request_is_served_without_body_drain() {
         use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
@@ -1392,6 +1390,27 @@ mod tests {
             200,
             "an authorized request with a complete body must still be served 200"
         );
+
+        // 3. Authorized request whose declared body never arrives: a pre-response
+        //    drain would hold the status line until the request deadline and
+        //    then answer 408, so only a head-only decision passes this.
+        let partial = "POST /?token={token} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Length: 100\r\n\
+             Connection: close\r\n\r\n\
+             abc"
+        .replace("{token}", token);
+        let started = StdInstant::now();
+        assert_eq!(
+            serve_one(token, &partial),
+            200,
+            "an authorized request must be served without waiting for its body"
+        );
+        assert!(
+            started.elapsed() < StdDuration::from_secs(2),
+            "the 200 must not wait for the body: {:?}",
+            started.elapsed()
+        );
     }
 
     // The shared transport keeps what browsers and simple clients send working:
@@ -1424,6 +1443,93 @@ mod tests {
             .to_ascii_lowercase()
             .contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'"));
         handle.join().expect("server thread");
+    }
+
+    /// Send `raw` and return the status of the first response line with the
+    /// time it took, reading only until that line arrives (never to EOF), so a
+    /// server that waits for the body shows up as a late or missing status.
+    fn status_within(port: u16, raw: &str) -> (u16, std::time::Duration) {
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+        let started = StdInstant::now();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(raw.as_bytes()).expect("write request");
+        stream.flush().expect("flush");
+        stream
+            .set_read_timeout(Some(StdDuration::from_millis(200)))
+            .expect("set read timeout");
+        let mut acc = Vec::new();
+        while started.elapsed() < StdDuration::from_secs(10) {
+            if let Some((line, _)) = String::from_utf8_lossy(&acc).split_once("\r\n") {
+                let status = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|code| code.parse().ok())
+                    .unwrap_or(0);
+                return (status, started.elapsed());
+            }
+            let mut buf = [0u8; 256];
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        (0, started.elapsed())
+    }
+
+    // Findings K and R12-4: the report decides from the request head alone and
+    // never waits for, bounds, or frames a body. A declared body that never
+    // arrives, one larger than the control API's limit, a streamed body, an
+    // `Expect`, or a repeated header all get the Host/token verdict at once,
+    // not a transport error after the request deadline.
+    #[test]
+    fn report_decision_never_waits_for_or_depends_on_the_body() {
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let cases = [
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 100\r\n\r\nabc"
+                    .to_string(),
+                401,
+            ),
+            (
+                format!("POST /?token={token} HTTP/1.1\r\nHost: evil.example.com\r\nContent-Length: 100\r\n\r\nabc"),
+                403,
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 20000\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\nAccept: text/html\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+            let raw = raw.replace("{port}", &port.to_string());
+            let (status, took) = status_within(port, &raw);
+            assert_eq!(status, expected, "{raw:?}");
+            assert!(
+                took < std::time::Duration::from_millis(1500),
+                "the verdict must not wait for the body: {took:?} for {raw:?}"
+            );
+            handle.join().expect("server thread");
+        }
     }
 
     // The accept loop ends at the monotonic TTL (exit 0) without needing a

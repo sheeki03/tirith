@@ -31,9 +31,10 @@ const MAX_SESSIONS: usize = 8;
 pub(crate) enum Rules {
     /// The control API: HTTP/1.1 GET, or POST with a JSON body.
     Control,
-    /// The read-only `dashboard serve` report: any method and HTTP/1.0 or 1.1;
-    /// a declared body (bounded) is read and ignored so the response is never
-    /// cut off by a reset.
+    /// The read-only `dashboard serve` report: any method and HTTP/1.0 or 1.1.
+    /// The decision comes from the head alone: a body is never read, bounded
+    /// or framed, so its headers (length, streaming, `Expect`) are not checked,
+    /// and a repeated header keeps its first value. See [`linger`].
     Report,
 }
 
@@ -91,7 +92,8 @@ fn remaining_within(start: Instant, deadline: Duration) -> Result<Duration, Erro
 
 /// Read one request. `authorize` gates the head before any body is read or
 /// allocated, and decides again once the whole request is in; that final
-/// decision (for example the credential's grant) is returned with it.
+/// decision (for example the credential's grant) is returned with it. Under
+/// [`Rules::Report`] only the head is read and decided on.
 pub(crate) fn read<T>(
     stream: &mut TcpStream,
     rules: Rules,
@@ -198,7 +200,10 @@ fn read_request<T>(
     };
     let (mut request, length) = parse_headers(&buffer[..head_end], rules)?;
     // Reject unauthenticated writes before waiting for or allocating their body.
-    authorize(&request)?;
+    let decision = authorize(&request)?;
+    if rules == Rules::Report {
+        return Ok((request, decision));
+    }
     request.body.resize(length, 0);
     // A single request per connection: anything past the declared body is ignored.
     let early = (filled - head_end).min(length);
@@ -278,13 +283,25 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
         {
             return Err(error(400, "malformed header"));
         }
-        if headers
-            .insert(name.to_ascii_lowercase(), value.trim().to_string())
-            .is_some()
-        {
+        let name = name.to_ascii_lowercase();
+        if headers.contains_key(&name) {
+            if rules == Rules::Report {
+                continue;
+            }
             return Err(error(400, "duplicate headers are not supported"));
         }
+        headers.insert(name, value.trim().to_string());
     }
+    let request = Request {
+        method: method.into(),
+        target: target.into(),
+        headers,
+        body: Vec::new(),
+    };
+    if rules == Rules::Report {
+        return Ok((request, 0));
+    }
+    let headers = &request.headers;
     if headers.contains_key("transfer-encoding")
         || headers.contains_key("expect")
         || headers.contains_key("upgrade")
@@ -301,19 +318,16 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
                 .map_err(|_| error(413, "request body exceeds limit"))?
         }
         Some(_) => return Err(error(400, "invalid content length")),
-        None if method == "POST" && rules == Rules::Control => {
-            return Err(error(411, "content length is required"))
-        }
+        None if method == "POST" => return Err(error(411, "content length is required")),
         None => 0,
     };
     if length > MAX_BODY {
         return Err(error(413, "request body exceeds limit"));
     }
-    if rules == Rules::Control && method == "GET" && length != 0 {
+    if method == "GET" && length != 0 {
         return Err(error(400, "GET cannot carry a body"));
     }
-    if rules == Rules::Control
-        && method == "POST"
+    if method == "POST"
         && !headers.get("content-type").is_some_and(|value| {
             value.eq_ignore_ascii_case("application/json")
                 || value.eq_ignore_ascii_case("application/json; charset=utf-8")
@@ -321,15 +335,39 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
     {
         return Err(error(415, "a JSON request body is required"));
     }
-    Ok((
-        Request {
-            method: method.into(),
-            target: target.into(),
-            headers,
-            body: Vec::new(),
-        },
-        length,
-    ))
+    Ok((request, length))
+}
+
+/// How long a report connection stays open after its response to take what
+/// the client is still sending.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// After a [`Rules::Report`] response: half-close, then discard whatever the
+/// client still sends (its unread body) for a short, bounded while, so closing
+/// with unread bytes does not reset the connection before the client has read
+/// the response. It runs after the response, so it never delays a decision.
+pub(crate) fn linger(stream: &mut TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let started = Instant::now();
+    let mut discarded = 0;
+    let mut scratch = [0; 4096];
+    while discarded < REPORT_HEADERS + MAX_BODY {
+        let Some(wait) = LINGER
+            .checked_sub(started.elapsed())
+            .filter(|wait| !wait.is_zero())
+        else {
+            return;
+        };
+        if stream.set_read_timeout(Some(wait)).is_err() {
+            return;
+        }
+        match stream.read(&mut scratch) {
+            Ok(0) => return,
+            Ok(count) => discarded += count,
+            Err(cause) if cause.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// What a valid credential may do. The CSRF value is bound to the credential.
@@ -942,17 +980,47 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: one\r\n folded\r\n\r\n",
             "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Type: text/plain\r\n\r\n",
         ] {
-            for rules in [Rules::Control, Rules::Report] {
-                let refused = parse_headers(bytes.as_bytes(), rules).is_err();
-                // The report page ignores bodies, so it does not require a
-                // declared length or a JSON type; everything else is refused.
-                let report_body_rule = rules == Rules::Report
-                    && ((bytes.ends_with("Content-Type: application/json\r\n\r\n")
-                        && !bytes.contains("Content-Length"))
-                        || bytes.contains("Content-Type: text/plain"));
-                assert_eq!(refused, !report_body_rule, "{bytes:?}");
-            }
+            assert!(
+                parse_headers(bytes.as_bytes(), Rules::Control).is_err(),
+                "{bytes:?}"
+            );
+            // The report never reads a body, so only a malformed head or
+            // target is refused there; body framing and repeats are not.
+            let malformed_head = bytes.contains("Host : ")
+                || bytes.contains(" folded")
+                || bytes.starts_with("GET http:");
+            assert_eq!(
+                parse_headers(bytes.as_bytes(), Rules::Report).is_err(),
+                malformed_head,
+                "{bytes:?}"
+            );
         }
+    }
+
+    // The report decides from the head: a declared body is never waited for,
+    // and a repeated header keeps its first value.
+    #[test]
+    fn the_report_rules_return_after_the_head() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(b"POST /?token=x HTTP/1.1\r\nHost: first\r\nHost: second\r\nContent-Length: 100\r\n\r\nabc")
+                .unwrap();
+            stream
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let (request, ()) = read(&mut stream, Rules::Report, |_| Ok(())).unwrap();
+        assert!(
+            started.elapsed() < HEADER_DEADLINE,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(request.header("host"), Some("first"));
+        assert!(request.body.is_empty());
+        drop(client.join().unwrap());
     }
 
     #[test]
@@ -962,6 +1030,7 @@ mod tests {
             "GET /?token=x HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
             "POST /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
             "GET /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 999999\r\n\r\n",
         ] {
             assert!(
                 parse_headers(bytes.as_bytes(), Rules::Report).is_ok(),
@@ -975,7 +1044,6 @@ mod tests {
         for bytes in [
             "get / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             "GET / HTTP/2\r\nHost: 127.0.0.1\r\n\r\n",
-            "POST / HTTP/1.1\r\nContent-Length: 999999\r\n\r\n",
         ] {
             assert!(
                 parse_headers(bytes.as_bytes(), Rules::Report).is_err(),
