@@ -4351,7 +4351,7 @@ fn parse_cargo_lock(text: &str) -> Vec<DeclaredDependency> {
 }
 
 /// Score one declared dependency into a [`DependencyAssessment`].
-fn assess_dependency(
+pub(crate) fn assess_dependency(
     dep: &DeclaredDependency,
     manifest: &str,
     request: &ScanRequest,

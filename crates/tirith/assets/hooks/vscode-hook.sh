@@ -8,11 +8,38 @@ set -uo pipefail  # No -e: we handle errors explicitly per command
 TIRITH_BIN="${TIRITH_BIN:-__TIRITH_BIN__}"
 TIRITH_PYTHON=__TIRITH_PYTHON__
 _tirith_hook_event() {
-  if [ $# -ge 2 ]; then
-    "$TIRITH_BIN" hook-event --integration vscode --hook-type pre_tool_use --event "$1" --detail "$2" 2>/dev/null &
-  else
-    "$TIRITH_BIN" hook-event --integration vscode --hook-type pre_tool_use --event "$1" 2>/dev/null &
+  # Optional telemetry owns its child; no background shell job or PID timer.
+  # Missing Python skips telemetry without changing the security decision.
+  [ -x "$TIRITH_PYTHON" ] || return 0
+  "$TIRITH_PYTHON" -I -S - "$TIRITH_BIN" vscode pre_tool_use "$@" >/dev/null 2>/dev/null <<'PY_TELEMETRY'
+import subprocess
+import sys
+child = None
+try:
+    cmd = [sys.argv[1], "hook-event", "--integration", sys.argv[2],
+           "--hook-type", sys.argv[3], "--event", sys.argv[4]]
+    if len(sys.argv) > 5:
+        cmd.extend(["--detail", sys.argv[5]])
+    child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    child.wait(timeout=0.25)
+except Exception:
+    pass
+finally:
+    if child is not None:
+        try:
+            if child.poll() is None:
+                try:
+                    child.kill()
+                finally:
+                    child.wait(timeout=0.25)
+        except Exception:
+            sys.exit(1)
+PY_TELEMETRY
+  if [ "$?" -ne 0 ]; then
+    printf '%s\n' 'tirith: optional hook telemetry unavailable' >&2
   fi
+  return 0
 }
 
 SHELL_TOOL_PATTERN="^(Bash|bash|shell|sh|zsh|terminal|Terminal|terminal_exec|terminalExec)$"

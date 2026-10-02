@@ -5,6 +5,14 @@
 #   TIRITH_VERSION=0.1.3 curl -fsSL ... | sh
 set -eu
 
+# Detect Android before replacing PATH: Termux tools are outside the FHS paths
+# below, and uname reports Linux even though GNU release assets require glibc.
+# This refusal uses only shell builtins and never downloads or requests root.
+if [ -n "${TERMUX_VERSION:-}" ] || [ -e /system/bin/linker ] || [ -e /system/bin/linker64 ]; then
+  printf '%s\n' 'error: Android/Termux release installation is not supported by this installer. Build the Android target from source; see https://github.com/sheeki03/tirith/blob/main/docs/android-termux.md. Do not use sudo or a GNU/Linux release archive.' >&2
+  exit 1
+fi
+
 REPO="sheeki03/tirith"
 INSTALL_DIR="${TIRITH_INSTALL_DIR:-$HOME/.local/bin}"
 # A release installer that later crosses a sudo boundary must never let a
@@ -29,6 +37,50 @@ PAIRED_HELPER_BACKUP=""
 PAIRED_HELPER_HAD_PREVIOUS=0
 PAIRED_HELPER_PREVIOUS_SHA256=""
 PAIRED_HELPER_NEW_SHA256=""
+PAIRED_HELPER_MANAGED=0
+
+package_approval_helper_state_present() {
+  for helper_path in "$PAIRED_HELPER_DEST" \
+      "${PAIRED_HELPER_DEST}.tirith-previous" \
+      "${PAIRED_HELPER_DEST}.tirith-previous.absent"; do
+    if [ -e "$helper_path" ] || [ -L "$helper_path" ]; then
+      return 0
+    fi
+  done
+  helper_parent="${PAIRED_HELPER_DEST%/*}"
+  while :; do
+    if { [ -e "$helper_parent" ] || [ -L "$helper_parent" ]; } &&
+       { [ ! -d "$helper_parent" ] || [ ! -x "$helper_parent" ]; }; then
+      return 0
+    fi
+    [ "$helper_parent" = / ] && break
+    helper_parent="${helper_parent%/*}"
+    [ -n "$helper_parent" ] || helper_parent=/
+  done
+  return 1
+}
+
+select_package_approval_helper() {
+  case "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" in
+    0|1) ;;
+    *) err "TIRITH_INSTALL_APPROVAL_HELPER must be 0 or 1" ;;
+  esac
+  PAIRED_HELPER_MANAGED=0
+  if [ "$TARGET" != "x86_64-unknown-linux-gnu" ]; then
+    if [ "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" = "1" ]; then
+      err "native package approval is supported only on x86_64 Linux"
+    fi
+    return 0
+  fi
+  if [ "${TIRITH_INSTALL_APPROVAL_HELPER:-0}" = "1" ] ||
+     package_approval_helper_state_present; then
+    PAIRED_HELPER_MANAGED=1
+  fi
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ] &&
+     [ "$(id -u)" -ne 0 ] && [ ! -x /usr/bin/sudo ]; then
+    err "updating or installing the root-owned package-approval helper requires administrator privileges; run from a root session or use /usr/bin/sudo"
+  fi
+}
 
 err() {
   printf 'error: %s\n' "$1" >&2
@@ -106,7 +158,7 @@ paired_exit_handler() {
     fi
     # Always attempt the helper restoration even if the main restoration
     # failed. The two results are combined only after both attempts finish.
-    if [ "${TARGET:-}" = "x86_64-unknown-linux-gnu" ]; then
+    if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
       if restore_package_approval_helper; then
         helper_restore_ok=1
       fi
@@ -147,7 +199,23 @@ detect_platform() {
   ARCH="$(uname -m)"
 
   case "$OS" in
-    Linux)  PLATFORM="unknown-linux-gnu" ;;
+    Linux)
+      # uname cannot distinguish a musl host from a glibc host. Select only
+      # an archive whose runtime is established before downloading anything.
+      if linux_libc="$(getconf GNU_LIBC_VERSION 2>/dev/null)" &&
+         case "$linux_libc" in glibc\ [0-9]*) true ;; *) false ;; esac; then
+        if [ "$(getconf LONG_BIT 2>/dev/null || :)" != "64" ]; then
+          err "GNU release archives require a 64-bit userland; kernel architecture alone is insufficient. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation."
+        fi
+        PLATFORM="unknown-linux-gnu"
+      else
+        linux_libc="$(ldd --version 2>&1 || :)"
+        case "$linux_libc" in
+          *"musl libc"*) PLATFORM="unknown-linux-musl" ;;
+          *) err "Cannot determine a supported Linux libc. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation." ;;
+        esac
+      fi
+      ;;
     Darwin) PLATFORM="apple-darwin" ;;
     *)      err "Unsupported OS: $OS" ;;
   esac
@@ -157,6 +225,10 @@ detect_platform() {
     aarch64|arm64)   ARCH="aarch64" ;;
     *)               err "Unsupported architecture: $ARCH" ;;
   esac
+
+  if [ "$PLATFORM" = "unknown-linux-musl" ] && [ "$ARCH" != "aarch64" ]; then
+    err "No release archive is published for ${ARCH} Linux musl. Install through a compatible package channel or build from source with cargo install tirith; no administrator privileges are required for a user installation."
+  fi
 
   TARGET="${ARCH}-${PLATFORM}"
   ARCHIVE="tirith-${TARGET}.tar.gz"
@@ -425,6 +497,7 @@ install_package_approval_helper() {
 
 main() {
   detect_platform
+  select_package_approval_helper
   resolve_version
 
   local tmpdir
@@ -477,7 +550,12 @@ main() {
     [ "$main_backup_sum" = "$PAIRED_MAIN_PREVIOUS_SHA256" ] \
       || err "the Tirith backup did not match the installed binary"
   fi
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "0" ] &&
+     [ "$TARGET" = "x86_64-unknown-linux-gnu" ] &&
+     package_approval_helper_state_present; then
+    err "package-approval helper state changed during installation; retry before replacing either binary"
+  fi
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     if [ -f "$PAIRED_HELPER_DEST" ]; then
       PAIRED_HELPER_HAD_PREVIOUS=1
       helper_previous_sum="$(run_root /usr/bin/sha256sum "$PAIRED_HELPER_DEST")" \
@@ -498,7 +576,7 @@ main() {
   # From this point through both exact readbacks, EXIT and signal paths restore
   # and verify both preimages. Arm before the helper is the first published.
   PAIRED_ROLLBACK_ARMED=1
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     archive_sha256="${CHECKSUM_LINE%% *}"
     if ! install_package_approval_helper "${tmpdir}/${ARCHIVE}" "$archive_sha256"; then
       err "could not install the root-owned package-approval helper"
@@ -517,7 +595,7 @@ main() {
     || err "could not read back the installed Tirith binary"
   [ "$main_installed_sum" = "$PAIRED_MAIN_NEW_SHA256" ] \
     || err "installed Tirith binary failed exact readback verification"
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
     [ -n "$PAIRED_HELPER_NEW_SHA256" ] \
       || err "installed package-approval helper was not read back and verified"
   fi
@@ -529,6 +607,11 @@ main() {
 
   info ""
   info "tirith installed to ${INSTALL_DIR}/tirith"
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ "$PAIRED_HELPER_MANAGED" = "0" ]; then
+    info "Native package approval is unavailable; ordinary command checks and shell protection do not require it."
+    info "Only if you need package approval, rerun with TIRITH_INSTALL_APPROVAL_HELPER=1."
+    info "Helper provisioning needs a root session or trusted /usr/bin/sudo; issuing approvals needs sudo and fresh interactive administrator confirmation."
+  fi
 
   # PATH advice
   case ":${PATH}:" in
@@ -546,10 +629,14 @@ main() {
   info ""
   info "To uninstall:"
   info "  rm ${INSTALL_DIR}/tirith"
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
-    info "  sudo rm /usr/local/libexec/tirith-package-approval-authority"
-    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
-    info "  sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
+  if [ "$PAIRED_HELPER_MANAGED" = "1" ]; then
+    helper_remove_command="rm"
+    if [ "$(id -u)" -ne 0 ]; then
+      helper_remove_command="sudo rm"
+    fi
+    info "  ${helper_remove_command} /usr/local/libexec/tirith-package-approval-authority"
+    info "  ${helper_remove_command} -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous"
+    info "  ${helper_remove_command} -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent"
   fi
 }
 

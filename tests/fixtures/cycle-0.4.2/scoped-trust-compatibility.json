@@ -1,0 +1,32 @@
+{
+  "old_binary_sha256": "873d8834902dbc47f339f79088d0a839f8932f5a8c34dcaedacb60fa6f2d0922",
+  "candidate_sha256": "e811d8cc999dd24294c6f30e22a62a413aee2170a0d48c48c17f441f990cc270",
+  "passed": true,
+  "checks": [
+    {
+      "case": "new_project",
+      "exit_code": 0,
+      "action": "allow"
+    },
+    {
+      "case": "new_sibling",
+      "exit_code": 1,
+      "action": "block"
+    },
+    {
+      "case": "old_project",
+      "exit_code": 1,
+      "action": "block"
+    },
+    {
+      "case": "old_sibling",
+      "exit_code": 1,
+      "action": "block"
+    },
+    {
+      "case": "old_reader_ignores_copied_new_envelope",
+      "exit_code": 1,
+      "action": "block"
+    }
+  ]
+}

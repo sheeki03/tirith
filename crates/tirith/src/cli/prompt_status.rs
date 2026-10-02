@@ -69,6 +69,10 @@ fn current_env_fingerprint() -> String {
     let mut h = Sha256::new();
     for name in [
         "TIRITH_STATUS",
+        "TIRITH_BASH_EFFECTIVE_PROTECTION",
+        "SHELL",
+        "ZDOTDIR",
+        "XDG_CONFIG_HOME",
         "TIRITH_SSH_REMOTE",
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
@@ -81,6 +85,9 @@ fn current_env_fingerprint() -> String {
         }
         h.update([0]);
     }
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    #[cfg(unix)]
+    h.update(unsafe { libc::getppid() }.to_le_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -90,6 +97,7 @@ fn current_env_fingerprint() -> String {
 struct PublicEnvelope<'a> {
     schema_version: u32,
     protection_mode: &'a str,
+    protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     contexts: &'a BTreeMap<String, String>,
     ssh_remote: bool,
     sudo_active: bool,
@@ -123,6 +131,11 @@ pub fn run(short: bool, json: bool) -> i32 {
         let env = PublicEnvelope {
             schema_version: 1,
             protection_mode: &status.protection_mode,
+            protection_evidence: crate::cli::protection_evidence::ProtectionEvidence::configuration(
+                &status.protection_mode,
+                false,
+                false,
+            ),
             contexts: &status.contexts,
             ssh_remote: status.ssh_remote,
             sudo_active: status.sudo_active,
@@ -159,7 +172,7 @@ fn format_short(s: &Status) -> String {
     // the prompt unescaped — sanitize terminal controls/bidi/newlines first.
     let mut out = format!(
         "[tirith:{}]",
-        super::sanitize_for_human_output(&s.protection_mode, false)
+        super::sanitize_for_human_output(prompt_mode_label(&s.protection_mode), false)
     );
     for (k, v) in &s.contexts {
         // A malformed cache entry shouldn't render `[kube:]`.
@@ -181,11 +194,21 @@ fn format_short(s: &Status) -> String {
     out
 }
 
+/// Prompt invocations only receive inherited environment, not an interception
+/// probe for this shell process. Keep that distinction visible in text.
+fn prompt_mode_label(mode: &str) -> &str {
+    match mode {
+        "guarded" => "blocking-unverified",
+        "off" => "unknown",
+        other => other,
+    }
+}
+
 /// Render the semicolon-separated long form.
 fn format_long(s: &Status) -> String {
     let mut parts = vec![format!(
         "tirith: {}",
-        super::sanitize_for_human_output(&s.protection_mode, false)
+        super::sanitize_for_human_output(prompt_mode_label(&s.protection_mode), false)
     )];
     for (k, v) in &s.contexts {
         if v.is_empty() {
@@ -568,26 +591,32 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(line, "[tirith:guarded][aws:prod][kube:payments-prod]");
+        assert_eq!(
+            line,
+            "[tirith:blocking-unverified][aws:prod][kube:payments-prod]"
+        );
     }
 
     #[test]
     fn short_form_includes_ssh_and_sudo_when_active() {
         let line = render_short_for_test("guarded", &[("aws", "prod")], true, true);
-        assert_eq!(line, "[tirith:guarded][aws:prod][ssh:remote][sudo:active]");
+        assert_eq!(
+            line,
+            "[tirith:blocking-unverified][aws:prod][ssh:remote][sudo:active]"
+        );
     }
 
     #[test]
     fn short_form_no_contexts_is_just_tirith_segment() {
         let line = render_short_for_test("off", &[], false, false);
-        assert_eq!(line, "[tirith:off]");
+        assert_eq!(line, "[tirith:unknown]");
     }
 
     #[test]
     fn short_form_skips_empty_context_values() {
         // A corrupt cache must not render `[kube:]`.
         let line = render_short_for_test("guarded", &[("kube", "")], false, false);
-        assert_eq!(line, "[tirith:guarded]");
+        assert_eq!(line, "[tirith:blocking-unverified]");
     }
 
     #[test]
@@ -600,14 +629,14 @@ mod tests {
         );
         assert_eq!(
             line,
-            "tirith: guarded; aws: prod; kube: payments-prod; sudo: session active",
+            "tirith: blocking-unverified; aws: prod; kube: payments-prod; sudo: session active",
         );
     }
 
     #[test]
     fn long_form_no_contexts_only_tirith() {
         let line = render_long_for_test("off", &[], false, false);
-        assert_eq!(line, "tirith: off");
+        assert_eq!(line, "tirith: unknown");
     }
 
     #[test]

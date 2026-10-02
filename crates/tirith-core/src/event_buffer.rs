@@ -170,17 +170,39 @@ fn metadata_is_within_projected_bounds(metadata: &BTreeMap<String, String>) -> b
 
 pub(crate) fn privacy_project_endpoint(value: &str) -> String {
     let projected = privacy_project_bounded_text(value, MAX_TYPED_EVENT_METADATA_VALUE_BYTES);
-    if projected.starts_with("[REDACTED:") {
+    if crate::redact::is_fixed_redaction_marker(&projected) {
         return projected;
+    }
+    if projected.starts_with("[REDACTED:") {
+        // Treat marker-shaped input as untrusted too: its type or suffix can
+        // contain opaque credentials. A fixed marker is safely idempotent.
+        return "[REDACTED:invalid_endpoint]".into();
+    }
+    // A bare endpoint can already be the host selected by its actual URL
+    // client. Do not reinterpret that identity through a synthetic HTTPS URL:
+    // curl's empty-hex DNS family would become a different numeric IPv4 host.
+    // Mandatory privacy projection above still runs first. Full URLs and all
+    // other host/RPC credential grammars retain their existing projection.
+    if let Some(host) = crate::parse::curl_empty_hex_dns_host(&projected) {
+        return host;
     }
     let canonical =
         crate::sensitive_assets::canonicalize_rpc_for_display(&projected).or_else(|| {
+            // A failed schemeful URL is not a bare host. Prefixing it again
+            // could turn its scheme into a fictitious hostname.
+            if projected.contains("://") {
+                return None;
+            }
             let endpoint = format!("https://{projected}");
             crate::sensitive_assets::canonicalize_rpc_for_display(&endpoint)
                 .and_then(|origin| origin.strip_prefix("https://").map(str::to_string))
         });
     crate::util::truncate_bytes(
-        canonical.as_deref().unwrap_or(&projected),
+        // Malformed endpoint text has no validated non-secret origin.
+        // Retaining it could publish opaque credentials after parse failure.
+        canonical
+            .as_deref()
+            .unwrap_or("[REDACTED:invalid_endpoint]"),
         MAX_TYPED_EVENT_METADATA_VALUE_BYTES,
     )
 }
@@ -2245,5 +2267,103 @@ mod tests {
         assert_eq!(basename("a/b/c.txt"), "c.txt");
         assert_eq!(basename("a\\b\\c.txt"), "c.txt");
         assert_eq!(basename("nodir"), "nodir");
+    }
+}
+
+#[cfg(test)]
+mod selected_domain_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn bare_selected_dns_identity_survives_privacy_without_changing_url_semantics() {
+        for host in ["0x7f.0x", "0x.0x", "0x7f.0x."] {
+            assert_eq!(privacy_project_endpoint(host), host);
+            assert_eq!(
+                privacy_project_endpoint(&privacy_project_endpoint(host)),
+                host
+            );
+        }
+        assert_eq!(privacy_project_endpoint("0X7F.0X"), "0x7f.0x");
+        assert_eq!(privacy_project_endpoint("127.0.0.0"), "127.0.0.0");
+        assert_eq!(privacy_project_endpoint("0x7f.1"), "127.0.0.1");
+        // Raw URLs still have no client provenance at this privacy boundary.
+        assert_eq!(
+            privacy_project_endpoint("https://0x7f.0x/path"),
+            "https://127.0.0.0"
+        );
+    }
+
+    #[test]
+    fn selected_domains_survive_typed_event_and_prototype_trait_roundtrips() {
+        for host in ["0x7f.0x", "127.0.0.0"] {
+            let event =
+                TypedEvent::new("2026-01-01T00:00:00Z", EventKind::Network, "network_egress")
+                    .with_meta("host", host)
+                    .with_meta("domain", host);
+            let prototype = EventPrototype {
+                kind: EventKind::Network,
+                rule_id: "network_egress".into(),
+                metadata: event.metadata.clone(),
+            };
+            let wire = serde_json::to_string(&event).unwrap();
+            let restored: TypedEvent = serde_json::from_str(&wire).unwrap();
+            let prototype_wire = serde_json::to_string(&prototype).unwrap();
+            let restored_prototype: EventPrototype = serde_json::from_str(&prototype_wire).unwrap();
+            for key in ["host", "domain"] {
+                assert_eq!(restored.metadata[key], host);
+                assert_eq!(restored_prototype.metadata[key], host);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_endpoint_parsing_never_retains_opaque_endpoint_text() {
+        for value in [
+            "providerToken123456789.0x7f.0x",
+            "https://providerToken123456789.0x7f.0x/private",
+            "https://[malformed-providerToken123456789",
+            "[REDACTED:providerToken123456789]",
+            "[REDACTED:foo]providerToken123456789.0x7f.0x",
+            "[REDACTED:invalid_endpoint]providerToken123456789",
+        ] {
+            assert_eq!(
+                privacy_project_endpoint(value),
+                "[REDACTED:invalid_endpoint]"
+            );
+        }
+        for (value, expected) in [
+            ("rpc.example", "rpc.example"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("[::1]", "[::1]"),
+            (
+                "https://rpc.example:8443/private",
+                "https://rpc.example:8443",
+            ),
+            ("[REDACTED:GitHub PAT]", "[REDACTED:GitHub PAT]"),
+            ("[REDACTED:invalid_endpoint]", "[REDACTED:invalid_endpoint]"),
+        ] {
+            assert_eq!(privacy_project_endpoint(value), expected, "{value}");
+        }
+        let event = TypedEvent::new("2026-01-01T00:00:00Z", EventKind::Network, "network_egress")
+            .with_meta("host", "providerToken123456789.0x7f.0x");
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("providerToken123456789"));
+        let restored: TypedEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(restored.metadata["host"], "[REDACTED:invalid_endpoint]");
+    }
+
+    #[test]
+    fn selected_domain_exception_keeps_rpc_and_credential_projection() {
+        let canary = format!("ghp_canary_{}", "C".repeat(30));
+        let provider_token = "providerToken123456789";
+        for value in [
+            format!("https://operator:{canary}@0x7f.0x/private?token={canary}"),
+            format!("https://mainnet.infura.io/v3/{provider_token}?token={canary}"),
+            format!("{provider_token}.0x7f.0x"),
+        ] {
+            let projected = privacy_project_endpoint(&value);
+            assert!(!projected.contains(&canary), "{projected}");
+            assert!(!projected.contains(provider_token), "{projected}");
+        }
     }
 }

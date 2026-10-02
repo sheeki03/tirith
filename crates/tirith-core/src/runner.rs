@@ -1605,13 +1605,24 @@ fn review_script_bytes_for_session(
         );
     }
     raw_verdict.agent_origin = Some(crate::agent_origin::resolve_cli_origin(interactive));
-    let effective_verdict = crate::escalation::post_process_verdict_for_verification(
-        &raw_verdict,
-        &policy,
-        &content_str,
-        session_id,
-        crate::escalation::CallerContext::Cli,
-    );
+    let effective_verdict = if command_semantics {
+        crate::escalation::post_process_verdict_for_verification_for_shell(
+            &raw_verdict,
+            &policy,
+            &content_str,
+            session_id,
+            crate::escalation::CallerContext::Cli,
+            shell,
+        )
+    } else {
+        crate::escalation::post_process_verdict_for_verification(
+            &raw_verdict,
+            &policy,
+            &content_str,
+            session_id,
+            crate::escalation::CallerContext::Cli,
+        )
+    };
     Ok(ScriptReview {
         legacy: script_analysis::analyze(&content_str, &interpreter),
         interpreter,

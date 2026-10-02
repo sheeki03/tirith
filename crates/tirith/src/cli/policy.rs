@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tirith_core::engine::{self, AnalysisContext};
+use tirith_core::engine::AnalysisContext;
 use tirith_core::extract::ScanContext;
 use tirith_core::policy::Policy;
 use tirith_core::policy_validate::{self, IssueLevel};
@@ -550,6 +550,10 @@ pub fn test(command: Option<&str>, file: Option<&str>, json: bool) -> i32 {
     test_command(command.unwrap(), json)
 }
 
+pub fn apply_profile(name: &str, dry_run: bool, json: bool) -> i32 {
+    super::profile::apply(name, dry_run, json)
+}
+
 fn test_command(command: &str, json: bool) -> i32 {
     let cwd = std::env::current_dir()
         .ok()
@@ -570,26 +574,28 @@ fn test_command(command: &str, json: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
     };
 
-    let mut verdict = engine::analyze(&ctx);
-    let policy = Policy::discover(cwd.as_deref());
-    engine::filter_findings_by_paranoia(&mut verdict, policy.paranoia);
-    // repo-0227: apply the same policy finalization the real gate runs
-    // (action_overrides / severity overrides), or `policy test` reports a
-    // different action than enforcement — a Medium-to-Block override would
-    // read as Warn here.
-    let verdict = tirith_core::escalation::finalize_static_verdict(
-        verdict.findings,
-        &policy,
-        verdict.tier_reached,
-        verdict.timings_ms.clone(),
+    let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+        cwd.as_deref(),
+        tirith_core::policy_snapshot::ResolutionMode::Runtime,
     );
+    let frozen = tirith_core::evaluation::FrozenEvaluation::capture(
+        ctx,
+        &snapshot,
+        tirith_core::escalation::CallerContext::Cli,
+        None,
+        tirith_core::evaluation::SessionEvidence::Unavailable,
+    );
+    let result = frozen.evaluate_current();
+    let verdict = result.verdict;
+    let policy = snapshot.policy;
 
     let trace = build_policy_trace(command, &policy);
 
     if json {
-        print_test_command_json(command, &verdict, &policy, &trace);
+        print_test_command_json(command, &verdict, &policy, &trace, &result.explanation);
     } else {
         print_test_command_human(command, &verdict, &policy, &trace);
+        eprintln!("  preview only; shell: posix; interaction: noninteractive; runtime/session coverage is incomplete");
     }
 
     verdict.action.exit_code()
@@ -645,184 +651,205 @@ fn test_file(file_path: &str, json: bool) -> i32 {
 
 /// Run `tirith policy tune --from-audit`: roll up per-rule audit-log statistics
 /// and print deterministic tuning suggestions. Never edits the policy.
-pub fn tune(from_audit: bool, json: bool) -> i32 {
-    if !from_audit {
-        eprintln!("tirith policy tune: specify a source — currently only --from-audit");
-        eprintln!("  try: tirith policy tune --from-audit");
-        return 1;
-    }
-
-    let log_path = match tirith_core::policy::data_dir() {
-        Some(d) => d.join("log.jsonl"),
-        None => {
-            eprintln!("tirith policy tune: could not determine audit log path");
-            return 1;
-        }
-    };
-
-    if !log_path.exists() {
-        eprintln!(
-            "tirith policy tune: no audit log found at {}",
-            log_path.display()
-        );
-        eprintln!("  tirith records an audit log as you use it; come back once you have history.");
-        return 1;
-    }
-
-    let result = match tirith_core::audit_aggregator::read_log(&log_path) {
-        Ok(r) => r,
-        Err(e) => {
-            // `read_log` only fails on an I/O error (malformed lines are skipped),
-            // so re-probe to distinguish an actionable permissions problem.
-            eprintln!(
-                "tirith policy tune: could not read the audit log at {}",
-                log_path.display()
-            );
-            match std::fs::File::open(&log_path) {
-                Err(probe) if probe.kind() == std::io::ErrorKind::PermissionDenied => {
-                    eprintln!(
-                        "  permission denied — check that you can read the file \
-                         (its directory may also need execute permission)."
-                    );
-                }
-                _ => {
-                    eprintln!("  {e}");
-                    eprintln!(
-                        "  the file may be unreadable or have been removed mid-read; \
-                         retry, or check the path's permissions."
-                    );
-                }
+/// Hypothetical comparison only. No result from this route is an execution
+/// permit or a policy-write authorization.
+pub fn simulate(
+    command: &str,
+    shell: ShellType,
+    interactive: bool,
+    proposed_path: Option<&str>,
+    session_id: Option<&str>,
+    json: bool,
+) -> i32 {
+    use tirith_core::evaluation::{FrozenEvaluation, SessionEvidence};
+    use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
+    let _diagnostics = tirith_core::policy::PolicyDiagnosticCapture::start();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let snapshot = EffectivePolicySnapshot::resolve(cwd.as_deref(), ResolutionMode::Runtime);
+    let proposed = if let Some(path) = proposed_path {
+        let bytes = match tirith_core::util::read_text_no_follow_capped(
+            std::path::Path::new(path),
+            1024 * 1024,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                eprintln!("tirith policy simulate: proposed policy is unreadable, non-regular, or exceeds 1 MiB");
+                return 1;
             }
-            return 1;
-        }
-    };
-    if result.skipped_lines > 0 {
-        eprintln!(
-            "tirith policy tune: warning: {} malformed audit log line(s) skipped",
-            result.skipped_lines
-        );
-    }
-
-    // Every rule tirith can emit — to point out rules that never fired.
-    let known_rules: Vec<&str> = tirith_core::rule_explanations::list_all()
-        .iter()
-        .map(|r| r.id)
-        .collect();
-
-    let report = tirith_core::audit_tune::analyze(&result.records, &known_rules);
-
-    if json {
-        if serde_json::to_writer_pretty(std::io::stdout().lock(), &report).is_err() {
-            eprintln!("tirith policy tune: failed to write JSON output");
-            return 1;
-        }
-        println!();
-    } else {
-        print_tune_human(&report);
-    }
-
-    0
-}
-
-fn print_tune_human(report: &tirith_core::audit_tune::TuneReport) {
-    eprintln!(
-        "tirith policy tune: analyzed {} audit record(s)",
-        report.records_analyzed
-    );
-
-    if report.data_is_thin {
-        eprintln!(
-            "  not enough audit history to suggest anything yet (need at least {}).",
-            tirith_core::audit_tune::MIN_OBSERVATIONS
-        );
-        eprintln!("  keep using tirith and re-run this once more commands have been analyzed.");
-        return;
-    }
-
-    if report.suggestions.is_empty() {
-        eprintln!(
-            "  no policy changes suggested — your current policy looks well matched to your usage."
-        );
-        return;
-    }
-
-    eprintln!(
-        "  {} suggestion(s) — these are SUGGESTIONS only; review each, then edit your policy yourself:",
-        report.suggestions.len()
-    );
-    eprintln!();
-
-    for (i, s) in report.suggestions.iter().enumerate() {
-        let conf = match s.confidence {
-            tirith_core::audit_tune::Confidence::Strong => "strong",
-            tirith_core::audit_tune::Confidence::Moderate => "moderate",
         };
-        eprintln!("  {}. [{}] {}", i + 1, conf, s.observation);
-        eprintln!("     {}", s.recommendation);
-        if let Some(snippet) = &s.policy_snippet {
-            eprintln!("     suggested policy snippet:");
-            for line in snippet.lines() {
-                eprintln!("       {line}");
+        let yaml = match std::str::from_utf8(&bytes) {
+            Ok(yaml) => yaml,
+            Err(_) => {
+                eprintln!("tirith policy simulate: proposed policy must be UTF-8 YAML");
+                return 1;
             }
+        };
+        if policy_validate::validate(yaml)
+            .iter()
+            .any(|issue| issue.level == IssueLevel::Error)
+        {
+            eprintln!("tirith policy simulate: proposed policy is invalid; run policy validate for details");
+            return 1;
         }
-        eprintln!();
+        Policy::load_from_yaml(yaml, Some(path))
+    } else {
+        snapshot.policy.clone()
+    };
+    let (session, session_availability) = match session_id {
+        Some(id) => {
+            let read = tirith_core::session_warnings::read_snapshot(id);
+            (
+                read.session
+                    .map(|s| SessionEvidence::Captured(Box::new(s)))
+                    .unwrap_or(SessionEvidence::Unavailable),
+                read.availability,
+            )
+        }
+        None => (
+            SessionEvidence::Unavailable,
+            tirith_core::session_warnings::SnapshotAvailability::Unavailable,
+        ),
+    };
+    let frozen = FrozenEvaluation::capture(
+        AnalysisContext {
+            input: command.into(),
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive,
+            cwd: cwd.clone(),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        },
+        &snapshot,
+        tirith_core::escalation::CallerContext::Cli,
+        None,
+        session,
+    );
+    let before = frozen.evaluate_current();
+    let after = frozen.evaluate(&proposed);
+    let mut patterns = snapshot.policy.dlp_custom_patterns.clone();
+    patterns.extend(proposed.dlp_custom_patterns.iter().cloned());
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new(&patterns);
+    for diagnostic in tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled) {
+        eprintln!("{diagnostic}");
     }
-
-    eprintln!("  tirith did not change your policy. Apply any suggestion by editing your .tirith/policy.yaml.");
+    let before_display = super::prepare_verdict_presentation(&before.verdict, &compiled);
+    let after_display = super::prepare_verdict_presentation(&after.verdict, &compiled);
+    let stale = snapshot.revalidate_inputs().is_err();
+    if json {
+        let output = serde_json::json!({
+            "schema_version": 1, "preview_only": true, "execution_permitted": false,
+            "snapshot_identity": frozen.identity, "policy_identity": snapshot.identity,
+            "captured_at": frozen.captured_at, "policy_changed_during_capture": stale,
+            "context": { "shell": shell, "interactive": interactive, "caller": "cli", "origin": "unspecified",
+                "cwd": cwd.map(|v| tirith_core::redact::redact_with_compiled(&v, &compiled)), "session_evidence": session_availability },
+            "command": tirith_core::redact::redact_command_text_with_compiled(command, &compiled),
+            "proposed_policy_is_hypothetical": true,
+            "before": { "verdict": before_display.verdict, "explanation": before.explanation },
+            "after": { "verdict": after_display.verdict, "explanation": after.explanation },
+        });
+        if !super::write_json_stdout(
+            &output,
+            "tirith policy simulate: failed to write JSON output",
+        ) {
+            return 1;
+        }
+    } else {
+        eprintln!(
+            "tirith policy simulate: {:?} → {:?}",
+            before.explanation.decision, after.explanation.decision
+        );
+        eprintln!(
+            "  shell: {shell:?}; interactive: {interactive}; session: {session_availability:?}"
+        );
+        eprintln!("  preview only; proposed policy is hypothetical and does not authorize execution or changes");
+        for restriction in &after.explanation.restrictions {
+            eprintln!(
+                "  {}: {:?}{}",
+                restriction.rule_id,
+                restriction.severity,
+                if restriction.individually_blocks {
+                    " (remaining blocker)"
+                } else {
+                    ""
+                }
+            );
+        }
+        for gap in &after.explanation.gaps {
+            eprintln!("  evidence gap: {gap:?}");
+        }
+        if stale {
+            eprintln!("  policy changed during capture; refresh this preview");
+        }
+    }
+    if stale {
+        1
+    } else {
+        after.verdict.action.exit_code()
+    }
 }
 
-/// The fully-resolved local policy plus its provenance, as gathered for
-/// `tirith policy effective`. Factored out of [`effective`] so the gathering is
-/// unit-testable without capturing stdout (the rendering is a thin function of
-/// these fields).
+pub fn tune(from_audit: bool, json: bool) -> i32 {
+    super::tuning::run(from_audit, json)
+}
+
+/// Diagnostic data captured from one resolver invocation. Source and scope come
+/// from the resulting policy, never from a second filesystem discovery.
 struct EffectivePolicy {
-    /// Source file the policy was loaded from, or `None` for built-in defaults.
     source_path: Option<String>,
-    /// Discovery scope (which branch matched) — drives the trust framing below.
     scope: tirith_core::policy::PolicyScope,
-    /// The resolved policy itself (repo-scope sanitization already applied).
     policy: Policy,
+    resolution_mode: tirith_core::policy_snapshot::ResolutionMode,
+    snapshot: tirith_core::policy_snapshot::EffectivePolicySnapshot,
 }
 
-/// Map a [`PolicyScope`] to its lowercase label for output. The single mapping
-/// point shared by both the JSON `scope` field and the human framing.
-///
-/// [`PolicyScope`]: tirith_core::policy::PolicyScope
 fn scope_label(scope: tirith_core::policy::PolicyScope) -> &'static str {
     scope.as_str()
 }
 
-/// Gather the effective local policy for `cwd`: its source path + scope (via
-/// [`discover_local_policy_path_scoped`]) and the fully-resolved policy (via
-/// [`Policy::discover_local_only`], which runs LOCAL resolution + repo-scope
-/// sanitize and NEVER fetches remotely). Discovery-only; no network.
-///
-/// [`discover_local_policy_path_scoped`]: tirith_core::policy::discover_local_policy_path_scoped
-fn gather_effective(cwd: Option<&str>) -> EffectivePolicy {
-    let (source_path, scope) = match tirith_core::policy::discover_local_policy_path_scoped(cwd) {
-        Some((path, scope)) => (Some(path.display().to_string()), scope),
-        None => (None, tirith_core::policy::PolicyScope::Default),
-    };
-    let policy = Policy::discover_local_only(cwd);
+fn gather_effective(cwd: Option<&str>, runtime: bool) -> EffectivePolicy {
+    use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
+    let snapshot = EffectivePolicySnapshot::resolve(
+        cwd,
+        if runtime {
+            ResolutionMode::Runtime
+        } else {
+            ResolutionMode::LocalOnly
+        },
+    );
     EffectivePolicy {
-        source_path,
-        scope,
-        policy,
+        source_path: snapshot.policy.path.clone(),
+        scope: snapshot.policy.scope,
+        policy: snapshot.policy.clone(),
+        resolution_mode: snapshot.resolution_mode,
+        snapshot,
     }
 }
 
-/// `tirith policy effective` — a transparency surface that prints the FULLY-
-/// RESOLVED effective policy for the current directory, where it came from, and
-/// (for a repo-scoped policy) which weakening fields were neutralized down to
-/// tightening-only. Discovery-only: no path argument, no network fetch (uses
-/// [`Policy::discover_local_only`], not [`Policy::discover`]).
-pub fn effective(json: bool) -> i32 {
+/// Keep the historic network-free default, but label its limited coverage.
+/// `--runtime` uses exactly the engine's resolver, including remote resolution
+/// and read-only overlays; neither mode analyzes or executes a command.
+pub fn effective(json: bool, runtime: bool) -> i32 {
+    let _diagnostics = tirith_core::policy::PolicyDiagnosticCapture::start();
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-
-    let info = gather_effective(cwd.as_deref());
-
+    let info = gather_effective(cwd.as_deref(), runtime);
+    // Diagnostics are projected with the resolved policy's custom patterns.
+    // stdout remains one machine-readable document, even on remote failure.
+    let patterns =
+        tirith_core::policy::captured_policy_dlp_patterns_or(&info.policy.dlp_custom_patterns);
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new(&patterns);
+    for message in tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled) {
+        eprintln!("{message}");
+    }
     if json {
         print_effective_json(&info)
     } else {
@@ -830,78 +857,603 @@ pub fn effective(json: bool) -> i32 {
     }
 }
 
-fn print_effective_json(info: &EffectivePolicy) -> i32 {
-    #[derive(serde::Serialize)]
-    struct Output<'a> {
-        source_path: Option<&'a str>,
-        scope: &'a str,
-        neutralized_fields: &'a [&'static str],
-        policy: &'a Policy,
+/// The legacy `policy` field is a display projection, not a document to apply.
+/// Credentials have field-owned redaction even when their contents do not look
+/// like a known secret. Protocol metadata is built separately below.
+pub(crate) fn effective_policy_display(
+    policy: &Policy,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut display_policy = policy.clone();
+    if display_policy.policy_server_api_key.is_some() {
+        display_policy.policy_server_api_key = Some("[REDACTED]".into());
+    }
+    for webhook in &mut display_policy.webhooks {
+        for value in webhook.headers.values_mut() {
+            *value = "[REDACTED]".into();
+        }
+    }
+    let mut value = serde_json::to_value(&display_policy)?;
+    project_policy_cli_json(&mut value);
+    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    // These objects are user-named maps, unlike static serde field names.
+    // Project their keys too; otherwise aliases and header names bypass DLP.
+    for pointer in [
+        "/severity_overrides",
+        "/action_overrides",
+        "/context_destructive_verbs",
+        "/context_labels",
+        "/ssh_host_labels",
+        "/scan/mcp_allowed_tools",
+        "/scan/profiles",
+    ] {
+        if let Some(map) = value.pointer_mut(pointer) {
+            redact_policy_map_keys(map, compiled);
+        }
+    }
+    if let Some(webhooks) = value
+        .get_mut("webhooks")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for webhook in webhooks {
+            if let Some(headers) = webhook.get_mut("headers") {
+                redact_policy_map_keys(headers, compiled);
+            }
+        }
+    }
+    if let Some(aliases) = value.pointer_mut("/web3_guard/selector_aliases") {
+        if let Some(tools) = aliases.as_object_mut() {
+            for entries in tools.values_mut() {
+                redact_policy_map_keys(entries, compiled);
+            }
+        }
+        redact_policy_map_keys(aliases, compiled);
+    }
+    Ok(value)
+}
+
+fn redact_policy_map_keys(
+    value: &mut serde_json::Value,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let mut entries: Vec<_> = std::mem::take(map).into_iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut next_suffix = std::collections::BTreeMap::<String, usize>::new();
+    for (key, value) in entries {
+        let projected = tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(&key),
+            compiled,
+        );
+        let mut unique = projected.clone();
+        let suffix = next_suffix.entry(projected.clone()).or_insert(2);
+        while map.contains_key(&unique) {
+            unique = format!("{projected} [display entry {suffix}]");
+            *suffix += 1;
+        }
+        // Keep every display entry when multiple private keys redact alike.
+        // The ordinal is not an identifier and confers no configuration scope.
+        map.insert(unique, value);
+    }
+}
+
+fn effective_json(info: &EffectivePolicy) -> Result<serde_json::Value, serde_json::Error> {
+    let patterns =
+        tirith_core::policy::captured_policy_dlp_patterns_or(&info.policy.dlp_custom_patterns);
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new(&patterns);
+    effective_snapshot_display(&info.snapshot, &compiled)
+}
+
+/// Redacted display from an already captured resolution. Callers supply the
+/// monotonic DLP union captured alongside it; this never resolves policy again.
+/// Protocol identities and statuses are preserved independently of content.
+pub(crate) fn effective_snapshot_display(
+    snapshot: &tirith_core::policy_snapshot::EffectivePolicySnapshot,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) -> Result<serde_json::Value, serde_json::Error> {
+    use tirith_core::policy_snapshot::ResolutionMode;
+    let policy = effective_policy_display(&snapshot.policy, compiled)?;
+    let project = |value: &str| {
+        tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(value),
+            compiled,
+        )
+    };
+    let source = snapshot.policy.path.as_deref().map(project);
+    let mut fields = serde_json::to_value(&snapshot.field_provenance)?;
+    if let Some(fields) = fields.as_object_mut() {
+        for field in fields.values_mut() {
+            project_snapshot_source(&mut field["effective_source"], compiled);
+            if let Some(contributions) = field["contributions"].as_array_mut() {
+                for contribution in contributions {
+                    project_snapshot_source(&mut contribution["source"], compiled);
+                }
+            }
+        }
+    }
+    redact_policy_map_keys(&mut fields, compiled);
+    let mut inputs = serde_json::to_value(&snapshot.input_revisions)?;
+    if let Some(inputs) = inputs.as_array_mut() {
+        for input in inputs {
+            project_snapshot_source(&mut input["source"], compiled);
+        }
+    }
+    let mut neutralized = serde_json::to_value(&snapshot.neutralized_settings)?;
+    if let Some(settings) = neutralized.as_array_mut() {
+        for setting in settings {
+            project_snapshot_source(&mut setting["source"], compiled);
+        }
+    }
+    let mut targets = serde_json::to_value(&snapshot.operator_targets)?;
+    if let Some(targets) = targets.as_array_mut() {
+        for target in targets {
+            if let Some(path) = target["path"].as_str() {
+                target["path"] = project(path).into();
+            }
+        }
+    }
+    let mut remote = serde_json::to_value(&snapshot.remote)?;
+    for key in ["server_date", "etag", "last_modified"] {
+        if let Some(value) = remote[key].as_str() {
+            remote[key] = project(value).into();
+        }
+    }
+    let mut display = serde_json::json!({
+        "schema_version": 1,
+        "source_path": source,
+        "scope": scope_label(snapshot.policy.scope),
+        "neutralized_fields": snapshot.policy.neutralized_fields,
+        "policy": policy,
+        "resolution": {
+            "mode": snapshot.resolution_mode,
+            "remote_configuration_resolved": snapshot.resolution_mode == ResolutionMode::Runtime,
+            "separate_overlay_loading_enabled": snapshot.resolution_mode == ResolutionMode::Runtime,
+            "policy_posture_sha256": snapshot.policy_posture_sha256,
+            "snapshot_schema_version": snapshot.schema_version,
+            "snapshot_identity": snapshot.identity,
+            "primary_input_revision": snapshot.primary_input_revision,
+            "input_revisions": inputs,
+            "field_provenance": fields,
+            "neutralized_settings": neutralized,
+            "operator_targets": targets,
+            "trust_generation": snapshot.trust_generation,
+            "next_trust_expiry": snapshot.next_trust_expiry,
+            "requested_profile": snapshot.requested_profile,
+            "effective_profile": snapshot.policy.protection_profile,
+            "custom_profile_overrides": snapshot.custom_profile_overrides,
+            "remote": remote,
+            "effective_fail_mode": snapshot.policy.fail_mode,
+            "effective_allow_bypass_env": snapshot.policy.allow_bypass_env,
+            "effective_allow_bypass_env_noninteractive": snapshot.policy.allow_bypass_env_noninteractive,
+            "policy_is_redacted_display": true
+        }
+    });
+    if snapshot.resolution_mode == ResolutionMode::Runtime {
+        display["personal_controls"] = PersonalControlDisplay::new(snapshot, compiled).all();
+    }
+    Ok(display)
+}
+
+/// Field-specific display evidence from one captured resolver result. This is
+/// neither a writable-field allowlist nor authority to apply a change. In
+/// particular, a repository or incident contribution does not disable the
+/// operator's personal preference; the mutation service revalidates authority.
+pub(crate) struct PersonalControlDisplay<'a> {
+    snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
+    compiled: &'a tirith_core::redact::CompiledCustomPatterns,
+    policy: serde_json::Value,
+    authority: serde_json::Value,
+}
+
+const PERSONAL_CONTROL_FIELDS: &[&str] = &[
+    "strict_warn",
+    "allow_bypass_env",
+    "allow_bypass_env_noninteractive",
+    "scan.require_complete",
+    "env_guard_enabled",
+    "context_guard_enabled",
+    "exec_guard_enabled",
+    "hooks_guard_enabled",
+    "baseline_enabled",
+    "mcp_redact_injection",
+    "fail_mode",
+    "paranoia",
+];
+
+impl<'a> PersonalControlDisplay<'a> {
+    pub(crate) fn new(
+        snapshot: &'a tirith_core::policy_snapshot::EffectivePolicySnapshot,
+        compiled: &'a tirith_core::redact::CompiledCustomPatterns,
+    ) -> Self {
+        let mut display = Self {
+            snapshot,
+            compiled,
+            // Serialize once for all fields. Only selected typed values or
+            // freshly redacted display content can leave this private value.
+            policy: serde_json::to_value(&snapshot.policy).unwrap_or_default(),
+            authority: serde_json::Value::Null,
+        };
+        display.authority = display.project_authority();
+        display
     }
 
-    let output = Output {
-        source_path: info.source_path.as_deref(),
-        scope: scope_label(info.scope),
-        neutralized_fields: &info.policy.neutralized_fields,
-        policy: &info.policy,
-    };
+    fn text(&self, value: &str, limit: usize) -> String {
+        let redacted = tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(value),
+            self.compiled,
+        );
+        let flattened = super::sanitize_for_human_output(&redacted, false);
+        // Removing row breaks can reconstitute a protected value. Reapply the
+        // frozen DLP plan to the exact flattened text before bounding it.
+        let safe =
+            tirith_core::redact::redact_sanitize_redact_with_compiled(&flattened, self.compiled);
+        if safe.chars().count() <= limit {
+            return safe;
+        }
+        let mut bounded = safe.chars().take(limit).collect::<String>();
+        bounded.push('…');
+        bounded
+    }
 
-    if super::write_json_stdout(
-        &output,
-        "tirith policy effective: failed to write JSON output",
-    ) {
-        0
-    } else {
-        1
+    fn source(&self, source: &tirith_core::policy_snapshot::PolicySource) -> serde_json::Value {
+        serde_json::json!({"kind":source.kind,
+            "path":source.path.as_deref().map(|path|self.text(path, 160))})
+    }
+
+    fn project_authority(&self) -> serde_json::Value {
+        use tirith_core::policy::PolicyScope;
+        use tirith_core::policy_snapshot::ResolutionMode;
+        let target = self
+            .snapshot
+            .operator_targets
+            .iter()
+            .find(|target| target.scope == "user");
+        let (state, source, reason) = if self.snapshot.resolution_mode != ResolutionMode::Runtime {
+            (
+                "unknown",
+                serde_json::Value::Null,
+                "This diagnostic does not establish the current runtime authority.",
+            )
+        } else if self.snapshot.policy.path.as_deref() == Some("fail-closed") {
+            ("unknown", serde_json::Value::Null,
+                "The configured effective policy could not be validated; inspect its failure evidence.")
+        } else if let Some(target) = target {
+            if target.effective {
+                ("effective", serde_json::Value::Null, target.reason.as_str())
+            } else if self.snapshot.policy.scope == PolicyScope::Remote {
+                // Actual remote replacement, not merely a configured server
+                // or a failed fetch that fell back to the personal baseline.
+                let source = self.snapshot.field_provenance.values().find_map(|field| {
+                    std::iter::once(&field.effective_source)
+                        .chain(field.contributions.iter().rev().map(|part| &part.source))
+                        .find(|source| matches!(source.kind.as_str(), "remote" | "remote_cache"))
+                });
+                (
+                    "overridden",
+                    source
+                        .map(|source| self.source(source))
+                        .unwrap_or_else(|| serde_json::json!({"kind":"remote","path":null})),
+                    target.reason.as_str(),
+                )
+            } else if let Some(org) = self
+                .snapshot
+                .operator_targets
+                .iter()
+                .find(|target| target.scope == "org" && target.effective)
+            {
+                // An omitted organization field can have a default source;
+                // the selected organization authority still replaces personal
+                // preferences for that field.
+                (
+                    "overridden",
+                    serde_json::json!({"kind":"org","path":self.text(&org.path,160)}),
+                    target.reason.as_str(),
+                )
+            } else {
+                ("unknown", serde_json::Value::Null,
+                    "The personal destination is ineffective, but its governing authority is unavailable.")
+            }
+        } else {
+            (
+                "unknown",
+                serde_json::Value::Null,
+                "The resolver did not establish a personal policy destination.",
+            )
+        };
+        serde_json::json!({"state":state,"governing_source":source,"reason":self.text(reason,160)})
+    }
+
+    pub(crate) fn field(&self, field: &str) -> serde_json::Value {
+        let rule_field = ["severity_overrides.", "action_overrides."]
+            .iter()
+            .find_map(|prefix| {
+                field.strip_prefix(*prefix).and_then(|id| {
+                    serde_json::from_value::<tirith_core::verdict::RuleId>(serde_json::json!(id))
+                        .ok()
+                        .map(|rule| (*prefix, rule))
+                })
+            });
+        let canonical = PERSONAL_CONTROL_FIELDS.contains(&field)
+            || rule_field.is_some()
+            || field == "approval_rules";
+        let mut effective = field
+            .split('.')
+            .try_fold(&self.policy, |value, key| value.get(key))
+            .cloned()
+            .unwrap_or_default();
+        if !PERSONAL_CONTROL_FIELDS.contains(&field) && rule_field.is_none() {
+            // Profile-owned compound values can include sensitive rule text.
+            project_policy_cli_json(&mut effective);
+            tirith_core::redact::redact_json_strings(&mut effective, self.compiled);
+        }
+        let effective_value_omitted =
+            serde_json::to_vec(&effective).map_or(true, |bytes| bytes.len() > 16 * 1024);
+        if effective_value_omitted {
+            effective = serde_json::Value::Null;
+        }
+        let provenance = self.snapshot.field_provenance.get(field);
+        let effective_source = provenance.map(|value|self.source(&value.effective_source))
+            .unwrap_or_else(||serde_json::json!({"kind":if rule_field.is_some() && effective.is_null() {"not_set"} else {"unknown"},"path":null}));
+        let mut contributions: Vec<_> = provenance.into_iter()
+            .flat_map(|value|value.contributions.iter())
+            .map(|value|serde_json::json!({"source":self.source(&value.source),
+                "reason":self.text(&value.reason,160),"changed_effective_value":value.changed_effective_value}))
+            .collect();
+        let mut neutralized: Vec<_> = self
+            .snapshot
+            .neutralized_settings
+            .iter()
+            .filter(|value| {
+                value.field == field
+                    || field
+                        .strip_prefix(value.field.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+            .map(|value| {
+                serde_json::json!({"field":self.text(&value.field,128),
+                "source":self.source(&value.source),"reason":self.text(&value.reason,160)})
+            })
+            .collect();
+        let mut contributions_omitted = contributions.len().saturating_sub(4);
+        if contributions_omitted > 0 {
+            contributions.drain(..contributions_omitted);
+        }
+        let mut neutralized_omitted = neutralized.len().saturating_sub(2);
+        neutralized.truncate(2);
+        let mut value = serde_json::json!({"field":if canonical {field.to_owned()} else {self.text(field,128)},
+            "effective_value":effective,"effective_source":effective_source,
+            "personal_authority":self.authority,"contributions":contributions,
+            "neutralized_settings":neutralized,"contributions_omitted":contributions_omitted,
+            "neutralized_settings_omitted":neutralized_omitted,
+            "effective_after":{"availability":"unavailable","reason":"requires_apply_and_fresh_readback"}});
+        if effective_value_omitted {
+            value["effective_value_omitted"] = true.into();
+        }
+        // Keep the all-rule control inventory bounded independently of policy
+        // size. Omitted history remains explicitly counted; newest evidence is
+        // retained first. Compound profile values have a separate 16 KiB bound
+        // so the full approval list cannot be duplicated in every policy read.
+        if PERSONAL_CONTROL_FIELDS.contains(&field) || rule_field.is_some() {
+            while serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() > 1024) {
+                if let Some(items) = value["contributions"]
+                    .as_array_mut()
+                    .filter(|items| !items.is_empty())
+                {
+                    items.remove(0);
+                    contributions_omitted += 1;
+                    value["contributions_omitted"] = contributions_omitted.into();
+                } else if let Some(items) = value["neutralized_settings"]
+                    .as_array_mut()
+                    .filter(|items| !items.is_empty())
+                {
+                    items.pop();
+                    neutralized_omitted += 1;
+                    value["neutralized_settings_omitted"] = neutralized_omitted.into();
+                } else {
+                    // Escaping can expand even bounded hostile source names.
+                    // Preserve source kinds without an unbounded path copy.
+                    value["effective_source"]["path"] = serde_json::Value::Null;
+                    if !value["personal_authority"]["governing_source"].is_null() {
+                        value["personal_authority"]["governing_source"]["path"] =
+                            serde_json::Value::Null;
+                    }
+                    value["source_paths_omitted"] = true.into();
+                    break;
+                }
+            }
+        }
+        value
+    }
+
+    fn all(&self) -> serde_json::Value {
+        let mut fields = serde_json::Map::new();
+        for field in PERSONAL_CONTROL_FIELDS {
+            fields.insert((*field).into(), self.field(field));
+        }
+        // The generated explanation inventory is checked against RuleId at
+        // build time. Unset known rules report no policy override, never an
+        // invented default rule severity or provenance.
+        for rule in tirith_core::rule_explanations::list_all() {
+            let field = format!("severity_overrides.{}", rule.id);
+            fields.insert(field.clone(), self.field(&field));
+        }
+        // Profile changes also own compound approval rules and selected action
+        // overrides. Keep their apply/undo readback as complete as the preview.
+        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
+        for profile in ProtectionProfile::ALL {
+            if let Ok(definition) = definition(profile, PROFILE_VERSION) {
+                for field in definition.settings.keys() {
+                    fields
+                        .entry(field.clone())
+                        .or_insert_with(|| self.field(field));
+                }
+            }
+        }
+        fields.into()
+    }
+}
+
+/// Project only owned human content. Opaque revisions, source kinds, status
+/// codes, timestamps and protocol field names must survive broad DLP regexes.
+fn project_snapshot_source(
+    source: &mut serde_json::Value,
+    compiled: &tirith_core::redact::CompiledCustomPatterns,
+) {
+    if source["kind"] == "environment" {
+        return;
+    }
+    if let Some(path) = source["path"].as_str() {
+        source["path"] = tirith_core::redact::redact_sanitize_redact_with_compiled(
+            &project_policy_cli_text(path),
+            compiled,
+        )
+        .into();
+    }
+}
+
+fn print_effective_json(info: &EffectivePolicy) -> i32 {
+    match effective_json(info) {
+        Ok(output)
+            if super::write_json_stdout(
+                &output,
+                "tirith policy effective: failed to write JSON output",
+            ) =>
+        {
+            0
+        }
+        _ => {
+            eprintln!("tirith policy effective: could not render policy");
+            1
+        }
     }
 }
 
 fn print_effective_human(info: &EffectivePolicy) -> i32 {
-    use tirith_core::policy::PolicyScope;
-
+    use tirith_core::policy_snapshot::ResolutionMode;
+    match info.resolution_mode {
+        ResolutionMode::Runtime => {
+            eprintln!("tirith policy effective: runtime resolution (configured remote policy and separate overlays evaluated)");
+        }
+        ResolutionMode::LocalOnly => {
+            eprintln!("tirith policy effective: local-only diagnostic (remote policy and separate overlays excluded)");
+            eprintln!("  Use `tirith policy effective --runtime` to resolve the policy used by enforcement.");
+        }
+        ResolutionMode::TeamPreview => {
+            eprintln!("tirith policy effective: team document preview (local restrictions evaluated; activation and current server revision unverified)");
+        }
+    }
+    let patterns =
+        tirith_core::policy::captured_policy_dlp_patterns_or(&info.policy.dlp_custom_patterns);
+    let source = info.source_path.as_deref().map(|path| {
+        tirith_core::output::sanitize_human_field(&project_policy_cli_text(path), &patterns)
+    });
     eprintln!(
-        "tirith policy effective: source = {}",
-        info.source_path
+        "  primary source: {}",
+        source
             .as_deref()
-            .unwrap_or("(none — built-in defaults)")
+            .unwrap_or("(no source path; defaults or failure policy)")
     );
-    eprintln!("  scope: {}", scope_label(info.scope));
-    eprintln!();
-
-    // Render the resolved policy as readable YAML (the crate already depends on
-    // serde_yaml; the policy is `Serialize`). On the unlikely serialize error,
-    // fall back to a note rather than failing the command — the provenance and
-    // neutralization sections below are the load-bearing transparency output.
-    match serde_yaml::to_string(&info.policy) {
+    eprintln!("  primary scope: {}", scope_label(info.scope));
+    eprintln!(
+        "  fail mode: {:?}; interactive bypass permitted: {}; noninteractive bypass permitted: {}",
+        info.policy.fail_mode,
+        info.policy.allow_bypass_env,
+        info.policy.allow_bypass_env_noninteractive
+    );
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new(&patterns);
+    let display = match effective_policy_display(&info.policy, &compiled) {
+        Ok(display) => display,
+        Err(_) => {
+            eprintln!("tirith policy effective: could not render policy");
+            return 1;
+        }
+    };
+    match serde_yaml::to_string(&display) {
         Ok(yaml) => {
-            eprintln!("  effective policy:");
+            eprintln!("  policy (redacted display; do not apply this output as configuration):");
             for line in yaml.lines() {
                 eprintln!("    {line}");
             }
         }
-        Err(e) => {
-            eprintln!("  (could not render effective policy as YAML: {e})");
+        Err(_) => {
+            eprintln!("tirith policy effective: could not render policy");
+            return 1;
         }
     }
-    eprintln!();
-
     let neutralized = &info.policy.neutralized_fields;
-    match info.scope {
-        PolicyScope::Repo if !neutralized.is_empty() => {
+    if !neutralized.is_empty() {
+        eprintln!(
+            "  Neutralized repository fields (tightening-only): {}",
+            neutralized.join(", ")
+        );
+    }
+    eprintln!(
+        "  snapshot: {}; {} captured inputs",
+        info.snapshot.identity,
+        info.snapshot.input_revisions.len()
+    );
+    if let Some(profile) = &info.snapshot.requested_profile {
+        eprintln!(
+            "  requested protection profile: {} v{}",
+            profile.name.as_str(),
+            profile.version
+        );
+        if !info.snapshot.custom_profile_overrides.is_empty() {
             eprintln!(
-                "  Neutralized (this repo policy is tightening-only; these weakening fields \
-                 were ignored): {}",
-                neutralized.join(", ")
+                "  effective custom or constrained profile fields: {}",
+                info.snapshot.custom_profile_overrides.join(", ")
             );
         }
-        PolicyScope::Repo => {
-            eprintln!("  No weakening fields — this repo policy only tightens.");
-        }
-        _ => {
-            eprintln!("  Operator-scoped policy — all fields honored (nothing neutralized).");
+    }
+    eprintln!(
+        "  remote policy: {}; freshness: {}",
+        info.snapshot.remote.availability, info.snapshot.remote.freshness
+    );
+    if let Some(age) = info.snapshot.remote.cache_age_seconds {
+        eprintln!("  cached policy fetch age: {age}s");
+    }
+    if let Some(expiry) = &info.snapshot.next_trust_expiry {
+        eprintln!("  next trust expiry: {expiry}");
+    }
+    eprintln!("  field sources and constraints:");
+    for (field, provenance) in &info.snapshot.field_provenance {
+        if provenance.effective_source.kind != "default" || provenance.contributions.len() > 1 {
+            let field = tirith_core::output::sanitize_human_field(
+                &project_policy_cli_text(field),
+                &patterns,
+            );
+            let path = provenance.effective_source.path.as_deref().map(|path| {
+                tirith_core::output::sanitize_human_field(&project_policy_cli_text(path), &patterns)
+            });
+            eprintln!(
+                "    {field}: {}{}",
+                provenance.effective_source.kind,
+                path.map(|path| format!(" ({path})")).unwrap_or_default()
+            );
+            for contribution in &provenance.contributions {
+                if contribution.source.kind != provenance.effective_source.kind
+                    || !contribution.changed_effective_value
+                {
+                    eprintln!(
+                        "      {}: {}",
+                        contribution.source.kind, contribution.reason
+                    );
+                }
+            }
         }
     }
-
+    for target in &info.snapshot.operator_targets {
+        let path = tirith_core::output::sanitize_human_field(
+            &project_policy_cli_text(&target.path),
+            &patterns,
+        );
+        eprintln!(
+            "  {} target: {path} ({}, effective: {})",
+            target.scope, target.allowed_operation, target.effective
+        );
+    }
     0
 }
 
@@ -948,8 +1500,9 @@ fn build_policy_trace(input: &str, policy: &Policy) -> PolicyTrace {
 fn print_test_command_json(
     command: &str,
     verdict: &tirith_core::verdict::Verdict,
-    _policy: &Policy,
+    policy: &Policy,
     trace: &PolicyTrace,
+    explanation: &tirith_core::evaluation::DecisionExplanation,
 ) {
     #[derive(serde::Serialize)]
     struct Output<'a> {
@@ -976,7 +1529,13 @@ fn print_test_command_json(
             return;
         }
     };
+    let compiled = tirith_core::redact::CompiledCustomPatterns::new(&policy.dlp_custom_patterns);
+    let presentation = super::prepare_verdict_presentation(verdict, &compiled);
     project_policy_cli_json(&mut output);
+    tirith_core::redact::redact_json_strings(&mut output, &compiled);
+    output["action"] = serde_json::to_value(verdict.action).unwrap();
+    output["findings"] = serde_json::to_value(&presentation.verdict.findings).unwrap();
+    output["explanation"] = serde_json::to_value(explanation).unwrap();
 
     if let Err(error) = serde_json::to_writer_pretty(std::io::stdout().lock(), &output) {
         let error = bounded_human_value(&error.to_string(), 512);
@@ -1105,6 +1664,271 @@ fn resolve_policy_path(explicit: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use tirith_core::policy_validate::{self, IssueLevel};
+
+    fn control_snapshot(
+        state: &tirith_test_support::GlobalStateGuard,
+    ) -> tirith_core::policy_snapshot::EffectivePolicySnapshot {
+        tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+            state.roots().cwd.to_str(),
+            tirith_core::policy_snapshot::ResolutionMode::Runtime,
+        )
+    }
+
+    #[test]
+    fn personal_control_org_omitted_field_is_overridden_even_with_default_source() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(org.join("policy.yaml"), "paranoia: 2\n").unwrap();
+        let snapshot = control_snapshot(&state);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
+        assert_eq!(value["effective_source"]["kind"], "default");
+        assert_eq!(value["personal_authority"]["state"], "overridden");
+        assert_eq!(
+            value["personal_authority"]["governing_source"]["kind"],
+            "org"
+        );
+        assert_eq!(value["effective_after"]["availability"], "unavailable");
+        assert!(value["personal_authority"]["governing_source"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("policy.yaml"));
+    }
+
+    #[test]
+    fn personal_control_repository_evidence_does_not_lock_personal_authority() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "paranoia: 2\nstrict_warn: true\n",
+        )
+        .unwrap();
+        let cwd = &state.roots().cwd;
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(cwd.join(".tirith")).unwrap();
+        std::fs::write(
+            cwd.join(".tirith/policy.yaml"),
+            "paranoia: 4\nstrict_warn: true\nallow_bypass_env_noninteractive: true\n",
+        )
+        .unwrap();
+        let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+            cwd.to_str(),
+            tirith_core::policy_snapshot::ResolutionMode::Runtime,
+        );
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
+        let paranoia = controls.field("paranoia");
+        assert_eq!(paranoia["effective_value"], 4);
+        assert_eq!(paranoia["effective_source"]["kind"], "repo");
+        assert_eq!(paranoia["personal_authority"]["state"], "effective");
+        let warning = controls.field("strict_warn");
+        assert_eq!(warning["effective_source"]["kind"], "user");
+        assert_eq!(warning["personal_authority"]["state"], "effective");
+        assert!(warning["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |item| item["source"]["kind"] == "repo" && item["changed_effective_value"] == false
+            ));
+        let unrelated = controls.field("env_guard_enabled");
+        assert_eq!(unrelated["personal_authority"]["state"], "effective");
+        assert!(!unrelated["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "repo"));
+        let bypass = controls.field("allow_bypass_env_noninteractive");
+        assert_eq!(bypass["personal_authority"]["state"], "effective");
+        assert!(bypass["neutralized_settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "repo"));
+    }
+
+    #[test]
+    fn personal_control_incident_constraints_are_field_specific_and_not_authority() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        tirith_core::incident::invalidate_cache();
+        tirith_core::incident::start("personal control fixture").unwrap();
+        let snapshot = control_snapshot(&state);
+        tirith_core::incident::stop().unwrap();
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let controls = PersonalControlDisplay::new(&snapshot, &compiled);
+        let bypass = controls.field("allow_bypass_env");
+        assert_eq!(bypass["effective_value"], false);
+        assert_eq!(bypass["personal_authority"]["state"], "effective");
+        assert!(bypass["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "incident"));
+        let unrelated = controls.field("env_guard_enabled");
+        assert!(!unrelated["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"]["kind"] == "incident"));
+    }
+
+    #[test]
+    fn personal_control_remote_local_fallback_is_not_a_managed_lock() {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_POLICY_ROOT");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "policy_fetch_fail_mode: open\nparanoia: 2\n",
+        )
+        .unwrap();
+        // Transport validation refuses this URL without opening a connection.
+        state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        state.set_env("TIRITH_API_KEY", "fixture-key");
+        let snapshot = control_snapshot(&state);
+        assert_eq!(snapshot.remote.fallback.as_deref(), Some("local"));
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = PersonalControlDisplay::new(&snapshot, &compiled).field("paranoia");
+        assert_eq!(value["effective_value"], 2);
+        assert_eq!(value["personal_authority"]["state"], "effective");
+        assert!(value["personal_authority"]["governing_source"].is_null());
+    }
+
+    #[test]
+    fn personal_control_source_redacts_custom_values_after_row_flattening() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let mut snapshot = control_snapshot(&state);
+        let compiled =
+            tirith_core::redact::CompiledCustomPatterns::new_silent(&["project-private".into()]);
+        for separator in ["\n", "\r\n", "\x1b[0m\n"] {
+            snapshot
+                .field_provenance
+                .get_mut("strict_warn")
+                .unwrap()
+                .effective_source
+                .path = Some(format!("/workspace/project-{separator}private/policy.yaml"));
+            let control = PersonalControlDisplay::new(&snapshot, &compiled).field("strict_warn");
+            let path = control["effective_source"]["path"].as_str().unwrap();
+            assert!(!path.contains("project-private"));
+            assert!(!path.chars().any(char::is_control));
+            assert!(path.ends_with("/policy.yaml"));
+            assert!(path.contains("REDACTED"));
+        }
+    }
+
+    #[test]
+    fn personal_control_rule_inventory_and_dlp_preserve_typed_identity_with_bounded_output() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(
+            org.join("policy.yaml"),
+            "severity_overrides:\n  non_standard_port: HIGH\n",
+        )
+        .unwrap();
+        let snapshot = control_snapshot(&state);
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[".+".into()]);
+        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
+        let controls = &value["personal_controls"];
+        let selected = &controls["severity_overrides.non_standard_port"];
+        assert_eq!(selected["field"], "severity_overrides.non_standard_port");
+        assert_eq!(selected["effective_value"], "HIGH");
+        assert_eq!(selected["effective_source"]["kind"], "org");
+        assert_eq!(selected["personal_authority"]["state"], "overridden");
+        assert!(!value.to_string().contains(&org.display().to_string()));
+        assert_eq!(controls["fail_mode"]["effective_value"], "open");
+        for rule in tirith_core::rule_explanations::list_all() {
+            let key = format!("severity_overrides.{}", rule.id);
+            let control = &controls[&key];
+            assert_eq!(control["field"], key);
+            assert!(serde_json::to_vec(control).unwrap().len() <= 1024);
+        }
+        use tirith_core::protection_profiles::{definition, ProtectionProfile, PROFILE_VERSION};
+        let display = PersonalControlDisplay::new(&snapshot, &compiled);
+        for profile in ProtectionProfile::ALL {
+            for field in definition(profile, PROFILE_VERSION)
+                .unwrap()
+                .settings
+                .keys()
+            {
+                assert_eq!(controls[field]["field"], *field);
+                assert_eq!(controls[field], display.field(field));
+            }
+        }
+        let unset = &controls["severity_overrides.curl_pipe_shell"];
+        assert!(unset["effective_value"].is_null());
+        assert_eq!(unset["effective_source"]["kind"], "not_set");
+        assert!(unset["contributions"].as_array().unwrap().is_empty());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
+        let unredacted = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        assert!(
+            serde_json::to_vec(&effective_snapshot_display(&snapshot, &unredacted).unwrap())
+                .unwrap()
+                .len()
+                < 512 * 1024
+        );
+    }
+
+    #[test]
+    fn personal_control_large_approval_list_is_not_duplicated_into_policy_response() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let mut snapshot = control_snapshot(&state);
+        snapshot.policy.approval_rules = vec![
+            tirith_core::policy::ApprovalRule {
+                rule_ids: vec!["credential_in_command".into()],
+                timeout_secs: 30,
+                fallback: "block".into(),
+            };
+            3600
+        ];
+        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
+        let value = effective_snapshot_display(&snapshot, &compiled).unwrap();
+        let policy_bytes = serde_json::to_vec(&value["policy"]).unwrap().len();
+        assert!(policy_bytes > 256 * 1024 && policy_bytes < 360 * 1024);
+        assert_eq!(
+            value["policy"]["approval_rules"].as_array().unwrap().len(),
+            3600
+        );
+        let control = &value["personal_controls"]["approval_rules"];
+        assert_eq!(control["effective_value_omitted"], true);
+        assert!(control["effective_value"].is_null());
+        assert_eq!(control["field"], "approval_rules");
+        assert!(serde_json::to_vec(control).unwrap().len() < 4096);
+        assert!(serde_json::to_vec(&value).unwrap().len() < 512 * 1024);
+        snapshot.policy.approval_rules.truncate(1);
+        let small = PersonalControlDisplay::new(&snapshot, &compiled).field("approval_rules");
+        assert!(small.get("effective_value_omitted").is_none());
+        assert_eq!(small["effective_value"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn effective_projection_uses_captured_snapshot_and_explicit_privacy_union() {
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let org = state.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&org).unwrap();
+        let path = org.join("policy.yaml");
+        std::fs::write(&path, "paranoia: 2\nallowlist: [private.example]\n").unwrap();
+        let snapshot = tirith_core::policy_snapshot::EffectivePolicySnapshot::resolve(
+            None,
+            tirith_core::policy_snapshot::ResolutionMode::Runtime,
+        );
+        std::fs::write(&path, "paranoia: 4\n").unwrap();
+        let patterns = tirith_core::redact::CompiledCustomPatterns::new(&[".+".into()]);
+        let value = effective_snapshot_display(&snapshot, &patterns).unwrap();
+        assert_eq!(value["policy"]["paranoia"], 2);
+        assert_eq!(value["resolution"]["snapshot_identity"], snapshot.identity);
+        assert_eq!(value["resolution"]["mode"], "runtime");
+        assert_eq!(value["scope"], "org");
+        assert!(!value.to_string().contains("private.example"));
+        assert!(!value.to_string().contains(&path.display().to_string()));
+        assert!(snapshot.revalidate_inputs().is_err());
+    }
 
     #[test]
     fn human_validation_issue_never_echoes_policy_values_or_controls() {
@@ -1444,6 +2268,30 @@ mod tests {
         assert!(!p.escalation.is_empty());
     }
 
+    #[test]
+    fn effective_display_large_key_collision_group_retains_every_entry() {
+        let mut values = serde_json::Map::new();
+        // Include an original key which already occupies a generated display
+        // suffix: the collision resolver must retain it and advance past it.
+        values.insert(
+            "[REDACTED:custom] [display entry 2]".into(),
+            serde_json::json!(-1),
+        );
+        for index in 0..5_000 {
+            values.insert(format!("customer-{index:06}"), serde_json::json!(index));
+        }
+        let mut value = serde_json::Value::Object(values);
+        let compiled =
+            tirith_core::redact::CompiledCustomPatterns::new_silent(&["customer-[0-9]+".into()]);
+        redact_policy_map_keys(&mut value, &compiled);
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 5_001);
+        assert_eq!(map["[REDACTED:custom] [display entry 2]"], -1);
+        assert_eq!(map["[REDACTED:custom]"], 0);
+        assert_eq!(map["[REDACTED:custom] [display entry 5001]"], 4_999);
+        assert!(map.keys().all(|key| !key.contains("customer-")));
+    }
+
     /// `policy effective` transparency contract: for a REPO-scoped policy that
     /// declares a weakening field (a non-empty `allowlist`), the gathered data
     /// must name the source path, classify the scope as `repo`, and list
@@ -1471,7 +2319,7 @@ mod tests {
             )
             .unwrap();
 
-            let info = gather_effective(cwd.to_str());
+            let info = gather_effective(cwd.to_str(), false);
 
             // Source path: the repo-root policy we just wrote.
             let expected_path = cwd

@@ -1,0 +1,44 @@
+[
+  {
+    "path": "node_modules/npm-package-arg/lib/npa.js",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/npm-package-arg/lib/npa.js",
+    "sha256": "41cd09e778c4a7588df362588dbe9146a024d5cfcdf449702feb294e6acde761",
+    "bytes": 14251
+  },
+  {
+    "path": "node_modules/validate-npm-package-name/lib/index.js",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/validate-npm-package-name/lib/index.js",
+    "sha256": "192644713adf00fa530905f1bd598b14c83644b4e4819a809e472cf6c6eb12f3",
+    "bytes": 2778
+  },
+  {
+    "path": "node_modules/validate-npm-package-name/lib/builtin-modules.json",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/validate-npm-package-name/lib/builtin-modules.json",
+    "sha256": "748abff83531219c79f949608c39dbc2078fa7a6f48672af0a68835db8e5ff60",
+    "bytes": 883
+  },
+  {
+    "path": "node_modules/npm-package-arg/LICENSE",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/npm-package-arg/LICENSE",
+    "sha256": "898c2bcff663681498ad1ca8235d45b6e70b10cdf1f869a5b5e69f6e46efedd3",
+    "bytes": 739
+  },
+  {
+    "path": "node_modules/npm-package-arg/package.json",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/npm-package-arg/package.json",
+    "sha256": "1a12d6b689df3628a831b61c29b55fe4ba667b37f37d5317eb306929eeb80bad",
+    "bytes": 1503
+  },
+  {
+    "path": "node_modules/validate-npm-package-name/LICENSE",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/validate-npm-package-name/LICENSE",
+    "sha256": "f3e1645267f7dd77ee6545283cc1766e5883e8fb3b5088fe2cfb995defbb3dde",
+    "bytes": 728
+  },
+  {
+    "path": "node_modules/validate-npm-package-name/package.json",
+    "url": "https://raw.githubusercontent.com/npm/cli/v11.19.0/node_modules/validate-npm-package-name/package.json",
+    "sha256": "f99a0874b70ee91c258e0dd49278db7bea941e97a95e36437e02a5588fe953af",
+    "bytes": 1924
+  }
+]

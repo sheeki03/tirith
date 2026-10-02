@@ -2,6 +2,7 @@ use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Value};
 
+use super::output_contract::{redact_projection, Projection};
 use super::{output_filter, resources, tools, types::*};
 
 /// Server state machine.
@@ -296,6 +297,12 @@ pub fn run_with_options(
                         };
                     let mut result =
                         handle_tools_call(&params, &output_policy, &mut task_boundary_audit);
+                    let projection = Projection::for_tool(
+                        params
+                            .as_ref()
+                            .and_then(|params| params.get("name"))
+                            .and_then(Value::as_str),
+                    );
                     if options.sanitize_tool_output {
                         // M7 ch4 — fail closed (deny on truncation), stricter than
                         // the gateway default: the calling agent is the
@@ -304,12 +311,12 @@ pub fn run_with_options(
                         // flag).
                         let mut outcome =
                             output_filter::filter_tool_result(&mut result, true, &filter_ctx);
-                        resources::redact_tool_result_strings(&mut result, &output_dlp);
+                        resources::redact_tool_result_strings(&mut result, projection, &output_dlp);
                         outcome.truncated |=
                             output_filter::bound_tool_result_for_output(&mut result);
                         write_filter_audit(&mut log, &outcome);
                     } else {
-                        resources::redact_tool_result_strings(&mut result, &output_dlp);
+                        resources::redact_tool_result_strings(&mut result, projection, &output_dlp);
                         output_filter::bound_tool_result_for_output(&mut result);
                     }
                     match serde_json::to_value(result) {
@@ -533,9 +540,24 @@ fn bounded_resources_read_response(
     compiled: &crate::redact::CompiledCustomPatterns,
 ) -> JsonRpcResponse {
     for content in &mut contents {
-        content.uri = crate::redact::redact_sanitize_redact_with_compiled(&content.uri, compiled);
-        content.mime_type =
-            crate::redact::redact_sanitize_redact_with_compiled(&content.mime_type, compiled);
+        if content.uri == "tirith://project-safety" && content.mime_type == "application/json" {
+            if let Ok(mut report) = serde_json::from_str::<Value>(&content.text) {
+                redact_projection(&mut report, Projection::DirectoryScan, compiled);
+                content.text = report.to_string();
+                continue;
+            }
+        }
+        if content.uri != "tirith://project-safety" {
+            content.uri =
+                crate::redact::redact_sanitize_redact_with_compiled(&content.uri, compiled);
+        }
+        if !matches!(
+            content.mime_type.as_str(),
+            "application/json" | "text/plain"
+        ) {
+            content.mime_type =
+                crate::redact::redact_sanitize_redact_with_compiled(&content.mime_type, compiled);
+        }
         content.text = crate::redact::redact_sanitize_redact_with_compiled(&content.text, compiled);
     }
     let response = JsonRpcResponse::ok(id.clone(), json!({ "contents": contents }));
@@ -554,10 +576,14 @@ fn bounded_resources_read_response(
     .unwrap_or_else(|_| {
         "{\"presentation_truncated\":true,\"analysis_incomplete\":true}".to_string()
     });
-    let safe_uri: String = crate::redact::redact_sanitize_redact_with_compiled(uri, compiled)
-        .chars()
-        .take(512)
-        .collect();
+    let safe_uri: String = (if uri == "tirith://project-safety" {
+        uri.to_string()
+    } else {
+        crate::redact::redact_sanitize_redact_with_compiled(uri, compiled)
+    })
+    .chars()
+    .take(512)
+    .collect();
     let compact_result = json!({
         "contents": [{
             "uri": safe_uri,
@@ -579,9 +605,9 @@ fn sanitize_json_rpc_response(
     response: &mut JsonRpcResponse,
     compiled: &crate::redact::CompiledCustomPatterns,
 ) {
-    if let Some(result) = response.result.as_mut() {
-        crate::redact::redact_json_strings(result, compiled);
-    }
+    // Successful results are redacted at their typed producer boundaries.
+    // initialize/list contain only server-owned schemas; rewriting their string
+    // values would corrupt version negotiation, tool names and input schemas.
     if let Some(error) = response.error.as_mut() {
         error.message =
             crate::redact::redact_sanitize_redact_with_compiled(&error.message, compiled);
@@ -628,7 +654,7 @@ fn write_mcp_task_boundary_audit(
     compiled: &crate::redact::CompiledCustomPatterns,
 ) {
     let mut projection = assessment.projection();
-    crate::redact::redact_json_strings(&mut projection, compiled);
+    redact_projection(&mut projection, Projection::Task, compiled);
     let projection = crate::verdict::bound_json_value_for_output(projection);
     let detail = serde_json::to_string(&projection).ok();
     crate::audit::log_hook_event(
@@ -826,6 +852,110 @@ mod tests {
         // id=3: ping
         assert_eq!(resps[2]["id"], 3);
         assert_eq!(resps[2]["result"], json!({}));
+    }
+
+    #[test]
+    fn broad_custom_dlp_preserves_full_mcp_session_contracts() {
+        let mut global = tirith_test_support::GlobalStateGuard::new().unwrap();
+        global.set_env(tools::PREVIEW_CAPABILITY_ENV, "1");
+        let policy_dir = global.roots().policy.join(".tirith");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(
+            policy_dir.join("policy.yaml"),
+            "dlp_custom_patterns:\n  - '(?s).+'\n",
+        )
+        .unwrap();
+        let requests = [
+            json!({"jsonrpc":"2.0", "id":"request-123", "method":"initialize", "params":{
+                "protocolVersion":"2024-11-05", "clientInfo":{"name":"private-client"}}}),
+            json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+            json!({"jsonrpc":"2.0", "id":3, "method":"resources/list"}),
+            json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
+                "name":"tirith_check_command", "arguments":{"command":"echo hello"}}}),
+            json!({"jsonrpc":"2.0", "id":5, "method":"tools/call", "params":{
+                "name":"tirith_check_task", "arguments":{"envelope":{
+                    "sources":[{"claimed_source":"agent_config", "content":"private-content"}],
+                    "actions":[{"package_install":{"ecosystem":"npm", "package":"private-package"}}]}}}}),
+        ];
+        let input = requests
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        for sanitize_tool_output in [true, false] {
+            let (stdout, _) = run_session_with_options(
+                &input,
+                DispatcherOptions {
+                    sanitize_tool_output,
+                },
+            );
+            let responses = parse_responses(&stdout);
+            assert_eq!(responses[0]["id"], "request-123");
+            assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
+            assert_eq!(responses[0]["result"]["serverInfo"]["name"], "tirith");
+            assert_eq!(
+                responses[1]["result"]["tools"],
+                serde_json::to_value(tools::list_with_preview()).unwrap()
+            );
+            assert_eq!(
+                responses[2]["result"]["resources"],
+                serde_json::to_value(resources::list()).unwrap()
+            );
+            assert_eq!(responses[3]["result"]["content"][0]["type"], "text");
+            assert_eq!(
+                responses[3]["result"]["structuredContent"]["action"],
+                "allow"
+            );
+            assert!(!stdout.contains("private-client"));
+            assert!(!stdout.contains("private-content"));
+            assert!(!stdout.contains("private-package"));
+            let task = &responses[4]["result"];
+            let structured = &task["structuredContent"];
+            assert_eq!(structured["provenance"][0]["receipt_status"], "unverified");
+            let text = task["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["text"].as_str())
+                .find(|text| text.starts_with("tirith_check_task (diagnostic;"))
+                .unwrap();
+            let (_, encoded) = text.split_once('\n').unwrap();
+            assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), *structured);
+        }
+    }
+
+    #[test]
+    fn resource_json_is_redacted_before_encoding_and_retains_protocol_metadata() {
+        let compiled = crate::redact::CompiledCustomPatterns::new_silent(&["(?s).+".into()]);
+        let digest = "a".repeat(64);
+        let contents = vec![ResourceContent {
+            uri: "tirith://project-safety".into(),
+            mime_type: "application/json".into(),
+            text: json!({"analysis_incomplete":true, "coverage_gaps":[{
+                "kind":"unreadable", "sha256":digest, "location":{"outer_path":"private-path"}}]})
+            .to_string(),
+        }];
+        let mut response = bounded_resources_read_response(
+            json!("request-456"),
+            "tirith://project-safety",
+            contents,
+            &compiled,
+        );
+        sanitize_json_rpc_response(&mut response, &compiled);
+        let result = response.result.unwrap();
+        assert_eq!(response.id, "request-456");
+        assert_eq!(result["contents"][0]["uri"], "tirith://project-safety");
+        assert_eq!(result["contents"][0]["mimeType"], "application/json");
+        let report: Value =
+            serde_json::from_str(result["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(report["analysis_incomplete"], true);
+        assert_eq!(report["coverage_gaps"][0]["kind"], "unreadable");
+        assert_eq!(report["coverage_gaps"][0]["sha256"], digest);
+        assert_eq!(
+            report["coverage_gaps"][0]["location"]["outer_path"],
+            "[REDACTED:custom]"
+        );
     }
 
     #[test]

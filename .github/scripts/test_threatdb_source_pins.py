@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import urllib.error
+import ssl
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -196,6 +200,46 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
                 self.new_ossf,
                 {"status": "diverged", "ahead_by": 1, "total_commits": 1, "files": []},
             )
+
+    def test_observation_does_not_adopt_pins_and_old_unchanged_is_current(self) -> None:
+        original = copy.deepcopy(self.manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            client = self.fixture_client(Path(temporary))
+            _, changes = PINS.update_pins(copy.deepcopy(self.manifest), client, "2026-09-01T02:00:00Z")
+        document = PINS.observation_document("2026-09-01T02:00:00Z", changes)
+        self.assertEqual(self.manifest, original)
+        old = document["sources"]["ecosystems_typosquatting_dataset"]
+        self.assertFalse(old["review_required"])
+        self.assertEqual(old["ahead_by"], 0)
+        pending = document["sources"]["ossf_malicious_packages"]
+        self.assertTrue(pending["review_required"])
+        self.assertEqual(pending["pinned_commit"], self.old_ossf)
+
+    def test_retry_obeys_server_backoff_and_overall_deadline(self) -> None:
+        self.assertEqual(PINS.retry_delay("4", 0, 10), 4)
+        self.assertIsNone(PINS.retry_delay("12", 0, 10))
+        self.assertIsNone(PINS.retry_delay("bad", 0, 10))
+        self.assertIsNone(PINS.retry_delay("0", 2, 10))
+        with patch.object(PINS.time, "time", return_value=0):
+            self.assertEqual(PINS.retry_delay("Thu, 01 Jan 1970 00:00:04 GMT", 0, 10), 4)
+
+    def test_rate_limit_recovers_but_schema_and_identity_fail_once(self) -> None:
+        response = io.BytesIO(b'{"ok":true}')
+        response.status = 200
+        limited = urllib.error.HTTPError("https://api.github.com/x", 429, "limited", {"Retry-After": "0"}, None)
+        with patch.object(PINS.urllib.request, "urlopen", side_effect=[limited, response]) as opener, patch.object(PINS.time, "sleep"):
+            self.assertEqual(PINS.GitHubClient(None)._get("/x"), {"ok": True})
+            self.assertEqual(opener.call_count, 2)
+        invalid = io.BytesIO(b'<html>not metadata</html>')
+        invalid.status = 200
+        with patch.object(PINS.urllib.request, "urlopen", return_value=invalid) as opener:
+            with self.assertRaisesRegex(PINS.PinError, "schema"):
+                PINS.GitHubClient(None)._get("/x")
+            self.assertEqual(opener.call_count, 1)
+        with patch.object(PINS.urllib.request, "urlopen", side_effect=urllib.error.URLError(ssl.SSLCertVerificationError("untrusted"))) as opener:
+            with self.assertRaisesRegex(PINS.PinError, "identity"):
+                PINS.GitHubClient(None)._get("/x")
+            self.assertEqual(opener.call_count, 1)
 
 
 if __name__ == "__main__":

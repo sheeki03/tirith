@@ -849,6 +849,105 @@ fn ensure_private_session_directory(directory: &Path) -> std::io::Result<()> {
 /// oversized file before any read. `with_session_locked` writes via an atomic
 /// temp+rename, so a reader sees a complete old-or-new file and needs no shared lock
 /// to avoid a transient empty state.
+/// A read result for previews. Unlike the legacy runtime loader, errors do not
+/// become apparently empty sessions and this API emits no raw diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotAvailability {
+    Complete,
+    Absent,
+    Invalid,
+    Unreadable,
+    Unavailable,
+}
+
+pub struct SessionSnapshotRead {
+    pub availability: SnapshotAvailability,
+    pub session: Option<SessionWarnings>,
+}
+
+pub fn read_snapshot(session_id: &str) -> SessionSnapshotRead {
+    if privacy_project_session_id(session_id) != session_id {
+        return SessionSnapshotRead {
+            availability: SnapshotAvailability::Invalid,
+            session: None,
+        };
+    }
+    let Some(path) = session_state_path(session_id) else {
+        return SessionSnapshotRead {
+            availability: SnapshotAvailability::Unavailable,
+            session: None,
+        };
+    };
+    read_snapshot_at(session_id, &path)
+}
+
+fn read_snapshot_at(session_id: &str, path: &std::path::Path) -> SessionSnapshotRead {
+    let bytes = match crate::util::read_text_no_follow_capped(path, SESSION_FILE_READ_CAP) {
+        Ok(bytes) => bytes,
+        Err(crate::util::OpenRegularError::NotFound) => {
+            return SessionSnapshotRead {
+                availability: SnapshotAvailability::Absent,
+                session: Some(SessionWarnings::new(session_id)),
+            }
+        }
+        Err(_) => {
+            return SessionSnapshotRead {
+                availability: SnapshotAvailability::Unreadable,
+                session: None,
+            }
+        }
+    };
+    match serde_json::from_slice::<SessionWarnings>(&bytes) {
+        Ok(mut session) if session.session_id == session_id => {
+            migrate_typed_event_identities(&mut session);
+            SessionSnapshotRead {
+                availability: SnapshotAvailability::Complete,
+                session: Some(session),
+            }
+        }
+        _ => SessionSnapshotRead {
+            availability: SnapshotAvailability::Invalid,
+            session: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod snapshot_read_tests {
+    use super::*;
+
+    #[test]
+    fn preview_session_read_distinguishes_absent_invalid_and_complete_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let absent = read_snapshot_at("preview", &path);
+        assert_eq!(absent.availability, SnapshotAvailability::Absent);
+        assert!(absent.session.is_some());
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"broken-json").unwrap();
+        let invalid = read_snapshot_at("preview", &path);
+        assert_eq!(invalid.availability, SnapshotAvailability::Invalid);
+        assert!(invalid.session.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken-json");
+
+        let original = serde_json::to_vec(&SessionWarnings::new("preview")).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let complete = read_snapshot_at("preview", &path);
+        assert_eq!(complete.availability, SnapshotAvailability::Complete);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            read_snapshot_at("different", &path).availability,
+            SnapshotAvailability::Invalid
+        );
+        assert_eq!(
+            read_snapshot_at("preview", directory.path()).availability,
+            SnapshotAvailability::Unreadable
+        );
+    }
+}
+
 pub fn load(session_id: &str) -> SessionWarnings {
     if privacy_project_session_id(session_id) != session_id {
         crate::audit::audit_diagnostic(PRIVACY_UNSAFE_SESSION_DIAGNOSTIC);
@@ -1067,6 +1166,26 @@ pub fn record_outcome(
     cmd: &str,
     dlp_patterns: &[String],
 ) {
+    record_outcome_with_urls(
+        session_id,
+        warn_findings,
+        hidden_findings_list,
+        cmd,
+        dlp_patterns,
+        &[],
+    );
+}
+
+/// Record warning identities using URL interpretations from the analyzed command.
+/// The raw-only public entry point retains its historical generic semantics.
+pub(crate) fn record_outcome_with_urls(
+    session_id: &str,
+    warn_findings: &[&Finding],
+    hidden_findings_list: &[&Finding],
+    cmd: &str,
+    dlp_patterns: &[String],
+    urls: &[crate::extract::ExtractedUrl],
+) {
     if warn_findings.is_empty() && hidden_findings_list.is_empty() {
         return;
     }
@@ -1107,7 +1226,7 @@ pub fn record_outcome(
                 &crate::mcp::output_filter::sanitize_for_display(&f.title),
                 120,
             ),
-            domains: extract_domains_from_evidence(&f.evidence),
+            domains: extract_domains_from_evidence_with_urls(&f.evidence, urls),
         })
         .collect();
 
@@ -1644,6 +1763,46 @@ pub fn extract_domains_from_evidence(evidence: &[Evidence]) -> Vec<String> {
             Evidence::HostComparison { raw_host, .. } => {
                 domains.push(raw_host.to_lowercase());
             }
+            _ => {}
+        }
+    }
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+/// Extract evidence domains with the already analyzed URL interpretations.
+///
+/// Raw text alone cannot distinguish curl's DNS authority from another client's
+/// numeric IPv4 interpretation. Keep every distinct matching interpretation;
+/// equal raw strings can belong to different commands. Evidence absent from the
+/// extraction retains the raw-only API's generic behavior. A matched URL with
+/// no host does not acquire a new host through a second parser.
+pub fn extract_domains_from_evidence_with_urls(
+    evidence: &[Evidence],
+    urls: &[crate::extract::ExtractedUrl],
+) -> Vec<String> {
+    let mut domains = Vec::new();
+    for ev in evidence {
+        match ev {
+            Evidence::Url { raw } => {
+                let mut matched = false;
+                for url in urls
+                    .iter()
+                    .filter(|url| url.raw == *raw || url.parsed.raw_str() == raw.as_str())
+                {
+                    matched = true;
+                    if let Some(host) = url.parsed.host() {
+                        domains.push(host.to_lowercase());
+                    }
+                }
+                if !matched {
+                    if let Some(host) = extract_host(raw) {
+                        domains.push(host);
+                    }
+                }
+            }
+            Evidence::HostComparison { raw_host, .. } => domains.push(raw_host.to_lowercase()),
             _ => {}
         }
     }
@@ -3539,5 +3698,116 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod contextual_domain_tests {
+    use super::*;
+    use crate::extract::{extract_urls, ExtractedUrl};
+    use crate::tokenize::ShellType;
+
+    #[test]
+    fn contextual_domains_keep_client_identity_and_all_equal_raw_interpretations() {
+        for raw in [
+            "http://0x7f.0x/path",
+            "http://user:secret@0x%37f.0x:8080/path?q=1#f",
+        ] {
+            let evidence = vec![Evidence::Url { raw: raw.into() }];
+            assert_eq!(extract_domains_from_evidence(&evidence), ["127.0.0.0"]);
+            for shell in [
+                ShellType::Posix,
+                ShellType::Fish,
+                ShellType::PowerShell,
+                ShellType::Cmd,
+            ] {
+                let curl = extract_urls(&format!("curl {raw}"), shell);
+                assert_eq!(
+                    extract_domains_from_evidence_with_urls(&evidence, &curl),
+                    ["0x7f.0x"],
+                    "curl {raw} {shell:?}"
+                );
+                let wget = extract_urls(&format!("wget {raw}"), shell);
+                assert_eq!(
+                    extract_domains_from_evidence_with_urls(&evidence, &wget),
+                    ["127.0.0.0"],
+                    "wget {raw} {shell:?}"
+                );
+                // Equal text is insufficient to choose one client. Repeated
+                // findings/URLs must neither discard an identity nor multiply it.
+                let mut both = curl.clone();
+                both.extend(wget);
+                both.extend(curl);
+                assert_eq!(
+                    extract_domains_from_evidence_with_urls(&evidence, &both),
+                    ["0x7f.0x", "127.0.0.0"]
+                );
+            }
+        }
+        let raw = "0x7f.0x/path";
+        let urls = extract_urls(&format!("curl {raw}"), ShellType::Posix);
+        assert_eq!(
+            extract_domains_from_evidence_with_urls(&[Evidence::Url { raw: raw.into() }], &urls),
+            ["0x7f.0x"]
+        );
+    }
+
+    #[test]
+    fn contextual_warning_recording_retains_dns_identity_and_raw_api_compatibility() {
+        let mut state =
+            tirith_test_support::GlobalStateGuard::new().expect("isolate warning state");
+        let temporary = tempfile::tempdir().expect("temporary warning state");
+        state.set_env("XDG_STATE_HOME", temporary.path());
+        let raw = "http://0x7f.0x/path";
+        let command = format!("curl {raw}; wget {raw}");
+        let finding = Finding {
+            rule_id: crate::verdict::RuleId::PlainHttpToSink,
+            severity: crate::verdict::Severity::Medium,
+            title: "contextual warning".into(),
+            description: "fixture".into(),
+            evidence: vec![Evidence::Url { raw: raw.into() }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        };
+        let urls = extract_urls(&command, ShellType::Posix);
+        record_outcome_with_urls(
+            "contextual-warning-fixture",
+            &[&finding],
+            &[],
+            &command,
+            &[],
+            &urls,
+        );
+        let recorded = load("contextual-warning-fixture");
+        assert_eq!(recorded.events.len(), 1);
+        assert_eq!(recorded.events[0].domains, ["0x7f.0x", "127.0.0.0"]);
+        record_outcome("raw-warning-fixture", &[&finding], &[], &command, &[]);
+        let raw_recorded = load("raw-warning-fixture");
+        assert_eq!(raw_recorded.events.len(), 1);
+        assert_eq!(raw_recorded.events[0].domains, ["127.0.0.0"]);
+    }
+
+    #[test]
+    fn contextual_domains_use_generic_fallback_only_for_unassociated_evidence() {
+        let raw = "http://0x7f.0x/path";
+        let evidence = vec![Evidence::Url { raw: raw.into() }];
+        let other = extract_urls("curl https://unrelated.example/x", ShellType::Posix);
+        assert_eq!(
+            extract_domains_from_evidence_with_urls(&evidence, &other),
+            extract_domains_from_evidence(&evidence)
+        );
+        let hostless = ExtractedUrl {
+            raw: raw.into(),
+            parsed: crate::parse::UrlLike::Unparsed {
+                raw: raw.into(),
+                raw_host: None,
+                raw_path: None,
+            },
+            segment_index: 0,
+            in_sink_context: false,
+        };
+        assert!(extract_domains_from_evidence_with_urls(&evidence, &[hostless]).is_empty());
     }
 }

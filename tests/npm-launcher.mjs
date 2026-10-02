@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "tirith-npm-launcher-"));
 const source = fileURLToPath(new URL("../npm/tirith/bin/tirith", import.meta.url));
@@ -26,6 +27,75 @@ function launch(...args) {
   assert.ifError(result.error);
   return result;
 }
+
+function checkRuntimeSelection(platform, arch, report, expectedStatus, excludeNetwork = false) {
+  let selected = 0;
+  let executed = 0;
+  let reportReads = 0;
+  const errors = [];
+  const stopped = {};
+  let status = 0;
+  const requireMock = (name) => {
+    if (name === "path") return path;
+    assert.equal(name, "child_process");
+    return { execFileSync: () => { executed += 1; } };
+  };
+  requireMock.resolve = () => { selected += 1; return "/fixture/package.json"; };
+  const reportMock = report === undefined ? undefined : {
+    excludeNetwork,
+    getReport() {
+      assert.equal(this.excludeNetwork, true, "runtime report must exclude networking");
+      reportReads += 1;
+      if (report instanceof Error) throw report;
+      return report;
+    },
+  };
+  try {
+    vm.runInNewContext(fs.readFileSync(source, "utf8"), {
+      require: requireMock,
+      console: { error: (message) => errors.push(message) },
+      process: {
+        platform, arch, report: reportMock, argv: ["node", "tirith"],
+        exit(code) { status = code; throw stopped; },
+      },
+    });
+  } catch (error) {
+    if (error !== stopped) throw error;
+  }
+  assert.equal(status, expectedStatus);
+  assert.equal(selected, expectedStatus === 0 ? 1 : 0);
+  assert.equal(executed, expectedStatus === 0 ? 1 : 0);
+  if (expectedStatus !== 0) {
+    assert.match(errors.join("\n"), /require glibc/);
+    assert.match(errors.join("\n"), /cargo install tirith/);
+    assert.match(errors.join("\n"), /does not require administrator/);
+    const reportAvailable = typeof excludeNetwork === "boolean" &&
+      report && !(report instanceof Error) && report.header && typeof report.header === "object";
+    if (reportAvailable) {
+      assert.match(errors.join("\n"), /does not identify glibc/);
+      assert.doesNotMatch(errors.join("\n"), /Use Node/);
+    } else {
+      assert.match(errors.join("\n"), /Use Node 20\.13/);
+    }
+  }
+  if (reportMock) assert.equal(reportMock.excludeNetwork, excludeNetwork, "report options must be restored");
+  if (platform !== "linux" || typeof excludeNetwork !== "boolean") assert.equal(reportReads, 0);
+}
+
+for (const arch of ["x64", "arm64"]) {
+  checkRuntimeSelection("linux", arch, { header: { glibcVersionRuntime: "2.36" } }, 0);
+  checkRuntimeSelection("linux", arch, { header: { glibcVersionRuntime: "2.36" } }, 0, true);
+  checkRuntimeSelection("linux", arch, { header: { glibcVersionRuntime: "2.36" } }, 1, null);
+  checkRuntimeSelection("linux", arch, new Error("report failed with exclusion set"), 1, true);
+  for (const report of [undefined, null, {}, { header: {} },
+    { header: { glibcVersionRuntime: "" } },
+    { header: { glibcVersionRuntime: "musl" } },
+    new Error("runtime report unavailable")]) {
+    checkRuntimeSelection("linux", arch, report, 1);
+  }
+}
+checkRuntimeSelection("darwin", "arm64", new Error("must not inspect libc"), 0);
+checkRuntimeSelection("win32", "x64", new Error("must not inspect libc"), 0);
 
 try {
   fs.copyFileSync(source, launcher);

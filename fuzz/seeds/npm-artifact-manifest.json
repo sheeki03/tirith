@@ -1,0 +1,60 @@
+{
+  "scope": "inert tarball bytes only; never extracted or executed",
+  "seeds": [
+    {
+      "path": "case-collision",
+      "bytes": 193,
+      "sha256": "9bd26bde8607470eb6b40720bf22d7395066d0f20d208d09f0363154a5276c64"
+    },
+    {
+      "path": "duplicate-member",
+      "bytes": 178,
+      "sha256": "dbed7c6d03d898e38c787d2dd645df7c8e9ba9f5b195388f59f886bd2eaf6e3d"
+    },
+    {
+      "path": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "gzip-concatenated",
+      "bytes": 396,
+      "sha256": "9b55eb4845dcb58494d6b9ebcadeea067c5f366a13a7477de97239048bfa5165"
+    },
+    {
+      "path": "gzip-truncated",
+      "bytes": 193,
+      "sha256": "974834adbd23bc9a67103ddbf6ad748a4da9d9d065ee804eab611bb1845d6288"
+    },
+    {
+      "path": "inert-script-signals",
+      "bytes": 300,
+      "sha256": "e04bd6bbb586dac77f381921914b9391dcac8cc2875f3b7d94bb0ceebb6b247f"
+    },
+    {
+      "path": "member-traversal",
+      "bytes": 174,
+      "sha256": "2223662307ea842804c2654796f37aa4627bfc15dd6535b80e3b4f0c8db94914"
+    },
+    {
+      "path": "npm-portable-pax",
+      "bytes": 465,
+      "sha256": "769755af559bda513cfe86d6c433bf8e6c0b2431dbb24955393e0dc69eeb2c0f"
+    },
+    {
+      "path": "ordinary-code",
+      "bytes": 198,
+      "sha256": "098eb1eeaf237a4a4ccaa882d054d5fb26e2c0b0dd9b8d8a9d50d073faa24ed7"
+    },
+    {
+      "path": "quoted-api-examples",
+      "bytes": 229,
+      "sha256": "dd6bb344234778e3f9215d5baabc9a91aac6d3d4306cc0838dabf6eaf7fbbb24"
+    },
+    {
+      "path": "symlink-member",
+      "bytes": 173,
+      "sha256": "396180b0b5cbc173791aa25902e8384965556c5c68db12a62494df1171e0bccf"
+    }
+  ]
+}

@@ -1330,20 +1330,21 @@ mod fd {
     /// clear, a stale non-zero `errno` makes the read look failed. That is the
     /// fail-closed direction: the copy refuses instead of returning a listing it
     /// cannot vouch for.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "dragonfly"))]
     fn clear_errno() {
-        // SAFETY: __errno_location returns this thread's errno slot.
+        // SAFETY: the target accessor returns this thread's live errno slot.
         unsafe { *libc::__errno_location() = 0 };
     }
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly"
-    ))]
+    #[cfg(any(target_os = "android", target_os = "openbsd", target_os = "netbsd"))]
     fn clear_errno() {
-        // SAFETY: __error returns this thread's errno slot.
+        // SAFETY: the target accessor returns this thread's live errno slot.
+        unsafe { *libc::__errno() = 0 };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    fn clear_errno() {
+        // SAFETY: the target accessor returns this thread's live errno slot.
         unsafe { *libc::__error() = 0 };
     }
 
@@ -1353,7 +1354,9 @@ mod fd {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
-        target_os = "dragonfly"
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
     )))]
     fn clear_errno() {}
 
@@ -1396,6 +1399,25 @@ mod fd {
             // borrow ends before the next readdir call.
             Ok(Some(unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }))
         }
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn project_directory_eof_does_not_inherit_an_unrelated_errno() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = std::fs::File::open(root.path()).expect("directory");
+        let mut stream = DirStream::adopt(file.into()).expect("directory stream");
+        while stream.next_name().expect("listing").is_some() {}
+        // SAFETY: -1 is never a valid descriptor; close sets this thread's errno.
+        assert_eq!(unsafe { libc::close(-1) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(stream
+            .next_name()
+            .expect("clean end of directory")
+            .is_none());
     }
 
     impl Drop for DirStream {

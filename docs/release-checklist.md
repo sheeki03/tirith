@@ -141,14 +141,15 @@ code. GLIBC 2.28 is deliberate: Tirith and Rust's standard library reference
 raw-syscall shim. EL8 already ships GLIBC 2.28, and adding that shim would
 increase release risk without expanding the supported target set.
 
-The aarch64 release does not overclaim x86_64-only seccomp support: extrasafe is
-compiled only for linux-x86_64. On aarch64, Landlock and the remaining Linux
-containment layers stay available, but `network_raw_denied` is reported false;
-a locked-down capsule that requires it is degraded and fails closed. The
-aarch64 release build is itself a required CI gate, preventing an x86_64-only
-dependency from silently breaking the shipped artifact again. Each aarch64
-runtime smoke also invokes the locked-down capsule and requires an exit-1
-pre-launch refusal naming `network_raw_denied`; any child output fails the gate.
+Native aarch64 Linux uses a separate deny-all seccomp policy alongside Landlock;
+the x86_64 extrasafe dependency remains architecture-specific. Each exact GNU
+and musl release archive must pass the native ARM containment job, including
+network/filesystem restrictions, resource limits and interruption cleanup.
+Missing required kernel controls still cause a pre-launch refusal. The QEMU
+runtime compatibility checks cannot establish native seccomp enforcement: they
+require an exit-1 refusal naming `network_raw_denied`, and any child output fails
+that gate. Keep both the native containment and emulated compatibility checks;
+see the [ARM capability and evidence record](next-cycle/containment-aarch64.md).
 The static musl build retains the cleanup walk's exact mount-ID proof through a
 size- and offset-asserted Linux `statx` UAPI buffer because libc hides those
 bindings for its default musl ABI. There is no `st_dev` fallback: an unavailable

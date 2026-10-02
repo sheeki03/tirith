@@ -11,7 +11,7 @@
 //! all provable without a working sandbox.
 //!
 //! The second half is the enforcing behaviour, which is only meaningful on an
-//! x86_64 Linux host with a usable Landlock ABI. Those tests probe the backend
+//! native x86_64 or aarch64 Linux host with a usable Landlock ABI. Those tests probe the backend
 //! first and skip with an explicit message when the host cannot deliver the
 //! coverage, mirroring the guard `cli_integration.rs` already uses for the
 //! production capsule receipt.
@@ -97,7 +97,10 @@ fn run_json(fixture: &Fixture, extra: &[&str]) -> (i32, serde_json::Value) {
 /// Whether this host can actually deliver the preset's controls. Everything in
 /// the enforcing half of this file is conditioned on it.
 fn host_can_enforce_the_preset(project: &Path) -> bool {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    if !cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
         return false;
     }
     #[cfg(target_os = "linux")]

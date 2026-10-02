@@ -16,7 +16,8 @@ use std::ffi::{c_void, OsStr};
 use std::fs::File;
 use std::mem::{size_of, ManuallyDrop};
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::io::{FromRawHandle as _, RawHandle};
+use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc;
@@ -44,7 +45,9 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -61,10 +64,10 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 /// Bounded post-termination verification allowance. The runtime deadline never
@@ -636,30 +639,160 @@ fn authenticode_trusted(path: &Path) -> Result<bool, String> {
     Ok(result == 0)
 }
 
-/// Rewrite a canonical `\\?\C:\...` directory as the plain `C:\...` form.
-/// Only the prefix changes: the directory the child receives is the same one
-/// the ACL and ownership checks above accepted.
-fn dos_directory_for_child(path: &Path) -> PathBuf {
+/// Prefer a DOS spelling only where it does not depend on legacy normalization.
+/// The returned candidate still requires held file-identity verification.
+fn dos_path_candidate(path: &Path) -> Option<PathBuf> {
     use std::path::{Component, Prefix};
 
     let mut components = path.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return path.to_path_buf();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
     };
-    match prefix.kind() {
-        Prefix::VerbatimDisk(letter) => {
-            let mut rebuilt = PathBuf::from(format!("{}:\\", letter as char));
-            rebuilt.extend(components.filter(|component| !matches!(component, Component::RootDir)));
-            rebuilt
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        return None;
+    };
+    let mut rebuilt = PathBuf::from(format!("{}:\\", letter as char));
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => {
+                let text = value.to_str()?;
+                if text.ends_with(['.', ' ']) || text.contains([':', '/', '\\']) {
+                    return None;
+                }
+                let base = text.split('.').next()?.to_ascii_uppercase();
+                if matches!(
+                    base.as_str(),
+                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                ) || base
+                    .strip_prefix("COM")
+                    .or_else(|| base.strip_prefix("LPT"))
+                    .is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    })
+                {
+                    return None;
+                }
+                rebuilt.push(value);
+            }
+            _ => return None,
         }
-        // Verbatim UNC and device paths have no DOS equivalent to fall back to,
-        // and a plain DOS prefix is already what the child wants.
-        _ => path.to_path_buf(),
+    }
+    (rebuilt.as_os_str().encode_wide().count() < 260).then_some(rebuilt)
+}
+
+fn file_id(file: &File) -> Result<(u64, [u8; 16]), String> {
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the live handle and correctly sized output buffer outlive this call.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "identify held Windows launch path: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// Deny replacement while validating and opening both namespace spellings.
+/// Directory metadata handles retain identity; pre-launch checks detect a
+/// renamed pathname even on filesystems that allow metadata-only handle rename.
+struct HeldLaunchPath {
+    path: PathBuf,
+    canonical: File,
+    _dos: Option<File>,
+}
+
+fn open_launch_path(path: &Path, directory: bool) -> Result<File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).share_mode(if directory {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    } else {
+        FILE_SHARE_READ
+    });
+    if directory {
+        options
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(path)
+        .map_err(|error| format!("hold Windows launch path {}: {error}", path.display()))
+}
+
+impl HeldLaunchPath {
+    fn open(path: &Path, directory: bool) -> Result<Self, String> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            canonical: open_launch_path(path, directory)?,
+            _dos: None,
+        })
+    }
+
+    fn revalidate_path(&self, directory: bool) -> Result<(), String> {
+        let current = open_launch_path(&self.path, directory)?;
+        if file_id(&current)? != file_id(&self.canonical)? {
+            return Err("Windows launch pathname no longer identifies the held object".to_string());
+        }
+        Ok(())
+    }
+
+    fn prefer_dos(&mut self, directory: bool) -> Result<(), String> {
+        if let Some(dos) = dos_path_candidate(&self.path) {
+            let candidate = open_launch_path(&dos, directory)?;
+            let resolved = dos
+                .canonicalize()
+                .map_err(|error| format!("resolve DOS launch path: {error}"))?;
+            if !os_str_eq_ignore_case(resolved.as_os_str(), self.path.as_os_str())
+                || file_id(&candidate)? != file_id(&self.canonical)?
+            {
+                return Err(
+                    "DOS launch path does not identify the held canonical object".to_string(),
+                );
+            }
+            self.path = dos;
+            self._dos = Some(candidate);
+        }
+        Ok(())
     }
 }
 
 pub(super) fn run(executable: &super::TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
-    let mut child = match WindowsChild::launch(executable.path(), spec) {
+    let mut image = match HeldLaunchPath::open(executable.path(), false) {
+        Ok(image) => image,
+        Err(error) => return ChildOutcome::SpawnError(error),
+    };
+    // Revalidate admission while writes/replacement of the opened image are
+    // denied, and bind the held bytes themselves to the originally admitted digest.
+    if let Err(error) = executable.revalidate() {
+        return ChildOutcome::SpawnError(format!(
+            "trusted executable failed held pre-spawn revalidation: {error}"
+        ));
+    }
+    match super::hash_open_file(&mut image.canonical, executable.path()) {
+        Ok(digest) if digest == executable.digest => {}
+        Ok(_) => {
+            return ChildOutcome::SpawnError(
+                "held Windows executable differs from admitted contents".to_string(),
+            )
+        }
+        Err(error) => return ChildOutcome::SpawnError(error.to_string()),
+    }
+    if let Err(error) = image.prefer_dos(false) {
+        return ChildOutcome::SpawnError(error);
+    }
+    // Both executable handles remain owned until native child cleanup finishes.
+    let mut child = match WindowsChild::launch(&image, spec) {
         Ok(child) => child,
         Err(error) => return ChildOutcome::SpawnError(error),
     };
@@ -866,10 +999,12 @@ struct WindowsChild {
     _handle_container: OwnedHandle,
     stdout: Option<File>,
     stderr: Option<File>,
+    _cwd: HeldLaunchPath,
 }
 
 impl WindowsChild {
-    fn launch(path: &Path, spec: &ChildSpec) -> Result<Self, String> {
+    fn launch(image: &HeldLaunchPath, spec: &ChildSpec) -> Result<Self, String> {
+        let path = &image.path;
         let application = wide_nul(path.as_os_str())?;
         let command_line =
             crate::capsule::windows::command_line_wide_from_parts(path.as_os_str(), &spec.args);
@@ -895,13 +1030,18 @@ impl WindowsChild {
                 cwd_path.display()
             ));
         }
-        // The trusted path is canonical, so it carries the `\\?\` verbatim
-        // prefix. CreateProcessW accepts that form, but a child that reads its
-        // own working directory can reject it: cmd.exe refuses a UNC-looking
-        // cwd, warns, and exits 1. Hand the child the equivalent DOS form.
-        let cwd = wide_nul(dos_directory_for_child(&cwd_path).as_os_str())?;
+        // Legacy runtimes also require a plain cwd. Verify and retain the
+        // directory object before using its DOS spelling.
+        let mut held_cwd =
+            HeldLaunchPath::open(&cwd_path.canonicalize().map_err(|e| e.to_string())?, true)?;
+        held_cwd.prefer_dos(true)?;
+        let cwd = wide_nul(held_cwd.path.as_os_str())?;
 
+        // Parent-directory names are not all retained by these leaf handles.
+        // Refuse a changed pathname at each native creation boundary.
         let job = configured_job()?;
+        image.revalidate_path(false)?;
+        held_cwd.revalidate_path(true)?;
         let helper =
             launch_suspended_handle_container(&application, &command_line, &mut environment, &cwd)?;
         // The real child will name this helper as its parent and therefore
@@ -951,6 +1091,13 @@ impl WindowsChild {
         startup.lpAttributeList = attributes.as_ptr();
         let mut child_command_line = assigned_helper.protect(wide_nul_units(&command_line))?;
         let mut process_info = PROCESS_INFORMATION::default();
+        // These bounded children communicate only through the three explicit
+        // standard handles. Do not attach a console inherited from the nominal
+        // parent: the handle container deliberately never initializes its DLLs
+        // or console state. This also works when Tirith itself has no console.
+        // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+        assigned_helper.protect(image.revalidate_path(false))?;
+        assigned_helper.protect(held_cwd.revalidate_path(true))?;
         // All remaining launch failures have explicit cleanup paths below.
         assigned_helper.disarm();
         // SAFETY: every pointer references a live NUL-terminated/mutable buffer;
@@ -962,7 +1109,10 @@ impl WindowsChild {
                 null(),
                 null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                CREATE_SUSPENDED
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NO_WINDOW
+                    | EXTENDED_STARTUPINFO_PRESENT,
                 environment.as_mut_ptr().cast(),
                 cwd.as_ptr(),
                 &startup.StartupInfo,
@@ -1031,6 +1181,7 @@ impl WindowsChild {
             _handle_container: helper_process,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            _cwd: held_cwd,
         })
     }
 
@@ -1181,7 +1332,7 @@ fn launch_suspended_handle_container(
             null(),
             null(),
             0,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             environment.as_mut_ptr().cast(),
             cwd.as_ptr(),
             &startup,
@@ -1545,5 +1696,121 @@ mod tests {
         assert_not_inheritable(read.0);
         assert_not_inheritable(write.0);
         assert_not_inheritable(input.0);
+    }
+    #[test]
+    fn dos_candidates_preserve_namespace_sensitive_paths() {
+        assert_eq!(
+            dos_path_candidate(Path::new(r"\\?\C:\Program Files\PowerShell\7\pwsh.exe")),
+            Some(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
+        );
+        for value in [
+            r"\\?\C:\trailing.\tool.exe",
+            r"\\?\C:\trailing \tool.exe",
+            r"\\?\C:\NUL.exe",
+            r"\\?\C:\COM¹\tool.exe",
+            r"\\?\C:\file:stream.exe",
+            r"\\?\UNC\server\share\tool.exe",
+            r"\\.\C:\tool.exe",
+            r"C:\tool.exe",
+        ] {
+            assert!(dos_path_candidate(Path::new(value)).is_none(), "{value}");
+        }
+        let long = format!(r"\\?\C:\{}\tool.exe", "a".repeat(260));
+        assert!(dos_path_candidate(Path::new(&long)).is_none());
+    }
+
+    #[test]
+    fn held_launch_identity_rejects_same_content_different_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.exe");
+        let second = directory.path().join("second.exe");
+        std::fs::write(&first, b"same bytes").unwrap();
+        std::fs::write(&second, b"same bytes").unwrap();
+        let mut held = HeldLaunchPath::open(&first.canonicalize().unwrap(), false).unwrap();
+        // Model a pathname switching after the canonical handle was acquired.
+        held.path = second.canonicalize().unwrap();
+        assert!(held
+            .prefer_dos(false)
+            .unwrap_err()
+            .contains("held canonical object"));
+    }
+
+    #[test]
+    fn held_launch_image_denies_write_delete_and_handle_inheritance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guard.exe");
+        std::fs::write(&path, b"original").unwrap();
+        let mut held = HeldLaunchPath::open(&path.canonicalize().unwrap(), false).unwrap();
+        held.prefer_dos(false).unwrap();
+        assert_not_inheritable(held.canonical.as_raw_handle());
+        assert_not_inheritable(held._dos.as_ref().unwrap().as_raw_handle());
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        drop(held);
+        std::fs::write(&path, b"replacement").unwrap();
+    }
+
+    #[test]
+    fn native_system_root_overrides_a_poisoned_explicit_environment() {
+        let spec = ChildSpec::new(
+            ["unused"],
+            super::super::ChildLimits::new(Duration::from_secs(1), 1, 1),
+        )
+        .env("systemroot", r"C:\poison")
+        .with_windows_system_root()
+        .unwrap();
+        let block = environment_block(&spec.env).unwrap();
+        let entries = String::from_utf16(&block)
+            .unwrap()
+            .split('\0')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].starts_with("SystemRoot="));
+        assert_ne!(entries[0], r"SystemRoot=C:\poison");
+        assert!(!entries[0].to_ascii_uppercase().contains("PSMODULEPATH"));
+    }
+    #[test]
+    fn renamed_parent_or_grandparent_never_passes_held_path_revalidation() {
+        for ancestor in ["parent", "grandparent"] {
+            let directory = tempfile::tempdir().unwrap();
+            let grandparent = directory.path().join("outer");
+            let parent = grandparent.join("inner");
+            std::fs::create_dir_all(&parent).unwrap();
+            let path = parent.join("guard.exe");
+            std::fs::write(&path, b"held launch identity").unwrap();
+            let mut image = HeldLaunchPath::open(&path.canonicalize().unwrap(), false).unwrap();
+            image.prefer_dos(false).unwrap();
+            let mut cwd = HeldLaunchPath::open(&parent.canonicalize().unwrap(), true).unwrap();
+            cwd.prefer_dos(true).unwrap();
+            image.revalidate_path(false).unwrap();
+            cwd.revalidate_path(true).unwrap();
+            let source = if ancestor == "parent" {
+                &parent
+            } else {
+                &grandparent
+            };
+            let renamed = source.with_extension("moved");
+            match std::fs::rename(source, &renamed) {
+                Ok(()) => {
+                    // Do not use a successful rename as an assertion that the
+                    // original pathname remains bound to its retained object.
+                    assert!(image.revalidate_path(false).is_err());
+                    assert!(cwd.revalidate_path(true).is_err());
+                    eprintln!("held launch {ancestor} rename succeeded; both pre-launch pathname checks refused");
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32)),
+                        "unexpected {ancestor} rename refusal: {error}"
+                    );
+                    image.revalidate_path(false).unwrap();
+                    cwd.revalidate_path(true).unwrap();
+                    eprintln!("held launch {ancestor} rename refused: {error}");
+                }
+            }
+        }
     }
 }

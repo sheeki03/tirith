@@ -565,7 +565,11 @@ fn handle_request_with_analysis(
         // Engine findings carry the shortened-URL rule that drives redirect
         // resolution. Runtime threat findings are a second input to the same
         // bounded DNS pass so their URL evidence retains the old coverage.
-        let network_findings = enrich_with_network_checks(&mut verdict.findings, &late_findings);
+        let network_findings = enrich_with_network_checks(
+            &mut verdict.findings,
+            &late_findings,
+            &tirith_core::extract::extract_urls(&req.input, shell_type),
+        );
         late_findings.extend(network_findings);
     }
 
@@ -616,6 +620,7 @@ fn handle_request_with_analysis(
 fn enrich_with_network_checks(
     engine_findings: &mut [Finding],
     late_findings: &[Finding],
+    urls: &[tirith_core::extract::ExtractedUrl],
 ) -> Vec<Finding> {
     let mut new_findings = Vec::new();
     // One cancellable resolver and one absolute budget cover every host in this
@@ -676,7 +681,13 @@ fn enrich_with_network_checks(
     for finding in engine_findings.iter().chain(late_findings.iter()) {
         for evidence in &finding.evidence {
             if let Evidence::Url { raw } = evidence {
-                if let Some(host) = extract_host_from_url(raw) {
+                // Original command evidence uses its actual client authority.
+                // Unassociated enrichment URLs retain generic URL semantics;
+                // a redirect URL is owned by the resolver's HTTP client.
+                for host in tirith_core::session_warnings::extract_domains_from_evidence_with_urls(
+                    std::slice::from_ref(evidence),
+                    urls,
+                ) {
                     if checked_hosts.insert(host.clone()) {
                         let hits = dns
                             .as_mut()

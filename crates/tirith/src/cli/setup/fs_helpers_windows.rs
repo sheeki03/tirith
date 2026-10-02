@@ -1,6 +1,10 @@
 //! Windows filesystem helpers for `tirith setup` — the same public API as
 //! `fs_helpers.rs` using held Windows handles and explicit DACL handling.
 
+#[path = "fs_retention_windows.rs"]
+mod retention;
+pub(crate) use retention::{open_existing_in_place, InPlaceLease};
+
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
@@ -28,8 +32,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
@@ -37,8 +41,8 @@ use windows::Win32::Security::{
     GetSecurityDescriptorOwner, GetTokenInformation, SetKernelObjectSecurity,
     SetSecurityDescriptorControl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_AUTO_INHERITED,
-    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FlushFileBuffers,
@@ -51,7 +55,7 @@ use windows::Win32::Storage::FileSystem::{
     OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject, INFINITE,
+    CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
 };
 
 struct OwnedHandle(HANDLE);
@@ -101,6 +105,9 @@ thread_local! {
         Option<Box<dyn FnMut(&Path)>>,
     > = std::cell::RefCell::new(None);
     static CREATED_ARTIFACT_CAPTURE_TEST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&Path)>>,
+    > = std::cell::RefCell::new(None);
+    static SCOPED_READ_TEST_HOOK: std::cell::RefCell<
         Option<Box<dyn FnMut(&Path)>>,
     > = std::cell::RefCell::new(None);
     static DELETE_FAILURE_TEST_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -485,6 +492,147 @@ fn owner_only_security_descriptor(bytes: &[u8]) -> bool {
     owner_is_current_user(owner) && unsafe { EqualSid(owner, ace_sid) }.is_ok()
 }
 
+fn control_trustee_is_trusted(sid: PSID) -> bool {
+    if sid.0.is_null() {
+        return false;
+    }
+    if owner_is_current_user(sid) {
+        return true;
+    }
+    let mut encoded = PWSTR::null();
+    if unsafe { ConvertSidToStringSidW(sid, &mut encoded) }.is_err() {
+        return false;
+    }
+    let text = unsafe { encoded.to_string() };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(encoded.0.cast())));
+    }
+    // Windows Resource Protection delegates protected OS resources to this
+    // exact TrustedInstaller service SID, also recognized by trusted_child.
+    // This predicate applies only to ancestry; private leaves still require
+    // the current user's protected, single-trustee DACL.
+    // https://learn.microsoft.com/en-us/windows/win32/wfp/about-windows-file-protection
+    matches!(
+        text.as_deref(),
+        Ok("S-1-5-18"
+            | "S-1-5-32-544"
+            | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+    )
+}
+
+/// An intermediate ancestor may permit creation of sibling subdirectories:
+/// the next child already exists, is separately validated, and remains held
+/// without delete sharing. A final trusted directory has no such exception,
+/// because callers can use it to retain an absent input or install a new file.
+/// Replacement, deletion, security changes and generic write still require a
+/// trusted trustee at every level. Private leaves use the stricter validator.
+fn control_ancestor_security_descriptor(bytes: &[u8], has_held_child: bool) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut storage = bytes.to_vec();
+    let descriptor = PSECURITY_DESCRIPTOR(storage.as_mut_ptr().cast());
+    let mut owner = PSID::default();
+    let mut defaulted = BOOL(0);
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) }.is_err()
+        || !control_trustee_is_trusted(owner)
+    {
+        return false;
+    }
+    let mut present = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        .is_err()
+        || !present.as_bool()
+        || dacl.is_null()
+    {
+        return false;
+    }
+    let mut size = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
+    // FILE_ADD_FILE/SUBDIRECTORY, WRITE_EA, DELETE_CHILD, WRITE_ATTRIBUTES;
+    // DELETE, WRITE_DAC, WRITE_OWNER; MAXIMUM_ALLOWED, GENERIC_ALL/WRITE.
+    const MUTATION_RIGHTS: u32 = 0x0000_0156 | 0x000d_0000 | 0x5200_0000;
+    // SDDL "LC" encodes 0x4. For a filesystem directory this is
+    // FILE_ADD_SUBDIRECTORY, not FILE_LIST_DIRECTORY (0x1). It cannot modify
+    // an existing child. Do not extend this to the final directory, generic
+    // writes, FILE_ADD_FILE, FILE_DELETE_CHILD or the child's own descriptor.
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+    let mutation_rights = if has_held_child {
+        MUTATION_RIGHTS & !0x0000_0004
+    } else {
+        MUTATION_RIGHTS
+    };
+    for index in 0..size.AceCount {
+        let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) }.is_err() || ace.is_null() {
+            return false;
+        }
+        let header = unsafe { &*ace.cast::<windows::Win32::Security::ACE_HEADER>() };
+        // INHERIT_ONLY has no effect on this held ancestor; children are checked
+        // through their own descriptors. A deny ACE cannot add authority.
+        if header.AceFlags & 0x08 != 0 || header.AceType == 1 {
+            continue;
+        }
+        if header.AceType != 0
+            || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return false;
+        }
+        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+        let mask = unsafe { (*allowed).Mask };
+        let sid = unsafe { PSID((&mut (*allowed).SidStart as *mut u32).cast()) };
+        if mask & mutation_rights != 0 && !control_trustee_is_trusted(sid) {
+            return false;
+        }
+    }
+    true
+}
+
+fn control_directory_descriptor(file: &fs::File) -> Result<Vec<u8>, String> {
+    let handle = HANDLE(file.as_raw_handle());
+    let label = Path::new("<held control directory>");
+    let info = handle_information(handle, label)?;
+    if !path_rules::attributes_are_safe(info.dwFileAttributes, true) {
+        return Err("held control path is not a regular non-reparse directory".into());
+    }
+    security_descriptor(handle, label)
+}
+
+pub(crate) fn validate_control_directory_handle(file: &fs::File) -> Result<(), String> {
+    if !owner_only_security_descriptor(&control_directory_descriptor(file)?) {
+        return Err("control directory must retain a protected current-user-only DACL".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_control_ancestor_handle(
+    file: &fs::File,
+    has_held_child: bool,
+) -> Result<(), String> {
+    let descriptor = control_directory_descriptor(file)?;
+    if !control_ancestor_security_descriptor(&descriptor, has_held_child) {
+        #[cfg(test)]
+        eprintln!(
+            "Unsupported native test ancestor ACL: {}",
+            describe_security_descriptor(&descriptor)
+        );
+        return Err("control directory ancestor has an untrusted owner or write authority".into());
+    }
+    Ok(())
+}
+
 fn backup_name(destination: &Path, bytes: &[u8]) -> String {
     let digest: [u8; 32] = Sha256::digest(bytes).into();
     format!(
@@ -638,7 +786,18 @@ fn open_or_create_directory(
         None if !create => return Ok(false),
         None => {
             let current_wide = wide(current);
-            if let Err(error) = unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), None) } {
+            // Set owner and privacy atomically. A default token owner may be the
+            // Administrators group on an elevated native Windows runner; a
+            // later DACL-only update cannot turn that into a user-owned object.
+            let descriptor = owner_only_descriptor()?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0 .0,
+                bInheritHandle: BOOL(0),
+            };
+            if let Err(error) =
+                unsafe { CreateDirectoryW(PCWSTR(current_wide.as_ptr()), Some(&attributes)) }
+            {
                 if !is_win32(&error, ERROR_ALREADY_EXISTS.0) {
                     return Err(format!("create directory {}: {error}", current.display()));
                 }
@@ -794,6 +953,7 @@ struct FileGeneration {
     volume_serial: u32,
     file_index: u64,
     size: u64,
+    links: u32,
     last_write: u64,
     attributes: u32,
     reparse_tag: Option<u32>,
@@ -812,6 +972,7 @@ impl FileGeneration {
             volume_serial: info.dwVolumeSerialNumber,
             file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
             size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            links: info.nNumberOfLinks,
             last_write: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
                 | info.ftLastWriteTime.dwLowDateTime as u64,
             attributes: info.dwFileAttributes,
@@ -840,6 +1001,19 @@ pub(crate) struct PlatformSnapshot {
 }
 
 impl PlatformSnapshot {
+    pub(crate) fn require_private(&self) -> Result<(), String> {
+        if let SnapshotGeneration::Present(generation) = &self.generation {
+            if generation.links != 1
+                || generation.reparse_tag.is_some()
+                || !path_rules::attributes_are_safe(generation.attributes, false)
+                || !owner_only_security_descriptor(&generation.security_descriptor)
+            {
+                return Err("private file must be single-link, non-reparse and retain a protected current-user-only DACL".into());
+            }
+        }
+        Ok(())
+    }
+
     fn absent() -> Self {
         Self {
             bytes: None,
@@ -918,7 +1092,18 @@ fn rollback_landed(live: Option<&FileGeneration>, expected: Option<&FileGenerati
     }
 }
 
-fn capture_once(file: &mut fs::File, path: &Path) -> Result<(Vec<u8>, FileGeneration), String> {
+fn capture_stable_file(
+    file: fs::File,
+    path: &Path,
+) -> Result<(fs::File, Vec<u8>, FileGeneration), String> {
+    capture_stable_file_capped(file, path, super::fs_transaction::MAX_SETUP_FILE_BYTES)
+}
+
+fn capture_once(
+    file: &mut fs::File,
+    path: &Path,
+    limit: usize,
+) -> Result<(Vec<u8>, FileGeneration), String> {
     let handle = HANDLE(file.as_raw_handle());
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek {} through open handle: {error}", path.display()))?;
@@ -926,24 +1111,24 @@ fn capture_once(file: &mut fs::File, path: &Path) -> Result<(Vec<u8>, FileGenera
     let before_security = security_descriptor(handle, path)?;
     let before_reparse = optional_reparse_tag(handle, &before)?;
     let before_size = ((before.nFileSizeHigh as u64) << 32) | before.nFileSizeLow as u64;
-    if before_size > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
+    if before_size > limit as u64 {
         return Err(format!(
             "{} exceeds setup file limit of {} bytes",
             path.display(),
-            super::fs_transaction::MAX_SETUP_FILE_BYTES
+            limit
         ));
     }
 
     let mut bytes = Vec::with_capacity(before_size as usize);
     (&mut *file)
-        .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read {} through open handle: {error}", path.display()))?;
-    if bytes.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES {
+    if bytes.len() > limit {
         return Err(format!(
             "{} exceeds setup file limit of {} bytes",
             path.display(),
-            super::fs_transaction::MAX_SETUP_FILE_BYTES
+            limit
         ));
     }
 
@@ -970,13 +1155,14 @@ fn capture_once(file: &mut fs::File, path: &Path) -> Result<(Vec<u8>, FileGenera
     ))
 }
 
-fn capture_stable_file(
+fn capture_stable_file_capped(
     mut file: fs::File,
     path: &Path,
+    limit: usize,
 ) -> Result<(fs::File, Vec<u8>, FileGeneration), String> {
-    let mut previous = capture_once(&mut file, path)?;
+    let mut previous = capture_once(&mut file, path, limit)?;
     for _ in 0..3 {
-        let current = capture_once(&mut file, path)?;
+        let current = capture_once(&mut file, path, limit)?;
         if current == previous {
             return Ok((file, current.0, current.1));
         }
@@ -1205,10 +1391,23 @@ fn snapshot_destination(
     destination: &Path,
     display_path: &Path,
 ) -> Result<PlatformSnapshot, String> {
+    snapshot_destination_capped(
+        destination,
+        display_path,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
+}
+
+fn snapshot_destination_capped(
+    destination: &Path,
+    display_path: &Path,
+    limit: usize,
+) -> Result<PlatformSnapshot, String> {
     let Some(handle) = open_existing(destination)? else {
         return Ok(PlatformSnapshot::absent());
     };
-    let (_, bytes, generation) = capture_stable_file(handle.into_file(), display_path)?;
+    let (_, bytes, generation) =
+        capture_stable_file_capped(handle.into_file(), display_path, limit)?;
     Ok(PlatformSnapshot {
         bytes: Some(bytes),
         mode: None,
@@ -1220,14 +1419,64 @@ pub(crate) fn read_snapshot_scoped(
     path: &Path,
     scope_root: &Path,
 ) -> Result<PlatformSnapshot, String> {
+    read_snapshot_scoped_capped(
+        path,
+        scope_root,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
+}
+
+/// Read at a smaller cap while retaining the same parent, ACL, and file-generation checks.
+pub(crate) fn read_snapshot_scoped_capped(
+    path: &Path,
+    scope_root: &Path,
+    limit: usize,
+) -> Result<PlatformSnapshot, String> {
+    read_snapshot_scoped_capped_with_timeout(
+        path,
+        scope_root,
+        limit,
+        super::fs_transaction::SETUP_LOCK_TIMEOUT,
+    )
+}
+
+pub(crate) fn read_snapshot_scoped_capped_with_timeout(
+    path: &Path,
+    scope_root: &Path,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> Result<PlatformSnapshot, String> {
+    // A snapshot deliberately denies delete sharing while it checks the file's
+    // bytes and DACL. Coordinate with publication so a concurrent status read
+    // cannot turn ReplaceFileW into a sharing violation after a mutation has
+    // already applied. This transient mutex creates no filesystem entries and
+    // is recursive when the current transaction already owns it.
+    let _lock = PlatformTransaction::lock_for(path, scope_root, timeout)?;
     let Some(parent) = validated_parent(path, scope_root, false)? else {
         return Ok(PlatformSnapshot::absent());
     };
-    let destination = parent.path.join(
-        path.file_name()
-            .ok_or_else(|| format!("no file name for {}", path.display()))?,
-    );
-    let snapshot = snapshot_destination(&destination, path)?;
+    let destination = parent
+        .path
+        .join(path.file_name().ok_or("file name unavailable")?);
+    let Some(handle) = open_existing(&destination)? else {
+        return Ok(PlatformSnapshot::absent());
+    };
+    #[cfg(test)]
+    SCOPED_READ_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    let (_, bytes, generation) = capture_stable_file_capped(
+        handle.into_file(),
+        path,
+        limit.min(super::fs_transaction::MAX_SETUP_FILE_BYTES),
+    )?;
+    let snapshot = PlatformSnapshot {
+        bytes: Some(bytes),
+        mode: None,
+        generation: SnapshotGeneration::Present(generation),
+    };
     drop(parent);
     Ok(snapshot)
 }
@@ -1244,10 +1493,118 @@ pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<St
         .transpose()
 }
 
-/// Return whether a destination's complete parent chain currently exists and
-/// is safe beneath `scope_root`, without creating anything.
-pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, String> {
-    validated_parent(path, scope_root, false).map(|parent| parent.is_some())
+pub(crate) fn directory_identity(path: &Path) -> Result<(u64, u64), String> {
+    let handle = open_directory(path)?.ok_or("mutation scope directory disappeared")?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut information) }
+        .map_err(|e| format!("identify mutation scope directory: {e}"))?;
+    Ok((
+        information.dwVolumeSerialNumber as u64,
+        ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+    ))
+}
+
+pub(crate) fn private_directory_names(
+    directory: &Path,
+    scope: &Path,
+    limit: usize,
+) -> Result<(Vec<OsString>, bool), String> {
+    let Some(_parents) = validated_parent(&directory.join(".inventory"), scope, false)? else {
+        return Ok((Vec::new(), false));
+    };
+    // Parent handles deny delete-sharing, retaining the enumerated pathname.
+    let encoded = wide(directory);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(encoded.as_ptr()),
+            (FILE_GENERIC_READ | READ_CONTROL).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|_| "cannot retain private journal directory")?;
+    let held = OwnedHandle(handle).into_file();
+    validate_control_directory_handle(&held)?;
+    let mut names = Vec::new();
+    let mut limited = false;
+    for entry in fs::read_dir(directory).map_err(|_| "cannot enumerate private journals")? {
+        let entry = entry.map_err(|_| "private journal enumeration failed")?;
+        if names.len() == limit {
+            limited = true;
+            break;
+        }
+        names.push(entry.file_name());
+    }
+    validate_control_directory_handle(&held)?;
+    Ok((names, limited))
+}
+
+/// Keep operation payloads and compensation preimages private on Windows too.
+/// Retained parent handles prevent rename/reparse substitution while applying
+/// and verifying the owner-only DACL on the directory handle.
+pub(crate) fn ensure_private_directory(path: &Path, scope_root: &Path) -> Result<(), String> {
+    let _parents = validated_parent(&path.join(".journal-entry"), scope_root, true)?
+        .ok_or("cannot create private journal directory")?;
+    let encoded = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(encoded.as_ptr()),
+            (FILE_GENERIC_READ | READ_CONTROL | WRITE_DAC).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|e| format!("open private journal directory: {e}"))?;
+    let held = OwnedHandle(handle);
+    // This helper is only for the caller's explicitly selected managed state
+    // directory. Never take ownership of an existing shared/foreign directory.
+    let mut before = security_descriptor(held.0, path)?;
+    let mut owner = PSID::default();
+    let mut defaulted = BOOL(0);
+    unsafe {
+        GetSecurityDescriptorOwner(
+            PSECURITY_DESCRIPTOR(before.as_mut_ptr().cast()),
+            &mut owner,
+            &mut defaulted,
+        )
+    }
+    .map_err(|e| format!("read private journal directory owner: {e}"))?;
+    if owner.0.is_null() || !owner_is_current_user(owner) {
+        return Err("private journal directory is not owned by the current user".into());
+    }
+    let descriptor = owner_only_descriptor()?;
+    let mut dacl = std::ptr::null_mut();
+    let mut present = BOOL(0);
+    unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) }
+        .map_err(|e| format!("read private journal directory DACL: {e}"))?;
+    if !present.as_bool() || dacl.is_null() {
+        return Err("private journal directory descriptor has no DACL".into());
+    }
+    // SetSecurityInfo is the filesystem-specific API. Protection must be an
+    // explicit security-information flag, not merely a bit in the source SDDL.
+    unsafe {
+        SetSecurityInfo(
+            held.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    }
+    .ok()
+    .map_err(|e| format!("make journal directory private: {e}"))?;
+    if !owner_only_security_descriptor(&security_descriptor(held.0, path)?) {
+        return Err("private journal directory ACL could not be verified".into());
+    }
+    Ok(())
 }
 
 fn owner_only_descriptor() -> Result<LocalSecurityDescriptor, String> {
@@ -1315,9 +1672,36 @@ fn open_transaction_mutex(path: &Path, scope_root: &Path) -> Result<OwnedHandle,
     Ok(OwnedHandle(handle))
 }
 
+thread_local! {
+    static TRANSACTION_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct PlatformLock {
     mutex: OwnedHandle,
     owned: bool,
+    transaction: bool,
+    // Native mutex ownership and the nesting count belong to this thread.
+    _thread_bound: std::marker::PhantomData<Rc<()>>,
+}
+
+pub(crate) fn try_lock_operation(
+    path: &Path,
+    scope: &Path,
+) -> Result<Option<PlatformLock>, String> {
+    let mutex = open_transaction_mutex(path, scope)?;
+    let wait = unsafe { WaitForSingleObject(mutex.0, 0) };
+    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+        Ok(Some(PlatformLock {
+            mutex,
+            owned: true,
+            transaction: false,
+            _thread_bound: std::marker::PhantomData,
+        }))
+    } else if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+        Ok(None)
+    } else {
+        Err(format!("wait for operation mutex returned {}", wait.0))
+    }
 }
 
 impl Drop for PlatformLock {
@@ -1325,6 +1709,9 @@ impl Drop for PlatformLock {
         if self.owned {
             unsafe {
                 let _ = ReleaseMutex(self.mutex.0);
+            }
+            if self.transaction {
+                TRANSACTION_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
             }
         }
     }
@@ -1342,15 +1729,46 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
+        Self::lock_for(path, scope_root, super::fs_transaction::SETUP_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn lock_for(
+        path: &Path,
+        scope_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<PlatformLock, String> {
         let mutex = open_transaction_mutex(path, scope_root)?;
-        let wait = unsafe { WaitForSingleObject(mutex.0, INFINITE) };
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            return Err(format!(
-                "wait for setup transaction mutex returned {}",
-                wait.0
-            ));
-        }
-        Ok(PlatformLock { mutex, owned: true })
+        // Multi-file authorization may read another destination while holding
+        // the current writer lock. Never wait in that situation: two writers
+        // could otherwise hold A/B and each wait for the other's snapshot.
+        // Same-thread recursion on the same native mutex still succeeds.
+        let timeout = TRANSACTION_LOCK_DEPTH.with(|depth| {
+            if depth.get() == 0 {
+                timeout
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        super::fs_transaction::wait_for_lock(timeout, || {
+            let wait = unsafe { WaitForSingleObject(mutex.0, 0) };
+            if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+                Ok(true)
+            } else if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "wait for setup transaction mutex returned {}",
+                    wait.0
+                ))
+            }
+        })?;
+        TRANSACTION_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Ok(PlatformLock {
+            mutex,
+            owned: true,
+            transaction: true,
+            _thread_bound: std::marker::PhantomData,
+        })
     }
 
     pub(crate) fn begin(
@@ -1409,13 +1827,50 @@ impl PlatformTransaction {
         if !path_rules::final_path_within(&self.parent.root_final, &parent_final) {
             return Err("destination parent moved outside trusted setup root".into());
         }
-        let live = self.read_snapshot()?;
+        let limit = expected.bytes.as_ref().map_or(0, Vec::len);
+        let live = snapshot_destination_capped(&self.destination, &self.display_path, limit)?;
         if &live != expected {
             return Err(format!(
                 "{} changed while setup was preparing the update; no changes were published",
                 self.display_path.display()
             ));
         }
+        Ok(())
+    }
+
+    /// DELETE-capable, no-write/no-delete-sharing handle binds the deletion to
+    /// the exact locked private postimage, using the existing cleanup primitive.
+    pub(crate) fn delete_private_expected(
+        &self,
+        expected: &PlatformSnapshot,
+        cap: usize,
+    ) -> Result<(), String> {
+        if cap == 0
+            || expected
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > cap)
+        {
+            return Err("private deletion input exceeds its fixed bound".into());
+        }
+        expected.require_private()?;
+        self.validate_snapshot(expected)?;
+        let SnapshotGeneration::Present(generation) = &expected.generation else {
+            return Err("disconnect requires a present file".into());
+        };
+        let handle = open_cleanup_handle(&self.destination)?
+            .ok_or("connection disappeared before disconnect")?;
+        let (file, bytes, actual) =
+            capture_stable_file_capped(handle.into_file(), &self.display_path, cap)?;
+        if &actual != generation || Some(bytes.as_slice()) != expected.bytes.as_deref() {
+            return Err("connection changed before disconnect".into());
+        }
+        // The retained DELETE handle already excludes replacement. Reopening
+        // here would conflict with its intentional sharing restriction.
+        mark_held_file_for_deletion(&file)?;
+        drop(file);
+        // Namespace persistence is not fsync-provable on Windows. The service
+        // releases its read witness, then proves absence before reporting it.
         Ok(())
     }
 
@@ -2584,10 +3039,147 @@ fn run_cli_bounded<S: AsRef<OsStr>>(
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn smaller_snapshot_cap_is_enforced_and_missing_parents_stay_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("annotation.json");
+        std::fs::write(&path, b"12345").unwrap();
+        assert!(super::read_snapshot_scoped_capped(&path, root.path(), 4).is_err());
+        let exact = super::read_snapshot_scoped_capped(&path, root.path(), 5).unwrap();
+        assert_eq!(exact.bytes.as_deref(), Some(&b"12345"[..]));
+        let absent = root.path().join("missing/entry");
+        assert!(super::read_snapshot_scoped_capped(&absent, root.path(), 5)
+            .unwrap()
+            .bytes
+            .is_none());
+        assert!(!absent.parent().unwrap().exists());
+    }
     use super::super::fs_transaction::{
         transactional_update_with_hook, FileUpdate, TestStage, TransactionOutcome,
     };
     use super::*;
+
+    #[test]
+    fn scoped_snapshot_readers_coordinate_with_atomic_publication() {
+        for capped in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("operation.json");
+            create_protected_owner_only_file(&path, b"prepared");
+            let before = read_snapshot_scoped(&path, root.path()).unwrap();
+            let worker_path = path.clone();
+            let worker_root = root.path().to_path_buf();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                start_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                // Observe the actual named mutex from another thread while
+                // the reader still holds the no-share-delete file handle.
+                let contended =
+                    PlatformTransaction::lock_is_contended(&worker_path, &worker_root).unwrap();
+                observed_tx.send(contended).unwrap();
+                transactional_update(&worker_path, &worker_root, false, |_| {
+                    Ok(FileUpdate::write_text("completed".into(), 0o600))
+                })
+            });
+            let read = with_scoped_read_hook(
+                move |_| {
+                    start_tx.send(()).unwrap();
+                    assert!(observed_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap());
+                },
+                || {
+                    if capped {
+                        read_snapshot_scoped_capped(&path, root.path(), 32)
+                    } else {
+                        read_snapshot_scoped(&path, root.path())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(read, before);
+            writer.join().unwrap().unwrap();
+            let after = read_snapshot_scoped(&path, root.path()).unwrap();
+            assert_eq!(after.bytes.as_deref(), Some(&b"completed"[..]));
+            after.require_private().unwrap();
+            let (SnapshotGeneration::Present(before), SnapshotGeneration::Present(after)) =
+                (before.generation, after.generation)
+            else {
+                panic!("both generations must exist")
+            };
+            assert_ne!(before.file_index, after.file_index);
+            assert_eq!(before.security_descriptor, after.security_descriptor);
+        }
+    }
+
+    #[test]
+    fn snapshot_read_preserves_short_wait_and_is_recursive_for_its_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operation.json");
+        create_protected_owner_only_file(&path, b"prepared");
+        let _lock = PlatformTransaction::lock(&path, root.path()).unwrap();
+        // A transaction's own repeated capture must not deadlock.
+        let snapshot = read_snapshot_scoped_capped_with_timeout(
+            &path,
+            root.path(),
+            32,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(snapshot.bytes.as_deref(), Some(&b"prepared"[..]));
+        let worker_path = path.clone();
+        let worker_root = root.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            read_snapshot_scoped_capped_with_timeout(
+                &worker_path,
+                &worker_root,
+                32,
+                std::time::Duration::ZERO,
+            )
+        });
+        assert!(reader.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn cross_target_snapshot_contention_refuses_without_a_nested_lock_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.json");
+        let second = root.path().join("second.json");
+        create_protected_owner_only_file(&first, b"first");
+        create_protected_owner_only_file(&second, b"second");
+        let worker_path = second.clone();
+        let worker_root = root.path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = PlatformTransaction::lock(&worker_path, &worker_root).unwrap();
+            held_tx.send(()).unwrap();
+            // A broken reader that waits will only proceed after this deadline
+            // and return success, causing the parent's refusal assertion to fail.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let lock = PlatformTransaction::lock(&first, root.path()).unwrap();
+        let result = read_snapshot_scoped(&second, root.path());
+        let released_while_held = release_tx.send(()).is_ok();
+        drop(lock);
+        holder.join().unwrap();
+        assert!(result.is_err());
+        assert!(released_while_held);
+        // Releasing every guard restores normal reads; failed acquisition must
+        // not leave the thread's nesting count elevated.
+        assert_eq!(
+            read_snapshot_scoped(&second, root.path())
+                .unwrap()
+                .bytes
+                .as_deref(),
+            Some(&b"second"[..])
+        );
+    }
 
     fn symlink_directory_or_explicitly_skip(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_dir(target, link) {
@@ -2679,6 +3271,22 @@ mod tests {
         }
     }
 
+    struct ScopedReadHookReset;
+    impl Drop for ScopedReadHookReset {
+        fn drop(&mut self) {
+            SCOPED_READ_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn with_scoped_read_hook<T>(hook: impl FnMut(&Path) + 'static, run: impl FnOnce() -> T) -> T {
+        SCOPED_READ_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        let _reset = ScopedReadHookReset;
+        run()
+    }
+
     fn with_replace_hook<T>(
         hook: impl FnMut(&Path, &Path, &Path) -> Result<(), u32> + 'static,
         run: impl FnOnce() -> T,
@@ -2752,6 +3360,241 @@ mod tests {
         let mut file = OwnedHandle(handle).into_file();
         file.write_all(content).unwrap();
         unsafe { FlushFileBuffers(HANDLE(file.as_raw_handle())) }.unwrap();
+    }
+
+    fn directory_security_for_test(path: &Path) -> Vec<u8> {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide(path).as_ptr()),
+                (FILE_READ_ATTRIBUTES | READ_CONTROL).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .unwrap();
+        let held = OwnedHandle(handle);
+        security_descriptor(held.0, path).unwrap()
+    }
+
+    #[test]
+    fn private_directory_creation_is_protected_and_current_user_owned() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("managed").join("journals");
+        ensure_private_directory(&path, fixture.path()).unwrap();
+        ensure_private_directory(&path, fixture.path()).unwrap();
+        // Every newly created component has explicit private security, including
+        // the scope itself when its first child causes it to be materialized.
+        for directory in [path.clone(), path.parent().unwrap().to_path_buf()] {
+            assert!(owner_only_security_descriptor(
+                &directory_security_for_test(&directory)
+            ));
+        }
+        let new_scope = fixture.path().join("new-scope");
+        ensure_private_directory(&new_scope, &new_scope).unwrap();
+        assert!(owner_only_security_descriptor(
+            &directory_security_for_test(&new_scope)
+        ));
+    }
+
+    #[test]
+    fn managed_private_directory_hardening_explicitly_protects_inheritance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("managed");
+        let sid = current_user_sid_string().unwrap();
+        let sddl: Vec<u16> = format!("O:{sid}D:(A;;FA;;;{sid})(A;;GR;;;WD)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .unwrap();
+        let descriptor = LocalSecurityDescriptor(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0 .0,
+            bInheritHandle: BOOL(0),
+        };
+        unsafe { CreateDirectoryW(PCWSTR(wide(&directory).as_ptr()), Some(&attributes)) }.unwrap();
+        ensure_private_directory(&directory, fixture.path()).unwrap();
+        assert!(owner_only_security_descriptor(
+            &directory_security_for_test(&directory)
+        ));
+    }
+
+    #[test]
+    fn control_ancestor_acl_distinguishes_effective_and_inherit_only_write_grants() {
+        fn descriptor(sddl: &str) -> Vec<u8> {
+            let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut value = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(encoded.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut value,
+                    None,
+                )
+            }
+            .unwrap();
+            let value = LocalSecurityDescriptor(value);
+            let len = unsafe { GetSecurityDescriptorLength(value.0) } as usize;
+            unsafe { std::slice::from_raw_parts(value.0 .0.cast::<u8>(), len) }.to_vec()
+        }
+        let user = current_user_sid_string().unwrap();
+        let private = descriptor(&format!("O:{user}D:P(A;;FA;;;{user})"));
+        assert!(owner_only_security_descriptor(&private));
+        for has_held_child in [false, true] {
+            assert!(control_ancestor_security_descriptor(
+                &private,
+                has_held_child
+            ));
+            assert!(control_ancestor_security_descriptor(
+                &descriptor("O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)(A;OICIIO;GW;;;BU)"),
+                has_held_child
+            ));
+            // Numeric file rights avoid misleading directory-service SDDL
+            // aliases: add-file=2, delete-child=0x40, not SDDL "DC"=2.
+            for rights in [
+                "GW",
+                "GA",
+                "WD",
+                "WO",
+                "SD",
+                "0x00000002",
+                "0x00000010",
+                "0x00000040",
+                "0x00000100",
+                "0x02000000",
+                "0x00040000",
+                "0x00000044",
+            ] {
+                assert!(
+                    !control_ancestor_security_descriptor(
+                        &descriptor(&format!("O:SYD:(A;;FA;;;SY)(A;;{rights};;;BU)")),
+                        has_held_child
+                    ),
+                    "untrusted {rights}, child={has_held_child}"
+                );
+            }
+            assert!(!control_ancestor_security_descriptor(
+                &descriptor("O:BUD:(A;;FA;;;SY)"),
+                has_held_child
+            ));
+        }
+        for rights in ["LC", "0x00000004"] {
+            let create_sibling = descriptor(&format!("O:SYD:(A;;FA;;;SY)(A;;{rights};;;AU)"));
+            assert!(control_ancestor_security_descriptor(&create_sibling, true));
+            assert!(!control_ancestor_security_descriptor(
+                &create_sibling,
+                false
+            ));
+            assert!(!owner_only_security_descriptor(&create_sibling));
+        }
+
+        // Exact native C:\ descriptor retained from Windows CI run 34746043256.
+        // AU can create subdirectories at this intermediate ancestor; it cannot
+        // replace the already held next child. Its broad write ACE is inherit-
+        // only here. This descriptor cannot authorize a terminal directory or
+        // a private control leaf.
+        let observed = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:SYD:AI(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176)(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        let rendered = observed.to_string();
+        let observed = descriptor(observed);
+        assert!(control_ancestor_security_descriptor(&observed, true));
+        assert!(!control_ancestor_security_descriptor(&observed, false));
+        assert!(!owner_only_security_descriptor(&observed));
+        for changed in [
+            rendered.replace("2271478464", "2271478465"),
+            rendered.replace("OICIIO", "OICI"),
+            rendered.replace("0x1200a9;;;BU", "FA;;;BU"),
+            // FILE_DELETE_CHILD would let AU delete protected children.
+            rendered.replace("LC;;;AU", "0x00000044;;;AU"),
+        ] {
+            assert_ne!(
+                changed, rendered,
+                "negative fixture must change the descriptor"
+            );
+            assert!(!control_ancestor_security_descriptor(
+                &descriptor(&changed),
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn control_chain_allows_sibling_creation_only_above_held_children() {
+        use crate::cli::control::identity::DirectoryIdentity;
+
+        fn create_with_sddl(path: &Path, sddl: &str) {
+            let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut value = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(encoded.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut value,
+                    None,
+                )
+            }
+            .unwrap();
+            let value = LocalSecurityDescriptor(value);
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: value.0 .0,
+                bInheritHandle: BOOL(0),
+            };
+            unsafe { CreateDirectoryW(PCWSTR(wide(path).as_ptr()), Some(&attributes)) }.unwrap();
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let user = current_user_sid_string().unwrap();
+        let parent = fixture.path().join("sibling-creation-parent");
+        create_with_sddl(
+            &parent,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;0x4;;;AU)"),
+        );
+        let leaf = parent.join("private-child");
+        create_with_sddl(&leaf, &format!("O:{user}D:P(A;;FA;;;{user})"));
+        assert!(
+            DirectoryIdentity::capture_trusted(&parent).is_err(),
+            "a terminal parent cannot authorize planting an absent input"
+        );
+        let guard = DirectoryIdentity::capture(&leaf).expect("independently protected held child");
+        assert!(
+            std::fs::rename(&leaf, parent.join("moved-child")).is_err(),
+            "held child retains its no-delete lease"
+        );
+        guard.revalidate().unwrap();
+        let unsafe_parent = fixture.path().join("delete-child-parent");
+        create_with_sddl(
+            &unsafe_parent,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;0x44;;;AU)"),
+        );
+        let protected_child = unsafe_parent.join("private-child");
+        create_with_sddl(&protected_child, &format!("O:{user}D:P(A;;FA;;;{user})"));
+        assert!(
+            DirectoryIdentity::capture(&protected_child).is_err(),
+            "FILE_DELETE_CHILD remains forbidden above a protected leaf"
+        );
+        let untrusted_child = parent.join("untrusted-child");
+        create_with_sddl(
+            &untrusted_child,
+            &format!("O:{user}D:P(A;;FA;;;{user})(A;;FA;;;AU)"),
+        );
+        assert!(
+            DirectoryIdentity::capture(&untrusted_child).is_err(),
+            "the ancestor exception cannot authorize the child's broad DACL"
+        );
+        drop(guard);
+        std::fs::rename(&leaf, parent.join("moved-child"))
+            .expect("guard release closes every lease");
     }
 
     fn overwrite_same_length_and_restore_last_write(path: &Path, content: &[u8]) {
@@ -3085,13 +3928,16 @@ mod tests {
             |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
             |stage| {
                 if stage == TestStage::TempSynced {
-                    fs::write(&path, "editor-change").unwrap();
+                    // Keep the original six-byte cap: this tests a changed
+                    // generation, independently of oversized-file refusal.
+                    fs::write(&path, "editor").unwrap();
                 }
                 Ok(())
             },
         );
-        assert!(result.unwrap_err().contains("changed while setup"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
+        let error = result.unwrap_err();
+        assert!(error.contains("changed"), "unexpected refusal: {error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "editor");
         assert!(!fs::read_dir(root.path())
             .unwrap()
             .filter_map(Result::ok)
