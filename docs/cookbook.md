@@ -278,14 +278,16 @@ allowlist:
 ### CLI: manage trust without editing YAML
 
 `tirith trust` does the same thing from the command line, and steers you
-toward the narrowest scope that works. Trusting a specific path is accepted
-as-is; trusting a whole domain is broad and must be opted into with `--broad`.
-Entries expire after 30 days by default, so a temporary allow does not linger.
+toward the narrowest scope that works. Every grant names the rule it allows
+with `--rule` (or explicitly `--all-rules`). Trusting a specific path is
+accepted as-is; trusting a whole domain is broad and must be opted into with
+`--broad`. Entries expire after 30 days by default, so a temporary allow does
+not linger.
 
 ```bash
-# Narrow: trust one exact HTTPS resource. Expires in 30 days.
+# Narrow: trust one exact HTTPS resource for one rule. Expires in 30 days.
 # Schemeless host/path patterns are normalized as HTTPS.
-tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
 
 # Broad: trust a whole domain for one rule only. --broad is required.
 tirith trust add get.docker.com --broad --rule curl_pipe_shell

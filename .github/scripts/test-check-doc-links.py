@@ -77,6 +77,45 @@ class Checker(unittest.TestCase):
         })
         self.assertEqual(len(found), 3)
 
+    def test_refused_trust_add_examples_are_reported(self):
+        found = self.problems({
+            "a.md": "```bash\n"
+            "tirith trust add example.com  # no rule, no --broad\n"
+            "tirith trust add example.com --rule pipe_to_interpreter\n"
+            "tirith trust add raw.example.dev/x/get.sh\n"
+            "tirith trust add '*.example.dev' --all-rules\n"
+            "```\n"
+            "Run `tirith trust add example.dev/get.sh`.\n",
+        })
+        self.assertEqual(len(found), 6, found)
+        self.assertIn("a.md:2:", found[0])
+
+    def test_accepted_trust_add_examples_pass(self):
+        self.assertEqual(
+            self.problems({
+                "a.md": "```bash\n"
+                "tirith trust add example.dev/x/get.sh --rule pipe_to_interpreter\n"
+                "tirith trust add example.com --broad --all-rules --permanent\n"
+                "tirith trust add example.com \\\n  --broad --rule=curl_pipe_shell\n"
+                "tirith trust add --help\n"
+                "```\n"
+                "`tirith trust add --help` lists flags; `trust add` needs a rule.\n",
+            }),
+            [],
+        )
+
+    def test_disabled_pkg_examples_are_reported(self):
+        found = self.problems({
+            "a.md": "```bash\n"
+            "tirith pkg approve pip requests==2.31.0 --target .t\n"
+            "tirith pkg install pip requests==2.31.0 --target .t\n"
+            "tirith pkg install --help\n"
+            "tirith pkg verify-env --target .t requests\n"
+            "```\n"
+            "`tirith pkg install pip` currently refuses.\n",
+        })
+        self.assertEqual(len(found), 2, found)
+
     def test_source_comment_doc_paths_are_checked(self):
         found = self.problems({
             "docs/real.md": "# Real\n",

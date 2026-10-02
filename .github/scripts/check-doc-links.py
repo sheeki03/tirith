@@ -6,7 +6,12 @@ Reports, for every tracked Markdown file:
     or directory does not exist;
   * a `#fragment` that names no heading or explicit anchor in the target
     Markdown file (GitHub heading slugs);
-  * a mention of a command that was removed before release.
+  * a mention of a command that was removed before release;
+  * a `tirith trust add` example (in code) that the current CLI refuses:
+    one without `--rule` or `--all-rules`, or a domain / wildcard pattern
+    without `--broad`;
+  * a fenced `tirith pkg approve` / `tirith pkg install` example: both are
+    disabled on every host in this release.
 For tracked source, script and workflow files it also reports a `docs/*.md`
 path named in a comment (or a GitHub `blob/<ref>/` URL) that does not exist.
 
@@ -26,6 +31,35 @@ REMOVED_COMMANDS = (
     (re.compile(r"\binstall-npm\b"), "`tirith pkg install-npm` was removed"),
     (re.compile(r"\bpkg\s+materialize\b"), "`tirith pkg materialize` was removed"),
 )
+
+TRUST_ADD = re.compile(r"\btirith\s+trust\s+add\s+([^\s`#]+)([^`#]*)")
+
+
+def trust_add_problems(code):
+    """Problems with each `tirith trust add` invocation in a code fragment."""
+    problems = []
+    for match in TRUST_ADD.finditer(code):
+        target, rest = match.group(1), match.group(2)
+        words = [target] + rest.split()
+        if any(w in ("--help", "-h") for w in words):
+            continue
+        if target.startswith("-") or target.isupper():
+            continue  # a flag-first or placeholder form such as PATTERN
+        if not any(w == "--all-rules" or w == "--rule" or w.startswith("--rule=")
+                   for w in words):
+            problems.append(
+                f"`tirith trust add {target}` needs --rule RULE or --all-rules"
+            )
+        host = re.sub(r"^[a-z]+://", "", target)
+        if ("*" in host or "/" not in host) and "--broad" not in words:
+            problems.append(
+                f"`tirith trust add {target}` trusts a domain and needs --broad"
+            )
+    return problems
+
+
+DISABLED_PKG = re.compile(r"\btirith\s+pkg\s+(approve|install)\s+(?!-h\b|--help\b)\S")
+
 
 SOURCE_SUFFIXES = {
     ".rs", ".py", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".nu", ".yml",
@@ -145,12 +179,30 @@ def check_markdown(root, name, anchor_cache):
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return problems
+    continued = ""
     for number, line, in_code in markdown_lines(text):
         for pattern, why in REMOVED_COMMANDS:
             if pattern.search(line):
                 problems.append(f"{name}:{number}: {why}")
         if in_code:
+            # Join shell line continuations so flags on later lines count.
+            if line.rstrip().endswith("\\"):
+                continued += line.rstrip()[:-1] + " "
+                continue
+            for why in trust_add_problems(continued + line):
+                problems.append(f"{name}:{number}: {why}")
+            disabled = DISABLED_PKG.search(continued + line)
+            if disabled:
+                problems.append(
+                    f"{name}:{number}: `tirith pkg {disabled.group(1)}` is "
+                    "disabled on every host; do not show it as a working example"
+                )
+            continued = ""
             continue
+        continued = ""
+        for span in INLINE_CODE.finditer(line):
+            for why in trust_add_problems(span.group(0).strip("`")):
+                problems.append(f"{name}:{number}: {why}")
         prose = INLINE_CODE.sub("", line)
         targets = [m.group(1) for m in INLINE_LINK.finditer(prose)]
         ref = REF_DEF.match(prose)
