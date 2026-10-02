@@ -2897,7 +2897,16 @@ fn run_to_completion_with_stdin_captured(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = (program, target_argv0, args, input, cwd, extra_env, &plan);
+        let _ = (
+            program,
+            target_argv0,
+            args,
+            input,
+            authorizer,
+            cwd,
+            extra_env,
+            &plan,
+        );
         Err(CapsuleRefused {
             backend_id: plan.reported_selected.backend_id,
             reason: "contained supervised stdin launch is supported only on Linux; refusing to run uncontained"

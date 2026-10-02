@@ -369,6 +369,50 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked --no-fail-fast
 
+  android:
+    # Issue #261: Android/Termux support lives behind cfg(target_os = "android")
+    # (no arboard there, the Bionic `__errno` accessor, the clipboard NoBackend
+    # test), so no other job compiles it. Build both crates and link the
+    # tirith-core test binary for aarch64 Android with the runner's NDK so a
+    # regression in that code fails CI. Compile only: nothing runs on Android.
+    name: Android (aarch64, compile only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_API: "24"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Point Cargo and cc at the NDK toolchain
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          clang="$bin/aarch64-linux-android${ANDROID_API}-clang"
+          if [ ! -x "$clang" ] || [ ! -x "$bin/llvm-ar" ]; then
+            echo "::error::Android NDK toolchain not found under '$ndk'"
+            exit 1
+          fi
+          {
+            echo "CC_aarch64_linux_android=$clang"
+            echo "AR_aarch64_linux_android=$bin/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$clang"
+          } >> "$GITHUB_ENV"
+      - name: Check both crates for Android
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --locked -p tirith-core -p tirith --target aarch64-linux-android
+      - name: Build the tirith-core tests for Android
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --no-run --locked -p tirith-core --target aarch64-linux-android
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest

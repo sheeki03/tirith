@@ -520,11 +520,14 @@ fn secret_seal(token: &str, domain: &str, value: &serde_json::Value) -> String {
 #[cfg(unix)]
 #[derive(Debug)]
 enum ShellProcessLookupError {
+    // Only the Linux and macOS identity readers can report a vanished shell;
+    // other Unix targets (Android, the BSDs) refuse registration outright.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Missing,
     Rejected(String),
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_shell_pid(shell_pid: u32) -> Result<libc::pid_t, String> {
     if shell_pid <= 1 || shell_pid > libc::pid_t::MAX as u32 {
         return Err("shell receipt registration has an invalid shell PID".to_string());

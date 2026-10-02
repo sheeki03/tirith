@@ -87,6 +87,27 @@ class WorkflowHygiene(unittest.TestCase):
                 with self.subTest(workflow=path.name, path=referenced):
                     self.assertTrue((ROOT / referenced).is_file(), "missing referenced file")
 
+    def test_android_target_is_compiled_in_ci(self):
+        # Issue #261: Android/Termux code (the arboard gate, the Bionic errno
+        # accessor, the cfg(target_os = "android") clipboard test) only builds
+        # for an Android target, so CI must compile both crates and the
+        # tirith-core test binary for one, or a regression goes unnoticed.
+        ci = text(ROOT / ".github/workflows/ci.yml")
+        for command in (
+            "cargo check --locked -p tirith-core -p tirith --target aarch64-linux-android",
+            "cargo test --no-run --locked -p tirith-core --target aarch64-linux-android",
+        ):
+            self.assertIn(command, ci)
+        for variable in (
+            "CC_aarch64_linux_android",
+            "AR_aarch64_linux_android",
+            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
+        ):
+            self.assertRegex(ci, r"\b" + variable + r"[:=]")
+        self.assertIn("targets: aarch64-linux-android", ci)
+        clipboard = text(ROOT / "crates/tirith-core/src/clipboard.rs")
+        self.assertIn('#[cfg(target_os = "android")]', clipboard)
+
     def test_windows_required_dashboard_tests_exist(self):
         defined = set(re.findall(r"^fn ([a-z0-9_]+)\(", text(DASHBOARD_TESTS), re.M))
         required = powershell_list(text(WINDOWS_COMMON), "required")
