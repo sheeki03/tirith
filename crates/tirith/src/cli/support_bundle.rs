@@ -79,7 +79,7 @@ fn preview_with_snapshot(
         Some(HistoryReader::new(path).recent(
             HistoryFilter::default(),
             500,
-            std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+            tirith_core::audit::logging_enabled(),
         )?)
     };
     let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);

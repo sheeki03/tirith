@@ -12,7 +12,7 @@ pub(crate) fn review(cwd: Option<&str>) -> Result<Value, String> {
     let history = HistoryReader::new(path).recent(
         HistoryFilter::default(),
         500,
-        std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+        tirith_core::audit::logging_enabled(),
     )?;
     let records = history
         .events

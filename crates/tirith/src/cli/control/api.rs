@@ -184,11 +184,13 @@ fn read_patterns(service: &Service) -> Vec<String> {
     read_view(service).patterns
 }
 
-pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Value) {
-    let grant = match service.auth.check(request) {
-        Ok(grant) => grant,
-        Err(error) => return (error.status, json!({"error": error.message})),
-    };
+/// Route an authorized request. `grant` is the credential decision made
+/// when the request was read; it is not re-derived here.
+pub(super) fn dispatch(
+    service: &Service,
+    request: &http::Request,
+    grant: &http::Grant,
+) -> (u16, Value) {
     if request.method == "GET" && request.target == "/api/session" {
         return (
             200,
@@ -200,7 +202,7 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
         );
     }
     if request.method == "POST" && request.target == "/api/session/code" {
-        return sign_in_code(service, request, &grant);
+        return sign_in_code(service, request, grant);
     }
     let _capture = PolicyDiagnosticCapture::start();
     let result = route(service, request);
@@ -289,20 +291,10 @@ fn merge_diagnostics(
         .filter_map(|value| value.as_str().map(str::to_string))
         .chain(diagnostics)
         .collect();
-    let omitted = previous_omitted.saturating_add(messages.len().saturating_sub(32) as u64);
-    let messages: Vec<_> = messages
-        .into_iter()
-        .take(32)
-        .map(|message| {
-            let redacted =
-                tirith_core::redact::redact_sanitize_redact_with_compiled(&message, compiled);
-            if redacted.len() > 1024 {
-                "[withheld: diagnostic exceeds output limit]".into()
-            } else {
-                redacted
-            }
-        })
-        .collect();
+    let (messages, omitted_now) = super::super::bounded_diagnostics(messages, 32, |message| {
+        tirith_core::redact::redact_sanitize_redact_with_compiled(message, compiled)
+    });
+    let omitted = previous_omitted.saturating_add(omitted_now as u64);
     object.insert("diagnostics".into(), json!(messages));
     object.insert("omitted_diagnostics".into(), json!(omitted));
 }
@@ -522,15 +514,12 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
         }
         ("GET", "/api/activity/summary") => {
             let patterns = read_patterns(service);
-            let mut report = service
-                .aggregate
-                .lock()
-                .map_err(|_| "history aggregate is unavailable")?
-                .refresh(
-                    chrono::Utc::now(),
-                    7,
-                    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
-                )?;
+            let mut report = tirith_core::history_aggregate::summarize(
+                &service.history,
+                chrono::Utc::now(),
+                7,
+                tirith_core::audit::logging_enabled(),
+            )?;
             let omitted = report.rules.len().saturating_sub(100);
             report.rules.truncate(100);
             let mut view = tirith_core::history_aggregate::display_projection(&report, &patterns);
@@ -576,24 +565,21 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
         ("GET", "/api/freshness") => freshness_projection(service),
         ("POST", "/api/history") => {
             let query: HistoryRequest = body(request)?;
-            if query
-                .cursor
-                .as_ref()
-                .is_some_and(|cursor| uuid::Uuid::parse_str(cursor).is_err())
-            {
+            if query.cursor.as_ref().is_some_and(|cursor| {
+                cursor.len() != tirith_core::history::CURSOR_HEX_LEN
+                    || !cursor
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }) {
                 return Err("history cursor must be one issued by this service".into());
             }
             let patterns = read_patterns(service);
-            let history = service
-                .history
-                .lock()
-                .map_err(|_| "history reader is unavailable")?
-                .newest_page(
-                    query.cursor.as_deref(),
-                    query.filter,
-                    query.limit,
-                    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
-                )?;
+            let history = service.history.newest_page(
+                query.cursor.as_deref(),
+                query.filter,
+                query.limit,
+                tirith_core::audit::logging_enabled(),
+            )?;
             Ok(super::super::history::projection(&history, &patterns))
         }
         ("POST", "/api/profile/preview") => {

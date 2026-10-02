@@ -1,10 +1,13 @@
-# Incremental history contract
+# History reading contract
 
-`history::HistoryReader` is a read-only, process-local reader for one path chosen
+`history::HistoryReader` is a read-only, stateless reader for one path chosen
 by the CLI or local service. A browser supplies filters and an issued cursor,
 never a filesystem path or byte offset. Each request reads at most 2 MiB plus
 bounded generation anchors, retains at most 500 records, and rejects individual
-lines over 1 MiB. At most 128 opaque cursor capabilities remain live.
+lines over 1 MiB. The reader keeps no cursor table: a cursor carries its own
+read position and is sealed with a per-reader random secret over the read
+direction, the filter, the opened file's identity and the inspected prefix, so
+it cannot be forged, retargeted or replayed against another source.
 
 CLI recent-history, tuning and incident feedback select the newest matching
 records within a bounded suffix. Activity opens on the newest page and offers
@@ -21,12 +24,16 @@ them. Cursors are bound to their read direction and filter. Malformed records,
 oversized lines, unknown source, disabled logging and unavailable data are
 separate from an empty result.
 
-Record IDs combine a random reader generation with the original byte position.
-Retries within that generation return the same IDs. Replacing/truncating the
-file, changing the filter, restarting the reader, or using an evicted cursor
-requires the consumer to replace its view. Consumers must not append replayed
-pages to old aggregates. File identity is obtained from the retained native
-handle; bounded head/tail anchors also detect truncation and tail replacement.
+Record IDs combine a reader generation (keyed by the reader secret, the file
+identity and its first record) with the original byte position. Retries within
+that generation return the same IDs. Replacing/truncating the file, changing the
+filter, restarting the reader, or altering a cursor requires the consumer to
+replace its view. File identity is obtained from the open native handle;
+bounded head/tail anchors also detect truncation and tail replacement.
+
+The Activity summary is rebuilt from one bounded read of the newest 2 MiB suffix
+on every request, so nothing is cached between requests and every report
+replaces the previous one (`replace_previous` is always true).
 
 This is an append-oriented display index, **not an integrity verifier**. It does
 not establish that an arbitrary earlier byte range was unchanged between reads.
@@ -40,7 +47,7 @@ observation; a task-boundary entry is an assessment. None is silently promoted t
 proof that execution happened or was prevented. Recorded actions and policy
 paths retain their historical attribution.
 
-The live dashboard, incremental aggregates and retention transactions use shared
+The live dashboard, the Activity summary and retention transactions use shared
 core and CLI services. Retention preserves signed segment/head evidence and
 explicitly addresses older writers; this reader does not rotate or delete
 anything. Append-failure health and final candidate verification remain WP12

@@ -1,13 +1,14 @@
-//! Rebuildable in-memory aggregates over bounded audit pages. Only canonical
-//! rule IDs, counters, and a bounded set of examples are retained; the signed
-//! log remains authoritative. Refresh continues a cursor instead of rescanning.
+//! Aggregates over the bounded newest audit suffix, rebuilt on every request.
+//! Only canonical rule IDs, counters, and a bounded set of examples are
+//! reported; the signed log remains authoritative. Nothing is cached between
+//! requests, so a restart, rotation, clock change or newly eligible
+//! future-dated record can never leave a stale count behind.
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 
-use crate::history::{Availability, HistoryEvent, HistoryFilter, HistoryReader};
+use crate::history::{Availability, HistoryEvent, HistoryReader};
 
 const EXAMPLES_PER_RULE: usize = 3;
 const RULE_LIMIT: usize = 1024;
@@ -48,6 +49,7 @@ pub struct AggregateReport {
     pub kind: &'static str,
     pub generation: String,
     pub source_generation: Option<String>,
+    /// Always true: every report is a complete view that replaces the last.
     pub replace_previous: bool,
     pub availability: Availability,
     pub window_start: NaiveDate,
@@ -69,198 +71,84 @@ pub struct AggregateReport {
     pub semantics: &'static str,
 }
 
-const AGGREGATE_PAGE_RECORDS: usize = 500;
-/// Bounds one refresh (each page reads at most 2 MiB) while still covering a
-/// whole 2 MiB suffix of ordinary-sized records.
-const MAX_PAGES_PER_REFRESH: usize = 64;
-
-/// This cache intentionally has no serialization API. It can be rebuilt from
-/// the log after restart without duplicating command/secret material on disk.
-pub struct HistoryAggregate {
-    path: PathBuf,
-    reader: HistoryReader,
-    cursor: Option<String>,
-    source_generation: Option<String>,
-    generation: String,
-    last_offset: Option<u64>,
-    window: Option<(NaiveDate, u32)>,
-    last_time: Option<DateTime<Utc>>,
-    next_future: Option<DateTime<Utc>>,
+#[derive(Default)]
+struct Tally {
     counts: CheckCounts,
     other_records: u64,
     future_records: u64,
     invalid_rules: u64,
     omitted_rules: u64,
-    malformed: u64,
-    oversized: u64,
     rules: BTreeMap<String, RuleAggregate>,
 }
 
-impl HistoryAggregate {
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            reader: HistoryReader::new(path.clone()),
-            path,
-            cursor: None,
-            source_generation: None,
-            generation: uuid::Uuid::new_v4().to_string(),
-            last_offset: None,
-            window: None,
-            last_time: None,
-            next_future: None,
-            counts: CheckCounts::default(),
-            other_records: 0,
-            future_records: 0,
-            invalid_rules: 0,
-            omitted_rules: 0,
-            malformed: 0,
-            oversized: 0,
-            rules: BTreeMap::new(),
+/// Summarize one bounded read (at most 2 MiB) of the newest audit suffix over
+/// an explicit UTC calendar window. Future-dated records are counted apart and
+/// never inside the window.
+pub fn summarize(
+    reader: &HistoryReader,
+    now: DateTime<Utc>,
+    days: u32,
+    logging_enabled: bool,
+) -> Result<AggregateReport, &'static str> {
+    if !(1..=31).contains(&days) {
+        return Err("aggregate window must be between 1 and 31 UTC days");
+    }
+    let end = now.date_naive();
+    let start = end
+        .checked_sub_days(chrono::Days::new(u64::from(days - 1)))
+        .ok_or("aggregate date window is unsupported")?;
+    let page = reader.suffix(logging_enabled)?;
+    let mut tally = Tally::default();
+    if page.availability != Availability::RefreshRequired {
+        for event in &page.events {
+            tally.observe(event, start, now);
         }
     }
+    let mut rules: Vec<_> = tally.rules.into_values().collect();
+    rules.sort_by(|a, b| {
+        b.interruptions
+            .cmp(&a.interruptions)
+            .then_with(|| b.recorded_checks.cmp(&a.recorded_checks))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
+    let availability = if matches!(
+        page.availability,
+        Availability::Available | Availability::Empty
+    ) && tally.counts.recorded_checks > 0
+    {
+        Availability::Available
+    } else {
+        page.availability
+    };
+    Ok(AggregateReport {
+        schema_version: 1,
+        kind: "history_aggregate",
+        generation: uuid::Uuid::new_v4().to_string(),
+        source_generation: Some(page.generation),
+        replace_previous: true,
+        availability,
+        window_start: start,
+        window_end: end,
+        window_basis: "utc_calendar_days_excluding_future_timestamps",
+        counts: tally.counts,
+        other_records: tally.other_records,
+        future_dated_records: tally.future_records,
+        invalid_rule_ids: tally.invalid_rules,
+        omitted_rule_records: tally.omitted_rules,
+        malformed_lines: page.malformed_lines as u64,
+        oversized_lines: page.oversized_lines as u64,
+        incomplete_tail: page.incomplete_tail,
+        earlier_history_uninspected: page.earlier_history_uninspected,
+        more_available: page.more_available,
+        inspected_bytes_this_refresh: page.inspected_bytes,
+        rules,
+        integrity: "not_verified_by_collector",
+        semantics: "recorded_checks_not_confirmed_execution_or_prevented_attacks",
+    })
+}
 
-    fn reset(&mut self) {
-        *self = Self::new(self.path.clone());
-    }
-
-    /// Bounded pages (at most 2 MiB / 500 records each, 64 pages) per refresh.
-    /// UTC calendar windows are explicit; clock rollback, window changes and
-    /// newly eligible future-dated records rebuild rather than miscounting.
-    pub fn refresh(
-        &mut self,
-        now: DateTime<Utc>,
-        days: u32,
-        logging_enabled: bool,
-    ) -> Result<AggregateReport, &'static str> {
-        if !(1..=31).contains(&days) {
-            return Err("aggregate window must be between 1 and 31 UTC days");
-        }
-        let end = now.date_naive();
-        let start = end
-            .checked_sub_days(chrono::Days::new(u64::from(days - 1)))
-            .ok_or("aggregate date window is unsupported")?;
-        let mut replace = self.window != Some((end, days))
-            || self.last_time.is_some_and(|last| now < last)
-            || self.next_future.is_some_and(|future| now >= future);
-        if replace {
-            self.reset();
-        }
-        self.window = Some((end, days));
-        self.last_time = Some(now);
-        // Catch up to the end of the log in this refresh. One page holds at
-        // most 500 records; stopping after it would show the oldest records of
-        // the suffix and leave the newest ones for later refreshes.
-        let mut pages = 0;
-        let mut inspected = 0u64;
-        let mut earlier_uninspected = false;
-        let page = loop {
-            let page = self.reader.query(
-                self.cursor.as_deref(),
-                HistoryFilter::default(),
-                AGGREGATE_PAGE_RECORDS,
-                logging_enabled,
-            )?;
-            pages += 1;
-            inspected = inspected.saturating_add(page.inspected_bytes);
-            if page.availability == Availability::RefreshRequired
-                || matches!(
-                    page.availability,
-                    Availability::Absent | Availability::Unreadable | Availability::Disabled
-                )
-            {
-                self.reset();
-                self.window = Some((end, days));
-                self.last_time = Some(now);
-                replace = true;
-            } else if self
-                .source_generation
-                .as_ref()
-                .is_some_and(|generation| generation != &page.generation)
-            {
-                // This page and its cursor belong to the live reader. Retain that
-                // reader while discarding aggregates from the previous source.
-                let reader =
-                    std::mem::replace(&mut self.reader, HistoryReader::new(self.path.clone()));
-                self.reset();
-                self.reader = reader;
-                self.window = Some((end, days));
-                self.last_time = Some(now);
-                replace = true;
-            }
-            self.source_generation = Some(page.generation.clone());
-            if page.availability != Availability::RefreshRequired {
-                self.cursor = page.next_cursor.clone();
-                self.malformed = self.malformed.saturating_add(page.malformed_lines as u64);
-                self.oversized = self.oversized.saturating_add(page.oversized_lines as u64);
-                for event in &page.events {
-                    self.observe(event, start, now);
-                }
-            }
-            earlier_uninspected |= page.earlier_history_uninspected;
-            // A short page reached the end of its byte window (or an
-            // unfinished last line); only a full page can have more after it.
-            if page.availability == Availability::RefreshRequired
-                || !page.more_available
-                || page.events.len() < AGGREGATE_PAGE_RECORDS
-                || pages >= MAX_PAGES_PER_REFRESH
-            {
-                break page;
-            }
-        };
-        let mut rules: Vec<_> = self.rules.values().cloned().collect();
-        rules.sort_by(|a, b| {
-            b.interruptions
-                .cmp(&a.interruptions)
-                .then_with(|| b.recorded_checks.cmp(&a.recorded_checks))
-                .then_with(|| a.rule_id.cmp(&b.rule_id))
-        });
-        let availability = if matches!(
-            page.availability,
-            Availability::Available | Availability::Empty
-        ) && self.counts.recorded_checks > 0
-        {
-            Availability::Available
-        } else {
-            page.availability
-        };
-        Ok(AggregateReport {
-            schema_version: 1,
-            kind: "history_aggregate",
-            generation: self.generation.clone(),
-            source_generation: self.source_generation.clone(),
-            replace_previous: replace,
-            availability,
-            window_start: start,
-            window_end: end,
-            window_basis: "utc_calendar_days_excluding_future_timestamps",
-            counts: self.counts.clone(),
-            other_records: self.other_records,
-            future_dated_records: self.future_records,
-            invalid_rule_ids: self.invalid_rules,
-            omitted_rule_records: self.omitted_rules,
-            malformed_lines: self.malformed,
-            oversized_lines: self.oversized,
-            incomplete_tail: page.incomplete_tail,
-            earlier_history_uninspected: earlier_uninspected,
-            more_available: page.more_available,
-            inspected_bytes_this_refresh: inspected,
-            rules,
-            integrity: "not_verified_by_collector",
-            semantics: "recorded_checks_not_confirmed_execution_or_prevented_attacks",
-        })
-    }
-
+impl Tally {
     fn observe(&mut self, event: &HistoryEvent, start: NaiveDate, now: DateTime<Utc>) {
-        let Some((_, raw_offset)) = event.record_id.rsplit_once(':') else {
-            return;
-        };
-        let Ok(offset) = raw_offset.parse::<u64>() else {
-            return;
-        };
-        if self.last_offset.is_some_and(|last| offset <= last) {
-            return;
-        }
-        self.last_offset = Some(offset);
         let Ok(timestamp) = DateTime::parse_from_rfc3339(&event.record.timestamp)
             .map(|time| time.with_timezone(&Utc))
         else {
@@ -268,10 +156,6 @@ impl HistoryAggregate {
         };
         if timestamp > now {
             self.future_records = self.future_records.saturating_add(1);
-            self.next_future = Some(
-                self.next_future
-                    .map_or(timestamp, |previous| previous.min(timestamp)),
-            );
             return;
         }
         if timestamp.date_naive() < start {
@@ -392,13 +276,17 @@ mod tests {
             serde_json::json!({"timestamp":timestamp,"action":action,"entry_type":kind,"command_redacted":"private fixture","rule_ids":["curl_pipe_shell","curl_pipe_shell"],"bypass_requested":true,"bypass_honored":false})
         )
     }
+    fn refresh(reader: &HistoryReader, now: DateTime<Utc>) -> AggregateReport {
+        summarize(reader, now, 7, true).unwrap()
+    }
+
     #[test]
     fn first_refresh_counts_the_newest_records_not_only_the_oldest_page() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("log");
         // More than one 500-record page: 550 allowed checks, then the newest
-        // 100 checks are blocks. A first refresh must observe the newest
-        // records instead of stopping after the oldest page of the suffix.
+        // 100 checks are blocks. A refresh must observe the newest records
+        // instead of stopping after the oldest page of the suffix.
         let mut log = String::new();
         for _ in 0..550 {
             log.push_str(&line("2026-09-12T00:00:00Z", "Allow", "verdict"));
@@ -407,14 +295,31 @@ mod tests {
             log.push_str(&line("2026-09-12T00:05:00Z", "Block", "verdict"));
         }
         std::fs::write(&path, log).unwrap();
-        let mut cache = HistoryAggregate::new(path.clone());
-        let first = cache.refresh(now(), 7, true).unwrap();
+        let reader = HistoryReader::new(path.clone());
+        let first = refresh(&reader, now());
         assert_eq!(first.counts.recorded_checks, 650);
         assert_eq!(first.counts.blocked_checks, 100);
         assert!(!first.more_available);
-        let retry = cache.refresh(now(), 7, true).unwrap();
+        assert!(first.inspected_bytes_this_refresh <= 2 * 1024 * 1024);
+        let retry = refresh(&reader, now());
         assert_eq!(retry.counts.recorded_checks, 650);
-        assert!(!retry.replace_previous);
+        assert!(retry.replace_previous);
+        assert_eq!(retry.source_generation, first.source_generation);
+    }
+
+    #[test]
+    fn a_suffix_larger_than_the_window_is_bounded_and_marked() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("log");
+        let record = line("2026-09-12T00:00:00Z", "Block", "verdict");
+        let count = (3 * 1024 * 1024) / record.len() + 1;
+        std::fs::write(&path, record.repeat(count)).unwrap();
+        let report = refresh(&HistoryReader::new(path), now());
+        assert!(report.inspected_bytes_this_refresh <= 2 * 1024 * 1024);
+        assert!(report.earlier_history_uninspected);
+        assert_eq!(report.availability, Availability::Partial);
+        assert!(report.counts.blocked_checks > 0);
+        assert!((report.counts.blocked_checks as usize) < count);
     }
 
     #[test]
@@ -427,21 +332,20 @@ mod tests {
                 + &line("2026-09-12T00:01:00Z", "Allow", "trust_change"),
         )
         .unwrap();
-        let mut cache = HistoryAggregate::new(path.clone());
-        let first = cache.refresh(now(), 7, true).unwrap();
+        let reader = HistoryReader::new(path.clone());
+        let first = refresh(&reader, now());
         assert_eq!(first.counts.recorded_checks, 1);
         assert_eq!(first.other_records, 1);
         assert_eq!(first.rules[0].recorded_checks, 1);
-        let retry = cache.refresh(now(), 7, true).unwrap();
+        let retry = refresh(&reader, now());
         assert_eq!(retry.counts.recorded_checks, 1);
-        assert!(!retry.replace_previous);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()
             .write_all(line("2026-09-12T00:02:00Z", "Block", "verdict").as_bytes())
             .unwrap();
-        let after = cache.refresh(now(), 7, true).unwrap();
+        let after = refresh(&reader, now());
         assert_eq!(after.counts.recorded_checks, 2);
         assert_eq!(after.counts.blocked_checks, 1);
         assert_eq!(after.counts.acknowledgement_required_checks, 1);
@@ -451,42 +355,39 @@ mod tests {
         assert!(!displayed.to_string().contains("private fixture"));
         assert_eq!(displayed["rules"][0]["rule_id"], "curl_pipe_shell");
     }
+
     #[test]
-    fn restart_rotation_clock_change_and_future_records_replace_the_view() {
+    fn rotation_clock_change_and_future_records_are_reflected_on_the_next_read() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("log");
         std::fs::write(&path, line("2026-09-12T12:01:00Z", "Block", "verdict")).unwrap();
-        let mut cache = HistoryAggregate::new(path.clone());
-        let before = cache.refresh(now(), 7, true).unwrap();
+        let reader = HistoryReader::new(path.clone());
+        let before = refresh(&reader, now());
         assert_eq!(before.counts.recorded_checks, 0);
         assert_eq!(before.future_dated_records, 1);
-        let after = cache
-            .refresh(now() + chrono::Duration::minutes(2), 7, true)
-            .unwrap();
+        let after = refresh(&reader, now() + chrono::Duration::minutes(2));
         assert!(after.replace_previous);
         assert_eq!(after.counts.recorded_checks, 1);
-        let rewind = cache.refresh(now(), 7, true).unwrap();
-        assert!(rewind.replace_previous);
+        let rewind = refresh(&reader, now());
         assert_eq!(rewind.counts.recorded_checks, 0);
-        let mut restarted = HistoryAggregate::new(path.clone());
-        let restart = restarted.refresh(now(), 7, true).unwrap();
+        let restart = refresh(&HistoryReader::new(path.clone()), now());
         assert_ne!(restart.generation, rewind.generation);
+        assert_ne!(restart.source_generation, rewind.source_generation);
         std::fs::write(&path, line("2026-09-12T11:01:00Z", "Allow", "verdict")).unwrap();
-        let changed = cache.refresh(now(), 7, true).unwrap();
-        assert!(changed.replace_previous);
-        assert!(changed.counts.recorded_checks <= 1);
-        let rebuilt = cache.refresh(now(), 7, true).unwrap();
+        let rebuilt = refresh(&reader, now());
+        assert_ne!(rebuilt.source_generation, rewind.source_generation);
         assert_eq!(rebuilt.counts.recorded_checks, 1);
         assert_eq!(rebuilt.counts.allowed_checks, 1);
-        let disabled = cache.refresh(now(), 7, false).unwrap();
+        assert_eq!(rebuilt.counts.blocked_checks, 0);
+        let disabled = summarize(&reader, now(), 7, false).unwrap();
         assert_eq!(disabled.availability, Availability::Disabled);
         assert_eq!(disabled.counts.recorded_checks, 0);
-        let reenabled = cache.refresh(now(), 7, true).unwrap();
+        let reenabled = refresh(&reader, now());
         assert_eq!(reenabled.counts.recorded_checks, 1);
-        let repeated = cache.refresh(now(), 7, true).unwrap();
-        assert_eq!(repeated.counts.recorded_checks, 1);
-        assert!(!repeated.replace_previous);
+        assert!(summarize(&reader, now(), 0, true).is_err());
+        assert!(summarize(&reader, now(), 32, true).is_err());
     }
+
     #[test]
     fn oversized_examples_do_not_leak_newly_protected_secret_prefixes() {
         let temp = tempfile::tempdir().unwrap();
@@ -494,7 +395,7 @@ mod tests {
         let secret = "sensitive".repeat(100);
         let record = serde_json::json!({"timestamp":"2026-09-12T11:00:00Z", "action":"Block", "entry_type":"verdict", "command_redacted":secret, "rule_ids":["curl_pipe_shell"]});
         std::fs::write(&path, format!("{record}\n")).unwrap();
-        let report = HistoryAggregate::new(path).refresh(now(), 7, true).unwrap();
+        let report = refresh(&HistoryReader::new(path), now());
         let projection = display_projection(&report, &[secret]);
         assert!(projection["rules"][0]["examples"][0]["command_truncated"]
             .as_bool()

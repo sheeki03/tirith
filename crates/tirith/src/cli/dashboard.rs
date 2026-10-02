@@ -19,11 +19,18 @@
 //! * Zero telemetry/network beyond the bound loopback port.
 //!
 //! The authorization decision is a PURE function ([`authorize`]), unit-testable
-//! without a socket; the accept loop is a thin shell around it.
+//! without a socket; the accept loop is a thin shell around it. Requests are
+//! read and answered by the same bounded loopback transport as the control
+//! dashboard (`cli::control::http`), with the report's own request rules and
+//! response policy.
 
-use std::net::SocketAddr;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::cli::control::http;
 
 use chrono::{DateTime, Utc};
 use tirith_core::dashboard::{self, DashboardSnapshot, HookSummary};
@@ -40,9 +47,20 @@ fn mono_ttl_expired(elapsed: Duration) -> bool {
     elapsed >= TOKEN_TTL
 }
 
-/// How long the accept loop blocks per `recv_timeout` before re-checking the
-/// TTL / shutdown — responsive to expiry without busy-polling.
-const ACCEPT_POLL: Duration = Duration::from_millis(500);
+/// How long the accept loop waits between polls of its nonblocking listener
+/// before re-checking the TTL — responsive to expiry without busy-polling.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Connections served at once. A slow client holds one slot for at most the
+/// transport's request deadline; further connections are closed immediately.
+const MAX_CONNECTIONS: usize = 8;
+
+/// The report has no scripts; inline styles only.
+const REPORT_RESPONSE: http::ResponsePolicy = http::ResponsePolicy {
+    content_security_policy: "default-src 'none'; style-src 'unsafe-inline'",
+    max_bytes: usize::MAX,
+    deadline: Duration::from_secs(30),
+};
 
 /// The outcome of authorizing a request — maps directly to an HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,11 +367,8 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
 /// `127.0.0.1:0` when `port` is `None`. NEVER `0.0.0.0`: the dashboard must not
 /// be reachable off-host. Factored out of [`serve`] so the loopback-only
 /// invariant is unit-testable against the production bind (finding F2).
-fn bind_loopback(
-    port: Option<u16>,
-) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let bind_addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
-    tiny_http::Server::http(bind_addr)
+fn bind_loopback(port: Option<u16>) -> std::io::Result<TcpListener> {
+    TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(0)))
 }
 
 /// `tirith dashboard serve [--port <p>] [--json]`. Binds `127.0.0.1:<port>`
@@ -389,14 +404,18 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         }
     };
 
-    // Resolve the actual bound port (the ephemeral `:0` case).
-    let actual_port = match server.server_addr().to_ip() {
-        Some(addr) => addr.port(),
-        None => {
+    // Resolve the actual bound port (the ephemeral `:0` case). The accept
+    // loop polls a nonblocking listener so it can stop at the TTL.
+    let actual_port = match server
+        .set_nonblocking(true)
+        .and_then(|()| server.local_addr())
+    {
+        Ok(addr) => addr.port(),
+        Err(e) => {
             if !emit_error(
                 json,
                 "tirith dashboard serve",
-                "bound socket has no IP address",
+                &format!("cannot configure the bound socket: {e}"),
             ) {
                 return 2;
             }
@@ -466,17 +485,19 @@ fn loop_outcome_exit_code(outcome: LoopOutcome) -> i32 {
     }
 }
 
-/// The blocking accept loop — re-renders the snapshot per request and routes
-/// each through [`authorize`]. `recv_timeout` lets it wake periodically and exit
-/// once the TTL elapses (the token can't be revived); SIGINT ends the process.
-/// TTL is enforced with a MONOTONIC [`Instant`] (clock-jump-resistant); the
-/// wall-clock TTL in [`authorize`] stays as defense-in-depth.
+/// The accept loop — each connection is read and answered on its own thread
+/// (at most [`MAX_CONNECTIONS`] at once) through [`handle_connection`]. The
+/// listener is polled so the loop exits once the TTL elapses (the token can't
+/// be revived); SIGINT ends the process. TTL is enforced with a MONOTONIC
+/// [`Instant`] (clock-jump-resistant); the wall-clock TTL in [`authorize`]
+/// stays as defense-in-depth.
 fn serve_loop(
-    server: &tiny_http::Server,
+    server: &TcpListener,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
 ) -> LoopOutcome {
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         // Stop once the token expires (every request would 401). Monotonic:
         // immune to a backward clock jump. Normal end-of-life, not a failure.
@@ -485,10 +506,40 @@ fn serve_loop(
             return LoopOutcome::TtlExpired;
         }
 
-        match server.recv_timeout(ACCEPT_POLL) {
-            Ok(Some(request)) => handle_request(request, token, issued_at, issued_mono),
-            Ok(None) => continue, // expected TTL-poll tick; re-check the TTL
-            // A genuine recv/accept error: the server can no longer serve, so
+        match server.accept() {
+            Ok((stream, _)) => {
+                if active
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < MAX_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    // Closing immediately bounds overload work.
+                    continue;
+                }
+                let slot = Arc::clone(&active);
+                let token = token.to_string();
+                let spawned = std::thread::Builder::new()
+                    .name("tirith-dashboard".into())
+                    .spawn(move || {
+                        handle_connection(stream, &token, issued_at, issued_mono);
+                        slot.fetch_sub(1, Ordering::AcqRel);
+                    });
+                if spawned.is_err() {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            // The expected poll tick; re-check the TTL.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_POLL),
+            // A connection that went away before it was accepted.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            // A genuine accept error: the server can no longer serve, so
             // surface it as fatal rather than a false success.
             Err(e) => {
                 eprintln!("tirith dashboard serve: accept error: {e}");
@@ -498,91 +549,58 @@ fn serve_loop(
     }
 }
 
-/// Apply the response-hardening header set (Cache-Control no-store, strict CSP,
-/// nosniff, no-referrer) to `response`. Applied to EVERY response — 200/401/403
-/// — so hardening can't drift between paths (finding D6-3). `Header::from_bytes`
-/// only fails on non-ASCII, which none of these are.
-fn with_security_headers(
-    mut response: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
-) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    for (name, value) in [
-        ("Content-Type", "text/html; charset=utf-8"),
-        // Strict CSP — the report has no scripts; this blocks any injected one.
-        (
-            "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'",
-        ),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Referrer-Policy", "no-referrer"),
-        ("Cache-Control", "no-store"),
-    ] {
-        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response = response.with_header(h);
-        }
-    }
-    response
-}
-
-/// Authorize + respond to one request: pull `Host` + the `token` query param,
-/// call [`authorize`], emit 200 (HTML) / 401 / 403. Authorization is decided
-/// BEFORE the body is touched (finding K), so an unauthenticated client can't
-/// make us buffer an unbounded body. We never read the body at all — even when
-/// authorized (finding R12-4): a post-auth drain would let a valid-token client
-/// trickle a body and stall this single-threaded loop. `tiny_http` discards any
-/// unread body on drop.
-fn handle_request(
-    request: tiny_http::Request,
+/// The status and body for one request: the authoritative monotonic TTL
+/// first, then [`authorize`] (Host before token), then a fresh render.
+fn respond_to(
+    request: &http::Request,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
-) {
+) -> (u16, String) {
     // AUTHORITATIVE TTL gate, checked FIRST (R7-4): a monotonic `Instant` can't
     // be wound back, so an expired token 401s here even if `authorize`'s
     // wall-clock TTL were defeated by a backward clock jump.
     if mono_ttl_expired(issued_mono.elapsed()) {
-        let response = tiny_http::Response::from_string("401 Unauthorized").with_status_code(401);
-        let _ = request.respond(with_security_headers(response));
-        return;
+        return (401, "401 Unauthorized".into());
     }
-
-    let host_header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().to_string());
-    let query_token = token_from_target(request.url());
-
-    let decision = authorize(
-        host_header.as_deref(),
+    let query_token = token_from_target(&request.target);
+    match authorize(
+        request.header("host"),
         query_token.as_deref(),
         token,
         Utc::now(),
         issued_at,
-    );
-
-    // Reject unauthorized/forbidden immediately, WITHOUT reading the body, with
-    // the same hardening headers as the 200 path.
-    if decision != Decision::Ok {
-        let response = match decision {
-            Decision::Unauthorized => {
-                tiny_http::Response::from_string("401 Unauthorized").with_status_code(401)
-            }
-            Decision::Forbidden => {
-                tiny_http::Response::from_string("403 Forbidden").with_status_code(403)
-            }
-            Decision::Ok => unreachable!("handled above"),
-        };
-        let _ = request.respond(with_security_headers(response));
-        return;
+    ) {
+        // Re-render fresh so a long-lived tab reflects new activity (the
+        // render escapes every value).
+        Decision::Ok => (200, dashboard::render_html(&build_snapshot())),
+        Decision::Unauthorized => (401, "401 Unauthorized".into()),
+        Decision::Forbidden => (403, "403 Forbidden".into()),
     }
+}
 
-    // Authorized — respond immediately without reading the body (R12-4); a
-    // post-auth drain would stall this single-threaded loop. Re-render fresh so
-    // a long-lived tab reflects new activity (the render escapes every value).
-    let snapshot = build_snapshot();
-    let html = dashboard::render_html(&snapshot);
-    let response = with_security_headers(tiny_http::Response::from_string(html));
-    let _ = request.respond(response);
+/// Read one bounded request and answer it. The decision never depends on the
+/// body: a declared body (at most 16 KiB, within the transport's request
+/// deadline) is read and discarded only so the response is not lost to a
+/// connection reset. Every response, including transport errors, carries the
+/// same hardening headers (finding D6-3).
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    issued_at: DateTime<Utc>,
+    issued_mono: Instant,
+) {
+    let (status, body) = match http::read(&mut stream, http::Rules::Report, |_| Ok(())) {
+        Ok((request, ())) => respond_to(&request, token, issued_at, issued_mono),
+        Err(error) => (error.status, format!("{} {}", error.status, error.message)),
+    };
+    let _ = http::respond_with(
+        &mut stream,
+        status,
+        "text/html; charset=utf-8",
+        &REPORT_RESPONSE,
+        body.as_bytes(),
+    );
 }
 
 #[cfg(test)]
@@ -707,11 +725,8 @@ mod tests {
 
     /// Assert a `bind_loopback` server's address is IPv4 loopback specifically
     /// (loopback AND not `0.0.0.0`).
-    fn assert_bound_loopback(server: &tiny_http::Server, label: &str) {
-        let addr = server
-            .server_addr()
-            .to_ip()
-            .expect("bound socket has an IP");
+    fn assert_bound_loopback(server: &TcpListener, label: &str) {
+        let addr = server.local_addr().expect("bound socket has an IP");
         assert!(
             addr.ip().is_loopback(),
             "{label}: bind address {} must be loopback",
@@ -730,7 +745,7 @@ mod tests {
         // `None` → ephemeral `127.0.0.1:0`; the IP must still be IPv4 loopback.
         let server = bind_loopback(None).expect("ephemeral loopback bind must succeed");
         assert_bound_loopback(&server, "bind_loopback(None)");
-        let port = server.server_addr().to_ip().unwrap().port();
+        let port = server.local_addr().unwrap().port();
         assert_ne!(port, 0, "an ephemeral bind must resolve to a concrete port");
     }
 
@@ -743,7 +758,7 @@ mod tests {
         // P stays occupied for the whole window.
         let held = bind_loopback(None).expect("hold a loopback server");
         assert_bound_loopback(&held, "held loopback server");
-        let port = held.server_addr().to_ip().unwrap().port();
+        let port = held.local_addr().unwrap().port();
 
         let second = bind_loopback(Some(port));
         assert!(
@@ -1039,12 +1054,35 @@ mod tests {
     // Light integration test (invariants B/D/E end-to-end over a real socket).
     // The security LOGIC lives in the pure `authorize` tests above; this binds
     // 127.0.0.1:0 and pushes forged raw HTTP/1.1 requests through
-    // `handle_request` to confirm the bound server wires each decision to the
+    // `handle_connection` to confirm the bound server wires each decision to the
     // right status code. We forge the `Host` header by hand — what a
     // DNS-rebinding attacker's browser does.
 
     use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
+
+    /// Bind through the production `bind_loopback` and answer `count`
+    /// connections, one at a time, through the production `handle_connection`.
+    fn serve_connections(
+        count: usize,
+        token: &str,
+        issued: DateTime<Utc>,
+        issued_mono: Instant,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let server = bind_loopback(None).expect("bind 127.0.0.1:0");
+        let addr = server.local_addr().expect("ip addr");
+        // INVARIANT B: the bound address is loopback, never 0.0.0.0.
+        assert!(addr.ip().is_loopback(), "must bind a loopback address");
+        let tok = token.to_string();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                match server.accept() {
+                    Ok((stream, _)) => handle_connection(stream, &tok, issued, issued_mono),
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr.port(), handle)
+    }
 
     /// Send a raw HTTP/1.1 GET with an explicit `Host` and return
     /// `(status_code, raw_text)` — the raw text includes the header block for
@@ -1079,23 +1117,8 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let addr = server.server_addr().to_ip().expect("ip addr");
-        // INVARIANT B: the bound address is loopback, never 0.0.0.0.
-        assert!(addr.ip().is_loopback(), "must bind a loopback address");
-        let port = addr.port();
-
         // Handle exactly three requests on a worker thread, then drop the server.
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
-                match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
-                    Err(_) => break,
-                }
-            }
-        });
+        let (port, handle) = serve_connections(3, token, issued, issued_mono);
 
         // 1. Good loopback Host + good token → 200.
         assert_eq!(
@@ -1134,20 +1157,8 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let port = server.server_addr().to_ip().expect("ip addr").port();
-
         // Handle exactly two requests: one 401, one 403.
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
-                match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
-                    Err(_) => break,
-                }
-            }
-        });
+        let (port, handle) = serve_connections(2, token, issued, issued_mono);
 
         // Assert a response's header block carries every hardening header,
         // case-insensitively (HTTP header names are case-insensitive).
@@ -1192,16 +1203,7 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let port = server.server_addr().to_ip().expect("ip addr").port();
-
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            if let Ok(req) = server.recv() {
-                handle_request(req, &tok, issued, issued_mono);
-            }
-        });
+        let (port, handle) = serve_connections(1, token, issued, issued_mono);
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         // Foreign Host + a complete body present, so the 403 verdict provably
@@ -1259,8 +1261,8 @@ mod tests {
     // We hold `ENV_LOCK` and point every base at fresh empty temp dirs (+ empty
     // cwd, no `.git`) so the build is fast, deterministic, and unraceable.
     //
-    // (We don't test a never-completed oversized body: tiny_http 0.12's own
-    // `respond` blocks reconciling an unread lazy body regardless of our code.)
+    // (A never-completed body is cut off by the shared transport's bounded
+    // request deadline; see `control::http` tests.)
     #[test]
     fn authorized_request_is_served_without_body_drain() {
         use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
@@ -1294,22 +1296,13 @@ mod tests {
         // Empty cwd (no `.git`) so the repo-scope overlays resolve to nothing.
         let _cwd = CwdGuard::set(cwd_tmp.path());
 
-        // Serve one forged request through the real `handle_request` and return
+        // Serve one forged request through the real `handle_connection` and return
         // its status. A deadline-bounded read makes a re-introduced drain fail
         // (not flakily).
         fn serve_one(token: &str, raw_request: &str) -> u16 {
             let issued = Utc::now();
             let issued_mono = Instant::now();
-            let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .expect("bind 127.0.0.1:0");
-            let port = server.server_addr().to_ip().expect("ip addr").port();
-
-            let tok = token.to_string();
-            let handle = std::thread::spawn(move || {
-                if let Ok(req) = server.recv() {
-                    handle_request(req, &tok, issued, issued_mono);
-                }
-            });
+            let (port, handle) = serve_connections(1, token, issued, issued_mono);
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
             // The forged request carries a `{port}` placeholder for the Host.
@@ -1398,6 +1391,53 @@ mod tests {
             serve_one(token, &post),
             200,
             "an authorized request with a complete body must still be served 200"
+        );
+    }
+
+    // The shared transport keeps what browsers and simple clients send working:
+    // HTTP/1.0, other methods, and large cookie headers for the loopback host.
+    #[test]
+    fn report_requests_beyond_the_control_api_shape_still_get_the_report_decision() {
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let (port, handle) = serve_connections(3, token, Utc::now(), Instant::now());
+        let send = |raw: String| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            stream.write_all(raw.as_bytes()).expect("write request");
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let http10 = send(format!(
+            "GET /?token={token} HTTP/1.0\r\nHost: evil.example.com\r\n\r\n"
+        ));
+        assert!(http10.starts_with("HTTP/1.1 403"), "{http10:?}");
+        let head = send(format!(
+            "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        ));
+        assert!(head.starts_with("HTTP/1.1 401"), "{head:?}");
+        let cookies = send(format!(
+            "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {}\r\n\r\n",
+            "c".repeat(16 * 1024)
+        ));
+        assert!(cookies.starts_with("HTTP/1.1 401"), "{cookies:?}");
+        assert!(cookies
+            .to_ascii_lowercase()
+            .contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'"));
+        handle.join().expect("server thread");
+    }
+
+    // The accept loop ends at the monotonic TTL (exit 0) without needing a
+    // request to arrive.
+    #[test]
+    fn serve_loop_stops_at_the_token_ttl() {
+        let Some(issued_mono) = Instant::now().checked_sub(TOKEN_TTL) else {
+            return;
+        };
+        let server = bind_loopback(None).expect("bind 127.0.0.1:0");
+        server.set_nonblocking(true).expect("nonblocking listener");
+        assert_eq!(
+            serve_loop(&server, "token", Utc::now(), issued_mono),
+            LoopOutcome::TtlExpired
         );
     }
 }

@@ -54,7 +54,7 @@ pub fn recent(
                 rule,
             },
             limit,
-            std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+            tirith_core::audit::logging_enabled(),
         )?;
         let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(
             &policy.policy.dlp_custom_patterns,

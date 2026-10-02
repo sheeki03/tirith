@@ -262,7 +262,7 @@ fn main() {
     }
     drop(file);
     let history_bytes = std::fs::metadata(&history).unwrap().len();
-    let mut reader = HistoryReader::new(history);
+    let reader = HistoryReader::new(history);
     results.push(measure("history_recent_100", samples, || {
         let page = reader.recent(HistoryFilter::default(), 100, true).unwrap();
         assert_eq!(page.events.len(), 100);

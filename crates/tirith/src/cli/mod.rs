@@ -72,6 +72,30 @@ pub(crate) fn offline_env_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Bound diagnostics shown in a JSON response: at most `cap` messages, each
+/// passed through `project` (for example DLP redaction) and withheld when it
+/// exceeds 1 KiB. Returns the shown messages and how many were omitted.
+pub(crate) fn bounded_diagnostics(
+    messages: Vec<String>,
+    cap: usize,
+    project: impl Fn(&str) -> String,
+) -> (Vec<String>, usize) {
+    let omitted = messages.len().saturating_sub(cap);
+    let shown = messages
+        .iter()
+        .take(cap)
+        .map(|message| {
+            let shown = project(message);
+            if shown.len() > 1024 {
+                "[withheld: diagnostic exceeds output limit]".to_string()
+            } else {
+                shown
+            }
+        })
+        .collect();
+    (shown, omitted)
+}
+
 /// Write `value` as pretty JSON + trailing newline to stdout through one locked
 /// handle with fallible ops, so a broken pipe returns `false` rather than
 /// panicking (a bare `println!` would). `ctx` is the stderr message on failure.

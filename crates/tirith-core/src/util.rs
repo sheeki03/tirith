@@ -716,6 +716,12 @@ pub fn hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }
 
+/// Stable identity of an open file: Unix `(st_dev, st_ino)`, Windows volume
+/// serial and file index. Taken from the open handle, never from a path.
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    dirfd::file_identity(file)
+}
+
 /// Lowercase hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

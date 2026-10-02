@@ -32,15 +32,7 @@ fn present(report: &ProjectReview, scope: &Path) -> Result<Value, String> {
     let mut value = report.projection(&patterns)?;
     let diagnostics = tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled);
     value["redaction"] = json!({"source":"trusted_local_policy","remote_policy":"unavailable_offline","effective_runtime_policy":false});
-    value["diagnostics"] = json!(diagnostics
-        .into_iter()
-        .take(16)
-        .map(|text| if text.len() > 1024 {
-            "[withheld: diagnostic exceeds output limit]".to_string()
-        } else {
-            text
-        })
-        .collect::<Vec<_>>());
+    value["diagnostics"] = json!(super::bounded_diagnostics(diagnostics, 16, str::to_string).0);
     Ok(value)
 }
 

@@ -84,8 +84,7 @@ impl DirectoryIdentity {
                 self.private_leaf && index + 1 == self.held.len(),
                 index + 1 < self.held.len(),
             )?;
-            if native::identity(&before.file)? != before.identity || before.identity != now.identity
-            {
+            if identity(&before.file)? != before.identity || before.identity != now.identity {
                 return Err(
                     "private control directory identity changed; reopen the dashboard".into(),
                 );
@@ -95,13 +94,19 @@ impl DirectoryIdentity {
     }
 }
 
+/// The identity of an open object (Unix device/inode, Windows volume/file
+/// index), shared with the core contained-file primitives.
+fn identity(file: &File) -> Result<(u64, u64), String> {
+    tirith_core::util::file_identity(file).map_err(|_| "cannot inspect native file identity".into())
+}
+
 fn capture_directories(path: &Path, private_leaf: bool) -> Result<Vec<HeldDirectory>, String> {
     let files = native::open_chain(path)?;
     let mut held = Vec::with_capacity(files.len());
     let count = files.len();
     for (index, file) in files.into_iter().enumerate() {
         native::validate_directory(&file, private_leaf && index + 1 == count, index + 1 < count)?;
-        let identity = native::identity(&file)?;
+        let identity = identity(&file)?;
         held.push(HeldDirectory { file, identity });
     }
     Ok(held)
@@ -427,13 +432,6 @@ mod native {
         Err("control directory ACL verification is unsupported on this platform".into())
     }
 
-    pub fn identity(file: &File) -> Result<(u64, u64), String> {
-        let metadata = file
-            .metadata()
-            .map_err(|_| "cannot inspect native file identity")?;
-        Ok((metadata.dev(), metadata.ino()))
-    }
-
     pub fn generation(file: &File) -> Result<Generation, String> {
         let metadata = file
             .metadata()
@@ -540,14 +538,6 @@ mod native {
         Ok(info)
     }
 
-    pub fn identity(file: &File) -> Result<(u64, u64), String> {
-        let info = information(file)?;
-        Ok((
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        ))
-    }
-
     pub fn generation(file: &File) -> Result<Generation, String> {
         let info = information(file)?;
         if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
@@ -566,7 +556,7 @@ mod native {
         }
         .map_err(|_| "cannot inspect binary change generation")?;
         Ok(Generation {
-            identity: identity(file)?,
+            identity: super::identity(file)?,
             size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
             links: u64::from(info.nNumberOfLinks),
             modified: (basic.LastWriteTime, 0),
@@ -584,9 +574,6 @@ mod native {
     }
     pub fn validate_directory(_: &File, _: bool, _: bool) -> Result<(), String> {
         Err("directory permissions are unsupported".into())
-    }
-    pub fn identity(_: &File) -> Result<(u64, u64), String> {
-        Err("native file identity is unsupported".into())
     }
     pub fn generation(_: &File) -> Result<Generation, String> {
         Err("native file generation is unsupported".into())

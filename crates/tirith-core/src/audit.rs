@@ -612,7 +612,7 @@ fn append_to_audit_log_unobserved(
     log_path: Option<PathBuf>,
     trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
 ) -> AuditWrite {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
+    if !logging_enabled() {
         return AuditWrite::Skipped;
     }
 
@@ -2133,7 +2133,7 @@ pub(crate) fn log_artifact_scan_receipt(
 ) -> ReceiptAnchor {
     // Preserve the ordinary logging-off/no-destination behavior without trying
     // to establish a trust capability that will never reach a durable sink.
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+    if !logging_enabled() || default_log_path().is_none() {
         return ReceiptAnchor::Skipped;
     }
     let trusted_detail =
@@ -2216,7 +2216,7 @@ pub(crate) fn log_capsule_run_receipt(
     content_sha256: &str,
     status: &str,
 ) -> ReceiptAnchor {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+    if !logging_enabled() || default_log_path().is_none() {
         return ReceiptAnchor::Skipped;
     }
     let trusted_detail =
@@ -2286,6 +2286,11 @@ fn default_log_path() -> Option<PathBuf> {
 
 /// Public accessor for the audit log path (so out-of-crate readers need not
 /// hard-code `data_dir()/log.jsonl`).
+/// Whether audit logging is on (`TIRITH_LOG=0` turns it off).
+pub fn logging_enabled() -> bool {
+    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0")
+}
+
 pub fn audit_log_path() -> Option<PathBuf> {
     default_log_path()
 }

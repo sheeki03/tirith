@@ -168,7 +168,7 @@ pub(crate) fn read() -> AuditHealth {
         detects_all_losses: false,
         claims_current_success: false,
     };
-    if std::env::var("TIRITH_LOG").as_deref() == Ok("0") {
+    if !tirith_core::audit::logging_enabled() {
         result.state = HealthState::Disabled;
         return result;
     }

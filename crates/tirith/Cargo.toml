@@ -96,9 +96,6 @@ toml_edit = { workspace = true }
 # (2.x, deflate only); already in the lockfile, no new transitive resolution.
 # License: MIT.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Synchronous loopback HTTP server for `tirith dashboard serve` (M13 ch3).
-# Bound to 127.0.0.1 ONLY; never exposed off-host.
-tiny_http = { workspace = true }
 # M14 (IDE Extensions) — `tirith lsp` runs a Language Server over stdio so an
 # editor extension can surface tirith diagnostics inline. tower-lsp re-exports
 # `lsp-types`; we use that re-export (`tower_lsp::lsp_types`) so the protocol

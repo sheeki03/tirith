@@ -72,13 +72,6 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "r
 # `Err` gracefully on headless Linux (no X/Wayland), which the CLI maps
 # to a "no clipboard backend" envelope rather than a panic.
 arboard = { version = "3", default-features = false }
-# tiny_http 0.12 — a SYNCHRONOUS (blocking, thread-per-accept) HTTP/1.1 server.
-# Used ONLY by the CLI `tirith dashboard serve` loopback path (M13 ch3); not by
-# tirith-core. Chosen because it needs no async runtime — the serve loop is a
-# plain blocking accept loop, which keeps the dependency surface tiny
-# (ascii / chunked_transfer / httpdate, all MSRV-clean). It is never bound to
-# anything but 127.0.0.1.
-tiny_http = "0.12"
 
 # Native identity tests hash real executables repeatedly. Sampling the debug
 # shell-change tests showed software SHA-256 consuming the writer deadline;

@@ -1,6 +1,7 @@
-//! Strict loopback HTTP/1.1 transport for the local control service. One request
-//! per connection, explicit lengths, fixed bounds, and an overall read deadline.
-//! This is deliberately not a proxy or a general-purpose web server.
+//! Strict loopback HTTP/1.1 transport for the local control service and the
+//! `dashboard serve` report. One request per connection, explicit lengths,
+//! fixed bounds, and an overall read deadline. This is deliberately not a
+//! proxy or a general-purpose web server.
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -9,6 +10,9 @@ use std::time::{Duration, Instant};
 pub(super) const MAX_BODY: usize = 16 * 1024;
 pub(super) const MAX_RESPONSE: usize = 512 * 1024;
 const MAX_HEADERS: usize = 8 * 1024;
+/// Browsers send every cookie set for the loopback host (on any port) to the
+/// report page, so its request head may be larger than the control API's.
+const REPORT_HEADERS: usize = 64 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(3);
 /// A loopback client sends its request head at once. A connection that is
 /// still trickling headers after this bound gives its slot back early, so a
@@ -22,7 +26,40 @@ pub(super) const CODE_TTL: Duration = Duration::from_secs(120);
 const MAX_CODES: usize = 4;
 const MAX_SESSIONS: usize = 8;
 
-pub(super) struct Request {
+/// Which request shapes a server accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rules {
+    /// The control API: HTTP/1.1 GET, or POST with a JSON body.
+    Control,
+    /// The read-only `dashboard serve` report: any method and HTTP/1.0 or 1.1;
+    /// a declared body (bounded) is read and ignored so the response is never
+    /// cut off by a reset.
+    Report,
+}
+
+impl Rules {
+    fn head_limit(self) -> usize {
+        match self {
+            Self::Control => MAX_HEADERS,
+            Self::Report => REPORT_HEADERS,
+        }
+    }
+}
+
+/// Response hardening and bounds.
+pub(crate) struct ResponsePolicy {
+    pub content_security_policy: &'static str,
+    pub max_bytes: usize,
+    pub deadline: Duration,
+}
+
+pub(super) const CONTROL_RESPONSE: ResponsePolicy = ResponsePolicy {
+    content_security_policy: "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+    max_bytes: MAX_RESPONSE,
+    deadline: Duration::from_secs(3),
+};
+
+pub(crate) struct Request {
     pub method: String,
     pub target: String,
     pub headers: BTreeMap<String, String>,
@@ -36,7 +73,7 @@ impl Request {
 }
 
 #[derive(Debug)]
-pub(super) struct Error {
+pub(crate) struct Error {
     pub status: u16,
     pub message: &'static str,
 }
@@ -52,10 +89,14 @@ fn remaining_within(start: Instant, deadline: Duration) -> Result<Duration, Erro
         .ok_or_else(|| error(408, "request deadline exceeded"))
 }
 
-pub(super) fn read(
+/// Read one request. `authorize` gates the head before any body is read or
+/// allocated, and decides again once the whole request is in; that final
+/// decision (for example the credential's grant) is returned with it.
+pub(crate) fn read<T>(
     stream: &mut TcpStream,
-    authorize: impl Fn(&Request) -> Result<(), Error>,
-) -> Result<Request, Error> {
+    rules: Rules,
+    authorize: impl Fn(&Request) -> Result<T, Error>,
+) -> Result<(Request, T), Error> {
     #[cfg(windows)]
     {
         // A Windows accepted socket can inherit the nonblocking listener's
@@ -69,7 +110,7 @@ pub(super) fn read(
         stream
             .set_nonblocking(true)
             .map_err(|_| error(400, "cannot configure request deadline"))?;
-        let result = read_request(stream, authorize);
+        let result = read_request(stream, rules, authorize);
         stream
             .set_nonblocking(false)
             .map_err(|_| error(400, "cannot restore response socket mode"))?;
@@ -83,7 +124,7 @@ pub(super) fn read(
         stream
             .set_nonblocking(false)
             .map_err(|_| error(400, "cannot configure request deadline"))?;
-        read_request(stream, authorize)
+        read_request(stream, rules, authorize)
     }
 }
 
@@ -119,14 +160,16 @@ fn read_before_deadline(
     }
 }
 
-fn read_request(
+fn read_request<T>(
     stream: &mut TcpStream,
-    authorize: impl Fn(&Request) -> Result<(), Error>,
-) -> Result<Request, Error> {
+    rules: Rules,
+    authorize: impl Fn(&Request) -> Result<T, Error>,
+) -> Result<(Request, T), Error> {
     let start = Instant::now();
+    let head_limit = rules.head_limit();
     // Read the head in chunks rather than one byte per system call. Bytes
     // after the blank line already belong to the body.
-    let mut buffer = vec![0; MAX_HEADERS];
+    let mut buffer = vec![0; head_limit];
     let mut filled = 0;
     let head_end = loop {
         if let Some(end) = buffer[..filled]
@@ -135,7 +178,7 @@ fn read_request(
         {
             break end + 4;
         }
-        if filled >= MAX_HEADERS {
+        if filled >= head_limit {
             return Err(error(431, "request headers exceed limit"));
         }
         let read = read_before_deadline(
@@ -153,7 +196,7 @@ fn read_request(
         }
         filled += read;
     };
-    let (mut request, length) = parse_headers(&buffer[..head_end])?;
+    let (mut request, length) = parse_headers(&buffer[..head_end], rules)?;
     // Reject unauthenticated writes before waiting for or allocating their body.
     authorize(&request)?;
     request.body.resize(length, 0);
@@ -174,12 +217,12 @@ fn read_request(
         }
         consumed += read;
     }
-    authorize(&request)?;
-    Ok(request)
+    let decision = authorize(&request)?;
+    Ok((request, decision))
 }
 
-fn parse_headers(bytes: &[u8]) -> Result<(Request, usize), Error> {
-    if bytes.len() > MAX_HEADERS || !bytes.ends_with(b"\r\n\r\n") {
+fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> {
+    if bytes.len() > rules.head_limit() || !bytes.ends_with(b"\r\n\r\n") {
         return Err(error(400, "invalid request headers"));
     }
     let text =
@@ -197,10 +240,23 @@ fn parse_headers(bytes: &[u8]) -> Result<(Request, usize), Error> {
         .split(' ');
     let method = first.next().unwrap_or("");
     let target = first.next().unwrap_or("");
-    if !matches!(method, "GET" | "POST") {
+    let method_supported = match rules {
+        Rules::Control => matches!(method, "GET" | "POST"),
+        Rules::Report => {
+            !method.is_empty()
+                && method.len() <= 16
+                && method.bytes().all(|byte| byte.is_ascii_uppercase())
+        }
+    };
+    if !method_supported {
         return Err(error(405, "only GET and POST are supported"));
     }
-    if first.next() != Some("HTTP/1.1")
+    let version_supported = match first.next() {
+        Some("HTTP/1.1") => true,
+        Some("HTTP/1.0") => rules == Rules::Report,
+        _ => false,
+    };
+    if !version_supported
         || first.next().is_some()
         || !target.starts_with('/')
         || target.starts_with("//")
@@ -245,16 +301,19 @@ fn parse_headers(bytes: &[u8]) -> Result<(Request, usize), Error> {
                 .map_err(|_| error(413, "request body exceeds limit"))?
         }
         Some(_) => return Err(error(400, "invalid content length")),
-        None if method == "POST" => return Err(error(411, "content length is required")),
+        None if method == "POST" && rules == Rules::Control => {
+            return Err(error(411, "content length is required"))
+        }
         None => 0,
     };
     if length > MAX_BODY {
         return Err(error(413, "request body exceeds limit"));
     }
-    if method == "GET" && length != 0 {
+    if rules == Rules::Control && method == "GET" && length != 0 {
         return Err(error(400, "GET cannot carry a body"));
     }
-    if method == "POST"
+    if rules == Rules::Control
+        && method == "POST"
         && !headers.get("content-type").is_some_and(|value| {
             value.eq_ignore_ascii_case("application/json")
                 || value.eq_ignore_ascii_case("application/json; charset=utf-8")
@@ -507,7 +566,17 @@ pub(super) fn respond(
     content_type: &str,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    if bytes.len() > MAX_RESPONSE {
+    respond_with(stream, status, content_type, &CONTROL_RESPONSE, bytes)
+}
+
+pub(crate) fn respond_with(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    policy: &ResponsePolicy,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if bytes.len() > policy.max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "control response exceeds limit",
@@ -535,10 +604,11 @@ pub(super) fn respond(
         431 => "Request Header Fields Too Large",
         _ => "Service Unavailable",
     };
-    let headers = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\r\n", bytes.len());
+    let headers = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\r\n", bytes.len(), policy.content_security_policy);
     for mut remaining_bytes in [headers.as_bytes(), bytes] {
         while !remaining_bytes.is_empty() {
-            let remaining = Duration::from_secs(3)
+            let remaining = policy
+                .deadline
                 .checked_sub(started.elapsed())
                 .filter(|value| !value.is_zero())
                 .ok_or_else(|| {
@@ -585,7 +655,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_nonblocking(initially_nonblocking).unwrap();
             let started = Instant::now();
-            let result = read(&mut stream, |_| Ok(()));
+            let result = read(&mut stream, Rules::Control, |_| Ok(()));
             let elapsed = started.elapsed();
             #[cfg(windows)]
             let read_timeout = stream.read_timeout();
@@ -673,9 +743,12 @@ mod tests {
     }
 
     fn get(headers: &str) -> Request {
-        parse_headers(format!("GET /api/state HTTP/1.1\r\n{headers}\r\n\r\n").as_bytes())
-            .unwrap()
-            .0
+        parse_headers(
+            format!("GET /api/state HTTP/1.1\r\n{headers}\r\n\r\n").as_bytes(),
+            Rules::Control,
+        )
+        .unwrap()
+        .0
     }
     fn auth(now: Instant) -> Authorization {
         Authorization::new(1234, "fixture-token".into(), "fixture-csrf".into(), now)
@@ -813,6 +886,7 @@ mod tests {
             let mut request = parse_headers(
                 format!("POST /api/session/exchange HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{headers}\r\n\r\n")
                     .as_bytes(),
+                Rules::Control,
             )
             .unwrap()
             .0;
@@ -848,7 +922,7 @@ mod tests {
                 stream
             });
             let (mut stream, _) = listener.accept().unwrap();
-            let request = read(&mut stream, |_| Ok(())).unwrap();
+            let (request, ()) = read(&mut stream, Rules::Control, |_| Ok(())).unwrap();
             drop(client.join().unwrap());
             assert_eq!(request.method, "POST");
             assert_eq!(request.header("host"), Some("h"));
@@ -868,10 +942,51 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: one\r\n folded\r\n\r\n",
             "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Type: text/plain\r\n\r\n",
         ] {
+            for rules in [Rules::Control, Rules::Report] {
+                let refused = parse_headers(bytes.as_bytes(), rules).is_err();
+                // The report page ignores bodies, so it does not require a
+                // declared length or a JSON type; everything else is refused.
+                let report_body_rule = rules == Rules::Report
+                    && ((bytes.ends_with("Content-Type: application/json\r\n\r\n")
+                        && !bytes.contains("Content-Length"))
+                        || bytes.contains("Content-Type: text/plain"));
+                assert_eq!(refused, !report_body_rule, "{bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_report_rules_accept_any_method_and_http_1_0_but_the_control_rules_do_not() {
+        for bytes in [
+            "HEAD /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET /?token=x HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+            "POST /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
+            "GET /?token=x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\n",
+        ] {
             assert!(
-                parse_headers(bytes.as_bytes()).is_err(),
-                "accepted {bytes:?}"
+                parse_headers(bytes.as_bytes(), Rules::Report).is_ok(),
+                "{bytes:?}"
+            );
+            assert!(
+                parse_headers(bytes.as_bytes(), Rules::Control).is_err(),
+                "{bytes:?}"
             );
         }
+        for bytes in [
+            "get / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET / HTTP/2\r\nHost: 127.0.0.1\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 999999\r\n\r\n",
+        ] {
+            assert!(
+                parse_headers(bytes.as_bytes(), Rules::Report).is_err(),
+                "{bytes:?}"
+            );
+        }
+        let cookies = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {}\r\n\r\n",
+            "a".repeat(16 * 1024)
+        );
+        assert!(parse_headers(cookies.as_bytes(), Rules::Report).is_ok());
+        assert!(parse_headers(cookies.as_bytes(), Rules::Control).is_err());
     }
 }

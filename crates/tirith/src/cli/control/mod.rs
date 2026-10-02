@@ -1,7 +1,7 @@
 //! Owner-scoped local controls. The browser supplies typed intent or a stored
 //! operation ID; it cannot select a write path, shell command, or policy source.
 mod api;
-mod http;
+pub(crate) mod http;
 pub(crate) mod identity;
 mod lifecycle;
 mod peer;
@@ -34,8 +34,7 @@ struct RuntimePatterns {
 struct Service {
     record: lifecycle::ServiceRecord,
     auth: http::Authorization,
-    history: Mutex<HistoryReader>,
-    aggregate: Mutex<tirith_core::history_aggregate::HistoryAggregate>,
+    history: HistoryReader,
     last_activity: Mutex<Instant>,
     runtime_patterns: Mutex<RuntimePatterns>,
     runtime_resolved: Condvar,
@@ -62,15 +61,18 @@ impl Service {
         }
     }
 
-    fn authorize(&self, request: &http::Request) -> Result<(), http::Error> {
+    /// The one authorization decision for a request: static assets need the
+    /// exact Host, the sign-in exchange its same-origin write checks, and every
+    /// other route a credential whose grant is handed to the API.
+    fn authorize(&self, request: &http::Request) -> Result<Option<http::Grant>, http::Error> {
         if request.method == "GET"
             && matches!(request.target.as_str(), "/" | "/app.js" | "/app.css")
         {
-            self.auth.check_host(request)
+            self.auth.check_host(request).map(|()| None)
         } else if request.target == EXCHANGE {
-            self.auth.check_exchange(request)
+            self.auth.check_exchange(request).map(|()| None)
         } else {
-            self.auth.check(request).map(|_| ())
+            self.auth.check(request).map(Some)
         }
     }
 
@@ -152,9 +154,11 @@ impl Service {
     }
 
     fn handle(&self, mut stream: TcpStream) {
-        let result = http::read(&mut stream, |request| self.authorize(request));
-        let request = match result {
-            Ok(request) => request,
+        let result = http::read(&mut stream, http::Rules::Control, |request| {
+            self.authorize(request)
+        });
+        let (request, grant) = match result {
+            Ok(read) => read,
             Err(error) => {
                 let _ = http::respond(
                     &mut stream,
@@ -187,10 +191,15 @@ impl Service {
         if let Ok(mut activity) = self.last_activity.lock() {
             *activity = Instant::now();
         }
-        let (status, result) = if request.method == "POST" && request.target == EXCHANGE {
-            self.exchange(&request)
-        } else {
-            api::dispatch(self, &request)
+        let (status, result) = match grant {
+            Some(grant) => api::dispatch(self, &request, &grant),
+            None if request.method == "POST" && request.target == EXCHANGE => {
+                self.exchange(&request)
+            }
+            None => (
+                404,
+                serde_json::json!({"error": "unknown local control endpoint"}),
+            ),
         };
         let bytes = serde_json::to_vec(&result)
             .unwrap_or_else(|_| b"{\"error\":\"response encoding failed\"}".to_vec());
@@ -307,10 +316,7 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
                 lifecycle::secret(),
                 Instant::now(),
             ),
-            history: Mutex::new(HistoryReader::new(history_path.clone())),
-            aggregate: Mutex::new(tirith_core::history_aggregate::HistoryAggregate::new(
-                history_path,
-            )),
+            history: HistoryReader::new(history_path),
             last_activity: Mutex::new(Instant::now()),
             runtime_patterns: Mutex::new(RuntimePatterns::default()),
             runtime_resolved: Condvar::new(),

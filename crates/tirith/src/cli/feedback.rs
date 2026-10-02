@@ -62,7 +62,7 @@ fn observed_incident(id: &str) -> Result<String, String> {
     let report = tirith_core::history::HistoryReader::new(path).recent(
         Default::default(),
         500,
-        std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+        tirith_core::audit::logging_enabled(),
     )?;
     let matches: Vec<_> = report
         .events
