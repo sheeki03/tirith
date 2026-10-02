@@ -4756,7 +4756,11 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
 const POSIX_INERT_BUILTINS: &[&str] = &[":", "[", "echo", "false", "printf", "pwd", "test", "true"];
 
 /// Shell-maintained or specially-typed parameters whose expansion can differ
-/// from the value just assigned (bash and zsh), plus `_`.
+/// from the value just assigned (bash and zsh), plus `_`. Includes every
+/// integer-typed special of zsh (with its modules loaded) and ksh: assigning
+/// one evaluates the value as arithmetic, so `V=BIN=9; MAILCHECK=V` assigns
+/// `BIN`. A name in this list is never resolved and never accepted as an
+/// assignment-only segment.
 const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
     "_",
     "ARGC",
@@ -4765,6 +4769,7 @@ const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
     "DIRSTACK",
     "EGID",
     "ENV",
+    "ERRNO",
     "EPOCHREALTIME",
     "EPOCHSECONDS",
     "EUID",
@@ -4781,10 +4786,15 @@ const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
     "HOSTNAME",
     "HOSTTYPE",
     "IFS",
+    "JOBMAX",
+    "KEYTIMEOUT",
     "KEYBOARD_HACK",
     "LANG",
     "LINENO",
     "LINES",
+    "LISTMAX",
+    "LOGCHECK",
+    "MAILCHECK",
     "MACHTYPE",
     "MAILPATH",
     "MANPATH",
@@ -4828,6 +4838,8 @@ const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
     "UID",
     "USERNAME",
     "WORDCHARS",
+    "ZCURSES_COLORS",
+    "ZCURSES_COLOR_PAIRS",
     "aliases",
     "argv",
     "builtins",
@@ -4843,6 +4855,7 @@ const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
     "dis_saliases",
     "epochtime",
     "errnos",
+    "exint",
     "fignore",
     "fpath",
     "funcfiletrace",
@@ -4941,12 +4954,13 @@ fn posix_quoted_variable_command_name(command: &str) -> Option<&str> {
 /// of the inert builtins. zsh and ksh evaluate the `printf` arguments of
 /// numeric conversions (`%d`, `%*s`) as arithmetic, so `printf '%d' 'BI''N=9'`
 /// assigns `BIN`; ksh does the same for `test`/`[` integer operands, even
-/// fully literal ones (`[ 'BI''N=9' -eq 9 ]`), and bash evaluates `test -v`
-/// array subscripts. So `printf` counts as inert only
+/// fully literal ones (`[ 'BI''N=9' -eq 9 ]`), zsh evaluates the `-t`
+/// operand (`[ -t 'BI''N=9' ]`), and bash evaluates `test -v` array
+/// subscripts. So `printf` counts as inert only
 /// without options and with literal arguments, and then only when its format
 /// has text conversions alone or no argument after the format has a letter or
 /// `_` (the start of an arithmetic name); `test`/`[` only without subscripts,
-/// integer comparisons, `-v` or `-R`.
+/// integer comparisons, `-t`, `-v` or `-R`.
 fn posix_command_word_is_inert(command: &str, args: &[String]) -> bool {
     if command.contains('/') {
         return true;
@@ -4981,7 +4995,7 @@ fn posix_command_word_is_inert(command: &str, args: &[String]) -> bool {
                 && !words.iter().any(|word| {
                     matches!(
                         word.as_str(),
-                        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-v" | "-R"
+                        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-t" | "-v" | "-R"
                     )
                 })
         }

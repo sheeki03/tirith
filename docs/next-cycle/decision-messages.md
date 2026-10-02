@@ -49,10 +49,12 @@ function or alias definition, no other builtin except `echo`, `printf`,
 `test`/`[`, `true`, `false`, `:` and `pwd` (zsh module builtins such as `stat`
 count as other builtins), no arithmetic (`((`, `$[`, zsh `$NAME[...]`
 subscripts, a `printf` numeric conversion of a name-like argument, `test`
-integer comparisons), zsh `$~`/`$=`/`$^` expansions, unquoted expansions in a
-command, `${...}` assignment forms, subshells, heredocs, line continuations or
-history expansion. Custom regex rules match both the command as typed and its
-literal form. A failed assignment (a read-only or integer variable inherited
+integer comparisons or zsh `test -t`, an assignment to an integer-typed shell
+parameter such as `MAILCHECK`), zsh `$~`/`$=`/`$^` expansions, unquoted
+expansions in a command, `${...}` assignment forms, subshells, heredocs, line
+continuations or history expansion. Custom regex rules match both the command
+as typed and its literal form, and `tirith rule test` evaluates both forms the
+same way `tirith check` does. A failed assignment (a read-only or integer variable inherited
 from the shell) aborts the rest of the line in bash, zsh, sh, dash and ksh, so
 the expansion cannot run with the inherited value. State the command cannot
 show, such as live aliases, functions or variable attributes like

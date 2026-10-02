@@ -122,8 +122,11 @@ pub fn test(rule_id: &str, input: &str, shell: &str, json: bool) -> i32 {
                 custom_rule_dsl::evaluate(when, &eval_ctx)
             }
             CompiledMatcher::Regex(re) => {
-                // Match against the input (compiled+validated, context-independent).
+                // Match against the input as typed and, like the engine, also
+                // against its #264 literal view when one exists in this context.
                 re.is_match(input)
+                    || tirith_core::engine::literal_view_for_input(input, shell_type, context)
+                        .is_some_and(|view| re.is_match(&view))
             }
         };
         if reported_context.is_none() {

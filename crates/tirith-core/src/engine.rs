@@ -263,20 +263,45 @@ pub fn build_dsl_backing(
     }
 }
 
+/// Issue #264: the literal view tier 3 analyzes for `input` in this context
+/// (`BIN=/bin/echo; "$BIN" --help` -> `BIN=/bin/echo; /bin/echo --help`), or
+/// `None` when the engine analyzes the input as typed. Same steps as the hot
+/// path: strip the `# tirith-card:` prelude in Exec, then resolve proven
+/// variable command words in Exec/Paste only. `tirith rule test` uses it so a
+/// tested rule sees the same text the engine matches.
+pub fn literal_view_for_input(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+) -> Option<String> {
+    match scan_context {
+        ScanContext::Exec => extract::posix_variable_command_literal_view(
+            &crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell),
+            shell,
+        ),
+        ScanContext::Paste => extract::posix_variable_command_literal_view(input, shell),
+        _ => None,
+    }
+}
+
 /// Build a [`DslBacking`] from raw input, running the SAME tier-2 extraction as
-/// the hot path (strip `# tirith-card:` prelude in Exec, `extract_urls`, then
-/// [`build_dsl_backing`] against the cached threat-DB). The entry point
-/// `tirith rule test` uses so a tested rule sees production data.
+/// the hot path (strip `# tirith-card:` prelude in Exec, the #264 literal view
+/// in Exec/Paste, `extract_urls`, then [`build_dsl_backing`] against the cached
+/// threat-DB). The entry point `tirith rule test` uses so a tested rule sees
+/// production data.
 pub fn dsl_backing_for_input(
     input: &str,
     shell: ShellType,
     scan_context: ScanContext,
 ) -> DslBacking {
-    let analyzed: std::borrow::Cow<'_, str> = if scan_context == ScanContext::Exec {
-        crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell)
-    } else {
-        std::borrow::Cow::Borrowed(input)
-    };
+    let analyzed: std::borrow::Cow<'_, str> =
+        match literal_view_for_input(input, shell, scan_context) {
+            Some(view) => std::borrow::Cow::Owned(view),
+            None if scan_context == ScanContext::Exec => {
+                crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell)
+            }
+            None => std::borrow::Cow::Borrowed(input),
+        };
     let extracted = if scan_context == ScanContext::FileScan {
         Vec::new()
     } else {
@@ -5053,6 +5078,41 @@ mod tests {
                 .iter()
                 .map(|f| (&f.rule_id, &f.custom_rule_id))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #264: `tirith rule test` builds its DSL facts through
+    /// `dsl_backing_for_input`, which must use the same literal view tier 3
+    /// analyzes, so a `package.ecosystem` rule sees `npm install` behind
+    /// `N=npm; "$N" install left-pad` exactly as `tirith check` does.
+    #[test]
+    fn dsl_backing_for_input_uses_the_literal_view_of_a_resolved_variable_command() {
+        let typed = r#"N=npm; "$N" install left-pad"#;
+        let literal = "N=npm; npm install left-pad";
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            assert_eq!(
+                literal_view_for_input(typed, ShellType::Posix, context).as_deref(),
+                Some(literal),
+                "precondition: the input resolves in {context:?}"
+            );
+            let packages = |input: &str| -> Vec<(String, String)> {
+                dsl_backing_for_input(input, ShellType::Posix, context)
+                    .packages
+                    .into_iter()
+                    .map(|(ecosystem, name, _)| (ecosystem, name))
+                    .collect()
+            };
+            let expected = packages(literal);
+            assert!(
+                expected.iter().any(|(ecosystem, _)| ecosystem == "npm"),
+                "precondition: the literal form has an npm package: {expected:?}"
+            );
+            assert_eq!(packages(typed), expected, "{context:?}");
+        }
+        assert_eq!(
+            literal_view_for_input(typed, ShellType::Posix, ScanContext::FileScan),
+            None,
+            "FileScan is analyzed as written"
         );
     }
 

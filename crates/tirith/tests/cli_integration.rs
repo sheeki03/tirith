@@ -18806,6 +18806,88 @@ fn rule_test_allowlisted_domain_does_not_fire() {
     );
 }
 
+/// Issue #264: `tirith rule test` must agree with `tirith check` on an input
+/// whose variable command word resolves (`N=npm; "$N" install ...`), for both
+/// a DSL `when:` rule and a regex rule keyed on the literal spelling.
+#[test]
+fn rule_test_agrees_with_check_on_a_resolved_variable_command() {
+    let (tmp, proj) = rule_project(
+        "custom_rules:\n  \
+         - id: pkg-npm\n    \
+         when:\n      \
+         package.ecosystem: npm\n    \
+         severity: medium\n    \
+         title: \"npm install\"\n    \
+         context: [exec]\n  \
+         - id: lit-npm\n    \
+         pattern: 'npm install'\n    \
+         severity: medium\n    \
+         title: \"npm install literal\"\n    \
+         context: [exec]\n",
+    );
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let isolated = |c: &mut Command| {
+        c.env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".state"))
+            .env("XDG_DATA_HOME", home.join(".data"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("TIRITH_LOG", "0");
+    };
+    for input in [
+        r#"N=npm; "$N" install left-pad"#,
+        "N=npm; npm install left-pad",
+    ] {
+        let mut check = tirith_in_proj(&proj);
+        isolated(&mut check);
+        let out = check
+            .args([
+                "check",
+                "--json",
+                "--non-interactive",
+                "--shell",
+                "posix",
+                "--",
+                input,
+            ])
+            .output()
+            .expect("run tirith check");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "check json for {input:?}: {e}; stdout {} stderr {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        let fired: Vec<&str> = v["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f["custom_rule_id"].as_str())
+            .collect();
+        for rule in ["pkg-npm", "lit-npm"] {
+            assert!(
+                fired.contains(&rule),
+                "check must fire {rule} on {input:?}: {fired:?}"
+            );
+            let mut test = tirith_in_proj(&proj);
+            isolated(&mut test);
+            let out = test
+                .args(["rule", "test", "--rule", rule, "--input", input, "--json"])
+                .output()
+                .expect("run tirith rule test");
+            assert_eq!(out.status.code(), Some(0));
+            let t: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(
+                t["fires"],
+                serde_json::json!(true),
+                "rule test must agree with check for {rule} on {input:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn rule_test_unknown_rule_exits_one() {
     let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
