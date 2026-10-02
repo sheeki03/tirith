@@ -570,7 +570,9 @@ pub fn run(
     // traverses the whole cwd (seconds on large dirs) and hooks need fast responses.
     if interactive
         && effective.action != Action::Block
-        && tirith_core::checkpoint::should_auto_checkpoint(cmd)
+        && (tirith_core::checkpoint::should_auto_checkpoint(cmd)
+            || tirith_core::extract::posix_variable_command_literal_view(cmd, shell_type)
+                .is_some_and(|view| tirith_core::checkpoint::should_auto_checkpoint(&view)))
     {
         if let Some(cwd_val) = &cwd {
             let cwd_owned = cwd_val.clone();

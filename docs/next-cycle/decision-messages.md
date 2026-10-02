@@ -33,13 +33,23 @@ note does not replace the final action or reinterpret incomplete coverage as
 proof of malicious content. Findings continue to provide the specific gap and
 reason.
 
-For example, `BIN=/bin/echo; "$BIN" --help` still has an unresolved command
-name. The earlier assignment does not prove the live shell variable's
-attributes or that the assignment succeeded. Quoting the variable preserves
-argument boundaries; it does not establish the selected executable. Use the
-literal command path, `/bin/echo --help`, when that is the intended command,
-then check that exact command again. Adding `&&` guards an assignment failure
-but does not prove the variable's attributes, so it is not a general fix.
+For example, `BIN=/bin/echo; $BIN --help` (unquoted) or
+`false && BIN=/bin/echo; "$BIN" --help` (assignment may not run) has an
+unresolved command name. Use the literal command path, `/bin/echo --help`, when
+that is the intended command, then check that exact command again.
+
+`BIN=/bin/echo; "$BIN" --help` itself is analyzed as
+`BIN=/bin/echo; /bin/echo --help`, with every finding of that literal form
+(POSIX shells only). This needs a literal value assigned unconditionally at the
+top level, the variable quoted as the command word, and nothing else in the
+command that can rebind it: no other builtin except `echo`, `printf`,
+`test`/`[`, `true`, `false`, `:` and `pwd`, no arithmetic, `${...}`
+assignment forms, functions, subshells, heredocs, line continuations or history
+expansion. A failed assignment (a read-only or integer variable inherited from
+the shell) aborts the rest of the line in bash, zsh, sh, dash and ksh, so the
+expansion cannot run with the inherited value. State the command cannot show,
+such as live aliases, functions or variable attributes like `typeset -u`, is
+outside the analysis, exactly as it is for a literal command name.
 
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the

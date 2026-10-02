@@ -3107,6 +3107,17 @@ fn analyze_with_observation(
     } else {
         std::borrow::Cow::Borrowed(ctx.input.as_str())
     };
+    // Issue #264: `BIN=/bin/echo; "$BIN" --help` names its executable through
+    // a literal assignment this input makes unconditionally. When every dynamic
+    // command word is proven that way, tier 3 analyzes the literal spelling, so
+    // the command gets exactly the findings of `BIN=/bin/echo; /bin/echo --help`.
+    let analyzed_input = match ctx.scan_context {
+        ScanContext::Exec | ScanContext::Paste => {
+            crate::extract::posix_variable_command_literal_view(&analyzed_input, ctx.shell)
+                .map_or(analyzed_input, std::borrow::Cow::Owned)
+        }
+        _ => analyzed_input,
+    };
 
     // M13 ch4 — scanned file path for the DSL `file.path_matches` predicate
     // (FileScan). Backslashes normalized to `/` so the predicate is

@@ -12218,12 +12218,32 @@ mod tests {
     }
 
     #[test]
-    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+    fn issue_264_literal_variable_command_resolves_like_the_literal_command() {
         for input in [
             r#"BIN=/bin/echo; "$BIN" --help"#,
             r#"BIN=/bin/echo; printf '%s\n' '--- a ---'; "$BIN" --help"#,
+            "BIN=/bin/echo\n\"${BIN}\" --help",
+            r#"BIN='/bin/echo' && "$BIN" --help"#,
+            r#"PY=python3; [ -x /usr/bin/python3 ] && "$PY" -c 'print(1)'"#,
+            r#"BIN=/bin/echo; PY=python3; "$BIN" a; "$PY" --version | tail -1"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+        for input in [
             r#"readonly BIN=/bin/sh; BIN=/bin/echo; "$BIN" -c 'rm -rf /'"#,
             r#"declare -n BIN=ACTUAL; BIN=/bin/echo; "$BIN" --help"#,
+            r#"BIN=/bin/echo; $BIN --help"#,
+            r#""$BIN" --help; BIN=/bin/echo"#,
         ] {
             let findings = check_default(input, ShellType::Posix);
             let finding = findings
