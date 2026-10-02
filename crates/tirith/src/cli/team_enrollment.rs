@@ -260,7 +260,9 @@ impl TeamEnrollmentService {
         Ok(
             json!({"schema_version":1,"state":state,"activation_id":activation,
             "selected_connection_id":selection_id,"runtime_evidence":evidence,
-            "offline_cache":cache.zip(now).map(|(cache, now)| offline_cache_projection(&cache, now)),
+            "offline_cache":cache.zip(now).map(|(cache, now)| {
+                offline_cache_projection(&cache, now, state == "ready_offline_cache")
+            }),
             "report":report_status(),"local_write":"observed","execution_permitted":false,"notice":NOTICE}),
         )
     }
@@ -999,8 +1001,12 @@ pub(crate) fn maybe_background_refresh(offline_flag: bool) {
 
 /// Additive `offline_cache` status field: how Runtime treats the cached team
 /// policy now, the deadlines, and a one-line human summary. Offline facts
-/// only; Runtime applies the same rules itself.
-fn offline_cache_projection(cache: &CacheStatus, now: u64) -> Value {
+/// only; Runtime applies the same rules itself. `runtime_ready` is false when
+/// Runtime refuses the enrollment for a reason other than the cache age (a
+/// competing authority, a replaced connection, a malformed record): the cache
+/// age is then still reported, but nothing is enforced and every command fails
+/// closed, so `enforced`/`fails_closed`/`summary` must say so.
+fn offline_cache_projection(cache: &CacheStatus, now: u64, runtime_ready: bool) -> Value {
     let left = |until: u64| until.saturating_sub(now);
     let grace_hours = cache.grace_ms.map(|grace| grace / 3_600_000);
     let sync =
@@ -1054,10 +1060,23 @@ fn offline_cache_projection(cache: &CacheStatus, now: u64) -> Value {
             ),
         ),
     };
+    let enforced = runtime_ready && cache.state.enforced();
+    let (time_left_ms, summary) = if runtime_ready {
+        (time_left_ms, summary)
+    } else {
+        (
+            None,
+            format!(
+                "team policy cache is {} by age, but Runtime refuses the enrollment (a competing policy authority such as TIRITH_SERVER_URL/TIRITH_API_KEY, an organization policy or a legacy policy_server_url, or a changed connection or enrollment record): every command is blocked (fail closed) until that is resolved; then {sync}.",
+                cache.state.as_str()
+            ),
+        )
+    };
     json!({
         "state": cache.state.as_str(),
-        "enforced": cache.state.enforced(),
-        "fails_closed": !cache.state.enforced(),
+        "runtime_refused": !runtime_ready,
+        "enforced": enforced,
+        "fails_closed": !enforced,
         "fetched_unix_ms": cache.fetched_unix_ms,
         "fresh_until_unix_ms": cache.fresh_until_unix_ms,
         "grace_hours": grace_hours,

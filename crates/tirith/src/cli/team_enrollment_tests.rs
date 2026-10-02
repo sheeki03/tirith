@@ -492,6 +492,66 @@ mod native {
         assert_eq!(carry_archives(Some(&stored)).unwrap().len(), 1);
     }
     #[test]
+    fn status_offline_cache_fails_closed_when_runtime_refuses_a_fresh_cache() {
+        use tirith_core::policy_team::{PolicyDocument, POLICY_SEMANTICS_VERSION};
+        use tirith_core::policy_team_client::AuthorityBinding;
+        let (mut guard, parent) = fixture();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        let authority_id = Id::new();
+        let policy_id = Id::new();
+        let connection_id = Id::new();
+        let binding = AuthorityBinding {
+            schema_version: SCHEMA_VERSION,
+            base_url: "https://must-not-contact.invalid".into(),
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            transport: Default::default(),
+        };
+        private_file(&parent.join("connection.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"binding":binding,"credential":"c".repeat(64)})).unwrap());
+        let connection = SelectedConnection::capture_current().unwrap();
+        let now = now_ms().unwrap();
+        let document = PolicyDocument {
+            schema_version: 1,
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            revision: Id::new(),
+            created_unix_ms: now,
+            policy_semantics_version: POLICY_SEMANTICS_VERSION,
+            yaml: "paranoia: 2\n".into(),
+        };
+        private_file(&parent.join("enrollment.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"authority_id":authority_id,"policy_id":policy_id,"activation_id":Id::new(),"client_id":Id::new(),"selection_commitment":connection.private_selection_commitment().unwrap(),"fetched_unix_ms":now,"cached_policy":document})).unwrap());
+        let cwd = guard.roots().cwd.clone();
+        let status = || {
+            TeamEnrollmentService::capture(cwd.to_str())
+                .unwrap()
+                .current()
+                .unwrap()
+        };
+        let ready = status();
+        assert_eq!(ready["state"], "ready_offline_cache", "{ready}");
+        assert_eq!(ready["offline_cache"]["state"], "fresh");
+        assert_eq!(ready["offline_cache"]["enforced"], true);
+        assert_eq!(ready["offline_cache"]["fails_closed"], false);
+        assert_eq!(ready["offline_cache"]["runtime_refused"], false);
+
+        // A competing legacy authority makes Runtime fail closed although the
+        // cache is fresh by age; the cache projection must agree.
+        guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
+        guard.set_env("TIRITH_API_KEY", "legacy-secret");
+        let refused = status();
+        assert_eq!(refused["state"], "runtime_refused", "{refused}");
+        let cache = &refused["offline_cache"];
+        assert_eq!(cache["state"], "fresh");
+        assert_eq!(cache["runtime_refused"], true);
+        assert_eq!(cache["enforced"], false);
+        assert_eq!(cache["fails_closed"], true);
+        assert!(cache["time_left_ms"].is_null());
+        let summary = cache["summary"].as_str().unwrap();
+        assert!(summary.contains("Runtime refuses"), "{summary}");
+        assert!(!summary.contains("is enforced"), "{summary}");
+        assert!(!refused.to_string().contains("legacy-secret"));
+    }
+    #[test]
     fn withdrawal_between_capture_and_resolution_never_falls_through_to_legacy_contact() {
         let (mut guard, parent) = fixture();
         guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
@@ -595,7 +655,7 @@ fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
         grace_until_unix_ms: Some(now - fetched_age + 96 * HOUR),
         refresh_due: fetched_age >= HOUR,
     };
-    let fresh = offline_cache_projection(&status(CacheState::Fresh, 2 * HOUR), now);
+    let fresh = offline_cache_projection(&status(CacheState::Fresh, 2 * HOUR), now, true);
     assert_eq!(fresh["state"], "fresh");
     assert_eq!(fresh["enforced"], true);
     assert_eq!(fresh["fails_closed"], false);
@@ -609,7 +669,7 @@ fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
     );
     assert!(summary.contains("background refresh is due"), "{summary}");
 
-    let grace = offline_cache_projection(&status(CacheState::Grace, 30 * HOUR + 90_000), now);
+    let grace = offline_cache_projection(&status(CacheState::Grace, 30 * HOUR + 90_000), now, true);
     assert_eq!(grace["state"], "grace");
     assert_eq!(grace["enforced"], true);
     assert_eq!(grace["time_left_ms"], 66 * HOUR - 90_000);
@@ -622,7 +682,7 @@ fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
         "{summary}"
     );
 
-    let expired = offline_cache_projection(&status(CacheState::Expired, 97 * HOUR), now);
+    let expired = offline_cache_projection(&status(CacheState::Expired, 97 * HOUR), now, true);
     assert_eq!(expired["state"], "expired");
     assert_eq!(expired["enforced"], false);
     assert_eq!(expired["fails_closed"], true);
@@ -636,11 +696,25 @@ fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
         CacheState::Missing,
         CacheState::Invalid,
     ] {
-        let value = offline_cache_projection(&status(state, 0), now);
+        let value = offline_cache_projection(&status(state, 0), now, true);
         assert_eq!(value["fails_closed"], true, "{state:?}");
         assert!(value["time_left_ms"].is_null());
         assert!(value["summary"].as_str().unwrap().contains("fail closed"));
     }
+    // A fresh or in-grace cache that Runtime refuses (competing authority,
+    // replaced connection) is not enforced: every command fails closed.
+    for state in [CacheState::Fresh, CacheState::Grace] {
+        let value = offline_cache_projection(&status(state, 2 * HOUR), now, false);
+        assert_eq!(value["runtime_refused"], true, "{state:?}");
+        assert_eq!(value["enforced"], false, "{state:?}");
+        assert_eq!(value["fails_closed"], true, "{state:?}");
+        assert!(value["time_left_ms"].is_null(), "{state:?}");
+        let summary = value["summary"].as_str().unwrap();
+        assert!(summary.contains("Runtime refuses"), "{summary}");
+        assert!(summary.contains("fail closed"), "{summary}");
+        assert!(!summary.contains("is enforced"), "{summary}");
+    }
+    assert_eq!(fresh["runtime_refused"], false);
     assert_eq!(duration(59_999), "0m");
     assert_eq!(duration(HOUR + 60_000), "1h 1m");
     assert_eq!(duration(49 * HOUR), "2d 1h");

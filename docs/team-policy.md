@@ -72,7 +72,7 @@ The grace period is 72 hours by default. The team authority sets it in the publi
 team_offline_grace_hours: 24
 ```
 
-`tirith policy team enrollment status` shows the activation and connection IDs, and while the cache is usable its `fetched_unix_ms`. Its `offline_cache` field says which of the stages above applies: `state` is `fresh`, `grace`, `expired` (fail closed), or `future_timestamp` / `missing` / `invalid` (also fail closed), with `fresh_until_unix_ms`, `grace_hours`, `grace_until_unix_ms`, `time_left_ms` (until the next stage, or until fail closed during grace), `refresh_due`, `fails_closed` and a one-line `summary`. Without `--json` the summary is also printed on stderr. To refresh immediately, run `sync` as shown above.
+`tirith policy team enrollment status` shows the activation and connection IDs, and while the cache is usable its `fetched_unix_ms`. Its `offline_cache` field says which of the stages above applies: `state` is `fresh`, `grace`, `expired` (fail closed), or `future_timestamp` / `missing` / `invalid` (also fail closed), with `fresh_until_unix_ms`, `grace_hours`, `grace_until_unix_ms`, `time_left_ms` (until the next stage, or until fail closed during grace), `refresh_due`, `enforced`, `fails_closed`, `runtime_refused` and a one-line `summary`. `state` describes only the cache age: when the top-level `state` is `runtime_refused` (for example a competing `TIRITH_SERVER_URL`/`TIRITH_API_KEY`, an organization policy, a legacy `policy_server_url`, or a changed connection file), `runtime_refused` is `true`, `enforced` is `false` and `fails_closed` is `true` even for a fresh cache. Without `--json` the summary is also printed on stderr. To refresh immediately, run `sync` as shown above.
 
 ### Competing policy authorities
 
