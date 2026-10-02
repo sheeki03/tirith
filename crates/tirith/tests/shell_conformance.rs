@@ -1433,6 +1433,160 @@ fn fish_noninteractive_source_is_a_noop() {
     );
 }
 
+/// Spawn fish (config disabled) with a deterministic prompt and the hook NOT yet
+/// sourced, so a test can establish a known umask BEFORE the hook's init path
+/// runs. `None` when fish is not installed.
+fn fish_presourced_session(env: &IsolatedEnv) -> Option<PtySession> {
+    let fish = fish_bin()?;
+    let mut sess = PtySession::spawn(env, &fish, &["--no-config", "-i"]);
+    // A fixed prompt the harness can synchronise on.
+    sess.send_line("function fish_prompt; printf 'TIRITH_PTY> '; end");
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    Some(sess)
+}
+
+/// Issue #265: `_tirith_v3_new_capture_file` hardens capture creation with
+/// `umask 077`. In bash and zsh `$( ... )` is a subshell, but fish command
+/// substitution runs in the CURRENT shell, so that mask used to apply to the
+/// whole session. The helper runs at `init`, on clipboard paste and on every
+/// checked command, so the session was pinned at `0077` from then on.
+///
+/// Establish `0022` before the hook loads and read the mask back after. The
+/// `%s` stays literal in the command echo, so the substituted value can never
+/// match the echoed command line.
+#[test]
+fn fish_capture_file_does_not_leak_umask_into_the_session() {
+    let env = IsolatedEnv::new();
+    let mut sess = match fish_presourced_session(&env) {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping: fish not installed");
+            return;
+        }
+    };
+
+    // Anti-vacuous guard: prove the session really is at 0022 before the hook
+    // is loaded, so the reads below are a genuine restoration and not a
+    // coincidence of whatever umask the runner inherited.
+    sess.send_line("umask 022; printf 'TIRITH_UMASK_PRE_INIT<%s>\\n' (umask)");
+    let before = sess.expect_any(
+        &["TIRITH_UMASK_PRE_INIT<0022>", "TIRITH_UMASK_PRE_INIT<0077>"],
+        VERDICT_IDLE,
+    );
+    sess.clear_buffer();
+
+    // The hook's own init path: it negotiates protocol v3 and registers a
+    // receipt through two capture files, so this is the leak a user hits first.
+    let hook = embedded_hook("fish-hook.fish");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    sess.send_line("printf 'TIRITH_UMASK_POST_INIT<%s>\\n' (umask)");
+    let after_init = sess.expect_any(
+        &["TIRITH_UMASK_POST_INIT<0022>", "TIRITH_UMASK_POST_INIT<0077>"],
+        VERDICT_IDLE,
+    );
+    sess.clear_buffer();
+
+    // Then the per-command path every checked command takes. `count` proves the
+    // helper really produced a capture path, so a silent early return cannot
+    // make this assertion pass without exercising the success branch.
+    sess.send_line("printf 'TIRITH_CAPTURE_CREATED<%s>' (count (_tirith_v3_new_capture_file))");
+    let created = sess.expect_any(
+        &["TIRITH_CAPTURE_CREATED<0>", "TIRITH_CAPTURE_CREATED<1>"],
+        VERDICT_IDLE,
+    );
+    sess.clear_buffer();
+    sess.send_line("printf 'TIRITH_UMASK_POST_CAPTURE<%s>\\n' (umask)");
+    let after_capture = sess.expect_any(
+        &["TIRITH_UMASK_POST_CAPTURE<0022>", "TIRITH_UMASK_POST_CAPTURE<0077>"],
+        VERDICT_IDLE,
+    );
+    sess.close();
+
+    assert!(
+        before.contains("TIRITH_UMASK_PRE_INIT<0022>"),
+        "the session must be at 0022 before the hook loads, got:\n{before}"
+    );
+    assert!(
+        created.contains("TIRITH_CAPTURE_CREATED<1>"),
+        "anti-vacuous guard: the capture helper must really have created a file, got:\n{created}"
+    );
+    assert!(
+        after_init.contains("TIRITH_UMASK_POST_INIT<0022>")
+            && !after_init.contains("TIRITH_UMASK_POST_INIT<0077>"),
+        "loading the fish hook must not leave the session at 0077 (#265), got:\n{after_init}"
+    );
+    assert!(
+        after_capture.contains("TIRITH_UMASK_POST_CAPTURE<0022>")
+            && !after_capture.contains("TIRITH_UMASK_POST_CAPTURE<0077>"),
+        "creating a capture file must not leave the session at 0077 (#265), got:\n{after_capture}"
+    );
+}
+
+/// Issue #265, error path: the restore is placed ahead of every early
+/// `return 1`, so a FAILED `mktemp` cannot strand the session at `0077`
+/// either. This is the branch most likely to regress silently — a test that
+/// only covers the success path keeps passing if the restore is later moved
+/// below that early return, because the success path is the one place the
+/// restore is not what saves the session.
+///
+/// `_TIRITH_MKTEMP_BIN` is repointed at an absolute path that cannot be
+/// executed, which passes the hook's own "absolute path" guard and so fails at
+/// the `mktemp` call itself. `umask 022` is re-established on the SAME line,
+/// immediately before the failing call, so the assertion isolates this call's
+/// restore rather than the init path's. It all has to be one line: once the
+/// helper is broken, the hook can no longer open its own capture files for the
+/// Enter binding, so it blocks every subsequent line instead of running it.
+#[test]
+fn fish_capture_file_restores_umask_when_capture_creation_fails() {
+    let env = IsolatedEnv::new();
+    let missing = env.workdir.join("no-such-mktemp");
+    let mut sess = match fish_presourced_session(&env) {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping: fish not installed");
+            return;
+        }
+    };
+
+    let hook = embedded_hook("fish-hook.fish");
+    sess.send_line(&format!("source '{}'", hook.display()));
+    sess.expect("TIRITH_PTY> ");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
+    sess.send_line(&format!(
+        "umask 022; set -g _TIRITH_MKTEMP_BIN '{}'; _tirith_v3_new_capture_file > /dev/null; set -l st $status; printf 'TIRITH_CAPTURE_CREATE_STATUS<%s>' $st; printf 'TIRITH_UMASK_POST_FAIL<%s>' (umask)",
+        missing.display()
+    ));
+    let outcome = sess.expect_any(
+        &[
+            "TIRITH_CAPTURE_CREATE_STATUS<0>",
+            "TIRITH_CAPTURE_CREATE_STATUS<1>",
+            "TIRITH_UMASK_POST_FAIL<0022>",
+            "TIRITH_UMASK_POST_FAIL<0077>",
+        ],
+        VERDICT_IDLE,
+    );
+    sess.close();
+
+    // The non-zero status is what proves the failing branch really ran: it is
+    // the branch that would strand the session at 0077 without the restore.
+    assert!(
+        outcome.contains("TIRITH_CAPTURE_CREATE_STATUS<1>"),
+        "anti-vacuous guard: the capture helper must really have failed, got:\n{outcome}"
+    );
+    assert!(
+        outcome.contains("TIRITH_UMASK_POST_FAIL<0022>")
+            && !outcome.contains("TIRITH_UMASK_POST_FAIL<0077>"),
+        "a failed capture must not leave the session at 0077 (#265), got:\n{outcome}"
+    );
+}
+
 // === trusted controlling-terminal confirmation ===
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
