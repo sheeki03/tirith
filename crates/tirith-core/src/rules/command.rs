@@ -12286,6 +12286,10 @@ mod tests {
             r#"BIN=/bin/echo; stat -A BI'N' +link l; "$BIN" -c id"#,
             r#"BIN=/bin/echo; nameref R=BI'N'; R=/bin/sh; "$BIN" -c id"#,
             r#"BIN=/bin/echo; strftime -s BI'N' %s 0; "$BIN" -c id"#,
+            // ksh93: `alarm VAR` binds a discipline variable and `compound`
+            // is an alias of `typeset -C`.
+            r#"BIN=/bin/echo; alarm BI'N' +1; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; compound BI'N'; "$BIN" -c id"#,
             // Nested bodies are never resolved: they can inherit a function
             // or alias from the enclosing input that rebinds the name.
             r#"bash -c 'BIN=/bin/echo; "$BIN" hi'"#,

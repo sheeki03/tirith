@@ -3889,6 +3889,33 @@ struct PosixHeredocRecovery {
     sanitized: String,
     bodies: Vec<ExecutableBody>,
     gap: Option<ShellExecutionGap>,
+    spans: Vec<PosixHeredocSpan>,
+}
+
+/// Where one recovered POSIX heredoc sits in its source (byte offsets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PosixHeredocSpan {
+    /// The physical header line holding the `<<` operator (no newline).
+    pub header: std::ops::Range<usize>,
+    /// The operator and its delimiter word (`<<'EOF'`, `2<<-EOF`).
+    pub operator: std::ops::Range<usize>,
+    /// The body lines, without the terminator line.
+    pub body: std::ops::Range<usize>,
+    /// Body plus terminator line, including the terminator's newline.
+    pub through_terminator: std::ops::Range<usize>,
+    /// A quoted delimiter: the body is not expanded.
+    pub quoted: bool,
+}
+
+/// Every heredoc of a POSIX source with its exact position, or `None` when
+/// any heredoc is unsupported, unterminated, oversized or past the count
+/// bound (the same bounds as the executable-body recovery).
+pub(crate) fn posix_heredoc_spans(raw: &str) -> Option<Vec<PosixHeredocSpan>> {
+    let recovery = recover_posix_heredocs(raw);
+    if recovery.gap.is_some() {
+        return None;
+    }
+    Some(recovery.spans)
 }
 
 fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String, bool, usize), ()> {
@@ -4326,6 +4353,17 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                     .gap
                     .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
             } else {
+                recovery.spans.push(PosixHeredocSpan {
+                    header: cursor..header_end,
+                    operator: spec.operator_range.clone(),
+                    body: body_start..terminator_start,
+                    through_terminator: body_start..if terminator_end < raw.len() {
+                        terminator_end + 1
+                    } else {
+                        terminator_end
+                    },
+                    quoted: spec.quoted,
+                });
                 let body = if spec.strip_tabs {
                     strip_heredoc_tabs(body)
                 } else {
@@ -4586,6 +4624,7 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "]]",
     "{",
     "}",
+    "alarm",
     "alias",
     "autoload",
     "bg",
@@ -4611,6 +4650,7 @@ const POSIX_STATEFUL_WORDS: &[&str] = &[
     "complete",
     "compgroups",
     "compopt",
+    "compound",
     "compquote",
     "compset",
     "comptags",
@@ -5324,8 +5364,14 @@ fn resolve_posix_variable_command_words(
 /// input, so the executable-body scan never resolves.
 pub fn posix_variable_command_literal_view(input: &str, shell: ShellType) -> Option<String> {
     // Cheap pre-checks first: this runs on every exec/paste analysis, and a
-    // resolvable command word always contains `"$`.
-    if shell != ShellType::Posix || !input.contains("\"$") || input.contains("<<") {
+    // resolvable command word always contains `"$`. The size cap is checked
+    // again by the resolver; checking it here keeps an oversized input from
+    // being tokenized at all.
+    if shell != ShellType::Posix
+        || input.len() > MAX_VARIABLE_COMMAND_INPUT_BYTES
+        || !input.contains("\"$")
+        || input.contains("<<")
+    {
         return None;
     }
     let segments = tokenize::tokenize(input, shell);
@@ -5557,6 +5603,36 @@ pub(crate) fn literal_posix_subshell_group_body(
     raw.get(1..close)
         .map(|body| Some(body.to_string()))
         .ok_or(())
+}
+
+/// The body of a literal brace group, subshell or function definition
+/// whatever follows its closer (`{ ...; } >log`, `f() { ...; } 2>&1`). Only
+/// for detectors that look for MORE evidence inside a body; consumers that
+/// track shell state must keep using the exact extractors above.
+pub(crate) fn posix_compound_body_any_suffix(raw: &str) -> Option<String> {
+    let raw = raw.trim_start();
+    if let PosixFunctionParse::Complete { definition, .. } = parse_posix_function_definition(raw, 0)
+    {
+        return Some(definition.body);
+    }
+    let brace = raw.starts_with('{') && raw[1..].starts_with(char::is_whitespace);
+    let paren = raw.starts_with('(') && !raw.starts_with("((");
+    if !brace && !paren {
+        return None;
+    }
+    let close = find_shell_delimiter_close(raw, 0, ShellType::Posix)?;
+    raw.get(1..close).map(str::to_string)
+}
+
+/// The byte index closing the POSIX `(` or `{` at `open`, honouring quotes,
+/// escapes, comments and nesting.
+pub(crate) fn posix_delimiter_close(input: &str, open: usize) -> Option<usize> {
+    find_shell_delimiter_close(input, open, ShellType::Posix)
+}
+
+/// The byte index closing the backtick at `open`.
+pub(crate) fn posix_backtick_close(input: &str, open: usize) -> Option<usize> {
+    find_backtick_close(input, open)
 }
 
 pub(crate) fn executable_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
@@ -17281,6 +17357,35 @@ mod tests {
                 "{input}: {scan:?}"
             );
         }
+    }
+
+    #[test]
+    fn issue_264_literal_view_is_capped_before_tokenizing() {
+        let command = r#"BIN=/bin/echo; "$BIN" --help"#;
+        let pad = |len: usize| format!("{command}{}", " ".repeat(len - command.len()));
+        let at_cap = pad(MAX_VARIABLE_COMMAND_INPUT_BYTES);
+        assert_eq!(
+            posix_variable_command_literal_view(&at_cap, ShellType::Posix)
+                .as_deref()
+                .map(str::trim_end),
+            Some("BIN=/bin/echo; /bin/echo --help")
+        );
+        assert_eq!(
+            posix_variable_command_literal_view(
+                &pad(MAX_VARIABLE_COMMAND_INPUT_BYTES + 1),
+                ShellType::Posix
+            ),
+            None
+        );
+        // Far over the cap the answer is the same and comes without
+        // tokenizing megabytes of input.
+        let huge = format!("{command}; {}", "echo \"$X\" a; ".repeat(400_000));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            posix_variable_command_literal_view(&huge, ShellType::Posix),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     #[test]

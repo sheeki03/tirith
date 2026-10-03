@@ -96,6 +96,15 @@ file contents can produce a new hash in the downloaded report.
   selection, unsupported syntax, dependency resolution, conditional exports,
   shell effects, nested archives, WebAssembly and unsupported source formats are
   reported as gaps.
+- Shell files and lifecycle scripts get a bounded command-pattern pass for a
+  literal curl/wget pipeline into a shell, including inside brace groups,
+  functions and subshells (also with a trailing redirection). Heredoc text is
+  skipped only when the file provably just prints it: a heredoc given to
+  `cat`, `echo`, `printf` or `:` (or read into a variable that is only
+  echoed), in a file with no pipe except into plain text filters, no output
+  redirection to a file, no capture of the printed text, and no `eval`,
+  `source`, `exec`, shell, `sudo`, alias or `PATH` change. Anything else keeps
+  the signal. What a caller does with a script's output is not followed.
 - JSON reports are capped at 384 KiB with omitted-row counts. A comparison keeps
   at most 200 deltas with an exact omitted count. A changed analyzer version,
   changed limits, or incomplete or different coverage disables capability-delta
