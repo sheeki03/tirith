@@ -570,9 +570,8 @@ Named explicitly so no reader has to infer it from silence.
 - **No package installation containment claim.** [Local npm inspection](npm-inspection.md)
   hashes the exact supplied tarball bytes and reports bounded static evidence
   without downloading it, writing its contents to disk, or executing package code.
-  Inspection and provenance do not authorize installation. `tirith pkg install` refuses for
-  both npm and Python on every host: contained package execution and its
-  private-input backend were removed.
+  Inspection and provenance do not authorize installation. `tirith pkg install` is disabled for
+  both npm and Python on every host pending private-input execution qualification.
 - **No browser forensics.** No browsing data is read, no browser is monitored,
   nothing is quarantined or removed, and no infostealer is attributed.
 - **No reproducible builds.** No receipt in this branch claims that an output

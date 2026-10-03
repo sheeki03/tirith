@@ -43,9 +43,9 @@
   exception (see "Opt-in runtime containment" below): the Linux-only live
   every live `tirith run` (`--capsule` remains a legacy spelling),
   `tirith temp-run --capsule` and `tirith gateway run --capsule` surfaces route
-  the program they launch through an OS containment capsule. `tirith pkg install`
-  refuses on every host: contained package execution and its private-input
-  backend were removed. This is an explicit, per-invocation choice for tirith-launched
+  the program they launch through an OS containment capsule. Contained
+  `tirith pkg install` execution is currently disabled pending private-input
+  qualification. This is an explicit, per-invocation choice for tirith-launched
   processes, not blanket containment of the shell.
 - **Network monitoring**: tirith does not inspect network traffic after command execution
 - **Malware detection**: tirith analyzes command structure, not payload content (except via `run`)
@@ -111,8 +111,8 @@
   supplied tarball bytes and reports bounded static evidence without downloading
   it, writing its contents to disk, or executing package code. Captured hashes
   identify the inspected bytes, not a later mutable path or a verified publisher, and do not authorize
-  installation. `tirith pkg install` refuses for both npm and Python on every
-  host: contained package execution and its private-input backend were removed.
+  installation. `tirith pkg install` is disabled for both npm and Python on every
+  host pending private-input execution qualification.
 - **Browser forensics or monitoring**: `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension SOURCE trees for Chrome,
   Chromium, Brave, and Edge. It never reads cookies, history, saved passwords,
@@ -166,10 +166,11 @@ tirith-launched surfaces can route their child process through:
   of the temp-dir file isolation.
 - `tirith gateway run --capsule` spawns the upstream MCP server contained
   (deny-network).
-- `tirith pkg install` refuses on every host before resolver, quarantine,
-  checkpoint, or package execution. Contained package execution and its private
-  named-input backend were removed, so nothing pending can enable it; generic
-  capsule coverage does not provide the immutable-input guarantee it would need.
+- `tirith pkg install` currently refuses on every host before resolver,
+  quarantine, checkpoint, or package execution. Its private named-input backend
+  has not been qualified for immutable inputs throughout the complete target
+  lifetime against another process owned by the same user. Generic capsule
+  coverage does not establish that additional guarantee.
 - `tirith capsule run --preset untrusted-project` copies an untrusted project
   into a held ephemeral directory and runs an exact argv there. It is
   enforceable on native x86_64 and AArch64 Linux with usable Landlock and
