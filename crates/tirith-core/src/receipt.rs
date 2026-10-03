@@ -226,7 +226,8 @@ pub struct PublicReceipt {
 }
 
 // ===========================================================================
-// D6: tamper-evident package-firewall scan receipt
+// D6: tamper-evident package-firewall scan receipt (written by the pip
+// package firewall in earlier releases; `pkg receipt` still reads them)
 // ===========================================================================
 
 /// The schema version of [`ArtifactScanReceipt`]. Bumped when a field is added or
@@ -347,7 +348,9 @@ impl ReceiptPublicationState {
 }
 
 /// A **new versioned, tamper-evident** receipt for one package-firewall install
-/// (PR D6).
+/// (PR D6). Earlier releases wrote these from the now-removed pip package
+/// firewall. No production path in this release writes them; `pkg receipt`
+/// reads, lists and verifies them.
 ///
 /// It records exactly what the install ran: the tirith version + engine build SHA,
 /// a redacted policy-posture hash, the threat-DB sequence the approval bound to,

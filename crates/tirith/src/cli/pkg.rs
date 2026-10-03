@@ -1,5 +1,5 @@
 //! `tirith pkg install | verify-env | approve | receipt | trust-tool`, the
-//! package-firewall CLI surface (PR D7).
+//! CLI surface left from the removed pip package firewall (PR D7).
 //!
 //! Contained Python package execution is disabled by the shared private-input
 //! qualification guard ([`capsule::require_private_input_execution_qualification`]).
@@ -26,8 +26,8 @@
 //!
 //! `tirith install` (in [`crate::cli::install`]) is the ANALYSIS path: it inspects a
 //! package-manager command and optionally runs the real, UNcontained install.
-//! `tirith pkg install` is the ENFORCING path and currently refuses on every host
-//! because the private-input backend is unqualified. The two stay separate
+//! `tirith pkg install` was the ENFORCING path; it refuses on every host because
+//! contained package execution and its private-input backend were removed. The two stay separate
 //! commands. This module reuses `tirith install`'s `MISPLACED_TIRITH_FLAGS`
 //! footgun guard (a tirith-owned flag placed after the trailing args would
 //! silently not affect tirith).

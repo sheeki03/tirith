@@ -532,8 +532,10 @@ impl InspectionCoverage {
 /// findings. Artifact gaps are always security-relevant: they describe bytes in
 /// an installable artifact, not an ordinary oversized text file.
 ///
-/// `fail_closed` is used by the package firewall/install path, where every byte
-/// must be covered before extraction. Other artifact-evaluation surfaces retain
+/// `fail_closed` is used by `tirith package` (cli/package.rs), the release diff
+/// (release_diff.rs) and `tirith lab` (cli/lab.rs), where every artifact byte
+/// must be covered. (The removed pip package firewall also used it before
+/// extraction.) Other artifact-evaluation surfaces retain
 /// the configured gap action, but floor it at Warn so an incomplete artifact can
 /// never finalize as Allow. `scan.require_complete` upgrades every artifact gap
 /// to the fail-closed Block grade.
@@ -587,8 +589,8 @@ pub(crate) fn artifact_analysis_incomplete_findings(
 /// Restore the minimum action and typed findings required by artifact coverage
 /// after the shared policy finalizer runs. Severity overrides and paranoia are
 /// presentation/policy controls; neither may turn an incomplete installable
-/// artifact into `Allow`, and the enforcing firewall path may never fall below
-/// `Block`.
+/// artifact into `Allow`, and a `fail_closed` caller (`tirith package`, the
+/// release diff, `tirith lab`) may never fall below `Block`.
 pub fn enforce_artifact_coverage_floor(
     verdict: &mut Verdict,
     gaps: &[CoverageGap],

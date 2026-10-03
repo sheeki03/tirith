@@ -5261,9 +5261,13 @@ fn posix_name_only_expanded(raw: &str, name: &str, assignment_start: usize) -> b
 ///
 /// A failed assignment (read-only or integer `NAME` inherited from the live
 /// shell) aborts the rest of the input in bash, zsh and sh, so the expansion
-/// never runs with the inherited value. State this input cannot show (live
-/// aliases, functions or attributes such as `typeset -u`) is outside the model,
-/// exactly as it is for a literal command name.
+/// never runs with the inherited value. State this input cannot show is
+/// outside the model, exactly as it is for a literal command name: live
+/// aliases, functions, attributes such as `typeset -u`, traps set by an earlier
+/// command (a bash, zsh or ksh `DEBUG`, `ERR` or `RETURN` trap can reassign
+/// `NAME` between the assignment and its use) and ksh93 discipline functions
+/// such as `NAME.get`. Only rebinding forms written in this input are refused;
+/// `trap` is a stateful word, so a trap in the same input is refused too.
 fn resolve_posix_variable_command_words(
     raw: &str,
     segments: &[tokenize::Segment],

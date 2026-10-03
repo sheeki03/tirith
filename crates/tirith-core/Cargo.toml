@@ -15,7 +15,7 @@ categories = ["development-tools"]
 # Compatibility-only feature name retained for downstream manifests. Artifact
 # and member SHA-256 lookups are a security control and are compiled
 # unconditionally; disabling default features must never remove known-malicious
-# blocking from the artifact firewall.
+# blocking from artifact inspection.
 default = []
 artifact-hash-lookup = []
 # Enables hermetic, per-instance DNS lookup injection for cross-crate network

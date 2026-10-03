@@ -3,7 +3,7 @@
 Synthetic, inert byte-level fixtures for `tirith lab` artifact scenarios (plan
 unit G2). These exercise the wheel / `.pth` / native-`.so` inspection pipeline
 (`tirith_core::artifact::inspect_artifact_set` plus `all_findings` and
-`finalize_static_verdict`) the same way the package firewall does, but over
+`finalize_static_verdict`) the same way `tirith package inspect` does, but over
 hand-built bytes that contain no real payload.
 
 ## What these are NOT
