@@ -68,7 +68,7 @@ absent from this branch, not that it is coming.
 
 | Capability | Detection | Preflight decision | Execution enforcement | Containment | Attestation | Unsupported |
 |---|---|---|---|---|---|---|
-| `capsule run --preset untrusted-project` | Full (project tree digest) | Full | Full (refuses before any copy or spawn) | Full where the backend delivers it | Partial (content-addressed always; anchored only when an audit chain is configured; signed only when an audit key exists) | everything except x86_64 Linux with a usable Landlock ABI; domain allow-listing is unavailable in every backend; `TIRITH_LOG=0` leaves the receipt unanchored |
+| `capsule run --preset untrusted-project` | Full (project tree digest) | Full | Full (refuses before any copy or spawn) | Full where the backend delivers it | Partial (content-addressed always; anchored only when an audit chain is configured; signed only when an audit key exists) | everything except native x86_64 and AArch64 Linux with usable Landlock and seccomp; domain allow-listing is unavailable in every backend; `TIRITH_LOG=0` leaves the receipt unanchored |
 | Chromium extension integrity audit | Full for the extension source tree | None (explicit command, not a gate) | None | None | Partial (content-addressed baseline, **not** anchored in the audit chain) | Firefox and XPI are refused by name; Chrome's `Secure Preferences` MAC is not verified |
 
 ### Point-in-time evidence
@@ -473,12 +473,14 @@ by refusing rather than by containing more.
 
 `required_coverage` was not weakened
 (`CapsuleSpec::required_coverage` in `crates/tirith-core/src/capsule/mod.rs`), so the preset is genuinely
-enforceable only on x86_64 Linux with a usable Landlock ABI. Raw-network denial
-needs seccomp, which is x86_64 Linux only in this build; macOS cannot enforce a
+enforceable only on native x86_64 and AArch64 Linux with usable Landlock and
+seccomp. Raw-network denial needs seccomp, which this build provides on both
+Linux architectures; macOS cannot enforce a
 per-process memory ceiling or a process-count ceiling at all; and the
 parent-owned wall-clock and combined-output supervisor is Linux-only.
 
-Verified live on the macOS development host at this branch tip: the command
+Verified live on the macOS development host (before the 0.5.0 cycle cleanup; not
+re-run since): the command
 refuses before anything is copied or spawned, exits 1, writes a refusal receipt,
 reports `project_copy_materialized: false`, and names the exact missing control
 ("missing: resource_limits ... the parent-owned wall-clock and combined-output

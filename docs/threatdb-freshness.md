@@ -47,8 +47,9 @@ sequence, format and database SHA-256 must match the installed database. Reads
 check these bindings again, so a stale or edited local evidence file cannot make
 another database look current.
 
-Downloads retry transient failures (HTTP 408, 429, 500, 502, 503 and 504, and a
-stalled server) at most three times within the original time budget. Each
+Downloads make at most three attempts (two retries) on transient failures (HTTP
+408, 429, 500, 502, 503 and 504, and a stalled server) within the original time
+budget. Each
 attempt waits for response headers for an equal share of the remaining budget;
 the last attempt gets all of it. A valid `Retry-After` is honored when it fits
 the budget.
