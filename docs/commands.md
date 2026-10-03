@@ -112,10 +112,10 @@ project review, interruptions, upgrade and removal.
 | Command | What it does |
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Currently disabled. Checks the native approval authority, then refuses with `private_input_execution_unqualified`; records no approval, because contained `pkg install` is disabled |
-| `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
+| `tirith pkg install <backend> <spec>` | Refuses on every host with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution. Contained package execution and its private-input backend were removed; flags and elevation do not enable it |
 | `tirith pkg inspect <artifact>...` | Inspect exact local npm tarballs or Python wheels without execution. [npm reports](npm-inspection.md) preserve captured hashes and explicit coverage; ambiguous `.tar.gz` files require `--ecosystem npm` for the npm reader (`--format json`, npm `--format sarif`) |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
-| `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
+| `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256. Nothing in this release reads the pin, because contained `pkg install` was removed |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
 | `tirith pkg diff <old> <new>` | Compare two local npm tarballs or Python wheels. [npm comparison](npm-inspection.md) retains exact artifact hashes and separates byte changes from analyzer/coverage changes; it grants no installation authority (`--ecosystem`, `--format json`, npm `--format sarif`) |
 | `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |

@@ -147,23 +147,33 @@ task_gate:
   mode: observe
 ```
 
-**Know what observe mode actually records before you plan around it.** Exactly
-one of the nine owned boundaries writes anything:
-`BoundaryAssessment::is_recordable()` (`crates/tirith-core/src/task_boundary.rs:203`)
-has a single production caller, `crates/tirith/src/cli/gateway.rs:3214`, and
-`write_task_boundary_audit` is defined and called only there (`gateway.rs:4227`).
-So `gateway_forward` produces audit-chain lines, and `package_approval`,
-`package_resolve`, `package_install_preparation`, `package_manager_network`,
-`package_manager_execution`, `remote_script_run`, `config_write`, and
-`capsule_preset_run` produce nothing at all, in any mode. Running
-`tirith policy init` under `mode: observe` creates no audit file anywhere.
-(`pkg approve` and `pkg install` currently refuse before their boundaries.)
+**Know what observe mode actually records before you plan around it.** Only
+an assessment that `BoundaryAssessment::is_recordable()` accepts is written,
+and only these boundaries have a production writer:
+
+- `gateway_forward`: the MCP gateway (`write_task_boundary_audit` in
+  `crates/tirith/src/cli/gateway.rs`).
+- `fetch_cloaking`: the MCP `tirith_fetch_cloaking` tool (the dispatcher's
+  audit callback) and `tirith fetch`, through `cloaking::check_with_audit`.
+- `remote_script_run`: `tirith run`, `tirith fetch --save`, the `tirith install`
+  remote-URL path, command cards and the core runner, through
+  `audit::log_task_boundary_assessment`.
+- `package_manager_network` and `package_manager_execution`: the local
+  `tirith install` authorization, through the same writer.
+- `verify_self` and `self_update`: `tirith verify-self` and `tirith update`,
+  through the same writer.
+
+`config_write` and `capsule_preset_run` evaluate the gate but write no
+assessment record. Running `tirith policy init` under `mode: observe` creates no
+audit file anywhere. (`package_approval`, `package_resolve` and
+`package_install_preparation` are retained wire tokens with no call site:
+`pkg approve` and `pkg install` refuse.)
 
 The records that do exist land in the standard audit chain, so read them with
-`tirith audit` (and note `TIRITH_LOG=0` disables that chain entirely). For the
-other eight boundaries there is nothing to read, so plan the burn-in around the
-gateway, or instrument the boundaries you care about outside tirith. Adding
-records at the other eight is a behaviour change and therefore a future slice.
+`tirith audit` (and note `TIRITH_LOG=0` disables that chain entirely). For
+`config_write` and `capsule_preset_run` there is nothing to read, so plan the
+burn-in around the recording boundaries, or instrument those two outside
+tirith. Adding records there is a behaviour change and therefore a future slice.
 
 Optionally declare `web3_guard` networks and signers so the endpoint and signer
 rules have something to compare against. Leave every `action_*` at `warn`.
@@ -231,22 +241,28 @@ task_gate:
 directions.** Effect inference models the Web3 shell grammar and nothing else,
 so nearly every ordinary SHELL command is incomplete. But the action only
 applies when the assessment is incomplete
-(`crates/tirith-core/src/task_boundary.rs:325-330`), and the four boundaries
-that submit package or config-write envelopes always assess as complete
-(`crates/tirith-core/src/task.rs:638-652`). So `block` refuses unmodelled shell
-at five boundaries (`capsule_preset_run`, `gateway_forward`, `remote_script_run`
-covering both `tirith run <url>` and `tirith install url <URL>`,
-`package_manager_network`, and `package_manager_execution`) and changes nothing
-at `pkg approve`, the two `pkg install` stages, or config writes. That is a real
+(`outcome_for` in `crates/tirith-core/src/task_boundary.rs`), and config-write
+envelopes and the cloaking probe envelope always assess as complete (the
+`ProposedAction::ConfigWrite` arm of `infer_effects_detailed_with_context` in
+`crates/tirith-core/src/task.rs`; the probe envelope has no action). So `block`
+refuses unmodelled shell at five boundaries (`capsule_preset_run`,
+`gateway_forward`, `remote_script_run` covering both `tirith run <url>` and
+`tirith install url <URL>`, `package_manager_network`, and
+`package_manager_execution`), also refuses the narrative actions that
+`gateway_forward` (unmodelled MCP tool calls), `verify_self` and `self_update`
+(operations that name no destination file) submit, and changes nothing at config
+writes or `fetch_cloaking`. `pkg approve` and `pkg install` refuse before any
+boundary. That is a real
 protection with a real cost, not a setting that breaks everything. Start at
 `warn`, measure your own incomplete rate on the five shell boundaries, and
 decide.
 
 **`effects_denied_for_untrusted_sources` denies the effect unconditionally.**
 The name suggests it discriminates by origin; at these boundaries it cannot.
-`SourceKind::is_trusted` returns `false` for every kind
-(`crates/tirith-core/src/task.rs:71-73`) and every owned boundary passes
-`IngressAdapter::Unattributed`, so the effect is filtered out on every call,
+`SourceKind::is_trusted` (`crates/tirith-core/src/task.rs`) returns `false`
+for every kind, and every owned boundary passes `IngressAdapter::Unattributed`
+or, for `verify_self` and `self_update`, `IngressAdapter::OperatorIngest` with
+an `unknown` source, so the effect is filtered out on every call,
 including the operator's own typed commands. With the snippet above,
 `tirith policy init` refuses with "task gate refused this configuration write".
 Under `mode: observe` it is allowed, so the mode is the only variable. Enable it deliberately, knowing it turns off those

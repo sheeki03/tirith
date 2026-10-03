@@ -240,7 +240,7 @@ the code rather than asserted here.
 The caller does not get to say where content came from. `claimed_source` is
 recorded as a claim; effective provenance is assigned by the tirith-owned
 ingress adapter. `SourceKind::is_trusted` is unconditionally `false`
-(`task.rs:71-73`) for every source kind including repository config, because
+(`SourceKind::is_trusted` in `task.rs`) for every source kind including repository config, because
 repository config is exactly what a malicious pull request edits.
 
 Verified live at this branch tip: an envelope whose source claims `agent_config`,
@@ -273,20 +273,26 @@ tool.
 
 ### Task gate at tirith-owned transitions
 
-`crates/tirith-core/src/task_boundary.rs` defines nine owned boundaries
-(`task_boundary.rs:118-130`) and is called at ten sites:
+`crates/tirith-core/src/task_boundary.rs` defines the owned boundaries
+(`enum OwnedBoundary`). These are evaluated in production:
 
 | Boundary token | Where |
 |---|---|
 | `gateway_forward` | before the MCP gateway registers a pending request and writes upstream |
-| `package_approval` | before `tirith pkg approve` runs the resolver (not reached while contained package execution is disabled: the command refuses first) |
-| `package_resolve` | before `tirith pkg install` runs the same resolver network (not reached while contained package execution is disabled: the command refuses first) |
-| `package_install_preparation` | before the target environment is checkpointed (not reached while contained package execution is disabled: the command refuses first) |
 | `package_manager_network` | before `tirith install <manager>` contacts a registry |
 | `package_manager_execution` | before the package manager is spawned |
 | `remote_script_run` | before `tirith run <url>` and `tirith install url <URL>` download and launch |
+| `fetch_cloaking` | before `tirith fetch` or its MCP tool runs the cloaking probe set |
 | `config_write` | before a tirith-owned config file is published by rename |
+| `verify_self` | before `tirith verify-self` creates private state and contacts the release origin |
+| `self_update` | before `tirith update` contacts the release origin and updates or rolls back |
 | `capsule_preset_run` | before `capsule run --preset untrusted-project` copies or spawns |
+
+`package_approval`, `package_resolve` and `package_install_preparation` are
+retained wire tokens only, so task receipts, MCP schemas and policies that name
+them keep parsing. No code evaluates them: `tirith pkg approve` and
+`tirith pkg install` refuse before any resolver or checkpoint work, and that
+work was removed.
 
 Four properties, each pinned by a test. Enforcement keys on the MODE, never on
 the denial set, so an operator who filled in effect sets without choosing a mode
@@ -298,19 +304,25 @@ is reachable, once enforcing to show the same evidence is gone. And the default
 ships inert: `TaskGateMode` defaults to `Off` and an `Off` gate does not even
 write an audit line.
 
-**Only one of the nine boundaries records anything, in any mode.**
-`BoundaryAssessment::is_recordable()` (`task_boundary.rs:203`) has exactly one
-production caller, `crates/tirith/src/cli/gateway.rs:3214`, and
-`write_task_boundary_audit` is defined and called only there
-(`gateway.rs:4227` and `:3215`). The `gateway_forward` boundary writes an
-audit-chain line in observe and enforce modes; the other eight decide, refuse or
-allow, and write nothing anywhere. An observation burn-in run against
-`tirith policy init` under `mode: observe` produces no audit file at all.
+**Seven of the nine boundaries record their assessments; two record nothing.**
+In observe and enforce modes, an assessment that
+`BoundaryAssessment::is_recordable()` accepts is written to the audit chain by
+these boundaries: `gateway_forward` (`write_task_boundary_audit` in
+`crates/tirith/src/cli/gateway.rs`), `fetch_cloaking` (`tirith fetch` and the
+MCP `tirith_fetch_cloaking` tool), `remote_script_run` (`tirith run`, the
+`tirith install` remote-URL path, command cards and the core runner),
+`package_manager_network` and `package_manager_execution` (`tirith install`),
+and `verify_self` and `self_update` (`tirith verify-self` and `tirith update`).
+All but the gateway write through `audit::log_task_boundary_assessment`.
+`config_write` and `capsule_preset_run` decide, refuse or allow, and write
+nothing anywhere. An observation burn-in run against `tirith policy init` under
+`mode: observe` produces no audit file at all.
 
-This matters for anyone planning a burn-in: eight of the nine boundaries cannot
-be measured from records, so "no records" means "not instrumented", never "not
-exercised". Instrumenting them is a behaviour change and therefore a future
-slice, not a documentation slice.
+This matters for anyone planning a burn-in: `config_write` and
+`capsule_preset_run` cannot be measured from records, so "no records" there
+means "not instrumented", never "not exercised". Instrumenting them is a
+behaviour change and therefore a future slice, not a documentation slice.
+See [Stage 2 of the Web3 task rollout](web3-task-rollout.md#stage-2-observation-burn-in-operator).
 
 The containment cell is **Partial** because a denied effect narrows the capsule
 spec rather than merely refusing: `network_egress` forces deny-all networking,
@@ -321,25 +333,32 @@ resource ceiling to the shared conservative values. It only ever tightens, which
 **The trap an operator must know about, stated precisely.** Effect inference
 models the Web3 shell grammar and nothing else, so nearly every ordinary SHELL
 command is reported INCOMPLETE. `action_incomplete_analysis` only applies when
-`!decision.complete` (`crates/tirith-core/src/task_boundary.rs:325-330`), so
-`block` bites at exactly the five boundaries that submit a shell envelope:
-`capsule_preset_run` (`capsule_run.rs:255`), `gateway_forward`
-(`gateway.rs:3202`), `remote_script_run` (`run.rs:68` for `tirith run <url>`
-and `install.rs:3154` for `tirith install url <URL>`), and
-`package_manager_network` plus `package_manager_execution`, which share the
-`evaluate_install_boundary` helper at `install.rs:1765`.
+`!decision.complete` (`outcome_for` in `crates/tirith-core/src/task_boundary.rs`),
+so `block` bites wherever a boundary submits an incomplete envelope. Shell
+envelopes come from `capsule_preset_run` (the `shell_envelope` call in
+`capsule_run.rs`), `gateway_forward` (shell tool calls), `remote_script_run`
+(`tirith run <url>` and `tirith install url <URL>`, through the core runner), and
+`package_manager_network` plus `package_manager_execution` (the
+`tirith install <manager>` authorization in `install.rs`). A
+`ProposedAction::Narrative` action is also incomplete: `gateway_forward` submits
+one for an MCP tool call it does not model, and `verify_self` and `self_update`
+submit one when the operation names no destination file (for example the
+dashboard's threat-DB refresh).
 
-It never fires at the other four. `ProposedAction::PackageInstall` and
-`ProposedAction::ConfigWrite` leave `complete = true`
-(`crates/tirith-core/src/task.rs:638-652`), so `tirith pkg approve`, the
-`pkg install` resolve and prepare stages, and every tirith-owned config write
-assess as complete and are unaffected by this setting. A one-action
+It never fires at `config_write` or `fetch_cloaking`, or at `verify_self` and
+`self_update` when they name a destination file. The `ProposedAction::ConfigWrite`
+and `ProposedAction::PackageInstall` arms of `infer_effects_detailed_with_context`
+(`crates/tirith-core/src/task.rs`) leave `complete = true`, and the cloaking
+probe envelope carries no action at all, so every tirith-owned config write
+assesses as complete and is unaffected by this setting. A one-action
 `package_install` envelope returns `"complete": true`; a `config_write` envelope
 returns `"complete": true`; `{"shell":{"command":"pip install requests"}}`
-returns `"complete": false`.
+returns `"complete": false`. (`tirith pkg approve` and `pkg install` refuse
+before any boundary, so they are unaffected either way.)
 
-So `block` is not "refuses everything". It is "refuses unmodelled shell at five
-of the nine owned boundaries, and changes nothing at the other four". Whether
+So `block` is not "refuses everything". It is "refuses unmodelled shell and
+unmodelled actions where a boundary submits them, and changes nothing at config
+writes or the cloaking probe". Whether
 that trade is worth making is an operator decision, not a foregone one. The
 conservative default remains `warn`, and
 `effects_denied_for_untrusted_sources` is the blunter and more predictable
@@ -348,14 +367,15 @@ control, but read the next paragraph before reaching for it.
 **`effects_denied_for_untrusted_sources` is an unconditional denial of the
 effect, not a denial scoped to agent-supplied content.** The name reads as
 though it discriminates by origin. At these boundaries it cannot.
-`SourceKind::is_trusted` returns `false` for every kind
-(`crates/tirith-core/src/task.rs:71-73`), and every owned boundary attributes
-its operation to `IngressAdapter::Unattributed` (`cli/mod.rs:665`,
-`cli/pkg.rs:651`, `cli/gateway.rs:3207`, `cli/capsule_run.rs:259`,
-`cli/run.rs:72`, `cli/install.rs:1769` and `:3158`), which is the truthful
-answer because an argv is just an argv. `allowed_effects`
-(`crates/tirith-core/src/web3_policy.rs:451`) therefore filters that effect out
-on every call, including the operator's own typed commands.
+`SourceKind::is_trusted` (`crates/tirith-core/src/task.rs`) returns `false`
+for every kind, and the owned boundaries attribute their operation to
+`IngressAdapter::Unattributed` (the config writes in `cli/mod.rs`, the gateway,
+`capsule_run.rs`, the core runner and `install.rs`) or, for `verify_self` and
+`self_update`, to `IngressAdapter::OperatorIngest` with an `unknown` source.
+Either way the source is untrusted, which is the truthful answer because an argv
+is just an argv. `allowed_effects` (`crates/tirith-core/src/web3_policy.rs`)
+therefore filters that effect out on every call, including the operator's own
+typed commands.
 
 Under `mode: enforce` with
 `effects_denied_for_untrusted_sources: [policy_change, package_install]`,
@@ -452,7 +472,7 @@ The one row in this document with **Full** execution enforcement, and it earns i
 by refusing rather than by containing more.
 
 `required_coverage` was not weakened
-(`crates/tirith-core/src/capsule/mod.rs:858-874`), so the preset is genuinely
+(`CapsuleSpec::required_coverage` in `crates/tirith-core/src/capsule/mod.rs`), so the preset is genuinely
 enforceable only on x86_64 Linux with a usable Landlock ABI. Raw-network denial
 needs seccomp, which is x86_64 Linux only in this build; macOS cannot enforce a
 per-process memory ceiling or a process-count ceiling at all; and the
@@ -476,7 +496,7 @@ receipt is unsigned (no audit signing key configured) and NOT anchored in the au
 
 where an installation with the log enabled prints `... and anchored in the audit
 chain`. An anchor SKIP is deliberately not a failure and does not downgrade the
-exit code (`crates/tirith/src/cli/capsule_run.rs:913-925`), so a caller that
+exit code (the receipt-anchoring step in `crates/tirith/src/cli/capsule_run.rs`), so a caller that
 reads only the exit status cannot detect it. Read the printed line, or check the
 chain, before treating a capsule receipt as tamper-evident.
 
@@ -550,8 +570,9 @@ Named explicitly so no reader has to infer it from silence.
 - **No package installation containment claim.** [Local npm inspection](npm-inspection.md)
   hashes the exact supplied tarball bytes and reports bounded static evidence
   without downloading it, writing its contents to disk, or executing package code.
-  Inspection and provenance do not authorize installation. `tirith pkg install` is disabled for
-  both npm and Python on every host pending private-input execution qualification.
+  Inspection and provenance do not authorize installation. `tirith pkg install` refuses for
+  both npm and Python on every host: contained package execution and its
+  private-input backend were removed.
 - **No browser forensics.** No browsing data is read, no browser is monitored,
   nothing is quarantined or removed, and no infostealer is attributed.
 - **No reproducible builds.** No receipt in this branch claims that an output

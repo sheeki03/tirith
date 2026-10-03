@@ -1,7 +1,7 @@
 # Roadmap
 
 This roadmap separates published behavior, code already merged after the last
-release, and capabilities that exist only on the current integration stack.
+release (see "Unreleased: 0.5.0" below), and capabilities that exist only on the current integration stack.
 Presence in the repository or a pull request is not the same as availability
 in a package-manager release.
 
@@ -43,6 +43,11 @@ These capabilities shipped in 0.4.0:
   resolver identity, native approval authority, contained hash-pinned pip
   installation, environment verification, provenance graphs, release diffs,
   PyPI attestation binding, and receipts. Enforcement is x86_64 Linux only.
+  The next release (0.5.0) removes the pip resolve, quarantine, firewall and
+  approval-issuance pipeline: `pkg install` and `pkg approve` refuse with
+  `private_input_execution_unqualified`, while inspection, environment
+  verification, provenance graphs, release diffs and reading existing receipts
+  remain.
 - **ThreatDB v2:** artifact/file hashes, malicious URLs, campaign and behavior
   indices, signed dual-format publication, monotonic rollback protection, and a
   staged v1/v2 cutover.
@@ -100,6 +105,22 @@ Custom-rule compilation, regex retention, recent-log reads, and legacy session
 correlation perform less repeated work. The
 [0.4.2 release notes](release-notes-0.4.2.md) describe the fixes and upgrade steps.
 
+## Unreleased: 0.5.0
+
+Merged after 0.4.2 and not yet published; the
+[changelog](../CHANGELOG.md#unreleased) is the full list. It must ship as
+`0.5.0` because it removes `tirith-core` library API.
+
+- **Added:** versioned protection profiles and typed personal settings with
+  reviewable, undoable operations; reviewed profile rollouts and
+  `policy simulate`; `tirith setup recommended` and `setup shell`; scoped,
+  expiring trust grants; the authenticated local dashboard; hook freshness and
+  current-shell verification in `status` and `doctor`; `tirith review` for
+  project files; npm tarball inspection and release comparison; team policy.
+- **Removed:** the pip resolve, quarantine, firewall and approval-issuance
+  pipeline and the private-input launcher (`pkg install` and `pkg approve`
+  refuse), plus `tirith-core` library API listed in the changelog.
+
 ## Publication contract
 
 A release is cut only from the final default-branch tree after the cross-platform
@@ -111,8 +132,8 @@ may lag and are reported separately.
 
 ## Later
 
-- Broader containment beyond x86_64 Linux without weakening the current
-  fail-closed capability contract.
+- Broader containment beyond Linux (x86_64 and AArch64 are supported today)
+  without weakening the current fail-closed capability contract.
 - Kernel/runtime interception for arbitrary Python and notebook process
   creation; source-level IPython extraction cannot provide that guarantee.
 - Broader host certification and recurring real-agent end-to-end tests across

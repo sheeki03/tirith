@@ -69,7 +69,15 @@ a character other than a letter, digit or `-` (for example `X_Foo`), trailing
 whitespace or extra words on the request line, a target longer than 2048 bytes
 or a path starting with `//` or containing `\` all get 400; a method token
 longer than 16 bytes gets 405; and a request head larger than 64 KiB gets 431.
-Ordinary browser and `curl` requests are not affected. See
+It differs from 0.4.2 in a few more cases: a target containing `#`, any other
+ASCII control byte in the request head (or a bare LF inside the request line or
+a header value), and an HTTP version other than `HTTP/1.0` or `HTTP/1.1` get 400
+and close the connection, where 0.4.2 served `HTTP/0.9` and answered
+`HTTP/2.0` and `HTTP/3.0` with 505 on a kept-open connection; leading
+whitespace before the method gets 405, where 0.4.2 trimmed the request line;
+an `Expect` value other than `100-continue` is ignored, where 0.4.2 answered
+417; and responses no longer carry the `Date` and `Server` headers tiny_http
+added. Ordinary browser and `curl` requests are not affected. See
 `tirith dashboard --help`.
 
 ## Limits
