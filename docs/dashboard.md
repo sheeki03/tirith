@@ -57,9 +57,20 @@ the saved operation before retrying (`tirith policy operation OPERATION_ID`).
 
 ## The older HTML report
 
-`tirith dashboard export` writes a static HTML security report to a file, and
-`tirith dashboard serve` serves that report on loopback with an ephemeral token.
-Both are unchanged; see `tirith dashboard --help`.
+`tirith dashboard export` writes a static HTML security report to a file; it
+is unchanged. `tirith dashboard serve` serves that report on loopback with an
+ephemeral token, as before, but now uses the dashboard's loopback transport and
+handles HTTP more strictly: a request head must arrive within 1 second, an
+absolute-form target with a non-loopback authority gets 403, user info in the
+target gets 400, a request that may carry a body closes the connection, and at
+most 8 connections (8 requests each) are served at once. It also refuses some
+requests 0.4.2 answered: a tab anywhere in the request head, a header name with
+a character other than a letter, digit or `-` (for example `X_Foo`), trailing
+whitespace or extra words on the request line, a target longer than 2048 bytes
+or a path starting with `//` or containing `\` all get 400; a method token
+longer than 16 bytes gets 405; and a request head larger than 64 KiB gets 431.
+Ordinary browser and `curl` requests are not affected. See
+`tirith dashboard --help`.
 
 ## Limits
 
