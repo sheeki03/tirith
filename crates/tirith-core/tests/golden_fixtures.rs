@@ -2848,6 +2848,9 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
     fs::create_dir_all(root.join("rec")).unwrap();
     fs::write(root.join("rec/tfplan2"), b"RECORDED REC PLAN").unwrap();
     iac_plan::record_plan_hash(b"RECORDED REC PLAN", &root.join("rec/tfplan2"), &summary).unwrap();
+    // R4 fix round 2: ./tfplan2 exists but is NOT recorded, so a `cd rec`
+    // that may not run (or may run in a subshell) must not let it through.
+    fs::write(root.join("tfplan2"), b"UNRECORDED ROOT PLAN2").unwrap();
 
     let mismatch = |input: &str| {
         let ctx = AnalysisContext {
@@ -2912,6 +2915,40 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
         ("tirith iac check-plan other && terraform apply tfplan3", true),
         ("tirith iac check-plan tfplan3 && terraform -chdir=infra apply tfplan3", true),
         ("XDG_STATE_HOME=/tmp/x tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        // R4 fix round 2: a `cd` that may not run (conditional, or in the
+        // `||` branch that only runs when it failed, or backgrounded into a
+        // subshell) does not move the directory the plan is read from.
+        ("false && cd rec; terraform apply tfplan2", true),
+        ("true || cd rec; terraform apply tfplan2", true),
+        ("[ -d nope ] && cd rec; terraform apply tfplan2", true),
+        ("false && cd rec || terraform apply tfplan2", true),
+        ("cd rec || terraform apply tfplan2", true),
+        ("cd rec && false || terraform apply tfplan2", true),
+        ("cd rec || true & terraform apply tfplan2", true),
+        ("cd rec && true & terraform apply tfplan2", true),
+        ("alias cd=true\ncd rec\nterraform apply tfplan2", true),
+        // Controls: an unconditional cd still moves it.
+        ("cd rec || exit 1; terraform apply tfplan2", false),
+        ("cd rec && echo ok; terraform apply tfplan2", false),
+        ("cd rec\nterraform apply tfplan2", false),
+        // R4 fix round 2: the check-plan shortcut needs a check-plan that
+        // runs whenever the apply runs, and the real (bare-name) tirith.
+        ("true || tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("false && true || tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("echo x | tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("tirith() { :; }; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("alias tirith=true; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("/tmp/x/tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("PATH=/tmp/x:$PATH; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("export PATH=/tmp/x:$PATH; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("eval 'tirith() { :; }'; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        // Controls: an unconditional check-plan still records it.
+        ("true; tirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        ("true\ntirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        (
+            "tirith iac check-plan tfplan3 && terraform apply tfplan3 && tirith iac check-plan tfplan4 && terraform apply tfplan4",
+            false,
+        ),
     ]
     .into_iter()
     .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)

@@ -53,28 +53,36 @@ impl IacTool {
 /// prod-context rule and the apply-gate rule can both fire on one segment).
 ///
 /// The plan-hash gate reads the plan file the apply segment will use, so it
-/// tracks the working directory across segments (`WorkDir`) and recognizes
-/// a plan file that the immediately preceding `&&` segment records with
-/// `tirith iac check-plan` (`check_plan_recorded_path`).
+/// tracks the working directory across segments (`DirTracker`) and recognizes
+/// a plan file that `tirith iac check-plan` records right before the apply,
+/// in the same `&&` chain (`check_plan_chained_before`).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
     let segments = tokenize::tokenize(input, shell);
-    let mut work_dir = WorkDir::start();
+    let tirith_may_be_rebound = tirith_lookup_may_be_rebound(&segments);
+    let mut dirs = DirTracker::start();
     let mut findings = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
-        let recorded_by_previous = match i.checked_sub(1) {
-            Some(prev) if seg.preceding_separator.as_deref() == Some("&&") => {
-                check_plan_recorded_path(&segments[prev], shell)
-            }
-            _ => None,
+        dirs.enter(seg);
+        let recorded_by_previous = if tirith_may_be_rebound {
+            None
+        } else {
+            check_plan_chained_before(&segments, i)
         };
+        let work_dir = dirs.current();
         let plan_env = PlanEnv {
             work_dir: &work_dir,
             recorded_by_previous: recorded_by_previous.as_deref(),
         };
         findings.extend(check_segment(input, shell, policy, seg, &plan_env));
-        work_dir = work_dir.after(&segments, i, shell);
+        dirs.leave(&segments, i, shell);
     }
     findings
+}
+
+/// `true` when a segment with this preceding separator starts a new and-or
+/// list, i.e. runs regardless of how the previous command exited.
+fn starts_and_or_list(sep: Option<&str>) -> bool {
+    matches!(sep, None | Some(";" | "\n" | "&"))
 }
 
 /// The shell's working directory at a segment, relative to the directory
@@ -89,32 +97,6 @@ enum WorkDir {
 }
 
 impl WorkDir {
-    fn start() -> Self {
-        Self::Known(PathBuf::new())
-    }
-
-    /// The working directory for the segment after `segments[i]`.
-    fn after(self, segments: &[tokenize::Segment], i: usize, shell: ShellType) -> Self {
-        let seg = &segments[i];
-        if !segment_may_change_dir(seg) {
-            return self;
-        }
-        // Only a top-level, sequential `cd <literal>` is resolved. In a
-        // pipeline or a background job the builtin may run in a subshell.
-        let sequential = |sep: Option<&str>| matches!(sep, None | Some(";" | "&&" | "||" | "\n"));
-        let next_sep = segments
-            .get(i + 1)
-            .and_then(|s| s.preceding_separator.as_deref());
-        if !sequential(seg.preceding_separator.as_deref()) || !sequential(next_sep) {
-            return Self::Unknown;
-        }
-        match (self, literal_cd_target(seg, shell)) {
-            (Self::Known(base), Some(target)) => Self::Known(base.join(target)),
-            (Self::Unknown, Some(target)) if target.is_absolute() => Self::Known(target),
-            _ => Self::Unknown,
-        }
-    }
-
     /// Where the shell will find `path` (already relative to the segment's
     /// working directory); `None` when that cannot be resolved statically.
     fn resolve(&self, path: &Path) -> Option<PathBuf> {
@@ -126,6 +108,135 @@ impl WorkDir {
             Self::Unknown => None,
         }
     }
+}
+
+/// Tracks the working directory across the segments of one input.
+///
+/// A `cd <literal>` is resolved only when it runs unconditionally: it starts
+/// its and-or list (preceded by nothing, `;` or a newline), is not part of a
+/// pipeline, and its and-or list is not backgrounded with `&` (a subshell).
+/// The cd then runs, and it succeeds whenever the plan file tirith reads
+/// below it exists. Inside the rest of that and-or list, a segment reached
+/// through `||` may run because the cd failed, so its directory is unknown.
+/// A conditional cd (after `&&` / `||`) makes the directory unknown.
+#[derive(Debug, Clone)]
+struct DirTracker {
+    dir: WorkDir,
+    /// The current and-or list resolved an unconditional `cd`.
+    cd_in_list: bool,
+    /// ... and a `||` has followed that cd in the list.
+    or_after_cd: bool,
+}
+
+impl DirTracker {
+    fn start() -> Self {
+        Self {
+            dir: WorkDir::Known(PathBuf::new()),
+            cd_in_list: false,
+            or_after_cd: false,
+        }
+    }
+
+    /// Update the and-or list state for the segment about to be checked.
+    fn enter(&mut self, seg: &tokenize::Segment) {
+        let sep = seg.preceding_separator.as_deref();
+        if starts_and_or_list(sep) {
+            self.cd_in_list = false;
+            self.or_after_cd = false;
+        } else if sep == Some("||") && self.cd_in_list {
+            self.or_after_cd = true;
+        }
+    }
+
+    /// The working directory of the segment last passed to `enter`.
+    fn current(&self) -> WorkDir {
+        if self.or_after_cd {
+            WorkDir::Unknown
+        } else {
+            self.dir.clone()
+        }
+    }
+
+    /// Apply the directory change (if any) of `segments[i]`.
+    fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
+        let seg = &segments[i];
+        if !segment_may_change_dir(seg) {
+            return;
+        }
+        let target = cd_runs_unconditionally(segments, i)
+            .then(|| literal_cd_target(seg, shell))
+            .flatten();
+        let dir = std::mem::replace(&mut self.dir, WorkDir::Unknown);
+        self.dir = match (dir, target) {
+            (WorkDir::Known(base), Some(target)) => WorkDir::Known(base.join(target)),
+            (WorkDir::Unknown, Some(target)) if target.is_absolute() => WorkDir::Known(target),
+            _ => WorkDir::Unknown,
+        };
+        if matches!(self.dir, WorkDir::Known(_)) {
+            self.cd_in_list = true;
+        }
+    }
+}
+
+/// `true` when `segments[i]` runs whenever the line runs, in the shell
+/// process itself: it starts its and-or list (after nothing, `;` or a
+/// newline; not after `&`, `&&`, `||` or a pipe), is not piped into the next
+/// segment, and its and-or list is not backgrounded with `&`.
+fn cd_runs_unconditionally(segments: &[tokenize::Segment], i: usize) -> bool {
+    if !matches!(
+        segments[i].preceding_separator.as_deref(),
+        None | Some(";" | "\n")
+    ) {
+        return false;
+    }
+    for (k, next) in segments.iter().enumerate().skip(i + 1) {
+        match next.preceding_separator.as_deref() {
+            Some("&&" | "||") => {}
+            Some("|" | "|&") if k == i + 1 => return false,
+            Some("|" | "|&") => {}
+            Some("&") => return false,
+            _ => return true,
+        }
+    }
+    true
+}
+
+/// The plan path that `tirith iac check-plan` records in `segments[i - 1]`
+/// when that check-plan surely runs, and succeeds, before `segments[i]`:
+/// `segments[i]` follows it with `&&`, and every separator back to the start
+/// of the and-or list is `&&` too (no `||` or pipe can skip it).
+fn check_plan_chained_before(segments: &[tokenize::Segment], i: usize) -> Option<PathBuf> {
+    let prev = i.checked_sub(1)?;
+    if segments[i].preceding_separator.as_deref() != Some("&&") {
+        return None;
+    }
+    let mut j = prev;
+    loop {
+        let sep = segments[j].preceding_separator.as_deref();
+        if starts_and_or_list(sep) {
+            break;
+        }
+        if sep != Some("&&") || j == 0 {
+            return None;
+        }
+        j -= 1;
+    }
+    check_plan_recorded_path(&segments[prev])
+}
+
+/// `true` when some segment other than a plain `tirith iac check-plan` could
+/// make the bare word `tirith` run something else: it names `tirith` (an
+/// alias, function or `hash` entry), changes `PATH`, defines a function, or
+/// evaluates code that could. Over-approximates: a false positive only means
+/// the plan file is read at preexec time as usual.
+fn tirith_lookup_may_be_rebound(segments: &[tokenize::Segment]) -> bool {
+    segments
+        .iter()
+        .filter(|seg| check_plan_recorded_path(seg).is_none())
+        .any(|seg| {
+            let squeezed: String = seg.raw.chars().filter(|c| !c.is_whitespace()).collect();
+            squeezed.contains("()") || seg_words(&seg.raw).any(|w| word_may_rebind_tirith(&w))
+        })
 }
 
 /// Plan-gate inputs that depend on the segments before the current one.
@@ -220,11 +331,66 @@ fn literal_path_word(word: &str) -> Option<&str> {
     plain.then_some(word)
 }
 
+/// The shell words of `raw`, split at whitespace, operators and brackets,
+/// with surrounding quotes dropped and lower-cased.
+fn seg_words(raw: &str) -> impl Iterator<Item = String> + '_ {
+    raw.split(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' | '[' | ']')
+    })
+    .map(|w| {
+        w.trim_matches(|c| matches!(c, '\'' | '"'))
+            .to_ascii_lowercase()
+    })
+}
+
+/// `true` when the word can rebind what the bare command `tirith` runs: an
+/// assignment to `PATH` (`PATH=`, `$env:PATH`, zsh `path`), a word that
+/// defines aliases / functions or evaluates code, or a mention of `tirith`
+/// (`alias tirith=...`, `alias t=tirith`, `hash -p ... tirith`).
+fn word_may_rebind_tirith(word: &str) -> bool {
+    const REBINDING_WORDS: &[&str] = &[
+        "path",
+        "eval",
+        "source",
+        ".",
+        "alias",
+        "hash",
+        "enable",
+        "function",
+        "functions",
+        "aliases",
+        "autoload",
+        "fpath",
+        "invoke-expression",
+        "iex",
+        "set-alias",
+        "new-alias",
+        "sal",
+        "nal",
+        "new-item",
+        "ni",
+        "set-item",
+        "si",
+    ];
+    let head = word.split(['=', '+']).next().unwrap_or(word);
+    REBINDING_WORDS.contains(&head)
+        || word.contains("env:path")
+        || word.contains("function:")
+        || word.contains("alias:")
+        || word.split('=').any(|part| {
+            part == "tirith"
+                || part == "tirith.exe"
+                || part.ends_with("/tirith")
+                || part.ends_with("\\tirith")
+        })
+}
+
 /// The plan path `tirith iac check-plan <plan>` records in this segment
 /// (exactly that command: no prefix assignments, only known options).
-fn check_plan_recorded_path(seg: &tokenize::Segment, shell: ShellType) -> Option<PathBuf> {
-    let cmd = seg.command.as_deref()?;
-    if command_basename(cmd, shell) != "tirith" || !seg.raw.trim_start().starts_with(cmd) {
+fn check_plan_recorded_path(seg: &tokenize::Segment) -> Option<PathBuf> {
+    // Only the bare command word: a path-qualified or quoted `tirith` may be
+    // any program (`tirith_lookup_may_be_rebound` covers the bare word).
+    if seg.command.as_deref() != Some("tirith") || !seg.raw.trim_start().starts_with("tirith") {
         return None;
     }
     let args: Vec<&str> = seg.args.iter().map(|a| strip_outer_quotes(a)).collect();
@@ -884,14 +1050,18 @@ mod tests {
         }
     }
 
-    /// The working directory `WorkDir` tracks for the last segment of `input`.
+    /// The working directory `DirTracker` gives the last segment of `input`.
     fn work_dir_at_last_segment(input: &str) -> WorkDir {
         let segments = tokenize::tokenize(input, ShellType::Posix);
-        let mut dir = WorkDir::start();
-        for i in 0..segments.len().saturating_sub(1) {
-            dir = dir.after(&segments, i, ShellType::Posix);
+        let mut dirs = DirTracker::start();
+        for (i, seg) in segments.iter().enumerate() {
+            dirs.enter(seg);
+            if i + 1 == segments.len() {
+                break;
+            }
+            dirs.leave(&segments, i, ShellType::Posix);
         }
-        dir
+        dirs.current()
     }
 
     #[test]
@@ -930,6 +1100,27 @@ mod tests {
             ),
             ("cd infra & terraform apply tfplan", WorkDir::Unknown),
             ("cd \"$D\"; cd /srv; terraform apply tfplan", known("/srv")),
+            // R4 fix round 2: a cd that may not run, or that runs in a
+            // background subshell, and the `||` branch taken when it fails.
+            (
+                "false && cd infra; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            ("true || cd infra; terraform apply tfplan", WorkDir::Unknown),
+            ("false && cd /srv; terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra || terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra && x || terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra || x && terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra && x & terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra | x; terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra && x | y; terraform apply tfplan", known("infra")),
+            ("cd infra || x; terraform apply tfplan", known("infra")),
+            ("cd infra && x; terraform apply tfplan", known("infra")),
+            ("cd infra\nterraform apply tfplan", known("infra")),
+            (
+                "cd infra && cd ops; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
         ] {
             assert_eq!(work_dir_at_last_segment(input), expected, "{input:?}");
         }
@@ -959,15 +1150,16 @@ mod tests {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let recorded = |input: &str| {
             let segments = tokenize::tokenize(input, ShellType::Posix);
-            check_plan_recorded_path(&segments[0], ShellType::Posix)
+            check_plan_recorded_path(&segments[0])
         };
         for (input, expected) in [
             ("tirith iac check-plan tfplan", Some("tfplan")),
             ("tirith iac check-plan ./tfplan", Some("tfplan")),
-            (
-                "/usr/local/bin/tirith iac check-plan 'out/tf plan'",
-                Some("out/tf plan"),
-            ),
+            ("tirith iac check-plan 'out/tf plan'", Some("out/tf plan")),
+            // Only the bare command word (R4 fix round 2).
+            ("/usr/local/bin/tirith iac check-plan tfplan", None),
+            ("./tirith iac check-plan tfplan", None),
+            ("'tirith' iac check-plan tfplan", None),
             (
                 "tirith iac check-plan --tool tofu --json tfplan",
                 Some("tfplan"),
@@ -985,6 +1177,61 @@ mod tests {
             ("echo tirith iac check-plan tfplan", None),
         ] {
             assert_eq!(recorded(input), expected.map(PathBuf::from), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn check_plan_shortcut_needs_an_unconditional_check_plan_and_the_bare_tirith() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let shortcut = |input: &str| {
+            let segments = tokenize::tokenize(input, ShellType::Posix);
+            let last = segments.len() - 1;
+            if tirith_lookup_may_be_rebound(&segments) {
+                return None;
+            }
+            check_plan_chained_before(&segments, last)
+        };
+        for (input, plan) in [
+            ("tirith iac check-plan p && terraform apply p", "p"),
+            ("true; tirith iac check-plan p && terraform apply p", "p"),
+            ("x & tirith iac check-plan p && terraform apply p", "p"),
+            (
+                "terraform plan -out p && tirith iac check-plan p && terraform apply p",
+                "p",
+            ),
+            (
+                "a && b && tirith iac check-plan p && terraform apply p",
+                "p",
+            ),
+            (
+                "tirith iac check-plan path/p && terraform -chdir=path apply p",
+                "path/p",
+            ),
+        ] {
+            assert_eq!(shortcut(input), Some(PathBuf::from(plan)), "{input:?}");
+        }
+        for input in [
+            "true || tirith iac check-plan p && terraform apply p",
+            "a || b && tirith iac check-plan p && terraform apply p",
+            "echo | tirith iac check-plan p && terraform apply p",
+            "tirith iac check-plan p || terraform apply p",
+            "tirith iac check-plan p; terraform apply p",
+            "tirith() { :; }; tirith iac check-plan p && terraform apply p",
+            "f () { :; }; tirith iac check-plan p && terraform apply p",
+            "alias tirith=true; tirith iac check-plan p && terraform apply p",
+            "alias t=tirith; tirith iac check-plan p && terraform apply p",
+            "hash -p /tmp/x/tirith tirith; tirith iac check-plan p && terraform apply p",
+            "PATH=/tmp/x:$PATH; tirith iac check-plan p && terraform apply p",
+            "export PATH=/tmp/x; tirith iac check-plan p && terraform apply p",
+            "set -x PATH /tmp/x $PATH; tirith iac check-plan p && terraform apply p",
+            "path=(/tmp/x $path); tirith iac check-plan p && terraform apply p",
+            "functions[tir$x]=:; tirith iac check-plan p && terraform apply p",
+            "eval \"$DEF\"; tirith iac check-plan p && terraform apply p",
+            ". ./defs.sh; tirith iac check-plan p && terraform apply p",
+            "source defs.sh; tirith iac check-plan p && terraform apply p",
+            "/tmp/x/tirith iac check-plan p && terraform apply p",
+        ] {
+            assert_eq!(shortcut(input), None, "{input:?}");
         }
     }
 
