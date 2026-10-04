@@ -8,9 +8,12 @@
 //! ANYTHING in the file could route printed text or a variable back into a
 //! shell (a pipe into anything but a plain text filter, a file redirection, a
 //! command substitution around the printer, eval/source/exec/coproc/trap, a
-//! shell or privilege wrapper, an alias or a redefined printer, `PATH`
-//! changes, allexport), nothing is masked and every heredoc line is read as
-//! before.
+//! shell or privilege wrapper, an alias or a redefined printer, any `PATH`
+//! word other than a plain `$PATH` expansion, allexport), nothing is masked
+//! and every heredoc line is read as before. A heredoc read or captured into
+//! a variable is masked only when every use of the variable is a plain
+//! expansion in an `echo` / `printf` command and nothing can reach its value
+//! without naming it (`${!name}`, a nameref, `$_`, a variable listing).
 //!
 //! Model boundary: what the CALLER does with this file's stdout, and a
 //! non-shell interpreter evaluating text this file reads back from its own
@@ -245,6 +248,9 @@ fn mask(text: &str, spans: &[PosixHeredocSpan]) -> Option<(String, BTreeSet<usiz
     if !rest_is_inert(&rest, &header_starts, &captures, &names) {
         return None;
     }
+    if !names.is_empty() && reads_variables_indirectly(&rest) {
+        return None;
+    }
     // Variable uses: the assignments themselves are not uses, and a mention
     // inside another heredoc's body is data for an unknown consumer.
     let mut uses = rest.into_bytes();
@@ -262,9 +268,14 @@ fn mask(text: &str, spans: &[PosixHeredocSpan]) -> Option<(String, BTreeSet<usiz
         })
         .map(|span| span.body.clone())
         .collect();
+    let quoted = if names.is_empty() {
+        Vec::new()
+    } else {
+        quoted_regions(&uses, &other_bodies)?
+    };
     if !names
         .iter()
-        .all(|name| variable_only_printed(&uses, name, &substitutions, &other_bodies))
+        .all(|name| variable_only_printed(&uses, name, &substitutions, &other_bodies, &quoted))
     {
         return None;
     }
@@ -369,18 +380,40 @@ fn header_shape(text: &str, header: &Range<usize>, line: &str, last_end: usize) 
 
 /// Blank full-line comments that contain no quote or escape character. Such
 /// a line cannot end a string, so whether it is a comment or string data,
-/// this shell never runs it.
+/// this shell never runs it. A line after a backslash-newline continuation
+/// is joined to the previous one, where its `#` may sit inside a word
+/// (`echo "$X"\` then `#|sh` runs `echo "$X"#|sh`), so it stays.
 fn blank_comment_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let mut continued = false;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with('#') && !line.contains(['"', '\'', '`', '\\']) {
+        if !continued && trimmed.starts_with('#') && !line.contains(['"', '\'', '`', '\\']) {
             out.extend(line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
         } else {
             out.push_str(line);
         }
+        continued = ends_in_continuation(line);
     }
     out
+}
+
+/// True when `line` (with or without its newline) ends in an odd number of
+/// backslashes, so the shell joins the next physical line to it.
+fn ends_in_continuation(line: &str) -> bool {
+    let content = line.strip_suffix('\n').unwrap_or(line);
+    content.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
+/// True when `segment` holds a lone `&` (a background separator), i.e. one
+/// that is not part of `&&`, `>&` / `<&` or `&>` / `&>>`.
+fn has_background_separator(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().any(|(index, &byte)| {
+        byte == b'&'
+            && !(index > 0 && matches!(bytes[index - 1], b'&' | b'>' | b'<'))
+            && !matches!(bytes.get(index + 1), Some(b'&' | b'>'))
+    })
 }
 
 /// Every `$(`, `<(`, `>(`, `=(` and backtick substitution, as byte ranges of
@@ -436,7 +469,7 @@ fn rest_is_inert(
 ) -> bool {
     // Nothing evaluates text, starts a shell or rebinds a command name.
     if words(rest).any(|word| EVALUATING_WORDS.contains(&word) || word == "allexport")
-        || assigns_path(rest)
+        || names_path(rest)
         || dot_command(rest)
         || line_has_flag(rest, "set", 'a')
         || line_has_flag(rest, "export", 'f')
@@ -490,13 +523,168 @@ fn rest_is_inert(
         .all(|open| substitutions.iter().any(|range| range.start == *open))
 }
 
-/// `PATH=` / `PATH+=` anywhere (`export PATH=...`, `PATH=x cmd`).
-fn assigns_path(text: &str) -> bool {
+/// The word `PATH` anywhere except as a plain `$PATH` / `${PATH}`
+/// expansion. Besides `PATH=` / `PATH+=` (`export PATH=...`, `PATH=x cmd`),
+/// `for PATH in`, `read PATH`, `getopts ... PATH` and the like also set it,
+/// which changes what `cat` runs.
+fn names_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
     text.match_indices("PATH").any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-            && (text[at + 4..].starts_with('=') || text[at + 4..].starts_with("+="))
+        let end = at + "PATH".len();
+        if (at > 0 && ident(bytes[at - 1])) || bytes.get(end).copied().is_some_and(ident) {
+            return false;
+        }
+        let expansion = (at >= 1 && bytes[at - 1] == b'$')
+            || (at >= 2 && &bytes[at - 2..at] == b"${" && bytes.get(end) == Some(&b'}'));
+        !expansion
     })
+}
+
+/// A way to read a variable's value without writing its name: indirect
+/// expansion (`${!v}`, `${!PREFIX*}`), a nameref (`local -n`, `readonly
+/// -n`), the last argument of the previous command (`$_`), or a builtin
+/// that lists variables with their values (a bare `set`, `local`,
+/// `readonly` / `export` with only options). `declare` / `typeset` are
+/// already evaluating words.
+fn reads_variables_indirectly(text: &str) -> bool {
+    static LAST_ARGUMENT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"\$\{?_(?:[^A-Za-z0-9_]|$)").expect("static regex")
+    });
+    static BARE_SET: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?m)(?:^|[;&|(){}\s])set[ \t]*(?:$|[;&|)}>#])").expect("static regex")
+    });
+    static LISTING: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|(){}\s])(?:local|readonly|export)(?:[ \t]+[-+][A-Za-z]*)*[ \t]*(?:$|[;&|)}>#])",
+        )
+        .expect("static regex")
+    });
+    text.contains("${!")
+        || line_has_flag(text, "local", 'n')
+        || line_has_flag(text, "readonly", 'n')
+        || LAST_ARGUMENT.is_match(text)
+        || BARE_SET.is_match(text)
+        || LISTING.is_match(text)
+}
+
+/// The byte ranges of `text` inside quotes (`'...'`, `"..."`, `$'...'`),
+/// from the opening through the closing quote. Comments, command and
+/// process substitutions (opaque) and the `skip` ranges (heredoc bodies,
+/// which are not shell words) are passed over. `None` when a quote or
+/// substitution does not close, or a `${...}` inside double quotes holds a
+/// quote or substitution (shells nest those differently).
+fn quoted_regions(text: &str, skip: &[Range<usize>]) -> Option<Vec<Range<usize>>> {
+    let bytes = text.as_bytes();
+    let mut skip: Vec<&Range<usize>> = skip.iter().collect();
+    skip.sort_by_key(|range| range.start);
+    let mut next_skip = 0usize;
+    let mut regions = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while skip.get(next_skip).is_some_and(|range| range.end <= index) {
+            next_skip += 1;
+        }
+        if let Some(range) = skip.get(next_skip).filter(|range| range.start <= index) {
+            index = range.end;
+            continue;
+        }
+        let word_start = index == 0
+            || matches!(
+                bytes[index - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+            );
+        let next = bytes.get(index + 1).copied();
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'#' if word_start => {
+                index = text[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+            }
+            b'\'' => {
+                let close = index + 1 + text[index + 1..].find('\'')?;
+                regions.push(index..close + 1);
+                index = close + 1;
+            }
+            b'$' if next == Some(b'\'') => {
+                let close = ansi_c_close(bytes, index + 2)?;
+                regions.push(index..close + 1);
+                index = close + 1;
+            }
+            b'"' => {
+                let close = double_quote_close(text, index)?;
+                regions.push(index..close + 1);
+                index = close + 1;
+            }
+            b'`' => index = crate::extract::posix_backtick_close(text, index)? + 1,
+            b'$' | b'<' | b'>' if next == Some(b'(') => {
+                index = crate::extract::posix_delimiter_close(text, index + 1)? + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Some(regions)
+}
+
+/// The closing `'` of a `$'...'` string whose text starts at `start`.
+fn ansi_c_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The closing `"` of the double-quoted string opened at `open`.
+fn double_quote_close(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = open + 1;
+    while index < bytes.len() {
+        let next = bytes.get(index + 1).copied();
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index),
+            b'`' => index = crate::extract::posix_backtick_close(text, index)? + 1,
+            b'$' if next == Some(b'(') => {
+                index = crate::extract::posix_delimiter_close(text, index + 1)? + 1;
+            }
+            b'$' if next == Some(b'{') => {
+                let close = index + text[index..].find('}')?;
+                let inner = &text[index..close];
+                if inner.contains(['"', '\'', '`']) || inner.contains("$(") {
+                    return None;
+                }
+                index = close + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The words of `command` after any [`HEADER_PREFIXES`].
+fn after_prefixes(command: &str) -> std::iter::Peekable<std::str::SplitWhitespace<'_>> {
+    let mut words = command.split_whitespace().peekable();
+    while words
+        .peek()
+        .is_some_and(|word| HEADER_PREFIXES.contains(word))
+    {
+        words.next();
+    }
+    words
+}
+
+/// Whether `offset` lies strictly inside one of the sorted `regions`.
+fn inside(regions: &[Range<usize>], offset: usize) -> bool {
+    let first = regions.partition_point(|region| region.end <= offset);
+    regions
+        .get(first)
+        .is_some_and(|region| region.start < offset)
 }
 
 /// `.` (source) in command position.
@@ -691,12 +879,14 @@ fn redirects_only_reorder(text: &str) -> bool {
 
 /// Every mention of `name` is a plain `$name` / `${name}` expansion in an
 /// `echo` or `printf` (without `-v`) command, outside any substitution and
-/// any other heredoc's body.
+/// any other heredoc's body. `quoted` holds the sorted quoted regions of
+/// `text` (see [`quoted_regions`]).
 fn variable_only_printed(
     text: &str,
     name: &str,
     substitutions: &[Range<usize>],
     other_bodies: &[Range<usize>],
+    quoted: &[Range<usize>],
 ) -> bool {
     let bytes = text.as_bytes();
     let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
@@ -733,32 +923,68 @@ fn variable_only_printed(
         if line_end - line_start > MAX_LINE {
             return false;
         }
-        let mut command_start = line_start;
-        for separator in [";", "&&", "||"] {
-            if let Some(offset) = text[line_start..at].rfind(separator) {
-                command_start = command_start.max(line_start + offset + separator.len());
-            }
-        }
-        let mut command_end = line_end;
-        for separator in [";", "&&", "||"] {
-            if let Some(offset) = text[at..line_end].find(separator) {
-                command_end = command_end.min(at + offset);
-            }
-        }
-        let mut words = text[command_start..command_end]
-            .split_whitespace()
-            .peekable();
-        while words
-            .peek()
-            .is_some_and(|word| HEADER_PREFIXES.contains(word))
+        // A backslash-newline joins this line to a neighbour, and a quoted
+        // word an earlier line opened carries on into this one, so the
+        // command that uses the variable may start on another line (fail
+        // closed).
+        let previous_line = text[..line_start.saturating_sub(1)]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        if (line_start > 0 && ends_in_continuation(&text[previous_line..line_start]))
+            || ends_in_continuation(&text[line_start..line_end])
+            || inside(quoted, line_start)
         {
-            words.next();
+            return false;
         }
-        let printer = match words.next() {
+        // Quoted text holds no separator and no command word: read the line
+        // with every quoted byte replaced.
+        let mut line = text.as_bytes()[line_start..line_end].to_vec();
+        let first = quoted.partition_point(|region| region.end <= line_start);
+        for region in quoted[first..]
+            .iter()
+            .take_while(|region| region.start < line_end)
+        {
+            let from = region.start.max(line_start) - line_start;
+            let to = region.end.min(line_end) - line_start;
+            line[from..to].fill(b'x');
+        }
+        let Ok(line) = String::from_utf8(line) else {
+            return false;
+        };
+        let mention = at - line_start;
+        // A lone `&` starts another command on the same line.
+        if has_background_separator(&line[..mention]) {
+            return false;
+        }
+        let mut command_start = 0;
+        for separator in [";", "&&", "||"] {
+            if let Some(offset) = line[..mention].rfind(separator) {
+                command_start = command_start.max(offset + separator.len());
+            }
+        }
+        let mut command_end = line.len();
+        for separator in [";", "&&", "||"] {
+            if let Some(offset) = line[mention..].find(separator) {
+                command_end = command_end.min(mention + offset);
+            }
+        }
+        let raw = &text[line_start + command_start..line_start + command_end];
+        let printer = match after_prefixes(&line[command_start..command_end]).next() {
             Some("echo") => true,
-            Some("printf") => !text[command_start..command_end]
-                .split_whitespace()
-                .any(|word| word == "-v"),
+            // `printf -v NAME` assigns instead of printing; options come
+            // before the format, also quoted (`'-v'`), joined (`-vNAME`) or
+            // from an expansion.
+            Some("printf") => {
+                let format = after_prefixes(raw).nth(1).map(|word| {
+                    word.chars()
+                        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                        .collect::<String>()
+                });
+                !raw.split_whitespace().any(|word| word == "-v")
+                    && format.is_some_and(|format| {
+                        !(format.starts_with('-') && format != "--") && !format.starts_with('$')
+                    })
+            }
             _ => false,
         };
         if !printer {

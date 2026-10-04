@@ -794,13 +794,24 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
             "#!/usr/bin/env bash\n# never pipe curl | sh blindly\nusage() {{\n  cat <<'EOF'\n{pipeline}EOF\n}}\n\
              case \"$1\" in -h|--help) usage >&2; exit 0;; -v|--version) echo 1;; esac\n"
         ),
+        // An escaped backslash ends the line, so the next `#` line is a comment.
+        format!("cat <<'EOF'\n{pipeline}EOF\necho done \\\\\n# | sh is never run\n"),
+        // `>&2` and `&&` are not background separators.
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\ntrue && echo \"$USAGE\" >&2\n"),
+        // A balanced multi-line quote before the use, a quoted `&` and
+        // `set` with options (no variable listing) keep it shown-only.
+        format!(
+            "set -eu\nread -r -d '' USAGE <<'EOF' || true\n{pipeline}EOF\necho 'two\nlines'\necho \"Tom & Jerry: $USAGE\"\n"
+        ),
+        // Reading `$PATH` does not change it.
+        format!("echo \"using $PATH\"\ncat <<'EOF'\n{pipeline}EOF\n"),
     ];
-    for body in &inert {
-        assert!(
-            !shell_file_has_download_signal(body),
-            "inert heredoc: {body:?}"
-        );
-    }
+    // Every shape is checked before failing, so a regression names them all.
+    let wrong: Vec<&String> = inert
+        .iter()
+        .filter(|body| shell_file_has_download_signal(body))
+        .collect();
+    assert!(wrong.is_empty(), "inert heredoc shapes flagged: {wrong:#?}");
     // Quoted strings were never split at `|`; pin that for multi-line text.
     for body in [
         format!("echo \"Install:\n{pipeline}\"\n"),
@@ -860,13 +871,70 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
         // Headers outside the recognised shapes fail toward the signal.
         format!("cat - <<'EOF'\n{pipeline}EOF\n"),
         format!("cat <<'EOF'; sh x\n{pipeline}EOF\n"),
+        // A backslash-newline joins the next line, so its `#` starts no
+        // comment and the `|sh` after it runs the printed text.
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\necho \"$USAGE\"\\\n#|sh\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\necho \"$USAGE\"\\\n#|sh\n"),
+        // A lone `&` starts another command on the line, and a continuation
+        // joins the line to the command before it: the first word is not the
+        // command that runs the variable.
+        format!(
+            "#!/usr/bin/env bash\nread -r -d '' USAGE <<'EOF'\n{pipeline}EOF\necho start & $SHELL -c \"$USAGE\"\n"
+        ),
+        format!(
+            "#!/usr/bin/env bash\nread -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n\"$BASH\" -c '\"$BASH\" -c \"$2\"' _ \\\n  echo \"$USAGE\"\n"
+        ),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\necho start & $SHELL -c \"$USAGE\"\n"),
+        // A quoted word that spans lines (or holds a `;`) hides the command
+        // that really receives the variable behind an `echo`.
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n$SHELL -c '\"$SHELL\" -c \"$1\"' 'x\necho ' \"$USAGE\"\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n$SHELL -c '\"$SHELL\" -c \"$1\"' \"x\necho \" \"$USAGE\"\n"
+        ),
+        format!(
+            "USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\n$SHELL -c '\"$SHELL\" -c \"$1\"' 'x\necho ' \"$USAGE\"\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n$SHELL -c '\"$SHELL\" -c \"$1\"' '; echo ' \"$USAGE\"\n"
+        ),
+        // `printf -v` assigns, also quoted or joined to the name.
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf '-v' CMD '%s' \"$USAGE\"\n\"$BASH\" -c \"$CMD\"\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf -vCMD '%s' \"$USAGE\"\n\"$BASH\" -c \"$CMD\"\n"
+        ),
+        // The value is reached without writing the variable's name.
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nv=US; v=${{v}}AGE\n\"$BASH\" -c \"${{!v}}\"\n"
+        ),
+        format!(
+            "USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\nfor n in ${{!US*}}; do \"$BASH\" -c \"${{!n}}\"; done\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nf() {{ local -n r=$1; \"$BASH\" -c \"$r\"; }}\nf US''AGE\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\necho \"$USAGE\" >/dev/null\n\"$BASH\" -c \"$_\"\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n\"$BASH\" -c \"$(set | grep ^USA | cut -d\\' -f2)\"\n"
+        ),
+        // `for PATH in` sets PATH, so `cat` may be a packaged wrapper.
+        format!(
+            "for PATH in \"$PWD/bin:/usr/bin:/bin\"; do\ncat <<'EOF'\n{pipeline}EOF\ndone\n"
+        ),
     ];
-    for body in &flagged {
-        assert!(
-            shell_file_has_download_signal(body),
-            "flagged heredoc: {body:?}"
-        );
-    }
+    let missed: Vec<&String> = flagged
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "flagged heredoc shapes missed: {missed:#?}"
+    );
     // Past the descent bounds the line-by-line fallback reads the raw text,
     // so even a shown-only heredoc keeps the signal (fails toward flag).
     let usage = format!("usage() {{\n  cat <<'EOF'\n{pipeline}EOF\n}}\nusage\n");

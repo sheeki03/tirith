@@ -103,8 +103,12 @@ file contents can produce a new hash in the downloaded report.
   `cat`, `echo`, `printf` or `:` (or read into a variable that is only
   echoed), in a file with no pipe except into plain text filters, no output
   redirection to a file, no capture of the printed text, and no `eval`,
-  `source`, `exec`, shell, `sudo`, alias or `PATH` change. Anything else keeps
-  the signal. What a caller does with a script's output is not followed.
+  `source`, `exec`, shell, `sudo`, alias or `PATH` word (other than reading
+  `$PATH`). A variable holding the text must only appear as a plain `$NAME`
+  in `echo` / `printf` commands that start on their own line (no quoted word
+  or backslash-newline carried in from another line, no lone `&`), and the
+  file must not reach it indirectly (`${!...}`, a nameref, `$_`, a bare
+  `set` or other variable listing). Anything else keeps the signal. What a caller does with a script's output is not followed.
 - JSON reports are capped at 384 KiB with omitted-row counts. A comparison keeps
   at most 200 deltas with an exact omitted count. A changed analyzer version,
   changed limits, or incomplete or different coverage disables capability-delta
