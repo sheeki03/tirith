@@ -47,13 +47,23 @@ impl IacTool {
     }
 }
 
-/// Run the IaC rules over the parsed command (the prod-context rule and the
-/// apply-gate rule can both fire on the same input).
+/// Run the IaC rules over every executable segment of the parsed command, as
+/// `rules::context` does, so `cd infra; terraform apply -auto-approve` and the
+/// #264 literal view `T=terraform; terraform apply ...` are checked (the
+/// prod-context rule and the apply-gate rule can both fire on one segment).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    let segments = tokenize::tokenize(input, shell);
-    let Some(seg) = segments.first() else {
-        return Vec::new();
-    };
+    tokenize::tokenize(input, shell)
+        .iter()
+        .flat_map(|seg| check_segment(input, shell, policy, seg))
+        .collect()
+}
+
+fn check_segment(
+    input: &str,
+    shell: ShellType,
+    policy: &Policy,
+    seg: &tokenize::Segment,
+) -> Vec<Finding> {
     let Some(cmd) = seg.command.as_deref() else {
         return Vec::new();
     };
@@ -536,6 +546,50 @@ mod tests {
                 .any(|f| matches!(f.rule_id, RuleId::IacDestroyProd)),
             "{findings:?}",
         );
+    }
+
+    #[test]
+    fn check_inspects_every_shell_segment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let policy = Policy::default();
+        for input in [
+            "cd infra; terraform apply -auto-approve",
+            "cd infra && terraform apply -auto-approve",
+            "terraform init || terraform apply -auto-approve",
+            "echo start | tofu apply -auto-approve",
+            // The #264 literal view of `T=terraform; "$T" apply -auto-approve`.
+            "T=terraform; terraform apply -auto-approve",
+            "terraform plan; pulumi up --yes",
+        ] {
+            let findings = check(input, ShellType::Posix, &policy);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| matches!(f.rule_id, RuleId::IacApplyAutoApprove)),
+                "expected IacApplyAutoApprove for {input:?}: {findings:?}",
+            );
+        }
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        let findings = check("cd infra; terraform apply", ShellType::Posix, &gated);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f.rule_id, RuleId::IacApplyWithoutPlan)),
+            "{findings:?}",
+        );
+        // Segments that are not an IaC apply/destroy still add nothing.
+        for input in [
+            "cd infra; terraform plan",
+            "cd infra; terraform apply tfplan",
+        ] {
+            assert!(
+                check(input, ShellType::Posix, &policy).is_empty(),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
