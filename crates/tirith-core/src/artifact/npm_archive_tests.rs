@@ -936,6 +936,31 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
         format!(
             "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf -?v X %s \"$USAGE\"\necho $((X))\n"
         ),
+        // The heredoc is read into a variable the shell itself expands or
+        // evaluates: PS4 under xtrace (from `set -x`, `set -o xtrace` or a
+        // `-x` shebang), and the integer specials whose assignment runs
+        // command substitutions in array subscripts (bash, sh, ksh). Such a
+        // body is not shown-only, so it stays live and is scanned. (What
+        // these shells run is the body's substitutions, which the download
+        // pass does not descend into; the masking unit test pins those exact
+        // shapes.)
+        format!("read -r -d '' PS4 <<'EOF' || true\n{pipeline}EOF\nset -x\necho hi\n"),
+        format!("PS4=$(cat <<'EOF'\n{pipeline}EOF\n)\nset -x\necho hi\n"),
+        format!("#!/bin/bash -x\nread -r -d '' PS4 <<'EOF' || true\n{pipeline}EOF\necho hi\n"),
+        format!("read -r -d '' PS4 <<'EOF' || true\n{pipeline}EOF\nset -o xtrace\necho hi\n"),
+        format!("read -r -d '' OPTIND <<'EOF' || true\n{pipeline}EOF\necho hi\n"),
+        format!("OPTIND=$(cat <<'EOF'\n{pipeline}EOF\n)\necho hi\n"),
+        format!("read -r -d '' RANDOM <<'EOF' || true\n{pipeline}EOF\necho hi\n"),
+        format!("local HISTCMD=$(cat <<'EOF'\n{pipeline}EOF\n)\necho hi\n"),
+        format!("IFS= read -r SECONDS <<'EOF'\n{pipeline}EOF\necho hi\n"),
+        // Bash 4+ rebinds `cat` through its command hash table or alias
+        // arrays without the words `hash` or `alias`.
+        format!("S=s\nBASH_CMDS[cat]=/bin/${{S}}h\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("S=s\nBASH_CMDS+=([cat]=/bin/${{S}}h)\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!(
+            "shopt -s expand_aliases\nS=s\nBASH_ALIASES[cat]=/bin/${{S}}h\ncat <<'EOF'\n{pipeline}EOF\n"
+        ),
+        format!("S=s\nBASH_ALIASES+=([cat]=/bin/${{S}}h)\ncat <<'EOF'\n{pipeline}EOF\n"),
         // The value is reached without writing the variable's name.
         format!(
             "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nv=US; v=${{v}}AGE\n\"$BASH\" -c \"${{!v}}\"\n"
