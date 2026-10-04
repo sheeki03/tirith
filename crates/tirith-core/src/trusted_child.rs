@@ -1909,14 +1909,6 @@ pub struct ChildSpec {
     env: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
     limits: ChildLimits,
-    /// Additional already-open capabilities that a Linux child must retain.
-    ///
-    /// The caller owns these descriptors and must keep their backing handles live
-    /// until [`run`] returns. `run` validates each descriptor before spawning and
-    /// clears only `FD_CLOEXEC` in the child. This is intentionally narrower than
-    /// ambient descriptor inheritance: callers opt in one exact fd at a time.
-    #[cfg(target_os = "linux")]
-    inherited_fds: Vec<std::os::fd::RawFd>,
 }
 
 impl ChildSpec {
@@ -1933,8 +1925,6 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             limits,
-            #[cfg(target_os = "linux")]
-            inherited_fds: Vec::new(),
         }
     }
 
@@ -1976,19 +1966,6 @@ impl ChildSpec {
 
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Retain one exact Linux descriptor across the child exec boundary.
-    ///
-    /// This supports capability paths such as `/proc/self/fd/N` without asking a
-    /// child to dereference its parent's procfs entries (which Yama, hidepid, or a
-    /// procfs mount policy may forbid). The backing handle must outlive [`run`].
-    #[cfg(target_os = "linux")]
-    pub fn inherit_fd(mut self, fd: std::os::fd::RawFd) -> Self {
-        if !self.inherited_fds.contains(&fd) {
-            self.inherited_fds.push(fd);
-        }
         self
     }
 }
@@ -2076,17 +2053,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         return ChildOutcome::SpawnError(error.to_string());
     }
     #[cfg(target_os = "linux")]
-    for fd in &spec.inherited_fds {
-        // SAFETY: F_GETFD only inspects the caller-supplied descriptor number; no
-        // pointer is dereferenced. A negative/closed descriptor is rejected.
-        if *fd < 0 || unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
-            return ChildOutcome::SpawnError(format!(
-                "inherited capability descriptor {fd} is not open: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    #[cfg(target_os = "linux")]
     let bound_fd = executable.bound_launch_fd();
     #[cfg(target_os = "linux")]
     let launch_program = bound_fd.map_or_else(
@@ -2125,10 +2091,7 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         // content-bound launch also clears CLOEXEC on the already-sealed
         // descriptor so a shebang interpreter can reopen `/proc/self/fd/N`;
         // the child can observe that immutable descriptor but cannot change its
-        // sealed bytes. Explicit capability descriptors use the same narrow
-        // inheritance rule, preserving any descriptor flags other than CLOEXEC.
-        #[cfg(target_os = "linux")]
-        let inherited_fds = spec.inherited_fds.clone();
+        // sealed bytes.
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
@@ -2137,13 +2100,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                 #[cfg(target_os = "linux")]
                 if let Some(fd) = bound_fd {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                for fd in &inherited_fds {
-                    let flags = libc::fcntl(*fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }

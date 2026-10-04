@@ -171,7 +171,22 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # every inspected value and every policy_complete flag stay unchanged. It
 # replaces digest
 # 9bc4e04b0aacc1bd0da755da03ab42bd5d52147ef3a3a14e6ff5f29df131ddd0.
-sha256 = "2c6beaf4148a87f79b86d1ae6503cd4fe44fc6b3dd983cd7e5c82a8255a795a2"
+#
+# Package firewall truthfulness (simplify/cycle-cleanup, R3): parsed and
+# compared the complete previous/current manifest. 89 entries become 91: two
+# rows are ADDED for commands `tirith pkg --help` already listed, in the
+# existing "Package firewall" group: `pkg inspect` (partial, policy_complete
+# false, the same local route as `package inspect`) and `pkg trust-tool`
+# (none, policy_complete true; the pin it records is not yet enforced). Zero
+# entries are removed, renamed, regrouped or reordered; manifest_version stays
+# 1; no existing inspected value or policy_complete flag changes. Only three
+# coverage descriptions change: `pkg diff` (npm tarballs as well as wheels),
+# `pkg attest` (binds to the wheel's SHA-256, not a quarantine) and `pkg
+# receipt` (reads receipts from earlier releases; nothing writes new ones).
+# `capability_manifest_covers_every_pkg_subcommand` now pins the row set. It
+# replaces digest
+# 2c6beaf4148a87f79b86d1ae6503cd4fe44fc6b3dd983cd7e5c82a8255a795a2.
+sha256 = "c516c9e8a6a5eeab433c070d24cd4244e2a5a830ed51f478fb080a3f0ade3f39"
 
 [mcp]
 default_tools = [

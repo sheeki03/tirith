@@ -787,6 +787,13 @@ pub fn capsule_receipts_dir() -> Option<PathBuf> {
     crate::policy::data_dir().map(|dir| dir.join("capsule-receipts"))
 }
 
+/// A coherent `contained` receipt for tests in other modules (the audit
+/// chain-anchor tests, which are Unix-only).
+#[cfg(all(test, unix))]
+pub(crate) fn sample_contained_receipt() -> CapsuleRunReceipt {
+    CapsuleRunReceipt::new(tests::contained_facts())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,7 +820,7 @@ mod tests {
         }
     }
 
-    fn contained_facts() -> CapsuleRunFacts {
+    pub(super) fn contained_facts() -> CapsuleRunFacts {
         CapsuleRunFacts {
             status: CapsuleRunStatus::Contained,
             policy_projection_hash: "a".repeat(64),

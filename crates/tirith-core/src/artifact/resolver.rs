@@ -6,9 +6,10 @@
 //! redeemed it) is disabled and its code was removed. What remains:
 //!
 //! 1. [`validate_resolver_request_with_artifact_origins`]: an effect-free check
-//!    of every requirement, index URL, and artifact origin. sdist / VCS /
-//!    editable / local-path / direct-URL forms are refused unless a
-//!    [`ResolverAllowances`] field opts in ([`validate_requirement`]), and an
+//!    of every requirement, index URL, and artifact origin. VCS / editable /
+//!    local-path / direct-URL forms (an sdist archive can only be named as a
+//!    local path or direct URL) are refused unless a [`ResolverAllowances`]
+//!    field opts in ([`validate_requirement`]), and an
 //!    index URL or artifact origin must be a credential-free public `https` URL.
 //!    It starts no process, opens no socket, resolves no DNS, and writes nothing.
 //! 2. [`enroll_resolver_tool`]: `tirith pkg trust-tool` records the digest of an
@@ -36,12 +37,6 @@ const MAX_INDEX_URLS: usize = 64;
 /// drives these is neutralized in `sanitize_repo_scoped`, where it is introduced).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolverAllowances {
-    /// Permit source distributions / building from source. Default `false`.
-    /// Currently inert: no resolve or download runs any more, and a plain name
-    /// spec cannot express an sdist (a `.tar.gz` target is gated as a local path
-    /// or direct URL), so validation does not read this field. It is kept so the
-    /// allowance set stays complete for a future contained install.
-    pub allow_sdist: bool,
     /// Permit `git+` / other VCS requirement forms. Default `false`.
     pub allow_vcs: bool,
     /// Permit `-e` / `--editable` requirement forms. Default `false`.
@@ -53,11 +48,6 @@ pub struct ResolverAllowances {
     /// `false`. Even when permitted the URL must still be a credential-free public
     /// `https` URL.
     pub allow_direct_url: bool,
-    /// Inert compatibility field. No resolver is executed any more (validation
-    /// and enrollment only), and nothing outside tests reads this field. It
-    /// remains so operator code compiled against the older API does not change
-    /// shape.
-    pub allow_untrusted_tool: bool,
 }
 
 /// Why a resolver request or resolver-tool enrollment was refused.
@@ -1052,10 +1042,8 @@ pub fn validate_requirement(
         }
     }
     // sdist-only requirements cannot be expressed by name alone (a `.tar.gz`
-    // target is caught as a local path or direct URL above). No resolve or
-    // download runs any more, so `allow_sdist` has no effect on a plain name
-    // spec. Nothing further to gate here.
-    let _ = &allowances.allow_sdist;
+    // target is caught as a local path or direct URL above), and no resolve or
+    // download runs any more. Nothing further to gate here.
     Ok(())
 }
 
@@ -1429,12 +1417,10 @@ mod tests {
 
     fn allow_all() -> ResolverAllowances {
         ResolverAllowances {
-            allow_sdist: true,
             allow_vcs: true,
             allow_editable: true,
             allow_local_path: true,
             allow_direct_url: true,
-            allow_untrusted_tool: true,
         }
     }
 
@@ -1839,12 +1825,10 @@ mod tests {
         assert!(r.index_urls.is_empty());
         assert_eq!(r.allowances, ResolverAllowances::default());
         // The default allowances refuse everything dangerous.
-        assert!(!r.allowances.allow_sdist);
         assert!(!r.allowances.allow_vcs);
         assert!(!r.allowances.allow_editable);
         assert!(!r.allowances.allow_local_path);
         assert!(!r.allowances.allow_direct_url);
-        assert!(!r.allowances.allow_untrusted_tool);
     }
 
     #[test]

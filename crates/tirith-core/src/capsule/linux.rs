@@ -313,59 +313,6 @@ pub fn apply_containment(
     apply_containment_inner(spec, temp_home, &[], &[])
 }
 
-/// Apply containment while attaching one read-only filesystem grant to an
-/// already-open directory descriptor instead of reopening its pathname. The
-/// caller must keep `bound_read_root_fd` in `HandlePolicy::extra_unix_fds`, must
-/// have entered that same directory with `fchdir`, and must supply its observed
-/// canonical path as `bound_read_root`. This closes the final pathname swap
-/// window. No caller remains in the workspace (the package install that used it
-/// was removed); [`apply_containment_with_bound_root_sets`] covers this case.
-pub fn apply_containment_with_bound_read_root(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: &Path,
-    bound_read_root_fd: i32,
-) -> Result<CapsuleCoverage, ContainError> {
-    if !spec.handles.extra_unix_fds.contains(&bound_read_root_fd) {
-        return Err(ContainError::Handles(format!(
-            "bound read-root descriptor {bound_read_root_fd} is absent from the handle allow-list"
-        )));
-    }
-    apply_containment_inner(
-        spec,
-        temp_home,
-        &[(bound_read_root, bound_read_root_fd)],
-        &[],
-    )
-}
-
-/// Apply containment with independently held read and write directory
-/// capabilities. The write grant is installed from `bound_write_root_fd`
-/// directly; the diagnostic pathname is never reopened to determine authority,
-/// so a same-UID rename or replacement of the public target path cannot
-/// redirect the Landlock grant. No caller remains in the workspace (the package
-/// install that used it was removed); [`apply_containment_with_bound_root_sets`]
-/// covers this case.
-pub fn apply_containment_with_bound_roots(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: Option<(&Path, i32)>,
-    bound_write_root: Option<(&Path, i32)>,
-) -> Result<CapsuleCoverage, ContainError> {
-    for (kind, bound) in [("read", bound_read_root), ("write", bound_write_root)] {
-        if let Some((_, fd)) = bound {
-            if !spec.handles.extra_unix_fds.contains(&fd) {
-                return Err(ContainError::Handles(format!(
-                    "bound {kind}-root descriptor {fd} is absent from the handle allow-list"
-                )));
-            }
-        }
-    }
-    let bound_read_roots = bound_read_root.into_iter().collect::<Vec<_>>();
-    let bound_write_roots = bound_write_root.into_iter().collect::<Vec<_>>();
-    apply_containment_inner(spec, temp_home, &bound_read_roots, &bound_write_roots)
-}
-
 /// Apply containment with any number of independently held directory grants.
 /// Every diagnostic path must be one exact canonical policy root and every
 /// descriptor must be explicitly retained by `HandlePolicy`. Landlock rules are

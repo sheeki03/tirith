@@ -6226,8 +6226,10 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Enroll a fully static, native Linux uv executable by canonical path and
-    /// SHA-256. Python runtimes must remain root-managed.
+    /// Record a canonical-path + SHA-256 pin for a fully static, native Linux uv
+    /// executable (not yet enforced: nothing reads the pin while contained
+    /// package installation is disabled). Python runtimes must remain
+    /// root-managed.
     TrustTool {
         /// Absolute path to the static Linux uv executable to enroll.
         path: std::path::PathBuf,

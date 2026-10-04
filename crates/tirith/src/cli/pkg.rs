@@ -22,7 +22,7 @@
 //!   including receipts written by earlier releases.
 //! * **`pkg trust-tool`** pins a user-writable uv/python executable. Nothing in
 //!   this release reads the pin: it is recorded only for when contained install
-//!   returns.
+//!   returns, and the help, stderr note and JSON `enforced: false` say so.
 //!
 //! # Distinct from `tirith install`
 //!
@@ -257,15 +257,26 @@ fn resolver_request_error(error: &ResolverError) -> String {
 // resolver tool enrollment
 // ---------------------------------------------------------------------------
 
+/// Printed after a successful `pkg trust-tool`: the pin is stored, but no
+/// command in this release reads it.
+const TRUST_TOOL_NOT_ENFORCED_NOTE: &str = "tirith pkg trust-tool: the pin is recorded but not yet enforced; nothing in this release reads it while contained package installation is disabled";
+
+/// The `--format json` document for a successful `pkg trust-tool`. `enforced`
+/// is always false in this release (additive field).
+fn trust_tool_success_json(canonical: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "trusted": true,
+        "canonical_path": canonical.display().to_string(),
+        "binding": "sha256",
+        "enforced": false,
+    })
+}
+
 fn run_trust_tool(path: &Path, json: bool) -> i32 {
     match enroll_resolver_tool(path) {
         Ok(canonical) => {
             if json {
-                let out = serde_json::json!({
-                    "trusted": true,
-                    "canonical_path": canonical.display().to_string(),
-                    "binding": "sha256",
-                });
+                let out = trust_tool_success_json(&canonical);
                 let _ = serde_json::to_writer_pretty(std::io::stdout().lock(), &out);
                 println!();
             } else {
@@ -273,6 +284,7 @@ fn run_trust_tool(path: &Path, json: bool) -> i32 {
                     "tirith pkg trust-tool: enrolled canonical path + SHA-256 for {}",
                     canonical.display()
                 );
+                eprintln!("{TRUST_TOOL_NOT_ENFORCED_NOTE}");
             }
             0
         }
@@ -627,6 +639,16 @@ fn run_receipt(which: ReceiptQuery, json: bool, display_json: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_tool_success_output_says_the_pin_is_not_enforced() {
+        let value = trust_tool_success_json(Path::new("/opt/uv/bin/uv"));
+        assert_eq!(value["trusted"], true);
+        assert_eq!(value["canonical_path"], "/opt/uv/bin/uv");
+        assert_eq!(value["binding"], "sha256");
+        assert_eq!(value["enforced"], false);
+        assert!(TRUST_TOOL_NOT_ENFORCED_NOTE.contains("not yet enforced"));
+    }
 
     #[test]
     fn approve_failures_share_one_stable_json_dto() {

@@ -627,8 +627,16 @@ coverage = "Clipboard with secret-shape gating and browser source attribution; i
 policy_complete = true
 
 # ---------------------------------------------------------------------------
-# Package firewall (Python; installation has separate native qualification gates)
+# Package firewall (local npm/Python artifact inspection and environment
+# verification; contained package installation is disabled)
 # ---------------------------------------------------------------------------
+
+[[command]]
+name = "pkg inspect"
+group = "Package firewall"
+inspected = "partial"
+coverage = "The local artifact route shared with `package inspect`: inspects exact local npm tarballs or Python wheels without installing or executing them. npm inspection is bounded static evidence over the compressed bytes with explicit coverage gaps. It never contacts a registry and never issues installation approval."
+policy_complete = false
 
 [[command]]
 name = "pkg install"
@@ -652,6 +660,13 @@ coverage = "Approval is disabled with package execution, its only consumer. Afte
 policy_complete = true
 
 [[command]]
+name = "pkg trust-tool"
+group = "Package firewall"
+inspected = "none"
+coverage = "Records a canonical path and SHA-256 pin for a fully static, native Linux uv executable. The pin is not yet enforced: nothing in this release reads it, because contained package installation is disabled."
+policy_complete = true
+
+[[command]]
 name = "pkg graph"
 group = "Package firewall"
 inspected = "full"
@@ -662,14 +677,14 @@ policy_complete = true
 name = "pkg diff"
 group = "Package firewall"
 inspected = "full"
-coverage = "Local release differential between two wheels; inspects members for execution-shape drift (pure to native, hooks added)."
+coverage = "Local release differential between two npm tarballs or two Python wheels; inspects members for execution-shape drift (pure to native, startup hooks, bundled payloads, newly gained execution capabilities). npm comparisons qualify differences when analyzer or coverage differs. No registry or network access."
 policy_complete = true
 
 [[command]]
 name = "pkg attest"
 group = "Package firewall"
 inspected = "full"
-coverage = "Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow."
+coverage = "Fetches a local wheel's PyPI publish attestation, binds its subject digest to the wheel's SHA-256, and verifies it only with the optional sigstore feature. Missing or invalid attestation is evidence, never an auto-allow."
 policy_complete = true
 
 [[command]]
@@ -683,5 +698,5 @@ policy_complete = true
 name = "pkg receipt"
 group = "Package firewall"
 inspected = "none"
-coverage = "Lists and shows tamper-evident artifact-scan receipts. Reporting surface over recorded receipts."
+coverage = "Lists and shows stored artifact-scan receipts and flags one whose content no longer matches its content-addressed id. Reporting surface only: receipts were written by contained installs in earlier releases, and nothing in this release writes new ones."
 policy_complete = true

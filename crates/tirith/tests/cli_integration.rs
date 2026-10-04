@@ -4078,6 +4078,51 @@ Regenerate it with: TIRITH_BLESS_CAPABILITY_MATRIX=1 cargo test -p tirith capabi
     );
 }
 
+/// Every `tirith pkg` subcommand the CLI lists must have its own row in the
+/// capability manifest, so the matrix cannot silently omit a package command
+/// (it once lacked `pkg inspect` and `pkg trust-tool`).
+#[test]
+fn capability_manifest_covers_every_pkg_subcommand() {
+    let manifest_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/capability-manifest.toml");
+    if !manifest_path.exists() {
+        return;
+    }
+    let manifest: toml::Value = fs::read_to_string(&manifest_path)
+        .expect("read capability-manifest.toml")
+        .parse()
+        .expect("capability-manifest.toml is valid TOML");
+    let names: Vec<&str> = manifest["command"]
+        .as_array()
+        .expect("[[command]] array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+
+    let out = tirith()
+        .args(["pkg", "--help"])
+        .output()
+        .expect("run pkg --help");
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    let subcommands: Vec<&str> = help
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| *name != "help")
+        .collect();
+    assert!(subcommands.len() >= 5, "parsed {subcommands:?} from {help}");
+    for subcommand in subcommands {
+        let name = format!("pkg {subcommand}");
+        assert!(
+            names.contains(&name.as_str()),
+            "docs/capability-manifest.toml has no [[command]] row for `{name}`"
+        );
+    }
+}
+
 #[test]
 fn tier1_exit_fast_for_ls() {
     let out = tirith()
@@ -23075,6 +23120,57 @@ fn pkg_install_empty_requirements_is_usage_error() {
     );
 }
 
+/// `pkg trust-tool` records a resolver pin that nothing in this release reads
+/// (contained package installation is disabled). Its help must say so instead
+/// of reading as if enrollment changed what tirith enforces.
+#[test]
+fn pkg_trust_tool_help_says_the_pin_is_not_enforced() {
+    for args in [vec!["pkg", "trust-tool", "--help"], vec!["pkg", "--help"]] {
+        let out = tirith().args(&args).output().expect("run tirith help");
+        assert!(out.status.success(), "{args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.contains("uv executable"))
+            .unwrap_or_else(|| panic!("{args:?}: no trust-tool summary in {stdout}"));
+        assert!(
+            line.contains("not yet enforced"),
+            "{args:?}: trust-tool help must say the pin is not enforced: {line}"
+        );
+    }
+}
+
+/// A schema-v2 `private_verified` artifact-scan receipt as the removed package
+/// install wrote it: `fields` plus the stamped schema, engine build, timestamp
+/// and content-addressed id. Artifact hashes are sorted like the old writer did.
+fn artifact_receipt_fixture(
+    mut fields: serde_json::Value,
+) -> tirith_core::receipt::ArtifactScanReceipt {
+    let object = fields.as_object_mut().expect("receipt fixture fields");
+    object.insert("schema".into(), serde_json::json!(2));
+    object.insert("receipt_id".into(), serde_json::json!(""));
+    object.insert(
+        "engine_build_sha".into(),
+        serde_json::json!(tirith_core::receipt::engine_build_sha()),
+    );
+    object.insert(
+        "publication_state".into(),
+        serde_json::json!("private_verified"),
+    );
+    object.insert(
+        "timestamp".into(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
+    if let Some(serde_json::Value::Array(hashes)) = object.get_mut("artifact_sha256") {
+        hashes.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        hashes.dedup();
+    }
+    let mut receipt: tirith_core::receipt::ArtifactScanReceipt =
+        serde_json::from_value(fields).expect("receipt fixture deserializes");
+    receipt.receipt_id = receipt.compute_content_hash();
+    receipt
+}
+
 /// `tirith pkg receipt show` on a TAMPERED receipt must detect the edit and exit
 /// non-zero with a warning, never report it as a clean receipt. We build a real,
 /// content-addressed `ArtifactScanReceipt`, save it under an isolated data dir,
@@ -23084,7 +23180,7 @@ fn pkg_install_empty_requirements_is_usage_error() {
 #[test]
 fn pkg_receipt_show_detects_a_tampered_receipt() {
     use tirith_core::capsule::CapsuleCoverage;
-    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+    use tirith_core::receipt::{CapsuleReceipt, VerdictSummary};
 
     let home = tempfile::tempdir().expect("tempdir");
     // `data_dir()` honors XDG_DATA_HOME on Unix and %APPDATA% on Windows; receipts
@@ -23093,25 +23189,25 @@ fn pkg_receipt_show_detects_a_tampered_receipt() {
     fs::create_dir_all(&receipts_dir).expect("create receipts dir");
 
     // A valid receipt whose `receipt_id` is the content hash of its own bytes.
-    let receipt = ArtifactScanReceipt::new(
-        "0.0.0-test".to_string(),
-        "deadbeef".repeat(8),
-        7,
-        "uv pip compile --generate-hashes --no-build".to_string(),
-        String::new(),
-        String::new(),
-        CapsuleReceipt {
+    let receipt = artifact_receipt_fixture(serde_json::json!({
+        "tirith_version": "0.0.0-test".to_string(),
+        "policy_hash": "deadbeef".repeat(8),
+        "threat_db_sequence": 7,
+        "resolver_command": "uv pip compile --generate-hashes --no-build".to_string(),
+        "resolver_version": String::new(),
+        "package_manager_version": String::new(),
+        "capsule": CapsuleReceipt {
             backend_id: "noop".to_string(),
             coverage: CapsuleCoverage::NONE,
         },
-        vec!["a".repeat(64)],
-        None,
-        VerdictSummary {
+        "artifact_sha256": vec!["a".repeat(64)],
+        "post_install_record": null,
+        "verdict": VerdictSummary {
             action: "Allow".to_string(),
             rule_ids: vec![],
             finding_count: 0,
         },
-    );
+    }));
     assert!(
         receipt.content_hash_matches(),
         "freshly built receipt must be self-consistent before tampering"
@@ -23154,31 +23250,31 @@ fn pkg_receipt_show_detects_a_tampered_receipt() {
 #[test]
 fn pkg_receipt_show_accepts_an_untampered_receipt() {
     use tirith_core::capsule::CapsuleCoverage;
-    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+    use tirith_core::receipt::{CapsuleReceipt, VerdictSummary};
 
     let home = tempfile::tempdir().expect("tempdir");
     let receipts_dir = home.path().join("tirith").join("receipts");
     fs::create_dir_all(&receipts_dir).expect("create receipts dir");
 
-    let receipt = ArtifactScanReceipt::new(
-        "0.0.0-test".to_string(),
-        "deadbeef".repeat(8),
-        7,
-        "uv pip compile --generate-hashes --no-build".to_string(),
-        String::new(),
-        String::new(),
-        CapsuleReceipt {
+    let receipt = artifact_receipt_fixture(serde_json::json!({
+        "tirith_version": "0.0.0-test".to_string(),
+        "policy_hash": "deadbeef".repeat(8),
+        "threat_db_sequence": 7,
+        "resolver_command": "uv pip compile --generate-hashes --no-build".to_string(),
+        "resolver_version": String::new(),
+        "package_manager_version": String::new(),
+        "capsule": CapsuleReceipt {
             backend_id: "noop".to_string(),
             coverage: CapsuleCoverage::NONE,
         },
-        vec!["a".repeat(64)],
-        None,
-        VerdictSummary {
+        "artifact_sha256": vec!["a".repeat(64)],
+        "post_install_record": null,
+        "verdict": VerdictSummary {
             action: "Allow".to_string(),
             rule_ids: vec![],
             finding_count: 0,
         },
-    );
+    }));
     let id = receipt.receipt_id.clone();
     // Write the receipt verbatim (no edit), keyed by its content-hash id.
     let json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
