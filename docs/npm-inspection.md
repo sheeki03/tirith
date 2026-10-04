@@ -102,9 +102,10 @@ file contents can produce a new hash in the downloaded report.
   skipped only when the file provably just prints it: a heredoc given to
   `cat`, `echo`, `printf` or `:` (or read into a variable that is only
   echoed), in a file with no pipe except into plain text filters, no output
-  redirection to a file, no capture of the printed text, and no `eval`,
-  `source`, `exec`, shell, `sudo`, alias or `PATH` word (other than reading
-  `$PATH`). A variable holding the text must only appear as a plain `$NAME`
+  redirection to a file, no capture of the printed text, no `eval`,
+  `source`, `exec`, shell, `$SHELL` / `$BASH`, `sudo`, alias or `PATH` word
+  (other than reading `$PATH`), and no command whose name is an expansion
+  (`"$RUN" ...`, `env "$X" ...`). A variable holding the text must only appear as a plain `$NAME`
   in `echo` / `printf` commands that start on their own line (no quoted word
   or backslash-newline carried in from another line, no lone `&`), and the
   file must not reach it indirectly (`${!...}`, a nameref, `$_`, a bare

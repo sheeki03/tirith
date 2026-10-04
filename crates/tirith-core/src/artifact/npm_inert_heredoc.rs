@@ -8,7 +8,8 @@
 //! ANYTHING in the file could route printed text or a variable back into a
 //! shell (a pipe into anything but a plain text filter, a file redirection, a
 //! command substitution around the printer, eval/source/exec/coproc/trap, a
-//! shell or privilege wrapper, an alias or a redefined printer, any `PATH`
+//! shell or privilege wrapper (also `$SHELL` / `$BASH`), a command whose name
+//! is an expansion, an alias or a redefined printer, any `PATH`
 //! word other than a plain `$PATH` expansion, allexport), nothing is masked
 //! and every heredoc line is read as before. A heredoc read or captured into
 //! a variable is masked only when every use of the variable is a plain
@@ -81,6 +82,9 @@ const EVALUATING_WORDS: &[&str] = &[
     "doas",
     "runuser",
     "pkexec",
+    // `$SHELL` / `$BASH` name the running shell.
+    "SHELL",
+    "BASH",
 ];
 
 /// Lines longer than this never hold an accepted variable print.
@@ -470,6 +474,7 @@ fn rest_is_inert(
     // Nothing evaluates text, starts a shell or rebinds a command name.
     if words(rest).any(|word| EVALUATING_WORDS.contains(&word) || word == "allexport")
         || names_path(rest)
+        || expansion_command_word(rest)
         || dot_command(rest)
         || line_has_flag(rest, "set", 'a')
         || line_has_flag(rest, "export", 'f')
@@ -539,6 +544,33 @@ fn names_path(text: &str) -> bool {
             || (at >= 2 && &bytes[at - 2..at] == b"${" && bytes.get(end) == Some(&b'}'));
         !expansion
     })
+}
+
+/// A command word (after assignments and plain wrappers such as `env`,
+/// `nohup` or `command`) that is an expansion (`$X`, `"${X}"`, `"$@"`,
+/// `$(...)`): the file runs a command it computes, which could be a shell
+/// reading text back. Defence in depth next to the per-variable check, so
+/// a parse slip there cannot mask a body this file executes. Quoted text
+/// that only looks like a command position fails toward the signal.
+fn expansion_command_word(text: &str) -> bool {
+    static COMMAND_WORD: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(concat!(
+            // A command position: line start, a separator, a substitution
+            // or group opener, a case-arm `)` or a compound keyword.
+            r"(?m)(?:^|[;&|`]|\$\(|[^$(]\(|[^$]\{|\)[ \t]|\b(?:then|do|else|elif|if|while|until|time)\b)",
+            r"[ \t]*(?:[!{(][ \t]*)*",
+            // Assignments before the command (a value holding a
+            // substitution is not skipped: its `$(` is a command position).
+            r#"(?:[A-Za-z_][A-Za-z0-9_]*\+?=(?:"[^"\n]*"|'[^'\n]*'|[^ \t;&|()"'`\\])*[ \t]+)*"#,
+            // Wrappers that run their operand, with options, numbers and
+            // assignments.
+            r"(?:(?:env|nohup|nice|command|builtin|setsid|xargs|timeout|stdbuf|time)",
+            r#"(?:[ \t]+(?:-[^ \t;&|]*|[0-9][^ \t;&|]*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|'[^'\n]*'|[^ \t;&|()"'`\\])*))*[ \t]+)*"#,
+            r#"["']?\$[A-Za-z_{(@*0-9!#?-]"#,
+        ))
+        .expect("static regex")
+    });
+    COMMAND_WORD.is_match(text)
 }
 
 /// A way to read a variable's value without writing its name: indirect
@@ -997,6 +1029,43 @@ fn variable_only_printed(
 #[cfg(test)]
 mod tests {
     use super::analyze;
+
+    /// Defence in depth: a shell started from `$SHELL` / `$BASH`, or any
+    /// command word that is an expansion, disables masking on its own,
+    /// whatever the per-variable use check concludes.
+    #[test]
+    fn shell_variables_and_expansion_command_words_disable_masking() {
+        let none = std::collections::BTreeMap::new();
+        let inert = |rest: &str| super::rest_is_inert(rest, &[], &none, &[]);
+        let executing = [
+            "echo start & $SHELL -c \"$USAGE\"\n",
+            "echo start & \"$BASH\" -c \"$USAGE\"\n",
+            "env \"${SHELL}\" -c \"$USAGE\"\n",
+            "x=1; \"$RUN\" -c \"$USAGE\"\n",
+            "if true; then ${SH:-/bin/sh} -c \"$USAGE\"; fi\n",
+            "nohup ${B:-x} -c \"$USAGE\" &\n",
+            "env -i A=1 \"$RUN\" -c \"$USAGE\"\n",
+            "{ $RUN; }\n",
+            "( \"$@\" )\n",
+            "case \"$1\" in x) \"$RUN\" -c \"$USAGE\";; esac\n",
+            "true && $RUN\n",
+            "X=\"a b\" \"$RUN\" -c y\n",
+            "echo \"$(\"$RUN\" -c y)\"\n",
+        ];
+        let kept: Vec<_> = executing.iter().filter(|rest| inert(rest)).collect();
+        assert!(kept.is_empty(), "masking stayed enabled: {kept:#?}");
+        let shown = [
+            "echo \"$USAGE\" >&2\n",
+            "echo \"${A}${B} $SHELL_NAME $BASH_SOURCE\"\n",
+            "DIR=$(cd \"$(dirname \"$0\")\" && pwd)\necho \"running in $DIR\"\n",
+            "case \"${1:-}\" in\n  -h|--help) echo hi; exit 0 ;;\n  *) ;;\nesac\n",
+            "for f in \"$@\"; do echo \"$f\"; done\n",
+            "[ -n \"$X\" ] && echo \"$X\"\n",
+            ": \"${X:=1}\"\nX=\"$Y\" Z=$W\n",
+        ];
+        let refused: Vec<_> = shown.iter().filter(|rest| !inert(rest)).collect();
+        assert!(refused.is_empty(), "masking disabled: {refused:#?}");
+    }
 
     /// Adversarial shapes stay linear: every scan is local to a pattern, a
     /// line capped in length, or bounded by a mention cap.
