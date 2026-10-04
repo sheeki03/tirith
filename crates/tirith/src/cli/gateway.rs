@@ -2875,6 +2875,11 @@ pub fn run_gateway_with_options(
         }
     };
 
+    // The configuration is valid, so the gateway is going to serve: refresh
+    // an enrolled team policy cache in the background, as `tirith check`
+    // does, for as long as it runs.
+    crate::cli::team_enrollment::start_server_background_refresh();
+
     // IM2, load the committed descriptor-lock baseline and make the fail-closed
     // decision on a present-but-unloadable lock BEFORE spawning the upstream, so a
     // refusal under `fail_mode: closed` never first launches the very MCP server it

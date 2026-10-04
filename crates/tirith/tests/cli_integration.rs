@@ -6989,6 +6989,136 @@ fn warn_only_json_output_matches_plain_when_timings_stripped() {
     );
 }
 
+// R4.8: the MCP server and the gateway start the same detached, rate-limited
+// team policy refresh as `tirith check`. The claim file is the observable proof
+// that the refresh was started (the detached `enrollment sync --background`
+// child finds no connection file here and exits without any network contact).
+
+/// An isolated home whose enrolled team cache is two hours old, so a refresh is
+/// due. A refresh target needs only a well-formed enrollment record.
+#[cfg(unix)]
+fn stale_team_enrollment_root() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    use tirith_core::policy_team::Id;
+    let root = tempfile::tempdir().expect("team refresh root");
+    let team = root
+        .path()
+        .join("config")
+        .join("tirith")
+        .join("team-policy");
+    fs::create_dir_all(&team).expect("create team-policy dir");
+    for dir in [
+        root.path().join("config"),
+        root.path().join("config").join("tirith"),
+        team.clone(),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod dir");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "connection_id": Id::new(),
+        "authority_id": Id::new(),
+        "policy_id": Id::new(),
+        "activation_id": Id::new(),
+        "client_id": Id::new(),
+        "selection_commitment": "a".repeat(64),
+        "fetched_unix_ms": now - 2 * 3_600_000,
+        "cached_policy": null,
+    });
+    let path = team.join("enrollment.json");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).expect("write enrollment");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod enrollment");
+    root
+}
+
+#[cfg(unix)]
+fn team_refresh_env(cmd: &mut Command, root: &Path) {
+    cmd.env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env_remove("TIRITH_OFFLINE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+}
+
+#[cfg(unix)]
+fn team_refresh_claimed(root: &Path) -> bool {
+    root.join("state")
+        .join("tirith")
+        .join("team-policy-refresh-claimed-at")
+        .is_file()
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_server_starts_the_team_policy_background_refresh() {
+    let root = stale_team_enrollment_root();
+    let mut cmd = tirith();
+    cmd.arg("mcp-server");
+    team_refresh_env(&mut cmd, root.path());
+    let out = cmd.output().expect("run tirith mcp-server");
+    assert!(
+        team_refresh_claimed(root.path()),
+        "the MCP server must start the team policy refresh; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let offline = stale_team_enrollment_root();
+    let mut cmd = tirith();
+    cmd.arg("mcp-server");
+    team_refresh_env(&mut cmd, offline.path());
+    cmd.env("TIRITH_OFFLINE", "1");
+    cmd.output().expect("run offline tirith mcp-server");
+    assert!(
+        !team_refresh_claimed(offline.path()),
+        "TIRITH_OFFLINE=1 must keep the MCP server from starting a refresh"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_starts_the_team_policy_background_refresh() {
+    let run = |offline: bool| {
+        let root = stale_team_enrollment_root();
+        let config = root.path().join("gateway.yaml");
+        fs::write(&config, "guarded_tools: []\n").expect("write gateway config");
+        let mut cmd = tirith();
+        cmd.current_dir(root.path()).args([
+            "gateway",
+            "run",
+            "--upstream-bin",
+            "/bin/cat",
+            "--config",
+            config.to_str().expect("utf-8 config path"),
+        ]);
+        team_refresh_env(&mut cmd, root.path());
+        if offline {
+            cmd.env("TIRITH_OFFLINE", "1");
+        }
+        let out = cmd.output().expect("run tirith gateway");
+        (team_refresh_claimed(root.path()), out)
+    };
+    let (claimed, out) = run(false);
+    assert!(
+        claimed,
+        "the gateway must start the team policy refresh; status={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (claimed, _) = run(true);
+    assert!(
+        !claimed,
+        "TIRITH_OFFLINE=1 must keep the gateway from starting a refresh"
+    );
+}
+
 // `--offline` / `TIRITH_OFFLINE` (roadmap M0.3). The offline switch suppresses the periodic
 // background threat-DB refresh that `tirith check` triggers on the hot path.
 

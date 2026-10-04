@@ -6,7 +6,7 @@ use super::team_shared::{error, id, network_allowed, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tirith_core::policy::{BoundedRuntimePolicyInputs, PolicyDiagnosticCapture};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
@@ -956,32 +956,79 @@ const REFRESH_CLAIM_INTERVAL_MS: u64 = 15 * 60 * 1000;
 const REFRESH_CLAIM_LOCK: &str = "team-policy-refresh.lock";
 const REFRESH_CLAIM_FILE: &str = "team-policy-refresh-claimed-at";
 const REFRESH_SYNC_LOCK: &str = "team-policy-sync.lock";
-static REFRESH_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static REFRESH_GATE: RefreshGate = RefreshGate(AtomicU64::new(0));
+
+/// In-process limit on refresh attempts: at most one per claim interval. A
+/// one-shot command such as `tirith check` therefore tries once; the
+/// long-running MCP server and gateway try again every interval.
+struct RefreshGate(AtomicU64);
+impl RefreshGate {
+    /// Whether this process may attempt a refresh at `now`; a pass reserves
+    /// the next interval. A reservation from the future (the clock moved back
+    /// by more than an interval) does not suppress refresh.
+    fn try_pass(&self, now: u64) -> bool {
+        let mut next = self.0.load(Ordering::Relaxed);
+        loop {
+            if now < next && next - now <= REFRESH_CLAIM_INTERVAL_MS {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                next,
+                now.saturating_add(REFRESH_CLAIM_INTERVAL_MS),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => next = actual,
+            }
+        }
+    }
+}
 
 /// Called from `tirith check`. When the enrolled team cache is an hour old,
 /// start a detached `enrollment sync --background` child and return at once:
 /// the command never waits for the network. Offline mode, no enrollment, a
 /// recent claim or a busy claim lock all make this a no-op.
 pub(crate) fn maybe_background_refresh(offline_flag: bool) {
+    let _ = start_background_refresh(offline_flag);
+}
+
+/// Called once by the long-running MCP server and gateway, which have no
+/// `--offline` flag (`TIRITH_OFFLINE=1` still disables it). The first attempt
+/// runs now; a background thread then repeats the same rate-limited attempt
+/// every claim interval for the life of the process and reaps each child, so
+/// a server that runs for days keeps its team cache fresh. Requests are never
+/// delayed: the thread only sleeps, checks and spawns.
+pub(crate) fn start_server_background_refresh() {
+    let first = start_background_refresh(false);
+    let _ = std::thread::Builder::new()
+        .name("tirith-team-refresh".into())
+        .spawn(move || {
+            let mut child = first;
+            loop {
+                if let Some(mut running) = child.take() {
+                    let _ = running.wait();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(REFRESH_CLAIM_INTERVAL_MS));
+                child = start_background_refresh(false);
+            }
+        });
+}
+
+fn start_background_refresh(offline_flag: bool) -> Option<std::process::Child> {
     if offline_flag || super::offline_env_active() {
-        return;
+        return None;
     }
-    if REFRESH_ATTEMPTED.swap(true, Ordering::Relaxed) {
-        return;
+    let now = now_ms().ok()?;
+    if !REFRESH_GATE.try_pass(now) {
+        return None;
     }
-    let Ok(now) = now_ms() else { return };
-    let Some(target) = TeamEnrollment::background_refresh_target(now) else {
-        return;
-    };
-    let Some(state) = tirith_core::policy::state_dir() else {
-        return;
-    };
+    let target = TeamEnrollment::background_refresh_target(now)?;
+    let state = tirith_core::policy::state_dir()?;
     if !claim_background_refresh(&state, now) {
-        return;
+        return None;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
+    let exe = std::env::current_exe().ok()?;
     let mut command = std::process::Command::new(exe);
     command
         .args(background_sync_args(
@@ -996,16 +1043,18 @@ pub(crate) fn maybe_background_refresh(offline_flag: bool) {
     if let Some(home) = home::home_dir() {
         command.current_dir(home);
     }
-    let _ = command.spawn();
+    command.spawn().ok()
 }
 
 /// Additive `offline_cache` status field: how Runtime treats the cached team
 /// policy now, the deadlines, and a one-line human summary. Offline facts
 /// only; Runtime applies the same rules itself. `runtime_ready` is false when
-/// Runtime refuses the enrollment for a reason other than the cache age (a
-/// competing authority, a replaced connection, a malformed record): the cache
-/// age is then still reported, but nothing is enforced and every command fails
-/// closed, so `enforced`/`fails_closed`/`summary` must say so.
+/// Runtime refuses the enrollment. For an expired, future, missing or invalid
+/// cache that refusal is the cache state itself, so the per-state cause is
+/// reported unchanged. For a cache that is usable by age (fresh or grace) the
+/// refusal has another cause (a competing authority, a replaced connection, a
+/// malformed record): `runtime_refused` is then set and nothing is enforced,
+/// so `enforced`/`fails_closed`/`summary` must say so.
 fn offline_cache_projection(cache: &CacheStatus, now: u64, runtime_ready: bool) -> Value {
     let left = |until: u64| until.saturating_sub(now);
     let grace_hours = cache.grace_ms.map(|grace| grace / 3_600_000);
@@ -1061,7 +1110,8 @@ fn offline_cache_projection(cache: &CacheStatus, now: u64, runtime_ready: bool) 
         ),
     };
     let enforced = runtime_ready && cache.state.enforced();
-    let (time_left_ms, summary) = if runtime_ready {
+    let refused = !runtime_ready && cache.state.enforced();
+    let (time_left_ms, summary) = if !refused {
         (time_left_ms, summary)
     } else {
         (
@@ -1074,7 +1124,7 @@ fn offline_cache_projection(cache: &CacheStatus, now: u64, runtime_ready: bool) 
     };
     json!({
         "state": cache.state.as_str(),
-        "runtime_refused": !runtime_ready,
+        "runtime_refused": refused,
         "enforced": enforced,
         "fails_closed": !enforced,
         "fetched_unix_ms": cache.fetched_unix_ms,

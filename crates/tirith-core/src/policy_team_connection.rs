@@ -524,21 +524,44 @@ mod tests {
         );
     }
     /// The birth time the commitment binds is read from the live file on
-    /// Linux, and it does not move with `touch`.
+    /// Linux and Android, including musl builds, and it does not move with
+    /// `touch`. The file lives under the build directory (a real disk), not
+    /// in `/tmp`, which can be a tmpfs. There is no silent skip: a missing
+    /// birth time on Linux or Android fails this test (R4.9).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn linux_birth_time_is_bound_and_survives_touch() {
-        let dir = tempfile::tempdir().unwrap();
+        let build_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let dir = tempfile::tempdir_in(build_dir).unwrap();
         let path = dir.path().join("connection.json");
         std::fs::write(&path, b"bytes").unwrap();
         let file = File::open(&path).unwrap();
-        let Ok(created) = file.metadata().unwrap().created() else {
-            // This filesystem records no birth time; the index alone is bound.
-            return;
-        };
         let (_, birth) = native::Facts::for_live_test(&file).stable_identity();
-        let since = created.duration_since(std::time::UNIX_EPOCH).unwrap();
-        assert_eq!(birth, Some((since.as_secs(), since.subsec_nanos())));
+        let birth = birth.unwrap_or_else(|| {
+            panic!(
+                "no birth time for {}: statx(STATX_BTIME) must provide one on Linux and \
+                 Android (glibc, musl and bionic alike); without it a same-bytes \
+                 replacement that reuses the inode is not a new selection",
+                path.display()
+            )
+        });
+        // glibc std reads the same statx field, so linux-gnu commitments are
+        // unchanged by reading it directly.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let since = file
+                .metadata()
+                .unwrap()
+                .created()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            assert_eq!(birth, (since.as_secs(), since.subsec_nanos()));
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -547,7 +570,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             native::Facts::for_live_test(&file).stable_identity().1,
-            birth
+            Some(birth)
         );
     }
     fn record() -> Record {

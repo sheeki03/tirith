@@ -558,6 +558,68 @@ mod native {
         assert!(!summary.contains("is enforced"), "{summary}");
         assert!(!refused.to_string().contains("legacy-secret"));
     }
+    /// R4.5: an expired cache is itself why Runtime refuses the enrollment, so
+    /// status must name that cause, not a competing authority. With a
+    /// competing authority as well, the cache cause still comes first: a sync
+    /// is needed either way, and both fail closed.
+    #[test]
+    fn status_offline_cache_names_the_cache_cause_when_the_cache_is_unusable() {
+        use tirith_core::policy_team::{PolicyDocument, POLICY_SEMANTICS_VERSION};
+        use tirith_core::policy_team_client::AuthorityBinding;
+        let (mut guard, parent) = fixture();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        let authority_id = Id::new();
+        let policy_id = Id::new();
+        let connection_id = Id::new();
+        let binding = AuthorityBinding {
+            schema_version: SCHEMA_VERSION,
+            base_url: "https://must-not-contact.invalid".into(),
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            transport: Default::default(),
+        };
+        private_file(&parent.join("connection.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"binding":binding,"credential":"c".repeat(64)})).unwrap());
+        let connection = SelectedConnection::capture_current().unwrap();
+        // 24 h fresh window + 72 h default grace have both passed.
+        let fetched = now_ms().unwrap() - 200 * 3_600_000;
+        let document = PolicyDocument {
+            schema_version: 1,
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            revision: Id::new(),
+            created_unix_ms: fetched,
+            policy_semantics_version: POLICY_SEMANTICS_VERSION,
+            yaml: "paranoia: 2\n".into(),
+        };
+        private_file(&parent.join("enrollment.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"authority_id":authority_id,"policy_id":policy_id,"activation_id":Id::new(),"client_id":Id::new(),"selection_commitment":connection.private_selection_commitment().unwrap(),"fetched_unix_ms":fetched,"cached_policy":document})).unwrap());
+        let cwd = guard.roots().cwd.clone();
+        let status = || {
+            TeamEnrollmentService::capture(cwd.to_str())
+                .unwrap()
+                .current()
+                .unwrap()
+        };
+        let check = |view: &Value| {
+            assert_eq!(view["state"], "runtime_refused", "{view}");
+            let cache = &view["offline_cache"];
+            assert_eq!(cache["state"], "expired", "{view}");
+            assert_eq!(cache["runtime_refused"], false, "{view}");
+            assert_eq!(cache["enforced"], false);
+            assert_eq!(cache["fails_closed"], true);
+            assert_eq!(cache["time_left_ms"], 0);
+            let summary = cache["summary"].as_str().unwrap();
+            assert!(summary.contains("expired after its 72h"), "{summary}");
+            assert!(summary.contains("blocked (fail closed)"), "{summary}");
+            assert!(!summary.contains("Runtime refuses"), "{summary}");
+            assert!(!summary.contains("competing"), "{summary}");
+        };
+        check(&status());
+        guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
+        guard.set_env("TIRITH_API_KEY", "legacy-secret");
+        let competing = status();
+        check(&competing);
+        assert!(!competing.to_string().contains("legacy-secret"));
+    }
     #[test]
     fn withdrawal_between_capture_and_resolution_never_falls_through_to_legacy_contact() {
         let (mut guard, parent) = fixture();
@@ -607,6 +669,23 @@ mod background_refresh {
                 now + 5 * REFRESH_CLAIM_INTERVAL_MS
             ));
         }
+    }
+
+    /// R4.8: one attempt per claim interval within a process, so the
+    /// long-running MCP server and gateway retry while `tirith check` (one
+    /// call) behaves as before.
+    #[test]
+    fn refresh_gate_allows_one_attempt_per_interval_in_a_process() {
+        let gate = RefreshGate(AtomicU64::new(0));
+        let now = 10 * REFRESH_CLAIM_INTERVAL_MS;
+        assert!(gate.try_pass(now));
+        assert!(!gate.try_pass(now));
+        assert!(!gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS - 1));
+        assert!(gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS));
+        assert!(!gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS + 1));
+        // A clock that moved back by more than an interval does not
+        // suppress refresh indefinitely.
+        assert!(gate.try_pass(now - 5 * REFRESH_CLAIM_INTERVAL_MS));
     }
 
     #[test]
@@ -721,6 +800,26 @@ fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
         assert!(summary.contains("Runtime refuses"), "{summary}");
         assert!(summary.contains("fail closed"), "{summary}");
         assert!(!summary.contains("is enforced"), "{summary}");
+    }
+    // R4.5: Runtime refuses an expired, future, missing or invalid cache
+    // because of that state, so `runtime_ready` is false there. The projection
+    // must still give the per-state cause, exactly as when it is true.
+    for (state, cause) in [
+        (CacheState::Expired, "expired after its 72h"),
+        (CacheState::FutureTimestamp, "future fetch time"),
+        (CacheState::Missing, "cache is missing"),
+        (CacheState::Invalid, "cache is invalid"),
+    ] {
+        let refused = offline_cache_projection(&status(state, 97 * HOUR), now, false);
+        let ready = offline_cache_projection(&status(state, 97 * HOUR), now, true);
+        assert_eq!(refused, ready, "{state:?}");
+        assert_eq!(refused["runtime_refused"], false, "{state:?}");
+        assert_eq!(refused["enforced"], false, "{state:?}");
+        assert_eq!(refused["fails_closed"], true, "{state:?}");
+        let summary = refused["summary"].as_str().unwrap();
+        assert!(summary.contains(cause), "{summary}");
+        assert!(summary.contains("fail closed"), "{summary}");
+        assert!(!summary.contains("Runtime refuses"), "{summary}");
     }
     assert_eq!(fresh["runtime_refused"], false);
     assert_eq!(duration(59_999), "0m");

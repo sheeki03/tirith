@@ -216,11 +216,11 @@ impl Facts {
     /// IDs are not reused and the NTFS file index carries a reuse sequence
     /// number, so other platforms bind the index alone. Never mtime or ctime.
     ///
-    /// The birth time comes from `std::fs::Metadata::created()`, which Rust std
-    /// fills in only through statx on glibc (`linux-gnu`). On musl targets
-    /// (including the shipped aarch64 musl artifact) and on Android it is always
-    /// `None`, so there the binding is the index alone, the same as before v3,
-    /// and the ext4 inode-reuse case is not closed.
+    /// The birth time comes from the `statx` system call made directly (see
+    /// [`birth_time`]), so glibc, musl (including the shipped aarch64 musl
+    /// artifact) and Android bionic builds all bind it. It is `None` only where
+    /// the kernel has no statx (before Linux 4.11) or the filesystem keeps no
+    /// birth time; the binding is then the index alone.
     pub(super) fn stable_identity(&self) -> (u64, Option<(u64, u32)>) {
         (self.generation.identity.1, self.birth)
     }
@@ -249,20 +249,48 @@ impl Facts {
         }
     }
 }
-/// The birth time of the open file on linux-gnu, `None` where the filesystem
-/// keeps none, on musl/Android (std has no statx there), or on other
+/// The birth time of the open file on Linux and Android, `None` where the
+/// kernel has no statx or the filesystem keeps no birth time, and on other
 /// platforms (see [`Facts::stable_identity`]).
+///
+/// This calls the statx system call itself rather than going through
+/// `std::fs::Metadata::created()`: Rust std uses statx only on glibc, so on
+/// musl and Android `created()` always fails. glibc std reads the same
+/// `stx_btime` field, so linux-gnu values are unchanged.
 fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let metadata = file.metadata().map_err(|_| E::UnsafeStorage)?;
-        // `created` fails when this filesystem records no birth time, and
-        // always on musl and Android, where std does not use statx.
-        Ok(metadata
-            .created()
+        use std::os::fd::AsRawFd;
+        let mut buffer = std::mem::MaybeUninit::<KernelStatx>::zeroed();
+        // SAFETY: an empty path with AT_EMPTY_PATH reads the open descriptor;
+        // the kernel writes at most the 256-byte UAPI struct it is given.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                file.as_raw_fd() as libc::c_long,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_long,
+                STATX_BTIME as libc::c_long,
+                buffer.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                // No statx in this kernel (or it is filtered): no birth time.
+                Some(libc::ENOSYS) | Some(libc::EPERM) => Ok(None),
+                _ => Err(E::UnsafeStorage),
+            };
+        }
+        // SAFETY: a successful statx call filled the buffer, which was zeroed.
+        let statx = unsafe { buffer.assume_init() };
+        if statx.stx_mask & STATX_BTIME == 0 {
+            return Ok(None);
+        }
+        // Same range std accepts: a birth time before the epoch is dropped.
+        Ok(u64::try_from(statx.stx_btime.tv_sec)
             .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|time| (time.as_secs(), time.subsec_nanos())))
+            .filter(|_| statx.stx_btime.tv_nsec < 1_000_000_000)
+            .map(|seconds| (seconds, statx.stx_btime.tv_nsec)))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
@@ -270,6 +298,44 @@ fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
         Ok(None)
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const STATX_BTIME: u32 = 0x0800;
+
+/// Linux's stable 256-byte `struct statx` UAPI layout. libc 0.2 exposes no
+/// statx binding for musl (without an unstable cfg) and the bionic wrapper
+/// needs API level 30, so the raw system call fills this private copy.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct KernelStatx {
+    stx_mask: u32,
+    _stx_blksize: u32,
+    _stx_attributes: u64,
+    _stx_nlink: u32,
+    _stx_uid: u32,
+    _stx_gid: u32,
+    _stx_mode: u16,
+    _stx_pad1: u16,
+    _stx_ino: u64,
+    _stx_size: u64,
+    _stx_blocks: u64,
+    _stx_attributes_mask: u64,
+    _stx_atime: KernelStatxTimestamp,
+    stx_btime: KernelStatxTimestamp,
+    _stx_rest: [u64; 20],
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct KernelStatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    _pad: i32,
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const _: [(); 256] = [(); std::mem::size_of::<KernelStatx>()];
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const _: [(); 80] = [(); std::mem::offset_of!(KernelStatx, stx_btime)];
+
 pub(super) fn facts(file: &File, private: bool) -> Result<Facts, E> {
     platform::validate(file, false, private, false).map_err(|_| E::UnsafeStorage)?;
     let g = file_generation(file).map_err(|_| E::UnsafeStorage)?;
