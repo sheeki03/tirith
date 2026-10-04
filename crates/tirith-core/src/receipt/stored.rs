@@ -227,6 +227,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn receipt_reader_refuses_symlinks_and_oversized_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
         let fixture = tempfile::tempdir().unwrap();
         let root = DirCapability::open_root(fixture.path()).unwrap();

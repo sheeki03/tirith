@@ -1218,6 +1218,7 @@ mod tests {
 
     #[test]
     fn apply_plan_refuses_allowlisted_via_core_plan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The pure plan builder refuses an allow-list spec; launch_contained surfaces
         // that as an error WITHOUT touching any Win32 API.
         let mut spec = CapsuleSpec::locked_down();

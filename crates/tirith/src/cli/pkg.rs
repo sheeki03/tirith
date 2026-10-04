@@ -649,6 +649,7 @@ mod tests {
 
     #[test]
     fn approve_refuses_with_the_install_reason_after_argument_validation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let refusal = approve_refusal(Ecosystem::Pip, &["requests==2.31.0".to_string()], &[], &[]);
         assert_eq!(refusal.phase, "refused_before_exec");
         assert_eq!(refusal.exit_code, 1);
@@ -663,6 +664,7 @@ mod tests {
 
     #[test]
     fn approve_keeps_usage_and_request_errors_before_the_refusal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let usage = approve_refusal(Ecosystem::Npm, &["lodash".to_string()], &[], &[]);
         assert_eq!((usage.phase, usage.exit_code), ("precheck", 2));
         let empty = approve_refusal(Ecosystem::Pip, &[], &[], &[]);
@@ -739,6 +741,7 @@ mod tests {
 
     #[test]
     fn verify_env_returns_nonzero_when_expected_distribution_is_absent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let target = tempfile::tempdir().unwrap();
         let packages = vec!["definitely-not-installed".to_string()];
         assert_eq!(

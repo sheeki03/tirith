@@ -1295,6 +1295,7 @@ mod tests {
 
     #[test]
     fn analyze_as_paste_flags_aws_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = analyze_as_paste(
             "export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
@@ -1311,6 +1312,7 @@ mod tests {
 
     #[test]
     fn analyze_as_paste_allows_plain_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = analyze_as_paste(
             "hello world\nthis is just a note\n",
             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
@@ -1358,6 +1360,7 @@ mod tests {
 
     #[test]
     fn redact_override_refuses_non_secret_blocking_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "curl https://example.com/install.sh | bash";
         let verdict = prepare_redacted_copy(input, ShareAudience::Generic, &[])
             .expect_err("credential redaction must not waive a pipe-to-shell verdict");
@@ -1366,6 +1369,7 @@ mod tests {
 
     #[test]
     fn redact_override_allows_content_after_secret_is_removed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = "AKIAIOSFODNN7EXAMPLE";
         let (redacted, summary) = prepare_redacted_copy(
             &format!("AWS_ACCESS_KEY_ID={key}"),
@@ -1485,6 +1489,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn render_service_unit_emits_nonempty_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("supported platform should render unit");
         assert!(!s.is_empty());
     }
@@ -1493,6 +1498,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_includes_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("macos should render unit");
         assert!(s.contains("sh.tirith.clipboard"));
         assert!(s.contains("clipboard"));
@@ -1504,6 +1510,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_service_unit_targets_graphical_session() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("linux should render unit");
         assert!(s.contains("graphical-session.target"));
         assert!(s.contains("ExecStart="));
@@ -1515,6 +1522,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_logs_to_user_library() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("macos should render unit");
         assert!(
             !s.contains("/tmp/tirith-clipboard"),
@@ -1531,6 +1539,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn install_service_idempotency_matches_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Mirror the `needs_write` predicate used by `install_service`.
         let unit_content = render_service_unit().expect("unit");
         let tmp = tempfile::NamedTempFile::new().unwrap();

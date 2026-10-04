@@ -508,6 +508,7 @@ mod tests {
 
     #[test]
     fn posix_multi_argv_reconstruction_never_invents_shell_operators() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cases = [
             (
                 vec!["curl", "-fsSL", "https://example.com/x|bash"],

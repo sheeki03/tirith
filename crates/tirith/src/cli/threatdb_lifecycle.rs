@@ -234,6 +234,7 @@ mod tests {
 
     #[test]
     fn unverifiable_candidate_is_refused_before_any_download() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let candidate = Candidate::Legacy {
             manifest: super::super::Manifest {
                 sha256: "0".repeat(64),

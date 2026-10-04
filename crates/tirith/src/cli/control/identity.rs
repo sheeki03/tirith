@@ -587,6 +587,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn input_identity_checks_the_opened_generation_before_hashing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small-private-input");
         std::fs::write(&path, b"1234").unwrap();
@@ -614,6 +615,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn binary_guard_detects_replacement_and_same_size_in_place_edits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("binary");
         std::fs::write(&path, b"original bytes").unwrap();
@@ -635,6 +637,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn binary_guard_excludes_in_place_writes_and_detects_atomic_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("binary");
         std::fs::write(&path, b"original bytes").unwrap();
@@ -753,6 +756,7 @@ mod tests {
 
         #[test]
         fn directory_guards_deny_delete_access_on_leaf_and_ancestors_until_release() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             for private in [true, false] {
                 let temp = tempfile::tempdir().unwrap();
                 let scope = temp.path().canonicalize().unwrap();
@@ -791,6 +795,7 @@ mod tests {
 
         #[test]
         fn directory_guard_refuses_a_preexisting_delete_access_handle() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             for held_ancestor in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let scope = temp.path().canonicalize().unwrap();
@@ -812,6 +817,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn private_directory_rejects_unsafe_modes_and_rebound_ancestors() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("control");
@@ -834,6 +840,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn directory_alias_retargeting_and_private_mode_drift_refuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("one");

@@ -3811,6 +3811,7 @@ mod tests {
 
     #[test]
     fn workflow_v2_index_payload_matches_client_canonical_with_min() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Parse the PUBLISHED index (signed payload + signature), exactly as the
         // client receives it over the wire.
         let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN, "AA==");
@@ -4028,6 +4029,7 @@ mod tests {
 
     #[test]
     fn spawned_at_recent_skips_update() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
@@ -4349,6 +4351,7 @@ mod tests {
 
     #[test]
     fn next_check_at_exactly_now_allows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
@@ -4644,6 +4647,7 @@ mod tests {
 
     #[test]
     fn production_fetch_paths_reject_private_initial_destinations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let private = "https://127.0.0.1/threatdb";
         for error in [
             super::fetch_manifest_from_with_state(private, None).unwrap_err(),
@@ -4663,6 +4667,7 @@ mod tests {
 
     #[test]
     fn transport_200_returns_manifest_and_caches_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let manifest_json = format!(
             r#"{{"sha256":"abc","size":1,"url":"{}","version":1,"signature":"sig"}}"#,
@@ -4698,6 +4703,7 @@ mod tests {
 
     #[test]
     fn transport_304_with_cached_body_returns_cached_manifest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", "/manifest.json")
@@ -4725,6 +4731,7 @@ mod tests {
 
     #[test]
     fn transport_304_without_cache_retries_and_succeeds() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
 
         // First request 304 (no cached body), then unconditional retry to 200.
@@ -4765,6 +4772,7 @@ mod tests {
 
     #[test]
     fn transport_404_returns_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", "/manifest.json")
@@ -4782,6 +4790,7 @@ mod tests {
 
     #[test]
     fn transport_invalid_json_not_cached() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", "/manifest.json")
@@ -4809,6 +4818,7 @@ mod tests {
 
     #[test]
     fn transport_sends_user_agent_header() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let manifest_json = r#"{"sha256":"a","size":1,"url":"u","version":1,"signature":"s"}"#;
         let mock = server

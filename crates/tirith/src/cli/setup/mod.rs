@@ -1050,6 +1050,7 @@ mod run_impl {
 
         #[test]
         fn generated_tirith_bin_never_falls_back_to_bare_name() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             assert!(choose_generated_tirith_bin(None, None).is_err());
             // Whether the RUNNING binary validates depends on the host: CI
             // runners execute tests from checkout/build directories owned by a

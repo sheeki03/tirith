@@ -151,6 +151,7 @@ mod tests {
 
     #[test]
     fn both_architectures_allow_only_reviewed_clone_flags() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let sigchld = libc::SIGCHLD as u64;
         let fork = (libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID) as u64 | sigchld;
         let vfork = (libc::CLONE_VM | libc::CLONE_VFORK) as u64 | sigchld;

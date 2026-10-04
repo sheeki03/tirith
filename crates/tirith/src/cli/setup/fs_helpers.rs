@@ -2433,6 +2433,7 @@ fn run_cli_bounded<S: AsRef<OsStr>>(
 mod tests {
     #[test]
     fn operation_lock_owner_releases_even_with_a_retained_descriptor_copy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let scope = directory.path();
         let path = scope.join("operation.lock");
@@ -2454,6 +2455,7 @@ mod tests {
 
     #[test]
     fn smaller_snapshot_cap_is_enforced_before_read_and_preserves_private_proof() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("annotation.json");
@@ -2524,6 +2526,7 @@ mod tests {
 
     #[test]
     fn cli_runner_preserves_short_legitimate_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
@@ -2539,6 +2542,7 @@ mod tests {
 
     #[test]
     fn cli_runner_rejects_output_over_its_bound() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
@@ -2565,6 +2569,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         atomic_write(&path, dir.path(), "hello", 0o644).unwrap();
@@ -2575,6 +2580,7 @@ mod tests {
 
     #[test]
     fn atomic_write_refuses_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.txt");
         fs::write(&target, "original").unwrap();
@@ -2590,6 +2596,7 @@ mod tests {
 
     #[test]
     fn atomic_write_preserves_permissions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("strict.txt");
         fs::write(&path, "old").unwrap();
@@ -2604,6 +2611,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_skip_on_same_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "#!/bin/bash\necho hi").unwrap();
@@ -2614,6 +2622,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_errors_on_different_content_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "old content").unwrap();
@@ -2625,6 +2634,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_replaces_an_empty_placeholder_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "").unwrap();
@@ -2638,6 +2648,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_overwrites_with_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "old content").unwrap();
@@ -2651,6 +2662,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_refuses_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.sh");
         fs::write(&target, "original").unwrap();
@@ -2664,6 +2676,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_rejects_hardlinked_destination_without_touching_external_link() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let external_path = external.path().join("shared-hook.sh");
@@ -2694,6 +2707,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_refuses_symlinked_parent_even_when_content_matches() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("hook.sh"), "expected").unwrap();
@@ -2716,6 +2730,7 @@ mod tests {
 
     #[test]
     fn atomic_write_refuses_symlinked_parent_and_leaves_outside_untouched() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let linked_parent = dir.path().join("hooks");
@@ -2734,6 +2749,7 @@ mod tests {
 
     #[test]
     fn transaction_parent_swap_stays_bound_to_the_retained_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let parent = root.path().join("hooks");
@@ -2780,6 +2796,7 @@ mod tests {
 
     #[test]
     fn atomic_write_rejects_destination_outside_scope() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let path = outside.path().join("config.json");
@@ -2792,6 +2809,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_nested_components_without_following_links() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("one").join("two").join("config.json");
 
@@ -2827,6 +2845,7 @@ mod tests {
 
     #[test]
     fn provenance_bound_backup_retention_keeps_exactly_five() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2845,6 +2864,7 @@ mod tests {
 
     #[test]
     fn backup_and_temp_retention_remain_bounded_over_the_same_lifecycle() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2878,6 +2898,7 @@ mod tests {
 
     #[test]
     fn failed_backup_transactions_return_their_slots_without_exceeding_the_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2925,6 +2946,7 @@ mod tests {
 
     #[test]
     fn backup_retirement_never_scrubs_a_pathname_swap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2956,6 +2978,7 @@ mod tests {
 
     #[test]
     fn backup_retention_never_touches_unproven_prefix_lookalikes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2981,6 +3004,7 @@ mod tests {
 
     #[test]
     fn backup_retention_rejects_a_fully_bound_file_without_creation_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -3014,6 +3038,7 @@ mod tests {
 
     #[test]
     fn successful_updates_reuse_unix_tombstones_with_a_bound_of_five() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         for index in 0..20 {
@@ -3040,6 +3065,7 @@ mod tests {
 
     #[test]
     fn temp_retention_never_reuses_or_scrubs_prefix_only_lookalikes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let forged = root
@@ -3060,6 +3086,7 @@ mod tests {
 
     #[test]
     fn backup_uses_locked_snapshot_content_and_restrictive_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "secret-data").unwrap();
@@ -3075,6 +3102,7 @@ mod tests {
 
     #[test]
     fn backup_generation_is_revalidated_before_commit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3099,6 +3127,7 @@ mod tests {
 
     #[test]
     fn transaction_backup_and_retention_refuse_symlinked_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let linked = root.path().join("configs");
@@ -3136,6 +3165,7 @@ mod tests {
 
     #[test]
     fn dry_run_is_read_only_and_does_not_create_lock_or_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing/config.json");
         let outcome = transactional_update(&path, root.path(), true, |_| {
@@ -3181,6 +3211,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_accepts_exact_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("exact-cap.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES);
@@ -3194,6 +3225,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_rejects_cap_plus_one_before_live_side_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing").join("too-large.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
@@ -3208,6 +3240,7 @@ mod tests {
 
     #[test]
     fn drifted_transform_is_recomputed_and_capped_before_artifacts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "base").unwrap();
@@ -3239,6 +3272,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_rejects_cap_plus_one_in_dry_run_without_side_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing").join("too-large.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
@@ -3252,6 +3286,7 @@ mod tests {
 
     #[test]
     fn precreated_regular_and_symlink_backup_names_are_never_overwritten() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "original").unwrap();
@@ -3272,6 +3307,7 @@ mod tests {
 
     #[test]
     fn non_cooperating_generation_change_is_rejected_and_temp_is_scrubbed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (editor_bytes, expected_refusal) in [
             ("editor", "changed while setup"),
             ("editor-change", "exceeds setup file limit of 6 bytes"),
@@ -3299,6 +3335,7 @@ mod tests {
 
     #[test]
     fn swapped_temp_is_rejected_without_deleting_the_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3327,6 +3364,7 @@ mod tests {
 
     #[test]
     fn destination_swap_after_validation_is_detected_and_competitor_is_restored() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let original_hold = root.path().join("original-held-by-writer");
@@ -3366,6 +3404,7 @@ mod tests {
 
     #[test]
     fn temp_swap_after_validation_never_publishes_attacker_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let held_prepared = root.path().join("prepared-held-by-writer");
@@ -3416,6 +3455,7 @@ mod tests {
 
     #[test]
     fn expected_absent_race_never_overwrites_new_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let result = transactional_update_with_hook(
@@ -3435,6 +3475,7 @@ mod tests {
 
     #[test]
     fn publication_failure_rolls_back_only_its_backup_and_temp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3457,6 +3498,7 @@ mod tests {
 
     #[test]
     fn failure_after_temp_sync_scrubs_temp_and_transaction_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3480,6 +3522,7 @@ mod tests {
 
     #[test]
     fn guard_cleanup_failure_is_propagated_with_the_primary_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3505,6 +3548,7 @@ mod tests {
 
     #[test]
     fn displaced_scrub_failure_returns_written_with_recovery_never_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3521,6 +3565,7 @@ mod tests {
 
     #[test]
     fn retention_cleanup_failure_returns_written_with_recovery_never_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -3539,6 +3584,7 @@ mod tests {
 
     #[test]
     fn swapped_backup_cleanup_scrubs_only_the_held_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let held_backup = root.path().join("held-original-backup");
@@ -3573,6 +3619,7 @@ mod tests {
 
     #[test]
     fn post_publication_durability_failure_keeps_recovery_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3595,6 +3642,7 @@ mod tests {
 
     #[test]
     fn installed_name_swap_before_completion_is_detected_without_deleting_attacker() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let moved_install = root.path().join("writer-moved-install");
@@ -3633,6 +3681,7 @@ mod tests {
 
     #[test]
     fn subprocess_lock_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(role) = std::env::var_os("TIRITH_SETUP_LOCK_CHILD_ROLE") else {
             return;
         };
@@ -3757,6 +3806,7 @@ mod tests {
 
     #[test]
     fn cooperative_transactions_serialize_and_recompute() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.txt");
         fs::write(&path, "base").unwrap();
@@ -3785,6 +3835,7 @@ mod tests {
 
     #[test]
     fn same_content_hook_mode_fix_is_atomic_and_dry_run_is_non_mutating() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("hook.sh");
         fs::write(&path, "hook").unwrap();

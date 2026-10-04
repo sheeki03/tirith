@@ -1672,6 +1672,7 @@ mod tests {
 
     #[test]
     fn a_missing_project_directory_is_a_usage_error_not_a_partial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let error = resolve_project(Some(Path::new("/definitely/not/a/directory/for/c17")))
             .expect_err("a non-directory must be refused");
         assert!(error.contains("--project"), "{error}");

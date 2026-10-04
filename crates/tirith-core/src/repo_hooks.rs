@@ -3999,6 +3999,7 @@ mod tests {
 
     #[test]
     fn rule_network_call_fires_high_on_husky_curl() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4018,6 +4019,7 @@ mod tests {
 
     #[test]
     fn rule_credential_read_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         write(
@@ -4037,6 +4039,7 @@ mod tests {
 
     #[test]
     fn rule_sudo_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4054,6 +4057,7 @@ mod tests {
 
     #[test]
     fn quoted_escaped_and_path_commands_are_classified_as_executed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for body in [
             "'curl' https://evil.example/x",
             "\"curl\" https://evil.example/x",
@@ -4085,6 +4089,7 @@ mod tests {
 
     #[test]
     fn command_names_in_arguments_and_comments_are_not_executable_words() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for body in [
             "echo 'curl https://evil.example/x'",
             "printf '%s\\n' sudo",
@@ -4104,6 +4109,7 @@ mod tests {
 
     #[test]
     fn ambiguous_and_overdepth_hook_execution_fails_closed_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dynamic = classify_body(
             "pre-commit",
             HookProvider::Git,
@@ -4131,6 +4137,7 @@ mod tests {
 
     #[test]
     fn hook_shebang_selects_shell_or_fails_closed_for_unsupported_runtime() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for body in [
             "#!/usr/bin/env pwsh\nc`url https://evil.example/pwsh\n",
             "#!cmd.exe /c\r\nc^url https://evil.example/cmd\r\n",
@@ -4159,6 +4166,7 @@ mod tests {
 
     #[test]
     fn rule_suspicious_shell_pattern_fires_medium_on_pipe_to_sh() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4192,6 +4200,7 @@ mod tests {
 
     #[test]
     fn rule_suspicious_shell_pattern_fires_on_base64_decode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4210,6 +4219,7 @@ mod tests {
 
     #[test]
     fn rule_external_fetch_fires_medium_on_npx() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         // postinstall via npx, no curl/wget (so external-fetch Medium, not the High rule).
         write(
@@ -4257,6 +4267,7 @@ mod tests {
 
     #[test]
     fn curl_url_fires_network_call_not_external_fetch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // curl+URL is the High path; external-fetch (Medium) must NOT also fire (mutually
         // exclusive — both fired previously).
         let root = tempdir().unwrap();
@@ -4279,6 +4290,7 @@ mod tests {
 
     #[test]
     fn rule_external_fetch_fires_on_envrc_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4295,6 +4307,7 @@ mod tests {
 
     #[test]
     fn benign_hook_has_no_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4330,6 +4343,7 @@ mod tests {
 
     #[test]
     fn credential_read_env_fires_on_envrc_style() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4346,6 +4360,7 @@ mod tests {
 
     #[test]
     fn network_word_boundary_no_false_positive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4361,6 +4376,7 @@ mod tests {
 
     #[test]
     fn git_sample_hooks_are_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         // A `.sample` hook is inert until renamed — even one with a network call is ignored.
@@ -4379,6 +4395,7 @@ mod tests {
 
     #[test]
     fn makefile_is_automation_not_hook() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4399,6 +4416,7 @@ mod tests {
 
     #[test]
     fn mise_is_automation_category() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(root.path(), "mise.toml", "[tools]\nnode = \"20\"\n");
         let scan = scan_for_repo(root.path());
@@ -4412,6 +4430,7 @@ mod tests {
 
     #[test]
     fn git_commit_targets_pre_commit_not_pre_push() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         // A clean pre-commit and a network-calling pre-push.
         write(
@@ -4443,6 +4462,7 @@ mod tests {
 
     #[test]
     fn every_inventoried_git_event_has_a_command_route() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut routed = BTreeSet::new();
         for subcommand in [
             "commit",
@@ -4478,6 +4498,7 @@ mod tests {
 
     #[test]
     fn every_git_event_has_positive_and_negative_target_enforcement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ROUTES: &[&str] = &[
             "commit",
             "push",
@@ -4539,6 +4560,7 @@ mod tests {
 
     #[test]
     fn receive_pack_target_repository_is_never_scanned_as_the_caller_repo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = scan_triggered_by_command(
             None,
             "git",
@@ -4600,6 +4622,7 @@ mod tests {
 
     #[test]
     fn git_am_and_worktree_add_route_their_exact_lifecycle_events() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let am = LeaderTarget::resolve("git", Some("am")).expect("git am must trigger hooks");
         assert!(am.git_events.starts_with(&[
             "applypatch-msg",
@@ -4707,6 +4730,7 @@ mod tests {
 
     #[test]
     fn git_repository_and_config_overrides_fail_closed_for_commit_and_push() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         for args in [
@@ -4727,6 +4751,7 @@ mod tests {
 
     #[test]
     fn current_local_core_hooks_path_is_inventoried_fresh_on_each_scan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         git_ok(root.path(), &["init", "-q"]);
         git_ok(root.path(), &["config", "core.hooksPath", ".githooks"]);
@@ -4778,6 +4803,7 @@ mod tests {
 
     #[test]
     fn external_core_hooks_path_fails_closed_without_disclosing_hook_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         git_ok(root.path(), &["init", "-q"]);
@@ -4803,6 +4829,7 @@ mod tests {
 
     #[test]
     fn linked_worktree_uses_common_git_hooks_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let container = tempdir().unwrap();
         let main = container.path().join("main");
         let linked = container.path().join("linked");
@@ -4833,6 +4860,7 @@ mod tests {
 
     #[test]
     fn package_manager_install_aliases_route_lifecycle_scripts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (leader, subcommand) in [
             ("npm", Some("i")),
             ("npm", Some("add")),
@@ -4863,6 +4891,7 @@ mod tests {
 
     #[test]
     fn package_manager_workdir_overrides_cannot_scan_the_wrong_project() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         for (leader, args) in [
             ("npm", vec!["--prefix", "../other", "install"]),
@@ -4885,6 +4914,7 @@ mod tests {
 
     #[test]
     fn package_workspace_lifecycle_scope_fails_closed_until_all_manifests_are_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4940,6 +4970,7 @@ mod tests {
 
     #[test]
     fn package_publish_and_global_forms_route_or_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (leader, args) in [
             ("yarn", vec!["npm", "publish"]),
             ("pnpm", vec!["publish"]),
@@ -4968,6 +4999,7 @@ mod tests {
 
     #[test]
     fn git_commit_surfaces_network_calling_pre_commit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -4986,6 +5018,7 @@ mod tests {
 
     #[test]
     fn npm_install_targets_package_json_only_not_hooks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         // A network-calling pre-commit (git surface) and a clean postinstall.
         write(
@@ -5010,6 +5043,7 @@ mod tests {
 
     #[test]
     fn npm_run_does_not_trigger_install_lifecycle() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         // A malicious postinstall — runs on `npm install`, NOT on `npm run`.
         write(
@@ -5039,6 +5073,7 @@ mod tests {
 
     #[test]
     fn npm_install_surfaces_malicious_postinstall() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5055,6 +5090,7 @@ mod tests {
 
     #[test]
     fn npm_lifecycle_routes_only_scripts_the_operation_executes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5074,6 +5110,7 @@ mod tests {
 
     #[test]
     fn make_command_is_not_hook_triggering() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5087,6 +5124,7 @@ mod tests {
 
     #[test]
     fn direnv_allow_targets_envrc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5103,6 +5141,7 @@ mod tests {
 
     #[test]
     fn direnv_export_and_current_exec_scan_envrc_but_other_directory_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(root.path(), ".envrc", "curl https://evil.example/direnv\n");
         for args in [vec!["export", "bash"], vec!["exec", ".", "true"]] {
@@ -5149,6 +5188,7 @@ mod tests {
 
     #[test]
     fn non_hook_leader_returns_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5168,6 +5208,7 @@ mod tests {
 
     #[test]
     fn lefthook_pre_commit_run_curl_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5196,6 +5237,7 @@ mod tests {
 
     #[test]
     fn lefthook_yaml_supports_quoted_flow_and_aliased_event_configuration() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = r#"
 shared: &shared
   commands:
@@ -5259,6 +5301,7 @@ pre-commit:
 
     #[test]
     fn lefthook_unsupported_composition_and_invalid_yaml_fail_closed_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for body in [
             "extends: ./shared-hooks.yml\n",
             "remotes:\n  - git_url: https://evil.example/hooks.git\n",
@@ -5282,6 +5325,7 @@ pre-commit:
 
     #[test]
     fn pre_commit_config_entry_curl_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5298,6 +5342,7 @@ pre-commit:
 
     #[test]
     fn pre_commit_stages_keep_each_entry_bound_to_its_own_git_event() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5335,6 +5380,7 @@ pre-commit:
 
     #[test]
     fn both_pre_commit_configuration_suffixes_are_inventoried() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5362,6 +5408,7 @@ pre-commit:
 
     #[test]
     fn explain_returns_matching_entries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5376,6 +5423,7 @@ pre-commit:
 
     #[test]
     fn explain_unknown_name_is_empty() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(root.path(), ".husky/pre-commit", "#!/bin/sh\nnpm test\n");
         assert!(explain_for_repo(root.path(), "nonexistent").is_empty());
@@ -5387,6 +5435,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn explain_matches_short_name_or_displayed_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         write(
@@ -5429,6 +5478,7 @@ pre-commit:
 
     #[test]
     fn empty_repo_yields_empty_scan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         let scan = scan_for_repo(root.path());
@@ -5438,6 +5488,7 @@ pre-commit:
 
     #[test]
     fn malformed_package_json_is_fail_closed_not_silence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(root.path(), "package.json", "{ not valid json");
         let scan = scan_for_repo(root.path());
@@ -5453,6 +5504,7 @@ pre-commit:
 
     #[test]
     fn repeated_lifecycle_scans_return_consistent_fresh_results() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5468,6 +5520,7 @@ pre-commit:
 
     #[test]
     fn unreadable_hook_surfaces_high_not_silence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         // A non-UTF-8 hook body can't be classified, but a deliberately-unreadable hook is
@@ -5496,6 +5549,7 @@ pre-commit:
 
     #[test]
     fn non_ascii_hook_body_does_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         write(
             root.path(),
@@ -5513,6 +5567,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn symlinked_hook_file_is_not_disclosed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         // A sentinel outside .git/hooks but still inside the repository, holding
@@ -5556,6 +5611,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn contained_clean_hook_symlink_is_inspected_without_false_positive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         write(root.path(), "hooks/clean.sh", "#!/bin/sh\necho safe\n");
@@ -5582,6 +5638,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn escaping_hook_symlink_is_uninspectable_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         mkgit(root.path());
@@ -5614,6 +5671,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn dangling_hook_directories_are_present_uninspectable_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let git_root = tempdir().unwrap();
         mkgit(git_root.path());
         std::fs::remove_dir(git_root.path().join(".git/hooks")).unwrap();
@@ -5641,6 +5699,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn intermediate_symlinked_git_dir_is_contained() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The repo we scan.
         let repo = tempdir().unwrap();
         // An attacker-controlled tree OUTSIDE the repo, holding a real hooks dir.
@@ -5687,6 +5746,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn blocked_single_file_surface_surfaces_high_not_silence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         // A sentinel OUTSIDE the repo holding a rule-tripping `curl` + a secret.
         let outside = tempdir().unwrap();
@@ -5738,6 +5798,7 @@ pre-commit:
     #[cfg(unix)]
     #[test]
     fn blocked_lefthook_config_still_triggers_under_git_leader() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let sentinel = outside.path().join("real_lefthook.yml");
@@ -5766,6 +5827,7 @@ pre-commit:
 
     #[test]
     fn updating_git_scans_destination_husky_lefthook_and_native_hook_blobs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         init_real_git_repo(root.path());
         git_ok(root.path(), &["config", "core.hooksPath", ".githooks"]);
@@ -5861,6 +5923,7 @@ pre-commit:
 
     #[test]
     fn checkout_paths_inspects_index_hook_blob_not_only_worktree() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         init_real_git_repo(root.path());
         write(
@@ -5900,6 +5963,7 @@ pre-commit:
 
     #[test]
     fn ambiguous_git_updates_fail_closed_and_pull_requires_fetch_then_merge() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         init_real_git_repo(root.path());
         let base = current_branch(root.path());
@@ -5967,6 +6031,7 @@ pre-commit:
     /// must not start inventorying files that simply aren't there.
     #[test]
     fn absent_surface_produces_no_entry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         mkgit(root.path());
         // Only an empty `.git/hooks` exists — no .envrc, no package.json, no hooks.

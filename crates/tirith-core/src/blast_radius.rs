@@ -1584,6 +1584,7 @@ mod tests {
 
     #[test]
     fn work_budget_caps_directory_only_trees_and_keeps_dir_counts_honest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let tree = root.path().join("tree");
         fs::create_dir_all(tree.join("a")).unwrap();
@@ -1609,6 +1610,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn work_budget_caps_symlink_only_trees_and_exact_budget_is_complete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let tree = root.path().join("tree");
         fs::create_dir_all(&tree).unwrap();
@@ -1632,6 +1634,7 @@ mod tests {
 
     #[test]
     fn nonmatching_glob_candidates_consume_the_global_work_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("a.txt"), b"x").unwrap();
         fs::write(root.path().join("b.txt"), b"x").unwrap();
@@ -1697,6 +1700,7 @@ mod tests {
 
     #[test]
     fn matching_glob_growth_and_followup_walk_share_one_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("a.log"), b"x").unwrap();
         fs::write(root.path().join("b.log"), b"x").unwrap();
@@ -1714,6 +1718,7 @@ mod tests {
 
     #[test]
     fn glob_errors_are_not_flattened_and_consume_budget_before_later_targets() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("later.txt"), b"x").unwrap();
 
@@ -1894,6 +1899,7 @@ mod tests {
 
     #[test]
     fn preview_classifies_relative_targets_against_its_supplied_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Exercise only lexical classification: do not invoke `simulate` and do
         // not read or walk the synthetic system paths.
         assert!(is_system_path_for_preview(".", Path::new("/etc"), None));
@@ -2148,6 +2154,7 @@ mod tests {
 
     #[test]
     fn simulate_counts_files_in_temp_tree() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dist");
         fs::create_dir_all(&target).unwrap();
@@ -2175,6 +2182,7 @@ mod tests {
 
     #[test]
     fn simulate_counts_symlinks_without_following() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("d");
         fs::create_dir_all(&target).unwrap();
@@ -2201,6 +2209,7 @@ mod tests {
 
     #[test]
     fn simulate_detects_outside_repo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let outside = dir.path().join("outside");
@@ -2228,6 +2237,7 @@ mod tests {
 
     #[test]
     fn simulate_large_file_count_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("many");
         fs::create_dir_all(&target).unwrap();
@@ -2248,6 +2258,7 @@ mod tests {
 
     #[test]
     fn budget_cutoff_before_a_later_target_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The first target exhausts the work budget, so the second target — which
         // escapes the repository — is never classified. The report must say so
         // rather than presenting "outside repo: no" as a complete answer.
@@ -2282,6 +2293,7 @@ mod tests {
 
     #[test]
     fn simulate_truncates_past_depth_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // pr-test-analyzer #2: a tree deeper than MAX_WALK_DEPTH must set
         // walk_truncated (depth-cap DoS guard).
         let dir = tempfile::tempdir().unwrap();
@@ -2308,6 +2320,7 @@ mod tests {
 
     #[test]
     fn simulate_glob_expansion_counted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.log"), b"x").unwrap();
         fs::write(dir.path().join("b.log"), b"x").unwrap();
@@ -2325,6 +2338,7 @@ mod tests {
 
     #[test]
     fn simulate_supports_bracket_and_wildcard_directory_components() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("service-a/logs");
         fs::create_dir_all(&logs).unwrap();
@@ -2346,6 +2360,7 @@ mod tests {
 
     #[test]
     fn glob_intermediate_component_ignores_ordinary_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("plain.txt"), b"not a directory").unwrap();
         fs::create_dir_all(dir.path().join("service-a")).unwrap();
@@ -2365,6 +2380,7 @@ mod tests {
 
     #[test]
     fn simulate_empty_var_glob_is_system_and_outside() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let report = simulate(
             "rm -rf \"$EMPTY/\"",
@@ -2383,6 +2399,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn simulate_flags_unreadable_subdir_as_walk_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F3: a read_dir permission error on a subtree must increment walk_errors.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

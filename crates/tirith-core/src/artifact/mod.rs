@@ -773,6 +773,7 @@ mod tests {
 
     #[test]
     fn round_trips_installed_distribution_subject() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let subject = InspectionSubject::InstalledDistribution(DistributionIdentity {
             ecosystem: Ecosystem::PyPI,
             name: "demo".to_string(),
@@ -801,6 +802,7 @@ mod tests {
 
     #[test]
     fn round_trips_installed_file_subject() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let subject = InspectionSubject::InstalledFile(InstalledFileIdentity {
             location: SubjectLocation::installed("/venv/lib/site-packages/__editable__.pth"),
             sha256: None,
@@ -916,6 +918,7 @@ mod tests {
 
     #[test]
     fn incomplete_artifact_evaluation_cannot_finalize_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
         assert_eq!(verdict.action, Action::Warn);
@@ -927,6 +930,7 @@ mod tests {
 
     #[test]
     fn incomplete_counters_without_explicit_gap_cannot_finalize_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut inspection = ArtifactInspection::new(artifact_subject());
         inspection.coverage = InspectionCoverage {
             members_total: 2,
@@ -945,6 +949,7 @@ mod tests {
 
     #[test]
     fn require_complete_blocks_incomplete_artifact_evaluation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let mut policy = Policy::default();
         policy.scan.require_complete = true;
@@ -957,6 +962,7 @@ mod tests {
 
     #[test]
     fn severity_override_cannot_hide_artifact_incompleteness() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let mut policy = Policy::default();
         policy
@@ -1073,6 +1079,7 @@ mod tests {
     /// analyzers, no findings) and routes through the policy helper.
     #[test]
     fn evaluate_artifact_skeleton_is_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = ArtifactInspection::new(artifact_subject());
         let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
         assert_eq!(verdict.action, Action::Allow);

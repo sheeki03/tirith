@@ -1602,6 +1602,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn repo_store_rejects_oversized_and_non_regular_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".tirith")).unwrap();
         let path = root.path().join(".tirith/trust.json");
@@ -1849,6 +1850,7 @@ mod tests {
 
     #[test]
     fn test_row_key_roundtrip() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let row = make_row(
             "github.com".to_string(),
             Some("shortened_url".to_string()),
@@ -1865,6 +1867,7 @@ mod tests {
 
     #[test]
     fn test_row_key_roundtrip_no_rule() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let row = make_row(
             "example.com".to_string(),
             None,

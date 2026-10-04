@@ -503,6 +503,7 @@ mod tests {
 
     #[test]
     fn candidates_must_read_the_current_state_contract() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let current = Document::current();
         assert_eq!(current.state_contract_versions, [STATE_CONTRACT_VERSION]);
         assert!(preview(&current, "fixture", vec![])
@@ -551,6 +552,7 @@ mod tests {
 
     #[test]
     fn stored_state_is_vouched_for_by_this_binary_contract() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let current = Document::current();
         let contract = super::super::lifecycle::PersistedFormats::current();
         // Keep an independent assertion for the receipt format transition:
@@ -601,6 +603,7 @@ mod tests {
 
     #[test]
     fn retired_per_surface_contract_fields_are_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Schema-1 inventory, feature and rule fields (including the retired
         // local-leaf npm surfaces) are unknown to schema 2, never ignored.
         for (field, value) in [
@@ -621,6 +624,7 @@ mod tests {
 
     #[test]
     fn fixture_crypto_rejects_wrong_key_and_modified_bound_material() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use ed25519_dalek::Signer;
         // Public RFC8032 vector seed, never a production signing secret.
         let signer = ed25519_dalek::SigningKey::from_bytes(&[
@@ -725,6 +729,7 @@ mod tests {
 
     #[test]
     fn format_preview_refuses_unknown_future_and_unsupported_downgrades() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut document = Document::current();
         let fact = |surface, version, state| super::super::lifecycle::FormatFact {
             surface,
@@ -765,6 +770,7 @@ mod tests {
 
     #[test]
     fn rollback_evidence_requires_exact_binary_binding_and_retains_future_fields_as_errors() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("tirith");
         let sha = "a".repeat(64);
@@ -788,6 +794,7 @@ mod tests {
 
     #[test]
     fn candidate_metadata_requires_checksum_target_version_and_explicit_signature_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let target = "x86_64-unknown-linux-gnu";
         let archive = selfupdate::release_archive_name(target);

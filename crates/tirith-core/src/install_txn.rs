@@ -4751,6 +4751,7 @@ mod tests {
 
     #[test]
     fn lacks_registry_adapter_matches_registry_api_dispatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Pins this in agreement with `registry_api`'s `fetch` dispatch (the
         // source of truth); wiring a new adapter must flip the method here.
         assert!(!PackageManager::Npm.lacks_registry_adapter());

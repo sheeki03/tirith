@@ -478,6 +478,7 @@ mod tests {
 
     #[test]
     fn check_terraform_apply_auto_approve_dev_warns_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("terraform apply -auto-approve", ShellType::Posix, &policy);
         let auto = findings
@@ -489,6 +490,7 @@ mod tests {
 
     #[test]
     fn check_pulumi_up_yes_dev_warns_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("pulumi up --yes", ShellType::Posix, &policy);
         assert!(
@@ -501,6 +503,7 @@ mod tests {
 
     #[test]
     fn check_tofu_apply_with_no_args_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("tofu apply", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -508,6 +511,7 @@ mod tests {
 
     #[test]
     fn check_terraform_apply_requires_plan_when_policy_on() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy {
             iac_require_plan_before_apply: true,
             ..Policy::default()
@@ -523,6 +527,7 @@ mod tests {
 
     #[test]
     fn check_terraform_destroy_without_prod_does_not_fire_destroy_rule() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("terraform destroy", ShellType::Posix, &policy);
         assert!(
@@ -535,6 +540,7 @@ mod tests {
 
     #[test]
     fn check_non_iac_leader_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("git apply -auto-approve", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -542,6 +548,7 @@ mod tests {
 
     #[test]
     fn check_terraform_apply_tfplan_no_policy_no_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No policy gate and no auto-approve → a clean apply yields nothing.
         let policy = Policy::default();
         let findings = check("terraform apply tfplan", ShellType::Posix, &policy);
@@ -550,6 +557,7 @@ mod tests {
 
     #[test]
     fn find_prod_context_with_empty_labels_returns_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         assert!(find_prod_context(&policy).is_none());
     }
@@ -566,6 +574,7 @@ mod tests {
 
     #[test]
     fn check_terraform_fmt_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `terraform fmt` is read-only — no apply/destroy verb.
         let policy = Policy::default();
         let findings = check("terraform fmt", ShellType::Posix, &policy);
@@ -574,6 +583,7 @@ mod tests {
 
     #[test]
     fn check_terraform_plan_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("terraform plan -out tfplan", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -581,6 +591,7 @@ mod tests {
 
     #[test]
     fn check_handles_chdir_global_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy {
             iac_require_plan_before_apply: true,
             ..Policy::default()

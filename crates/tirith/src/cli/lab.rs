@@ -621,6 +621,7 @@ mod tests {
 
     #[test]
     fn artifact_scenarios_produce_expected_action() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Drive each artifact scenario through the real pipeline (materialize ->
         // inspect_artifact_set -> finalize_static_verdict) and assert the action
         // matches expected_action, bucketing Warn/WarnAck like the runner.
@@ -681,6 +682,7 @@ mod tests {
 
     #[test]
     fn evaluate_scenario_rejects_both_fixture_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = corpus()
             .scenarios
             .into_iter()

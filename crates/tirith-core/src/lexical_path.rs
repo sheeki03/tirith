@@ -840,6 +840,7 @@ mod tests {
 
     #[test]
     fn component_containment_is_root_aware_and_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(is_within("/repo/src", "/repo"));
         assert!(!is_within("/repo-other", "/repo"));
         assert!(!is_within("/Repo/src", "/repo"));
@@ -858,6 +859,7 @@ mod tests {
 
     #[test]
     fn root_sentinel_accepts_only_clean_fully_qualified_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for absolute in ["/", "/x", "C:/", r"C:\x", r"\\server\share\x", r"\\?\C:\x"] {
             assert!(is_within(absolute, "/"), "{absolute}");
         }
@@ -876,6 +878,7 @@ mod tests {
 
     #[test]
     fn safe_verbatim_roots_match_only_the_same_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(is_within(r"\\?\C:\Repo\src", r"\\?\c:\repo"));
         assert!(is_within(
             r"\\?\UNC\Server\Share\src",
@@ -886,6 +889,7 @@ mod tests {
 
     #[test]
     fn auto_detection_does_not_case_fold_posix_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(detect_dialect("/Home/User"), PathDialect::Posix);
         assert_eq!(detect_dialect(r"C:\Home\User"), PathDialect::Windows);
         assert_eq!(detect_dialect(r"relative\windows"), PathDialect::Windows);

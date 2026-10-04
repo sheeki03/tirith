@@ -903,6 +903,7 @@ mod tests {
     // reject it up front.
     #[test]
     fn validate_both_pattern_and_when_reaches_per_rule_validator_not_strict_parse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = "custom_rules:\n  - id: both\n    pattern: \"foo\"\n    when:\n      command.uses_sudo: true\n    title: \"has both pattern and when\"\n    context: [exec]\n";
 
         // The strict path (test/explain) still rejects it up front.
@@ -984,6 +985,7 @@ mod tests {
     /// under the parallel harness.
     #[test]
     fn validate_json_missing_path_exits_nonzero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist-policy.yaml");
         let missing = missing.to_string_lossy().into_owned();
@@ -1123,6 +1125,7 @@ mod tests {
     // Use the human path so a clean stdout proves the raw entry was NOT rendered.
     #[test]
     fn explain_rejects_unsupported_predicate_rule_via_real_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = "custom_rules:\n  - id: agent-kind-only\n    when:\n      agent.kind: aider\n    title: \"unsupported predicate rule\"\n";
         let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
         // Sanity: `compile_rules` drops the `agent.kind` rule (the gate's trigger).
@@ -1232,6 +1235,7 @@ mod tests {
     // pre-F1; this pins that `explain` now normalizes to `[exec, file]`.
     #[test]
     fn explain_orders_contexts_exec_before_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = "custom_rules:\n  - id: regex-reversed-ctx\n    pattern: 'curl'\n    title: \"regex rule declared file then exec\"\n    context: [file, exec]\n";
         let policy = Policy::try_parse_yaml(yaml).expect("policy parses");
 

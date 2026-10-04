@@ -1460,6 +1460,7 @@ mod tests {
     /// and single-quote the substitution so it defers to prompt render.
     #[test]
     fn prompt_status_snippet_zsh_is_marker_wrapped_and_deferred() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = prompt_status_snippet("zsh");
         assert!(s.contains("# >>> tirith prompt-status (M8 ch6) >>>"));
         assert!(s.contains("# <<< tirith prompt-status (M8 ch6) <<<"));
@@ -1474,6 +1475,7 @@ mod tests {
 
     #[test]
     fn prompt_status_snippet_bash_uses_ps1_with_single_quoted_subst() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = prompt_status_snippet("bash");
         assert!(s.contains("/opt/Tirith Bin/tirith"));
         assert!(!s.contains(" tirith prompt-status --short"));

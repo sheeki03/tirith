@@ -874,6 +874,7 @@ mod tests {
 
     #[test]
     fn scan_reports_sha256_for_existing_rc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         std::fs::write(
             home.path().join(".zshrc"),
@@ -893,6 +894,7 @@ mod tests {
 
     #[test]
     fn shell_rc_modified_fires_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let zshrc = home.path().join(".zshrc");
         std::fs::write(&zshrc, b"export PATH=$PATH:/usr/local/bin\n").unwrap();
@@ -921,6 +923,7 @@ mod tests {
 
     #[test]
     fn unchanged_rc_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         std::fs::write(home.path().join(".bashrc"), b"alias ll='ls -la'\n").unwrap();
 
@@ -935,6 +938,7 @@ mod tests {
 
     #[test]
     fn authorized_keys_new_entry_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let ssh = home.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -996,6 +1000,7 @@ mod tests {
 
     #[test]
     fn absent_baseline_replaced_by_unsafe_surface_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A baseline-absent rc file and a later symlink/special/over-cap read
         // both carry the empty-content hash, so the hash comparison alone sees
         // no change. The presence flip IS the change: an attacker planting
@@ -1054,6 +1059,7 @@ mod tests {
 
     #[test]
     fn launch_agent_added_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         // Snapshot with NO launch agents.
         let snap = snapshot_then(home.path(), None);
@@ -1078,6 +1084,7 @@ mod tests {
 
     #[test]
     fn ssh_config_include_added_fires_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let ssh = home.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -1104,6 +1111,7 @@ mod tests {
 
     #[test]
     fn ssh_config_indented_include_unchanged_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An unchanged indented `  Include …` must not look "added" — the
         // trimmed-vs-raw hash mismatch was a real bug.
         let home = tempdir().unwrap();
@@ -1130,6 +1138,7 @@ mod tests {
 
     #[test]
     fn ssh_config_non_include_edit_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let ssh = home.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -1150,6 +1159,7 @@ mod tests {
 
     #[test]
     fn direnv_new_envrc_fires_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
         // Snapshot with no .envrc in the project.
@@ -1252,6 +1262,7 @@ mod tests {
 
     #[test]
     fn snapshot_persists_no_cleartext_only_hashes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The serialized snapshot must NOT contain raw rc-file bytes (secret-at-rest).
         let home = tempdir().unwrap();
         std::fs::write(
@@ -1332,6 +1343,7 @@ mod tests {
 
     #[test]
     fn crontab_absence_is_empty_not_present() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A failing crontab shell-out yields an absent, empty, well-formed entry.
         let entry = crontab_entry();
         assert_eq!(entry.sha256.len(), 64);
@@ -1341,6 +1353,7 @@ mod tests {
 
     #[test]
     fn empty_home_first_scan_yields_no_change() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let snap = snapshot_then(home.path(), None);
         // Re-diff with no mutation: all surfaces absent and unchanged.
@@ -1350,6 +1363,7 @@ mod tests {
 
     #[test]
     fn diff_against_empty_snapshot_reports_present_surfaces() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         std::fs::write(home.path().join(".zshrc"), b"alias g=git\n").unwrap();
         // Empty snapshot (no baseline). A present rc file with no prior record
@@ -1410,6 +1424,7 @@ mod tests {
 
     #[test]
     fn envrc_ancestry_walk_finds_parent_envrc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let child = root.path().join("a").join("b");
         std::fs::create_dir_all(&child).unwrap();
@@ -1428,6 +1443,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn envrc_symlink_registers_surface_without_disclosing_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let secret = outside.path().join("accounts.txt");
@@ -1459,6 +1475,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsafe_surface_stays_present_with_empty_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let target = outside.path().join("real-zshrc");

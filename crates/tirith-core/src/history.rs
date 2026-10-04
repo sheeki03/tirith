@@ -1064,6 +1064,7 @@ mod tests {
 
     #[test]
     fn errors_large_logs_and_limits_have_explicit_coverage() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let reader = HistoryReader::new(path.clone());

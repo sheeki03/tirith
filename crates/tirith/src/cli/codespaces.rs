@@ -320,6 +320,7 @@ mod tests {
 
     #[test]
     fn setup_creates_devcontainer_and_gitignore() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let code = setup(Some(dir.path()), false);
         assert_eq!(code, 0);
@@ -332,6 +333,7 @@ mod tests {
 
     #[test]
     fn setup_idempotent_second_run() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let _ = setup(Some(dir.path()), false);
         let code = setup(Some(dir.path()), false);
@@ -340,6 +342,7 @@ mod tests {
 
     #[test]
     fn setup_off_mode_publishes_both_config_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let mut policy = Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Off;
@@ -353,6 +356,7 @@ mod tests {
 
     #[test]
     fn setup_deny_leaves_devcontainer_and_gitignore_byte_identical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let config_path = write_decoy_hook(dir.path());
         let gitignore_path = dir.path().join(".gitignore");
@@ -373,6 +377,7 @@ mod tests {
 
     #[test]
     fn setup_deny_creates_no_devcontainer_directory_or_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let mut policy = Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
@@ -389,6 +394,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn setup_rolls_back_a_new_gitignore_when_devcontainer_is_unsafe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join(".devcontainer")).unwrap();
@@ -406,6 +412,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn setup_restores_existing_gitignore_bytes_when_devcontainer_is_unsafe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let original = b"target/\n# keep exact spacing  \n";
@@ -425,6 +432,7 @@ mod tests {
 
     #[test]
     fn rollback_preserves_a_competing_gitignore_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join(".gitignore");
         let written = b".tirith/\n".to_vec();
@@ -444,6 +452,7 @@ mod tests {
 
     #[test]
     fn setup_does_not_trust_a_hook_substring() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let config_path = write_decoy_hook(dir.path());
 
@@ -453,6 +462,7 @@ mod tests {
 
     #[test]
     fn inject_does_not_trust_a_hook_substring() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let config_path = write_decoy_hook(dir.path());
 

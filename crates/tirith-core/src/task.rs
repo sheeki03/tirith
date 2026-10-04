@@ -1201,6 +1201,7 @@ mod tests {
 
     #[test]
     fn effects_are_inferred_from_the_operation_not_the_description() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The envelope says nothing about installing; the action does.
         let effects = infer_effects(&ProposedAction::PackageInstall {
             ecosystem: "npm".into(),
@@ -1226,6 +1227,7 @@ mod tests {
     /// the other runs a binary already on disk and names no package.
     #[test]
     fn npm_shell_actions_are_modelled_but_script_indirection_is_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let install = infer_effects_detailed(&ProposedAction::Shell {
             command: "npm install left-pad".into(),
         });
@@ -1329,6 +1331,7 @@ mod tests {
 
     #[test]
     fn normalized_tirith_policy_writes_are_policy_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for path in [
             ".tirith/policy.yaml",
             ".tirith/policy.yml",
@@ -1352,6 +1355,7 @@ mod tests {
 
     #[test]
     fn escaped_ambiguous_or_nonpolicy_paths_are_not_policy_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for path in [
             ".tirith/../policy.yaml",
             ".TIRITH/policy.yaml",
@@ -1380,6 +1384,7 @@ mod tests {
 
     #[test]
     fn requesting_an_effect_never_grants_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::ConfigWrite {
                 path: "notes.md".into(),
@@ -1414,6 +1419,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_source_cannot_reach_a_provenance_gated_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1443,6 +1449,7 @@ mod tests {
 
     #[test]
     fn public_receipt_status_values_cannot_forge_verified_provenance() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1470,6 +1477,7 @@ mod tests {
 
     #[test]
     fn two_untrusted_sources_cannot_launder_each_other() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Composition must not average out to "verified": the weakest source
         // decides, because effects cannot be attributed to one source.
         let mut verified = untrusted(SourceKind::IssueBody);
@@ -1494,6 +1502,7 @@ mod tests {
 
     #[test]
     fn an_oversized_or_deep_envelope_is_refused_before_analysis() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let deep = format!(
             "{}{}",
             "[".repeat(MAX_JSON_DEPTH + 2),
@@ -1551,6 +1560,7 @@ mod tests {
 
     #[test]
     fn a_narrative_action_makes_the_assessment_incomplete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::Narrative {
                 text: "do the needful".into(),
@@ -1572,6 +1582,7 @@ mod tests {
 
     #[test]
     fn an_observing_gate_records_denials_without_withholding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1815,6 +1826,7 @@ mod tests {
 
     #[test]
     fn a_verified_receipt_does_not_exceed_the_trusted_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The exit gate: a receipt can only ever fail to lift a restriction.
         // It must never authorize an effect the policy denies outright.
         let mut verified = untrusted(SourceKind::IssueBody);

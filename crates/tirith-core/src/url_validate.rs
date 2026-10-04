@@ -827,6 +827,7 @@ mod tests {
 
     #[test]
     fn test_accepts_https() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://policy.tirith.dev/api",
             UrlValidationMode::Server,
@@ -837,6 +838,7 @@ mod tests {
 
     #[test]
     fn test_rejects_loopback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://127.0.0.1/api");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-public"));
@@ -844,42 +846,49 @@ mod tests {
 
     #[test]
     fn test_rejects_private_10() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://10.0.0.1/api");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_private_172() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://172.16.0.1/api");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_private_192() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://192.168.1.1/api");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_metadata() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://169.254.169.254/latest/meta-data/");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_cloud_metadata_hostname() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("https://metadata.google.internal/");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_invalid_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_server_url("not a url");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_embedded_credentials() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://user:pass@example.com/path",
             UrlValidationMode::Fetch,
@@ -891,6 +900,7 @@ mod tests {
 
     #[test]
     fn test_rejects_localhost_name() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://localhost/path",
@@ -903,6 +913,7 @@ mod tests {
 
     #[test]
     fn test_rejects_localhost_subdomain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://api.localhost/path",
@@ -915,6 +926,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hostname_resolving_to_private_ip() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/path",
             UrlValidationMode::Server,
@@ -929,6 +941,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hostname_resolving_to_documentation_range() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/path",
@@ -944,6 +957,7 @@ mod tests {
 
     #[test]
     fn test_fetch_allows_http_when_public() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "http://example.com/path",
@@ -955,6 +969,7 @@ mod tests {
 
     #[test]
     fn fetch_syntax_preflight_accepts_a_domain_without_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let parsed = validate_fetch_url_syntax("https://does-not-resolve.invalid/script")
             .expect("pure preflight must not consult DNS for a domain name");
@@ -975,6 +990,7 @@ mod tests {
 
     #[test]
     fn fetch_syntax_preflight_rejects_literal_ssrf_and_malformed_inputs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         for input in [
             "not a URL",
@@ -993,6 +1009,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_non_http_scheme() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "ftp://example.com/file",
             UrlValidationMode::Fetch,
@@ -1004,6 +1021,7 @@ mod tests {
 
     #[test]
     fn test_accepts_public_ipv6_literal_without_dns_lookup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[2606:2800:220:1:248:1893:25c8:1946]",
             UrlValidationMode::Server,
@@ -1014,6 +1032,7 @@ mod tests {
 
     #[test]
     fn test_rejects_ipv4_mapped_ipv6_literal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:127.0.0.1]/api",
             UrlValidationMode::Server,
@@ -1025,6 +1044,7 @@ mod tests {
 
     #[test]
     fn test_rejects_hostname_resolving_to_ipv4_mapped_ipv6() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/api",
@@ -1041,6 +1061,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_cloud_metadata() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // AWS metadata endpoint via IPv4-mapped IPv6.
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:169.254.169.254]/latest/meta-data/",
@@ -1052,6 +1073,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_private_10() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:10.0.0.1]/admin",
             UrlValidationMode::Server,
@@ -1062,6 +1084,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_private_192() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:192.168.1.1]/config",
             UrlValidationMode::Server,
@@ -1072,6 +1095,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_private_172() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:172.16.0.1]/",
             UrlValidationMode::Server,
@@ -1082,6 +1106,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_unspecified() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:0.0.0.0]/",
             UrlValidationMode::Server,
@@ -1092,6 +1117,7 @@ mod tests {
 
     #[test]
     fn test_bypass_mapped_broadcast() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::ffff:255.255.255.255]/",
             UrlValidationMode::Server,
@@ -1102,6 +1128,7 @@ mod tests {
 
     #[test]
     fn test_bypass_resolved_mapped_loopback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // DNS returns ::ffff:127.0.0.1 for a hostname
         let result = validate_outbound_url_with_resolver(
             "https://attacker.example.com/",
@@ -1116,6 +1143,7 @@ mod tests {
 
     #[test]
     fn test_bypass_resolved_mapped_private() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         // DNS returns ::ffff:10.0.0.1 for a hostname
         let result = validate_outbound_url_with_resolver(
@@ -1131,6 +1159,7 @@ mod tests {
 
     #[test]
     fn test_rejects_nat64_encoded_loopback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[64:ff9b::127.0.0.1]/",
             UrlValidationMode::Server,
@@ -1141,6 +1170,7 @@ mod tests {
 
     #[test]
     fn test_rejects_resolved_nat64_encoded_metadata() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/api",
@@ -1155,6 +1185,7 @@ mod tests {
 
     #[test]
     fn test_rejects_ipv4_compatible_loopback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[::127.0.0.1]/",
             UrlValidationMode::Server,
@@ -1168,6 +1199,7 @@ mod tests {
 
     #[test]
     fn test_allows_nat64_encoded_public_ipv4() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://[64:ff9b::0808:0808]/",
             UrlValidationMode::Server,
@@ -1181,6 +1213,7 @@ mod tests {
 
     #[test]
     fn test_legitimate_public_ipv6_still_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Google's public DNS — must NOT be blocked
         let result = validate_outbound_url_with_resolver(
             "https://[2607:f8b0:4004:800::200e]/",
@@ -1192,6 +1225,7 @@ mod tests {
 
     #[test]
     fn test_legitimate_resolved_public_ipv6_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = validate_outbound_url_with_resolver(
             "https://example.com/api",
             UrlValidationMode::Server,
@@ -1206,6 +1240,7 @@ mod tests {
 
     #[test]
     fn test_rejects_6to4_encoded_loopback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 2002:7f00:1:: is the 6to4 wrapping of 127.0.0.1.
         let result = validate_outbound_url_with_resolver(
             "https://[2002:7f00:1::]/",
@@ -1218,6 +1253,7 @@ mod tests {
 
     #[test]
     fn test_rejects_deprecated_6to4_even_with_public_ipv4() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 2002:0808:0808:: wraps 8.8.8.8, but RFC 9637 makes 2002::/16
         // non-global regardless of the embedded address.
         let result = validate_outbound_url_with_resolver(
@@ -1230,6 +1266,7 @@ mod tests {
 
     #[test]
     fn test_rejects_teredo_encoded_private_ipv4() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Teredo address whose embedded server IPv4 is 192.168.1.1: the last 32
         // bits are the server IPv4 XOR 0xff per octet (0x3f57:fefe).
         let result = validate_outbound_url_with_resolver(
@@ -1246,6 +1283,7 @@ mod tests {
 
     #[test]
     fn test_normal_public_ipv6_still_allowed_after_carveout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A genuine public v6 (Cloudflare DNS) must not collide with the 6to4 or
         // Teredo prefixes added by the carve-out.
         let result = validate_outbound_url_with_resolver(
@@ -1264,6 +1302,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_loopback_literal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://127.0.0.1");
         assert!(result.is_err());
@@ -1272,6 +1311,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_metadata_literal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://169.254.169.254");
         assert!(result.is_err());
@@ -1282,6 +1322,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_ipv6_loopback_literal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://[::1]");
         assert!(result.is_err());
@@ -1290,6 +1331,7 @@ mod tests {
 
     #[test]
     fn test_fetch_rejects_private_10_literal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
         let result = validate_fetch_url("http://10.0.0.1");
         assert!(result.is_err());
@@ -1452,6 +1494,7 @@ mod tests {
 
     #[test]
     fn test_legacy_broad_private_fetch_flag_grants_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::disabled();
 
         assert!(validate_fetch_url("http://127.0.0.1/card.json").is_err());
@@ -1461,6 +1504,7 @@ mod tests {
 
     #[test]
     fn test_private_fetch_allowlist_accepts_only_exact_host_or_cidr() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("127.0.0.1/32,10.42.0.0/24,registry.internal");
 
         assert!(validate_fetch_url("http://127.0.0.1/card.json").is_ok());
@@ -1483,6 +1527,7 @@ mod tests {
 
     #[test]
     fn test_private_fetch_allowlist_rejects_cloud_endpoints_even_for_exact_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("registry.internal");
 
         for address in [
@@ -1509,6 +1554,7 @@ mod tests {
 
     #[test]
     fn test_private_fetch_allowlist_never_relaxes_link_local_or_special_use() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("registry.internal");
 
         for address in [
@@ -1530,6 +1576,7 @@ mod tests {
 
     #[test]
     fn test_private_fetch_rejects_mixed_dns_answer_set_unless_every_ip_is_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("10.42.0.0/24");
 
         let mixed = resolver_with_many(vec![
@@ -1577,6 +1624,7 @@ mod tests {
 
     #[test]
     fn test_invalid_private_fetch_env_fails_even_public_fetch_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("0.0.0.0/0");
         let result = validate_outbound_url_with_resolver(
             "https://example.com/",
@@ -1589,6 +1637,7 @@ mod tests {
 
     #[test]
     fn test_private_fetch_policy_does_not_apply_to_server_urls() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _policy = PrivatePolicyGuard::from_value("10.0.0.0/8");
 
         let result = validate_outbound_url_with_resolver(

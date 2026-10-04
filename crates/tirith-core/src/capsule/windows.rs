@@ -753,6 +753,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_appcontainer_is_fully_degraded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The core E4 honesty guarantee: no AppContainer support is reported as
         // degraded (everything false), NEVER a silent NoOp success.
         let spec = CapsuleSpec::locked_down();
@@ -768,6 +769,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_appcontainer() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // AppContainer supported + locked_down -> FS enforced, raw-net denied,
         // exec limited, env + handles set, and NEVER egress. The resource bit
         // stays false because locked_down requests open-files/output/wall limits
@@ -793,6 +795,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join(".ssh");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -811,6 +814,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_unrepresentable_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = CapsuleSpec::locked_down();
         spec.filesystem.deny_roots = vec![PathBuf::from("C:/credential\0store")];
         let probe = WindowsProbe {
@@ -825,6 +829,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_allowlist_never_claims_egress() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Even for an allow-list spec, E4 reports network_raw_denied (no capability
         // is granted) but NEVER domain_proxy_enforced -> the allow-list level stays
         // degraded against its requirement and the surface fails closed.
@@ -846,6 +851,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_resource_flag_tracks_job_limitable_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = WindowsProbe {
             appcontainer_supported: true,
         };
@@ -880,6 +886,7 @@ mod tests {
 
     #[test]
     fn mixed_memory_and_open_files_does_not_claim_all_resource_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = WindowsProbe {
             appcontainer_supported: true,
         };
@@ -900,6 +907,7 @@ mod tests {
 
     #[test]
     fn windows_supported_only_resource_limits_are_reported_enforced() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = WindowsProbe {
             appcontainer_supported: true,
         };
@@ -926,6 +934,7 @@ mod tests {
 
     #[test]
     fn app_container_name_is_deterministic_and_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let a = app_container_name(&spec).expect("moniker derivable");
         let b = app_container_name(&spec).expect("moniker derivable");
@@ -944,6 +953,7 @@ mod tests {
 
     #[test]
     fn app_container_name_differs_for_different_specs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // MN6: distinct specs derive DISTINCT monikers (hence distinct package SIDs /
         // ACL identities). Before the fix a serialize failure fell back to a constant
         // suffix, collapsing every such spec onto ONE SID; now derivation is fallible
@@ -958,6 +968,7 @@ mod tests {
 
     #[test]
     fn app_container_profile_grants_no_network_for_denyall() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let prof = app_container_profile(&spec).expect("profile derivable");
         assert!(prof.networking_capabilities.is_empty());
@@ -967,6 +978,7 @@ mod tests {
 
     #[test]
     fn app_container_profile_grants_no_network_even_for_allowlist() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The descriptor must NEVER silently grant a networking capability for an
         // allow-list spec; that level is degraded and routed through the broker, not
         // a granted capability.
@@ -981,6 +993,7 @@ mod tests {
 
     #[test]
     fn acl_grants_map_read_and_write_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let read = temp.path().join("in");
         let write = temp.path().join("out");
@@ -1007,6 +1020,7 @@ mod tests {
 
     #[test]
     fn acl_grants_does_not_emit_deny_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Deny roots are NOT grants — denial is the AppContainer default. A spec with
         // only deny roots yields no ACL grants.
         let fs = FilesystemPolicy::deny_by_default();
@@ -1016,6 +1030,7 @@ mod tests {
 
     #[test]
     fn acl_grants_rejects_interior_nul_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Fail closed on an unrepresentable path rather than silently drop a grant.
         let mut fs = FilesystemPolicy::deny_by_default();
         fs.write_roots.push(PathBuf::from("C:/a\0b"));
@@ -1058,6 +1073,7 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_denyall_builds() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let write = temp.path().join("work");
         std::fs::create_dir(&write).expect("create write root");
@@ -1085,6 +1101,7 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_refuses_covering_allow_before_acl_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join("credentials");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -1102,6 +1119,7 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_refuses_allowlisted_domains() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // E4 enforces DenyAll natively; an allow-list needs E5's broker, so the plan
         // builder fails closed (mirrors derive_coverage reporting it degraded).
         let mut spec = CapsuleSpec::locked_down();
@@ -1119,6 +1137,7 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_rejects_interior_nul() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let err = windows_launch_plan(&spec, "C:/cmd.exe", &["a\0b".into()])
             .expect_err("NUL in arg must error");
@@ -1131,6 +1150,7 @@ mod tests {
 
     #[test]
     fn windows_launch_plan_handle_inherit_is_always_false() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The honest handle closure is fixed, regardless of the handle policy: E4
         // never inherits parent handles.
         let mut spec = CapsuleSpec::locked_down();
@@ -1185,6 +1205,7 @@ mod tests {
 
     #[test]
     fn command_line_for_quotes_program_and_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let plan = windows_launch_plan(
             &spec,
@@ -1199,6 +1220,7 @@ mod tests {
 
     #[test]
     fn windows_quoting_keeps_shell_metacharacter_classes_inside_arguments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for arg in [
             "two words",
             "safe; touch marker",

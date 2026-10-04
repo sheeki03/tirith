@@ -241,6 +241,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_clean_zero_finding_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No findings: the breakdown still renders, every factor +0, total 0/100.
         let breakdown = scoring::score_findings(&[]);
         assert_eq!(breakdown.score, 0);
@@ -271,6 +272,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_negative_clamp_factor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 5 critical findings: 110 raw → clamps to 100 with an explicit -10
         // factor rendered without a leading '+'; total reads 100/100.
         let findings: Vec<Finding> = (0..5)
@@ -308,6 +310,7 @@ mod tests {
 
     #[test]
     fn score_json_recursively_redacts_zero_width_split_custom_secret() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = "C02_SCORE_CUSTOM_RECONSTITUTION_CANARY";
         let split = format!("{}\u{200b}{}", &secret[..15], &secret[15..]);
         let patterns = vec![regex::escape(secret)];

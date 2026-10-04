@@ -3480,6 +3480,7 @@ mod tests {
 
     #[test]
     fn customer_id_patterns_are_redacted_and_counted_under_one_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two patterns collapse to one `customer_id` label (count aggregates).
         let input = "customer CUST-12345 escalated; ref ACME-99887.";
         let patterns = vec![r"CUST-\d+".to_string(), r"ACME-\d+".to_string()];
@@ -3567,6 +3568,7 @@ mod tests {
 
     #[test]
     fn looks_secret_shaped_generic_opaque_token_gated_on_entropy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A long mixed-case/digit opaque token (entropy well above 4.0 bits/char)
         // matches the generic arm.
         let opaque = "aB3xK9mP2qR7tV1wY5zC4dF8gH6jL0nQ_sT-uW2xZ4bN8kM";

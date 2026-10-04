@@ -2031,6 +2031,7 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_all_command_and_file_is_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-9 R9-1: `all(command.*, file.*)` mixes contexts that never
         // co-occur, so its satisfiable set is ∅ — rejected with the dedicated
         // "never co-occur" message (not the generic coverage one), even with both

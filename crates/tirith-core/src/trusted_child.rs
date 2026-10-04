@@ -3450,6 +3450,7 @@ mod unix_cleanup_tests {
 
     #[test]
     fn external_reap_before_direct_signal_never_reaches_child_kill() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let child_pid = 41_009;
         let mut observations = 0;
         let mut sends = 0;

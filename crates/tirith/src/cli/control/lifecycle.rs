@@ -608,6 +608,7 @@ mod required_reuse_tests {
 
     #[test]
     fn required_reuse_missing_dead_or_mismatched_never_selects_spawn_fallback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(
             select_existing_service(None, Some(SERVICE), DIGEST, PROJECT, |_| {
                 panic!("missing discovery must not probe")
@@ -636,6 +637,7 @@ mod required_reuse_tests {
 
     #[test]
     fn required_reuse_live_service_preserves_all_existing_context_checks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let selected =
             select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| Ok(true))
                 .unwrap()
@@ -660,6 +662,7 @@ mod required_reuse_tests {
 
     #[test]
     fn required_reuse_exit_race_never_requests_a_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let alive = Cell::new(true);
         let selected =
             select_existing_service(Some(record()), Some(SERVICE), DIGEST, PROJECT, |_| {
@@ -681,6 +684,7 @@ mod required_reuse_tests {
 
     #[test]
     fn ordinary_launch_preserves_missing_and_dead_fallback_and_live_reuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(
             select_existing_service(None, None, DIGEST, PROJECT, |_| panic!("missing record"))
                 .unwrap()

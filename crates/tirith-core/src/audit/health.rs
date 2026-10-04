@@ -137,6 +137,7 @@ mod tests {
 
     #[test]
     fn held_native_append_lock_returns_within_its_deadline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let held = tempfile::NamedTempFile::new().unwrap();
         let contender = std::fs::OpenOptions::new()
             .read(true)

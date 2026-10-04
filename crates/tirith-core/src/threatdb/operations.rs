@@ -445,6 +445,7 @@ mod tests {
 
     #[test]
     fn old_unchanged_upstream_is_current_and_pending_adoption_is_separate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (mut document, mut observations) = fixture();
         let row = observations.sources.get_mut(SOURCE_IDS[0]).unwrap();
         row.candidate_commit = "b".repeat(40);
@@ -476,6 +477,7 @@ mod tests {
 
     #[test]
     fn missing_observation_is_unknown_and_future_timestamp_is_not_fresh() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (document, _) = fixture();
         let report = source_freshness(&document, 200, 100).unwrap();
         assert!(report.clock_skew);
@@ -488,6 +490,7 @@ mod tests {
 
     #[test]
     fn source_evidence_refuses_incomplete_coverage_and_inconsistent_observations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (mut document, observations) = fixture();
         document["compiler_parse"]["upstream_observations"] =
             serde_json::to_value(observations).unwrap();
@@ -507,6 +510,7 @@ mod tests {
 
     #[test]
     fn source_signature_binds_database_and_canonical_source_and_counts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (document, _) = fixture();
         let key = SigningKey::from_bytes(&[29; 32]);
         let mut source = document.clone();
@@ -589,6 +593,7 @@ mod tests {
     /// the retry happens and its answer is returned.
     #[test]
     fn stalled_first_attempt_is_retried_within_the_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -624,6 +629,7 @@ mod tests {
     /// than the whole budget, is read in full.
     #[test]
     fn slow_body_may_use_the_whole_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -663,6 +669,7 @@ mod tests {
 
     #[test]
     fn retry_transport_refuses_mutations_before_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = reqwest::blocking::Client::new();
         let error = send_with_retry(client.post("https://example.com/"), Duration::from_secs(1))
             .unwrap_err();

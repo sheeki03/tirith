@@ -1208,6 +1208,7 @@ mod tests {
     /// pinned by `output_filter::tests` and the gateway integration test.
     #[test]
     fn test_sanitize_tool_output_emits_audit_line() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = format!(
             "{}\n{}\n",
             init_msg(1, "2025-11-25"),
@@ -1228,6 +1229,7 @@ mod tests {
     /// The dispatcher entrypoint is safe without an opt-in flag.
     #[test]
     fn default_dispatcher_sanitizes_tool_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = format!(
             "{}\n{}\n",
             init_msg(1, "2025-11-25"),
@@ -1242,6 +1244,7 @@ mod tests {
 
     #[test]
     fn explicit_unsafe_compatibility_mode_disables_tool_output_filter() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = format!(
             "{}\n{}\n",
             init_msg(1, "2025-11-25"),
@@ -1349,6 +1352,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tools_call_threads_the_frozen_operator_gate_to_cloaking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = crate::policy::Policy {
             task_gate: crate::web3_policy::TaskGatePolicy {
                 mode: crate::web3_policy::TaskGateMode::Enforce,

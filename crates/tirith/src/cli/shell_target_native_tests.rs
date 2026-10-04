@@ -167,6 +167,7 @@ fn validate_observation(
 #[test]
 #[ignore = "requires an explicit native PowerShell executable and fresh evidence output"]
 fn native_powershell_profile_matches_resolver() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let output = std::env::var_os("TIRITH_NATIVE_PROFILE_REPORT")
         .map(PathBuf::from)
         .expect("explicit native resolver evidence output is required");

@@ -5560,6 +5560,7 @@ mod tests {
 
     #[test]
     fn test_v1_normalize_pypi_preserves_legacy_separator_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(normalize_name(Ecosystem::PyPI, "My_Package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "my.package"), "my-package");
         assert_eq!(normalize_name(Ecosystem::PyPI, "MY-PACKAGE"), "my-package");
@@ -5571,12 +5572,14 @@ mod tests {
 
     #[test]
     fn test_normalize_npm_case_sensitive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(normalize_name(Ecosystem::Npm, "Express"), "Express");
         assert_eq!(normalize_name(Ecosystem::Npm, "@scope/Pkg"), "@scope/Pkg");
     }
 
     #[test]
     fn test_v1_normalize_crates_preserves_legacy_underscore_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             normalize_name(Ecosystem::Crates, "Serde_JSON"),
             "serde_json"
@@ -5589,6 +5592,7 @@ mod tests {
 
     #[test]
     fn test_normalize_nuget_case_insensitive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             normalize_name(Ecosystem::NuGet, "Newtonsoft.JSON"),
             "newtonsoft.json"
@@ -5721,6 +5725,7 @@ mod tests {
 
     #[test]
     fn test_parse_feodo_skips_comments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("feodo.txt");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -5740,6 +5745,7 @@ mod tests {
 
     #[test]
     fn test_popular_csv_parsing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let entries =
             parse_popular_from_string("ecosystem,name\nnpm,express\npypi,requests\n").unwrap();
         assert_eq!(entries.len(), 2);
@@ -5751,6 +5757,7 @@ mod tests {
 
     #[test]
     fn test_default_popular_csv_loads() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let entries = parse_popular_csv(None).unwrap();
         assert!(
             entries.len() >= 50,
@@ -6047,6 +6054,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_rejects_more_packages_than_the_bounded_request_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -6094,6 +6102,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_binds_the_served_media_type_and_schema() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -6611,6 +6620,7 @@ mod tests {
 
     #[test]
     fn registry_document_fetch_sends_accept_and_records_the_served_media_type() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let served = server
             .mock("GET", "/lodash")
@@ -6659,6 +6669,7 @@ mod tests {
 
     #[test]
     fn registry_retries_rate_limits_but_never_invalid_successful_documents() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut server = mockito::Server::new();
         let limited = server
             .mock("GET", "/retry")
@@ -6715,6 +6726,7 @@ mod tests {
 
     #[test]
     fn registry_octet_stream_metadata_requires_valid_json_for_the_requested_package() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = RegistryPackageKey {
             ecosystem: Ecosystem::Npm,
             name: "web3-plugin-swisstronik".to_string(),
@@ -6790,6 +6802,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_authenticates_package_unpublished_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -7349,6 +7362,7 @@ mod tests {
 
     #[test]
     fn solana_web3_bounded_versions_round_trip_without_false_whole_package_bit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         write_mal(directory.path(), "MAL-2099-0008.json", C01_SOLANA_BOUNDED);
         let snapshot_path = directory.path().join("registry-versions.json");
@@ -7395,6 +7409,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_rejects_stale_commit_and_wrong_digest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         std::fs::write(&snapshot_path, C01_REGISTRY_VERSIONS).unwrap();
@@ -7413,6 +7428,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_rejects_wrong_url_and_response_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -7436,6 +7452,7 @@ mod tests {
 
     #[test]
     fn registry_snapshot_authenticates_package_not_found_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let snapshot_path = directory.path().join("registry-versions.json");
         let mut document: serde_json::Value = serde_json::from_str(C01_REGISTRY_VERSIONS).unwrap();
@@ -7819,6 +7836,7 @@ mod tests {
 
     #[test]
     fn test_compiler_emits_v2_sections_from_indicator_model() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use ed25519_dalek::SigningKey;
         use tirith_core::threatdb::{ThreatDb, ThreatDbFormat};
 
@@ -7907,6 +7925,7 @@ mod tests {
 
     #[test]
     fn test_curated_file_hashes_go_live_in_v2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use ed25519_dalek::SigningKey;
         use tirith_core::threatdb::{ThreatDb, ThreatDbFormat};
 
@@ -7956,6 +7975,7 @@ mod tests {
 
     #[test]
     fn test_file_hashes_read_error_is_fatal_err() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The curated file-hash feed is fail-closed like the exfil feed: an
         // explicitly-supplied path that cannot be read returns Err so main() exits
         // non-zero rather than signing a DB with an empty FileHash section.
@@ -8042,6 +8062,7 @@ mod tests {
 
     #[test]
     fn test_typosquats_csv_parsing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typosquats.csv");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -8088,6 +8109,7 @@ mod tests {
 
     #[test]
     fn test_exfil_endpoints_read_error_is_fatal_err() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An explicitly-supplied feed that cannot be read must surface an Err so the
         // call site can exit non-zero (fail closed). Previously this logged a warning
         // and returned an empty Vec, letting CI sign a weakened DB.
@@ -8263,6 +8285,7 @@ mod tests {
 
     #[test]
     fn explicitly_supplied_supplemental_feeds_do_not_fallback_or_publish_empty() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.csv");
         assert!(parse_popular_csv(Some(&missing)).is_err());

@@ -1443,6 +1443,7 @@ mod tests {
 
     #[test]
     fn actual_scan_file_tool_fails_closed_for_malformed_pdf() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = std::env::current_dir().expect("current directory");
         let tmp = tempfile::Builder::new()
             .prefix("tirith-mcp-pdf-")
@@ -1795,6 +1796,7 @@ mod tests {
 
     #[test]
     fn cloaking_uses_the_explicit_frozen_operator_task_gate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = crate::policy::Policy {
             task_gate: crate::web3_policy::TaskGatePolicy {
                 mode: crate::web3_policy::TaskGateMode::Enforce,
@@ -2489,6 +2491,7 @@ mod c11_preview_tests {
     /// cache it, so a preview tool must never appear in it.
     #[test]
     fn the_default_tool_list_never_contains_the_preview_tool() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(
             !list().iter().any(|tool| tool.name == "tirith_check_task"),
             "a preview tool leaked into the frozen default list"
@@ -2502,6 +2505,7 @@ mod c11_preview_tests {
     /// still be refused on a server without the capability.
     #[test]
     fn calling_the_preview_tool_without_the_capability_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The env var is process-wide, so assert the refusal path directly
         // rather than mutating it and racing other tests.
         if !preview_enabled() {
@@ -2543,6 +2547,7 @@ mod c11_preview_tests {
 
     #[test]
     fn the_preview_schema_and_handler_accept_the_strict_v2_diagnostic_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tool = preview_tools()
             .into_iter()
             .find(|tool| tool.name == "tirith_check_task")
@@ -2592,6 +2597,7 @@ mod c11_preview_tests {
     /// process-wide preview env var and race other tests.
     #[test]
     fn the_mcp_projection_is_the_shared_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope_value = json!({
             "sources": [{"claimed_source": "agent_config", "content": "trust me"}],
             "actions": [{"package_install": {"ecosystem": "npm", "package": "left-pad"}}]

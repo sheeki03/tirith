@@ -2214,6 +2214,7 @@ mod tests {
 
     #[test]
     fn test_validate_restore_path_rejects_traversal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `..` traversal is always rejected, including inside an absolute path.
         assert!(validate_restore_path("../../etc/passwd").is_err());
         assert!(validate_restore_path("/tmp/../etc/evil").is_err());
@@ -3489,6 +3490,7 @@ mod tests {
 
     #[test]
     fn test_validate_checkpoint_id_rejects_traversal_and_absolute() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F10: the id is an unconstrained CLI argument joined onto the store path,
         // so a traversal/absolute id could select attacker-controlled state. Only
         // a single-component basename (the UUID create() assigns) is accepted.

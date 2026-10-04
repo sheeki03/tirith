@@ -809,6 +809,7 @@ mod tests {
 
     #[test]
     fn first_observation_is_first_time() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let k = key("curl_pipe_shell");
@@ -821,6 +822,7 @@ mod tests {
 
     #[test]
     fn recorded_three_times_is_not_anomalous() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let k = key("curl_pipe_shell");
@@ -836,6 +838,7 @@ mod tests {
 
     #[test]
     fn recorded_once_is_rare() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let k = key("curl_pipe_shell");
@@ -849,6 +852,7 @@ mod tests {
 
     #[test]
     fn distinct_tuples_counted_separately() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let mut k2 = key("curl_pipe_shell");
@@ -863,6 +867,7 @@ mod tests {
 
     #[test]
     fn out_of_window_observations_are_not_counted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         // One old (out-of-window) observation by hand.
@@ -910,6 +915,7 @@ mod tests {
 
     #[test]
     fn reset_zeroes_the_store() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         record_at(&store, key("rule_a")).unwrap();
@@ -931,6 +937,7 @@ mod tests {
 
     #[test]
     fn compaction_preserves_unparseable_lines_and_prunes_parsed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // R12 #F: compaction window-prunes PARSED rows without dropping an
         // unparseable line. Hand-build a store with one in-window obs, one
         // out-of-window (pruned), and one unparseable line (preserved verbatim).
@@ -993,6 +1000,7 @@ mod tests {
 
     #[test]
     fn salt_is_persisted_and_stable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         let h1 = hash_host_at(&salt_file, "github.com").unwrap();
@@ -1212,6 +1220,7 @@ mod tests {
 
     #[test]
     fn cwd_hash_is_8_chars_and_not_raw_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let salt_file = salt_in(dir.path());
         let h = hash_cwd_at(&salt_file, Some("/home/alice/secret-project")).unwrap();
@@ -1243,6 +1252,7 @@ mod tests {
 
     #[test]
     fn corrupt_line_is_skipped_not_fatal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         // A valid recent observation alongside a junk line and a blank line.
@@ -1267,6 +1277,7 @@ mod tests {
 
     #[test]
     fn future_dated_observation_is_out_of_window() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Greptile P2 regression: a future-dated row (clock skew / tampered store)
         // must NOT count as in-window forever.
         let dir = tempdir().unwrap();

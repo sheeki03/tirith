@@ -1528,6 +1528,7 @@ mod tests {
 
     #[test]
     fn powershell_classification_is_case_insensitive_and_native_aware() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mk = |name: &str, body: &str| AliasEntry {
             name: name.to_string(),
             body: body.to_string(),
@@ -1659,6 +1660,7 @@ mod tests {
 
     #[test]
     fn parses_single_double_and_bare_alias() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1680,6 +1682,7 @@ mod tests {
 
     #[test]
     fn bare_alias_keyword_does_not_panic_or_record() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(home.path(), ".bashrc", "alias\nalias   \n");
         let scan = scan_with_root(home.path(), false);
@@ -1688,6 +1691,7 @@ mod tests {
 
     #[test]
     fn parses_function_brace_forms() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1707,6 +1711,7 @@ mod tests {
 
     #[test]
     fn unbalanced_function_body_marked_unparsed_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         // Truncated function — opening brace, never closed.
         write(
@@ -1725,6 +1730,7 @@ mod tests {
 
     #[test]
     fn nested_braces_balance_correctly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1745,6 +1751,7 @@ mod tests {
 
     #[test]
     fn fish_alias_and_function_shapes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1763,6 +1770,7 @@ mod tests {
 
     #[test]
     fn powershell_alias_and_function_shapes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1780,6 +1788,7 @@ mod tests {
 
     #[test]
     fn rule_overrides_critical_command_fires_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(home.path(), ".bashrc", "alias sudo='sudo evil-wrapper'\n");
         let scan = scan_with_root(home.path(), false);
@@ -1794,6 +1803,7 @@ mod tests {
 
     #[test]
     fn rule_non_critical_alias_does_not_override() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(home.path(), ".bashrc", "alias gs='git status'\n");
         let scan = scan_with_root(home.path(), false);
@@ -1805,6 +1815,7 @@ mod tests {
 
     #[test]
     fn rule_network_call_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1823,6 +1834,7 @@ mod tests {
 
     #[test]
     fn shell_effective_network_names_fire_for_aliases_and_functions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1891,6 +1903,7 @@ mod tests {
 
     #[test]
     fn rule_network_call_word_boundary_no_false_positive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         // "securely" contains no command-word curl/wget/nc; must not fire.
         write(
@@ -1907,6 +1920,7 @@ mod tests {
 
     #[test]
     fn rule_credential_read_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1925,6 +1939,7 @@ mod tests {
 
     #[test]
     fn rule_credential_read_ssh_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(
             home.path(),
@@ -1940,6 +1955,7 @@ mod tests {
 
     #[test]
     fn rule_recently_added_fires_info_on_fresh_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         // A freshly-written rc file has an mtime of "now" → within the window.
         write(home.path(), ".bashrc", "alias gs='git status'\n");
@@ -1998,6 +2014,7 @@ mod tests {
 
     #[test]
     fn empty_home_yields_empty_scan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let scan = scan_with_root(home.path(), false);
         assert!(scan.entries.is_empty());
@@ -2007,6 +2024,7 @@ mod tests {
 
     #[test]
     fn non_ascii_keyword_head_does_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         // A line whose head is multibyte — `strip_keyword` must not panic.
         write(home.path(), ".bashrc", "álias foo=bar\n# Привет\n");
@@ -2017,6 +2035,7 @@ mod tests {
 
     #[test]
     fn unterminated_quote_does_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         write(home.path(), ".bashrc", "alias bad='unterminated\n");
         let scan = scan_with_root(home.path(), false);

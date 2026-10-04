@@ -1147,6 +1147,7 @@ mod no_follow_tests {
     #[cfg(unix)]
     #[test]
     fn canonical_within_false_when_intermediate_dir_is_symlink_outside_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempdir().unwrap();
         let root = base.path().join("root");
         std::fs::create_dir(&root).unwrap();
@@ -1261,6 +1262,7 @@ mod store_line_tests {
 
     #[test]
     fn raw_variant_preserves_surrounding_whitespace_but_drops_blank_lines() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use super::collect_store_lines_raw_complete;
         // CodeRabbit R15 #3 — the raw collector preserves surrounding whitespace
         // on content lines (for a byte-for-byte rewrite) but still drops blank ones.
@@ -1320,6 +1322,7 @@ mod write_file_atomic_tests {
 
     #[test]
     fn publishes_whole_file_and_leaves_no_temp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The crash-atomic write must publish the COMPLETE bytes under the target
         // name and leave NO temp sibling behind (proving it used temp+rename, not
         // an in-place write a crash mid-write could truncate). It must also fully

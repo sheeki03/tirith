@@ -7177,6 +7177,7 @@ mod contextual_warning_identity_tests {
 
     #[test]
     fn strict_warning_prototypes_keep_both_client_identities_including_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut verdict = verdict();
         for (command, expected) in [
             ("curl http://0x7f.0x/path", vec!["0x7f.0x"]),

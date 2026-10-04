@@ -393,6 +393,7 @@ mod tests {
 
     #[test]
     fn state_contract_v1_pins_every_persisted_reader() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Independent literals: deriving expectations from the implementation
         // constants would let a format change slip past the contract version.
         // Changing a reader means bumping STATE_CONTRACT_VERSION (and the
@@ -442,6 +443,7 @@ mod tests {
         }
         #[test]
         fn absent_optional_stores_are_observed_without_creating_them() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let facts = observe(Some(temp.path()), Some(temp.path()));
             assert_eq!(facts.len(), 5);
@@ -453,6 +455,7 @@ mod tests {
         }
         #[test]
         fn receipt_inventory_distinguishes_ack_schema_without_exposing_private_payloads() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let receipts = temp.path().join("sessions/execution-receipts");
             file(&receipts.join(".receipt-registry.lock"), b"");
@@ -493,6 +496,7 @@ mod tests {
 
         #[test]
         fn fixed_team_stores_and_journals_preserve_future_versions_without_private_contents() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let id = "11111111-1111-4111-8111-111111111111";
             for name in ["connection.json", "enrollment.json", "report.json"] {
@@ -525,6 +529,7 @@ mod tests {
         }
         #[test]
         fn embedded_enrollment_and_both_rollout_documents_keep_unknown_versions_visible() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let enrollment = temp.path().join("team-policy/enrollment.json");
             let rollout = temp
@@ -589,6 +594,7 @@ mod tests {
         }
         #[test]
         fn malformed_duplicate_symlink_oversized_and_unknown_entries_remain_visible() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let team = temp.path().join("team-policy");
             let connection = team.join("connection.json");
@@ -631,6 +637,7 @@ mod tests {
         }
         #[test]
         fn directory_and_byte_limits_never_look_like_absence() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let rolls = temp.path().join("team-policy/rollouts");
             directory(&rolls);
@@ -660,6 +667,7 @@ mod tests {
         }
         #[test]
         fn private_storage_and_descendant_links_are_not_treated_as_ordinary_state() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let connection = temp.path().join("team-policy/connection.json");
             file(&connection, br#"{"schema_version":1}"#);
@@ -684,6 +692,7 @@ mod tests {
         }
         #[test]
         fn rollout_unknown_versions_and_unsafe_records_do_not_disappear() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = scope();
             let path = temp
                 .path()

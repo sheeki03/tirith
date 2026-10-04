@@ -2140,6 +2140,7 @@ mod tests {
 
     #[test]
     fn the_default_policy_allows_and_records_nothing_to_refuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("cast send 0xabc --private-key 0xdead");
         let assessment = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         assert_eq!(assessment.outcome, BoundaryOutcome::Allow);
@@ -2148,6 +2149,7 @@ mod tests {
 
     #[test]
     fn cloaking_boundary_binds_the_exact_url_and_ordered_probe_set() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probes = [("browser", "Browser/1"), ("bot", "Bot/1")];
         let binding = fetch_cloaking_operation_binding("https://example.com/a", &probes).unwrap();
         let operation = binding.operation();
@@ -2175,6 +2177,7 @@ mod tests {
 
     #[test]
     fn cloaking_boundary_has_no_require_approval_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut binding =
             fetch_cloaking_operation_binding("https://example.com", &[("bot", "Bot/1")]).unwrap();
         binding.envelope.actions.push(ProposedAction::Narrative {
@@ -2199,6 +2202,7 @@ mod tests {
 
     #[test]
     fn boundary_effects_widen_the_inferred_set_but_never_grant() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("echo hello");
         let mut operation = operation(&envelope);
         operation.boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2218,6 +2222,7 @@ mod tests {
 
     #[test]
     fn required_approval_is_a_refusal_where_no_human_gate_exists() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = TaskGatePolicy {
             mode: TaskGateMode::Enforce,
             action_incomplete_analysis: Web3GuardAction::RequireApproval,
@@ -2238,6 +2243,7 @@ mod tests {
 
     #[test]
     fn the_projection_says_it_is_not_diagnostic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls");
         let assessment = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         let projection = assessment.projection();
@@ -2248,6 +2254,7 @@ mod tests {
 
     #[test]
     fn tightening_only_removes_capabilities() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
         spec.network = crate::capsule::NetworkPolicy::AllowListedDomains {
             domains: ["example.test".to_string()].into_iter().collect(),
@@ -2267,6 +2274,7 @@ mod tests {
 
     #[test]
     fn tightening_never_raises_an_already_lower_resource_ceiling() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
         spec.resources.cpu_seconds = Some(5);
         spec.resources.memory_bytes = None;
@@ -2288,6 +2296,7 @@ mod tests {
     /// twice equals applying it once, and no dimension is ever raised.
     #[test]
     fn tightening_is_monotone_and_idempotent_over_every_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let every_effect: BTreeSet<CommandEffectKind> = [
             CommandEffectKind::PackageInstall,
             CommandEffectKind::PersistenceChange,
@@ -2346,6 +2355,7 @@ mod tests {
     /// is exactly the property a future preset change could silently break.
     #[test]
     fn tightening_the_untrusted_project_preset_never_widens_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("held-copy");
         std::fs::create_dir(&project).expect("create held copy");
@@ -2368,6 +2378,7 @@ mod tests {
 
     #[test]
     fn the_ceiling_binding_changes_with_the_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls");
         let off = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         let on = evaluate(&operation(&envelope), &enforcing());
@@ -2401,6 +2412,7 @@ mod tests {
 
     #[test]
     fn public_challenge_exposes_and_verifies_the_same_safe_projections() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects: BTreeSet<CommandEffectKind> =
@@ -2442,6 +2454,7 @@ mod tests {
 
     #[test]
     fn mixed_source_adapters_are_bound_per_source_in_one_challenge() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let action_identities = vec!["pkg:left-pad".to_string(), "pkg:is-even".to_string()];
@@ -2485,6 +2498,7 @@ mod tests {
 
     #[test]
     fn typed_approval_is_required_before_lazy_receiptless_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls -la");
         let document = TaskEnvelopeDocument {
             version: 1,
@@ -2541,6 +2555,7 @@ mod tests {
 
     #[test]
     fn approval_expiry_is_intersected_into_the_final_effect_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls -la");
         let document = TaskEnvelopeDocument {
             version: 1,
@@ -2595,6 +2610,7 @@ mod tests {
 
     #[test]
     fn strict_v2_decision_consumes_one_atomic_batch_before_minting_a_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2666,6 +2682,7 @@ mod tests {
 
     #[test]
     fn operation_mismatch_is_rejected_before_any_replay_state_is_consumed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2724,6 +2741,7 @@ mod tests {
 
     #[test]
     fn strict_v2_rejects_cross_action_boundary_and_task_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2838,6 +2856,7 @@ mod tests {
 
     #[test]
     fn v1_and_missing_v2_receipts_fail_only_when_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             task_id: Some("legacy-task".to_string()),
             sources: vec![TaskSourceInput {
@@ -2895,6 +2914,7 @@ mod tests {
 
     #[test]
     fn required_replay_store_failure_never_mints_a_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2940,6 +2960,7 @@ mod tests {
 
     #[test]
     fn typed_permit_rechecks_earliest_receipt_expiry_at_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();

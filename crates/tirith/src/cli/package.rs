@@ -1365,6 +1365,7 @@ mod tests {
     /// `finalize_static_verdict` (not a manual re-check) and never double-emits.
     #[test]
     fn inspect_blocks_path_traversal_wheel_via_shared_chokepoint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -1565,6 +1566,7 @@ mod tests {
 
     #[test]
     fn gather_content_signals_missing_explicit_path_is_not_inspected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = gather_content_signals(
             Ecosystem::Npm,
             "whatever",
@@ -1575,6 +1577,7 @@ mod tests {
 
     #[test]
     fn gather_content_signals_inspects_explicit_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1599,6 +1602,7 @@ mod tests {
 
     #[test]
     fn installed_npm_lifecycle_body_drives_local_network_signal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1642,6 +1646,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_known_popular_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "react".to_string(),
@@ -1662,6 +1667,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_negative_clamp_factor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
@@ -1779,6 +1785,7 @@ mod tests {
 
     #[test]
     fn available_provenance_drives_api_factors_and_human_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "pypi".to_string(),
@@ -1819,6 +1826,7 @@ mod tests {
 
     #[test]
     fn package_risk_human_output_sanitizes_every_untrusted_field() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::package_risk::{
             DepConfusionVerdict, OsvAdvisorySummary, RepoMismatchState, RepoMismatchVerdict,
         };

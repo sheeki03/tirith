@@ -403,6 +403,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn write_file_atomic_dangling_symlink_falls_back() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -466,6 +467,7 @@ mod write_json_tests {
 
     #[test]
     fn contained_atomic_write_stays_beneath_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -503,6 +505,7 @@ mod write_json_tests {
 
     #[test]
     fn config_write_without_a_v2_provider_fails_closed_when_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -533,6 +536,7 @@ mod write_json_tests {
 
     #[test]
     fn config_write_operation_mismatch_never_enters_replay_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let root = tempfile::tempdir().unwrap();
@@ -604,6 +608,7 @@ mod write_json_tests {
 
     #[test]
     fn every_config_projection_mutation_fails_before_replay_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Mutation {
@@ -835,6 +840,7 @@ mod write_json_tests {
 
     #[test]
     fn context_label_writer_is_byte_identical_on_real_writer_denial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -856,6 +862,7 @@ mod write_json_tests {
 
     #[test]
     fn retained_publisher_does_not_run_after_policy_change_deny() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = inert();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
         policy
@@ -888,6 +895,7 @@ mod write_json_tests {
 
     #[test]
     fn denied_parent_creating_write_leaves_namespace_absent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         let path = config.join("policy.yaml");
@@ -917,6 +925,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn cli_rejects_distinct_non_utf8_config_destinations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -945,6 +954,7 @@ mod write_json_tests {
 
     #[test]
     fn contained_atomic_write_preserves_no_clobber_semantics() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -991,6 +1001,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn contained_atomic_write_rejects_final_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -1013,6 +1024,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn contained_atomic_write_rejects_symlinked_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();

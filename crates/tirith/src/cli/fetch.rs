@@ -374,6 +374,7 @@ mod tests {
 
     #[test]
     fn enforcing_operator_policy_refuses_before_fetch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = tirith_core::policy::Policy {
             task_gate: tirith_core::web3_policy::TaskGatePolicy {
                 mode: tirith_core::web3_policy::TaskGateMode::Enforce,

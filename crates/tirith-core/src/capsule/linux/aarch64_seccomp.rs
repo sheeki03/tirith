@@ -301,6 +301,7 @@ mod tests {
 
     #[test]
     fn compiled_filters_allow_only_stdio_nonblocking_mode_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
@@ -340,6 +341,7 @@ mod tests {
 
     #[test]
     fn compiled_filters_bound_stdio_status_restoration() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
@@ -399,6 +401,7 @@ mod tests {
 
     #[test]
     fn compiled_filter_binds_architecture_and_sensitive_arguments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;

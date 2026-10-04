@@ -1025,6 +1025,7 @@ mod tests {
 
     #[test]
     fn interpreter_read_roots_never_overlap_the_default_deny_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let deny = deny_default_paths();
         let policy = FilesystemPolicy {
             read_roots: interpreter_read_roots(),
@@ -1046,6 +1047,7 @@ mod tests {
 
     #[test]
     fn exit_codes_keep_tirith_decisions_apart_from_the_child_status() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = |status, child| PresetOutcome {
             status,
             decision: CapsuleRunDecision::TargetCompleted,

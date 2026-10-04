@@ -926,6 +926,7 @@ mod tests {
     /// each clause.
     #[test]
     fn test_seven_example_dsl_rules_round_trip() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1029,6 +1030,7 @@ all:
 
     #[test]
     fn test_acceptance_example_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = r#"
 all:
   - command.has_pipeline_to: [sh, bash, zsh]
@@ -1059,6 +1061,7 @@ all:
 
     #[test]
     fn test_not_and_any() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = r#"
 any:
   - command.uses_sudo: true
@@ -1134,6 +1137,7 @@ any:
     // evaluation of the same rule keeps identical match/non-match semantics.
     #[test]
     fn test_host_matches_regex_cache_preserves_semantics() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let clause = WhenClause::UrlHostMatches(r"\.evil\.com$".to_string());
 
         let mut hit = DslEvalContext::default();
@@ -1161,6 +1165,7 @@ any:
 
     #[test]
     fn regex_cache_bounds_policy_churn_and_recompiles_evicted_patterns() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         REGEX_CACHE.with(|cache| *cache.borrow_mut() = RegexCache::default());
         let first = r"^/repo_0/[a-z0-9]+\.rs$";
         let ctx = DslEvalContext {
@@ -1201,6 +1206,7 @@ any:
 
     #[test]
     fn regex_eviction_preserves_all_predicates_and_unknown_contexts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let hit = DslEvalContext {
             urls: vec![DslUrl {
                 host: "api.evil.com",
@@ -1278,6 +1284,7 @@ any:
 
     #[test]
     fn test_satisfiable_empty_list_command_predicate_is_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-24: an empty-list `command.*` predicate can never match, so it
         // yields the EMPTY satisfiable set (dead rule, rejected) rather than
         // mislabeling itself runnable.
@@ -1391,6 +1398,7 @@ any:
 
     #[test]
     fn test_satisfiable_all_command_and_file_is_empty_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-9 R9-1: `all(command.*, file.*)` is UNSATISFIABLE — no single scan
         // has both, so {Exec, Paste} ∩ {FileScan} is empty. The old flatten
         // wrongly accepted it for `[exec, file]`.
@@ -1500,6 +1508,7 @@ any:
 
     #[test]
     fn test_satisfiable_empty_any_is_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-10 R10-1: empty `any: []` is vacuously FALSE → EMPTY so the
         // validators reject it as a dead rule.
         let any_empty = WhenClause::Any(vec![]);
@@ -1522,6 +1531,7 @@ any:
 
     #[test]
     fn test_satisfiable_empty_all_is_universal_and_vacuously_true() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-10 R10-1 companion: empty `all: []` is vacuously TRUE → universal
         // set (contrasts with empty `any` above).
         let all_empty = WhenClause::All(vec![]);
@@ -1559,6 +1569,7 @@ any:
 
     #[test]
     fn test_satisfiable_not_of_degenerate_empty_combinators_follow_truth_value() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // R17-1: the only `Not` divergence from the child's set is the two
         // degenerate directly-nested EMPTY combinators:
         //   * `not(any: [])` == constant-TRUE → ALL.
@@ -1876,6 +1887,7 @@ any:
 
     #[test]
     fn test_path_is_under_root_sentinel_rejects_drive_relative() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-20 (correcting round-19): only genuinely-absolute Windows paths
         // (drive + separator) are root-contained; bare `C:` and `C:relative` are
         // drive-RELATIVE and must NOT be.
@@ -2032,6 +2044,7 @@ any:
 
     #[test]
     fn test_package_predicates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = r#"
 all:
   - package.ecosystem: npm
@@ -2059,6 +2072,7 @@ all:
 
     #[test]
     fn test_package_reputation_tristate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression (finding C): `unknown`/`known`/`malicious` must each be
         // independently matchable, incl. `unknown` with a DB loaded.
         let unknown_clause = WhenClause::PackageReputation(Reputation::Unknown);
@@ -2102,6 +2116,7 @@ all:
 
     #[test]
     fn test_ecosystem_alias_round_trip() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `crates`/`cargo` should match the canonical `crates.io`.
         let clause = WhenClause::PackageEcosystem("cargo".to_string());
         let mut ctx = DslEvalContext::default();

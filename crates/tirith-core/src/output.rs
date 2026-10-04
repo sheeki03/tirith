@@ -1263,6 +1263,7 @@ mod tests {
 
     #[test]
     fn shared_json_writer_embeds_captured_policy_diagnostics_safely() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let custom = "C02_OUTPUT_POLICY_DIAGNOSTIC_CANARY";
         let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
         let source = format!(

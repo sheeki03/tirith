@@ -296,6 +296,7 @@ mod tests {
 
     #[test]
     fn human_policy_path_reuses_frozen_dlp_after_escape_removal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
         tirith_core::policy::freeze_captured_policy_dlp_patterns(&["private-project".into()]);
         for path in [

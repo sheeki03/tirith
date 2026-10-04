@@ -782,6 +782,7 @@ mod tests {
     /// deterministic regardless of the runner's TTY (R15).
     #[test]
     fn apply_actions_noop_when_already_configured_returns_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = report_with_state(true, true);
         assert_eq!(
             apply_actions_with_interactivity(&report, false),
@@ -795,6 +796,7 @@ mod tests {
     /// short-circuit fires ONLY when nothing is needed.
     #[test]
     fn apply_actions_noninteractive_with_work_returns_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Policy present but hook missing → a real step remains → refusal (exit 1).
         let report = report_with_state(false, true);
         assert_eq!(
@@ -944,6 +946,7 @@ mod tests {
     /// dir named `pipeline.yaml` must not flip detection. Both halves covered.
     #[test]
     fn detect_ci_requires_regular_file_not_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Half 1: a real workflow FILE → CI detected.
         let with_file = tempfile::tempdir().expect("tempdir");
         let wf = with_file.path().join(".github").join("workflows");

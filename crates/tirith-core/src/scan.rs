@@ -3021,6 +3021,7 @@ mod tests {
 
     #[test]
     fn missing_scan_root_is_an_unreadable_coverage_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let missing = tmp.path().join("missing-security-tree");
 
@@ -3066,6 +3067,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_metadata_failure_is_an_intrinsically_relevant_enumeration_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let loop_path = root.path().join("ordinary-root");
         std::os::unix::fs::symlink("ordinary-root", &loop_path).unwrap();
@@ -3101,6 +3103,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_subtree_is_recorded_without_hiding_readable_siblings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().expect("create scan root");
@@ -3136,6 +3139,7 @@ mod tests {
 
     #[test]
     fn readable_subtree_remains_a_complete_legitimate_control() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let nested = root.path().join("nested");
         std::fs::create_dir_all(&nested).unwrap();
@@ -3151,6 +3155,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn linked_config_read_is_bound_to_the_file_that_passed_containment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Containment is checked against a canonicalized path, and the read
         // re-walks that path. Swap the file the path names between the two and
         // the read must refuse, because it would otherwise scan content that
@@ -3206,6 +3211,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn in_root_config_symlink_is_scanned_under_its_logical_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let target = root.path().join("shared-instructions.txt");
         let logical = root.path().join("CLAUDE.md");
@@ -3232,6 +3238,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn binary_hinted_config_symlink_is_byte_classified_before_ignore() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let config_dir = root.path().join(".github");
         std::fs::create_dir(&config_dir).unwrap();
@@ -3265,6 +3272,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn external_config_symlink_is_an_unreadable_gap_and_is_not_followed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let outside = tempfile::tempdir().expect("create outside tree");
         let target = outside.path().join("instructions.txt");
@@ -3287,6 +3295,7 @@ mod tests {
 
     #[test]
     fn max_files_is_one_priority_aware_budget_across_text_and_artifacts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let priority = root.path().join("CLAUDE.md");
         let ordinary = root.path().join("z-last.md");
@@ -3365,6 +3374,7 @@ mod tests {
 
     #[test]
     fn artifact_analysis_gap_counts_as_skipped_and_remains_visible() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let artifact = root.path().join("payload.so");
         std::fs::write(&artifact, b"\x7fELF unsupported").unwrap();
@@ -3457,6 +3467,7 @@ mod tests {
 
     #[test]
     fn scan_single_file_guarded_non_panic_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A readable file scans to Completed(Scanned(_)); the panic arm is
         // exercised by `catch_panic_scanning_returns_none_on_panic` above.
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -3529,6 +3540,7 @@ mod tests {
 
     #[test]
     fn test_svg_active_content_visible_in_scan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An SVG carrying a <script> must be collected (not skipped as binary)
         // and flagged by the aifile rules.
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -3626,6 +3638,7 @@ mod tests {
     /// the startup finding rather than a blanket `Unsupported` coverage gap.
     #[test]
     fn test_directory_scan_inspects_wheel_member() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -3704,6 +3717,7 @@ mod tests {
 
     #[test]
     fn directory_scan_propagates_accepted_wheel_internal_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -3746,6 +3760,7 @@ mod tests {
     /// Block on the same condition), not a silent pass / exit 0.
     #[test]
     fn test_directory_scan_rejected_wheel_is_not_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -3889,6 +3904,7 @@ mod tests {
 
     #[test]
     fn test_variation_selector_visible_in_scan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Variation selector U+FE0F (EF B8 8F) in a temp dir with no policy.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let file_path = tmp.path().join("test_vs.txt");
@@ -3980,6 +3996,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_file_is_not_read_through() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().expect("create scan root");
         let outside = tempfile::tempdir().expect("create outside tree");
         let target = outside.path().join("leak.md");
@@ -4044,6 +4061,7 @@ mod tests {
     /// NEVER shells out to `sha256sum`.
     #[test]
     fn oversized_priority_file_is_oversized_gap_with_matching_hash() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use sha2::{Digest, Sha256};
         let tmp = tempfile::tempdir().expect("create temp dir");
         // A PRIORITY file (CLAUDE.md) just over the analysis ceiling.
@@ -4075,6 +4093,7 @@ mod tests {
     /// silent drop).
     #[test]
     fn native_so_is_unsupported_coverage_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         std::fs::write(tmp.path().join("keep.md"), "hello").unwrap();
         // A native extension with some bytes so it can be hashed.
@@ -4140,6 +4159,7 @@ mod tests {
     /// the regular-file gate rejects) yields an `Unreadable` gap with no hash.
     #[test]
     fn unreadable_path_is_unreadable_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         // A directory is not a regular file: the no-follow regular-file gate
         // refuses it, which the scan classifies as Unreadable.
@@ -4218,6 +4238,7 @@ mod tests {
     /// as text.
     #[test]
     fn scan_single_file_on_artifact_is_unsupported_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use sha2::{Digest, Sha256};
         let tmp = tempfile::tempdir().expect("create temp dir");
         let so = tmp.path().join("lib.so");
@@ -4235,6 +4256,7 @@ mod tests {
 
     #[test]
     fn utf8_attack_payloads_with_png_and_so_suffixes_are_scanned_directly_and_in_walks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let payload = "visible\u{202e}hidden";
         let paths = [
@@ -4298,6 +4320,7 @@ mod tests {
     /// from `SECURITY_RELEVANT_EXTENSIONS`).
     #[test]
     fn whl_unsupported_gap_is_security_relevant() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let whl = tmp.path().join("pkg-1.0-py3-none-any.whl");
         std::fs::write(&whl, b"PK\x03\x04 not a real wheel").unwrap();
@@ -4314,6 +4337,7 @@ mod tests {
 
     #[test]
     fn pdf_first_large_zip64_polyglot_is_never_scanned_as_exclusive_pdf() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const EXTENSIBLE_BYTES: usize = 1024 * 1024 + 1;
         let mut bytes = b"%PDF-1.7\n%%EOF\n".to_vec();
         let mut record = vec![0u8; 56 + EXTENSIBLE_BYTES];
@@ -4362,6 +4386,7 @@ mod tests {
 
     #[test]
     fn malformed_exclusive_pdf_retains_findings_and_typed_coverage_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let path = tmp.path().join("malformed.pdf");
         let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
@@ -4402,6 +4427,7 @@ mod tests {
 
     #[test]
     fn malformed_pdf_stdin_has_typed_analyzer_coverage() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let bytes = b"%PDF-1.7\nnot a complete PDF\n%%EOF\n";
         let result = scan_stdin(&String::from_utf8_lossy(bytes), bytes);
         assert!(result.analysis_incomplete());
@@ -4475,6 +4501,7 @@ mod tests {
     /// a planted native blob read as "clean" and slip past `require_complete`.
     #[test]
     fn dll_exe_jar_are_unsupported_gaps_not_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Each loadable-code extension classifies as an artifact candidate.
         for name in ["evil.dll", "evil.exe", "evil.jar", "evil.class"] {
             assert_eq!(
@@ -4539,6 +4566,7 @@ mod tests {
 
     #[test]
     fn utf8_dll_suffix_is_scanned_byte_first_not_reported_unsupported() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let path = tmp.path().join("instructions.dll");
         std::fs::write(&path, "visible\u{202e}hidden").unwrap();

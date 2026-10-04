@@ -5764,6 +5764,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for process-scoped capability tests"]
     fn protocol_v3_capability_process_helper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         match std::env::var("TIRITH_CAPABILITY_PROCESS_HELPER").as_deref() {
             Ok("register") => {
                 let session_id = crate::session::resolve_session_id();

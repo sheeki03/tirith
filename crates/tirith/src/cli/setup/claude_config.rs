@@ -483,6 +483,7 @@ mod tests {
     const COMMAND: &str = "TIRITH_BIN='/fixture/tirith' '/fixture/python3' '/fixture/.claude/hooks/tirith-check.py' || exit 2";
     #[test]
     fn preserves_unknown_settings_and_other_hooks_across_apply_and_undo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let original = json!({"theme":"dark","future_setting":{"nested":[1,2]},"hooks":{"SessionStart":[{"matcher":"*","hooks":[{"type":"command","command":"echo other"}]}],"PreToolUse":[{"matcher":"Bash","future_matcher":true,"hooks":[{"type":"command","command":"echo manual"}]}]}});
         let text = original.to_string();
         let edit = OwnedClaudeHandler::capture(Some(&text), COMMAND, &[]).unwrap();
@@ -499,6 +500,7 @@ mod tests {
     }
     #[test]
     fn known_legacy_upgrade_preserves_extra_handler_fields_and_rejects_manual_edits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let legacy = "'/fixture/python3' '/fixture/.claude/hooks/tirith-check.py' || exit 2";
         let before=json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":legacy,"timeout":600,"future_field":"keep"}]}]}}).to_string();
         let edit = OwnedClaudeHandler::capture(Some(&before), COMMAND, &[legacy.into()]).unwrap();
@@ -519,6 +521,7 @@ mod tests {
     }
     #[test]
     fn duplicate_or_ambiguous_configuration_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for raw in [
             r#"{"hooks":{},"hooks":{}}"#,
             r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[]},{"matcher":"Bash","hooks":[]}]}}"#,
@@ -531,6 +534,7 @@ mod tests {
     }
     #[test]
     fn new_handler_compensation_removes_only_empty_created_containers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let edit = OwnedClaudeHandler::capture(None, COMMAND, &[]).unwrap();
         let after = edit.transform(None, false).unwrap().unwrap();
         assert_eq!(edit.transform(Some(&after), false).unwrap(), None);
@@ -555,6 +559,7 @@ mod tests {
     }
     #[test]
     fn manual_commands_and_blocking_contract_overrides_are_not_overwritten() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for extra in [
             json!({"command":"custom tirith-check.py"}),
             json!({"command":COMMAND,"async":true}),
@@ -1018,6 +1023,7 @@ mod tests {
 
     #[test]
     fn later_hook_disable_refuses_apply_but_is_preserved_by_compensation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for flag in ["disableAllHooks", "allowManagedHooksOnly"] {
             let edit =
                 OwnedClaudeHandler::capture(None, "python /owned/tirith-check.py", &[]).unwrap();

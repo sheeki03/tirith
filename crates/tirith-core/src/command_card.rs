@@ -1543,6 +1543,7 @@ mod tests {
 
     #[test]
     fn verified_card_mismatched_command_is_mismatch_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let (secret, pubkey) = generate_keypair().unwrap();
         write_trusted_key(dir.path(), &pubkey);
@@ -1966,6 +1967,7 @@ mod tests {
 
     #[test]
     fn crlf_multiline_command_carried_card_verifies_without_normalization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: a CRLF-authored multi-line command via a CRLF-terminated
         // prelude must still VERIFY. The old `lines()` + `join("\n")` strip
         // normalized CRLF→LF and falsely Mismatched.

@@ -1438,6 +1438,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn offline_check_skips_network_url_enrichment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let req = super::DaemonRequest {
             command: "check".to_string(),
             input:
@@ -1801,6 +1802,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_dir_drives_socket_and_pid_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = super::runtime_dir();
         if let Some(state) = tirith_core::policy::state_dir() {
             assert_eq!(dir, state, "runtime dir should prefer state_dir when set");

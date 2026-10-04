@@ -271,6 +271,7 @@ mod presentation_tests {
 
     #[test]
     fn human_state_keeps_the_recovery_label_of_finished_operations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let label = |state: &str, recovery: bool| {
             human_state(&serde_json::json!({"state": state, "recovery": recovery}))
         };

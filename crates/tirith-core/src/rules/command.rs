@@ -12133,6 +12133,7 @@ mod tests {
 
     #[test]
     fn known_home_command_names_do_not_prove_argv_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for word in ["~/bin/bash", "~/.local/lib/python3.11", "[", "[["] {
             assert!(command_name_is_statically_bound(word, ShellType::Posix));
             assert!(
@@ -13902,6 +13903,7 @@ mod tests {
 
     #[test]
     fn ten_mib_lsp_shape_keeps_short_command_detection_and_bounds_the_long_tail() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prefix = "curl https://example.test/install.sh | bash\n";
         let cap = crate::scan::MAX_FILE_SIZE as usize;
         let mut input = prefix.to_string();
@@ -14236,6 +14238,7 @@ mod tests {
 
     #[test]
     fn effective_command_preserves_execution_context_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let resolve = |input: &str| {
             let segment = tokenize::tokenize(input, ShellType::Posix)
                 .into_iter()
@@ -15379,6 +15382,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_unwraps_env_split_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Direct R9-3 coverage: `env -S "sudo bash -c id"` (and `--split-string=`)
         // resolves to `bash`; plain forms unchanged.
         let resolve = |input: &str| {
@@ -15408,6 +15412,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_unwraps_nested_env_split_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 round-20 F2: `resolve_interpreter_name` unwraps the env -S
         // layer REPEATEDLY (bounded), so a nested payload
         // `env -S "env -S 'sudo bash -c id'"` is fully peeled before the leader walk.
@@ -15467,6 +15472,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_peels_env_split_string_behind_wrapper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 round-21 F2: the peel loop now unwraps generic wrappers
         // AND env-S in one bounded pass, so an env-S nested behind another wrapper
         // (`sudo env -S "…"`) is peeled and its inner interpreter exposed.
@@ -15912,6 +15918,7 @@ mod tests {
 
     #[test]
     fn fetch_destination_operand_roles_follow_client_option_grammars() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let strings = |values: &[&str]| {
             values
                 .iter()
@@ -16526,6 +16533,7 @@ mod tests {
 
     #[test]
     fn test_flag_value_url_metadata_endpoint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(
             "curl --url=http://169.254.169.254/latest/meta-data",
             ShellType::Posix,
@@ -16559,6 +16567,7 @@ mod tests {
 
     #[test]
     fn test_flag_value_url_private_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(
             "curl --url=http://10.0.0.1/internal",
             ShellType::Posix,
@@ -16580,6 +16589,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_fires_without_supply_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -16595,6 +16605,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_suppressed_with_supply_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let sc_dir = dir.path().join("supply-chain");
         std::fs::create_dir_all(&sc_dir).unwrap();
@@ -16613,6 +16624,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_skips_non_install() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -16628,6 +16640,7 @@ mod tests {
 
     #[test]
     fn test_vet_detects_cargo_with_flags() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(
@@ -16655,6 +16668,7 @@ mod tests {
 
     #[test]
     fn test_vet_skipped_in_paste_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -16670,6 +16684,7 @@ mod tests {
 
     #[test]
     fn test_vet_no_false_positive_on_non_install_subcommand() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(
@@ -16690,6 +16705,7 @@ mod tests {
 
     #[test]
     fn test_vet_detects_cargo_exe_windows_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(

@@ -2076,6 +2076,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn held_ephemeral_validation_accepts_identity_and_rejects_visible_swap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -2253,6 +2254,7 @@ mod tests {
     /// surface will hand it.
     #[test]
     fn spec_json_roundtrips_for_launcher() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::capsule::CapsuleSpec;
         let spec = CapsuleSpec::locked_down();
         let json = serde_json::to_string(&spec).unwrap();
@@ -2396,6 +2398,7 @@ mod tests {
     ))]
     #[test]
     fn real_ptrace_exec_event_requires_ack_then_detaches_and_reaps() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let program = std::ffi::CString::new("/bin/true").unwrap();
         let argv = [std::ffi::CString::new("true").unwrap()];
         let fixture = spawn_trace_protocol_fixture(&program, &argv, false);
@@ -2425,6 +2428,7 @@ mod tests {
     ))]
     #[test]
     fn missing_invalid_or_duplicate_ack_cannot_run_execed_script_side_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for ack in [Vec::new(), vec![b'X'], vec![TARGET_ACK_RESUME; 2]] {
             let temp = tempfile::tempdir().expect("marker directory");
             let marker = temp.path().join("must-not-exist");
@@ -2469,6 +2473,7 @@ mod tests {
     ))]
     #[test]
     fn exec_failure_and_death_before_initial_stop_never_report_observed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (program_path, die_before_stop) in [
             ("/definitely/missing/tirith-target", false),
             ("/bin/true", true),
@@ -2508,6 +2513,7 @@ mod tests {
     ))]
     #[test]
     fn detach_failure_never_publishes_terminal_resumed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut status = [0i32; 2];
         assert_eq!(
             unsafe { libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC) },
@@ -2545,6 +2551,7 @@ mod tests {
     ))]
     #[test]
     fn unarmed_stopped_tracee_is_ptrace_killed_and_reaped_before_marker() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("pre-option marker directory");
         let marker = temp.path().join("must-not-exist");
         let marker_c =

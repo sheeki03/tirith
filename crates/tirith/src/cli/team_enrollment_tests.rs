@@ -90,6 +90,7 @@ fn expected_activation_never_reinterprets_malformed_or_replaced_state() {
 }
 #[test]
 fn pending_roundtrip_preserves_exact_request_id_sequence_and_observation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let original = record();
     let request = serde_json::to_vec(&original.request).unwrap();
     let restored = decode_report(&encoded(&original).unwrap()).unwrap();
@@ -107,6 +108,7 @@ fn pending_roundtrip_preserves_exact_request_id_sequence_and_observation() {
 }
 #[test]
 fn pending_schema_rejects_ambiguous_unknown_oversized_or_rebound_fields() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let original = record();
     let bytes = encoded(&original).unwrap();
     let mut value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -135,6 +137,7 @@ fn pending_schema_rejects_ambiguous_unknown_oversized_or_rebound_fields() {
 }
 #[test]
 fn downloaded_failed_or_invented_receipt_cannot_promote_pending_report() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for state in [ReportState::Downloaded, ReportState::Failed] {
         let mut r = record();
         r.request.state = state;
@@ -154,6 +157,7 @@ fn downloaded_failed_or_invented_receipt_cannot_promote_pending_report() {
 }
 #[test]
 fn report_projection_omits_private_commitments_policy_and_paths() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let r = record();
     let output = report_result(
         &r,
@@ -179,6 +183,7 @@ fn report_projection_omits_private_commitments_policy_and_paths() {
 
 #[test]
 fn bounded_archive_preserves_exact_context_and_never_silently_evicts() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut previous = record();
     let original = serde_json::to_vec(&previous.request).unwrap();
     previous.phase = ReportPhase::ArchivedUnknown;
@@ -204,6 +209,7 @@ fn bounded_archive_preserves_exact_context_and_never_silently_evicts() {
 }
 #[test]
 fn deterministic_report_id_reuse_requires_exact_archive_identity_for_reconciliation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut current = record();
     let mut archived = current.clone();
     archived.phase = ReportPhase::ArchivedUnknown;
@@ -223,6 +229,7 @@ fn deterministic_report_id_reuse_requires_exact_archive_identity_for_reconciliat
 }
 #[test]
 fn nested_archive_and_private_history_projection_are_bounded() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut current = record();
     let mut archived = record();
     archived.phase = ReportPhase::ArchivedUnknown;
@@ -645,6 +652,7 @@ mod background_refresh {
 }
 #[test]
 fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     const HOUR: u64 = 3_600_000;
     let now = 1_000 * HOUR;
     let status = |state, fetched_age: u64| CacheStatus {

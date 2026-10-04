@@ -1446,6 +1446,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_full_backend() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Landlock usable + seccomp supported + a locked-down spec -> FS
         // enforced, raw-net denied, NEVER egress, and env + handles set. The
         // aggregate resource bit stays false because locked_down also requests
@@ -1472,6 +1473,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_landlock_does_not_claim_fs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No Landlock on the kernel -> FS not enforced, even though seccomp is.
         let spec = CapsuleSpec::locked_down();
         let fs = LandlockProbe::default(); // usable = false
@@ -1483,6 +1485,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join(".ssh");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -1502,6 +1505,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_unresolved_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = CapsuleSpec::locked_down();
         spec.filesystem.deny_roots = vec![PathBuf::new()];
         let fs = LandlockProbe {
@@ -1516,6 +1520,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_seccomp_does_not_claim_raw_net_deny() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-x86_64 Linux arch can apply Landlock but not seccomp -> raw sockets
         // are NOT denied, so a DenyAll spec is degraded against its requirement.
         let spec = CapsuleSpec::locked_down();
@@ -1531,6 +1536,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_resource_flag_tracks_rlimitable_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A spec with NO rlimit-able dimension does not claim resource limits.
         let mut spec = CapsuleSpec::locked_down();
         spec.resources = ResourceLimits::default(); // nothing set
@@ -1561,6 +1567,7 @@ mod tests {
 
     #[test]
     fn mixed_cpu_and_wall_clock_does_not_claim_all_resource_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let fs = LandlockProbe {
             usable: true,
             abi: Some(4),
@@ -1582,6 +1589,7 @@ mod tests {
 
     #[test]
     fn linux_supported_only_resource_limits_are_reported_enforced() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let fs = LandlockProbe {
             usable: true,
             abi: Some(4),
@@ -2139,6 +2147,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn runtime_file_topology_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(root) = std::env::var_os("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE") else {
             return;
         };
@@ -2258,6 +2267,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn runtime_readiness_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         if std::env::var_os("TIRITH_RUNTIME_READINESS_FIXTURE").is_none() {
             return;
         }
@@ -2435,6 +2445,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn production_clone_policy_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         if std::env::var_os("TIRITH_CLONE_POLICY_FIXTURE").is_none() {
             return;
         }
@@ -2549,6 +2560,7 @@ mod tests {
 
     #[test]
     fn apply_containment_refuses_allowlisted_domains() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // E2 has no verified raw-socket-blocking egress backend, so an allow-list
         // spec must be refused BEFORE any process state is changed (it is the
         // first thing apply_containment checks).
@@ -2566,6 +2578,7 @@ mod tests {
 
     #[test]
     fn apply_containment_refuses_missing_parent_temp_home_before_mutation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let err = apply_containment(&spec, None).expect_err("missing temp HOME must fail closed");
         match err {
@@ -2578,6 +2591,7 @@ mod tests {
 
     #[test]
     fn env_survivors_strip_sensitive_and_keep_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = EnvironmentPolicy {
             inherit: false,
             allow: vec![

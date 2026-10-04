@@ -499,6 +499,7 @@ mod tests {
 
     #[test]
     fn scan_json_body_redacts_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let scan = RepoHookScan {
             repo_root: Some("/repo".to_string()),
             entries: vec![sample_entry(
@@ -541,11 +542,13 @@ mod tests {
 
     #[test]
     fn guard_unknown_action_returns_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(guard("bogus", false), 2);
     }
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Real layout: <root>/.tirith/policy.yaml so the grandparent containment
         // root (<root>) exists and is not a symlink — the legit write must pass.
         let dir = tempfile::tempdir().unwrap();
@@ -571,6 +574,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_ignores_indented_lookalike() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: repo-0385 — an indented (nested-mapping) lookalike key
         // must NOT be treated as the root key; the real root key is appended
         // and the document stays valid YAML with the guard effective.
@@ -607,6 +611,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_rejects_unparseable_candidate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Defense in depth for repo-0385: if the existing file is invalid
         // YAML, the toggle must fail rather than report a guard state that
         // policy loading would silently ignore.
@@ -625,6 +630,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_does_not_follow_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel.yaml");
         let original = "paranoia: 2\n# do not clobber\n";
@@ -662,6 +668,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_rejects_symlinked_intermediate_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().unwrap();
 
         // An outside directory holding a real (non-symlink) policy.yaml sentinel.

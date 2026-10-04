@@ -68,6 +68,7 @@ mod tests {
 
     #[test]
     fn test_explain_known_rule() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let e = explain("pipe_to_interpreter");
         assert!(e.is_some(), "pipe_to_interpreter must have an explanation");
         let e = e.unwrap();
@@ -77,6 +78,7 @@ mod tests {
 
     #[test]
     fn test_explain_unknown_rule() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(explain("not_a_real_rule").is_none());
     }
 
@@ -211,6 +213,7 @@ mod tests {
     /// `artifact_download_integrity_mismatch` id must say it has no live emitter.
     #[test]
     fn explanations_do_not_describe_removed_package_firewall_as_live() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for entry in list_all() {
             let prose = [
                 entry.title,

@@ -2394,6 +2394,7 @@ mod tests {
 
     #[test]
     fn enrich_command_returns_empty_when_all_apis_disabled() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = ThreatIntelConfig {
             osv_enabled: false,
             deps_dev_enabled: false,

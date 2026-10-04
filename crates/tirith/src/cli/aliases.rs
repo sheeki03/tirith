@@ -270,6 +270,7 @@ mod tests {
 
     #[test]
     fn scan_json_body_redacts_body_and_counts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let scan = AliasScan {
             entries: vec![sample_entry(
                 "getkey",
@@ -306,6 +307,7 @@ mod tests {
 
     #[test]
     fn explain_body_display_strips_terminal_controls() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: repo-0358 — a redacted-but-unsanitized body must not
         // reach the terminal with ANSI/OSC, bidi, or zero-width content.
         let body = "cat ~/.aws/credentials \u{1b}]52;c;SGFja2Vk\u{7}\u{202e}\u{200b}evil";

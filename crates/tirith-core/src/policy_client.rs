@@ -179,6 +179,7 @@ mod tests {
 
     #[test]
     fn test_fetch_invalid_url_returns_network_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Non-routable address should fail quickly
         let result = fetch_remote_policy("http://192.0.2.1:1", "test-key");
         assert!(result.is_err());

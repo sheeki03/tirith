@@ -850,6 +850,7 @@ mod tests {
 
     #[test]
     fn authorize_ok_for_loopback_host_and_good_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         assert_eq!(
             authorize(Some("127.0.0.1:8080"), Some(token()), token(), n, n),
@@ -873,6 +874,7 @@ mod tests {
 
     #[test]
     fn authorize_forbids_foreign_host_dns_rebinding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         // A DNS-rebinding attacker's browser sends the attacker hostname in Host.
         assert_eq!(
@@ -909,6 +911,7 @@ mod tests {
 
     #[test]
     fn authorize_unauthorized_for_missing_or_wrong_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         // Missing token.
         assert_eq!(
@@ -936,6 +939,7 @@ mod tests {
 
     #[test]
     fn authorize_unauthorized_when_token_expired() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let issued = Utc::now() - chrono::Duration::hours(2); // older than TTL
         let n = Utc::now();
         // Correct Host AND correct token, but the token has aged out → 401.
@@ -968,6 +972,7 @@ mod tests {
 
     #[test]
     fn authorize_host_checked_before_ttl_and_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A foreign Host with an expired token + wrong token still reports 403
         // (Forbidden), proving Host is evaluated first.
         let issued = Utc::now() - chrono::Duration::hours(5);
@@ -1026,6 +1031,7 @@ mod tests {
 
     #[test]
     fn resolve_export_path_variants() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `--out .` → ./dashboard.html
         let p = resolve_export_path(Some(".")).unwrap();
         assert_eq!(p, Path::new("./dashboard.html"));
@@ -1043,6 +1049,7 @@ mod tests {
 
     #[test]
     fn resolve_export_path_existing_dir_gets_dashboard_html() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = resolve_export_path(Some(dir.path().to_str().unwrap())).unwrap();
         assert_eq!(p, dir.path().join("dashboard.html"));
@@ -1095,6 +1102,7 @@ mod tests {
     /// the complete new content and keeps 0600 — never a half-written file.
     #[test]
     fn write_html_file_overwrite_preserves_intact_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dashboard.html");
 
@@ -1482,6 +1490,7 @@ mod tests {
     // HTTP/1.0, other methods, and large cookie headers for the loopback host.
     #[test]
     fn report_requests_beyond_the_control_api_shape_still_get_the_report_decision() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
         let (port, handle) = serve_connections(3, token, Utc::now(), Instant::now());
         let send = |raw: String| {

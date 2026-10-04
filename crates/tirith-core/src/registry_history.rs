@@ -407,6 +407,7 @@ mod tests {
 
     #[test]
     fn snapshot_path_sanitizes_name() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `/` must become `_` so a scoped npm name does not write to a nested dir.
         let path = snapshot_path(Ecosystem::Npm, "@org/util");
         if let Some(p) = path {

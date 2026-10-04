@@ -1153,6 +1153,7 @@ mod tests {
 
     #[test]
     fn noop_capsule_never_claims_any_coverage() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Invariant 2: a missing backend can never be mistaken for a working one.
         let cap = NoOpCapsule;
         let cov = cap.available_coverage(&CapsuleSpec::locked_down());
@@ -1163,6 +1164,7 @@ mod tests {
 
     #[test]
     fn noop_capsule_never_claims_egress() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The single most important NoOp property: it must never report egress.
         let cap = NoOpCapsule;
         let cov = cap.available_coverage(&CapsuleSpec::locked_down());
@@ -1191,6 +1193,7 @@ mod tests {
 
     #[test]
     fn degraded_against_detects_shortfall() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let required = CapsuleSpec::locked_down().required_coverage();
         // NoOp coverage satisfies nothing required -> degraded.
         assert!(CapsuleCoverage::NONE.is_degraded_against(&required));
@@ -1212,6 +1215,7 @@ mod tests {
 
     #[test]
     fn locked_down_spec_requires_egress_only_when_allowlisted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Deny-all spec must NOT require the proxy flag.
         let deny = CapsuleSpec::locked_down();
         assert!(!deny.required_coverage().domain_proxy_enforced);
@@ -1230,6 +1234,7 @@ mod tests {
 
     #[test]
     fn capability_level_follows_network_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Deny-all network -> DenyAll level (natively satisfiable).
         assert_eq!(
             CapsuleSpec::locked_down().capability_level(),
@@ -1249,6 +1254,7 @@ mod tests {
 
     #[test]
     fn the_untrusted_project_preset_inherits_the_locked_down_baseline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("held-copy");
         std::fs::create_dir(&project).expect("create held copy");
@@ -1268,6 +1274,7 @@ mod tests {
 
     #[test]
     fn the_untrusted_project_preset_denies_every_shared_sensitive_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("held-copy");
         std::fs::create_dir(&project).expect("create held copy");
@@ -1301,6 +1308,7 @@ mod tests {
 
     #[test]
     fn the_untrusted_project_preset_refuses_a_project_over_a_denied_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The negative half of the deny contract, and the reason `--project ~`
         // and `--project ~/.ssh` must never be accepted: the validator rejects
         // an allow root that overlaps a deny root in either direction.
@@ -1316,6 +1324,7 @@ mod tests {
 
     #[test]
     fn the_untrusted_project_env_allowlist_cannot_re_expose_a_credential() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("held-copy");
         std::fs::create_dir(&project).expect("create held copy");
@@ -1572,6 +1581,7 @@ mod tests {
 
     #[test]
     fn filesystem_deny_by_default_seeds_deny_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The OS-authenticated account home, not HOME, seeds the sensitive roots.
         // A lookup failure produces a poison root that every backend rejects.
         let fs = FilesystemPolicy::deny_by_default();
@@ -1583,6 +1593,7 @@ mod tests {
 
     #[test]
     fn filesystem_policy_rejects_exact_equivalent_allow_and_deny_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let sensitive = temp.path().join("sensitive");
         std::fs::create_dir(&sensitive).expect("create sensitive directory");
@@ -1600,6 +1611,7 @@ mod tests {
 
     #[test]
     fn filesystem_policy_rejects_allow_parent_of_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join("credentials");
         std::fs::create_dir(&denied).expect("create denied directory");
@@ -1614,6 +1626,7 @@ mod tests {
 
     #[test]
     fn filesystem_policy_rejects_unresolved_empty_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = FilesystemPolicy {
             read_roots: Vec::new(),
             write_roots: Vec::new(),
@@ -1627,6 +1640,7 @@ mod tests {
 
     #[test]
     fn filesystem_policy_rejects_deny_parent_of_allow_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let allowed = temp.path().join("credentials").join("public");
         std::fs::create_dir_all(&allowed).expect("create allowed directory");
@@ -1642,6 +1656,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn filesystem_policy_rejects_symlink_alias_of_covering_allow_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1661,6 +1676,7 @@ mod tests {
 
     #[test]
     fn filesystem_policy_preserves_canonical_disjoint_roots() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let allowed = temp.path().join("allowed");
         let denied = temp.path().join("denied");
@@ -1687,6 +1703,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn filesystem_policy_compares_missing_windows_suffixes_case_insensitively() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let policy = FilesystemPolicy {
             read_roots: vec![temp.path().join("CREDENTIALS")],
@@ -1707,6 +1724,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn authenticated_home_spoof_probe_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(expected) = std::env::var_os(AUTH_HOME_EXPECTED) else {
             return;
         };
@@ -1732,6 +1750,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn authenticated_home_ignores_environment_spoof() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let expected = authenticated_home_dir().expect("authenticated home must resolve");
         let temp = tempfile::tempdir().expect("tempdir");
         let spoof = std::fs::canonicalize(temp.path()).expect("canonical spoof directory");
@@ -1764,6 +1783,7 @@ mod tests {
 
     #[test]
     fn capsule_spec_roundtrips_through_json() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The spec is serde-serializable (receipts / capsule-child handoff).
         let mut spec = CapsuleSpec::locked_down();
         spec.filesystem.read_roots.push(PathBuf::from("/tmp/work"));

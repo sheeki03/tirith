@@ -2374,6 +2374,7 @@ mod tests {
 
     #[test]
     fn test_remediation_shapes_reach_the_rule_through_the_engine_gate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, rule) in [
             (
                 "apt-get -o APT::Get::AllowUnauthenticated=true install pkg",

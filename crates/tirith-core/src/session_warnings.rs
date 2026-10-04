@@ -1997,6 +1997,7 @@ mod tests {
 
     #[test]
     fn test_session_state_path_validation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Valid IDs
         assert!(session_state_path("abc-123_DEF").is_some());
         assert!(session_state_path("a").is_some());
@@ -2679,6 +2680,7 @@ mod tests {
 
     #[test]
     fn test_load_returns_default_on_missing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let session = load("nonexistent-session-id-12345");
         assert_eq!(session.session_id, "nonexistent-session-id-12345");
         assert_eq!(session.total_warnings, 0);
@@ -3709,6 +3711,7 @@ mod contextual_domain_tests {
 
     #[test]
     fn contextual_domains_keep_client_identity_and_all_equal_raw_interpretations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for raw in [
             "http://0x7f.0x/path",
             "http://user:secret@0x%37f.0x:8080/path?q=1#f",
@@ -3791,6 +3794,7 @@ mod contextual_domain_tests {
 
     #[test]
     fn contextual_domains_use_generic_fallback_only_for_unassociated_evidence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let raw = "http://0x7f.0x/path";
         let evidence = vec![Evidence::Url { raw: raw.into() }];
         let other = extract_urls("curl https://unrelated.example/x", ShellType::Posix);

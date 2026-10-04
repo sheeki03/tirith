@@ -497,6 +497,7 @@ mod tests {
 
     #[test]
     fn audit_log_creation_is_private_and_appends_after_reads() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("audit.jsonl");
         let mut log = open_log(&path).unwrap();

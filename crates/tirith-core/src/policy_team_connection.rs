@@ -673,6 +673,7 @@ mod tests {
         }
         #[test]
         fn retained_input_detects_same_size_rewrite() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -682,6 +683,7 @@ mod tests {
         }
         #[test]
         fn retained_input_detects_same_bytes_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -709,6 +711,7 @@ mod tests {
         }
         #[test]
         fn private_inputs_reject_symlink_hardlink_shared_mode_fifo_and_size() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -730,6 +733,7 @@ mod tests {
         }
         #[test]
         fn private_parent_and_mutated_ancestor_refuse() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let parent = root.path().join("team-policy");
             std::fs::create_dir(&parent).unwrap();

@@ -123,6 +123,7 @@ mod tests {
 
     #[test]
     fn registered_shells_report_current_stale_and_unregistered() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (state, token, text) in [
             (
                 HookFreshnessState::Current,
@@ -155,6 +156,7 @@ mod tests {
 
     #[test]
     fn other_stale_terminals_are_counted_in_human_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let one = report(
             Some("bash"),
             true,
@@ -182,6 +184,7 @@ mod tests {
 
     #[test]
     fn unregistered_shell_families_fall_back_to_the_unverified_inherited_hint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A record-free shell never becomes current, even if a record existed.
         let report = report(
             Some("pwsh"),

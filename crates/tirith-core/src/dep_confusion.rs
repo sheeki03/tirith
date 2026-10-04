@@ -179,6 +179,7 @@ mod tests {
 
     #[test]
     fn no_internal_names_does_not_flag_normal_packages() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = Policy::default();
         let v = evaluate(Ecosystem::Npm, "react", &p);
         assert!(!v.risk);
@@ -187,6 +188,7 @@ mod tests {
 
     #[test]
     fn exact_internal_name_flags() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with(&["@my-co/util"]);
         let v = evaluate(Ecosystem::Npm, "@my-co/util", &p);
         assert!(v.risk);
@@ -195,6 +197,7 @@ mod tests {
 
     #[test]
     fn wildcard_internal_pattern_flags_subnames() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with(&["@my-co/*"]);
         let v = evaluate(Ecosystem::Npm, "@my-co/util", &p);
         assert!(v.risk);
@@ -206,6 +209,7 @@ mod tests {
 
     #[test]
     fn reserved_internal_scope_flags_without_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = Policy::default();
         let v = evaluate(Ecosystem::Npm, "@internal/helper", &p);
         assert!(v.risk);
@@ -215,6 +219,7 @@ mod tests {
 
     #[test]
     fn non_reserved_scope_does_not_flag_without_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = Policy::default();
         let v = evaluate(Ecosystem::Npm, "@org/lib", &p);
         assert!(!v.risk);
@@ -222,6 +227,7 @@ mod tests {
 
     #[test]
     fn non_npm_ecosystem_does_not_use_scope_heuristic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = Policy::default();
         let v = evaluate(Ecosystem::PyPI, "@internal/helper", &p);
         assert!(!v.risk, "PyPI does not use npm scopes");
@@ -229,6 +235,7 @@ mod tests {
 
     #[test]
     fn empty_name_returns_no_risk() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = Policy::default();
         let v = evaluate(Ecosystem::Npm, "   ", &p);
         assert!(!v.risk);
@@ -236,6 +243,7 @@ mod tests {
 
     #[test]
     fn scoped_spec_matches_only_declared_ecosystem() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with_scoped(&[(Some("npm"), "internal-tool")]);
         let v_npm = evaluate(Ecosystem::Npm, "internal-tool", &p);
         assert!(v_npm.risk);
@@ -248,6 +256,7 @@ mod tests {
 
     #[test]
     fn unscoped_spec_matches_all_ecosystems() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with_scoped(&[(None, "internal-tool")]);
         assert!(evaluate(Ecosystem::Npm, "internal-tool", &p).risk);
         assert!(evaluate(Ecosystem::PyPI, "internal-tool", &p).risk);
@@ -263,6 +272,7 @@ mod tests {
 
     #[test]
     fn pypi_pattern_matches_pep503_canonical_spelling() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // repo-0270: PyPI resolves case and `-_.` variants as the same project
         // (PEP 503), so an operator pattern in one spelling must match the
         // registry's canonical resolution of another.
@@ -283,6 +293,7 @@ mod tests {
 
     #[test]
     fn pypi_wildcard_prefix_is_canonicalized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with(&["Acme_*"]);
         assert!(evaluate(Ecosystem::PyPI, "acme-foo", &p).risk);
         assert!(evaluate(Ecosystem::PyPI, "ACME.FOO", &p).risk);
@@ -291,6 +302,7 @@ mod tests {
 
     #[test]
     fn npm_pattern_matches_case_insensitively() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with(&["MyLib"]);
         assert!(evaluate(Ecosystem::Npm, "mylib", &p).risk);
         assert!(evaluate(Ecosystem::Npm, "MYLIB", &p).risk);
@@ -300,6 +312,7 @@ mod tests {
 
     #[test]
     fn other_ecosystems_keep_exact_matching() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let p = policy_with(&["Acme_Internal"]);
         // RubyGems treats spellings as distinct packages; no canonicalization.
         assert!(!evaluate(Ecosystem::RubyGems, "acme-internal", &p).risk);

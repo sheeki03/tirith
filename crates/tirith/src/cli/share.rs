@@ -272,6 +272,7 @@ mod tests {
 
     #[test]
     fn share_writes_to_out_path_when_given() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let input = dir.path().join("in.log");
         let out = dir.path().join("out.log");
@@ -285,6 +286,7 @@ mod tests {
 
     #[test]
     fn share_json_writes_documented_envelope_to_out_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let input = dir.path().join("in.log");
         let out = dir.path().join("out.json");
@@ -305,6 +307,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_refuses_symlinked_output_and_preserves_its_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let input = dir.path().join("in.log");
         let victim = dir.path().join("victim.log");
@@ -326,6 +329,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn share_refuses_fifo_output_without_blocking_or_replacing_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::FileTypeExt as _;

@@ -648,6 +648,7 @@ mod tests {
 
     #[test]
     fn scan_of_missing_path_exits_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A path that does not exist is a usage error → exit 2, never 1
         // (1 is reserved for a BLOCK-level finding).
         let code = scan(
@@ -763,6 +764,7 @@ mod tests {
 
     #[test]
     fn scan_max_installed_entries_out_of_range_is_usage_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         // Below the minimum.
         let too_low = scan(dir.path().to_str(), false, false, true, 10, true, true);

@@ -3436,6 +3436,7 @@ mod tests {
 
     #[test]
     fn printable_scanner_bounds_single_giant_run() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // REGRESSION (T3.8): a single long printable run with NO separator never
         // hits `flush_current`, so `captured_bytes` (only bumped on flush) used to
         // stay 0 and the in-progress `current` grew without bound. Feed several MiB

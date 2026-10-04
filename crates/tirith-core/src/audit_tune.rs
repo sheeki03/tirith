@@ -329,6 +329,7 @@ mod tests {
 
     #[test]
     fn thin_data_makes_no_suggestions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let records = n_records(10, "Block", "curl_pipe_shell", false);
         let report = analyze(&records, &[]);
         assert!(report.data_is_thin);
@@ -338,6 +339,7 @@ mod tests {
 
     #[test]
     fn exactly_min_observations_is_not_thin() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let records = n_records(MIN_OBSERVATIONS, "Allow", "shortened_url", false);
         let report = analyze(&records, &[]);
         assert!(!report.data_is_thin);
@@ -345,6 +347,7 @@ mod tests {
 
     #[test]
     fn rule_always_allowed_yields_strong_suggestion() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Always Allow, never blocked → strong.
         let records = n_records(25, "Allow", "shortened_url", false);
         let report = analyze(&records, &[]);
@@ -360,6 +363,7 @@ mod tests {
 
     #[test]
     fn rule_bypassed_via_honored_bypass_counts_as_waved_through() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A bypass is logged as Allow with bypass_honored=true.
         let records = n_records(25, "Allow", "curl_pipe_shell", true);
         let report = analyze(&records, &[]);
@@ -380,6 +384,7 @@ mod tests {
 
     #[test]
     fn rule_sometimes_blocked_is_never_suggested_for_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 20 Allow + 5 Block: the rule IS catching real things → no downgrade.
         let mut records = n_records(20, "Allow", "curl_pipe_shell", false);
         records.extend(n_records(5, "Block", "curl_pipe_shell", false));
@@ -395,6 +400,7 @@ mod tests {
 
     #[test]
     fn mostly_waved_through_yields_moderate_suggestion() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 22 Allow + 3 Warn (no Block) = 88% waved through → moderate.
         let mut records = n_records(22, "Allow", "non_standard_port", false);
         records.extend(n_records(3, "Warn", "non_standard_port", false));
@@ -409,6 +415,7 @@ mod tests {
 
     #[test]
     fn warned_but_not_allowed_rule_is_not_suggested() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // 25 Warn, never Allow/Block → not waved through, no downgrade.
         let records = n_records(25, "Warn", "shortened_url", false);
         let report = analyze(&records, &[]);
@@ -423,6 +430,7 @@ mod tests {
 
     #[test]
     fn rule_below_min_firings_is_not_suggested() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // shortened_url fires only 3× (< MIN_RULE_FIRINGS) → no suggestion.
         let mut records = n_records(3, "Allow", "shortened_url", false);
         records.extend(n_records(19, "Allow", "plain_http_to_sink", false));
@@ -438,6 +446,7 @@ mod tests {
 
     #[test]
     fn never_fired_rules_are_reported_informationally() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let records = n_records(25, "Allow", "shortened_url", false);
         let known = ["shortened_url", "curl_pipe_shell", "raw_ip_url"];
         let report = analyze(&records, &known);
@@ -455,6 +464,7 @@ mod tests {
 
     #[test]
     fn no_never_fired_suggestion_when_all_rules_fired() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let records = n_records(25, "Allow", "shortened_url", false);
         let report = analyze(&records, &["shortened_url"]);
         assert!(report.suggestions.iter().all(|s| s.kind != "never_fired"));
@@ -462,6 +472,7 @@ mod tests {
 
     #[test]
     fn never_fired_suppressed_when_unused_list_is_too_large() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Unused set > NEVER_FIRED_MAX_LIST → the note is SKIPPED.
         let records = n_records(25, "Allow", "shortened_url", false);
         let mut known: Vec<String> = (0..NEVER_FIRED_MAX_LIST + 5)
@@ -483,6 +494,7 @@ mod tests {
 
     #[test]
     fn never_fired_emitted_when_unused_list_is_small() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Exactly NEVER_FIRED_MAX_LIST unused rules — boundary, still emitted.
         let records = n_records(25, "Allow", "shortened_url", false);
         let mut known: Vec<String> = (0..NEVER_FIRED_MAX_LIST)
@@ -499,6 +511,7 @@ mod tests {
 
     #[test]
     fn strong_suggestions_sort_before_moderate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // shortened_url (strong) must sort before non_standard_port (moderate).
         let mut records = n_records(25, "Allow", "shortened_url", false);
         records.extend(n_records(22, "Allow", "non_standard_port", false));
@@ -545,6 +558,7 @@ mod tests {
 
     #[test]
     fn empty_log_is_thin_not_a_crash() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = analyze(&[], &["shortened_url"]);
         assert!(report.data_is_thin);
         assert_eq!(report.records_analyzed, 0);
@@ -552,6 +566,7 @@ mod tests {
     }
     #[test]
     fn recurring_blocks_are_reported_without_relaxation_even_with_thin_history() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for count in [MIN_RULE_FIRINGS, MIN_OBSERVATIONS] {
             let report = analyze(&n_records(count, "Block", "curl_pipe_shell", false), &[]);
             assert!(report.suggestions.is_empty());
@@ -564,6 +579,7 @@ mod tests {
 
     #[test]
     fn recurring_blocks_sort_by_blocked_checks_not_total_firings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut records = n_records(6, "Block", "curl_pipe_shell", false);
         records.extend(n_records(5, "Block", "shortened_url", false));
         records.extend(n_records(20, "Allow", "shortened_url", false));
@@ -575,6 +591,7 @@ mod tests {
 
     #[test]
     fn repeated_findings_in_a_single_check_do_not_inflate_counts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let record = verdict_record(
             "Block",
             &["curl_pipe_shell", "curl_pipe_shell", "shortened_url"],

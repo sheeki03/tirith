@@ -333,6 +333,7 @@ mod tests {
 
     #[test]
     fn privacy_unsafe_env_ids_fall_back_to_storable_uuid() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let canary = format!("ghp_canary_{}", "S".repeat(30));
         let private_scalar = format!("0x{}1", "0".repeat(63));
         for unsafe_id in [&canary, &private_scalar] {
@@ -352,6 +353,7 @@ mod tests {
 
     #[test]
     fn resolver_and_state_path_share_one_session_id_predicate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for valid in [generate_session_id(), "operator-session_1".to_string()] {
             assert!(is_valid_session_id(&valid));
             assert!(crate::session_warnings::session_state_path(&valid).is_some());
@@ -372,6 +374,7 @@ mod tests {
     /// a per-process one and the shell would lose its warning history.
     #[test]
     fn hook_built_session_ids_are_valid_and_storable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for pid in [1u32, 0x2a, 0xffff, 0x7fff_ffff, u32::MAX] {
             for _ in 0..200 {
                 let uuid = new_session_id();
@@ -386,6 +389,7 @@ mod tests {
 
     #[test]
     fn test_resolve_session_id_returns_non_empty() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Whether env var is set or not, resolve should return something
         let id = resolve_session_id();
         assert!(!id.is_empty());
@@ -410,6 +414,7 @@ mod tests {
 
     #[test]
     fn test_compute_scope_format() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let scope = compute_scope();
         // Should be "{integration}-{8_hex_chars}"
         assert!(scope.contains('-'));
@@ -421,6 +426,7 @@ mod tests {
 
     #[test]
     fn benign_fallback_scope_remains_deterministic_and_partitioned() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd_a = Path::new("/workspace/operator-project-a");
         let cwd_b = Path::new("/workspace/operator-project-b");
         let first = compute_scope_from(Some("claude-code"), Some(cwd_a));
@@ -458,6 +464,7 @@ mod tests {
 
     #[test]
     fn fallback_filename_categorizes_secret_bearing_integration_and_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("tirith");
         let integration_canary = format!("ghp_canary_{}", "I".repeat(30));
@@ -636,6 +643,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_env_session_id_priority() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Note: env_session_id uses OnceLock so we can only test the concept.
         // The actual env check is cached for the process lifetime, so we verify
         // the resolve logic indirectly.

@@ -2573,6 +2573,7 @@ mod tests {
 
     #[test]
     fn v2_rejects_empty_acquisition_and_unsafe_identifiers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let action = ProposedAction::Narrative {
             text: "diagnostic".to_string(),
         };
@@ -3224,6 +3225,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replay_store_subprocess_helper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(root) = std::env::var_os("TIRITH_TEST_RECEIPT_REPLAY_ROOT") else {
             return;
         };
@@ -3337,6 +3339,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replay_consumption_and_pruning_expire_at_equality() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let expected = projection();
         let (receipt, keys) = signed_receipt(&expected, now() - TimeDelta::hours(1), now());
         let validated = verify_receipt_v2(
@@ -3522,6 +3525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn full_store_never_evicts_a_live_receipt() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("replay");
         ensure_secure_directory(&root).unwrap();

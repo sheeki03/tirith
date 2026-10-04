@@ -1,18 +1,113 @@
 //! Shared, panic-safe isolation for tests that mutate process-global state.
 //!
-//! A [`GlobalStateGuard`] serializes environment and current-directory changes,
+//! A [`GlobalStateGuard`] takes the process-global state lock EXCLUSIVELY,
 //! installs fresh application roots, and restores the exact prior state on
 //! drop. Child processes should be configured through
 //! [`GlobalStateGuard::apply_to_command`], which starts from `env_clear()` and
 //! inherits only the isolated roots plus the small platform launch allowlist.
+//!
+//! A [`SharedStateGuard`] takes the same lock SHARED. Tests that only READ
+//! process-global state (HOME/XDG/`TIRITH_*`-based policy, trust, threat-DB or
+//! state discovery, or the cwd) hold one so they never observe another test's
+//! temporary roots: readers run concurrently with each other, but never while
+//! a [`GlobalStateGuard`] is alive.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+/// Readers ([`SharedStateGuard`]) share it; mutators ([`GlobalStateGuard`])
+/// hold it exclusively.
+static GLOBAL_STATE_LOCK: RwLock<()> = RwLock::new(());
+
+thread_local! {
+    /// Shared guards alive on this thread. Only the outermost one holds the
+    /// read lock, so nesting never re-enters the RwLock (a nested read behind
+    /// a queued writer would deadlock).
+    static SHARED_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Exclusive guards alive on this thread. A shared guard taken while this
+    /// thread already excludes everyone else is a no-op.
+    static EXCLUSIVE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Shared (read) side of the process-global test state lock.
+///
+/// Hold one for the whole test when the test (or code it calls) reads HOME,
+/// XDG/`APPDATA` roots, `TIRITH_*` overrides or the cwd without changing them.
+/// While it is alive no [`GlobalStateGuard`] can install or restore isolated
+/// roots, so discovery sees one consistent environment. Nested shared guards
+/// on one thread and a shared guard taken under this thread's own
+/// [`GlobalStateGuard`] are allowed. Taking a [`GlobalStateGuard`] while this
+/// thread holds a shared guard panics instead of deadlocking.
+pub struct SharedStateGuard {
+    _lock: Option<RwLockReadGuard<'static, ()>>,
+    // Thread-local depth accounting requires dropping on the acquiring thread.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl SharedStateGuard {
+    /// Wait until no [`GlobalStateGuard`] is alive, then hold the lock shared.
+    /// Poison-tolerant like [`GlobalStateGuard::new`].
+    pub fn acquire() -> Self {
+        let lock = if EXCLUSIVE_DEPTH.with(Cell::get) > 0 || SHARED_DEPTH.with(Cell::get) > 0 {
+            None
+        } else {
+            Some(
+                GLOBAL_STATE_LOCK
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        };
+        SHARED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self {
+            _lock: lock,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for SharedStateGuard {
+    fn drop(&mut self) {
+        SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Hold the shared side of the process-global test state lock; see
+/// [`SharedStateGuard`].
+pub fn shared_global_state() -> SharedStateGuard {
+    SharedStateGuard::acquire()
+}
+
+/// Exclusive side; tracks this thread's ownership for [`SharedStateGuard`].
+struct ExclusiveLock {
+    _lock: RwLockWriteGuard<'static, ()>,
+}
+
+impl ExclusiveLock {
+    fn acquire() -> Self {
+        assert_eq!(
+            SHARED_DEPTH.with(Cell::get),
+            0,
+            "GlobalStateGuard::new() on a thread that holds a SharedStateGuard \
+             would deadlock: take only the GlobalStateGuard in this test"
+        );
+        let lock = GLOBAL_STATE_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        EXCLUSIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        EXCLUSIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 const CHILD_PASSTHROUGH_ENV: &[&str] = &[
     "PATH",
@@ -130,10 +225,11 @@ impl IsolatedRoots {
 
 type RestoreCallback = Box<dyn FnOnce() + 'static>;
 
-/// Owns the process-global test lock and restores all state even during unwind.
+/// Owns the process-global test lock exclusively and restores all state even
+/// during unwind.
 ///
 /// Construction is fallible so a missing original cwd or an unusable temp root
-/// cannot turn into a half-installed environment. The mutex is poison-tolerant:
+/// cannot turn into a half-installed environment. The lock is poison-tolerant:
 /// a previous panicking test does not cascade into every later test.
 pub struct GlobalStateGuard {
     temp_root: Option<tempfile::TempDir>,
@@ -142,16 +238,18 @@ pub struct GlobalStateGuard {
     previous_cwd: PathBuf,
     child_env: Vec<(OsString, OsString)>,
     after_restore: Vec<RestoreCallback>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: ExclusiveLock,
 }
 
 impl GlobalStateGuard {
-    /// Acquire the process-global lock and install a fully isolated environment
-    /// plus a fresh cwd.
+    /// Acquire the process-global lock exclusively and install a fully
+    /// isolated environment plus a fresh cwd.
+    ///
+    /// # Panics
+    /// When the calling thread holds a [`SharedStateGuard`] (that would
+    /// otherwise deadlock).
     pub fn new() -> io::Result<Self> {
-        let lock = GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = ExclusiveLock::acquire();
         let previous_cwd = std::env::current_dir()?;
         let temp_root = tempfile::Builder::new()
             .prefix("tirith-test-state-")
@@ -337,7 +435,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+    use std::time::Duration;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     const CHILD_PROBE: &str = "TIRITH_TEST_SUPPORT_CHILD_PROBE";
@@ -440,7 +540,7 @@ mod tests {
         let _serial = test_lock();
         let joined = std::thread::spawn(|| {
             let _lock = GLOBAL_STATE_LOCK
-                .lock()
+                .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             panic!("poison the global state lock");
         })
@@ -448,6 +548,121 @@ mod tests {
         assert!(joined.is_err());
         let guard = GlobalStateGuard::new().expect("poison-tolerant guard");
         assert!(guard.roots().home.is_dir());
+        drop(guard);
+        let _shared = SharedStateGuard::acquire();
+    }
+
+    /// The isolation contract readers rely on: while a SharedStateGuard is
+    /// alive, no GlobalStateGuard can install its roots, so HOME/cwd seen by a
+    /// discovery-reading test cannot change underneath it.
+    #[test]
+    fn exclusive_guard_waits_for_every_shared_reader() {
+        let _serial = test_lock();
+        let home_before = std::env::var_os("HOME");
+        let cwd_before = std::env::current_dir().expect("cwd");
+        let shared = SharedStateGuard::acquire();
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let guard = GlobalStateGuard::new().expect("writer guard");
+            installed_tx
+                .send(guard.roots().home.clone())
+                .expect("report install");
+            release_rx.recv().expect("release writer");
+            drop(guard);
+        });
+
+        // The writer must still be blocked: state the reader sees is stable.
+        for _ in 0..20 {
+            assert!(
+                installed_rx
+                    .recv_timeout(Duration::from_millis(10))
+                    .is_err(),
+                "GlobalStateGuard installed roots while a SharedStateGuard was alive"
+            );
+            assert_eq!(std::env::var_os("HOME"), home_before);
+            assert_eq!(std::env::current_dir().expect("cwd"), cwd_before);
+        }
+        drop(shared);
+        let isolated_home = installed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer proceeds once the reader is gone");
+        assert_eq!(std::env::var_os("HOME"), Some(isolated_home.into()));
+        release_tx.send(()).expect("release");
+        writer.join().expect("writer thread");
+        assert_eq!(std::env::var_os("HOME"), home_before);
+    }
+
+    /// A reader that arrives while a GlobalStateGuard is alive waits for the
+    /// exact prior state to be restored instead of reading the temporary roots.
+    #[test]
+    fn shared_reader_waits_for_exclusive_restore() {
+        let _serial = test_lock();
+        let home_before = std::env::var_os("HOME");
+        let guard = GlobalStateGuard::new().expect("writer guard");
+        let isolated_home = guard.roots().home.clone();
+
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _shared = SharedStateGuard::acquire();
+            seen_tx.send(std::env::var_os("HOME")).expect("report HOME");
+        });
+        assert!(
+            seen_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "SharedStateGuard was granted while a GlobalStateGuard was alive"
+        );
+        assert_eq!(std::env::var_os("HOME"), Some(isolated_home.into()));
+        drop(guard);
+        let seen = seen_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("reader proceeds after restore");
+        assert_eq!(seen, home_before, "reader observed a temporary HOME");
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn shared_readers_run_concurrently() {
+        let _serial = test_lock();
+        let barrier = Arc::new(Barrier::new(2));
+        let other = Arc::clone(&barrier);
+        let _mine = SharedStateGuard::acquire();
+        let peer = std::thread::spawn(move || {
+            let _theirs = SharedStateGuard::acquire();
+            // Both readers hold the lock at this rendezvous; a second
+            // exclusive-style lock would hang here.
+            other.wait();
+        });
+        barrier.wait();
+        peer.join().expect("peer reader");
+    }
+
+    #[test]
+    fn nested_and_under_exclusive_shared_guards_do_not_deadlock() {
+        let _serial = test_lock();
+        {
+            let _outer = SharedStateGuard::acquire();
+            let _inner = shared_global_state();
+        }
+        let guard = GlobalStateGuard::new().expect("writer guard");
+        let home = std::env::var_os("HOME");
+        {
+            let _shared_under_own_writer = SharedStateGuard::acquire();
+            assert_eq!(std::env::var_os("HOME"), home);
+        }
+        drop(guard);
+        // Depth accounting returned to zero: a fresh exclusive guard works.
+        drop(GlobalStateGuard::new().expect("second writer guard"));
+    }
+
+    #[test]
+    fn exclusive_guard_under_a_shared_guard_panics_instead_of_deadlocking() {
+        let _serial = test_lock();
+        let shared = SharedStateGuard::acquire();
+        let result = std::panic::catch_unwind(|| GlobalStateGuard::new().map(drop));
+        assert!(result.is_err(), "nested exclusive acquisition must panic");
+        drop(shared);
+        drop(GlobalStateGuard::new().expect("lock is not left poisoned or held"));
     }
 
     #[test]

@@ -126,6 +126,7 @@ mod tests {
 
     #[test]
     fn relayed_or_unlisted_loopback_peers_are_not_dropped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // WSL2 NAT relays a Windows browser through /init (uid 0); mirrored
         // mode and WSL1 leave no row for the client in this kernel's tables.
         let client = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50000);
@@ -156,6 +157,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_connection_from_this_account_is_accepted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (accepted, _) = listener.accept().unwrap();

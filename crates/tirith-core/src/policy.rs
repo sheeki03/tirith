@@ -4891,6 +4891,7 @@ mod tests {
 
     #[test]
     fn policy_diagnostic_capture_drains_without_ending_the_sink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let capture = PolicyDiagnosticCapture::start();
         policy_diagnostic!("first diagnostic {}", "attacker-path");
         assert_eq!(
@@ -4905,6 +4906,7 @@ mod tests {
 
     #[test]
     fn policy_diagnostic_capture_monotonically_unions_frozen_dlp_plans() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let first = "C02_FIRST_POLICY_DIAGNOSTIC_CANARY";
         let second = "C02_SECOND_POLICY_DIAGNOSTIC_CANARY";
         let _capture = PolicyDiagnosticCapture::start();
@@ -4929,6 +4931,7 @@ mod tests {
 
     #[test]
     fn nested_silent_capture_retains_dlp_without_forwarding_diagnostics() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let capture = PolicyDiagnosticCapture::start();
         freeze_captured_policy_dlp_patterns(&["outer-secret".into()]);
         policy_diagnostic!("outer diagnostic");
@@ -8086,6 +8089,7 @@ mod curl_client_authority_tests {
     use super::*;
     #[test]
     fn curl_dns_trust_matching_uses_components_without_changing_raw_api() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let raw = "http://user:secret@0x7f.0x:8080/path?q=1#f";
         let parsed = crate::extract::parse_curl_destination(raw);
         for pattern in ["127.0.0.0", "http://user:secret@127.0.0.0:8080/path?q=1#f"] {

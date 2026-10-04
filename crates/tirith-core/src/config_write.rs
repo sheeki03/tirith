@@ -574,6 +574,7 @@ mod tests {
 
     #[test]
     fn a_committed_permit_publishes_the_exact_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         let permit =
@@ -588,6 +589,7 @@ mod tests {
 
     #[test]
     fn authorized_commit_consumes_both_exact_permits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         let write_permit =
@@ -605,6 +607,7 @@ mod tests {
 
     #[test]
     fn expired_authorization_at_the_final_seam_does_not_publish() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         std::fs::write(&path, b"safe: false\n").expect("write original");
@@ -635,6 +638,7 @@ mod tests {
 
     #[test]
     fn authorized_commit_rejects_a_task_permit_for_another_operation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         let other = root.path().join("other.yaml");
@@ -659,6 +663,7 @@ mod tests {
 
     #[test]
     fn authorized_commit_rejects_a_filesystem_permit_for_another_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let authorized_path = root.path().join("authorized.yaml");
         let actual_path = root.path().join("actual.yaml");
@@ -682,6 +687,7 @@ mod tests {
 
     #[test]
     fn from_prepared_rejects_a_capability_for_another_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let declared = root.path().join("declared.yaml");
         let actual = root.path().join("actual.yaml");
@@ -707,6 +713,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authorized_commit_rejects_an_ordinary_parent_directory_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let config = root.path().join(".tirith");
         let displaced = root.path().join(".tirith-displaced");
@@ -740,6 +747,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authorized_commit_rechecks_visible_parent_at_final_publication_seam() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let config = root.path().join(".tirith");
         let displaced = root.path().join(".tirith-displaced");
@@ -778,6 +786,7 @@ mod tests {
 
     #[test]
     fn authorized_rmw_refuses_a_changed_present_preimage_at_publication_seam() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         std::fs::write(&path, b"old\n").unwrap();
@@ -812,6 +821,7 @@ mod tests {
 
     #[test]
     fn authorized_rmw_refuses_when_an_absent_preimage_appears_at_publication_seam() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         let destination = ContainedAtomicFile::prepare(root.path(), &path, false).unwrap();
@@ -848,6 +858,7 @@ mod tests {
 
     #[test]
     fn exact_operation_projection_binds_the_observed_preimage() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let first_root = temp_root();
         let second_root = temp_root();
         let first_path = first_root.path().join("policy.yaml");
@@ -891,6 +902,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authorized_commit_never_reports_success_when_publication_disappears_from_view() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let config = root.path().join(".tirith");
         let displaced = root.path().join(".tirith-displaced");
@@ -932,6 +944,7 @@ mod tests {
 
     #[test]
     fn authorized_commit_rejects_every_exact_operation_mutation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         struct Mutation {
             label: &'static str,
             other_root: bool,
@@ -1033,6 +1046,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_destinations_are_rejected_instead_of_aliasing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -1061,6 +1075,7 @@ mod tests {
     /// destination path, which is what this must not forward.
     #[test]
     fn a_rendered_error_never_carries_the_destination_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         std::fs::write(&path, b"existing\n").expect("seed");
@@ -1081,6 +1096,7 @@ mod tests {
 
     #[test]
     fn a_permit_refuses_content_it_was_not_issued_for() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         let permit =
@@ -1094,6 +1110,7 @@ mod tests {
 
     #[test]
     fn dropping_a_permit_publishes_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         {
@@ -1106,6 +1123,7 @@ mod tests {
 
     #[test]
     fn debug_prints_digests_and_never_the_path_or_the_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("secret-name.yaml");
         let permit =
@@ -1119,6 +1137,7 @@ mod tests {
 
     #[test]
     fn a_no_clobber_permit_refuses_an_existing_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = temp_root();
         let path = root.path().join("policy.yaml");
         std::fs::write(&path, b"original\n").expect("seed");

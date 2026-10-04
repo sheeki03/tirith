@@ -845,6 +845,7 @@ where
 mod tests {
     #[test]
     fn publication_authorization_binds_exact_bytes_and_refusal_preserves_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("policy.yaml");
         std::fs::write(&path, "old\n").unwrap();

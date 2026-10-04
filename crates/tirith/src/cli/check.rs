@@ -3022,6 +3022,7 @@ mod receipt_interaction_tests {
     #[cfg(unix)]
     #[test]
     fn terminal_mode_guard_restores_full_mode_on_restore_and_unwind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::FromRawFd as _;
 
         let mut master = -1;
@@ -3565,6 +3566,7 @@ mod contextual_display_tests {
 
     #[test]
     fn display_cooldown_requires_every_client_authority() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let finding = finding();
         let urls = tirith_core::extract::extract_urls(
             "curl http://0x7f.0x/path; wget http://0x7f.0x/path",

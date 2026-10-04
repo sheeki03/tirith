@@ -815,6 +815,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn receive_deadline_keeps_the_socket_usable_for_http_408() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An unfinished head is cut at the header deadline; an unfinished
         // body at the whole-request deadline.
         for (request, initially_nonblocking, minimum, maximum) in [
@@ -857,6 +858,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nonblocking_accepted_socket_sends_the_complete_response_under_backpressure() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::AsRawFd;
 
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1086,6 +1088,7 @@ mod tests {
 
     #[test]
     fn head_and_body_in_one_segment_and_a_head_in_many_segments_both_parse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for chunks in [
             vec!["POST /api/plans HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"],
             vec!["POST /api/plans HTTP/1.1\r\nHo", "st: h\r\nContent-Type: application/json\r\nContent-Length: 2\r", "\n\r", "\n{", "}"],
@@ -1146,6 +1149,7 @@ mod tests {
     // and a repeated header keeps its first value.
     #[test]
     fn the_report_rules_return_after_the_head() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
@@ -1219,6 +1223,7 @@ mod tests {
     // target becomes origin-form and its authority is kept for the host check.
     #[test]
     fn report_absolute_form_targets_become_origin_form_with_their_authority() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (target, path, authority) in [
             ("http://127.0.0.1:9/?token=x", "/?token=x", "127.0.0.1:9"),
             ("HTTP://localhost/a/b", "/a/b", "localhost"),
@@ -1260,6 +1265,7 @@ mod tests {
 
     #[test]
     fn report_requests_know_their_version_persistence_and_possible_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let r = |head: &str| report(&format!("{head}\r\n\r\n")).unwrap();
         let plain = r("GET / HTTP/1.1\r\nHost: h");
         assert!(!plain.http_1_0 && plain.wants_keep_alive() && !plain.may_have_body);
@@ -1284,6 +1290,7 @@ mod tests {
     // other: the bytes after a head are carried to the next read.
     #[test]
     fn report_reads_pipelined_requests_in_order_through_the_carry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {

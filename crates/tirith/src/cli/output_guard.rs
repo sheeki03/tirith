@@ -847,6 +847,7 @@ mod tests {
 
     #[test]
     fn denied_profile_write_creates_neither_parent_nor_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("missing-profile-dir");
         let profile = parent.join("config.nu");

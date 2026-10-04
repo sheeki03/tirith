@@ -10036,6 +10036,7 @@ mod tests {
 
     #[test]
     fn wrappers_and_shell_forms_resolve_while_unproven_package_runners_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             only("sudo env FOUNDRY_PROFILE=prod cast send 0xabc").write_mode,
             Web3WriteMode::StateChanging
@@ -10082,6 +10083,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn literal_runner_prefix_options_are_bounded_and_cwd_aware() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         let nested = root.join("packages/app");
@@ -10143,6 +10145,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exact_local_bin_paths_are_trusted_beneath_the_observed_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let nested = project.join("packages/app");
@@ -10184,6 +10187,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exact_local_runners_reject_executable_bootstrap_environment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let context = reviewed_runner_context(dir.path(), "cast");
         for command in [
@@ -10216,6 +10220,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exact_local_shims_require_a_proven_shebang_interpreter() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -10275,6 +10280,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn yarn_exact_local_inspects_bounded_no_follow_bootstrap_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -10552,6 +10558,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_project_root_cannot_establish_runner_provenance() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -10763,6 +10770,7 @@ mod tests {
 
     #[test]
     fn foundry_eth_private_key_environment_is_privacy_safe_and_honors_unset() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let leading_secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         for command in [
             format!(
@@ -11094,6 +11102,7 @@ mod tests {
 
     #[test]
     fn foundry_solana_anchor_config_readers_are_static_and_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("foundry.toml"),
@@ -11174,6 +11183,7 @@ mod tests {
 
     #[test]
     fn foundry_alias_resolution_is_capped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let aliases = (0..=super::super::config::MAX_ALIAS_RESOLUTIONS)
             .map(|index| format!("alias{index} = 'https://rpc{index}.example'"))
@@ -11202,6 +11212,7 @@ mod tests {
 
     #[test]
     fn malformed_explicit_rpc_stays_unresolved_ahead_of_static_config() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("foundry.toml"),
@@ -11233,6 +11244,7 @@ mod tests {
 
     #[test]
     fn injected_selector_maps_and_values_are_bounded_and_secret_safe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("foundry.toml"),
@@ -11280,6 +11292,7 @@ mod tests {
 
     #[test]
     fn foundry_profiles_inherit_the_default_profile_rpc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Foundry layers every profile over `[profile.default]`, so a profile
         // that does not restate `eth_rpc_url` still resolves to the default
         // endpoint. Reporting the localhost tool-default instead would call a
@@ -11321,6 +11334,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn config_symlink_fifo_oversize_and_malformed_are_typed_gaps() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::{symlink, FileTypeExt as _};
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.toml");
@@ -11379,6 +11393,7 @@ mod tests {
 
     #[test]
     fn non_web3_and_fully_explicit_commands_do_not_need_config_io() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.toml");
         let mut context = Web3ParseContextV2::for_cwd(dir.path());
@@ -11403,6 +11418,7 @@ mod tests {
 
     #[test]
     fn non_web3_runner_children_never_trigger_provenance_filesystem_reads() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // Any runner provenance walk would reject this non-file manifest.
         // Benign children must be discarded before reaching that seam.
@@ -11454,6 +11470,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn package_runner_child_flags_are_preserved_after_exact_boundary() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let context = reviewed_runner_context(dir.path(), "forge");
         for command in [
@@ -11557,6 +11574,7 @@ mod tests {
 
     #[test]
     fn untrusted_package_specs_and_runner_provenance_never_resolve_as_web3_tools() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for command in [
             "npx @evil/cast send 0xabc",
             "npx ./cast send 0xabc",
@@ -11634,6 +11652,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn package_runner_npmrc_provenance_is_bounded_and_no_follow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("foundry.toml"),
@@ -11703,6 +11722,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn package_runner_npmrc_symlink_is_never_followed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -11744,6 +11764,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_effective_config_layers_are_bounded_and_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let runner_root = project.join("nested");
@@ -11831,6 +11852,7 @@ mod tests {
 
     #[test]
     fn npm_missing_home_and_filesystem_free_defaults_are_not_complete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let missing_home = parse_web3_commands(
             "npx cast balance 0xabc",
@@ -11862,6 +11884,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_precedence_trust_settings_and_local_bins_are_sound() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let home = dir.path().join("home");
@@ -11990,6 +12013,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_project_bins_and_explicit_package_selectors_precede_direct_bin_trust() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -12025,6 +12049,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_workspace_root_and_first_ancestor_bin_are_both_authoritative() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let leaf = root.join("packages/app");
@@ -12082,6 +12107,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_bin_declaration_global_fallback_and_custom_runtime_knobs_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -12170,6 +12196,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_prefix_coercion_and_empty_environment_values_preserve_typed_precedence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -12259,6 +12286,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn npm_prefix_keeps_process_cwd_while_tool_cwd_flags_override_stale_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -12428,6 +12456,7 @@ mod tests {
 
     #[test]
     fn privilege_wrappers_taint_ambient_environment_cwd_and_config() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("foundry.toml");
         fs::write(
@@ -12468,6 +12497,7 @@ mod tests {
 
     #[test]
     fn static_cd_flows_across_and_and_uncertain_cd_taints_following_facts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -12576,6 +12606,7 @@ mod tests {
 
     #[test]
     fn effective_environment_clear_unset_set_and_chdir_precede_lower_sources() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -12647,6 +12678,7 @@ mod tests {
 
     #[test]
     fn leading_foundry_rpc_alias_beats_profile_rpc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("foundry.toml"),
@@ -12727,6 +12759,7 @@ mod tests {
 
     #[test]
     fn solana_state_change_requires_resolved_default_keypair() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let missing = parse("solana --url devnet program deploy p.so");
         assert!(missing.commands[0]
             .completeness
@@ -12819,6 +12852,7 @@ mod tests {
 
     #[test]
     fn build_and_query_operations_project_only_selectors_they_use() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let malformed = dir.path().join("malformed.toml");
         fs::write(&malformed, "[broken\n").unwrap();
@@ -12912,6 +12946,7 @@ mod tests {
 
     #[test]
     fn selector_caps_are_applied_before_context_projection() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         for index in 0..=MAX_CONTEXT_SELECTORS {
             context.environment.insert(
@@ -13071,6 +13106,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn package_selectors_and_scripts_remain_unresolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let context = reviewed_runner_context(dir.path(), "hardhat");
         for command in [
@@ -13186,6 +13222,7 @@ mod tests {
 
     #[test]
     fn anchor_deploy_explicit_and_forwarded_config_precedence_is_stable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Anchor.toml"),
@@ -13402,6 +13439,7 @@ mod tests {
 
     #[test]
     fn exec_clear_and_home_xdg_changes_rederive_config_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
@@ -13601,6 +13639,7 @@ mod tests {
 
     #[test]
     fn pipeline_background_and_assignment_only_cwd_flow_is_shell_correct() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -13794,6 +13833,7 @@ mod tests {
 
     #[test]
     fn persistent_environment_mutations_are_modeled_or_gap_explicitly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         context.environment.insert(
             "ETH_RPC_URL".to_string(),
@@ -14114,6 +14154,7 @@ mod tests {
 
     #[test]
     fn posix_functions_emit_facts_and_share_bounded_current_shell_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for command in [
             "deploy() { cast send 0xabc --rpc-url https://direct-function.example; }; deploy",
             "deploy() { cast send 0xabc --rpc-url https://transitive-function.example; }; outer() { time -p -- deploy; }; outer",
@@ -14216,6 +14257,7 @@ mod tests {
 
     #[test]
     fn cwd_options_cdpath_and_branch_merges_are_sound_or_tainted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -14300,6 +14342,7 @@ mod tests {
 
     #[test]
     fn solana_address_is_a_local_default_signer_read_without_implicit_rpc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("solana.yml");
         fs::write(
@@ -14481,6 +14524,7 @@ mod tests {
 
     #[test]
     fn anchor_config_unknown_signer_uri_is_unresolved_and_authority_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Anchor.toml"),
@@ -14518,6 +14562,7 @@ mod tests {
 
     #[test]
     fn anchor_cluster_selector_is_bounded_before_retention_and_round_trips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let oversized = format!("https://rpc.example/{}", "x".repeat(MAX_SELECTOR_BYTES));
         fs::write(
@@ -14552,6 +14597,7 @@ mod tests {
 
     #[test]
     fn rpc_path_digest_truncation_taints_facts_and_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Trusted path prefixes are segment-bound: `/ssss` must not match a
         // sibling such as `/ssssuffix`. Keep a complete matching segment while
         // retaining a path long enough to exercise digest truncation/privacy.
@@ -14628,6 +14674,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardhat_typescript_config_is_never_opened_or_executed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("hardhat.config.ts");
         let status = std::process::Command::new("mkfifo")
@@ -14685,6 +14732,7 @@ mod tests {
 
     #[test]
     fn shared_fact_free_work_and_expansion_budgets_exhaust_deterministically() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let context = Web3ParseContextV2::without_filesystem();
 
         let leaf = std::iter::repeat_n("true", MAX_SHELL_SEGMENTS)
@@ -14748,6 +14796,7 @@ mod tests {
 
     #[test]
     fn parser_output_with_max_matchers_stays_inside_bounded_decoder() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         context.trusted_rpc_path_prefixes = Some(
             (0..MAX_TRUSTED_RPC_PATH_MATCHERS)
@@ -15082,6 +15131,7 @@ mod tests {
 
     #[test]
     fn temporary_function_assignments_apply_then_restore() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         context.environment.insert(
             "ETH_RPC_URL".to_string(),
@@ -15115,6 +15165,7 @@ mod tests {
 
     #[test]
     fn brace_groups_share_function_state_while_subshells_isolate_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let brace = parse(
             "{ deploy() { cast send 0xabc --rpc-url https://brace-state.example; }; }; deploy",
         );
@@ -15166,6 +15217,7 @@ mod tests {
 
     #[test]
     fn parenthesized_function_bodies_restore_caller_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         context.environment.insert(
             "ETH_RPC_URL".to_string(),
@@ -15199,6 +15251,7 @@ mod tests {
 
     #[test]
     fn trailing_background_inside_functions_never_commits_shell_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut context = Web3ParseContextV2::without_filesystem();
         context.environment.insert(
             "ETH_RPC_URL".to_string(),

@@ -1038,6 +1038,7 @@ mod tests {
 
     #[test]
     fn retained_empty_hook_preserves_empty_input_compatibility() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("empty-hook");
         std::fs::write(&path, b"").unwrap();
@@ -1055,6 +1056,7 @@ mod tests {
 
     #[test]
     fn retained_hook_rejects_identical_replacement_while_original_handle_is_live() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("hook");
         let replacement = root.path().join("replacement");
@@ -1067,6 +1069,7 @@ mod tests {
 
     #[test]
     fn retained_hook_detects_or_excludes_in_place_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("hook");
         std::fs::write(&path, b"before").unwrap();
@@ -1090,6 +1093,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_invocation_alias_and_executable_permission_changes_refuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::{symlink, PermissionsExt};
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");

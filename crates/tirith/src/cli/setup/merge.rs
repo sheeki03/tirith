@@ -2047,6 +2047,7 @@ mod tests {
 
     #[test]
     fn mcp_json_vscode_servers_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         merge_mcp_json_with_key(
@@ -2068,6 +2069,7 @@ mod tests {
 
     #[test]
     fn mcp_json_vscode_preserves_existing_servers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         fs::write(
@@ -2093,6 +2095,7 @@ mod tests {
 
     #[test]
     fn mcp_jsonc_preserves_comments_and_unrelated_entries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.jsonc");
         let original = r#"{
@@ -2128,6 +2131,7 @@ mod tests {
 
     #[test]
     fn mcp_jsonc_force_replaces_only_managed_value() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.jsonc");
         fs::write(
@@ -2160,6 +2164,7 @@ mod tests {
 
     #[test]
     fn mcp_jsonc_rejects_duplicate_effective_server_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.jsonc");
         fs::write(&path, r#"{"mcp": {}, "m\u0063p": {}}"#).unwrap();
@@ -2178,6 +2183,7 @@ mod tests {
 
     #[test]
     fn mcp_jsonc_rejects_duplicate_escaped_server_name() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.jsonc");
         fs::write(&path, r#"{"mcp": {"tirith": {}, "t\u0069rith": {}}}"#).unwrap();
@@ -2196,6 +2202,7 @@ mod tests {
 
     #[test]
     fn mcp_jsonc_dry_run_does_not_create_config() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing").join("mcp.jsonc");
 
@@ -2219,6 +2226,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mcp_jsonc_repairs_private_mode_when_content_is_current() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2259,6 +2267,7 @@ mod tests {
 
     #[test]
     fn hooks_json_creates_new_file_with_version() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let entry = json!({"command": "hooks/tirith-hook.sh", "type": "command"});
@@ -2281,6 +2290,7 @@ mod tests {
 
     #[test]
     fn hooks_json_skip_if_identical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         let entry = json!({"command": "hooks/tirith-hook.sh"});
@@ -2310,6 +2320,7 @@ mod tests {
 
     #[test]
     fn hooks_json_drift_error_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         merge_hooks_json(
@@ -2338,6 +2349,7 @@ mod tests {
 
     #[test]
     fn hooks_json_preserves_other_hooks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
         fs::write(
@@ -2364,6 +2376,7 @@ mod tests {
 
     #[test]
     fn claude_settings_creates_new() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2377,6 +2390,7 @@ mod tests {
 
     #[test]
     fn claude_settings_preserves_other_matchers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(
@@ -2394,6 +2408,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_creates_managed_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2407,6 +2422,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_skip_if_block_exists() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
@@ -2417,6 +2433,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_does_not_trust_marker_substring() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(
@@ -2440,6 +2457,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_does_not_trust_exact_block_in_ineffective_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let managed = vscode_managed_block(
             "// BEGIN tirith-hooks",
             "// END tirith-hooks",
@@ -2474,6 +2492,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_rejects_unpaired_or_drifted_managed_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(&path, "{\n  // BEGIN tirith-hooks\n}\n").unwrap();
@@ -2497,6 +2516,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_rejects_competing_hooks_key_beside_exact_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         merge_vscode_settings(&path, "hooks/tirith-hook.sh", false, false).unwrap();
@@ -2513,6 +2533,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_detects_inline_and_escaped_effective_hooks_keys() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for original in [
             "{ \"hooks\": {} }\n",
             "{ \"ho\\u006fks\": {} }\n",
@@ -2532,6 +2553,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_ignores_hooks_text_inside_comments_and_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(
@@ -2545,6 +2567,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_hard_error_on_existing_hooks_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(&path, "{\n  \"hooks\": {\n    \"PreToolUse\": []\n  }\n}\n").unwrap();
@@ -2556,6 +2579,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_preserves_content_outside_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let original = "{\n  \"editor.fontSize\": 14\n}\n";
@@ -2570,6 +2594,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_preserves_jsonc_features() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // JSONC content: comments, trailing comma, URL string with "https://"
@@ -2615,6 +2640,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_inserts_after_trailing_block_comment_without_double_comma() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let original = "{\n  \"editor.fontSize\": 14,\n  /* keep this trailing comment */\n}\n";
@@ -2634,6 +2660,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_uses_root_close_not_brace_in_trailing_comment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let original = "{\n  \"editor.fontSize\": 14\n}\n// trailing documentation: }\n";
@@ -2653,6 +2680,7 @@ mod tests {
 
     #[test]
     fn vscode_settings_force_preserves_jsonc_outside_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2708,6 +2736,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_creates_new() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2733,6 +2762,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_preserves_other_matchers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(
@@ -2756,6 +2786,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_preserves_other_hooks_in_same_matcher() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Existing run_shell_command matcher with a non-tirith hook
@@ -2787,6 +2818,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_skip_if_identical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2804,6 +2836,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_drift_error_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2827,6 +2860,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_force_replaces_only_tirith_hook() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Matcher with tirith hook + another hook
@@ -2858,6 +2892,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_multiple_matchers_error_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Two run_shell_command matcher entries
@@ -2879,6 +2914,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_multiple_matchers_force_deduplicates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Two run_shell_command matchers, both with a tirith hook
@@ -2910,6 +2946,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_force_consolidates_mixed_hooks_from_duplicates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Two run_shell_command matchers: first has tirith + other hook, second has another hook
@@ -2952,6 +2989,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_force_handles_malformed_matcher_hooks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Two matchers: first has hooks=null (malformed), second has a tirith hook
@@ -2982,6 +3020,7 @@ mod tests {
 
     #[test]
     fn gemini_settings_dry_run_no_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
@@ -2997,6 +3036,7 @@ mod tests {
 
     #[test]
     fn claude_inner_preserves_other_hooks_in_bash_matcher() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         // Bash matcher with a non-tirith hook
@@ -3019,6 +3059,7 @@ mod tests {
 
     #[test]
     fn claude_inner_idempotent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 

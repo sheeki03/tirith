@@ -385,6 +385,7 @@ mod tests {
 
     #[test]
     fn wrapped_curl_cluster_uses_resolved_client_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, shell) in [
             (
                 "env MODE=safe curl -skL https://example.com/archive.tgz",
@@ -412,6 +413,7 @@ mod tests {
 
     #[test]
     fn plain_http_loopback_suppressed_regardless_of_host_casing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PlainHttpToSink must NOT fire for a loopback host in sink context. The
         // url crate already lowercases the host of a Standard http URL, but the
         // suppression now relies on is_loopback_host being case-insensitive
