@@ -54,7 +54,7 @@ tirith policy team enrollment sync --expected-connection-id CONNECTION_UUID --ex
 
 Activation and sync do not send Applied reports. Commands read the enrolled local cache and never contact the team server. Repository restrictions and the ordinary local overlays still apply.
 
-Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again. The activation binds the file's index on its volume and, on Linux, its birth time, so a replacement that reuses a freed inode number (as ext4 does) is still a different file. On macOS, setting the file's modification time to before its creation time also moves its birth time; tirith does not bind birth time there, so this does not matter.
+Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again. The activation binds the file's index on its volume and, on glibc Linux builds, its birth time, so a replacement that reuses a freed inode number (as ext4 does) is still a different file. Musl Linux builds (such as the aarch64 musl release) and Android bind the index alone, because the Rust standard library reads no birth time there. On macOS, setting the file's modification time to before its creation time also moves its birth time; tirith does not bind birth time there, so this does not matter.
 
 ### Automatic refresh and the offline grace period
 

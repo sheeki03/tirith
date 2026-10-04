@@ -93,7 +93,10 @@ added. Ordinary browser and `curl` requests are not affected. See
 - Read-only views (state, integrations, activity, history, freshness,
   operation status and the job list) never contact a policy server. The
   effective-policy view and applying or undoing a change resolve the full
-  policy, which can.
+  policy, which can. With a legacy remote policy server configured, the
+  exceptions list and explain also resolve the full policy when a local policy
+  input has changed since the cached snapshot or no full resolution has
+  finished yet, so they can contact it too.
 - Keep the URL private. On Linux, connections from another ordinary account
   are dropped before they are served. Other platforms have no API for the owner
   of a loopback connection. Root-owned clients and clients missing from the

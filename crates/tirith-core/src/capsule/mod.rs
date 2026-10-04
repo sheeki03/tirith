@@ -9,7 +9,7 @@
 //! OS-specific backends (Landlock/seccomp on Linux, Seatbelt on macOS,
 //! AppContainer/Job Objects on Windows) arrive in E2-E4; the async egress broker
 //! that funnels allow-listed traffic lives in the CLI crate
-//! (`tirith::cli::capsule_proxy`) because it needs `tokio`/`hyper`, and
+//! (`tirith::cli::capsule_proxy`) because it needs `tokio`, and
 //! `tirith-core` stays async-free.
 //!
 //! The Windows backend (E4) is split: the portable, host-testable planning layer

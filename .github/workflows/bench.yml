@@ -48,11 +48,13 @@ jobs:
       - name: Enforce absolute benchmark budgets
         run: ./scripts/check-bench-budgets.sh bench-output.txt
 
-      # Allocation regression gate. The ceilings are plain committed numbers
-      # (about 25% above the measured ubuntu-latest values), so a version bump,
-      # a new toolchain or a runner image refresh cannot fail this step; only
-      # real allocation growth can. Raise a ceiling deliberately when growth is
-      # intended. Derivation: crates/tirith-core/benches/resource_ceilings.json.
+      # Allocation regression gate. The ceilings are plain committed numbers,
+      # about 25% above counts measured on aarch64 (macOS and Linux, rustc
+      # 1.98); they have not yet been confirmed on ubuntu-latest x86_64. No
+      # hashes or runner pins are checked, but a new toolchain or std can move
+      # allocation counts, so re-measure and raise a ceiling deliberately when
+      # that happens or when growth is intended. Derivation:
+      # crates/tirith-core/benches/resource_ceilings.json.
       - name: Enforce allocation ceilings
         run: >-
           cargo bench --locked -p tirith-core --bench resource_counts --

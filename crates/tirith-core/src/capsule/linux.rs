@@ -318,7 +318,8 @@ pub fn apply_containment(
 /// caller must keep `bound_read_root_fd` in `HandlePolicy::extra_unix_fds`, must
 /// have entered that same directory with `fchdir`, and must supply its observed
 /// canonical path as `bound_read_root`. This closes the final pathname swap
-/// window for quarantine-backed package installs.
+/// window. No caller remains in the workspace (the package install that used it
+/// was removed); [`apply_containment_with_bound_root_sets`] covers this case.
 pub fn apply_containment_with_bound_read_root(
     spec: &CapsuleSpec,
     temp_home: Option<&Path>,
@@ -340,9 +341,11 @@ pub fn apply_containment_with_bound_read_root(
 
 /// Apply containment with independently held read and write directory
 /// capabilities. The write grant is installed from `bound_write_root_fd`
-/// directly; the diagnostic pathname is never reopened to determine authority.
-/// This is the capability seam used by package installation: a same-UID rename
-/// or replacement of the public target path cannot redirect the Landlock grant.
+/// directly; the diagnostic pathname is never reopened to determine authority,
+/// so a same-UID rename or replacement of the public target path cannot
+/// redirect the Landlock grant. No caller remains in the workspace (the package
+/// install that used it was removed); [`apply_containment_with_bound_root_sets`]
+/// covers this case.
 pub fn apply_containment_with_bound_roots(
     spec: &CapsuleSpec,
     temp_home: Option<&Path>,

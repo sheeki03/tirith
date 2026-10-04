@@ -1656,11 +1656,11 @@ pub mod browser_audit;
 pub mod browser_host;
 pub mod canary;
 /// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
-/// `runner.rs`, `temp_run.rs`, the package-firewall install, and the gateway
-/// upstream spawn route through. Selects the host backend (Landlock/seccomp,
-/// Seatbelt, AppContainer, or NoOp), probes deliverable coverage, fails closed for
-/// enforcing surfaces under degraded coverage, and offers both a run-to-completion
-/// and a piped-stdio launch on top of one fail-closed gate.
+/// `runner.rs`, `temp_run.rs` and the gateway upstream spawn route through.
+/// Selects the host backend (Landlock/seccomp, Seatbelt, AppContainer, or NoOp),
+/// probes deliverable coverage, fails closed for enforcing surfaces under
+/// degraded coverage, and offers both a run-to-completion and a piped-stdio
+/// launch on top of one fail-closed gate.
 pub mod capsule;
 pub mod capsule_child;
 pub mod capsule_proxy;
@@ -1739,7 +1739,8 @@ pub mod persistence;
 /// The package-firewall CLI surface (PR D7): `tirith pkg install | verify-env |
 /// approve | receipt | trust-tool`. Contained package execution is disabled, so
 /// `install` and `approve` refuse with a named reason; the verification and
-/// receipt commands keep working. Distinct from `tirith install` (analysis-only).
+/// receipt commands keep working, and `trust-tool` records a pin that nothing in
+/// this release reads. Distinct from `tirith install` (analysis-only).
 pub mod pkg;
 pub mod policy;
 pub mod preview;

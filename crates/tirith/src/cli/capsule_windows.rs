@@ -54,7 +54,7 @@
 //! `tirith-core` and is tested on every platform.
 #![cfg(windows)]
 // The launch entry point is consumed by E5 (which routes `runner.rs` / `temp_run.rs`
-// / the package-firewall install / the gateway upstream spawn through the capsule).
+// / the gateway upstream spawn through the capsule).
 // Until that wiring lands, the public surface here is exercised only by this
 // module's own tests; keep the not-yet-wired API from tripping `-D warnings`.
 #![allow(dead_code)]

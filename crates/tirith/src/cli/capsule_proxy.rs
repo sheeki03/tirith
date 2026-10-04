@@ -44,7 +44,7 @@
 //! private helpers are exercised only by this module's own tests in this unit.
 //! `#![allow(dead_code)]` keeps the not-yet-wired surface from tripping the
 //! `-D warnings` gate; E5 removes the need for it by routing the gateway upstream
-//! spawn, `runner.rs`, `temp_run.rs`, and the package-firewall install through it.
+//! spawn, `runner.rs` and `temp_run.rs` through it.
 #![allow(dead_code)]
 
 use std::net::{IpAddr, SocketAddr};

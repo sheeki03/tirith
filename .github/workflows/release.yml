@@ -231,8 +231,9 @@ jobs:
         if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p tirith
 
-      # The aarch64 musl artifact ships for Android/Termux (Bionic libc cannot
-      # run the glibc build). The x86_64 runner cannot execute an aarch64
+      # The aarch64 musl artifact is a generic, fully static Linux build (it
+      # does not qualify Android/Termux; the installer refuses Android and no
+      # Android asset is published). The x86_64 runner cannot execute an aarch64
       # binary natively, so verify it under QEMU user-mode emulation: confirm
       # it is fully static (no dynamic linker) and that `--version` runs.
       - name: Smoke-test musl artifact under QEMU (Linux aarch64 musl)

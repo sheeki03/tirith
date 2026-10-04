@@ -2,7 +2,7 @@
 //! CLI surface left from the removed pip package firewall (PR D7).
 //!
 //! Contained Python package execution is disabled by the shared private-input
-//! qualification guard ([`capsule::require_private_input_execution_qualification`]).
+//! qualification guard ([`capsule::private_input_execution_refusal`]).
 //! Both commands that only existed to feed that execution path refuse with the
 //! same named reason and exit code 1, before any policy discovery, target
 //! binding, resolver, network, quarantine, or approval-store side effect:
@@ -20,7 +20,9 @@
 //!   already-installed environment, without installing anything.
 //! * **`pkg receipt`** lists and shows the D6 [`tirith_core::receipt::ArtifactScanReceipt`]s,
 //!   including receipts written by earlier releases.
-//! * **`pkg trust-tool`** pins a user-writable uv/python executable.
+//! * **`pkg trust-tool`** pins a user-writable uv/python executable. Nothing in
+//!   this release reads the pin: it is recorded only for when contained install
+//!   returns.
 //!
 //! # Distinct from `tirith install`
 //!

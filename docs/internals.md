@@ -1036,8 +1036,9 @@ override. Runner-owned files do not become standard-user-owned files. An
 unsupported native owner or ancestor descriptor remains a failing test; the CI
 runner does not relax or replace that product check.
 
-The unchanged dashboard harness is listed and run without a filter. All current
-nine test names must be present; any newly added listed tests must run too. A
+The dashboard harness is listed and run without a filter. The nine required test
+names in windows-test-common.ps1 must be present, and every other listed test
+must also run. A
 successful result requires every listed test to pass with zero failures,
 ignored tests and filtered tests. Output overflow, malformed results, missing
 tests, changed binary hashes, a worker deadline, or leaked descendants all fail.

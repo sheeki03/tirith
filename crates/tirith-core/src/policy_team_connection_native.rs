@@ -215,6 +215,12 @@ impl Facts {
     /// call to change it (utimensat changes only atime and mtime). APFS file
     /// IDs are not reused and the NTFS file index carries a reuse sequence
     /// number, so other platforms bind the index alone. Never mtime or ctime.
+    ///
+    /// The birth time comes from `std::fs::Metadata::created()`, which Rust std
+    /// fills in only through statx on glibc (`linux-gnu`). On musl targets
+    /// (including the shipped aarch64 musl artifact) and on Android it is always
+    /// `None`, so there the binding is the index alone, the same as before v3,
+    /// and the ext4 inode-reuse case is not closed.
     pub(super) fn stable_identity(&self) -> (u64, Option<(u64, u32)>) {
         (self.generation.identity.1, self.birth)
     }
@@ -243,13 +249,15 @@ impl Facts {
         }
     }
 }
-/// The birth time of the open file on Linux, `None` where the filesystem
-/// keeps none or on other platforms (see [`Facts::stable_identity`]).
+/// The birth time of the open file on linux-gnu, `None` where the filesystem
+/// keeps none, on musl/Android (std has no statx there), or on other
+/// platforms (see [`Facts::stable_identity`]).
 fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let metadata = file.metadata().map_err(|_| E::UnsafeStorage)?;
-        // `created` fails only when this filesystem records no birth time.
+        // `created` fails when this filesystem records no birth time, and
+        // always on musl and Android, where std does not use statx.
         Ok(metadata
             .created()
             .ok()

@@ -12,7 +12,9 @@
 //!    index URL or artifact origin must be a credential-free public `https` URL.
 //!    It starts no process, opens no socket, resolves no DNS, and writes nothing.
 //! 2. [`enroll_resolver_tool`]: `tirith pkg trust-tool` records the digest of an
-//!    explicitly named resolver executable in the private trust store.
+//!    explicitly named resolver executable in the private trust store. Nothing
+//!    outside the enrollment self-check reads that store while contained install
+//!    is disabled; the pin is kept for when it returns.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,10 +36,11 @@ const MAX_INDEX_URLS: usize = 64;
 /// drives these is neutralized in `sanitize_repo_scoped`, where it is introduced).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolverAllowances {
-    /// Permit source distributions / building from source. Default `false`:
-    /// `--only-binary=:all:` + `--no-build`, and an sdist-only requirement is
-    /// refused. Building a backend off the network is exactly what containment
-    /// exists to stop, so this stays off without an explicit operator opt-in.
+    /// Permit source distributions / building from source. Default `false`.
+    /// Currently inert: no resolve or download runs any more, and a plain name
+    /// spec cannot express an sdist (a `.tar.gz` target is gated as a local path
+    /// or direct URL), so validation does not read this field. It is kept so the
+    /// allowance set stays complete for a future contained install.
     pub allow_sdist: bool,
     /// Permit `git+` / other VCS requirement forms. Default `false`.
     pub allow_vcs: bool,
@@ -50,10 +53,10 @@ pub struct ResolverAllowances {
     /// `false`. Even when permitted the URL must still be a credential-free public
     /// `https` URL.
     pub allow_direct_url: bool,
-    /// Legacy compatibility field. Resolver execution now always requires the
-    /// trusted-child canonical ownership/identity contract; an unsafe PATH hit
-    /// cannot bypass that boundary. The field remains so serialized/operator
-    /// policy compiled against the older API does not change shape.
+    /// Inert compatibility field. No resolver is executed any more (validation
+    /// and enrollment only), and nothing outside tests reads this field. It
+    /// remains so operator code compiled against the older API does not change
+    /// shape.
     pub allow_untrusted_tool: bool,
 }
 
@@ -133,10 +136,11 @@ impl ResolverRequest {
 /// executable, and only when its canonical name identifies the tool.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn validate_resolver_tool_name(label: &str, path: &Path) -> Result<(), String> {
-    // Resolver paths are later carried through uv/pip string argv and PATH.
-    // Reject the whole canonical path, not merely its file name, when that
-    // round-trip would be lossy. Otherwise distinct non-UTF-8 parent paths can
-    // collapse to the same U+FFFD-containing child argument.
+    // The canonical path is the trust-store key for the enrolled pin (and would
+    // be carried through string argv if contained install returns). Reject the
+    // whole canonical path, not merely its file name, when a UTF-8 round-trip
+    // would be lossy. Otherwise distinct non-UTF-8 parent paths can collapse to
+    // the same U+FFFD-containing key.
     resolver_tool_unicode_path(path)?;
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err("canonical executable has no UTF-8 file name".to_string());
@@ -1048,10 +1052,9 @@ pub fn validate_requirement(
         }
     }
     // sdist-only requirements cannot be expressed by name alone (a `.tar.gz`
-    // target is caught as a local path or direct URL above); source *building*
-    // is blocked by `--no-build` / `--only-binary=:all:` at download time, and a
-    // resolve that can only satisfy a name from an sdist is refused there.
-    // Nothing further to gate here for a plain name spec.
+    // target is caught as a local path or direct URL above). No resolve or
+    // download runs any more, so `allow_sdist` has no effect on a plain name
+    // spec. Nothing further to gate here.
     let _ = &allowances.allow_sdist;
     Ok(())
 }

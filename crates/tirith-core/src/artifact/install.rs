@@ -117,12 +117,11 @@ pub struct ExpectedInstalledDistribution {
 /// `target_environment` and fold any integrity problem into a single verdict
 /// (cross-cutting invariant: "installed files verify against installed RECORD").
 ///
-/// `installed_names` are the PEP 503-normalised distribution names the install
-/// landed (one per [`crate::artifact::resolver::ResolvedArtifact`]; build them with
-/// [`installed_distribution_names`]). The check is install-SCOPED: it verifies ONLY
-/// the `.dist-info` directories whose project name matches one of `installed_names`,
-/// never the whole pre-existing environment, so a venv's unrelated pre-installed
-/// packages are not re-judged.
+/// `installed_names` are the PEP 503-normalised distribution names to check
+/// (`tirith pkg verify-env` normalises the names it was given). The check is
+/// install-SCOPED: it verifies ONLY the `.dist-info` directories whose project
+/// name matches one of `installed_names`, never the whole pre-existing
+/// environment, so a venv's unrelated pre-installed packages are not re-judged.
 ///
 /// For the matched distributions it:
 /// 1. builds a duplicate-aware [`OwnershipIndex`] across them (so a path two of the
