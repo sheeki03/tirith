@@ -20,7 +20,7 @@
 //! rules additionally require `context_guard_enabled` + an operator-labeled
 //! context (`policy.context_labels`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::context_detect::{self, Provider};
 use crate::iac_plan;
@@ -51,11 +51,239 @@ impl IacTool {
 /// `rules::context` does, so `cd infra; terraform apply -auto-approve` and the
 /// #264 literal view `T=terraform; terraform apply ...` are checked (the
 /// prod-context rule and the apply-gate rule can both fire on one segment).
+///
+/// The plan-hash gate reads the plan file the apply segment will use, so it
+/// tracks the working directory across segments (`WorkDir`) and recognizes
+/// a plan file that the immediately preceding `&&` segment records with
+/// `tirith iac check-plan` (`check_plan_recorded_path`).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    tokenize::tokenize(input, shell)
+    let segments = tokenize::tokenize(input, shell);
+    let mut work_dir = WorkDir::start();
+    let mut findings = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let recorded_by_previous = match i.checked_sub(1) {
+            Some(prev) if seg.preceding_separator.as_deref() == Some("&&") => {
+                check_plan_recorded_path(&segments[prev], shell)
+            }
+            _ => None,
+        };
+        let plan_env = PlanEnv {
+            work_dir: &work_dir,
+            recorded_by_previous: recorded_by_previous.as_deref(),
+        };
+        findings.extend(check_segment(input, shell, policy, seg, &plan_env));
+        work_dir = work_dir.after(&segments, i, shell);
+    }
+    findings
+}
+
+/// The shell's working directory at a segment, relative to the directory
+/// tirith resolves plain relative paths against (its own cwd).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkDir {
+    /// Statically known: the tirith cwd joined with this path (empty = no
+    /// change; absolute after `cd /abs`).
+    Known(PathBuf),
+    /// An earlier segment changed directory in a way tirith cannot resolve.
+    Unknown,
+}
+
+impl WorkDir {
+    fn start() -> Self {
+        Self::Known(PathBuf::new())
+    }
+
+    /// The working directory for the segment after `segments[i]`.
+    fn after(self, segments: &[tokenize::Segment], i: usize, shell: ShellType) -> Self {
+        let seg = &segments[i];
+        if !segment_may_change_dir(seg) {
+            return self;
+        }
+        // Only a top-level, sequential `cd <literal>` is resolved. In a
+        // pipeline or a background job the builtin may run in a subshell.
+        let sequential = |sep: Option<&str>| matches!(sep, None | Some(";" | "&&" | "||" | "\n"));
+        let next_sep = segments
+            .get(i + 1)
+            .and_then(|s| s.preceding_separator.as_deref());
+        if !sequential(seg.preceding_separator.as_deref()) || !sequential(next_sep) {
+            return Self::Unknown;
+        }
+        match (self, literal_cd_target(seg, shell)) {
+            (Self::Known(base), Some(target)) => Self::Known(base.join(target)),
+            (Self::Unknown, Some(target)) if target.is_absolute() => Self::Known(target),
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Where the shell will find `path` (already relative to the segment's
+    /// working directory); `None` when that cannot be resolved statically.
+    fn resolve(&self, path: &Path) -> Option<PathBuf> {
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        match self {
+            Self::Known(base) => Some(base.join(path)),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Plan-gate inputs that depend on the segments before the current one.
+struct PlanEnv<'a> {
+    work_dir: &'a WorkDir,
+    /// The plan path (relative to the shared working directory) that the
+    /// immediately preceding `&&` segment records via `tirith iac check-plan`.
+    recorded_by_previous: Option<&'a Path>,
+}
+
+/// Commands that change (or may change) the shell's working directory. Words
+/// are compared case-insensitively so PowerShell aliases are covered too.
+const DIR_CHANGE_WORDS: &[&str] = &[
+    "cd",
+    "chdir",
+    "pushd",
+    "popd",
+    "prevd",
+    "nextd",
+    "source",
+    "eval",
+    "set-location",
+    "sl",
+    "push-location",
+    "pop-location",
+];
+
+/// `true` when the segment contains a word that can change the working
+/// directory (as its command, behind `builtin` / `command`, or inside a
+/// `{ ...; }` group), or sources a file (`. file`). Over-approximates: a
+/// false positive only makes a later relative plan path unresolvable.
+fn segment_may_change_dir(seg: &tokenize::Segment) -> bool {
+    if seg
+        .command
+        .as_deref()
+        .is_some_and(|cmd| strip_outer_quotes(cmd) == ".")
+    {
+        return true;
+    }
+    seg.raw
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`')
+        })
+        .map(|w| strip_outer_quotes(w).to_ascii_lowercase())
+        .any(|w| DIR_CHANGE_WORDS.contains(&w.as_str()))
+}
+
+/// The target of a plain `cd <literal>` / `pushd <literal>` segment in a POSIX
+/// or fish shell; `None` for anything else (no or several operands, `-`,
+/// `+N`, expansions, quoting inside the word, a `CDPATH` that could redirect
+/// a bare name, PowerShell / cmd syntax).
+fn literal_cd_target(seg: &tokenize::Segment, shell: ShellType) -> Option<PathBuf> {
+    if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
+        return None;
+    }
+    let cmd = seg.command.as_deref()?;
+    if !matches!(cmd, "cd" | "pushd") || !seg.raw.trim_start().starts_with(cmd) {
+        return None;
+    }
+    let mut operands = seg
+        .args
         .iter()
-        .flat_map(|seg| check_segment(input, shell, policy, seg))
+        .map(|a| strip_outer_quotes(a))
+        .skip_while(|a| matches!(*a, "-L" | "-P"));
+    let mut target = operands.next()?;
+    if target == "--" {
+        target = operands.next()?;
+    }
+    if operands.next().is_some() {
+        return None;
+    }
+    let target = literal_path_word(target)?;
+    let bare_name = !(target.starts_with('/')
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target == "."
+        || target == "..");
+    if bare_name && std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    Some(PathBuf::from(target))
+}
+
+/// `word` when it is a plain path with no shell expansion, quoting or option
+/// syntax left in it.
+fn literal_path_word(word: &str) -> Option<&str> {
+    let plain = !word.is_empty()
+        && !word.starts_with(['-', '+'])
+        && !word.contains([
+            '$', '`', '~', '*', '?', '[', ']', '{', '}', '\\', '\'', '"', '<', '>', '(', ')',
+        ]);
+    plain.then_some(word)
+}
+
+/// The plan path `tirith iac check-plan <plan>` records in this segment
+/// (exactly that command: no prefix assignments, only known options).
+fn check_plan_recorded_path(seg: &tokenize::Segment, shell: ShellType) -> Option<PathBuf> {
+    let cmd = seg.command.as_deref()?;
+    if command_basename(cmd, shell) != "tirith" || !seg.raw.trim_start().starts_with(cmd) {
+        return None;
+    }
+    let args: Vec<&str> = seg.args.iter().map(|a| strip_outer_quotes(a)).collect();
+    let rest = match args.as_slice() {
+        ["iac", "check-plan", rest @ ..] => rest,
+        _ => return None,
+    };
+    let mut plan = None;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match *arg {
+            "--json" => {}
+            "--tool" | "--format" => {
+                iter.next()?;
+            }
+            a if a.starts_with("--tool=") || a.starts_with("--format=") => {}
+            "--" => {
+                plan = Some(*iter.next()?);
+                if iter.next().is_some() {
+                    return None;
+                }
+            }
+            a if a.starts_with('-') => return None,
+            a => {
+                if plan.replace(a).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    literal_path_word(plan?).map(normalize_lexically)
+}
+
+/// Drop `.` components so `./tfplan` and `tfplan` compare equal.
+fn normalize_lexically(path: &str) -> PathBuf {
+    Path::new(path)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect()
+}
+
+/// The terraform / tofu `-chdir=<dir>` global option before the verb:
+/// `Ok(None)` when absent, `Err(())` when its value is not a literal path.
+fn chdir_option(tool: IacTool, pre_verb: &[String]) -> Result<Option<PathBuf>, ()> {
+    if !matches!(tool, IacTool::Terraform | IacTool::Tofu) {
+        return Ok(None);
+    }
+    let mut dir = None;
+    for arg in pre_verb {
+        let value = arg
+            .strip_prefix("-chdir=")
+            .or_else(|| arg.strip_prefix("--chdir="));
+        if let Some(value) = value {
+            dir = Some(PathBuf::from(
+                literal_path_word(strip_outer_quotes(value)).ok_or(())?,
+            ));
+        }
+    }
+    Ok(dir)
 }
 
 fn check_segment(
@@ -63,6 +291,7 @@ fn check_segment(
     shell: ShellType,
     policy: &Policy,
     seg: &tokenize::Segment,
+    plan_env: &PlanEnv<'_>,
 ) -> Vec<Finding> {
     let Some(cmd) = seg.command.as_deref() else {
         return Vec::new();
@@ -87,6 +316,7 @@ fn check_segment(
         Some(p) => p,
         None => return Vec::new(),
     };
+    let pre_verb = &args[..args.len() - post_verb.len() - 1];
     let is_apply = matches!(verb, IacVerb::Apply | IacVerb::Up);
     let is_destroy = matches!(verb, IacVerb::Destroy);
     if !is_apply && !is_destroy {
@@ -186,67 +416,129 @@ fn check_segment(
                 ));
             }
             Some(path) => {
-                // Validate the plan hash against the recorded store.
-                let pb = PathBuf::from(&path);
-                match std::fs::read(&pb) {
-                    Ok(bytes) => {
-                        let sha = iac_plan::sha256_hex(&bytes);
-                        let status = iac_plan::plan_hash_status(&sha);
-                        // Both NotRecorded and StateDirUnresolved fail closed
-                        // (PR-127 review #14); the evidence text differentiates.
-                        if !matches!(status, iac_plan::PlanHashStatus::Recorded) {
-                            let detail = match status {
-                                iac_plan::PlanHashStatus::StateDirUnresolved => format!(
-                                    "tirith could not resolve its state directory; plan-hash \
-                                     verification cannot proceed. Set `XDG_STATE_HOME` or \
-                                     ensure `$HOME` is writable, then run \
-                                     `tirith iac check-plan {path}` to record this plan."
-                                ),
-                                _ => format!(
-                                    "`{}` was invoked with plan file `{}` but the file's \
-                                     SHA-256 (`{}`) does not match any plan recorded in \
-                                     `{}`. Run `tirith iac check-plan {}` first.",
-                                    tool.as_str(),
-                                    path,
-                                    sha,
-                                    iac_plan::iac_plans_dir_display(),
-                                    path,
-                                ),
-                            };
-                            findings.push(make_finding(
-                                RuleId::IacPlanHashMismatch,
-                                Severity::High,
-                                format!("{} apply against an unrecorded plan file", tool.as_str()),
-                                detail,
-                                tool,
-                                input,
-                                prod_context.as_deref(),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        // Couldn't open the plan file — emit the mismatch anyway.
-                        findings.push(make_finding(
-                            RuleId::IacPlanHashMismatch,
-                            Severity::High,
-                            format!(
-                                "{} apply: plan file '{}' could not be read",
-                                tool.as_str(),
-                                path
-                            ),
-                            format!(
-                                "`{}` was invoked with plan file `{}` but tirith could not \
-                                 read it (`{e}`). Verify the path before re-running.",
-                                tool.as_str(),
-                                path
-                            ),
-                            tool,
-                            input,
-                            prod_context.as_deref(),
-                        ));
-                    }
+                // The plan file relative to the shell's working directory at
+                // this segment (`-chdir=` applies first), then where tirith
+                // finds it after any earlier `cd`.
+                let in_segment_dir = chdir_option(tool, pre_verb).map(|chdir| match chdir {
+                    Some(dir) => dir.join(normalize_lexically(&path)),
+                    None => normalize_lexically(&path),
+                });
+                let recorded_by_previous = matches!(
+                    (&in_segment_dir, plan_env.recorded_by_previous),
+                    (Ok(p), Some(recorded)) if p == recorded
+                );
+                let resolved = in_segment_dir
+                    .ok()
+                    .and_then(|p| plan_env.work_dir.resolve(&p));
+                if recorded_by_previous {
+                    // `tirith iac check-plan <plan> && <tool> apply <plan>`:
+                    // the chain records this exact file right before the
+                    // apply, and the apply does not run when recording fails.
+                    // The file may not exist yet at preexec time.
+                } else if let Some(pb) = resolved {
+                    findings.extend(check_plan_hash(
+                        tool,
+                        &path,
+                        &pb,
+                        input,
+                        prod_context.as_deref(),
+                    ));
+                } else {
+                    findings.push(make_finding(
+                        RuleId::IacPlanHashMismatch,
+                        Severity::High,
+                        format!(
+                            "{} apply: plan file '{}' cannot be located",
+                            tool.as_str(),
+                            path
+                        ),
+                        format!(
+                            "`{}` was invoked with plan file `{}` after a directory change \
+                             (`cd`, `pushd`, `-chdir=`, ...) that tirith cannot resolve, so \
+                             it cannot verify which plan file will be applied. Use an \
+                             absolute plan path, or run `tirith iac check-plan <plan> && \
+                             {} apply <plan>` from the plan's directory.",
+                            tool.as_str(),
+                            path,
+                            tool.as_str(),
+                        ),
+                        tool,
+                        input,
+                        prod_context.as_deref(),
+                    ));
                 }
             }
+        }
+    }
+
+    findings
+}
+
+/// Hash `pb` (the plan file `path` names) and report it unless it is recorded.
+fn check_plan_hash(
+    tool: IacTool,
+    path: &str,
+    pb: &Path,
+    input: &str,
+    prod_context: Option<&str>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    match std::fs::read(pb) {
+        Ok(bytes) => {
+            let sha = iac_plan::sha256_hex(&bytes);
+            let status = iac_plan::plan_hash_status(&sha);
+            // Both NotRecorded and StateDirUnresolved fail closed
+            // (PR-127 review #14); the evidence text differentiates.
+            if !matches!(status, iac_plan::PlanHashStatus::Recorded) {
+                let detail = match status {
+                    iac_plan::PlanHashStatus::StateDirUnresolved => format!(
+                        "tirith could not resolve its state directory; plan-hash \
+                         verification cannot proceed. Set `XDG_STATE_HOME` or \
+                         ensure `$HOME` is writable, then run \
+                         `tirith iac check-plan {path}` to record this plan."
+                    ),
+                    _ => format!(
+                        "`{}` was invoked with plan file `{}` but the file's \
+                         SHA-256 (`{}`) does not match any plan recorded in \
+                         `{}`. Run `tirith iac check-plan {}` first.",
+                        tool.as_str(),
+                        path,
+                        sha,
+                        iac_plan::iac_plans_dir_display(),
+                        path,
+                    ),
+                };
+                findings.push(make_finding(
+                    RuleId::IacPlanHashMismatch,
+                    Severity::High,
+                    format!("{} apply against an unrecorded plan file", tool.as_str()),
+                    detail,
+                    tool,
+                    input,
+                    prod_context,
+                ));
+            }
+        }
+        Err(e) => {
+            // Couldn't open the plan file — emit the mismatch anyway.
+            findings.push(make_finding(
+                RuleId::IacPlanHashMismatch,
+                Severity::High,
+                format!(
+                    "{} apply: plan file '{}' could not be read",
+                    tool.as_str(),
+                    path
+                ),
+                format!(
+                    "`{}` was invoked with plan file `{}` but tirith could not \
+                     read it (`{e}`). Verify the path before re-running.",
+                    tool.as_str(),
+                    path
+                ),
+                tool,
+                input,
+                prod_context,
+            ));
         }
     }
 
@@ -588,6 +880,148 @@ mod tests {
             assert!(
                 check(input, ShellType::Posix, &policy).is_empty(),
                 "{input:?}"
+            );
+        }
+    }
+
+    /// The working directory `WorkDir` tracks for the last segment of `input`.
+    fn work_dir_at_last_segment(input: &str) -> WorkDir {
+        let segments = tokenize::tokenize(input, ShellType::Posix);
+        let mut dir = WorkDir::start();
+        for i in 0..segments.len().saturating_sub(1) {
+            dir = dir.after(&segments, i, ShellType::Posix);
+        }
+        dir
+    }
+
+    #[test]
+    fn work_dir_follows_literal_cd_and_gives_up_on_anything_else() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let known = |p: &str| WorkDir::Known(PathBuf::from(p));
+        for (input, expected) in [
+            ("terraform apply tfplan", known("")),
+            ("echo cd; terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra; terraform apply tfplan", known("infra")),
+            ("cd 'infra' && terraform apply tfplan", known("infra")),
+            (
+                "cd -P -- ./infra || exit; terraform apply tfplan",
+                known("./infra"),
+            ),
+            (
+                "cd infra; cd ../ops; terraform apply tfplan",
+                known("infra/../ops"),
+            ),
+            ("cd /srv/infra; terraform apply tfplan", known("/srv/infra")),
+            ("cd \"$D\"; terraform apply tfplan", WorkDir::Unknown),
+            ("cd ~/infra; terraform apply tfplan", WorkDir::Unknown),
+            ("cd; terraform apply tfplan", WorkDir::Unknown),
+            ("cd -; terraform apply tfplan", WorkDir::Unknown),
+            ("cd a b; terraform apply tfplan", WorkDir::Unknown),
+            ("pushd +1; terraform apply tfplan", WorkDir::Unknown),
+            ("popd; terraform apply tfplan", WorkDir::Unknown),
+            ("builtin cd infra; terraform apply tfplan", WorkDir::Unknown),
+            ("{ cd infra; }; terraform apply tfplan", WorkDir::Unknown),
+            ("(cd infra); terraform apply tfplan", WorkDir::Unknown),
+            (". ./env.sh; terraform apply tfplan", WorkDir::Unknown),
+            ("source env.sh; terraform apply tfplan", WorkDir::Unknown),
+            (
+                "echo x | cd infra; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            ("cd infra & terraform apply tfplan", WorkDir::Unknown),
+            ("cd \"$D\"; cd /srv; terraform apply tfplan", known("/srv")),
+        ] {
+            assert_eq!(work_dir_at_last_segment(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn literal_cd_target_refuses_bare_names_under_cdpath() {
+        let mut global = tirith_test_support::GlobalStateGuard::new().unwrap();
+        global.set_env("CDPATH", "/srv/projects");
+        assert_eq!(
+            work_dir_at_last_segment("cd infra; terraform apply tfplan"),
+            WorkDir::Unknown
+        );
+        assert_eq!(
+            work_dir_at_last_segment("cd ./infra; terraform apply tfplan"),
+            WorkDir::Known(PathBuf::from("./infra"))
+        );
+        global.remove_env("CDPATH");
+        assert_eq!(
+            work_dir_at_last_segment("cd infra; terraform apply tfplan"),
+            WorkDir::Known(PathBuf::from("infra"))
+        );
+    }
+
+    #[test]
+    fn check_plan_recorded_path_accepts_only_the_plain_command() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let recorded = |input: &str| {
+            let segments = tokenize::tokenize(input, ShellType::Posix);
+            check_plan_recorded_path(&segments[0], ShellType::Posix)
+        };
+        for (input, expected) in [
+            ("tirith iac check-plan tfplan", Some("tfplan")),
+            ("tirith iac check-plan ./tfplan", Some("tfplan")),
+            (
+                "/usr/local/bin/tirith iac check-plan 'out/tf plan'",
+                Some("out/tf plan"),
+            ),
+            (
+                "tirith iac check-plan --tool tofu --json tfplan",
+                Some("tfplan"),
+            ),
+            (
+                "tirith iac check-plan --format=json -- tfplan",
+                Some("tfplan"),
+            ),
+            ("tirith iac check-plan", None),
+            ("tirith iac check-plan a b", None),
+            ("tirith iac check-plan --unknown tfplan", None),
+            ("tirith iac check-plan \"$PLAN\"", None),
+            ("tirith iac guard tfplan", None),
+            ("XDG_STATE_HOME=/tmp/x tirith iac check-plan tfplan", None),
+            ("echo tirith iac check-plan tfplan", None),
+        ] {
+            assert_eq!(recorded(input), expected.map(PathBuf::from), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn plan_gate_chain_and_unresolvable_directories() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        let rules = |input: &str| {
+            check(input, ShellType::Posix, &gated)
+                .into_iter()
+                .map(|f| (f.rule_id, f.title))
+                .collect::<Vec<_>>()
+        };
+        // The chain the IacApplyWithoutPlan message recommends.
+        for input in [
+            "terraform plan -out tfplan && tirith iac check-plan tfplan && terraform apply tfplan",
+            "tirith iac check-plan ./tfplan && tofu apply tfplan",
+            "tirith iac check-plan infra/tfplan && terraform -chdir=infra apply tfplan",
+        ] {
+            assert_eq!(rules(input), Vec::new(), "{input:?}");
+        }
+        // Unresolvable working directory: fail closed with a distinct title.
+        for input in [
+            "cd \"$D\" && terraform apply tfplan",
+            "terraform -chdir=$D apply tfplan",
+            "popd; terraform apply tfplan",
+        ] {
+            let found = rules(input);
+            assert!(
+                matches!(
+                    found.as_slice(),
+                    [(RuleId::IacPlanHashMismatch, title)] if title.contains("cannot be located")
+                ),
+                "{input:?}: {found:?}"
             );
         }
     }

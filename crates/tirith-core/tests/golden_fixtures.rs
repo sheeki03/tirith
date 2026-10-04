@@ -2808,6 +2808,120 @@ fn iac_rule_detects_plan_modification_after_record() {
     );
 }
 
+/// R4 fix round 1: with the plan gate on, the IaC rule sees every segment, so
+/// the plan file it hashes must be the one the apply segment will actually
+/// read. A literal `cd` / `-chdir=` earlier in the line moves the base
+/// directory; an unresolvable directory change fails closed. A plan file that
+/// the immediately preceding `&&` segment records with `tirith iac
+/// check-plan` (the workflow the rule's own message recommends) is not read at
+/// preexec time, because it may not exist yet.
+#[test]
+fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_cwd(&root).unwrap();
+
+    // ./tfplan is recorded; infra/tfplan is a different, unrecorded plan.
+    // rec/tfplan2 is recorded and there is no ./tfplan2.
+    let summary = PlanSummary::default();
+    fs::write(root.join("tfplan"), b"RECORDED ROOT PLAN").unwrap();
+    iac_plan::record_plan_hash(b"RECORDED ROOT PLAN", &root.join("tfplan"), &summary).unwrap();
+    fs::create_dir_all(root.join("infra")).unwrap();
+    fs::write(root.join("infra/tfplan"), b"UNRECORDED INFRA PLAN").unwrap();
+    fs::create_dir_all(root.join("rec")).unwrap();
+    fs::write(root.join("rec/tfplan2"), b"RECORDED REC PLAN").unwrap();
+    iac_plan::record_plan_hash(b"RECORDED REC PLAN", &root.join("rec/tfplan2"), &summary).unwrap();
+
+    let mismatch = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(root.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+
+    let infra_abs = format!(
+        "cd {} && terraform apply tfplan",
+        root.join("infra").display()
+    );
+    let rec_abs = format!("cd {}; terraform apply tfplan2", root.join("rec").display());
+    let wrong = [
+        // Baseline: the recorded plan in the cwd passes, the unrecorded one blocks.
+        ("terraform apply tfplan", false),
+        ("terraform apply infra/tfplan", true),
+        // A directory change before the apply moves the plan file it reads.
+        ("cd infra; terraform apply tfplan", true),
+        ("cd infra && terraform apply tfplan", true),
+        ("cd ./infra || exit 1; terraform apply tfplan", true),
+        (infra_abs.as_str(), true),
+        ("terraform -chdir=infra apply tfplan", true),
+        ("cd rec && terraform apply tfplan2", false),
+        (rec_abs.as_str(), false),
+        ("terraform -chdir=rec apply tfplan2", false),
+        ("cd rec; cd ..; terraform apply tfplan", false),
+        // A directory change tirith cannot resolve fails closed.
+        ("cd \"$D\" && terraform apply tfplan", true),
+        ("pushd infra >/dev/null; popd; terraform apply tfplan", true),
+        ("{ cd infra; }; terraform apply tfplan", true),
+        // The recommended chain records the plan right before the apply.
+        (
+            "terraform plan -out tfplan3 && tirith iac check-plan tfplan3 && terraform apply tfplan3",
+            false,
+        ),
+        ("tirith iac check-plan --json tfplan3 && terraform apply tfplan3", false),
+        ("cd infra && tirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        // Anything short of that still checks the (missing) file and blocks.
+        ("terraform plan -out tfplan3 && terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3; terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3 || terraform apply tfplan3", true),
+        (
+            "tirith iac check-plan tfplan3 && cp other tfplan3 && terraform apply tfplan3",
+            true,
+        ),
+        ("tirith iac check-plan other && terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3 && terraform -chdir=infra apply tfplan3", true),
+        ("XDG_STATE_HOME=/tmp/x tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
 // M12 ch1 (G1 TOCTOU fix): when the caller found no sidecar it sets
 // `AbsentOrInvalid`, and the engine must NOT re-read `clipboard_source.json`.
 // Plant a MATCHING sidecar (a disk read WOULD fire the rule), then prove
