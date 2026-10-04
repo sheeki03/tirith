@@ -527,7 +527,9 @@ mod tests {
     /// Linux and Android, including musl builds, and it does not move with
     /// `touch`. The file lives under the build directory (a real disk), not
     /// in `/tmp`, which can be a tmpfs. There is no silent skip: a missing
-    /// birth time on Linux or Android fails this test (R4.9).
+    /// birth time on Linux, or on Android from API level 30, fails this test
+    /// (R4.9). Below API level 30 statx may not be called, and the birth time
+    /// must be `None`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn linux_birth_time_is_bound_and_survives_touch() {
@@ -541,6 +543,10 @@ mod tests {
         std::fs::write(&path, b"bytes").unwrap();
         let file = File::open(&path).unwrap();
         let (_, birth) = native::Facts::for_live_test(&file).stable_identity();
+        if !native::statx_may_be_called() {
+            assert_eq!(birth, None);
+            return;
+        }
         let birth = birth.unwrap_or_else(|| {
             panic!(
                 "no birth time for {}: statx(STATX_BTIME) must provide one on Linux and \

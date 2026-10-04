@@ -217,10 +217,12 @@ impl Facts {
     /// number, so other platforms bind the index alone. Never mtime or ctime.
     ///
     /// The birth time comes from the `statx` system call made directly (see
-    /// [`birth_time`]), so glibc, musl (including the shipped aarch64 musl
-    /// artifact) and Android bionic builds all bind it. It is `None` only where
-    /// the kernel has no statx (before Linux 4.11) or the filesystem keeps no
-    /// birth time; the binding is then the index alone.
+    /// [`birth_time`]), so glibc and musl builds (including the shipped
+    /// aarch64 musl artifact) bind it, and so do Android builds on Android 11
+    /// (API level 30) and later. It is `None` where the kernel has no statx
+    /// (before Linux 4.11), where the filesystem keeps no birth time, and on
+    /// Android 10 and earlier, whose app seccomp filter kills a process that
+    /// calls statx; the binding is then the index alone.
     pub(super) fn stable_identity(&self) -> (u64, Option<(u64, u32)>) {
         (self.generation.identity.1, self.birth)
     }
@@ -250,8 +252,9 @@ impl Facts {
     }
 }
 /// The birth time of the open file on Linux and Android, `None` where the
-/// kernel has no statx or the filesystem keeps no birth time, and on other
-/// platforms (see [`Facts::stable_identity`]).
+/// kernel has no statx, the filesystem keeps no birth time or (on Android)
+/// statx may not be called, and on other platforms (see
+/// [`Facts::stable_identity`]).
 ///
 /// This calls the statx system call itself rather than going through
 /// `std::fs::Metadata::created()`: Rust std uses statx only on glibc, so on
@@ -261,6 +264,9 @@ fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::os::fd::AsRawFd;
+        if !statx_may_be_called() {
+            return Ok(None);
+        }
         let mut buffer = std::mem::MaybeUninit::<KernelStatx>::zeroed();
         // SAFETY: an empty path with AT_EMPTY_PATH reads the open descriptor;
         // the kernel writes at most the 256-byte UAPI struct it is given.
@@ -297,6 +303,59 @@ fn birth_time(file: &File) -> Result<Option<(u64, u32)>, E> {
         let _ = file;
         Ok(None)
     }
+}
+
+/// Whether this process may make the statx system call. Always on Linux: a
+/// kernel without statx or a filter that blocks it answers ENOSYS or EPERM,
+/// which [`birth_time`] maps to `None`.
+#[cfg(target_os = "linux")]
+pub(super) fn statx_may_be_called() -> bool {
+    true
+}
+
+/// Whether this process may make the statx system call. On Android 8 to 10
+/// (API levels 26 to 29) the seccomp filter every app process (Termux
+/// included) runs under does not allow statx and kills the process with
+/// SIGSYS instead of returning an error, so nothing could fall back. statx
+/// joined that allowlist, with the bionic wrapper, in API level 30. Below it,
+/// or when the level cannot be read, no birth time is read, as before.
+#[cfg(target_os = "android")]
+pub(super) fn statx_may_be_called() -> bool {
+    android_api_level_allows_statx(android_device_api_level())
+}
+
+/// The first Android API level whose app seccomp filter allows statx.
+#[cfg(any(target_os = "android", test))]
+const ANDROID_STATX_MIN_API_LEVEL: u32 = 30;
+
+#[cfg(any(target_os = "android", test))]
+fn android_api_level_allows_statx(level: Option<u32>) -> bool {
+    level.is_some_and(|level| level >= ANDROID_STATX_MIN_API_LEVEL)
+}
+
+/// Parses the `ro.build.version.sdk` property value; anything but a plain
+/// decimal level is `None`.
+#[cfg(any(target_os = "android", test))]
+fn parse_android_api_level(value: &[u8]) -> Option<u32> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// The running device's API level (what the NDK's
+/// `android_get_device_api_level()` reads). `__system_property_get` exists at
+/// every API level, unlike that function, which needs API level 29.
+#[cfg(target_os = "android")]
+fn android_device_api_level() -> Option<u32> {
+    let mut value = [0u8; libc::PROP_VALUE_MAX as usize];
+    // SAFETY: the name is NUL-terminated and the buffer holds PROP_VALUE_MAX
+    // bytes, the most the call writes (value plus terminating NUL).
+    let length = unsafe {
+        libc::__system_property_get(c"ro.build.version.sdk".as_ptr(), value.as_mut_ptr().cast())
+    };
+    let length = usize::try_from(length).ok()?.min(value.len());
+    parse_android_api_level(&value[..length])
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -937,5 +996,41 @@ mod platform {
     }
     pub(super) fn validate(_: &File, _: bool, _: bool, _: bool) -> Result<(), String> {
         Err("unsupported".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Android 8 to 10 kill an app process that calls statx (SIGSYS from the
+    /// seccomp filter, no errno), so the direct statx call is made only from
+    /// API level 30, and never when the level cannot be read.
+    #[test]
+    fn android_statx_is_called_only_from_api_level_30() {
+        assert!(!android_api_level_allows_statx(None));
+        for level in [21, 24, 26, 27, 28, 29] {
+            assert!(!android_api_level_allows_statx(Some(level)), "{level}");
+        }
+        for level in [30, 31, 34, 36] {
+            assert!(android_api_level_allows_statx(Some(level)), "{level}");
+        }
+    }
+
+    #[test]
+    fn android_api_level_parses_only_a_plain_decimal_property() {
+        assert_eq!(parse_android_api_level(b"29"), Some(29));
+        assert_eq!(parse_android_api_level(b"30"), Some(30));
+        for value in [
+            &b""[..],
+            b" 30",
+            b"30 ",
+            b"+30",
+            b"-1",
+            b"3O",
+            b"99999999999",
+        ] {
+            assert_eq!(parse_android_api_level(value), None, "{value:?}");
+        }
     }
 }
