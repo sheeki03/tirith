@@ -6078,15 +6078,16 @@ impl LocalArtifactEcosystem {
     }
 }
 
-/// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
-/// resolve-and-inspect lives behind hidden experimental flags and cannot install.
+/// The ecosystem argument of `tirith pkg approve` / `install`. Contained
+/// installation is disabled for every ecosystem: `pip` requirements are
+/// accepted and the command then refuses; `npm` and `cargo` are not accepted.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum PkgEcosystem {
-    /// Python wheels (the only enforced ecosystem).
+    /// Python requirements (accepted; the command still refuses).
     Pip,
-    /// npm, not enforced in this version.
+    /// Not accepted.
     Npm,
-    /// cargo, not enforced in this version.
+    /// Not accepted.
     Cargo,
 }
 
@@ -6140,12 +6141,14 @@ Linux) refuse at native_authority. Otherwise approve validates its arguments
 and refuses with private_input_execution_unqualified before resolver
 execution, network access, quarantine writes, or approval-record publication.")]
     Approve {
-        /// The ecosystem (only `pip` is enforced).
+        /// The ecosystem. Only `pip` requirements are accepted; contained
+        /// installation is disabled for every ecosystem.
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
         requirements: Vec<String>,
-        /// Required new dedicated install directory (pip `--target`).
+        /// Accepted for compatibility and ignored: installation is disabled, so
+        /// no install directory is created or used.
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -6179,12 +6182,14 @@ unchanged for the complete target lifetime against another process owned by
 the same user. `tirith package inspect` and `tirith pkg verify-env` remain
 available.")]
     Install {
-        /// The ecosystem (only `pip` is enforced).
+        /// The ecosystem. Only `pip` requirements are accepted; contained
+        /// installation is disabled for every ecosystem.
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
         requirements: Vec<String>,
-        /// Required new dedicated install directory (pip `--target`).
+        /// Accepted for compatibility and ignored: installation is disabled, so
+        /// no install directory is created or used.
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -7242,14 +7247,21 @@ Examples:
         #[arg(long)]
         apply: bool,
     },
-    /// Garbage-collect expired entries from trust stores
+    /// Garbage-collect trust stores: expired grants, old revocations, and the
+    /// oldest revocations of an oversized grant store
     #[command(after_help = "\
+What it collects:
+  In the grant store (trust-grants.json): expired grants and revocations older
+  than 30 days. If the store is still above 768 KiB, the oldest remaining
+  revocations are also pruned until it fits. Active grants and unreadable
+  records are kept. In the legacy trust.json stores: expired entries only.
+
 Examples:
   tirith trust gc --expired
   tirith trust gc --expired --scope user")]
     Gc {
-        /// Collect expired entries — currently the only collection mode, so
-        /// this flag is optional
+        /// Accepted for compatibility; has no effect (gc always collects what
+        /// "What it collects" lists)
         #[arg(long)]
         expired: bool,
         /// Scope: user, project, repo, or all (default)
@@ -7267,17 +7279,20 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Prune expired trust entries (alias for `gc`).
-    ///
-    /// `prune` is the spec-named CLI surface for the M6 garbage-collection
-    /// flow; `gc` is the shipping name kept as the canonical short form.
-    /// Both invoke the same backing function in `cli::trust::gc`.
+    /// Prune trust stores (alias for `gc`; both run the same collection).
     #[command(after_help = "\
+What it collects:
+  In the grant store (trust-grants.json): expired grants and revocations older
+  than 30 days. If the store is still above 768 KiB, the oldest remaining
+  revocations are also pruned until it fits. Active grants and unreadable
+  records are kept. In the legacy trust.json stores: expired entries only.
+
 Examples:
   tirith trust prune --expired
   tirith trust prune --expired --scope user")]
     Prune {
-        /// Collect expired entries — currently the only collection mode.
+        /// Accepted for compatibility; has no effect (prune always collects
+        /// what "What it collects" lists)
         #[arg(long)]
         expired: bool,
         /// Scope: user, project, repo, or all (default)

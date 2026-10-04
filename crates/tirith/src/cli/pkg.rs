@@ -102,17 +102,17 @@ pub enum ReceiptQuery {
     Show(String),
 }
 
-/// The ecosystem `pkg install` / `approve` enforce for. Only `pip` (Python wheels)
-/// is enforced in v1; npm / cargo are deliberately refused here (their hardened
-/// `.tgz` / `.crate` analysers do not exist yet, plan Stack D).
+/// The ecosystem argument of `pkg install` / `approve`. Contained installation is
+/// disabled for every ecosystem: `pip` requirements are validated and then
+/// refused with the pinned private-input reason; npm and cargo are refused at
+/// [`precheck`] as usage errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
-    /// Python wheels via the D2 `uv` + `pip` resolver. The only enforced ecosystem.
+    /// Python requirements (validated, then refused).
     Pip,
-    /// npm, not enforced in v1 (resolve+inspect-metadata only lives behind hidden
-    /// experimental flags; the firewall install path refuses it).
+    /// npm (usage error at precheck).
     Npm,
-    /// cargo, not enforced in v1, as npm.
+    /// cargo (usage error at precheck).
     Cargo,
 }
 
@@ -162,8 +162,8 @@ pub fn run(action: PkgAction) -> i32 {
 // Shared guards
 // ---------------------------------------------------------------------------
 
-/// Refuse a non-pip ecosystem (only Python is enforced in v1) and refuse a
-/// misplaced tirith-owned flag in the requirement list. The check is presentation-
+/// Refuse a non-pip ecosystem (only `pip` requirement syntax is accepted) and
+/// refuse a misplaced tirith-owned flag in the requirement list. The check is presentation-
 /// free so `--json` callers can emit one structured document without a preceding
 /// human diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,10 +177,10 @@ fn precheck(ecosystem: Ecosystem, requirements: &[String]) -> Option<PkgPrecheck
         return Some(PkgPrecheckFailure {
             exit_code: 2,
             reason: format!(
-                "only `pip` is enforced in this version; `{}` is not yet supported \
-             (npm / cargo resolve-and-inspect lives behind hidden experimental flags and cannot \
-             install). Use `tirith install {}` for analysis-only.",
-                ecosystem.label(),
+                "`{0}` is not supported: `tirith pkg install` and `tirith pkg approve` accept \
+             only `pip` requirements, and contained package installation is disabled for \
+             every ecosystem. To analyze an install without running it, use \
+             `tirith install --no-exec {0} <package>`.",
                 ecosystem.label()
             ),
         });
@@ -707,14 +707,24 @@ mod tests {
 
     #[test]
     fn precheck_refuses_non_pip_ecosystem() {
-        assert_eq!(
-            precheck(Ecosystem::Npm, &["lodash".to_string()]).map(|failure| failure.exit_code),
-            Some(2)
-        );
-        assert_eq!(
-            precheck(Ecosystem::Cargo, &["serde".to_string()]).map(|failure| failure.exit_code),
-            Some(2)
-        );
+        for (ecosystem, package, label) in [
+            (Ecosystem::Npm, "lodash", "npm"),
+            (Ecosystem::Cargo, "serde", "cargo"),
+        ] {
+            let failure = precheck(ecosystem, &[package.to_string()]).expect("refused");
+            assert_eq!(failure.exit_code, 2);
+            assert!(failure
+                .reason
+                .starts_with(&format!("`{label}` is not supported")));
+            assert!(failure
+                .reason
+                .contains(&format!("`tirith install --no-exec {label} <package>`")));
+            assert!(
+                !failure.reason.contains("experimental"),
+                "{}",
+                failure.reason
+            );
+        }
     }
 
     #[test]

@@ -23069,33 +23069,45 @@ fn hidden_capsule_private_inputs_refuse_before_target_execution() {
     assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
 }
 
-/// `tirith pkg install` only enforces `pip` in v1; a non-pip ecosystem must be a
-/// hard usage refusal (exit 2) that points at the analysis-only path, never an
-/// attempt to install. Refused at the `precheck` gate before any resolve, so this
-/// is host-independent.
+/// `tirith pkg install` accepts only `pip` requirements (and then refuses, since
+/// contained installation is disabled); a non-pip ecosystem must be a hard usage
+/// refusal (exit 2) that points at the analysis-only path, never an attempt to
+/// install. Refused at the `precheck` gate before any resolve, so this is
+/// host-independent.
 #[test]
 fn pkg_install_non_pip_ecosystem_is_refused() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let out = tirith()
-        .env("PATH", empty_path_dir(home.path()))
-        .env("XDG_DATA_HOME", home.path())
-        .env("APPDATA", home.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .args(["pkg", "install", "npm", "lodash"])
-        .output()
-        .expect("failed to run tirith pkg install npm");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a non-pip ecosystem must be a usage refusal (exit 2); stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("only `pip` is enforced"),
-        "the refusal must explain only pip is enforced: {stderr}"
-    );
+    for (ecosystem, package) in [("npm", "lodash"), ("cargo", "serde")] {
+        let home = tempfile::tempdir().expect("tempdir");
+        let out = tirith()
+            .env("PATH", empty_path_dir(home.path()))
+            .env("XDG_DATA_HOME", home.path())
+            .env("APPDATA", home.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .args(["pkg", "install", ecosystem, package])
+            .output()
+            .expect("failed to run tirith pkg install");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "a non-pip ecosystem must be a usage refusal (exit 2); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("accept only `pip` requirements")
+                && stderr.contains("disabled for every ecosystem"),
+            "the refusal must explain only pip requirements are accepted: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("tirith install --no-exec {ecosystem} <package>")),
+            "the refusal must name the analysis-only path: {stderr}"
+        );
+        assert!(
+            !stderr.contains("hidden experimental flags") && !stderr.contains("is enforced"),
+            "the refusal must not describe removed or nonexistent paths: {stderr}"
+        );
+    }
 }
 
 /// `tirith pkg install pip` with no requirements is a usage error (exit 2), not a
