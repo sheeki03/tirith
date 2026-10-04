@@ -2927,6 +2927,17 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
         ("cd rec || true & terraform apply tfplan2", true),
         ("cd rec && true & terraform apply tfplan2", true),
         ("alias cd=true\ncd rec\nterraform apply tfplan2", true),
+        // R4 fix round 3: a quoted or escaped `cd` is still `cd` to the
+        // shell, so after it the directory is unknown.
+        ("cd rec; \\cd ..; terraform apply tfplan2", true),
+        ("cd rec; c''d ..; terraform apply tfplan2", true),
+        ("cd rec; c\"d\" ..; terraform apply tfplan2", true),
+        ("cd rec; 'c'd ..; terraform apply tfplan2", true),
+        ("cd rec; c\\d ..; terraform apply tfplan2", true),
+        ("cd rec; pu''shd ..; terraform apply tfplan2", true),
+        ("cd rec; time c''d ..; terraform apply tfplan2", true),
+        ("cd rec; { c''d ..; }; terraform apply tfplan2", true),
+        ("cd rec; so''urce x; terraform apply tfplan2", true),
         // Controls: an unconditional cd still moves it.
         ("cd rec || exit 1; terraform apply tfplan2", false),
         ("cd rec && echo ok; terraform apply tfplan2", false),

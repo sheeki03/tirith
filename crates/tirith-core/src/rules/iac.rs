@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use crate::context_detect::{self, Provider};
 use crate::iac_plan;
 use crate::policy::Policy;
+use crate::rules::command::normalize_shell_token;
 use crate::rules::shared::is_critical_label;
 use crate::tokenize::{self, ShellType};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
@@ -160,7 +161,7 @@ impl DirTracker {
     /// Apply the directory change (if any) of `segments[i]`.
     fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
         let seg = &segments[i];
-        if !segment_may_change_dir(seg) {
+        if !segment_may_change_dir(seg, shell) {
             return;
         }
         let target = cd_runs_unconditionally(segments, i)
@@ -265,23 +266,38 @@ const DIR_CHANGE_WORDS: &[&str] = &[
 ];
 
 /// `true` when the segment contains a word that can change the working
-/// directory (as its command, behind `builtin` / `command`, or inside a
-/// `{ ...; }` group), or sources a file (`. file`). Over-approximates: a
-/// false positive only makes a later relative plan path unresolvable.
-fn segment_may_change_dir(seg: &tokenize::Segment) -> bool {
-    if seg
-        .command
-        .as_deref()
-        .is_some_and(|cmd| strip_outer_quotes(cmd) == ".")
-    {
-        return true;
+/// directory (as its command, behind `builtin` / `command` / `time`, or inside
+/// a `{ ...; }` group), sources a file (`. file`), or has a command word built
+/// by an expansion (`$X ..`). A word counts with its quoting and escapes
+/// removed, the way the shell reads it (`\cd`, `c''d`, `'c'd`, `$'\x63d'`,
+/// PowerShell `` c`d ``, cmd `c^d` are all `cd`). Over-approximates: a false
+/// positive only makes a later relative plan path unresolvable.
+fn segment_may_change_dir(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    if let Some(cmd) = seg.command.as_deref() {
+        if normalize_shell_token(cmd, shell) == "." || cmd.contains(['$', '`']) {
+            return true;
+        }
     }
-    seg.raw
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`')
-        })
-        .map(|w| strip_outer_quotes(w).to_ascii_lowercase())
-        .any(|w| DIR_CHANGE_WORDS.contains(&w.as_str()))
+    let is_dir_change = |w: &str| DIR_CHANGE_WORDS.contains(&w.to_ascii_lowercase().as_str());
+    // Each word as the shell decodes it (quotes, backslashes, ANSI-C escapes).
+    let decoded =
+        split_shell_words(&seg.raw).any(|w| is_dir_change(&normalize_shell_token(w, shell)));
+    // And with every quote and escape character simply dropped, so an escape
+    // character that is also a separator above (PowerShell's backtick) or a
+    // quoting form the decoder leaves alone cannot hide the word either.
+    let stripped: String = seg
+        .raw
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
+        .collect();
+    decoded || split_shell_words(&stripped).any(is_dir_change)
+}
+
+/// `raw` split at whitespace, operators and brackets (quotes are kept).
+fn split_shell_words(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`')
+    })
 }
 
 /// The target of a plain `cd <literal>` / `pushd <literal>` segment in a POSIX
@@ -1121,6 +1137,50 @@ mod tests {
                 "cd infra && cd ops; terraform apply tfplan",
                 WorkDir::Unknown,
             ),
+            // R4 fix round 3: quoting or escaping inside the word does not
+            // stop the shell from running it as `cd`.
+            (
+                "cd infra; \\cd ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; c''d ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; c\"d\" ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; 'c'd ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; c\\d ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; $'\\x63d' ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; $\"cd\" ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; pu''shd ..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; so\\urce x; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "cd infra; { 'cd' ..; }; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            ("cd infra; $X ..; terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra; echo ok; terraform apply tfplan", known("infra")),
         ] {
             assert_eq!(work_dir_at_last_segment(input), expected, "{input:?}");
         }
