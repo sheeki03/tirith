@@ -633,11 +633,14 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // reading the raw text (fails toward the signal).
     let heredocs = inert_heredoc::analyze(text);
     let mut outcome = fetch_feeds_shell(heredocs.masked.as_deref().unwrap_or(text), 0, &mut budget);
+    // The live bodies were already counted by the whole-file pass, so their
+    // own pass gets a fresh (shared) budget: at most twice the work.
+    let mut body_budget = SHELL_BODY_BUDGET;
     for body in &heredocs.live_bodies {
         if outcome == ShellFetch::Found {
             break;
         }
-        match fetch_feeds_shell(&text[body.clone()], 0, &mut budget) {
+        match fetch_feeds_shell(&text[body.clone()], 0, &mut body_budget) {
             ShellFetch::NotFound => {}
             other => outcome = other,
         }
