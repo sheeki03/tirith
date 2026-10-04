@@ -103,13 +103,21 @@ file contents can produce a new hash in the downloaded report.
   `cat`, `echo`, `printf` or `:` (or read into a variable that is only
   echoed), in a file with no pipe except into plain text filters, no output
   redirection to a file, no capture of the printed text, no `eval`,
-  `source`, `exec`, shell, `$SHELL` / `$BASH`, `sudo`, alias,
-  `BASH_CMDS` / `BASH_ALIASES` / `expand_aliases` or `PATH` word
-  (other than reading `$PATH`), and no command whose name is an expansion
-  (`"$RUN" ...`, `env "$X" ...`). A variable holding the text must only appear as a plain `$NAME`
-  in `echo` / `printf` commands that start on their own line (a `printf`
-  whose first word is or could expand to an option, such as `-v`, `{-v,X}`,
-  `[-]v` or `~-`, does not count; no quoted word
+  `source`, `exec`, shell, `$SHELL` / `$BASH`, `sudo`, alias, `hash`,
+  `autoload`, `BASH_CMDS` / `BASH_ALIASES` / `expand_aliases`, zsh
+  `functions` / `commands` / `aliases` / `path` / `fpath` assignment or
+  `PATH` word (other than reading `$PATH`), also when spelled with
+  backslashes or quotes inside the word (`ha\sh`, `al''ias`), no function
+  named after a printer, filter, `read`, `local` or `readonly`, or whose
+  name holds a backslash, quote or expansion (`c\at() {`), and no command
+  whose name is or holds an expansion (`"$RUN" ...`, `env "$X" ...`,
+  `al${E}ias`). A variable holding the text must only appear as a plain
+  `$NAME` or `${NAME}`, not inside another `${...}` or `$[...]` (a
+  subscript or substring offset is arithmetic), in `echo` / `printf`
+  commands that start on their own line (a `printf` whose first word after
+  any redirection is or could expand to an option, such as `-v`,
+  `{-v,X}`, `[-]v` or `~-`, or whose format is not a literal with only
+  `%s` / `%b` / `%q` / `%c` conversions, does not count; no quoted word
   or backslash-newline carried in from another line, no lone `&`), and the
   file must not reach it indirectly (`${!...}`, a nameref, `$_`, a bare
   `set` or other variable listing). The variable must not be one the shell

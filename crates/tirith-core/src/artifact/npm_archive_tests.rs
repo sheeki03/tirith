@@ -977,6 +977,43 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
         format!(
             "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\n\"$BASH\" -c \"$(set | grep ^USA | cut -d\\' -f2)\"\n"
         ),
+        // A header command redefined as a function under a spelling the word
+        // scan cannot read starts a shell that reads the heredoc on stdin.
+        format!(
+            "read() {{ /bin/s\\h; }}\nread -r -d '' USAGE <<'EOF' || true\n{pipeline}EOF\necho \"$USAGE\"\n"
+        ),
+        format!(
+            "function read {{ s\\h; }}\nread -r -d '' USAGE <<'EOF' || true\n{pipeline}EOF\necho \"$USAGE\"\n"
+        ),
+        format!("c\\at() {{ /bin/s\\h; }}\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("'cat'() {{ /bin/s\\h; }}\ncat <<'EOF'\n{pipeline}EOF\n"),
+        // An evaluating word spelled with a backslash, quotes or an
+        // expansion still rebinds `cat`.
+        format!("ha\\sh -p /bin/s\\h cat\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("'alias' cat=/bin/s''h\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("al${{E}}ias cat=/bin/s${{E}}h\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("S=s\ncommands[cat]=/bin/${{S}}h\ncat <<'EOF'\n{pipeline}EOF\n"),
+        format!("path=(./bin $path)\ncat <<'EOF'\n{pipeline}EOF\n"),
+        // `printf -v` after a redirection assigns PS4.
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf >&2 -vPS4 '%s' \"$USAGE\"\nset -x\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf >&2 '-v' PS4 '%s' \"$USAGE\"\nset -x\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf 2>/dev/null -vPS4 '%s' \"$USAGE\"\nset -x\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf >&2 {{-v,PS4}} '%s' \"$USAGE\"\nset -x\n"
+        ),
+        // The printed value is evaluated as arithmetic: a subscript or
+        // substring offset (bash, sh) or a numeric printf conversion (ksh).
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\necho \"${{a[$USAGE]}}\"\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\necho \"${{HOME:0:$USAGE}}\"\n"),
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\necho $[$USAGE]\n"),
+        format!("read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf '%d\\n' \"$USAGE\"\n"),
+        format!("USAGE=$(cat <<'EOF'\n{pipeline}EOF\n)\nprintf '%*s\\n' \"$USAGE\" x\n"),
         // `for PATH in` sets PATH, so `cat` may be a packaged wrapper.
         format!(
             "for PATH in \"$PWD/bin:/usr/bin:/bin\"; do\ncat <<'EOF'\n{pipeline}EOF\ndone\n"
