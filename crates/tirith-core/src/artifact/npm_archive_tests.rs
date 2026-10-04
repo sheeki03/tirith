@@ -816,6 +816,9 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
     for body in [
         format!("echo \"Install:\n{pipeline}\"\n"),
         format!("printf '%s\\n' 'Install:\n{pipeline}'\n"),
+        format!(
+            "IFS= read -r -d '' USAGE <<'EOF' || true\n{pipeline}EOF\nprintf 'Usage {{a,b}} [x] (*?~):\\n%s\\n' \"$USAGE\"\n"
+        ),
     ] {
         assert!(
             !shell_file_has_download_signal(&body),
@@ -905,6 +908,33 @@ fn heredoc_text_that_is_only_shown_is_not_a_download_signal() {
         ),
         format!(
             "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf -vCMD '%s' \"$USAGE\"\n\"$BASH\" -c \"$CMD\"\n"
+        ),
+        // ... or made by brace, tilde or glob expansion of the format word.
+        // Bash runs command substitutions in the copied value's array
+        // subscripts during arithmetic, or expands it as PS4 under `set -x`.
+        format!(
+            "read -r -d '' USAGE <<'EOF'\na[`\n{pipeline}`]\nEOF\nprintf {{-v,X}} %s \"$USAGE\"\necho $((X))\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf {{,-v}} X %s \"$USAGE\"\n[[ X -eq 0 ]]\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf {{-v,PS4}} %s \"$USAGE\"\nset -x\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf [-]v X %s \"$USAGE\"\necho $((X))\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf ''{{-v,X}} %s \"$USAGE\"\necho $((X))\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nOLDPWD=-v\nprintf ~- X %s \"$USAGE\"\necho $((X))\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nshopt -s extglob\nprintf @(-v) X %s \"$USAGE\"\necho $((X))\n"
+        ),
+        format!(
+            "read -r -d '' USAGE <<'EOF'\n{pipeline}EOF\nprintf -?v X %s \"$USAGE\"\necho $((X))\n"
         ),
         // The value is reached without writing the variable's name.
         format!(

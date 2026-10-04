@@ -106,7 +106,9 @@ file contents can produce a new hash in the downloaded report.
   `source`, `exec`, shell, `$SHELL` / `$BASH`, `sudo`, alias or `PATH` word
   (other than reading `$PATH`), and no command whose name is an expansion
   (`"$RUN" ...`, `env "$X" ...`). A variable holding the text must only appear as a plain `$NAME`
-  in `echo` / `printf` commands that start on their own line (no quoted word
+  in `echo` / `printf` commands that start on their own line (a `printf`
+  whose first word is or could expand to an option, such as `-v`, `{-v,X}`,
+  `[-]v` or `~-`, does not count; no quoted word
   or backslash-newline carried in from another line, no lone `&`), and the
   file must not reach it indirectly (`${!...}`, a nameref, `$_`, a bare
   `set` or other variable listing). Anything else keeps the signal. What a caller does with a script's output is not followed.

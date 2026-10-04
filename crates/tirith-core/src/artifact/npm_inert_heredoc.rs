@@ -1004,17 +1004,22 @@ fn variable_only_printed(
         let printer = match after_prefixes(&line[command_start..command_end]).next() {
             Some("echo") => true,
             // `printf -v NAME` assigns instead of printing; options come
-            // before the format, also quoted (`'-v'`), joined (`-vNAME`) or
-            // from an expansion.
+            // before the format, also quoted (`'-v'`), joined (`-vNAME`),
+            // from an expansion, or made by brace, tilde or glob expansion
+            // of the unquoted format word (`{-v,X}`, `~-`, `[-]v`, `@(-v)`).
             Some("printf") => {
+                let unquoted = after_prefixes(&line[command_start..command_end]).nth(1);
                 let format = after_prefixes(raw).nth(1).map(|word| {
                     word.chars()
                         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
                         .collect::<String>()
                 });
                 !raw.split_whitespace().any(|word| word == "-v")
+                    && unquoted
+                        .is_some_and(|word| !word.contains(['{', '[', '*', '?', '~', '(', '`']))
                     && format.is_some_and(|format| {
-                        !(format.starts_with('-') && format != "--") && !format.starts_with('$')
+                        !(format.starts_with('-') && format != "--")
+                            && !format.starts_with(['$', '`', '~'])
                     })
             }
             _ => false,
