@@ -105,11 +105,12 @@ keeps your later edits.
   `tirith policy effective --runtime` after the change. A warning setting never
   approves an independent hard block.
 - A field inside a structure that cannot be edited in place safely (a
-  flow-style `{...}` parent, an anchor or alias, tab indentation, or several
-  YAML documents) is refused before anything is saved; the error shows the
-  change as a diff of that field to make by hand. A leading `---`, a trailing
-  `...` document-end marker and other fields written in flow style (also when
-  their closing `]` or `}` is in the key's column) are kept as they are.
+  flow-style `{...}` parent, an anchor or alias, tab indentation, a tab after
+  the field's key, several YAML documents, or a key repeated in one mapping)
+  is refused before anything is saved; the error shows the change as a diff of
+  that field to make by hand. A leading `---`, a trailing `...` document-end
+  marker and other fields written in flow style (also when their closing `]` or
+  `}` is in the key's column) are kept as they are.
 - Undo checks fresh authorization, refuses a concurrent change to what it would
   restore, and never writes an old policy document over newer settings.
 - Unsupported fields, values, rules and paths are refused. Compound values

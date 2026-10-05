@@ -15,7 +15,8 @@
 //! column) are left as they are.
 //!
 //! Every edit is checked: the edited text must parse to exactly the original
-//! document with only the owned field changed. A failed check is a refusal.
+//! document with only the owned field changed, and repeat no key. A failed
+//! check is a refusal.
 
 use serde_json::Value;
 
@@ -34,11 +35,22 @@ pub(super) fn set_field(
     let mut expected = original.clone();
     set_value(&mut expected, &keys, value);
     let refuse = |reason: &str| refusal(&keys, reason, &original, value);
+    if !unique_keys(text) {
+        return Err(refuse("a mapping in the file repeats a key"));
+    }
     let edited = edit(text, &keys, value).map_err(&refuse)?;
     match parse(&edited) {
-        Ok(actual) if actual == expected => Ok(edited),
+        Ok(actual) if actual == expected && unique_keys(&edited) => Ok(edited),
         _ => Err(refuse("the in-place edit could not be verified")),
     }
+}
+
+/// The parsed comparison above keeps the last of two equal keys, so it cannot
+/// see a repeated key; serde_yaml's own value type refuses one, as the policy
+/// loader does. An edit that adds a second entry for a key it did not
+/// recognize is therefore refused, never written.
+fn unique_keys(text: &str) -> bool {
+    text.trim().is_empty() || serde_yaml::from_str::<serde_yaml::Value>(text).is_ok()
 }
 
 /// Parse like the change journal does: blank or comment-only text is `{}`.
@@ -339,6 +351,11 @@ impl Document {
         value: Option<&Value>,
     ) -> Result<(), Refusal> {
         let line = &self.lines[entry.line];
+        if value.is_some() && line[entry.colon..].contains('\t') {
+            // Comments and values are only located after spaces here, so a
+            // rewrite of this line could drop a comment written after a tab.
+            return Err("a tab follows the field's key");
+        }
         let rest = classify(&line[entry.colon..], entry.colon);
         let Some(value) = value else {
             self.splice(entry.line, entry.end, Vec::new());
@@ -598,14 +615,15 @@ fn is_sequence_item(content: &str) -> bool {
 }
 
 /// A plain or quoted key followed by `:`. Returns the decoded key and the byte
-/// offset just past the colon.
+/// offset just past the colon. Spaces or tabs may separate the key from the
+/// `:` and the `:` from the value, as in YAML.
 fn parse_key(content: &str) -> Option<(String, usize)> {
     let followed_by_separator = |at: usize| {
         content[at..].starts_with(':')
             && content[at + 1..]
                 .chars()
                 .next()
-                .is_none_or(|next| next == ' ')
+                .is_none_or(|next| next == ' ' || next == '\t')
     };
     let first = content.chars().next()?;
     let (key, end) = match first {
@@ -614,8 +632,9 @@ fn parse_key(content: &str) -> Option<(String, usize)> {
             let raw = &content[..close];
             let key: String = serde_yaml::from_str(raw).ok()?;
             let after = raw.len();
-            let spaces = content[after..].len() - content[after..].trim_start_matches(' ').len();
-            (key, after + spaces)
+            let blanks =
+                content[after..].len() - content[after..].trim_start_matches([' ', '\t']).len();
+            (key, after + blanks)
         }
         _ => {
             if "-?:,[]{}#&*!|>%@`".contains(first) {
@@ -625,8 +644,8 @@ fn parse_key(content: &str) -> Option<(String, usize)> {
                 .char_indices()
                 .find(|(at, _)| followed_by_separator(*at))
                 .map(|(at, _)| at)?;
-            let key = content[..at].trim_end_matches(' ');
-            if key.contains(" #") {
+            let key = content[..at].trim_end_matches([' ', '\t']);
+            if key.contains(" #") || key.contains("\t#") {
                 return None;
             }
             (key.to_owned(), at)
@@ -971,10 +990,15 @@ mod tests {
             ("a: 1\n!!str b: 2\n", "/b"),
             ("a: 1\n&x b: 2\nc: 3\n", "/c"),
             ("a: 1\n? b\n: 2\n", "/b"),
+            // A tab-separated key after a key-column flow closer is a key.
+            ("allowlist: [\n  \"a.example\"\n]\nb:\t2\n", "/b"),
         ] {
             let result = set_field(text, pointer, Some(&json!(3)));
             assert!(result.is_err(), "{text:?} {pointer} -> {result:?}");
         }
+        // A tab after a key-column closer only separates a comment.
+        let closer = "allowlist: [\n  \"a.example\"\n]\t# end\nb: 1\n";
+        assert_eq!(set(closer, "/b", json!(3)), closer.replace("b: 1", "b: 3"));
         // A flow collection on the path is still refused.
         assert!(set_field(
             "severity_overrides: {\n  a: low\n}\nb: 1\n",
@@ -982,6 +1006,101 @@ mod tests {
             Some(&json!("high"))
         )
         .is_err());
+    }
+
+    /// YAML separates a key from `:` and `:` from its value with spaces or
+    /// tabs. A key line using a tab was not seen as a key, so setting that
+    /// key appended a second entry (`paranoia:\t1` then `paranoia: 3`), the
+    /// check passed because the last duplicate wins, and the policy loader
+    /// then refused the file and every command was blocked.
+    #[test]
+    fn tab_separated_keys_are_seen_so_no_second_entry_is_added() {
+        let duplicate_free = |text: &str| serde_yaml::from_str::<serde_yaml::Value>(text).is_ok();
+        for (text, pointer, value) in [
+            ("fail_mode: open\nparanoia:\t1\n", "/paranoia", json!(3)),
+            (
+                "allow_bypass_env: false\nfail_mode:\topen\n",
+                "/fail_mode",
+                json!("closed"),
+            ),
+            ("fail_mode: open\n\"paranoia\":\t1\n", "/paranoia", json!(3)),
+            ("fail_mode: open\nparanoia\t: 1\n", "/paranoia", json!(3)),
+            (
+                "fail_mode: open\n\"paranoia\"\t: 1\n",
+                "/paranoia",
+                json!(3),
+            ),
+            (
+                "scan:\n  fast: true\n  require_complete:\tfalse\n",
+                "/scan/require_complete",
+                json!(true),
+            ),
+            ("parent:\t\n  child: 1\n", "/parent/child", json!(2)),
+        ] {
+            match set_field(text, pointer, Some(&value)) {
+                Ok(edited) => {
+                    assert!(duplicate_free(&edited), "{text:?} {pointer} -> {edited:?}");
+                    assert_eq!(
+                        edited
+                            .matches(&pointer[pointer.rfind('/').unwrap() + 1..])
+                            .count(),
+                        1,
+                        "{text:?} -> {edited:?}"
+                    );
+                }
+                Err(reason) => assert!(reason.contains("nothing was changed"), "{reason}"),
+            }
+        }
+        // A tab after the colon: the value on that line is not rewritten (a
+        // comment after a tab would be lost), so setting it is refused.
+        for (text, pointer) in [
+            ("fail_mode: open\nparanoia:\t1\n", "/paranoia"),
+            ("fail_mode: open\n\"paranoia\":\t1  # two\n", "/paranoia"),
+            (
+                "scan:\n  require_complete:\tfalse\n",
+                "/scan/require_complete",
+            ),
+        ] {
+            let result = set_field(text, pointer, Some(&json!(3)));
+            assert!(result.is_err(), "{text:?} {pointer} -> {result:?}");
+        }
+        // The key itself is seen: other edits and removal work, in place.
+        let tabbed = "fail_mode: open\nparanoia:\t1\t# tabbed\n";
+        assert_eq!(
+            set(tabbed, "/fail_mode", json!("closed")),
+            "fail_mode: closed\nparanoia:\t1\t# tabbed\n"
+        );
+        assert_eq!(
+            set(tabbed, "/strict_warn", json!(true)),
+            format!("{tabbed}strict_warn: true\n")
+        );
+        assert_eq!(remove(tabbed, "/paranoia"), "fail_mode: open\n");
+        // A tab before the colon is part of the separation, not the key.
+        assert_eq!(
+            set("fail_mode: open\nparanoia\t: 1\n", "/paranoia", json!(3)),
+            "fail_mode: open\nparanoia\t: 3\n"
+        );
+        assert_eq!(
+            set("\"paranoia\"\t: 1  # q\n", "/paranoia", json!(3)),
+            "\"paranoia\"\t: 3  # q\n"
+        );
+    }
+
+    /// The check after an edit compares the parsed result, where the last of
+    /// two equal keys wins, so it must also refuse duplicate keys: a written
+    /// duplicate makes the policy loader refuse the whole file.
+    #[test]
+    fn an_edit_that_would_leave_a_duplicate_key_is_refused() {
+        for (text, pointer) in [
+            ("a: 1\na: 1\n", "/b"),
+            ("a: 1\n\"a\": 1\n", "/b"),
+            ("s:\n  b: 1\n  b: 1\nc: 1\n", "/c"),
+            ("s:\n  b: 1\n  'b': 1\n", "/s/d"),
+        ] {
+            let result = set_field(text, pointer, Some(&json!(2)));
+            assert!(result.is_err(), "{text:?} {pointer} -> {result:?}");
+        }
+        assert_eq!(set("a: 1\nb: 1\n", "/c", json!(2)), "a: 1\nb: 1\nc: 2\n");
     }
 
     #[test]
