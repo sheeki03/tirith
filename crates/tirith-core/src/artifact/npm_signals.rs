@@ -525,10 +525,11 @@ fn literal_script_target(command: &str) -> Option<String> {
     package_relative(&target)
 }
 
-/// Nesting depth and body count for the brace/function/subshell descent in
-/// [`fetch_feeds_shell`]. Package scripts are bounded text, so this only keeps
-/// adversarial nesting from turning one file into unbounded work. Hitting
-/// either bound is incomplete coverage, never "no pipeline".
+/// Nesting depth and body count for the brace/function/subshell and
+/// substitution descent in [`fetch_feeds_shell`]. Package scripts are bounded
+/// text, so this only keeps adversarial nesting from turning one file into
+/// unbounded work. Hitting either bound is incomplete coverage, never "no
+/// pipeline".
 const SHELL_BODY_DEPTH: usize = 8;
 const SHELL_BODY_BUDGET: usize = 256;
 
@@ -556,10 +557,19 @@ fn feeds_shell(text: &str) -> bool {
         })
 }
 
-/// The core tokenizer splits neither `|` nor newlines inside `{ ... }` or
-/// `( ... )`, so a pipeline inside a brace group, function body or subshell
-/// is only visible after descending into that body.
-fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> ShellFetch {
+/// The core tokenizer splits neither `|` nor newlines inside `{ ... }`,
+/// `( ... )` or a substitution, so a pipeline inside a brace group, function
+/// body, subshell, command substitution (`$(...)`, backticks) or process
+/// substitution is only visible after descending into that body.
+/// `substitutions` is the text to read substitutions from (heredoc bodies
+/// blanked, see [`without_heredoc_bodies`]); it is `None` for a group body,
+/// whose substitutions were already read from the text around it.
+fn fetch_feeds_shell(
+    text: &str,
+    substitutions: Option<&str>,
+    depth: usize,
+    budget: &mut usize,
+) -> ShellFetch {
     if feeds_shell(text) {
         return ShellFetch::Found;
     }
@@ -601,7 +611,26 @@ fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> ShellFetch
             continue;
         }
         *budget -= 1;
-        match fetch_feeds_shell(&body, depth + 1, budget) {
+        match fetch_feeds_shell(&body, None, depth + 1, budget) {
+            ShellFetch::Found => return ShellFetch::Found,
+            ShellFetch::Bounded => bounded = true,
+            ShellFetch::NotFound => {}
+        }
+    }
+    for body in substitutions.map(substitution_bodies).unwrap_or_default() {
+        // A pipeline needs a `|`; a body without one uses no budget.
+        if !body.contains('|') {
+            continue;
+        }
+        if *budget == 0 {
+            return ShellFetch::Bounded;
+        }
+        if depth >= SHELL_BODY_DEPTH {
+            bounded = true;
+            continue;
+        }
+        *budget -= 1;
+        match fetch_feeds_shell(&body, Some(&body), depth + 1, budget) {
             ShellFetch::Found => return ShellFetch::Found,
             ShellFetch::Bounded => bounded = true,
             ShellFetch::NotFound => {}
@@ -614,15 +643,151 @@ fn fetch_feeds_shell(text: &str, depth: usize, budget: &mut usize) -> ShellFetch
     }
 }
 
+/// The bodies of the command substitutions (`$(...)`, backticks) and process
+/// substitutions (`<(...)`, `>(...)`) in `text`, outermost only, read as the
+/// shell reads them: none inside single quotes, `$'...'` or a comment, and
+/// inside double quotes only `$(...)` and backticks. An unclosed one takes the
+/// rest of the text, so more is read, never less.
+fn substitution_bodies(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut bodies = Vec::new();
+    let mut double = false;
+    let mut word_start = true;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if byte == b'`' {
+            let end = crate::extract::posix_backtick_close(text, index).unwrap_or(bytes.len());
+            bodies.push(unescape_backticks(&text[index + 1..end]));
+            index = end + 1;
+            word_start = false;
+            continue;
+        }
+        if next == Some(b'(') && (byte == b'$' || (!double && matches!(byte, b'<' | b'>'))) {
+            let end = crate::extract::posix_delimiter_close(text, index + 1).unwrap_or(bytes.len());
+            bodies.push(text[index + 2..end].to_owned());
+            index = end + 1;
+            word_start = false;
+            continue;
+        }
+        if double {
+            match byte {
+                b'\\' => index += 1,
+                b'"' => double = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'$' && next == Some(b'\'') {
+            // `$'...'`: a backslash escapes the next byte, `\'` included.
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\'' {
+                index += if bytes[index] == b'\\' { 2 } else { 1 };
+            }
+            index += 1;
+            word_start = false;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                index += 2;
+                word_start = false;
+                continue;
+            }
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index += 1;
+                word_start = false;
+                continue;
+            }
+            b'"' => double = true,
+            // Only where a comment certainly starts: reading a comment as
+            // code over-reads, reading code as a comment would hide it.
+            b'#' if word_start => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        word_start = matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+        );
+        index += 1;
+    }
+    bodies
+}
+
+/// Inside backticks a backslash quotes only `$`, `` ` `` and `\`.
+fn unescape_backticks(body: &str) -> String {
+    let mut unescaped = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            unescaped.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some(next @ ('$' | '`' | '\\')) => unescaped.push(next),
+            Some(next) => {
+                unescaped.push('\\');
+                unescaped.push(next);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+    unescaped
+}
+
+/// `text` with every heredoc body and terminator blanked (newlines kept), for
+/// reading substitutions: heredoc text is data there (an apostrophe in it is
+/// no quote), and each body that may run is scanned on its own. Unchanged
+/// when the heredocs cannot be delimited.
+fn without_heredoc_bodies(text: &str) -> std::borrow::Cow<'_, str> {
+    let spans = if text.contains("<<") {
+        crate::extract::posix_heredoc_spans(text).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    for span in spans {
+        for byte in bytes.get_mut(span.through_terminator).into_iter().flatten() {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
 /// Fallback once the descent hit a bound: each line on its own, with group
-/// openers and closers around it removed.
+/// openers and closers around it removed, and the substitutions in it.
 fn any_line_feeds_shell(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line
             .trim_start_matches(|c: char| c == '{' || c == '(' || c.is_whitespace())
             .trim_end_matches(|c: char| c == '}' || c == ')' || c == ';' || c.is_whitespace());
-        !line.is_empty() && feeds_shell(line)
+        !line.is_empty() && (feeds_shell(line) || substitution_feeds_shell(line, 0))
     })
+}
+
+/// The line pass reads inside a line's substitutions too. The bodies of one
+/// level are disjoint parts of the line, so this is linear in it per level.
+fn substitution_feeds_shell(text: &str, depth: usize) -> bool {
+    depth < SHELL_BODY_DEPTH
+        && substitution_bodies(text).iter().any(|body| {
+            body.contains('|') && (feeds_shell(body) || substitution_feeds_shell(body, depth + 1))
+        })
 }
 
 fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
@@ -632,7 +797,13 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // heredocs add the line-by-line pass. The bounded fallback below keeps
     // reading the raw text (fails toward the signal).
     let heredocs = inert_heredoc::analyze(text);
-    let mut outcome = fetch_feeds_shell(heredocs.masked.as_deref().unwrap_or(text), 0, &mut budget);
+    let substitutions = without_heredoc_bodies(text);
+    let mut outcome = fetch_feeds_shell(
+        heredocs.masked.as_deref().unwrap_or(text),
+        Some(&substitutions),
+        0,
+        &mut budget,
+    );
     // The live bodies were already counted by the whole-file pass, so their
     // own pass gets a fresh (shared) budget: at most twice the work.
     let mut body_budget = SHELL_BODY_BUDGET;
@@ -640,7 +811,9 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
         if outcome == ShellFetch::Found {
             break;
         }
-        match fetch_feeds_shell(&text[body.clone()], 0, &mut body_budget) {
+        let body = &text[body.clone()];
+        let substitutions = without_heredoc_bodies(body);
+        match fetch_feeds_shell(body, Some(&substitutions), 0, &mut body_budget) {
             ShellFetch::NotFound => {}
             other => outcome = other,
         }
@@ -650,7 +823,7 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
         ShellFetch::NotFound => heredocs.ambiguous && any_line_feeds_shell(text),
         ShellFetch::Bounded => {
             inspection.issue(NpmIssueKind::CodeLimit, Some(member),
-                "Shell brace-group, function or subshell nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
+                "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
             any_line_feeds_shell(text)
         }
     };

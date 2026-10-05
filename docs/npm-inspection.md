@@ -98,7 +98,10 @@ file contents can produce a new hash in the downloaded report.
   reported as gaps.
 - Shell files and lifecycle scripts get a bounded command-pattern pass for a
   literal curl/wget pipeline into a shell, including inside brace groups,
-  functions and subshells (also with a trailing redirection). Heredoc text is
+  functions and subshells (also with a trailing redirection) and inside
+  command substitutions (`$(...)`, backticks) and process substitutions
+  (`<(...)`, `>(...)`), but not inside single-quoted text, comments or heredoc
+  data. Heredoc text is
   skipped only when the file provably just prints it: a heredoc given to
   `cat`, `echo`, `printf` or `:` (or read into a variable that is only
   echoed), in a file with no pipe except into plain text filters, no output
