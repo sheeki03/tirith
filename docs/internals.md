@@ -100,8 +100,8 @@ against the contract and refuses an unreviewed format change; changing any of
 them requires a new contract version.
 
 Inventory reads only fixed private team files, the bounded team rollout directory,
-and shell receipt declarations in the private session receipt directory. Known receipt locks and hook capability
-filenames are skipped; this inventory does not authenticate or declare compatibility
+and shell receipt declarations in the private session receipt directory. Known receipt locks, hook capability
+and hook load-record filenames are skipped; this inventory does not authenticate or declare compatibility
 for their payloads. The same captured bytes
 also expose document schemas and policy semantics inside enrollment caches and
 both rollout policy documents; future or malformed nested declarations refuse.
@@ -752,7 +752,22 @@ uses one raw string so multiline content is checked and inserted intact.
 `scripts/certify-powershell-hook.py` records executable, hook and harness hashes
 in disposable environments. Its full mode uses native POSIX terminals; the
 Windows CI lane explicitly selects noninteractive-only. Neither lane certifies
-an untested platform, version or current user session.
+an untested platform, version or current user session. The full mode also
+checks that only the interactive hook writes its hook load record and that
+`tirith status --json` run at its prompt reports the hook as `current`.
+
+PowerShell and Nushell hook load records (`tirith __hook-presence --family
+powershell|nushell --shell-pid <pid>`, Unix only) live beside the hook
+capabilities as `.hook-presence-<key>.record`, where the key hashes the
+effective UID, shell PID and process start identity. A record holds those, the
+family, and the identity of the Tirith executable that wrote it; it holds no
+secret. The command records only the shell that caller detection (the same
+detection `status` uses) names as its caller, of the named family. Hook
+freshness accepts a record only for a live process with the same start
+identity and, for the calling shell, the same family; a capability lookup never
+accepts one. Registration removes records of exited shells and is bounded like
+the capability registry. The name matches no receipt (`*.json`) or capability
+pattern, so 0.4.2 and current receipt and capability scans skip it.
 
 ## Task command families (Python and Cargo)
 

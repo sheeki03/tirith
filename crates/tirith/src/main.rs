@@ -214,6 +214,21 @@ impl From<ShellHookFamilyArg> for tirith_core::execution_state::ShellHookFamily 
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum HookPresenceFamilyArg {
+    Powershell,
+    Nushell,
+}
+
+impl From<HookPresenceFamilyArg> for tirith_core::execution_state::HookPresenceFamily {
+    fn from(value: HookPresenceFamilyArg) -> Self {
+        match value {
+            HookPresenceFamilyArg::Powershell => Self::PowerShell,
+            HookPresenceFamilyArg::Nushell => Self::Nushell,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum ShellApprovalOutcomeArg {
     Granted,
     Rejected,
@@ -320,6 +335,17 @@ enum Commands {
     /// Internal: print a fresh random session ID for a newly loaded shell hook.
     #[command(name = "__session-id", hide = true)]
     SessionIdInternal,
+    /// Internal: record that a PowerShell or Nushell hook loaded in the calling
+    /// shell, for the hook-freshness readout of `status` and `doctor`. The
+    /// record carries no secret and grants nothing. Unix only.
+    #[command(name = "__hook-presence", hide = true)]
+    HookPresenceInternal {
+        #[arg(long, value_enum)]
+        family: HookPresenceFamilyArg,
+        /// Process ID of the calling shell (`$PID`, `$nu.pid`)
+        #[arg(long)]
+        shell_pid: u32,
+    },
 
     /// Manage the tirith background daemon
     #[command(after_help = "\
@@ -8267,6 +8293,9 @@ fn run() {
         Commands::SessionIdInternal => {
             println!("{}", tirith_core::session::new_session_id());
             0
+        }
+        Commands::HookPresenceInternal { family, shell_pid } => {
+            cli::hook_freshness::register_presence(family.into(), shell_pid)
         }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { detach } => cli::daemon::start(detach),

@@ -10,6 +10,12 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+#[path = "hook_presence.rs"]
+mod hook_presence;
+#[cfg(unix)]
+use hook_presence::{hook_presence_key, presence_key, registered_presence};
+pub use hook_presence::{register_hook_presence, HookPresenceFamily};
+
 #[path = "shell_verification.rs"]
 mod shell_verification;
 pub use shell_verification::{
@@ -1859,16 +1865,26 @@ pub enum HookFreshnessState {
     Current,
     /// Registered by a different or since-replaced executable.
     Stale,
-    /// No completed protocol-v3 registration for this shell.
+    /// No completed protocol-v3 registration (Bash, Zsh, Fish) or hook load
+    /// record (PowerShell, Nushell) for this shell.
     Unregistered,
     /// Not determinable (no shell identified, unsupported platform, or
     /// unreadable state).
     Unknown,
 }
 
-/// Read-only projection over the private hook capability records. Secrets and
-/// seals are neither needed nor read; records of dead or reused processes are
-/// ignored with the registry's own liveness test.
+/// Which record a shell's hook writes when it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRegistration {
+    /// Bash, Zsh and Fish: the protocol-v3 receipt capability.
+    Capability,
+    /// PowerShell and Nushell: a hook load record, which carries no bearer.
+    Presence(HookPresenceFamily),
+}
+
+/// Read-only projection over the private hook capability and hook load
+/// records. Secrets and seals are neither needed nor read; records of dead or
+/// reused processes are ignored with the registry's own liveness test.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HookFreshness {
     pub this_shell: HookFreshnessState,
@@ -1888,18 +1904,21 @@ impl HookFreshness {
     }
 }
 
-/// `shell_pid` is the caller's shell, when known. Other live registered shells
-/// of this user are counted separately. Never creates, repairs or locks state.
-pub fn hook_freshness(shell_pid: Option<u32>) -> HookFreshness {
+/// `shell` is the caller's shell PID and the record its hook writes, when
+/// known. A capability lookup never accepts a load record, and a load-record
+/// lookup accepts only a record of the same family. Other live registered
+/// shells of this user (either kind) are counted separately. Never creates,
+/// repairs or locks state.
+pub fn hook_freshness(shell: Option<(u32, HookRegistration)>) -> HookFreshness {
     #[cfg(not(unix))]
     {
-        let _ = shell_pid;
+        let _ = shell;
         HookFreshness::unknown()
     }
     #[cfg(unix)]
     {
         match current_tirith_executable_identity() {
-            Ok(executable) => hook_freshness_for(shell_pid, &executable),
+            Ok(executable) => hook_freshness_for(shell, &executable),
             Err(_) => HookFreshness::unknown(),
         }
     }
@@ -1980,16 +1999,22 @@ fn registered_hook(
 
 #[cfg(unix)]
 fn hook_freshness_for(
-    shell_pid: Option<u32>,
+    shell: Option<(u32, HookRegistration)>,
     executable: &TirithExecutableIdentity,
 ) -> HookFreshness {
     let effective_uid = unsafe { libc::geteuid() };
     let mut result = HookFreshness::unknown();
-    let this_key = shell_pid.and_then(|pid| match shell_process_identity(pid) {
-        Ok(identity) if identity.effective_uid == effective_uid => Some(capability_key(
-            effective_uid,
-            pid,
-            &identity.start_fingerprint,
+    let this_key = shell.and_then(|(pid, registration)| match shell_process_identity(pid) {
+        Ok(identity) if identity.effective_uid == effective_uid => Some((
+            match registration {
+                HookRegistration::Capability => {
+                    capability_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+                HookRegistration::Presence(_) => {
+                    presence_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+            },
+            registration,
         )),
         _ => None,
     });
@@ -2008,8 +2033,16 @@ fn hook_freshness_for(
             return result;
         }
     };
-    if let Some(key) = &this_key {
-        result.this_shell = match registered_hook(&directory, key, effective_uid, executable) {
+    if let Some((key, registration)) = &this_key {
+        let registered = match registration {
+            HookRegistration::Capability => {
+                registered_hook(&directory, key, effective_uid, executable)
+            }
+            HookRegistration::Presence(family) => {
+                registered_presence(&directory, key, effective_uid, executable, Some(*family))
+            }
+        };
+        result.this_shell = match registered {
             RegisteredHook::Absent => HookFreshnessState::Unregistered,
             RegisteredHook::Invalid => HookFreshnessState::Unknown,
             RegisteredHook::Live { current: true } => HookFreshnessState::Current,
@@ -2019,26 +2052,44 @@ fn hook_freshness_for(
     let Ok(entries) = fs::read_dir(&directory) else {
         return result;
     };
-    let mut examined = 0usize;
+    // Each kind is bounded like its registry.
+    let (mut capabilities, mut load_records) = (0usize, 0usize);
     for entry in entries {
         let Ok(entry) = entry else {
             continue;
         };
         let name = entry.file_name();
-        let Some(key) = name.to_str().and_then(hook_capability_key) else {
+        let Some(name) = name.to_str() else {
             continue;
         };
-        if this_key.as_deref() == Some(key) {
+        let (key, presence) = if let Some(key) = hook_capability_key(name) {
+            (key, false)
+        } else if let Some(key) = hook_presence_key(name) {
+            (key, true)
+        } else {
+            continue;
+        };
+        if this_key.as_ref().is_some_and(|(this, registration)| {
+            this == key && matches!(registration, HookRegistration::Presence(_)) == presence
+        }) {
             continue;
         }
-        examined += 1;
-        if examined > MAX_HOOK_CAPABILITIES {
+        let examined = if presence {
+            &mut load_records
+        } else {
+            &mut capabilities
+        };
+        *examined += 1;
+        if *examined > MAX_HOOK_CAPABILITIES {
             result.scan_limited = true;
             break;
         }
-        if let RegisteredHook::Live { current } =
+        let registered = if presence {
+            registered_presence(&directory, key, effective_uid, executable, None)
+        } else {
             registered_hook(&directory, key, effective_uid, executable)
-        {
+        };
+        if let RegisteredHook::Live { current } = registered {
             if current {
                 result.other_live_current = result.other_live_current.saturating_add(1);
             } else {
@@ -5808,7 +5859,7 @@ mod tests {
     fn hook_freshness_reports_current_stale_and_unregistered_hooks() {
         let shell_pid = unsafe { libc::getppid() } as u32;
         isolated_unregistered_state(|_, _| {
-            let freshness = hook_freshness(Some(shell_pid));
+            let freshness = hook_freshness(Some((shell_pid, HookRegistration::Capability)));
             assert_eq!(freshness.this_shell, HookFreshnessState::Unregistered);
             assert_eq!(
                 (freshness.other_live_current, freshness.other_live_stale),
@@ -5819,7 +5870,7 @@ mod tests {
         isolated_state(|temporary, _| {
             // The hook registered by this executable is current.
             assert_eq!(
-                hook_freshness(Some(shell_pid)).this_shell,
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
                 HookFreshnessState::Current
             );
             // Seen from another shell, it is one other live current terminal.
@@ -5832,7 +5883,8 @@ mod tests {
             fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
             let upgraded = executable_identity_at(&upgraded_path).unwrap();
             assert_eq!(
-                hook_freshness_for(Some(shell_pid), &upgraded).this_shell,
+                hook_freshness_for(Some((shell_pid, HookRegistration::Capability)), &upgraded)
+                    .this_shell,
                 HookFreshnessState::Stale
             );
             let others = hook_freshness_for(None, &upgraded);
@@ -5861,6 +5913,130 @@ mod tests {
                 (counted.other_live_current, counted.other_live_stale),
                 (1, 0)
             );
+        });
+    }
+
+    fn hook_load_record_paths() -> Vec<PathBuf> {
+        let directory = existing_receipt_directory(unsafe { libc::geteuid() })
+            .expect("private receipt directory")
+            .expect("provisioned receipt directory");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(hook_presence_key)
+                    .is_some()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn hook_load_records_report_freshness_without_acting_as_capabilities() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        let nushell = HookRegistration::Presence(HookPresenceFamily::Nushell);
+        let powershell = HookRegistration::Presence(HookPresenceFamily::PowerShell);
+        isolated_unregistered_state(|temporary, _| {
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load");
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // Loading the hook again in the same live shell replaces its record.
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load again");
+            assert_eq!(hook_load_record_paths().len(), 1);
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // A load record never stands in for a protocol-v3 capability, and
+            // it names one shell family.
+            assert_eq!(
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            assert_eq!(
+                hook_freshness(Some((shell_pid, powershell))).this_shell,
+                HookFreshnessState::Unknown
+            );
+            assert!(validate_shell_hook_instance_inner(
+                OTHER_HOOK_INSTANCE,
+                shell_pid,
+                ShellHookFamily::Zsh,
+                &crate::session::resolve_session_id(),
+                false,
+            )
+            .is_err());
+            // Seen from another shell it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // A replaced executable makes the loaded hook stale.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some((shell_pid, nushell)), &upgraded).this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+
+            // The record is private, is not a receipt (`*.json`) or capability
+            // name, and holds no secret.
+            let paths = hook_load_record_paths();
+            let record_path = &paths[0];
+            let name = record_path.file_name().unwrap().to_str().unwrap();
+            assert!(!name.ends_with(".json") && hook_capability_key(name).is_none());
+            assert_eq!(
+                fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
+            assert_eq!(record["family"], "nushell");
+            assert!(record.get("secret_sha256").is_none());
+            assert!(record.get("session_id").is_none());
+
+            // A record whose shell exited is never counted and is removed by
+            // the next registration; an exited shell cannot be registered.
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            record["shell_pid"] = serde_json::json!(dead_pid);
+            let key = presence_key(
+                unsafe { libc::geteuid() },
+                dead_pid,
+                record["shell_start_fingerprint"].as_str().unwrap(),
+            );
+            let directory = record_path.parent().unwrap();
+            let dead_path = hook_presence::presence_path(directory, &key);
+            fs::write(&dead_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(hook_load_record_paths().len(), 2);
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+            let error = register_hook_presence(dead_pid, HookPresenceFamily::PowerShell)
+                .expect_err("an exited shell cannot record a hook load");
+            assert!(error.contains("not a live process"), "{error}");
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell).unwrap();
+            assert_eq!(hook_load_record_paths(), vec![record_path.clone()]);
         });
     }
 

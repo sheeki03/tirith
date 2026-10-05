@@ -259,6 +259,11 @@ fn receipt_auxiliary_name(name: &str) -> bool {
                 .or_else(|| rest.strip_suffix(".capability.lock"))
                 .is_some_and(|stem| tirith_core::util::is_lower_hex(stem, 64))
         })
+        // PowerShell/Nushell hook load records (hook freshness evidence only).
+        || name
+            .strip_prefix(".hook-presence-")
+            .and_then(|rest| rest.strip_suffix(".record"))
+            .is_some_and(|stem| tirith_core::util::is_lower_hex(stem, 64))
 }
 
 /// Observe receipt format declarations only. The known lock/capability names
@@ -461,6 +466,10 @@ mod tests {
             file(&receipts.join(".receipt-registry.lock"), b"");
             file(
                 &receipts.join(format!(".hook-{}.capability", "a".repeat(64))),
+                b"not inventoried",
+            );
+            file(
+                &receipts.join(format!(".hook-presence-{}.record", "b".repeat(64))),
                 b"not inventoried",
             );
             for (index, version) in [3, 4, 99].into_iter().enumerate() {

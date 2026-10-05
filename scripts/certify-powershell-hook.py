@@ -69,6 +69,11 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8-sig'))
 
 
+def hook_load_records(path):
+    """PowerShell hook load records (`tirith __hook-presence`) in a fixture."""
+    return sorted((path / 'state/tirith/sessions/execution-receipts').glob('.hook-presence-*.record'))
+
+
 def run_bounded(command, cwd, env, log, timeout=45):
     with log.open('wb') as sink:
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -118,6 +123,7 @@ def inactive_cases(root, pwsh, binary, hook, results=None):
         assert state['loaded'] is False and state['status'] == 'off', state
         assert state['integration'] is None and state['session'] is None, state
         assert not (path / 'state/tirith/env_snapshot.json').exists()
+        assert not hook_load_records(path), mode
         results.append({'case': mode, 'passed': True, 'state': state})
     return results
 
@@ -227,6 +233,7 @@ def inactive_terminal_cases(root, pwsh, binary, hook, results=None):
             assert state['after'] == state['before'] and state['loaded'] is False, state
             assert state['status'] == 'off' and state['integration'] is None and state['session'] is None, state
             assert not (path / 'state/tirith/env_snapshot.json').exists()
+            assert not hook_load_records(path), 'terminal-' + mode
             results.append({'case': 'terminal-' + mode, 'passed': True, 'state': state})
         finally:
             tty.close()
@@ -255,6 +262,14 @@ def interactive_case(root, pwsh, binary, hook, results=None):
         tty.wait(lambda: read_json(path / 'prompt.json')['generation'] >= 2, 'allowed prompt')
         assert (path / 'allowed.txt').read_text().splitlines() == ['ran']
         results.append({'case': 'allowed-once', 'passed': True})
+        assert len(hook_load_records(path)) == 1, hook_load_records(path)
+        # `status` may exit non-zero; /usr/bin/true keeps the later exit-code checks independent.
+        tty.send('tirith status --json | Set-Content ' + quote(path / 'hook-status.json') + '; /usr/bin/true\r')
+        tty.wait(lambda: read_json(path / 'prompt.json')['generation'] >= 3, 'hook freshness status prompt')
+        freshness = read_json(path / 'hook-status.json')['hook_freshness']
+        assert freshness['this_shell'] == 'current' and freshness['evidence'] == 'registered_hook_presence', freshness
+        assert freshness['shell'] == 'pwsh' and freshness['blocking_proof'] is False, freshness
+        results.append({'case': 'hook-load-recorded-current', 'passed': True, 'hook_freshness': freshness})
         start = len(tty.trace)
         tty.send("Write-Output 'Write-Output safe' | Invoke-Expression; Add-Content blocked.txt ran\r")
         tty.output(b'tirith: BLOCKED', start)

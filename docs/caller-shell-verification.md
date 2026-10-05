@@ -65,18 +65,25 @@ sequence does not activate hooks.
 ## Is this terminal's hook current?
 
 `tirith status` and `tirith doctor` report whether the hook loaded in the
-calling terminal is current, and `--json` adds a `hook_freshness` object. Bash,
-Zsh and Fish hooks register a private record at startup that names the Tirith
-executable which generated them:
+calling terminal is current, and `--json` adds a `hook_freshness` object. At
+startup each hook writes a private record that names the shell process and the
+Tirith executable which loaded the hook. Bash, Zsh and Fish register their
+receipt capability (`evidence: registered_hook_capability`). PowerShell and
+Nushell have no receipt capability, so on Linux and macOS their hooks write a
+hook load record instead (`evidence: registered_hook_presence`). It carries no
+secret and grants nothing:
 
 - `current`: registered by this Tirith executable (loaded, not a blocking proof).
 - `stale`: registered by a different or since-replaced executable, for example
   before an upgrade. Open a new terminal to load the upgraded hook.
 - `unregistered`: no completed registration for this shell. Open a new terminal
-  after setup, or run `tirith init`.
-- `unknown`: the calling shell or its record could not be determined.
-  PowerShell and Nushell have no registration and report the inherited,
-  unverified `TIRITH_INTEGRATION_VERSION` instead.
+  after setup, or run `tirith init`. A PowerShell or Nushell terminal opened
+  before this release also reports `unregistered` until it is reopened.
+- `unknown`: the calling shell or its record could not be determined. On
+  Windows no shell can be registered (the process identity used here is
+  Unix-only), so PowerShell and Nushell there report the inherited, unverified
+  `TIRITH_INTEGRATION_VERSION` instead (`evidence:
+  inherited_environment_unverified`), as does any other unrecognized shell.
 
 The human output also counts other open terminals that still run an older hook
 (`other_live_stale`, with `other_live_current` in JSON). Records of exited
@@ -99,7 +106,11 @@ shells are ignored. This readout never reports verified or blocking protection
 - The dashboard is a configuration view. A saved success or a surviving shell
   PID does not let it claim current blocking.
 - The hook freshness readout is loaded-hook evidence only (`blocking_proof` is
-  always `false`).
+  always `false`). A PowerShell or Nushell hook load record shows only that the
+  hook finished loading in that shell process. It is never a receipt
+  capability or verification, and Nushell stays warn-only.
+- Hook freshness is not available on Windows: every shell there reports
+  `unknown`.
 - The core state-machine tests do not qualify a shell adapter. Each adapter must
   show the full sequence in a real interactive shell, including helper
   redefinition, hook disablement, configuration changes and failed

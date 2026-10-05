@@ -3930,6 +3930,128 @@ fn repo_shell_path_is_the_embedded_hook_directory() {
     }
 }
 
+/// PowerShell and Nushell hooks record their load with `tirith __hook-presence`
+/// (as the shipped hooks do), so `status` reports this terminal's hook as
+/// unregistered, then current, instead of the inherited, unverified hint.
+/// Caller detection reads the parent process's executable name, so a copy of
+/// this test binary named `pwsh` or `nu` stands in for the shell and runs
+/// [`hook_presence_shell_stand_in`] (system shells cannot be copied on macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn powershell_and_nushell_hook_load_records_drive_status_hook_freshness() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("shell stand-in fixture");
+    for (name, family, shell, other) in [
+        ("pwsh", "powershell", "pwsh", "nushell"),
+        ("nu", "nushell", "nushell", "powershell"),
+    ] {
+        let stand_in = fixture.path().join(name);
+        fs::copy(std::env::current_exe().unwrap(), &stand_in)
+            .expect("copy the test binary as the shell stand-in");
+        fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let mut hermetic = tirith();
+        hermetic.env("TIRITH_OFFLINE", "1");
+        let mut cmd = Command::new(&stand_in);
+        for (key, value) in hermetic.get_envs() {
+            match value {
+                Some(value) => cmd.env(key, value),
+                None => cmd.env_remove(key),
+            };
+        }
+        cmd.env("TIRITH_STAND_IN_TIRITH", hermetic.get_program())
+            .env("TIRITH_STAND_IN_FAMILY", family)
+            .env("TIRITH_STAND_IN_OTHER_FAMILY", other)
+            .env("TIRITH_STAND_IN_SHELL", shell)
+            .args([
+                "--exact",
+                "hook_presence_shell_stand_in",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        let run = cmd.output().expect("run the shell stand-in");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.contains("1 passed"),
+            "{name}: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+/// The stand-in shell's side of the test above; a no-op in a normal test run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn hook_presence_shell_stand_in() {
+    let Some(tirith) = std::env::var_os("TIRITH_STAND_IN_TIRITH") else {
+        return;
+    };
+    let var = |key: &str| std::env::var(key).expect(key);
+    let (family, other, shell) = (
+        var("TIRITH_STAND_IN_FAMILY"),
+        var("TIRITH_STAND_IN_OTHER_FAMILY"),
+        var("TIRITH_STAND_IN_SHELL"),
+    );
+    let pid = std::process::id().to_string();
+    let run = |args: &[&str]| {
+        Command::new(&tirith)
+            .args(args)
+            .output()
+            .expect("run tirith from the stand-in shell")
+    };
+    let freshness = || -> serde_json::Value {
+        let out = run(&["status", "--json"]);
+        let value: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "status --json: {error}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        value["hook_freshness"].clone()
+    };
+
+    let before = freshness();
+    assert_eq!(before["shell"], shell.as_str(), "{before}");
+    assert_eq!(before["evidence"], "registered_hook_presence", "{before}");
+    assert_eq!(before["this_shell"], "unregistered", "{before}");
+    assert_eq!(before["blocking_proof"], false);
+
+    // Only the calling shell, under its own family, can be recorded.
+    for (record_family, shell_pid) in [(other.as_str(), pid.as_str()), (family.as_str(), "1")] {
+        let refused = run(&[
+            "__hook-presence",
+            "--family",
+            record_family,
+            "--shell-pid",
+            shell_pid,
+        ]);
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{record_family} {shell_pid}"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("hook load record refused"), "{stderr}");
+    }
+    assert_eq!(freshness()["this_shell"], "unregistered");
+
+    let registered = run(&["__hook-presence", "--family", &family, "--shell-pid", &pid]);
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    assert!(registered.stdout.is_empty());
+    let after = freshness();
+    assert_eq!(after["this_shell"], "current", "{after}");
+    assert_eq!(after["evidence"], "registered_hook_presence");
+    assert_eq!(after["other_live_current"], 0);
+    assert_eq!(after["blocking_proof"], false);
+    assert!(after.get("inherited_integration_version").is_none());
+}
+
 /// Render `docs/capability-matrix.md` deterministically from a parsed
 /// `docs/capability-manifest.toml`. This is the generator behind the
 /// versioned capability matrix: the manifest is the single source of truth and

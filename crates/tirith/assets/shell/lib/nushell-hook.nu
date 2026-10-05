@@ -90,6 +90,18 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
     # A double-source guard never reaches this version publication.
     $env.TIRITH_INTEGRATION_VERSION = ($env._TIRITH_INIT_VERSION? | default "unknown")
     $env.TIRITH_INTEGRATION_SHELL = "nushell"
+
+    # Record that this hook loaded, so `tirith status` and `tirith doctor` can
+    # say whether this terminal runs the hook of the current Tirith
+    # executable. The private record names this live process and that
+    # executable; it carries no secret and grants nothing. Unix only: on
+    # Windows the readout keeps the inherited, unverified integration version.
+    # Failure only leaves the readout `unregistered`.
+    if ($nu.os-info.name != "windows") {
+        try {
+            do { ^tirith __hook-presence --family nushell --shell-pid $nu.pid } | complete | ignore
+        }
+    }
 }
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────

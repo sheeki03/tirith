@@ -496,6 +496,24 @@ $env:TIRITH_INTEGRATION_VERSION = 'unknown'
 if ($global:_TIRITH_INIT_VERSION) { $env:TIRITH_INTEGRATION_VERSION = $global:_TIRITH_INIT_VERSION }
 $env:TIRITH_INTEGRATION_SHELL = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
 
+# Record that this hook loaded, so `tirith status` and `tirith doctor` can say
+# whether this terminal runs the hook of the current Tirith executable. The
+# private record names this live process and that executable; it carries no
+# secret and grants nothing. Unix only: on Windows the readout keeps the
+# inherited, unverified integration version. Failure only leaves the readout
+# `unregistered`, and the previous native exit code is kept.
+if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
+    $_tirithPresenceExit = $global:LASTEXITCODE
+    try {
+        & $global:_TIRITH_BIN __hook-presence --family powershell --shell-pid $PID 2>$null 1>$null
+    } catch {
+        # Best effort: a load record must never break the shell.
+    } finally {
+        $global:LASTEXITCODE = $_tirithPresenceExit
+    }
+    Remove-Variable _tirithPresenceExit -ErrorAction SilentlyContinue
+}
+
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded
 # hook copy; `tirith output wrap on` writes an active copy of the function

@@ -26,6 +26,7 @@ fn sanitize_completion_subcommand_names(command: Command) -> Command {
             "__execution-receipt" => Some("_execution-receipt"),
             "__shell-verification" => Some("_shell-verification"),
             "__session-id" => Some("_session-id"),
+            "__hook-presence" => Some("_hook-presence"),
             _ => None,
         };
         let contains_path_delimiter = subcommand.get_name().contains("__");
@@ -83,6 +84,7 @@ mod tests {
                     ("__execution-receipt", "_execution-receipt"),
                     ("__shell-verification", "_shell-verification"),
                     ("__session-id", "_session-id"),
+                    ("__hook-presence", "_hook-presence"),
                 ] {
                     assert!(parser_command
                         .find_subcommand(internal)
