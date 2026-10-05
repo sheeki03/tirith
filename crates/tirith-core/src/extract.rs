@@ -3954,9 +3954,19 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
         }
         // A `!` outside single quotes starts a history expansion in an
         // interactive bash or zsh (on by default): `!#` is the line typed so
-        // far, so `cat <<E!#` reads `cat <<Ecat <<E` there (two heredocs).
-        // Batch shells keep the `!`. The terminator depends on the shell.
-        if quote != Some(b'\'') && byte == b'!' {
+        // far, so `cat <<E!#` reads `cat <<Ecat <<E` there (two heredocs),
+        // and `E!x` recalls an event. Batch shells keep the `!`. The
+        // terminator depends on the shell. Both shells leave an unquoted `!`
+        // alone before a blank, `=` or the end of the line, so the classic
+        // `<<!` and `<<END!` read the same everywhere (checked in bash 5.3
+        // and 3.2, dash, zsh 5.9 and ksh93, and interactive bash and zsh).
+        // Inside double quotes an interactive zsh reads even `<<"!"` to the
+        // end of the input.
+        if quote != Some(b'\'')
+            && byte == b'!'
+            && (quote.is_some()
+                || !matches!(bytes.get(index + 1), None | Some(b' ' | b'\t' | b'=')))
+        {
             return Err(());
         }
         if let Some(active) = quote {
@@ -4324,6 +4334,79 @@ fn heredoc_interpreter_for_header(
     shell_reads_heredoc_from_stdin(&command, &args)
 }
 
+/// Where a heredoc's body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeredocEnd {
+    /// The terminator line: its start and its end (before the newline).
+    At(usize, usize),
+    /// The line that ends the body differs between the shells.
+    ShellDependent,
+    Unterminated,
+}
+
+/// The line that ends the heredoc body starting at `body_start`. Each line is
+/// compared with the delimiter word byte for byte (after `<<-` strips leading
+/// tabs). In an unquoted heredoc a line ending in an unescaped backslash is
+/// continued: no shell compares the next line on its own (bash 5.3 and 3.2,
+/// dash, zsh and ksh93 all read `foo\` + `EOF` as data). bash and zsh then
+/// compare the joined line, dash only drops backslash-newlines at the start
+/// of a line (it ends `\` + `EOF`, not `EO\` + `F`) and ksh compares only a
+/// line that is not continued, so a joined line equal to the word ends the
+/// body in some shells only.
+fn heredoc_end(raw: &str, body_start: usize, spec: &PosixHeredocSpec) -> HeredocEnd {
+    let mut cursor = body_start;
+    let mut joined: Option<String> = None;
+    while cursor <= raw.len() {
+        let line_end = raw[cursor..]
+            .find('\n')
+            .map_or(raw.len(), |offset| cursor + offset);
+        let raw_line = raw.get(cursor..line_end).unwrap_or_default();
+        let backslashes = raw_line.bytes().rev().take_while(|&b| b == b'\\').count();
+        if !spec.quoted && line_end < raw.len() && backslashes % 2 == 1 {
+            joined
+                .get_or_insert_with(String::new)
+                .push_str(&raw_line[..raw_line.len() - 1]);
+            cursor = line_end + 1;
+            continue;
+        }
+        match joined.take() {
+            Some(mut joined) => {
+                joined.push_str(raw_line);
+                if terminator_match(&joined, spec).is_some() {
+                    return HeredocEnd::ShellDependent;
+                }
+            }
+            // The line's CR must match the word's; a shell that drops CRs
+            // (Cygwin bash's igncr) would end the heredoc here anyway. Where
+            // the two disagree the boundary depends on the shell, and ending
+            // it early would let a data line such as `cat <<Z` open a heredoc
+            // that hides code.
+            None => match terminator_match(raw_line, spec) {
+                Some(true) => return HeredocEnd::At(cursor, line_end),
+                Some(false) => return HeredocEnd::ShellDependent,
+                None => {}
+            },
+        }
+        if line_end == raw.len() {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+    HeredocEnd::Unterminated
+}
+
+/// `Some` when `line` is the delimiter word once a trailing CR is set aside,
+/// holding whether that CR matches the word's (a CRLF header line).
+fn terminator_match(line: &str, spec: &PosixHeredocSpec) -> Option<bool> {
+    let without_cr = line.strip_suffix('\r').unwrap_or(line);
+    let candidate = if spec.strip_tabs {
+        without_cr.trim_start_matches('\t')
+    } else {
+        without_cr
+    };
+    (candidate == spec.delimiter).then(|| line.ends_with('\r') == spec.word_ends_in_cr)
+}
+
 fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
     let mut recovery = PosixHeredocRecovery {
         sanitized: raw.to_string(),
@@ -4383,39 +4466,8 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
         let mut body_cursor = header_end + 1;
         for (spec, relative) in specs.iter().zip(relative_specs.iter()) {
             let body_start = body_cursor;
-            let mut terminator = None;
-            let mut cr_dependent = false;
-            while body_cursor <= raw.len() {
-                let line_end = raw[body_cursor..]
-                    .find('\n')
-                    .map_or(raw.len(), |offset| body_cursor + offset);
-                let raw_line = raw.get(body_cursor..line_end).unwrap_or_default();
-                let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-                let candidate = if spec.strip_tabs {
-                    line.trim_start_matches('\t')
-                } else {
-                    line
-                };
-                if candidate == spec.delimiter {
-                    // bash, dash, zsh and ksh compare the line byte for byte,
-                    // so its CR must match the word's; a shell that drops
-                    // CRs (Cygwin bash's igncr) would end the heredoc here
-                    // anyway. Where the two disagree the boundary depends on
-                    // the shell, and ending it early would let a data line
-                    // such as `cat <<Z` open a heredoc that hides code.
-                    if raw_line.ends_with('\r') == spec.word_ends_in_cr {
-                        terminator = Some((body_cursor, line_end));
-                    } else {
-                        cr_dependent = true;
-                    }
-                    break;
-                }
-                if line_end == raw.len() {
-                    break;
-                }
-                body_cursor = line_end + 1;
-            }
-            if cr_dependent {
+            let end = heredoc_end(raw, body_start, spec);
+            if end == HeredocEnd::ShellDependent {
                 // Fail closed with every line left visible.
                 recovery
                     .gap
@@ -4423,7 +4475,7 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 body_cursor = raw.len();
                 break;
             }
-            let Some((terminator_start, terminator_end)) = terminator else {
+            let HeredocEnd::At(terminator_start, terminator_end) = end else {
                 recovery
                     .gap
                     .get_or_insert(ShellExecutionGap::IncompleteExecutableBody);
@@ -15879,7 +15931,11 @@ mod tests {
     /// every shell, the heredoc fails closed and every line stays visible:
     /// - a `!` outside single quotes is history-expanded by an interactive
     ///   bash and zsh (`!#` is the line typed so far, so `cat <<E!#` becomes
-    ///   `cat <<Ecat <<E`, two heredocs);
+    ///   `cat <<Ecat <<E`, two heredocs), except an unquoted one before a
+    ///   blank, `=` or the end of the line (`<<!`, `<<END!` stay exact);
+    /// - in an unquoted heredoc bash and zsh join a line ending in an
+    ///   unescaped backslash with the next before comparing it, dash and ksh
+    ///   do not, so `EO\` + `F` ends the body in some shells only;
     /// - a `(` after word bytes is a glob group to zsh, and to bash with
     ///   extglob and ksh (`E(x)F`, `E@(x)F`), one word ending at `E(x)F`;
     /// - `<->` / `<1-2>` is a zsh numeric glob inside the word;
@@ -15918,6 +15974,30 @@ mod tests {
             // A quoted or escaped CR is part of the word.
             format!("cat <<'EOF\r'\nEOF\r\n{payload}\n"),
             format!("cat <<EOF\\\r\nEOF\r\n{payload}\n"),
+            // An interactive bash or zsh history-expands a `!` before any
+            // other byte, and an interactive zsh reads `<<"!"` to the end.
+            format!("cat <<E!x\nbody\nE!x\n{payload}\n"),
+            format!("cat <<!E\nbody\n!E\n{payload}\n"),
+            format!("cat <<E!|cat\nbody\nE!\n{payload}\n"),
+            format!("cat <<E!;\nbody\nE!\n{payload}\n"),
+            format!("cat <<\"!\"\nbody\n!\n{payload}\n"),
+            format!("cat <<\"END!\"\nbody\nEND!\n{payload}\n"),
+            format!("cat <<E!\r\nbody\r\nE!\r\n{payload}\r\n"),
+            // In an unquoted heredoc bash and zsh join a line ending in a
+            // backslash with the next before comparing it, so `EO\` + `F`
+            // ends the body and the pipeline runs there; dash and ksh compare
+            // only lines that are not continued and read it as data.
+            format!("cat <<EOF\nbody\nEO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\tEO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<EOF\nE\\\nO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<EOF\nEOF\\\n\n{payload}\nEOF\n"),
+            // dash drops a backslash-newline at the start of a line before it
+            // compares the rest, so it ends `\` + `EOF` too (ksh does not);
+            // with `<<-`, `\` + tab `EOF` ends in bash and dash but not zsh,
+            // and tab `\` + `EOF` in bash and zsh but not dash.
+            format!("cat <<EOF\nbody\n\\\nEOF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\\\n\tEOF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\t\\\nEOF\n{payload}\nEOF\n"),
         ] {
             let scan = executable_substitution_scan(&input, ShellType::Posix);
             let view = shell_execution_view(&input, ShellType::Posix);
@@ -15929,6 +16009,28 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "boundary read one way only: {wrong:#?}");
+
+        // No shell compares the line after a continued one on its own, so
+        // `foo\` + `EOF` is data everywhere and the body ends at the next
+        // `EOF`. Ending it there let the data line `cat <<X` open a heredoc
+        // that hid the pipeline every shell runs.
+        for input in [
+            format!("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\n{payload}\nX\n"),
+            // Three backslashes: an escaped one, then a continuation.
+            format!("cat <<EOF\nfoo\\\\\\\nEOF\ncat <<X\nEOF\n{payload}\nX\n"),
+        ] {
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            if spans.len() != 1 || !input[spans[0].body.clone()].ends_with("EOF\ncat <<X\n") {
+                wrong.push(input.clone());
+            }
+            if !shell_execution_view(&input, ShellType::Posix).contains(payload) {
+                wrong.push(input);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "line after a continued one ended the body: {wrong:#?}"
+        );
 
         // Spellings every shell reads alike keep their exact boundaries.
         for (input, body) in [
@@ -15945,6 +16047,26 @@ mod tests {
             ("cat <<EOF\r\nbody\r\nEOF\r\n", "body\r\n"),
             ("cat <<'EOF'\r\nbody\r\nEOF\r\n", "body\r\n"),
             ("cat <<-EOF\r\n\tbody\r\n\tEOF\r\n", "\tbody\r\n"),
+            // Neither shell history-expands an unquoted `!` before a blank,
+            // `=` or the end of the line: the classic `<<!` idiom.
+            ("cat <<!\nbody\n!\n", "body\n"),
+            ("cat <<END!\nbody\nEND!\necho done\n", "body\n"),
+            ("cat <<END! | cat\nbody\nEND!\n", "body\n"),
+            ("cat <<END!\t>out.txt\nbody\nEND!\n", "body\n"),
+            ("cat <<E!=x\nbody\nE!=x\n", "body\n"),
+            ("cat <<E\"x\"!\nbody\nEx!\n", "body\n"),
+            ("cat <<'!'\nbody\n!\n", "body\n"),
+            // A continued line that joins into no terminator, a quoted
+            // heredoc (no joining), an escaped backslash and a backslash
+            // before a CR end the body at the same line in every shell.
+            ("cat <<EOF\na\\\nb\nEOF\n", "a\\\nb\n"),
+            ("cat <<'EOF'\nEO\\\nF\nEOF\n", "EO\\\nF\n"),
+            ("cat <<EOF\nEO\\\\\nF\nEOF\n", "EO\\\\\nF\n"),
+            ("cat <<EOF\nfoo\\\\\nEOF\n", "foo\\\\\n"),
+            ("cat <<EOF\r\nEO\\\r\nF\r\nEOF\r\n", "EO\\\r\nF\r\n"),
+            // `<<-` strips the tabs before the joined line, not inside it.
+            ("cat <<-EOF\nEO\\\n\tF\nEOF\n", "EO\\\n\tF\n"),
+            ("cat <<-EOF\n\tE\\\n\t\tOF\nEOF\n", "\tE\\\n\t\tOF\n"),
         ] {
             let spans = posix_heredoc_spans(input).unwrap_or_else(|| panic!("{input:?}"));
             assert_eq!(spans.len(), 1, "{input:?}");

