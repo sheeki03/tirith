@@ -23966,6 +23966,74 @@ fn daemon_check_uses_the_clients_python_inspect_not_the_daemons() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
+    let answered_by_daemon = |json: &serde_json::Value| {
+        json["policy_path_used"]
+            .as_str()
+            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
+    };
+    let has_pipe = |json: &serde_json::Value| {
+        json["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|f| f["rule_id"].as_str() == Some("pipe_to_interpreter"))
+        })
+    };
+
+    // `tirith check` waits at most 5 s for the daemon's answer, then falls
+    // back to local analysis. The first requests a fresh daemon serves also
+    // pay its one-time start-up work, and under the parallel workspace run
+    // that took longer than 5 s, so the asserted checks got a local verdict
+    // (the cold local fallback in those runs took another 2.8 s and 7.4 s).
+    // Warm the daemon first: send the exact request the client sends, for
+    // both inspect values, over the daemon socket with no 5 s deadline.
+    // These answers also show the daemon's own decision, with no client in
+    // between.
+    let project_cwd = fs::canonicalize(&project).expect("canonical project dir");
+    let ask_daemon = |python_inspect_inherited: bool| -> serde_json::Value {
+        use std::io::{BufRead as _, Write as _};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket).expect("connect to the daemon");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+            .expect("bounded warm-up read");
+        let request = serde_json::json!({
+            "command": "check",
+            "input": "echo payload | python3 -c 'print(1)'",
+            "context": "exec",
+            "cwd": project_cwd.display().to_string(),
+            "shell": "posix",
+            "interactive": false,
+            "bypass_requested": false,
+            "offline": true,
+            "python_inspect_inherited": python_inspect_inherited,
+        });
+        writeln!(stream, "{request}").expect("send the request");
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("daemon answer");
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("daemon answer must be JSON: {error}: {line}"))
+    };
+    let direct_without = ask_daemon(false);
+    assert!(
+        answered_by_daemon(&direct_without),
+        "warm-up answer did not come from the daemon's policy: {direct_without}"
+    );
+    assert!(
+        !has_pipe(&direct_without),
+        "the daemon's own PYTHONINSPECT must not refuse the exemption: {direct_without}"
+    );
+    let direct_with = ask_daemon(true);
+    assert!(
+        answered_by_daemon(&direct_with),
+        "warm-up answer did not come from the daemon's policy: {direct_with}"
+    );
+    assert!(
+        has_pipe(&direct_with),
+        "an inherited PYTHONINSPECT in the request must refuse the exemption: {direct_with}"
+    );
+
     let check = |client_inspect: Option<&str>| -> serde_json::Value {
         let mut cmd = tirith_in_proj(&project);
         cmd.env("XDG_STATE_HOME", &state)
@@ -23991,18 +24059,6 @@ fn daemon_check_uses_the_clients_python_inspect_not_the_daemons() {
                 "check output must be JSON: {error}; stderr={}",
                 String::from_utf8_lossy(&out.stderr)
             )
-        })
-    };
-    let answered_by_daemon = |json: &serde_json::Value| {
-        json["policy_path_used"]
-            .as_str()
-            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
-    };
-    let has_pipe = |json: &serde_json::Value| {
-        json["findings"].as_array().is_some_and(|findings| {
-            findings
-                .iter()
-                .any(|f| f["rule_id"].as_str() == Some("pipe_to_interpreter"))
         })
     };
 
