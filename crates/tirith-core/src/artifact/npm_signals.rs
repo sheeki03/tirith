@@ -526,10 +526,10 @@ fn literal_script_target(command: &str) -> Option<String> {
 }
 
 /// Nesting depth and body count for the brace/function/subshell and
-/// substitution descent in [`fetch_feeds_shell`]. Package scripts are bounded
-/// text, so this only keeps adversarial nesting from turning one file into
-/// unbounded work. Hitting either bound is incomplete coverage, never "no
-/// pipeline".
+/// substitution descent in [`fetch_feeds_shell`] (each pass of [`descend`]
+/// has its own count). Package scripts are bounded text, so this only keeps
+/// adversarial nesting from turning one file into unbounded work. Hitting
+/// either bound is incomplete coverage, never "no pipeline".
 const SHELL_BODY_DEPTH: usize = 8;
 const SHELL_BODY_BUDGET: usize = 256;
 
@@ -563,7 +563,8 @@ fn feeds_shell(text: &str) -> bool {
 /// substitution is only visible after descending into that body.
 /// `substitutions` is the text to read substitutions from (heredoc bodies
 /// blanked, see [`without_heredoc_bodies`]); it is `None` for a group body,
-/// whose substitutions were already read from the text around it.
+/// whose substitutions were already read from the text around it, and in the
+/// group-only pass of [`descend`].
 fn fetch_feeds_shell(
     text: &str,
     substitutions: Option<&str>,
@@ -790,17 +791,19 @@ fn substitution_feeds_shell(text: &str, depth: usize) -> bool {
         })
 }
 
-fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
+/// One bounded descent over the file, then over each live heredoc body.
+/// Without `read_substitutions` it enters brace-group, function and subshell
+/// bodies only; with it, substitution bodies too.
+fn descend(
+    text: &str,
+    heredocs: &inert_heredoc::HeredocView,
+    read_substitutions: bool,
+) -> ShellFetch {
+    let substitutions = read_substitutions.then(|| without_heredoc_bodies(text));
     let mut budget = SHELL_BODY_BUDGET;
-    // Heredoc text this file provably only prints is data, like a comment.
-    // Every other heredoc body is also scanned on its own, and ambiguous
-    // heredocs add the line-by-line pass. The bounded fallback below keeps
-    // reading the raw text (fails toward the signal).
-    let heredocs = inert_heredoc::analyze(text);
-    let substitutions = without_heredoc_bodies(text);
     let mut outcome = fetch_feeds_shell(
         heredocs.masked.as_deref().unwrap_or(text),
-        Some(&substitutions),
+        substitutions.as_deref(),
         0,
         &mut budget,
     );
@@ -812,21 +815,40 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
             break;
         }
         let body = &text[body.clone()];
-        let substitutions = without_heredoc_bodies(body);
-        match fetch_feeds_shell(body, Some(&substitutions), 0, &mut body_budget) {
+        let substitutions = read_substitutions.then(|| without_heredoc_bodies(body));
+        match fetch_feeds_shell(body, substitutions.as_deref(), 0, &mut body_budget) {
             ShellFetch::NotFound => {}
             other => outcome = other,
         }
     }
-    let found = match outcome {
-        ShellFetch::Found => true,
-        ShellFetch::NotFound => heredocs.ambiguous && any_line_feeds_shell(text),
-        ShellFetch::Bounded => {
-            inspection.issue(NpmIssueKind::CodeLimit, Some(member),
-                "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
-            any_line_feeds_shell(text)
-        }
+    outcome
+}
+
+fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
+    // Heredoc text this file provably only prints is data, like a comment.
+    // Every other heredoc body is also scanned on its own, and ambiguous
+    // heredocs add the line-by-line pass. The bounded fallback below keeps
+    // reading the raw text (fails toward the signal).
+    let heredocs = inert_heredoc::analyze(text);
+    // The group descent runs alone first, on its own budget, so substitution
+    // bodies (each piped one costs a body) can never use up the budget a
+    // later brace group, function or subshell needs, as in a live heredoc
+    // body full of `$(... | ...)` before one holding `f() { curl … | sh; }`.
+    // The descent that also reads substitutions then gets a fresh budget.
+    let grouped = descend(text, &heredocs, false);
+    let substituted = if grouped == ShellFetch::Found {
+        ShellFetch::NotFound
+    } else {
+        descend(text, &heredocs, true)
     };
+    let bounded = grouped == ShellFetch::Bounded || substituted == ShellFetch::Bounded;
+    if bounded {
+        inspection.issue(NpmIssueKind::CodeLimit, Some(member),
+            "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
+    }
+    let found = grouped == ShellFetch::Found
+        || substituted == ShellFetch::Found
+        || ((bounded || heredocs.ambiguous) && any_line_feeds_shell(text));
     if found {
         push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
             vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,

