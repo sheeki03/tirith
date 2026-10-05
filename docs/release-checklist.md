@@ -149,6 +149,9 @@ Native aarch64 Linux uses a separate deny-all seccomp policy alongside Landlock;
 the x86_64 extrasafe dependency remains architecture-specific. Each exact GNU
 and musl release archive must pass the native ARM containment job, including
 network/filesystem restrictions, resource limits and interruption cleanup.
+For the GNU target the same job also runs the seccomp, `clone` flag policy
+(including the installed production filter), ACL, breakpoint and parent-lifetime
+contract tests on the native aarch64 kernel.
 Missing required kernel controls still cause a pre-launch refusal. The QEMU
 runtime compatibility checks cannot establish native seccomp enforcement: they
 require an exit-1 refusal naming `network_raw_denied`, and any child output fails
