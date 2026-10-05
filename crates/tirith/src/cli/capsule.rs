@@ -5722,6 +5722,61 @@ mod tests {
         }
     }
 
+    /// Set (to the test's path) in the copy of this test binary that runs one
+    /// descriptor-pressure test body alone.
+    #[cfg(target_os = "linux")]
+    const FD_PRESSURE_CHILD: &str = "TIRITH_CAPSULE_FD_PRESSURE_CHILD";
+
+    /// Run a test that fills the low descriptor range in its own process.
+    ///
+    /// Descriptor numbers are process-global. A body that fills 3..=64 and then
+    /// needs one of the few free slots below its RLIMIT_NOFILE races every other
+    /// test thread that opens a file, pipe or socket meanwhile; in the full
+    /// parallel Linux run those threads once held every slot from 65 to 69, so
+    /// the reservation was refused. Here the body runs in a fresh copy of this
+    /// test binary (`--exact`, one test thread) that first closes every
+    /// descriptor it inherited above stderr, so the table holds only what the
+    /// body itself opens.
+    #[cfg(target_os = "linux")]
+    fn run_fd_pressure_test_alone(test_path: &str, body: fn()) {
+        if std::env::var_os(FD_PRESSURE_CHILD).as_deref() == Some(std::ffi::OsStr::new(test_path)) {
+            close_inherited_descriptors();
+            body();
+            return;
+        }
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let output = Command::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", test_path, "--test-threads=1", "--nocapture"])
+            .env(FD_PRESSURE_CHILD, test_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the descriptor-pressure test in its own process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{test_path} failed in its own process: status={:?} stdout={stdout} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Close every descriptor above stderr. Only for the single-test child of
+    /// [`run_fd_pressure_test_alone`]: nothing in that process owns them.
+    #[cfg(target_os = "linux")]
+    fn close_inherited_descriptors() {
+        let inherited: Vec<i32> = std::fs::read_dir("/proc/self/fd")
+            .expect("list /proc/self/fd")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|fd| *fd > 2)
+            .collect();
+        for fd in inherited {
+            // SAFETY: this process runs one test body on one thread and has not
+            // created any descriptor of its own yet. The listing's own directory
+            // descriptor is already closed, so close() just returns EBADF for it.
+            unsafe { libc::close(fd) };
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn consume_shared_directory_offset(fd: i32) -> usize {
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
@@ -6165,6 +6220,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bound_destination_is_owned_across_dense_fd_command_spawn() {
+        run_fd_pressure_test_alone(
+            "cli::capsule::tests::bound_destination_is_owned_across_dense_fd_command_spawn",
+            bound_destination_is_owned_across_dense_fd_command_spawn_body,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bound_destination_is_owned_across_dense_fd_command_spawn_body() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Seek as _, Write as _};
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -6224,6 +6287,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn file_shape_reserves_both_content_objects_under_fd_pressure() {
+        run_fd_pressure_test_alone(
+            "cli::capsule::tests::file_shape_reserves_both_content_objects_under_fd_pressure",
+            file_shape_reserves_both_content_objects_under_fd_pressure_body,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn file_shape_reserves_both_content_objects_under_fd_pressure_body() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Seek as _, Write as _};
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
