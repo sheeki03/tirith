@@ -61,6 +61,7 @@ The next release removes `tirith-core` library API (see Removed), so it must be 
 - `tirith explain artifact_download_integrity_mismatch` says the id is retained with no live emitter instead of describing the removed pip package firewall and quarantine workflow as live.
 - Preserve the interactive fish shell's umask during private capture, including helper failures and Ctrl-C. Capture files retain their private permissions (#265).
 - Ignore phantom policy and repository-marker directories reported by Unix virtual filesystems only when bounded directory enumeration proves the names absent. Genuine policy errors and filesystem name aliases retain conservative handling (#266).
+- A heredoc delimiter is read with the shell's quote removal: inside double quotes a backslash is removed only before `$`, `` ` ``, `"` and `\`, so `<<"E\OF"` ends at the line `E\OF`. It was read as `EOF`, which hid the commands after the real terminator as heredoc data. A `$'...'` or `$"..."` delimiter, whose terminator differs between shells, is reported as incomplete analysis.
 - Preserve the exact release libc/ABI during update selection. Linux installation and npm launch refuse incompatible or unidentified runtimes before selecting a GNU executable.
 
 ## [0.4.2] - 2026-09-11

