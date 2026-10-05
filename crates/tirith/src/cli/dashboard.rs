@@ -69,6 +69,10 @@ const REPORT_RESPONSE: http::ResponsePolicy = http::ResponsePolicy {
     content_security_policy: "default-src 'none'; style-src 'unsafe-inline'",
     max_bytes: usize::MAX,
     deadline: Duration::from_secs(30),
+    // Every method token gets the report decision; GET and HEAD are the ones
+    // that mean something.
+    allow: "GET, HEAD",
+    date: true,
 };
 
 /// The outcome of authorizing a request — maps directly to an HTTP status.
@@ -1843,6 +1847,128 @@ mod tests {
             statuses(&malformed),
             ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 400 Bad Request"]
         );
+    }
+
+    /// Answer one raw request on one connection through the production
+    /// `handle_connection` (env cleared like the other serve tests).
+    fn serve_one(token: &str, raw: &str) -> Vec<Answer> {
+        let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+        let raw = raw
+            .replace("{port}", &port.to_string())
+            .replace("{token}", token);
+        let (answers, _) = exchange(port, &raw, &[]);
+        handle.join().expect("server thread");
+        answers
+    }
+
+    // RFC 9110 section 15.5.6: a 405 MUST carry `Allow`. `dashboard serve`
+    // answers every method token of up to 16 bytes with the report decision,
+    // so its 405 must say what it refuses (a method that is not such a token),
+    // not the control API's "only GET and POST".
+    #[test]
+    fn serve_405_carries_allow_and_names_what_it_refuses() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+
+        // A method token over 16 bytes, an empty method (leading space), and a
+        // method with a byte that is not a token character.
+        for raw in [
+            "ABCDEFGHIJKLMNOPQ /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            " GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            "G(T /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+        ] {
+            let answers = serve_one(token, raw);
+            assert_eq!(answers.len(), 1, "{raw:?}");
+            let answer = &answers[0];
+            assert_eq!(answer.status_line, "HTTP/1.1 405 Method Not Allowed");
+            assert_eq!(
+                answer.headers.get("allow").map(String::as_str),
+                Some("GET, HEAD"),
+                "{raw:?}: {answer:?}"
+            );
+            let body = String::from_utf8_lossy(&answer.body);
+            assert_eq!(
+                body, "405 the method must be a token of 1 to 16 bytes, such as GET or HEAD",
+                "{raw:?}"
+            );
+        }
+
+        // A method token the report answers gets the report decision, not 405.
+        let answers = serve_one(
+            token,
+            "PROPFIND /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status_line, "HTTP/1.1 200 OK");
+        assert!(!answers[0].headers.contains_key("allow"));
+    }
+
+    // RFC 9110 section 6.6.1: an origin server with a clock sends `Date` on
+    // every 2xx and 4xx response, here including transport errors (400, 405,
+    // 408) and HEAD and HTTP/1.0 answers. tiny_http sent it in 0.4.2.
+    #[test]
+    fn every_serve_response_carries_an_imf_fixdate_date() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+
+        for (raw, expected) in [
+            (
+                "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "HEAD /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.0 200 OK",
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 401 Unauthorized",
+            ),
+            (
+                "GET /?token={token} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "GET nope HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.1 400 Bad Request",
+            ),
+            (
+                "ABCDEFGHIJKLMNOPQ /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.1 405 Method Not Allowed",
+            ),
+            // An incomplete head: 408 after the 1 s head deadline.
+            (
+                "GET /?token={token} HTTP/1.1\r\n",
+                "HTTP/1.1 408 Request Timeout",
+            ),
+        ] {
+            let answers = serve_one(token, raw);
+            assert_eq!(answers.len(), 1, "{raw:?}");
+            let answer = &answers[0];
+            assert_eq!(answer.status_line, expected, "{raw:?}");
+            if !expected.contains(" 405 ") {
+                assert!(!answer.headers.contains_key("allow"), "{raw:?}");
+            }
+            let date = answer
+                .headers
+                .get("date")
+                .unwrap_or_else(|| panic!("{raw:?}: no Date header: {answer:?}"));
+            // IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+            assert_eq!(date.len(), 29, "{raw:?}: {date:?}");
+            let parsed = chrono::NaiveDateTime::parse_from_str(date, "%a, %d %b %Y %H:%M:%S GMT")
+                .unwrap_or_else(|e| panic!("{raw:?}: {date:?} is not an IMF-fixdate: {e}"))
+                .and_utc();
+            let skew = (Utc::now() - parsed).num_seconds().abs();
+            assert!(skew < 120, "{raw:?}: Date {date:?} is {skew} s off");
+        }
     }
 
     // An idle keep-alive connection gives its slot back after the head

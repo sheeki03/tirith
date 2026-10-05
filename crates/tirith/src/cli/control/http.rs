@@ -59,12 +59,19 @@ pub(crate) struct ResponsePolicy {
     pub content_security_policy: &'static str,
     pub max_bytes: usize,
     pub deadline: Duration,
+    /// The `Allow` value sent with a 405 (RFC 9110 section 15.5.6 requires
+    /// one): the methods a client should use on this server.
+    pub allow: &'static str,
+    /// Send a `Date` header (RFC 9110 section 6.6.1) on every response.
+    pub date: bool,
 }
 
 pub(super) const CONTROL_RESPONSE: ResponsePolicy = ResponsePolicy {
     content_security_policy: "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
     max_bytes: MAX_RESPONSE,
     deadline: Duration::from_secs(3),
+    allow: "GET, POST",
+    date: false,
 };
 
 pub(crate) struct Request {
@@ -306,7 +313,15 @@ fn parse_headers(bytes: &[u8], rules: Rules) -> Result<(Request, usize), Error> 
         }
     };
     if !method_supported {
-        return Err(error(405, "only GET and POST are supported"));
+        // The report answers any method token with the report decision, so
+        // its 405 names what it refuses, not the control API's method list.
+        return Err(match rules {
+            Rules::Control => error(405, "only GET and POST are supported"),
+            Rules::Report => error(
+                405,
+                "the method must be a token of 1 to 16 bytes, such as GET or HEAD",
+            ),
+        });
     }
     let version = first.next();
     let version_supported = match version {
@@ -783,7 +798,16 @@ pub(crate) fn respond_framed(
     } else {
         "close"
     };
-    let headers = format!("HTTP/{version} {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: {}\r\n\r\n", bytes.len(), policy.content_security_policy);
+    let mut headers = format!("HTTP/{version} {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nCross-Origin-Opener-Policy: same-origin\r\nContent-Security-Policy: {}\r\n", bytes.len(), policy.content_security_policy);
+    if status == 405 {
+        headers.push_str(&format!("Allow: {}\r\n", policy.allow));
+    }
+    if policy.date {
+        // IMF-fixdate (RFC 9110 section 5.6.7); chrono's names are English.
+        let now = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
+        headers.push_str(&format!("Date: {now}\r\n"));
+    }
+    headers.push_str("\r\n");
     let body = if framing.head { &[][..] } else { bytes };
     for mut remaining_bytes in [headers.as_bytes(), body] {
         while !remaining_bytes.is_empty() {
@@ -922,6 +946,53 @@ mod tests {
             body.len()
         )));
         assert_eq!(&response[header_end..], body.as_slice());
+    }
+
+    // RFC 9110 section 15.5.6: a 405 response MUST carry `Allow`. The control
+    // API accepts exactly GET and POST, says so, and (unlike the `dashboard
+    // serve` report) does not add a `Date` header.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn control_405_names_the_allowed_methods_over_a_raw_socket() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            stream
+                .write_all(b"PUT /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let Err(rejected) = read(&mut stream, Rules::Control, |_| Ok(())) else {
+            panic!("PUT must be refused");
+        };
+        respond(
+            &mut stream,
+            rejected.status,
+            "text/plain",
+            rejected.message.as_bytes(),
+        )
+        .unwrap();
+        drop(stream);
+        let response = client.join().expect("join 405 client");
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{response:?}"
+        );
+        let head = &response[..response.find("\r\n\r\n").expect("complete head") + 2];
+        assert!(head.contains("\r\nAllow: GET, POST\r\n"), "{response:?}");
+        assert!(
+            !head.to_ascii_lowercase().contains("\r\ndate:"),
+            "{response:?}"
+        );
+        assert!(response.ends_with("only GET and POST are supported"));
     }
 
     fn get(headers: &str) -> Request {

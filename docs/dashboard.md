@@ -76,9 +76,10 @@ and close the connection, where 0.4.2 served `HTTP/0.9` and answered
 `HTTP/2.0` and `HTTP/3.0` with 505 on a kept-open connection; leading
 whitespace before the method gets 405, where 0.4.2 trimmed the request line;
 an `Expect` value other than `100-continue` is ignored, where 0.4.2 answered
-417; and responses no longer carry the `Date` and `Server` headers tiny_http
-added. Ordinary browser and `curl` requests are not affected. See
-`tirith dashboard --help`.
+417; and responses still carry a `Date` header but no longer the `Server`
+header tiny_http added. Every 405 carries `Allow: GET, HEAD` and says the
+method must be a token of 1 to 16 bytes. Ordinary browser and `curl` requests
+are not affected. See `tirith dashboard --help`.
 
 ## Limits
 
