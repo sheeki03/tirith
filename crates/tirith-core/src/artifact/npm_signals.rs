@@ -649,7 +649,26 @@ fn fetch_feeds_shell(
 /// shell reads them: none inside single quotes, `$'...'` or a comment, and
 /// inside double quotes only `$(...)` and backticks. An unclosed one takes the
 /// rest of the text, so more is read, never less.
+///
+/// dash (`/bin/sh` on Debian and Ubuntu) has no `$'...'`: it reads a `$` and
+/// then an ordinary single-quoted string, which a `\'` closes. Where the text
+/// holds `$'` it is read both ways and every body either way finds is kept.
 fn substitution_bodies(text: &str) -> Vec<String> {
+    let mut bodies = read_substitution_bodies(text, true);
+    if text.contains("$'") {
+        let seen: std::collections::HashSet<String> = bodies.iter().cloned().collect();
+        bodies.extend(
+            read_substitution_bodies(text, false)
+                .into_iter()
+                .filter(|body| !seen.contains(body)),
+        );
+    }
+    bodies
+}
+
+/// [`substitution_bodies`] under one reading of `$'`: an ANSI-C string
+/// (bash, zsh, ksh) when `ansi_c`, else a literal `$` (dash).
+fn read_substitution_bodies(text: &str, ansi_c: bool) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut bodies = Vec::new();
     let mut double = false;
@@ -681,7 +700,7 @@ fn substitution_bodies(text: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        if byte == b'$' && next == Some(b'\'') {
+        if ansi_c && byte == b'$' && next == Some(b'\'') {
             // `$'...'`: a backslash escapes the next byte, `\'` included.
             index += 2;
             while index < bytes.len() && bytes[index] != b'\'' {
@@ -717,9 +736,11 @@ fn substitution_bodies(text: &str) -> Vec<String> {
             }
             _ => {}
         }
+        // A carriage return is an ordinary word byte in every shell, so a
+        // `#` right after one starts no comment.
         word_start = matches!(
             byte,
-            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
         );
         index += 1;
     }

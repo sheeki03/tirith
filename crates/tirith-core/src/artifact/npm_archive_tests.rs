@@ -1170,6 +1170,14 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
         format!("cat > notes.txt <<'EOF'\ndon't\nEOF\nx=$({pipeline})\n"),
         // An unquoted heredoc runs its substitutions when it is read.
         format!("cat <<EOF\nresult: $({pipeline})\nEOF\n"),
+        // A carriage return is an ordinary word byte in every shell, so the
+        // `#` after it starts no comment and the substitution runs.
+        format!("x=1\r#$({pipeline})\n"),
+        format!("b=1\r#`{pipeline}`\n"),
+        // dash (`/bin/sh` on Debian and Ubuntu) has no `$'...'`: it reads a
+        // `$` then an ordinary single-quoted string, which `\'` closes, so
+        // the substitution runs there (bash, zsh and ksh read one string).
+        format!("echo $'a\\' ; x=$({pipeline}) # '\n"),
     ];
     let missed: Vec<&String> = flagged
         .iter()
@@ -1186,6 +1194,10 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
         format!("echo '$({pipeline})'\n"),
         format!("# x=$({pipeline})\n"),
         format!("echo $'$({pipeline})\\''\n"),
+        // A comment after a blank, or on a CRLF line of its own.
+        format!("x=1 #$({pipeline})\n"),
+        format!("x=1\t#$({pipeline})\n"),
+        format!("x=1\r\n# $({pipeline})\r\n"),
         "x=$(echo curl https://example.invalid/setup | sh)\n".to_owned(),
         format!("cat >&2 <<'EOF'\nx=$({pipeline})\nEOF\nexit 1\n"),
         format!("USAGE=$(cat <<'EOF'\nx=$({pipeline})\nEOF\n)\necho \"$USAGE\" >&2\n"),
