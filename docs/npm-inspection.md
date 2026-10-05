@@ -101,7 +101,11 @@ file contents can produce a new hash in the downloaded report.
   functions and subshells (also with a trailing redirection) and inside
   command substitutions (`$(...)`, backticks) and process substitutions
   (`<(...)`, `>(...)`), but not inside single-quoted text, comments or heredoc
-  data. Heredoc text is
+  data. Quotes are read the way bash, dash, ksh and zsh read them (`$'...'`,
+  nested quotes in a double-quoted `${...}`), and a substitution any of them
+  runs counts. The body of an unquoted heredoc is read the way the shell
+  expands it: `'`, `"` and `#` are plain text there, so a substitution after
+  an apostrophe still counts. Heredoc text is
   skipped only when the file provably just prints it: a heredoc given to
   `cat`, `echo`, `printf` or `:` (or read into a variable that is only
   echoed), in a file with no pipe except into plain text filters, no output

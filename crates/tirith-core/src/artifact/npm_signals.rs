@@ -618,8 +618,18 @@ fn fetch_feeds_shell(
             ShellFetch::NotFound => {}
         }
     }
-    for body in substitutions.map(substitution_bodies).unwrap_or_default() {
-        // A pipeline needs a `|`; a body without one uses no budget.
+    let bodies = substitutions.map(substitution_bodies).unwrap_or_default();
+    match substitutions_feed_shell(&bodies, depth, budget) {
+        ShellFetch::NotFound if bounded => ShellFetch::Bounded,
+        outcome => outcome,
+    }
+}
+
+/// Descends into each substitution body that holds a `|` (a pipeline needs
+/// one, so a body without one uses no budget).
+fn substitutions_feed_shell(bodies: &[String], depth: usize, budget: &mut usize) -> ShellFetch {
+    let mut bounded = false;
+    for body in bodies {
         if !body.contains('|') {
             continue;
         }
@@ -631,7 +641,7 @@ fn fetch_feeds_shell(
             continue;
         }
         *budget -= 1;
-        match fetch_feeds_shell(&body, Some(&body), depth + 1, budget) {
+        match fetch_feeds_shell(body, Some(body), depth + 1, budget) {
             ShellFetch::Found => return ShellFetch::Found,
             ShellFetch::Bounded => bounded = true,
             ShellFetch::NotFound => {}
@@ -644,39 +654,114 @@ fn fetch_feeds_shell(
     }
 }
 
+/// How one shell reads the spots where the shells read quotes differently.
+#[derive(Clone, Copy)]
+struct Dialect {
+    /// `$'...'` is one ANSI-C string (bash, zsh, ksh). dash has no `$'...'`:
+    /// it reads a `$` and then an ordinary single-quoted string, which a `\'`
+    /// closes.
+    ansi_c: bool,
+    /// Which `'` inside a `${...}` that sits in double quotes pairs with the
+    /// next `'` while the shell looks for the closing `}`. The text between
+    /// still expands (`"${x:-'$(cmd)'}"` runs `cmd` in every shell).
+    parameter_quotes: ParameterQuotes,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParameterQuotes {
+    /// bash: every one.
+    Always,
+    /// dash and ksh: one in the operand of a `#`, `%` or `/` pattern operator
+    /// (`"${x#'"'}"`); elsewhere a `'` is a plain byte (`"${x:-'"'}"`).
+    PatternOperand,
+    /// zsh: none.
+    Never,
+}
+
+/// bash first: every other reading only adds the bodies it alone finds.
+const DIALECTS: [Dialect; 4] = [
+    Dialect {
+        ansi_c: true,
+        parameter_quotes: ParameterQuotes::Always,
+    },
+    Dialect {
+        ansi_c: false,
+        parameter_quotes: ParameterQuotes::PatternOperand,
+    },
+    Dialect {
+        ansi_c: true,
+        parameter_quotes: ParameterQuotes::PatternOperand,
+    },
+    Dialect {
+        ansi_c: true,
+        parameter_quotes: ParameterQuotes::Never,
+    },
+];
+
 /// The bodies of the command substitutions (`$(...)`, backticks) and process
 /// substitutions (`<(...)`, `>(...)`) in `text`, outermost only, read as the
 /// shell reads them: none inside single quotes, `$'...'` or a comment, and
 /// inside double quotes only `$(...)` and backticks. An unclosed one takes the
 /// rest of the text, so more is read, never less.
 ///
-/// dash (`/bin/sh` on Debian and Ubuntu) has no `$'...'`: it reads a `$` and
-/// then an ordinary single-quoted string, which a `\'` closes. Where the text
-/// holds `$'` it is read both ways and every body either way finds is kept.
+/// Where the shells read quotes differently (a `$'`, which dash does not
+/// know, and a `'` inside a double-quoted `${...}`), the text is read the way
+/// each of bash, dash, ksh and zsh reads it, and every body any reading finds
+/// is kept, once.
 fn substitution_bodies(text: &str) -> Vec<String> {
-    let mut bodies = read_substitution_bodies(text, true);
-    if text.contains("$'") {
-        let seen: std::collections::HashSet<String> = bodies.iter().cloned().collect();
-        bodies.extend(
-            read_substitution_bodies(text, false)
-                .into_iter()
-                .filter(|body| !seen.contains(body)),
-        );
+    let mut bodies = read_substitution_bodies(text, DIALECTS[0]);
+    // The readings can differ only at a `$'` or at a `'` inside a `${...}`.
+    let others = if text.contains("${") && text.contains('\'') {
+        &DIALECTS[1..]
+    } else if text.contains("$'") {
+        &DIALECTS[1..2]
+    } else {
+        &[]
+    };
+    if !others.is_empty() {
+        let mut seen: std::collections::HashSet<String> = bodies.iter().cloned().collect();
+        for dialect in others {
+            for body in read_substitution_bodies(text, *dialect) {
+                if seen.insert(body.clone()) {
+                    bodies.push(body);
+                }
+            }
+        }
     }
     bodies
 }
 
-/// [`substitution_bodies`] under one reading of `$'`: an ANSI-C string
-/// (bash, zsh, ksh) when `ansi_c`, else a literal `$` (dash).
-fn read_substitution_bodies(text: &str, ansi_c: bool) -> Vec<String> {
+/// What the reader of [`read_substitution_bodies`] is inside of.
+#[derive(Clone, Copy)]
+enum Frame {
+    /// Double quotes.
+    Double,
+    /// A `${...}`. `in_double`: the `${` sits in double quotes, where nested
+    /// double quotes pair (`"${x:-"'"}"` is one string in bash, dash and zsh)
+    /// and `quotes_pair` says whether a `'` pairs with the next one.
+    Parameter { in_double: bool, quotes_pair: bool },
+}
+
+/// [`substitution_bodies`] under one shell's reading.
+fn read_substitution_bodies(text: &str, dialect: Dialect) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut bodies = Vec::new();
-    let mut double = false;
+    let mut frames: Vec<Frame> = Vec::new();
     let mut word_start = true;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         let next = bytes.get(index + 1).copied();
+        let in_double = matches!(
+            frames.last(),
+            Some(
+                Frame::Double
+                    | Frame::Parameter {
+                        in_double: true,
+                        ..
+                    }
+            )
+        );
         if byte == b'`' {
             let end = crate::extract::posix_backtick_close(text, index).unwrap_or(bytes.len());
             bodies.push(unescape_backticks(&text[index + 1..end]));
@@ -684,51 +769,114 @@ fn read_substitution_bodies(text: &str, ansi_c: bool) -> Vec<String> {
             word_start = false;
             continue;
         }
-        if next == Some(b'(') && (byte == b'$' || (!double && matches!(byte, b'<' | b'>'))) {
+        if next == Some(b'(') && (byte == b'$' || (!in_double && matches!(byte, b'<' | b'>'))) {
             let end = crate::extract::posix_delimiter_close(text, index + 1).unwrap_or(bytes.len());
             bodies.push(text[index + 2..end].to_owned());
             index = end + 1;
             word_start = false;
             continue;
         }
-        if double {
-            match byte {
-                b'\\' => index += 1,
-                b'"' => double = false,
-                _ => {}
-            }
-            index += 1;
+        if byte == b'$' && next == Some(b'{') {
+            let quotes_pair = match dialect.parameter_quotes {
+                ParameterQuotes::Always => true,
+                ParameterQuotes::PatternOperand => pattern_operator_follows(&bytes[index + 2..]),
+                ParameterQuotes::Never => false,
+            };
+            frames.push(Frame::Parameter {
+                in_double,
+                quotes_pair,
+            });
+            index += 2;
+            word_start = false;
             continue;
         }
-        if ansi_c && byte == b'$' && next == Some(b'\'') {
-            // `$'...'`: a backslash escapes the next byte, `\'` included.
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\'' {
-                index += if bytes[index] == b'\\' { 2 } else { 1 };
+        match frames.last().copied() {
+            Some(Frame::Double) => {
+                match byte {
+                    b'\\' => index += 1,
+                    b'"' => {
+                        frames.pop();
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
             }
-            index += 1;
+            Some(Frame::Parameter {
+                in_double: true,
+                quotes_pair,
+            }) => {
+                let quoted_from = match byte {
+                    b'\'' if quotes_pair => Some((index + 1, false)),
+                    // bash reads a `$'...'` there with its escapes.
+                    b'$' if quotes_pair && dialect.ansi_c && next == Some(b'\'') => {
+                        Some((index + 2, true))
+                    }
+                    _ => None,
+                };
+                if let Some((from, escapes)) = quoted_from {
+                    let close = closing_quote(bytes, from, escapes);
+                    expanded_substitution_bodies(text, from..close, &mut bodies);
+                    index = close + 1;
+                    continue;
+                }
+                match byte {
+                    b'\\' => index += 1,
+                    b'"' => frames.push(Frame::Double),
+                    b'}' => {
+                        frames.pop();
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            Some(Frame::Parameter {
+                in_double: false, ..
+            })
+            | None => {}
+        }
+        // Unquoted: at the top level, or inside a `${...}` outside double
+        // quotes, where quotes pair as at the top level but no comment starts
+        // (`echo ${x:- #} $(cmd)` runs `cmd`).
+        let in_parameter = !frames.is_empty();
+        if dialect.ansi_c && byte == b'$' && next == Some(b'\'') {
+            // `$'...'`: a backslash escapes the next byte, `\'` included.
+            index = closing_quote(bytes, index + 2, true) + 1;
             word_start = false;
             continue;
         }
         match byte {
             b'\\' => {
+                // The shells remove a backslash-newline before they split the
+                // line into words, so it leaves the word state alone: the `#`
+                // in `echo hi \` + `#note` starts a comment.
+                if next != Some(b'\n') {
+                    word_start = false;
+                }
                 index += 2;
-                word_start = false;
                 continue;
             }
             b'\'' => {
-                index += 1;
-                while index < bytes.len() && bytes[index] != b'\'' {
-                    index += 1;
-                }
+                index = closing_quote(bytes, index + 1, false) + 1;
+                word_start = false;
+                continue;
+            }
+            b'"' => {
+                frames.push(Frame::Double);
                 index += 1;
                 word_start = false;
                 continue;
             }
-            b'"' => double = true,
+            b'}' if in_parameter => {
+                frames.pop();
+                index += 1;
+                word_start = false;
+                continue;
+            }
             // Only where a comment certainly starts: reading a comment as
             // code over-reads, reading code as a comment would hide it.
-            b'#' if word_start => {
+            b'#' if word_start && !in_parameter => {
                 while index < bytes.len() && bytes[index] != b'\n' {
                     index += 1;
                 }
@@ -745,6 +893,76 @@ fn read_substitution_bodies(text: &str, ansi_c: bool) -> Vec<String> {
         index += 1;
     }
     bodies
+}
+
+/// The index of the `'` that closes a single-quoted string whose text starts
+/// at `from`, or the end of the input. With `escapes` (`$'...'`) a backslash
+/// escapes the next byte.
+fn closing_quote(bytes: &[u8], from: usize, escapes: bool) -> usize {
+    let mut index = from;
+    while index < bytes.len() && bytes[index] != b'\'' {
+        index += if escapes && bytes[index] == b'\\' {
+            2
+        } else {
+            1
+        };
+    }
+    index.min(bytes.len())
+}
+
+/// The text after a `${` names a parameter followed by a `#`, `%` or `/`
+/// pattern operator (`${x#'*'}`, `${1%%.*}`, `${x/a/b}`). `${#x}` is a length.
+fn pattern_operator_follows(rest: &[u8]) -> bool {
+    let mut index = usize::from(rest.first() == Some(&b'#') && rest.get(1) != Some(&b'}'));
+    match rest.get(index) {
+        Some(byte) if byte.is_ascii_alphabetic() || *byte == b'_' => {
+            while rest
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index += 1;
+            }
+        }
+        Some(byte) if byte.is_ascii_digit() => {
+            while rest.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        Some(b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!') => index += 1,
+        _ => return false,
+    }
+    matches!(rest.get(index), Some(b'#' | b'%' | b'/'))
+}
+
+/// The substitution bodies in `text[range]` read as expanded text, the way
+/// the shells read an unquoted heredoc body: only a backslash quotes there,
+/// and `'`, `"` and `#` are plain bytes, so every unescaped `$(...)` and
+/// backtick runs. A body may run past the range end (more is read, never
+/// less).
+fn expanded_substitution_bodies(
+    text: &str,
+    range: std::ops::Range<usize>,
+    bodies: &mut Vec<String>,
+) {
+    let bytes = text.as_bytes();
+    let mut index = range.start;
+    while index < range.end.min(bytes.len()) {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'`' => {
+                let end = crate::extract::posix_backtick_close(text, index).unwrap_or(bytes.len());
+                bodies.push(unescape_backticks(&text[index + 1..end]));
+                index = end + 1;
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                let end =
+                    crate::extract::posix_delimiter_close(text, index + 1).unwrap_or(bytes.len());
+                bodies.push(text[index + 2..end].to_owned());
+                index = end + 1;
+            }
+            _ => index += 1,
+        }
+    }
 }
 
 /// Inside backticks a backslash quotes only `$`, `` ` `` and `\`.
@@ -792,23 +1010,44 @@ fn without_heredoc_bodies(text: &str) -> std::borrow::Cow<'_, str> {
     String::from_utf8(bytes).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
 }
 
-/// Fallback once the descent hit a bound: each line on its own, with group
-/// openers and closers around it removed, and the substitutions in it.
-fn any_line_feeds_shell(text: &str) -> bool {
+/// Fallback once the descent hit a bound, or where the heredocs are
+/// ambiguous: each line on its own, with group openers and closers around it
+/// removed, and the substitutions in it. With `expanded` (ambiguous
+/// heredocs), a line may be an unquoted heredoc body line, so its
+/// substitutions are also read the way such a body expands.
+fn any_line_feeds_shell(text: &str, expanded: bool) -> bool {
     text.lines().any(|line| {
         let line = line
             .trim_start_matches(|c: char| c == '{' || c == '(' || c.is_whitespace())
             .trim_end_matches(|c: char| c == '}' || c == ')' || c == ';' || c.is_whitespace());
-        !line.is_empty() && (feeds_shell(line) || substitution_feeds_shell(line, 0))
+        if line.is_empty() {
+            return false;
+        }
+        let mut budget = SHELL_BODY_BUDGET;
+        if feeds_shell(line) || substitution_feeds_shell(&substitution_bodies(line), 0, &mut budget)
+        {
+            return true;
+        }
+        let mut bodies = Vec::new();
+        if expanded {
+            expanded_substitution_bodies(line, 0..line.len(), &mut bodies);
+        }
+        substitution_feeds_shell(&bodies, 0, &mut budget)
     })
 }
 
-/// The line pass reads inside a line's substitutions too. The bodies of one
-/// level are disjoint parts of the line, so this is linear in it per level.
-fn substitution_feeds_shell(text: &str, depth: usize) -> bool {
+/// The line pass reads inside a line's substitutions too, within `budget`
+/// piped bodies per line. Running out counts as found: the line pass is the
+/// fallback, which fails toward the signal.
+fn substitution_feeds_shell(bodies: &[String], depth: usize, budget: &mut usize) -> bool {
     depth < SHELL_BODY_DEPTH
-        && substitution_bodies(text).iter().any(|body| {
-            body.contains('|') && (feeds_shell(body) || substitution_feeds_shell(body, depth + 1))
+        && bodies.iter().filter(|body| body.contains('|')).any(|body| {
+            if *budget == 0 {
+                return true;
+            }
+            *budget -= 1;
+            feeds_shell(body)
+                || substitution_feeds_shell(&substitution_bodies(body), depth + 1, budget)
         })
 }
 
@@ -831,15 +1070,33 @@ fn descend(
     // The live bodies were already counted by the whole-file pass, so their
     // own pass gets a fresh (shared) budget: at most twice the work.
     let mut body_budget = SHELL_BODY_BUDGET;
-    for body in &heredocs.live_bodies {
+    for live in &heredocs.live_bodies {
         if outcome == ShellFetch::Found {
             break;
         }
-        let body = &text[body.clone()];
+        let body = &text[live.range.clone()];
         let substitutions = read_substitutions.then(|| without_heredoc_bodies(body));
         match fetch_feeds_shell(body, substitutions.as_deref(), 0, &mut body_budget) {
             ShellFetch::NotFound => {}
             other => outcome = other,
+        }
+        if outcome == ShellFetch::Found || live.quoted {
+            continue;
+        }
+        // An unquoted body is also expanded when the heredoc is read, as
+        // data: only a backslash quotes there, so its substitutions run
+        // whatever `'`, `"` or `#` it holds (`it's $(cmd)`). The reading as
+        // code above is still needed where the body is fed to a shell.
+        if let Some(substitutions) = substitutions.as_deref() {
+            let read_as_code: std::collections::HashSet<String> =
+                substitution_bodies(substitutions).into_iter().collect();
+            let mut expanded = Vec::new();
+            expanded_substitution_bodies(body, 0..body.len(), &mut expanded);
+            expanded.retain(|body| !read_as_code.contains(body));
+            match substitutions_feed_shell(&expanded, 0, &mut body_budget) {
+                ShellFetch::NotFound => {}
+                other => outcome = other,
+            }
         }
     }
     outcome
@@ -867,9 +1124,17 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
         inspection.issue(NpmIssueKind::CodeLimit, Some(member),
             "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
     }
+    // The line pass reads the file as code. The body of an unquoted live
+    // heredoc is also expanded as data, where `'`, `"` and `#` are plain
+    // text, so once the descent is bounded its lines are read that way too.
     let found = grouped == ShellFetch::Found
         || substituted == ShellFetch::Found
-        || ((bounded || heredocs.ambiguous) && any_line_feeds_shell(text));
+        || ((bounded || heredocs.ambiguous) && any_line_feeds_shell(text, heredocs.ambiguous))
+        || (bounded
+            && heredocs
+                .live_bodies
+                .iter()
+                .any(|live| !live.quoted && any_line_feeds_shell(&text[live.range.clone()], true)));
     if found {
         push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
             vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,

