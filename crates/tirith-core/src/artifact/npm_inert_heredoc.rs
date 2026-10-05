@@ -1544,8 +1544,67 @@ mod tests {
         assert!(refused.is_empty(), "masking disabled: {refused:#?}");
     }
 
+    /// CPU time the calling thread has used so far.
+    ///
+    /// Wall-clock time also counts the time the thread waits for a CPU, so on
+    /// a loaded host (the parallel workspace test run) linear work looked slow.
+    /// A thread's CPU time is never more than its wall time, so a bound on it
+    /// is never stricter than the same bound on wall time.
+    #[cfg(unix)]
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `now` is a valid, writable timespec for the call.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+        assert_eq!(
+            rc,
+            0,
+            "CLOCK_THREAD_CPUTIME_ID: {}",
+            std::io::Error::last_os_error()
+        );
+        std::time::Duration::new(
+            u64::try_from(now.tv_sec).expect("non-negative seconds"),
+            u32::try_from(now.tv_nsec).expect("nanoseconds below one second"),
+        )
+    }
+
+    /// CPU time the calling thread has used so far (kernel plus user time).
+    #[cfg(windows)]
+    fn thread_cpu_time() -> std::time::Duration {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the pseudo-handle names the calling thread and every out
+        // pointer is a valid, writable FILETIME.
+        let ok = unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        assert_ne!(ok, 0, "GetThreadTimes: {}", std::io::Error::last_os_error());
+        // FILETIME counts 100-nanosecond intervals.
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    }
+
     /// Adversarial shapes stay linear: every scan is local to a pattern, a
     /// line capped in length, or bounded by a mention cap.
+    ///
+    /// The bound is on the CPU time of this thread (`analyze` runs on the
+    /// calling thread only), not on wall-clock time: under the parallel
+    /// workspace run the wall time of linear work exceeded 5 s (5.7 s and
+    /// 12.7 s logged) while a super-linear scan of these 1 MiB inputs would
+    /// need far more than 5 s of CPU on any host.
+    #[cfg(any(unix, windows))]
     #[test]
     fn adversarial_inputs_are_analyzed_in_linear_time() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
@@ -1565,13 +1624,16 @@ mod tests {
             ),
         ];
         for input in &inputs {
-            let started = std::time::Instant::now();
+            let wall = std::time::Instant::now();
+            let cpu = thread_cpu_time();
             let _ = analyze(input);
+            let used = thread_cpu_time().saturating_sub(cpu);
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "{:?} took {:?}",
+                used < std::time::Duration::from_secs(5),
+                "{:?} used {:?} of CPU ({:?} wall)",
                 &input[..40],
-                started.elapsed()
+                used,
+                wall.elapsed()
             );
         }
     }
