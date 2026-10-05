@@ -20,10 +20,14 @@ fn fresh_command_environment() -> PathBuf {
     static NEXT_COMMAND: AtomicU64 = AtomicU64::new(0);
 
     let suite = SUITE_ROOT.get_or_init(|| {
-        tempfile::Builder::new()
+        let root = tempfile::Builder::new()
             .prefix("tirith-cli-integration-")
             .tempdir()
-            .expect("create hermetic CLI integration root")
+            .expect("create hermetic CLI integration root");
+        // A static is never dropped, so this TempDir would never delete the
+        // suite tree; remove it when the test process exits instead.
+        tirith_test_support::remove_at_exit(root.path());
+        root
     });
     let id = NEXT_COMMAND.fetch_add(1, Ordering::Relaxed);
     let root = suite.path().join(format!("command-{id}"));
@@ -77,6 +81,61 @@ fn tirith() -> Command {
         cmd.env_remove(key);
     }
     cmd
+}
+
+#[cfg(unix)]
+const SUITE_ROOT_MARKER: &str = "TIRITH_CLI_INTEGRATION_SUITE_ROOT_MARKER";
+
+/// Child half of `hermetic_suite_root_is_removed_when_the_suite_exits`: creates
+/// the suite root and records where it is. A no-op in an ordinary run.
+#[cfg(unix)]
+#[test]
+fn hermetic_suite_root_exit_probe() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(marker) = std::env::var_os(SUITE_ROOT_MARKER) else {
+        return;
+    };
+    let command_root = fresh_command_environment();
+    let suite_root = command_root.parent().expect("command dir has a suite root");
+    fs::write(marker, suite_root.as_os_str().as_bytes()).expect("record the suite root");
+}
+
+/// The suite root lives in a static, which Rust never drops: without an exit
+/// hook every run left its whole tree (hundreds of MB) in the temp dir.
+#[cfg(unix)]
+#[test]
+fn hermetic_suite_root_is_removed_when_the_suite_exits() {
+    use std::os::unix::ffi::OsStrExt;
+    let private_tmp = tempfile::tempdir().expect("private temp dir");
+    let marker = private_tmp.path().join("suite-root-marker");
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", "hermetic_suite_root_exit_probe", "--nocapture"])
+        .env("TMPDIR", private_tmp.path())
+        .env(SUITE_ROOT_MARKER, &marker)
+        .output()
+        .expect("run the suite-root probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "probe failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let suite_root = PathBuf::from(OsStr::from_bytes(
+        &fs::read(&marker).expect("the probe recorded its suite root"),
+    ));
+    assert!(
+        suite_root.starts_with(private_tmp.path())
+            && suite_root.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("tirith-cli-integration-")),
+        "unexpected suite root {}",
+        suite_root.display()
+    );
+    assert!(
+        !suite_root.exists(),
+        "the suite root {} must be removed when the test process exits",
+        suite_root.display()
+    );
 }
 
 #[test]

@@ -417,6 +417,63 @@ impl Drop for GlobalStateGuard {
     }
 }
 
+/// Paths [`remove_at_exit`] deletes when the test process exits, with the pid
+/// that registered them.
+#[cfg(unix)]
+static EXIT_REMOVALS: std::sync::Mutex<Vec<(u32, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// Remove `path` and everything under it when this test process exits.
+///
+/// Integration suites keep one hermetic root per process in a `static`
+/// (`OnceLock<tempfile::TempDir>`). Rust never runs destructors for statics, so
+/// that `TempDir` never deletes its directory: every run of the suite would
+/// leave its whole tree (hundreds of MB for `cli_integration`) in the system
+/// temp dir. Register the root here when it is created.
+///
+/// The removal runs from a C `atexit` handler, which libc calls both when the
+/// test harness returns from `main` and when it calls `std::process::exit`
+/// after a failure. It is best effort (errors are ignored) and only runs in
+/// the process that registered the path, so a forked child that calls `exit`
+/// cannot delete its parent's root. Unix only: elsewhere it is a no-op and the
+/// root is left behind as before (that exit path has not been verified).
+pub fn remove_at_exit(path: &Path) {
+    #[cfg(unix)]
+    {
+        static REGISTER_HOOK: std::sync::Once = std::sync::Once::new();
+        EXIT_REMOVALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((std::process::id(), path.to_path_buf()));
+        REGISTER_HOOK.call_once(|| {
+            extern "C" {
+                fn atexit(callback: extern "C" fn()) -> std::os::raw::c_int;
+            }
+            // SAFETY: `atexit` is the C standard library function; the callback
+            // is a plain `extern "C" fn` that never unwinds.
+            unsafe {
+                atexit(remove_registered_paths_at_exit);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[cfg(unix)]
+extern "C" fn remove_registered_paths_at_exit() {
+    let paths = std::mem::take(
+        &mut *EXIT_REMOVALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    let pid = std::process::id();
+    for (owner, path) in paths {
+        if owner == pid {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 fn restore_environment(previous: &[(&'static str, Option<OsString>)]) {
     // SAFETY: every caller owns GLOBAL_STATE_LOCK. Restore in reverse mutation
     // order and preserve Option<OsString> exactly, including non-UTF-8 values.
@@ -817,5 +874,81 @@ mod tests {
             std::env::var_os(CHILD_CUSTOM),
             Some(OsString::from("inherited-custom-value"))
         );
+    }
+
+    #[cfg(unix)]
+    const EXIT_REMOVAL_ROOT: &str = "TIRITH_TEST_SUPPORT_EXIT_REMOVAL_ROOT";
+
+    /// Child half of `registered_roots_are_removed_when_the_process_exits`:
+    /// builds a tree, registers it and exits. A no-op in an ordinary run.
+    #[cfg(unix)]
+    #[test]
+    fn exit_removal_child_probe() {
+        let Some(root) = std::env::var_os(EXIT_REMOVAL_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        std::fs::create_dir_all(root.join("nested/deeper")).expect("create tree");
+        std::fs::write(root.join("nested/deeper/file"), b"left by the child").expect("write");
+        remove_at_exit(&root);
+        assert!(root.exists(), "registration must not remove the root early");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_roots_are_removed_when_the_process_exits() {
+        let parent = tempfile::tempdir().expect("parent temp dir");
+        let root = parent.path().join("suite-root");
+        let output = Command::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", "tests::exit_removal_child_probe", "--nocapture"])
+            .env(EXIT_REMOVAL_ROOT, &root)
+            .output()
+            .expect("run child probe");
+        assert!(
+            output.status.success(),
+            "child probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child must have run the probe: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !root.exists(),
+            "a root registered with remove_at_exit must be gone once its process exits"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_removal_skips_roots_registered_by_another_process() {
+        let _serial = test_lock();
+        let parent = tempfile::tempdir().expect("parent temp dir");
+        let own = parent.path().join("own");
+        let foreign = parent.path().join("foreign");
+        std::fs::create_dir_all(own.join("sub")).expect("own tree");
+        std::fs::create_dir_all(foreign.join("sub")).expect("foreign tree");
+        // Keep whatever the process has registered so far; restore it below.
+        let saved = std::mem::take(
+            &mut *EXIT_REMOVALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        EXIT_REMOVALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([
+                (std::process::id(), own.clone()),
+                // What a forked child sees: an entry its parent registered.
+                (std::process::id().wrapping_add(1), foreign.clone()),
+            ]);
+        remove_registered_paths_at_exit();
+        *EXIT_REMOVALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = saved;
+        assert!(!own.exists(), "this process's root is removed");
+        assert!(foreign.exists(), "another process's root is left alone");
     }
 }
