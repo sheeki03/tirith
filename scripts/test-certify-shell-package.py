@@ -136,6 +136,13 @@ class NativeProcessOwnership(unittest.TestCase):
     def test_failed_cleanup_with_live_leader_and_closed_pipe_is_bounded(self):
         original_start = CERTIFICATE.merged_job
         retained = []
+        # The child writes this marker only after it has closed its output.
+        # The bounded drain deadline starts once the marker exists: started at
+        # a fixed time after spawn, a slow interpreter start on a loaded host
+        # let the deadline pass while the pipe was still open (output_eof
+        # False), so the test then exercised a different case.
+        closed_marker = self.root / "output-closed"
+        deadline_started = []
 
         def start(*args, **kwargs):
             job = original_start(*args, **kwargs)
@@ -145,23 +152,28 @@ class NativeProcessOwnership(unittest.TestCase):
 
             def unproved_cleanup():
                 job.failure = "fixture cleanup unavailable"
-                if job.pipe_deadline is None:
-                    job.pipe_deadline = time.monotonic() + .1
+                if job.pipe_deadline is None and closed_marker.exists():
+                    deadline_started.append(time.monotonic())
+                    job.pipe_deadline = deadline_started[0] + .1
 
             job.kill = unproved_cleanup
             return job
 
-        started = time.monotonic()
         try:
             with mock.patch.object(CERTIFICATE, "merged_job", side_effect=start):
                 with self.assertRaisesRegex(ValueError, "cleanup is incomplete") as raised:
                     # The finite child exits on its own even if the driver
                     # regresses. No extra watcher or sampled signal target.
-                    self.fixture("import os,time; os.close(1); os.close(2); time.sleep(2)", timeout=.1)
-            self.assertLess(time.monotonic() - started, 1.5)
+                    self.fixture("import os,pathlib,time; os.close(1); os.close(2); "
+                                 f"pathlib.Path({str(closed_marker)!r}).touch(); time.sleep(30)", timeout=.1)
+            returned = time.monotonic()
+            self.assertEqual(len(deadline_started), 1, "the drain deadline started once the pipe was closed")
+            # Bounded by the drain deadline, not by the leader: run() returned
+            # shortly after the deadline started and while the leader still lived.
+            self.assertLess(returned - deadline_started[0], 1.5)
+            self.assertIsNone(retained[0][0].process.poll())
             self.assertTrue(raised.exception.qualification["cleanup"]["output_eof"])
             self.assertFalse(raised.exception.qualification["cleanup"]["leader_reaped"])
-            self.assertIsNone(retained[0][0].process.poll())
         finally:
             for job, native_cleanup in retained:
                 native_cleanup()  # Original helper retains/reaps only our child.
