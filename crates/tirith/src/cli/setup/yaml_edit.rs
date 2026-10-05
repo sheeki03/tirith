@@ -9,7 +9,10 @@
 //! Only block-style mappings are navigated. Anything else on the path (flow
 //! collections, anchors, tags, multi-line scalars, sequences, tabs, several
 //! documents, mixed line endings) is refused with the requested change shown as
-//! a diff, so nothing is ever rewritten that the user did not ask for.
+//! a diff, so nothing is ever rewritten that the user did not ask for. A
+//! leading `---` and a trailing `...` that ends the one document are kept, and
+//! lines off the path (a multi-line flow collection closing in its key's
+//! column) are left as they are.
 //!
 //! Every edit is checked: the edited text must parse to exactly the original
 //! document with only the owned field changed. A failed check is a refusal.
@@ -181,6 +184,9 @@ struct Document {
     /// First line of the root mapping (after a leading `---`).
     root: usize,
     step: usize,
+    /// A trailing `...` document-end marker and the comment or blank lines
+    /// after it, written back unchanged after the content.
+    trailer: Vec<String>,
 }
 
 type Refusal = &'static str;
@@ -211,12 +217,19 @@ impl Document {
         {
             return Err("tab indentation is not supported");
         }
-        // A single leading `---` is allowed; directives and further documents are not.
+        // A single leading `---` is allowed, and so is a trailing `...` with
+        // only comments after it (it ends the one document); directives and
+        // further documents are not.
         let root = lines
             .iter()
             .position(|line| !is_blank_or_comment(line))
             .filter(|at| lines[*at].trim_end_matches(' ') == "---")
             .map_or(0, |at| at + 1);
+        let end_marker = lines
+            .iter()
+            .rposition(|line| !is_blank_or_comment(line))
+            .filter(|at| *at >= root && is_document_end(&lines[*at]));
+        let trailer = end_marker.map_or_else(Vec::new, |at| lines.split_off(at));
         if lines.iter().enumerate().any(|(at, line)| {
             line.starts_with('%')
                 || (at >= root && (line.starts_with("---") || line.starts_with("...")))
@@ -230,12 +243,19 @@ impl Document {
             final_newline,
             root,
             step,
+            trailer,
         })
     }
 
     fn write(&self) -> String {
-        let mut text = self.lines.join(self.eol);
-        if self.final_newline && !self.lines.is_empty() {
+        let lines: Vec<&str> = self
+            .lines
+            .iter()
+            .chain(&self.trailer)
+            .map(String::as_str)
+            .collect();
+        let mut text = lines.join(self.eol);
+        if self.final_newline && !lines.is_empty() {
             text.push_str(self.eol);
         }
         text
@@ -377,7 +397,23 @@ impl Document {
                 entry.end = index + 1;
                 continue;
             }
-            let (key, colon) = parse_key(content).ok_or("a key is not a plain or quoted key")?;
+            let Some((key, colon)) = parse_key(content) else {
+                // Not a plain or quoted key: the line continues the previous
+                // entry's value, such as the closing `]` / `}` (or an item) of
+                // a multi-line flow collection written in the key's column.
+                // A line that may still be a key (anchored, tagged, alias or
+                // complex) is refused, so an edit can never add a second
+                // entry for a key it did not see. The edited text is
+                // re-parsed and compared, so a wrong boundary can only refuse.
+                if content.starts_with(|first: char| "?&*!|>%@`-:".contains(first)) {
+                    return Err("a key is not a plain or quoted key");
+                }
+                let entry = entries
+                    .last_mut()
+                    .ok_or("a key is not a plain or quoted key")?;
+                entry.end = index + 1;
+                continue;
+            };
             entries.push(Entry {
                 key,
                 line: index,
@@ -538,6 +574,14 @@ fn detect_step(lines: &[String]) -> usize {
             .map(|_| column);
     }
     2
+}
+
+/// A `...` document-end marker line, optionally followed by a comment.
+fn is_document_end(line: &str) -> bool {
+    line.strip_prefix("...").is_some_and(|rest| {
+        let trimmed = rest.trim_start_matches(' ');
+        trimmed.is_empty() || (trimmed.len() < rest.len() && trimmed.starts_with('#'))
+    })
 }
 
 fn is_blank_or_comment(line: &str) -> bool {
@@ -820,6 +864,124 @@ mod tests {
             set("---\nfail_mode: open", "/paranoia", json!(3)),
             "---\nfail_mode: open\nparanoia: 3"
         );
+    }
+
+    /// A trailing `...` document-end marker (with comments after it) ends the
+    /// only document, so it is kept and edits stay before it. Every edit
+    /// undone restores the exact bytes.
+    #[test]
+    fn trailing_document_end_marker_is_kept_and_edits_stay_before_it() {
+        let text = "fail_mode: open\nscan:\n  require_complete: false\n...\n# after the end\n";
+        let edited = set(text, "/fail_mode", json!("closed"));
+        assert_eq!(
+            edited,
+            "fail_mode: closed\nscan:\n  require_complete: false\n...\n# after the end\n"
+        );
+        assert_eq!(set(&edited, "/fail_mode", json!("open")), text);
+        let nested = set(text, "/scan/require_complete", json!(true));
+        assert_eq!(nested, text.replace("complete: false", "complete: true"));
+        assert_eq!(set(&nested, "/scan/require_complete", json!(false)), text);
+        let added = set(text, "/strict_warn", json!(true));
+        assert_eq!(
+            added,
+            "fail_mode: open\nscan:\n  require_complete: false\nstrict_warn: true\n...\n# after the end\n"
+        );
+        assert_eq!(remove(&added, "/strict_warn"), text);
+        let created = set(text, "/action_overrides/shortened_url", json!("warn"));
+        assert_eq!(
+            created,
+            "fail_mode: open\nscan:\n  require_complete: false\naction_overrides:\n  shortened_url: warn\n...\n# after the end\n"
+        );
+
+        // Marker forms: with a comment, without a final newline, CRLF, after `---`.
+        assert_eq!(
+            set("a: 1\n... # end\n", "/a", json!(2)),
+            "a: 2\n... # end\n"
+        );
+        assert_eq!(set("a: 1\n...", "/a", json!(2)), "a: 2\n...");
+        assert_eq!(set("a: 1\n...", "/b", json!(2)), "a: 1\nb: 2\n...");
+        assert_eq!(
+            set("a: 1\r\n...\r\n", "/b", json!(2)),
+            "a: 1\r\nb: 2\r\n...\r\n"
+        );
+        assert_eq!(set("---\na: 1\n...\n", "/a", json!(2)), "---\na: 2\n...\n");
+        // Emptied or empty documents stay mappings before the marker.
+        assert_eq!(remove("a: 1\n...\n", "/a"), "{}\n...\n");
+        assert_eq!(set("{}\n...\n", "/a", json!(1)), "a: 1\n...\n");
+        assert_eq!(set("---\n...\n", "/a", json!(1)), "---\na: 1\n...\n");
+
+        // Content after the marker is another document: still refused.
+        for text in [
+            "a: 1\n...\nb: 2\n",
+            "a: 1\n...\n---\nb: 2\n",
+            "a: 1\n...\n%YAML 1.2\n---\nb: 2\n",
+        ] {
+            let result = set_field(text, "/a", Some(&json!(2)));
+            assert!(result.is_err(), "{text:?} -> {result:?}");
+        }
+    }
+
+    /// A multi-line flow collection may close (or list its items) in the
+    /// column of its key. Such a line continues that entry; it is not a
+    /// reason to refuse an edit of another field.
+    #[test]
+    fn flow_collection_lines_in_the_key_column_belong_to_their_entry() {
+        let flow =
+            "allowlist: [\n  \"a.example\",\n  \"b.example\"\n]\n# mode\nfail_mode: open  # x\n";
+        let edited = set(flow, "/fail_mode", json!("closed"));
+        assert_eq!(edited, flow.replace("fail_mode: open", "fail_mode: closed"));
+        assert_eq!(set(&edited, "/fail_mode", json!("open")), flow);
+        let added = set(flow, "/strict_warn", json!(true));
+        assert_eq!(added, format!("{flow}strict_warn: true\n"));
+        assert_eq!(remove(&added, "/strict_warn"), flow);
+
+        // The flow collection as the last entry: new keys go after its closer.
+        let last = "fail_mode: open\nblocklist: {\n  a.example: x\n}\n";
+        let added = set(last, "/strict_warn", json!(true));
+        assert_eq!(added, format!("{last}strict_warn: true\n"));
+        assert_eq!(remove(&added, "/strict_warn"), last);
+
+        // Items in the key column too.
+        let items = "allowlist: [\n\"a.example\",\n\"b.example\"\n]\nfail_mode: open\n";
+        assert_eq!(
+            set(items, "/fail_mode", json!("closed")),
+            items.replace("open", "closed")
+        );
+
+        // Inside a nested mapping the closer sits in that mapping's column.
+        let nested = "scan:\n  require_complete: false\n  extra: [\n    1\n  ]\nfail_mode: open\n";
+        let edited = set(nested, "/scan/require_complete", json!(true));
+        assert_eq!(edited, nested.replace("false", "true"));
+        assert_eq!(set(&edited, "/scan/require_complete", json!(false)), nested);
+        let added = set(nested, "/scan/fast", json!(true));
+        assert_eq!(
+            added,
+            "scan:\n  require_complete: false\n  extra: [\n    1\n  ]\n  fast: true\nfail_mode: open\n"
+        );
+        assert_eq!(remove(&added, "/scan/fast"), nested);
+
+        // The owned field itself: its whole entry, closer included, is replaced.
+        assert_eq!(
+            set(flow, "/allowlist", json!(["c.example"])),
+            "allowlist:\n  - c.example\n# mode\nfail_mode: open  # x\n"
+        );
+        // A key line this parser cannot read stays a refusal, so no second
+        // entry is ever added for it.
+        for (text, pointer) in [
+            ("a: 1\n!!str b: 2\n", "/b"),
+            ("a: 1\n&x b: 2\nc: 3\n", "/c"),
+            ("a: 1\n? b\n: 2\n", "/b"),
+        ] {
+            let result = set_field(text, pointer, Some(&json!(3)));
+            assert!(result.is_err(), "{text:?} {pointer} -> {result:?}");
+        }
+        // A flow collection on the path is still refused.
+        assert!(set_field(
+            "severity_overrides: {\n  a: low\n}\nb: 1\n",
+            "/severity_overrides/x",
+            Some(&json!("high"))
+        )
+        .is_err());
     }
 
     #[test]

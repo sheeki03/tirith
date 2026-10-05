@@ -4285,6 +4285,47 @@ mod tests {
         );
     }
 
+    /// A trailing `...` document-end marker and a multi-line flow collection
+    /// closing in the key column are edited in place (they used to refuse),
+    /// and undo restores the exact bytes, also field by field after an
+    /// unrelated later edit.
+    #[test]
+    fn yaml_field_undo_is_exact_around_a_document_end_marker_and_a_key_column_flow_closer() {
+        let values = || {
+            std::collections::BTreeMap::from([
+                ("/fail_mode".to_owned(), Some(serde_json::json!("closed"))),
+                ("/severity_overrides/shortened_url".to_owned(), None),
+                ("/strict_warn".to_owned(), Some(serde_json::json!(true))),
+            ])
+        };
+        for (original, expected) in [
+            (
+                "fail_mode: open  # mine\nseverity_overrides:\n  shortened_url: low\n...\n# end\n",
+                "fail_mode: closed  # mine\nseverity_overrides: {}\nstrict_warn: true\n...\n# end\n",
+            ),
+            (
+                "allowlist: [\n  \"a.example\"\n]\nfail_mode: open  # mine\nseverity_overrides:\n  shortened_url: low\n",
+                "allowlist: [\n  \"a.example\"\n]\nfail_mode: closed  # mine\nseverity_overrides: {}\nstrict_warn: true\n",
+            ),
+        ] {
+            let edit = capture_fields(Some(original), true, values()).unwrap();
+            let applied = transform(&edit, Some(original), false).unwrap().unwrap();
+            assert_eq!(applied, expected);
+            assert_eq!(
+                transform(&edit, Some(&applied), true).unwrap().as_deref(),
+                Some(original),
+                "exact undo of {original:?}"
+            );
+            let later = applied.replace("# mine", "# mine, edited later");
+            let undone = transform(&edit, Some(&later), true).unwrap().unwrap();
+            assert_eq!(
+                undone,
+                original.replace("# mine", "# mine, edited later"),
+                "field-wise undo of {original:?}"
+            );
+        }
+    }
+
     #[test]
     fn yaml_field_plan_refuses_unsafe_in_place_edit_with_a_diff_and_changes_nothing() {
         with_fake_env(true, |home, _| {
