@@ -5362,7 +5362,9 @@ fn descriptor_copied_to_stdin(text: &str, fd: &str) -> bool {
 /// (masked to blanks) at `operator`: the one between the control operators
 /// (`;`, `&&`, `||`, `|`, `&`, a newline) around it. The operator may stand
 /// before the command word (`true; <<'EOF' sh` is read by `sh`) or after its
-/// last word (`sh <<'EOF'; true` by `sh`).
+/// last word (`sh <<'EOF'; true` by `sh`). An operator with no command word
+/// of its own is read with the command after it: zsh runs $READNULLCMD for
+/// it, which copies the body into a pipe (`<<'EOF' | sh`).
 fn heredoc_operator_segment(
     line: &str,
     segments: &[tokenize::Segment],
@@ -5371,11 +5373,12 @@ fn heredoc_operator_segment(
     if segments.is_empty() {
         return None;
     }
-    // Only blanks and the control operator lie between two segments.
+    // Only blanks and the control operator (or a newline) lie between two
+    // segments.
     let separator_before = |index: usize| {
         let gap = segments[index - 1].byte_range.end..segments[index].byte_range.start;
         line.get(gap.clone())
-            .and_then(|text| text.find(|character: char| !character.is_whitespace()))
+            .and_then(posix_separator_offset)
             .map_or(segments[index].byte_range.start, |offset| {
                 gap.start + offset
             })
@@ -5394,6 +5397,21 @@ fn heredoc_operator_segment(
     Some(low - 1)
 }
 
+/// The offset of the first control operator or newline in `gap`, text
+/// between two commands' words: any byte but a blank or a backslash-newline.
+fn posix_separator_offset(gap: &str) -> Option<usize> {
+    let bytes = gap.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' => index += 1,
+            b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
 /// How the reserved words that lead a POSIX command end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PosixLeadEnd {
@@ -5409,8 +5427,9 @@ enum PosixLeadEnd {
     Nothing,
 }
 
-/// A reserved word (or `)` for a case arm's pattern) before a command, and
-/// the byte after it.
+/// A reserved word, or the `)` that ends a case arm's pattern (a group's
+/// one-word last command and the `)` that closes the group, opened before
+/// the text, read the same), before a command, and the byte after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PosixLeadWord {
     word: &'static str,
@@ -5457,7 +5476,8 @@ fn posix_command_lead(text: &str, range: std::ops::Range<usize>, limit: usize) -
         if index >= limit {
             break PosixLeadEnd::Command(index);
         }
-        let word_end = posix_lead_word_end(bytes, index, end);
+        let scanned = posix_lead_word(bytes, index, end);
+        let word_end = scanned.end;
         if word_end == index {
             // An operator such as a redirection starts the command.
             break PosixLeadEnd::Command(index);
@@ -5512,18 +5532,27 @@ fn posix_command_lead(text: &str, range: std::ops::Range<usize>, limit: usize) -
             index = word_end;
             continue;
         }
-        // A case arm's `pattern)` (after `;;` the tokenizer starts a new
-        // segment with it).
-        if word.ends_with(')')
-            && !word.ends_with("()")
-            && !word.contains("$(")
-            && !word.contains('`')
-        {
+        // A case arm's pattern: one word up to a `)` that closes nothing
+        // opened in it (`x)`, `$(echo x))`), or one word and a lone `)`
+        // (`x )`, and `y )` after a `|` or `;;` where the tokenizer starts a
+        // new segment). The lead goes on after the `)`. More words before a
+        // `)` are no pattern: they are the last command of a group opened
+        // before `text` (`sh - )`), read as a command, or a syntax error.
+        let pattern_end = if scanned.unopened_close {
+            Some(word_end)
+        } else {
+            let mut next = word_end;
+            while next < end && matches!(bytes[next], b' ' | b'\t') {
+                next += 1;
+            }
+            (next < end.min(limit) && bytes[next] == b')').then_some(next + 1)
+        };
+        if let Some(close_end) = pattern_end {
             words.push(PosixLeadWord {
                 word: ")",
-                end: word_end,
+                end: close_end,
             });
-            index = word_end;
+            index = close_end;
             continue;
         }
         break PosixLeadEnd::Command(index);
@@ -5554,33 +5583,184 @@ fn posix_word_spells(word: &str, expected: &str) -> bool {
     spelled.next().is_none()
 }
 
-/// The end of the shell word starting at `bytes[index]`, read up to an
-/// unquoted blank, `;`, `&`, `|`, `<` or `>`.
-fn posix_lead_word_end(bytes: &[u8], mut index: usize, end: usize) -> usize {
+/// A shell word read by [`posix_lead_word`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PosixLeadWordEnd {
+    /// The byte after the word.
+    end: usize,
+    /// The word ends with a `)` that closes nothing opened in it: in code an
+    /// unquoted `)` like that ends a case pattern (`x)`, `$(echo x))`) or a
+    /// group opened before the word.
+    unopened_close: bool,
+}
+
+/// Read the shell word starting at `bytes[index]` up to an unquoted blank,
+/// `;`, `&`, `|`, `<` or `>`, or through a `)` that closes nothing opened in
+/// the word, with its scopes read as the shells (and the tokenizer) read
+/// them: a `$(...)`, `$((...))`, `${...}`, backtick body or `(...)` in the
+/// word is part of it, blanks, quotes and operators included
+/// (`$(uname -s | tr A-Z a-z)` is one word). In double quotes only `$(` and
+/// a backtick open a body; in `${...}` a `(` or `)` is a plain byte; a
+/// backtick body ends at its first unescaped backtick, with every scope
+/// opened in it. A scope left open runs to `end`. Nesting has no bound (the
+/// tokenizer has none): the read is one pass over the word.
+fn posix_lead_word(bytes: &[u8], mut index: usize, end: usize) -> PosixLeadWordEnd {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        Paren,
+        Parameter,
+        Backtick,
+    }
+    // Each open scope with whether double-quoted text resumes at its closer.
+    let mut scopes: Vec<(Scope, bool)> = Vec::new();
+    // Where the open backtick body sits in `scopes`: at most one is open, as
+    // a backtick in it closes it.
+    let mut backtick_open: Option<usize> = None;
     let mut quote: Option<u8> = None;
+    // A `#` at the start of a word in a body starts a comment.
+    let mut word_start = false;
+    // The run of unescaped `$` before this byte.
+    let mut dollars = 0usize;
     while index < end {
         let byte = bytes[index];
+        let innermost = scopes.last().map(|&(scope, _)| scope);
+        let dollar_before = dollars;
+        dollars = if byte == b'$' { dollars + 1 } else { 0 };
+        if byte == b'`' {
+            if let Some(open) = backtick_open.take() {
+                let (_, in_double) = scopes[open];
+                scopes.truncate(open);
+                quote = in_double.then_some(b'"');
+                word_start = false;
+                index += 1;
+                continue;
+            }
+        }
         match quote {
             Some(b'\'') => {
                 if byte == b'\'' {
                     quote = None;
+                } else if byte == b'\\'
+                    && backtick_open.is_some()
+                    && matches!(bytes.get(index + 1), Some(b'\\' | b'`'))
+                {
+                    index += 1;
                 }
             }
             Some(_) => match byte {
                 b'\\' => index += 1,
                 b'"' => quote = None,
+                b'`' => {
+                    backtick_open = Some(scopes.len());
+                    scopes.push((Scope::Backtick, true));
+                    quote = None;
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                // `$(` after an odd run of `$` (`$$(` is the PID and a `(`).
+                b'(' if dollar_before % 2 == 1 => {
+                    scopes.push((Scope::Paren, true));
+                    quote = None;
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
                 _ => {}
             },
             None => match byte {
-                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => break,
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' if scopes.is_empty() => {
+                    break
+                }
                 b'\\' => index += 1,
                 b'\'' | b'"' => quote = Some(byte),
+                b'#' if word_start && innermost != Some(Scope::Parameter) => {
+                    // A comment in a body runs to the line end, or to the
+                    // backtick that ends the backtick body it is in.
+                    while index < end && bytes[index] != b'\n' {
+                        if backtick_open.is_some() {
+                            if bytes[index] == b'`' {
+                                break;
+                            }
+                            if bytes[index] == b'\\' && bytes.get(index + 1) != Some(&b'\n') {
+                                index += 1;
+                            }
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                b'`' => {
+                    backtick_open = Some(scopes.len());
+                    scopes.push((Scope::Backtick, false));
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                b'{' if dollar_before > 0
+                    && (innermost == Some(Scope::Parameter) || dollar_before % 2 == 1) =>
+                {
+                    scopes.push((Scope::Parameter, false));
+                }
+                b'(' if innermost != Some(Scope::Parameter)
+                    || matches!(
+                        index.checked_sub(1).map(|at| bytes[at]),
+                        Some(b'$' | b'<' | b'>')
+                    ) =>
+                {
+                    scopes.push((Scope::Paren, false));
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                b')' => match innermost {
+                    Some(Scope::Paren) => {
+                        let (_, in_double) = scopes.pop().unwrap_or((Scope::Paren, false));
+                        quote = in_double.then_some(b'"');
+                    }
+                    None => {
+                        return PosixLeadWordEnd {
+                            end: index + 1,
+                            unopened_close: true,
+                        }
+                    }
+                    // A plain byte in `${...}`; a backtick body cannot
+                    // close a paren opened before it.
+                    Some(_) => {}
+                },
+                b'}' if innermost == Some(Scope::Parameter) => {
+                    scopes.pop();
+                }
                 _ => {}
             },
         }
+        word_start = quote.is_none() && matches!(byte, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|');
         index += 1;
     }
-    index.min(end)
+    PosixLeadWordEnd {
+        end: index.min(end),
+        unopened_close: false,
+    }
+}
+
+/// The byte after the first `)` that closes nothing opened before it in the
+/// words of `bytes[index..stop]` (redirection operators between them
+/// skipped): the end of a case arm's pattern (`x )`) or of the last command
+/// of a group opened before the text (`sh - )`).
+fn posix_unopened_close_end(bytes: &[u8], mut index: usize, stop: usize) -> Option<usize> {
+    while index < stop {
+        match bytes[index] {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => index += 1,
+            _ => {
+                let word = posix_lead_word(bytes, index, stop);
+                if word.unopened_close {
+                    return Some(word.end);
+                }
+                index = word.end.max(index + 1);
+            }
+        }
+    }
+    None
 }
 
 /// The words of one segment's lead that open or close compound commands,
@@ -5677,9 +5857,10 @@ fn descriptor_number(digits: &str) -> Option<String> {
 /// body open at the operator (the tokenizer does not split inside `$(...)`,
 /// so for `x="$(sh <<'EOF'` the reader is found in that body). The body is
 /// code if either reads it as code and ambiguous if either is ambiguous.
-/// The flag is set when the line closes a compound command (`done <<'EOF'`)
-/// that starts on an earlier line: the whole program is read for it once
-/// every heredoc body is masked.
+/// The flag is set when the line closes a compound command that starts on an
+/// earlier line (`done <<'EOF'`, and a subshell's `) <<'EOF'` or
+/// `sh ) <<'EOF'`): the whole program is read for it once every heredoc body
+/// is masked.
 fn heredoc_readers_for_header(
     line: &str,
     specs: &[PosixHeredocSpec],
@@ -5699,17 +5880,19 @@ fn heredoc_readers_for_header(
         fd: &target.fd,
         work,
     };
+    let segments = tokenize::tokenize(&masked, ShellType::Posix);
     // The line and the body open at the operator are read once per heredoc
     // outside the work bound; only what is read through them counts.
     let line_reading = heredoc_reader_at(
         &masked,
-        &tokenize::tokenize(&masked, ShellType::Posix),
+        &segments,
         None,
         operator,
         operator_end,
         MAX_HEREDOC_READER_DEPTH,
         &mut cx,
     );
+    let closes_earlier_group = heredoc_follows_unopened_close(&masked, &segments, operator);
     let mut reading = line_reading.unwrap_or(HeredocReading::DATA);
     if let Some(body) = posix_innermost_open_body(&masked, operator) {
         if let Some(text) = masked.get(body.clone()) {
@@ -5725,7 +5908,46 @@ fn heredoc_readers_for_header(
             .unwrap_or(HeredocReading::AMBIGUOUS));
         }
     }
-    (reading, line_reading.is_none())
+    (reading, line_reading.is_none() || closes_earlier_group)
+}
+
+/// Whether the heredoc operator at `operator` in `line` (read into
+/// `segments`) sits on, or in, a group opened on an earlier line, which only
+/// the whole program shows: its command holds a `)` that closes nothing
+/// opened on the line, either before the operator with nothing but
+/// redirections after it (the heredoc is on the group: `) <<'EOF'`,
+/// `sh ) 2>/dev/null <<'EOF'`, `cat x ) <<'EOF'`), or after the operator
+/// (the heredoc is on the group's last command: `sh <<'EOF' )`). Two such
+/// `)` before the operator also close a scope opened on an earlier line,
+/// as a command holds at most one case pattern's (`cat) in x) sh <<'EOF'`
+/// after `case $(echo x |`). A case arm's `pattern) <<'EOF'` reads like the
+/// first and is read again as data.
+fn heredoc_follows_unopened_close(
+    line: &str,
+    segments: &[tokenize::Segment],
+    operator: usize,
+) -> bool {
+    let Some(segment) =
+        heredoc_operator_segment(line, segments, operator).and_then(|index| segments.get(index))
+    else {
+        return false;
+    };
+    let range = segment.byte_range.clone();
+    let mut from = range.start;
+    let mut last_before = None;
+    while let Some(close_end) = posix_unopened_close_end(line.as_bytes(), from, range.end) {
+        if close_end > operator || last_before.is_some() {
+            return true;
+        }
+        last_before = Some(close_end);
+        from = close_end;
+    }
+    last_before.is_some_and(|close_end| {
+        crate::escalation::args_without_redirections(&tokenize::split_words(
+            line.get(close_end..range.end).unwrap_or_default(),
+        ))
+        .is_empty()
+    })
 }
 
 /// The byte range of the innermost `(`, `$(`, `<(`, `>(` or backtick body
@@ -17908,6 +18130,181 @@ mod tests {
             heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
             Some(HeredocReading::shell(ShellType::Posix))
         );
+    }
+
+    /// A subshell opened on an earlier line holds the heredoc on the line of
+    /// its `)` (`(` + newline + `sh` + newline + `) <<'EOF'`, `sh ) <<'EOF'`,
+    /// `sh <<'EOF' )`): the whole program is read for it. A case subject or
+    /// pattern holding `$(...)` or `${...}` with blanks or operators is one
+    /// word, and a pattern list runs up to its `)` however it is spaced
+    /// (`x | y )`, `x )`, `x)sh`). bash 3.2 and 5, sh, dash, zsh and ksh run
+    /// the body of every code shape below and none of the data shapes. (The
+    /// tokenizer splits at a `|` in a backtick body, so a backtick subject
+    /// such as `` `echo x | cat` `` is not read here; its unresolved command
+    /// word fails closed, see the golden fixtures.)
+    #[test]
+    fn heredoc_readers_read_subshells_closed_later_and_whole_case_words() {
+        let read = |header: &str, tail: &str| {
+            let recovery = recover_posix_heredocs(&format!("{header}\necho body\nEOF\n{tail}"));
+            let code = recovery
+                .bodies
+                .iter()
+                .any(|body| body.input.trim() == "echo body");
+            (code, recovery.gap)
+        };
+        for (header, tail) in [
+            ("(\n  sh\n) <<'EOF'", ""),
+            ("(cd /tmp\n  sh\n) <<'EOF'", ""),
+            ("( true\nsh ) <<'EOF'", ""),
+            ("( true\nsh; ) <<'EOF'", ""),
+            ("if true; then (\n  sh\n) <<'EOF'", "fi"),
+            ("true && (\n  sh\n) <<'EOF'", ""),
+            ("x=1; (\n  sh\n) <<'EOF'", ""),
+            ("(\n  sh\n) 2>/dev/null <<'EOF'", ""),
+            ("(\n  sh\n) 3<<'EOF' 0<&3", ""),
+            ("(\n  sh\n)<<'EOF'", ""),
+            ("(\n  sh\n) <<'EOF' | cat", ""),
+            ("(\n  (\n    sh\n  )\n) <<'EOF'", ""),
+            ("( (\n  sh\n) ) <<'EOF'", ""),
+            ("while true; do (\n  sh\n) <<'EOF'", "break; done"),
+            ("( true\nsh <<'EOF' )", ""),
+            ("( true\nsh <<'EOF')", ""),
+            ("( true\n<<'EOF' sh )", ""),
+            ("( sh\ncat /dev/null ) <<'EOF'", ""),
+            ("( sh\necho a b ) <<'EOF'", ""),
+            // A `)` with no group to close is a syntax error; the command
+            // before it is still read as one.
+            ("bash -s ) <<'EOF'", ""),
+            ("<<'EOF' | sh", ""),
+            ("true; <<'EOF' | sh", ""),
+            ("case $(echo x |\n  cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo x | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(true; echo x) in x) sh <<'EOF';; esac", ""),
+            ("case $(true && echo x) in x) sh <<'EOF';; esac", ""),
+            ("case ${v%;*} in x) sh <<'EOF';; esac", ""),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) sh <<'EOF';; esac",
+                "",
+            ),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) sh;; esac <<'EOF'",
+                "",
+            ),
+            ("case $((1 < 2)) in 1) sh <<'EOF';; esac", ""),
+            ("case $(echo \"a b\" | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo ')' | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo x | cat)y in xy) sh <<'EOF';; esac", ""),
+            ("case x in x | y ) sh <<'EOF';; esac", ""),
+            ("case x in x|y ) sh <<'EOF';; esac", ""),
+            ("case x in (x | y) sh <<'EOF';; esac", ""),
+            ("case x in y) :;; x ) sh <<'EOF';; esac", ""),
+            ("case x in y) :;; x | z ) sh <<'EOF';; esac", ""),
+            ("case x in x)sh <<'EOF';; esac", ""),
+            ("case x in x )sh <<'EOF';; esac", ""),
+            ("case x in y) :;; $(echo x)) sh <<'EOF';; esac", ""),
+        ] {
+            assert!(read(header, tail).0, "{header}: {:?}", read(header, tail));
+        }
+        for (header, tail) in [
+            ("(\n  cat\n) <<'EOF'", ""),
+            ("( true\ncat ) <<'EOF'", ""),
+            ("(\n  sh ./script.sh\n) <<'EOF'", ""),
+            ("if true; then (\n  cat\n) <<'EOF'", "fi"),
+            ("( true\ncat <<'EOF' )", ""),
+            ("( true\ncat /dev/null ) <<'EOF'", ""),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) cat <<'EOF';; esac",
+                "",
+            ),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) cat;; esac <<'EOF'",
+                "",
+            ),
+            ("case ${v%;*} in x) cat <<'EOF';; esac", ""),
+            ("case x in y) :;; x | z ) cat <<'EOF';; esac", ""),
+            ("case x in x) <<'EOF';; esac", ""),
+            ("case x in\n  x) <<'EOF'", "  ;;\nesac"),
+            ("x=$(\n  cat <<'EOF'", ")"),
+            ("true\n<<'EOF'", "sh"),
+        ] {
+            assert_eq!(read(header, tail), (false, None), "{header}");
+        }
+        // Nesting has no bound of its own (the tokenizer has none): a deep
+        // but closed subject is one word, as it was when no blank split it.
+        let deep = format!(
+            "case {}x{} in x) sh <<'EOF';; esac",
+            "$(".repeat(200),
+            ")".repeat(200)
+        );
+        assert!(read(&deep, "").0, "{deep}");
+        let deep_word = format!("{}x{} in", "$(".repeat(200), ")".repeat(200));
+        assert_eq!(
+            posix_lead_word(deep_word.as_bytes(), 0, deep_word.len()),
+            PosixLeadWordEnd {
+                end: deep_word.len() - " in".len(),
+                unopened_close: false
+            }
+        );
+
+        // The word reader keeps the tokenizer's scopes in one word and stops
+        // after a `)` that closes nothing opened in the word.
+        for (text, word, unopened_close) in [
+            (
+                "$(uname -s | tr A-Z a-z) in",
+                "$(uname -s | tr A-Z a-z)",
+                false,
+            ),
+            ("${v%;*} in", "${v%;*}", false),
+            ("$((1 < 2)) in", "$((1 < 2))", false),
+            ("`echo x | cat` in", "`echo x | cat`", false),
+            (
+                "\"$(echo \")\" | cat)\" x",
+                "\"$(echo \")\" | cat)\"",
+                false,
+            ),
+            ("$(echo ')' | cat)y in", "$(echo ')' | cat)y", false),
+            ("${x:-(} y", "${x:-(}", false),
+            ("${x:-)} y", "${x:-)}", false),
+            ("$(echo # )\n) y", "$(echo # )\n)", false),
+            ("`echo $(x` y", "`echo $(x`", false),
+            ("\"$$(\" x", "\"$$(\"", false),
+            ("$(unclosed | x", "$(unclosed | x", false),
+            ("x)sh", "x)", true),
+            ("$(echo x)) sh", "$(echo x))", true),
+            (")", ")", true),
+            ("f() {", "f()", false),
+            ("arr=(a b) sh", "arr=(a b)", false),
+            ("a;b", "a", false),
+            ("'a b' c", "'a b'", false),
+        ] {
+            assert_eq!(
+                posix_lead_word(text.as_bytes(), 0, text.len()),
+                PosixLeadWordEnd {
+                    end: word.len(),
+                    unopened_close
+                },
+                "{text:?}"
+            );
+        }
+
+        // A newline separates commands like `;`: the operator (masked to
+        // blanks) at the start of a line is read with the command after it
+        // (`<<'EOF' sh`). zsh also pipes a lone heredoc into the next command
+        // through $READNULLCMD (`<<'EOF' | sh` runs the body there).
+        for (line, operator, holder) in [
+            ("true\n        sh", 5, 1),
+            ("true;        sh", 5, 1),
+            ("        | sh", 0, 0),
+            ("true;         | sh", 5, 1),
+            ("sh        ; true", 3, 0),
+        ] {
+            let segments = tokenize::tokenize(line, ShellType::Posix);
+            assert_eq!(
+                heredoc_operator_segment(line, &segments, operator),
+                Some(holder),
+                "{line:?}"
+            );
+        }
     }
 
     /// The terminator line is the delimiter word after quote removal, as the
