@@ -129,7 +129,7 @@ impl Receipt {
             |value: &str| crate::redact::sanitize_provenance_url_with_compiled(value, compiled);
         Self {
             url: url(&self.url),
-            final_url: self.final_url.as_deref().map(&url),
+            final_url: self.final_url.as_deref().map(url),
             redirects: self.redirects.iter().map(|value| url(value)).collect(),
             sha256: self.sha256.clone(),
             size: self.size,

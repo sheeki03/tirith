@@ -3856,20 +3856,18 @@ fn detect_unsupported_pdf_subgraphs(
                 format!("page {page_num}: PDF annotation graph: {err}"),
             ),
         }
-        for (key, label) in [(b"AA".as_slice(), "additional-actions graph")] {
-            match pdf_dictionary_has_non_null(doc, page, key) {
-                Ok(true) => push_pdf_incomplete_reason(
-                    reasons,
-                    format!(
-                        "page {page_num}: PDF {label} is unsupported for complete rendering analysis"
-                    ),
+        match pdf_dictionary_has_non_null(doc, page, b"AA") {
+            Ok(true) => push_pdf_incomplete_reason(
+                reasons,
+                format!(
+                    "page {page_num}: PDF additional-actions graph is unsupported for complete rendering analysis"
                 ),
-                Ok(false) => {}
-                Err(err) => push_pdf_incomplete_reason(
-                    reasons,
-                    format!("page {page_num}: PDF {label}: {err}"),
-                ),
-            }
+            ),
+            Ok(false) => {}
+            Err(err) => push_pdf_incomplete_reason(
+                reasons,
+                format!("page {page_num}: PDF additional-actions graph: {err}"),
+            ),
         }
     }
 

@@ -521,12 +521,15 @@ fn serve_loop(
 
         match server.accept() {
             Ok((stream, _)) => {
-                if active
+                // Rust 1.99 deprecates `fetch_update` as a rename to
+                // `try_update`, which the 1.83 MSRV does not have.
+                #[allow(deprecated)]
+                let admitted = active
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                         (count < MAX_CONNECTIONS).then_some(count + 1)
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                if !admitted {
                     // Closing immediately bounds overload work.
                     continue;
                 }

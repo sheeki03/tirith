@@ -849,7 +849,7 @@ fn emit(
             "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
             "child_exit_code": outcome.child_exit_code,
             "termination_kind": outcome.termination_kind,
-            "reason": outcome.reason.as_deref().map(&safe),
+            "reason": outcome.reason.as_deref().map(safe),
             "cleanup_confirmed": outcome.cleanup_confirmed,
             "requested_coverage": outcome.coverage.requested,
             "achieved_coverage": outcome.coverage.achieved,

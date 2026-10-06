@@ -38,7 +38,7 @@ pub(super) fn set_field(
     if !unique_keys(text) {
         return Err(refuse("a mapping in the file repeats a key"));
     }
-    let edited = edit(text, &keys, value).map_err(&refuse)?;
+    let edited = edit(text, &keys, value).map_err(refuse)?;
     match parse(&edited) {
         Ok(actual) if actual == expected && unique_keys(&edited) => Ok(edited),
         _ => Err(refuse("the in-place edit could not be verified")),

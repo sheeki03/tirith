@@ -401,13 +401,16 @@ pub(crate) fn serve(startup_id: &str) -> i32 {
                     if !peer.ip().is_loopback() || !peer::same_user(&stream) {
                         continue;
                     }
-                    if service
+                    // Rust 1.99 deprecates `fetch_update` as a rename to
+                    // `try_update`, which the 1.83 MSRV does not have.
+                    #[allow(deprecated)]
+                    let admitted = service
                         .connections
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                             (count < MAX_CONNECTIONS).then_some(count + 1)
                         })
-                        .is_err()
-                    {
+                        .is_ok();
+                    if !admitted {
                         // Closing immediately bounds overload work and socket lifetime.
                         drop(stream);
                         continue;
