@@ -161,19 +161,48 @@ fn tokenize_posix(
     // group. The distinction matters because parameter braces stay within the
     // current word while grouping braces start/end shell words.
     let mut brace_scopes: Vec<bool> = Vec::new();
-    // Which scope a word-start `#` sits in decides whether it is a comment
-    // and where that comment ends (POSIX only; fish has neither `${...}` nor
-    // backticks). `brace_paren_depth[n]` is `paren_depth` when
-    // `brace_scopes[n]` opened, so a `(` opened after a brace (still open)
-    // makes that paren the inner scope. `backtick` holds `paren_depth` and
-    // the brace count when a backtick substitution opened. Backticks are
-    // tracked only for comments; they do not change where segments split.
+    // POSIX only (fish has neither `${...}` nor backticks): which scope is
+    // innermost decides what `#`, `(`, `)`, `{` and `}` are.
+    // `brace_paren_depth[n]` is `paren_depth` when `brace_scopes[n]` opened,
+    // so a `(` opened after a brace (still open) makes that paren the inner
+    // scope. `backtick` holds `paren_depth` and the brace count when a
+    // backtick body opened. The shells cut a backtick body out at its closing
+    // backtick before they parse it, so nothing in the body closes a scope
+    // opened before it, and a scope it leaves open ends with it. Backticks do
+    // not change where segments split.
     let posix = single_quote_style == SingleQuoteStyle::Posix;
     let mut brace_paren_depth: Vec<usize> = Vec::new();
     let mut backtick: Option<(usize, usize)> = None;
+    // The last unescaped character read at a token position, with the index
+    // just past it, and the run of unescaped `$` that ends with it. The
+    // shells remove a backslash-newline before they read tokens, so one in
+    // between leaves both in place (`$\` + newline + `(cmd)` is `$(cmd)`).
+    let mut previous: Option<(char, usize)> = None;
+    let mut dollar_run = 0usize;
 
     while i < len {
         let ch = chars[i];
+        let before = previous
+            .filter(|(_, end)| *end == i)
+            .map(|(previous, _)| previous);
+        let dollars_before = if before == Some('$') { dollar_run } else { 0 };
+        if posix {
+            if ch == '\\' && chars.get(i + 1) == Some(&'\n') {
+                if let Some((_, end)) = previous.as_mut().filter(|(_, end)| *end == i) {
+                    *end = i + 2;
+                }
+            } else {
+                dollar_run = if ch == '$' { dollars_before + 1 } else { 0 };
+                previous = Some((ch, i + 1));
+            }
+        }
+        let parameter_innermost = posix
+            && posix_parameter_is_innermost(
+                paren_depth,
+                &brace_scopes,
+                &brace_paren_depth,
+                backtick,
+            );
 
         match ch {
             '\\' if i + 1 < len => {
@@ -236,7 +265,7 @@ fn tokenize_posix(
             }
             '#' if at_word_start => {
                 let scope = if posix {
-                    posix_hash_scope(paren_depth, &brace_scopes, &brace_paren_depth, backtick)
+                    posix_hash_scope(parameter_innermost, backtick.is_some())
                 } else {
                     HashScope::Comment
                 };
@@ -270,12 +299,29 @@ fn tokenize_posix(
             }
             // A backtick opens a command substitution, or closes the open one
             // (a nested backtick must be escaped, and the escape arm above
-            // keeps `\`` together).
+            // keeps `\`` together). The body starts a command, so a `#` first
+            // in it is a comment. Closing the body drops every scope opened
+            // inside it.
             '`' if posix => {
-                backtick = match backtick {
-                    Some(_) => None,
-                    None => Some((paren_depth, brace_scopes.len())),
-                };
+                match backtick.take() {
+                    Some((parens, braces)) => {
+                        paren_depth = parens;
+                        brace_scopes.truncate(braces);
+                        brace_paren_depth.truncate(braces);
+                        at_word_start = false;
+                    }
+                    None => {
+                        backtick = Some((paren_depth, brace_scopes.len()));
+                        at_word_start = true;
+                    }
+                }
+                current.push(ch);
+                i += 1;
+                continue;
+            }
+            // Inside `${...}` a `(` is a plain byte (`${x//(/_}`, `${x:-(}`)
+            // unless it opens a `$(`, `$((`, `<(` or `>(`.
+            '(' if parameter_innermost && !matches!(before, Some('$' | '<' | '>')) => {
                 current.push(ch);
                 at_word_start = false;
                 i += 1;
@@ -288,24 +334,38 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
-            ')' if paren_depth > 0 => {
+            // A `)` closes a paren only when a paren is the innermost scope:
+            // inside `${...}` it is a plain byte, and a backtick body cannot
+            // close a paren opened before it.
+            ')' if paren_depth > 0
+                && !parameter_innermost
+                && backtick.is_none_or(|(parens, _)| paren_depth > parens) =>
+            {
                 paren_depth -= 1;
                 current.push(ch);
                 at_word_start = true;
                 i += 1;
                 continue;
             }
-            '{' if ends_with_unescaped_char(&current, '$', '\\')
-                || (posix_reserved_word_boundary_after(&chars, i)
-                    && ((!brace_scopes.is_empty() && at_word_start)
-                        || opens_posix_brace_scope(
-                            &current,
-                            paren_depth,
-                            bash_function_names,
-                            single_quote_style,
-                        ))) =>
+            '{' if (if posix {
+                posix_dollars_open_parameter(dollars_before, parameter_innermost)
+            } else {
+                ends_with_unescaped_char(&current, '$', '\\')
+            }) || (!parameter_innermost
+                && posix_reserved_word_boundary_after(&chars, i)
+                && ((!brace_scopes.is_empty() && at_word_start)
+                    || opens_posix_brace_scope(
+                        &current,
+                        paren_depth,
+                        bash_function_names,
+                        single_quote_style,
+                    ))) =>
             {
-                let embedded_in_word = ends_with_unescaped_char(&current, '$', '\\');
+                let embedded_in_word = if posix {
+                    posix_dollars_open_parameter(dollars_before, parameter_innermost)
+                } else {
+                    ends_with_unescaped_char(&current, '$', '\\')
+                };
                 brace_scopes.push(embedded_in_word);
                 brace_paren_depth.push(paren_depth);
                 current.push(ch);
@@ -313,10 +373,16 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
+            // A `}` closes `${...}` only when it is the innermost scope (a `}`
+            // inside `${x:-$(echo })}` is a word of the `$(...)`), and no
+            // brace scope opened before an open backtick body.
             '}' if brace_scopes.last().is_some_and(|embedded_in_word| {
-                *embedded_in_word
-                    || (at_word_start && posix_reserved_word_boundary_after(&chars, i))
-            }) =>
+                if *embedded_in_word {
+                    !posix || parameter_innermost
+                } else {
+                    at_word_start && posix_reserved_word_boundary_after(&chars, i)
+                }
+            }) && backtick.is_none_or(|(_, braces)| braces < brace_scopes.len()) =>
             {
                 let embedded_in_word = brace_scopes.pop().unwrap_or(false);
                 brace_paren_depth.pop();
@@ -467,37 +533,50 @@ enum HashScope {
     Comment,
     /// A comment in a backtick body: it ends at the end of the line or at
     /// the closing backtick, whichever comes first (`` `echo a #x` ; cmd ``
-    /// runs `cmd`).
+    /// runs `cmd`). The shells cut the body out at that backtick before they
+    /// parse it, so this holds in a `(...)` inside the body too.
     CommentToBacktick,
     /// Part of a `${...}` word: no comment (`${x:- #} ; cmd` runs `cmd`).
     Parameter,
 }
 
-/// The innermost of the open scopes: a brace scope, a paren opened after
-/// it, or a backtick body opened after either. `brace_paren_depth[n]` is the
-/// paren depth when `brace_scopes[n]` opened; `backtick` is the paren depth
-/// and brace count when the open backtick body started.
-fn posix_hash_scope(
+fn posix_hash_scope(parameter_innermost: bool, backtick_open: bool) -> HashScope {
+    if parameter_innermost {
+        HashScope::Parameter
+    } else if backtick_open {
+        HashScope::CommentToBacktick
+    } else {
+        HashScope::Comment
+    }
+}
+
+/// Whether an open `${...}` is the innermost scope of [`tokenize_posix`]: no
+/// paren opened after it, and no backtick body opened after it.
+/// `brace_paren_depth[n]` is the paren depth when `brace_scopes[n]` opened;
+/// `backtick` is the paren depth and brace count when the open backtick body
+/// started.
+fn posix_parameter_is_innermost(
     paren_depth: usize,
     brace_scopes: &[bool],
     brace_paren_depth: &[usize],
     backtick: Option<(usize, usize)>,
-) -> HashScope {
-    if backtick
-        .is_some_and(|(parens, braces)| paren_depth <= parens && brace_scopes.len() <= braces)
-    {
-        return HashScope::CommentToBacktick;
-    }
-    let parameter_is_innermost = brace_scopes.last() == Some(&true)
+) -> bool {
+    brace_scopes.last() == Some(&true)
         && brace_paren_depth
             .last()
             .is_some_and(|parens| paren_depth <= *parens)
-        && backtick.is_none_or(|(_, braces)| braces < brace_scopes.len());
-    if parameter_is_innermost {
-        HashScope::Parameter
-    } else {
-        HashScope::Comment
-    }
+        && backtick.is_none_or(|(_, braces)| braces < brace_scopes.len())
+}
+
+/// Whether a `{` after `dollars` unescaped `$` opens a `${...}`. Outside
+/// `${...}`, bash, dash and ksh read `$$` as one parameter (the PID), so
+/// `$${x` is `$$` and a plain `{x`; an odd run ends in `${`. zsh reads `$${x`
+/// as `$` and `${x`, and inside `${...}` bash 3.2 and ksh do too, while bash
+/// 5 and dash do not, so inside `${...}` any run opens one. The exec gate
+/// fails closed on the even runs where the shells disagree
+/// (`extract::lexical_executable_substitutions_bounded`).
+fn posix_dollars_open_parameter(dollars: usize, parameter_innermost: bool) -> bool {
+    dollars > 0 && (parameter_innermost || dollars % 2 == 1)
 }
 
 /// Whether the current token really ends in a redirection operator.  Looking
@@ -2683,6 +2762,105 @@ mod tests {
 
         // Fish has neither `${...}` nor backtick substitutions: unchanged.
         for input in ["echo ${x:- #} ; sink", "echo `a #b` ; sink"] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+        }
+    }
+
+    /// Only the innermost scope closes: inside `${...}` a `(`, `)` or `{` is
+    /// a plain byte, a `}` in a `$(...)` or backtick body does not close the
+    /// `${...}` around it, and a backtick body cannot leave a scope open. A
+    /// `{` opens `${...}` after an odd run of `$` outside `${...}` (`$$` is
+    /// one parameter), backslash-newlines removed. A `#` first in a backtick
+    /// body is a comment that ends at the closing backtick. Each misreading
+    /// hid every later command; bash or dash (most also zsh or ksh) run
+    /// `sink` in every input below.
+    #[test]
+    fn scopes_close_innermost_first_and_hide_no_later_command() {
+        let runs_sink = |input: &str| {
+            tokenize(input, ShellType::Posix)
+                .iter()
+                .map(|seg| seg.command.as_deref())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == [Some("printf"), Some("sink")])
+        };
+        let plain_bytes = [
+            "echo ${x:-(}\necho }\nprintf ready | sink",
+            "echo ${x:- #(} && printf ready | sink",
+            "echo ${x:- #(} ; printf ready | sink",
+            "echo ${x//(/_}\nprintf ready | sink",
+            "echo ${x:-${y:-(}}\nprintf ready | sink",
+            "echo ${x:- { } ; printf ready | sink",
+            "echo ${x:-$(echo }) #} ; printf ready | sink",
+        ];
+        let mut missed: Vec<_> = plain_bytes
+            .into_iter()
+            .filter(|input| !runs_sink(input))
+            .collect();
+        for input in [
+            "echo ${x:- #(}\necho }\nprintf ready | sink",
+            "echo ${x:- #(}\n: } ; printf ready | sink",
+            "echo ${x:- #((}\necho }\nprintf ready | sink",
+            "echo ${x:-`true #`(}\necho }\nprintf ready | sink",
+            "echo ${x:-`echo }` #} ; printf ready | sink",
+            "echo `echo ${x:-`\nprintf ready | sink",
+            "echo ${x:-`echo (`}\nprintf ready | sink",
+            "echo `echo (`\nprintf ready | sink",
+            // `(` still opens `$(`, `$((`, `<(` and `>(` inside `${...}`.
+            "echo ${x:-$(echo a)} ; printf ready | sink",
+            "echo ${x:-$((1+2))} ; printf ready | sink",
+            "echo ${x:-<(true)} ; printf ready | sink",
+            "echo ${x:-a(b)c} ; printf ready | sink",
+            // `$$` and then a plain `{`.
+            "echo $${x # it's\necho a}b\nprintf ready | sink\n# '}",
+            "x=$${ #it's\necho }\nprintf ready | sink\n#'}",
+            "echo $$$${x # it's\necho a}b\nprintf ready | sink\n# '}",
+            "x=$${ #(\n: } && printf ready | sink",
+            "echo $${x ; printf ready | sink",
+            "echo $${x\nprintf ready | sink",
+            "echo $\\\n$\\\n{x # it's\necho a}b\nprintf ready | sink\n# '}",
+            // An odd run, an escaped `$`, or a backslash-newline: `${`.
+            "echo $$${x:- #} ; printf ready | sink",
+            "echo \\$${x:- #} ; printf ready | sink",
+            "echo $\\\n{x:- #} ; printf ready | sink",
+            // A `#` first in a backtick body.
+            "echo `#it's` ; printf ready | sink",
+            "x=`#it's`; printf ready | sink",
+            "x=`#it's` ; printf ready | sink",
+            "echo `#it's` && printf ready | sink",
+            "echo `#'` ; printf ready | sink",
+            "echo ${x:-`#it's`} ; printf ready | sink",
+            "echo `#it's`\nprintf ready | sink",
+            "x=`(echo a #x` ; printf ready | sink",
+        ] {
+            if !runs_sink(input) {
+                missed.push(input);
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        for input in plain_bytes {
+            assert_byte_ranges_match_raw(input, &tokenize(input, ShellType::Posix));
+        }
+
+        // Comments that stay comments.
+        for input in [
+            "echo `#printf ready | sink`",
+            "echo $${x} # ; printf ready | sink",
+            "echo ${x:-(} # ; printf ready | sink",
+            "echo `echo ${x:-` # ; printf ready | sink",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert!(
+                !segs
+                    .iter()
+                    .any(|seg| seg.command.as_deref() == Some("sink")),
+                "{input:?} -> {segs:?}"
+            );
+        }
+
+        // Fish keeps counting every `(` and `$`-brace.
+        for input in ["echo ${x:-(} ; sink", "echo $${x ; sink"] {
             let segs = tokenize(input, ShellType::Fish);
             assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
         }

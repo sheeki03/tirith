@@ -1142,9 +1142,14 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // The line pass reads the file as code. The body of an unquoted live
     // heredoc is also expanded as data, where `'`, `"` and `#` are plain
     // text, so once the descent is bounded its lines are read that way too.
+    // It also runs where the shells read the text differently (a `$${` or
+    // `$$(`, or a backslash-newline inside `$(`/`${`), since the descent
+    // follows one reading only.
+    let reads_differently = crate::extract::posix_text_reads_differently_across_shells(text);
     let found = grouped == ShellFetch::Found
         || substituted == ShellFetch::Found
-        || ((bounded || heredocs.ambiguous) && any_line_feeds_shell(text, heredocs.ambiguous))
+        || ((bounded || heredocs.ambiguous || reads_differently)
+            && any_line_feeds_shell(text, heredocs.ambiguous))
         || (bounded
             && heredocs
                 .live_bodies
