@@ -1143,9 +1143,12 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // heredoc is also expanded as data, where `'`, `"` and `#` are plain
     // text, so once the descent is bounded its lines are read that way too.
     // It also runs where the shells read the text differently (a `$${` or
-    // `$$(`, or a backslash-newline inside `$(`/`${`), since the descent
+    // `$$(`, a backslash-newline inside `$(`/`${`, or a `$'`, one ANSI-C
+    // string in bash, zsh and ksh but a `$` and a plain quote in dash, so
+    // `$'it\'s'` ends in bash and opens a quote in dash), since the descent
     // follows one reading only.
-    let reads_differently = crate::extract::posix_text_reads_differently_across_shells(text);
+    let reads_differently =
+        crate::extract::posix_text_reads_differently_across_shells(text) || text.contains("$'");
     let found = grouped == ShellFetch::Found
         || substituted == ShellFetch::Found
         || ((bounded || heredocs.ambiguous || reads_differently)

