@@ -1067,6 +1067,21 @@ fn descend(
         0,
         &mut budget,
     );
+    // A live heredoc body stays in the text read above, where the tokenizer
+    // reads it as code: the apostrophe of `it's` (or a `"`, or `$(`) opens a
+    // quote that hides every later line, and a `curl … | sh` after the
+    // heredoc was missed. So the group pass also reads the file with every
+    // heredoc body blanked (heredoc text is data there, and each live body is
+    // scanned on its own below), on its own budget, and keeps any finding.
+    // Substitutions are already read from that blanked text.
+    if !read_substitutions && outcome != ShellFetch::Found && !heredocs.live_bodies.is_empty() {
+        let blanked = without_heredoc_bodies(text);
+        let mut blanked_budget = SHELL_BODY_BUDGET;
+        match fetch_feeds_shell(&blanked, None, 0, &mut blanked_budget) {
+            ShellFetch::NotFound => {}
+            other => outcome = other,
+        }
+    }
     // The live bodies were already counted by the whole-file pass, so their
     // own pass gets a fresh (shared) budget: at most twice the work.
     let mut body_budget = SHELL_BODY_BUDGET;

