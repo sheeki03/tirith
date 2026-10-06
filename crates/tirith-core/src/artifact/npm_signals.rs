@@ -1117,24 +1117,84 @@ fn descend(
     outcome
 }
 
+/// The group descent, then the descent that also reads substitutions, over
+/// `text`: whether either found a pipeline, and whether either hit a bound.
+fn descend_all(text: &str, heredocs: &inert_heredoc::HeredocView) -> (bool, bool) {
+    // The group descent runs alone first, on its own budget, so substitution
+    // bodies (each piped one costs a body) can never use up the budget a
+    // later brace group, function or subshell needs, as in a live heredoc
+    // body full of `$(... | ...)` before one holding `f() { curl … | sh; }`.
+    // The descent that also reads substitutions then gets a fresh budget.
+    let grouped = descend(text, heredocs, false);
+    let substituted = if grouped == ShellFetch::Found {
+        ShellFetch::NotFound
+    } else {
+        descend(text, heredocs, true)
+    };
+    (
+        grouped == ShellFetch::Found || substituted == ShellFetch::Found,
+        grouped == ShellFetch::Bounded || substituted == ShellFetch::Bounded,
+    )
+}
+
+/// Where the shells read `text` differently, outside single quotes,
+/// comments and heredoc data: the text is read with every heredoc body
+/// blanked (an apostrophe there is no quote), and each body that may run on
+/// its own. Offsets are into `text`.
+fn shell_readings(
+    text: &str,
+    heredocs: &inert_heredoc::HeredocView,
+) -> crate::tokenize::PosixReadings {
+    let mut readings = crate::tokenize::posix_readings(&without_heredoc_bodies(text));
+    for live in &heredocs.live_bodies {
+        let body = crate::tokenize::posix_readings(&text[live.range.clone()]);
+        readings.dollars_differ |= body.dollars_differ;
+        readings.ansi_c_escaped_quotes.extend(
+            body.ansi_c_escaped_quotes
+                .iter()
+                .map(|offset| live.range.start + offset),
+        );
+    }
+    readings
+}
+
+/// `text` as bash, zsh and ksh read its `$'...'` strings: each `'` a
+/// backslash escapes there made a plain `_`, so the tokenizer, which reads
+/// `$'` the dash way (a `$` and a plain single-quoted string), ends each
+/// string where they do. `None` when no string holds an escaped quote.
+fn ansi_c_reading(text: &str, escaped_quotes: &[usize]) -> Option<String> {
+    if escaped_quotes.is_empty() {
+        return None;
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    for offset in escaped_quotes {
+        if let Some(byte) = bytes.get_mut(*offset).filter(|byte| **byte == b'\'') {
+            *byte = b'_';
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut NpmInspection) {
     // Heredoc text this file provably only prints is data, like a comment.
     // Every other heredoc body is also scanned on its own, and ambiguous
     // heredocs add the line-by-line pass. The bounded fallback below keeps
     // reading the raw text (fails toward the signal).
     let heredocs = inert_heredoc::analyze(text);
-    // The group descent runs alone first, on its own budget, so substitution
-    // bodies (each piped one costs a body) can never use up the budget a
-    // later brace group, function or subshell needs, as in a live heredoc
-    // body full of `$(... | ...)` before one holding `f() { curl … | sh; }`.
-    // The descent that also reads substitutions then gets a fresh budget.
-    let grouped = descend(text, &heredocs, false);
-    let substituted = if grouped == ShellFetch::Found {
-        ShellFetch::NotFound
-    } else {
-        descend(text, &heredocs, true)
-    };
-    let bounded = grouped == ShellFetch::Bounded || substituted == ShellFetch::Bounded;
+    let (mut found, mut bounded) = descend_all(text, &heredocs);
+    let readings = shell_readings(text, &heredocs);
+    // The descent reads `$'...'` the dash way: `$'a\'' ; curl … | sh # '`
+    // quotes the pipeline there, while bash, zsh and ksh read `$'a\''` as
+    // one string and run it. So where a string holds an escaped quote, the
+    // text is also read their way.
+    if !found {
+        if let Some(reading) = ansi_c_reading(text, &readings.ansi_c_escaped_quotes) {
+            let (reading_found, reading_bounded) =
+                descend_all(&reading, &inert_heredoc::analyze(&reading));
+            found = reading_found;
+            bounded |= reading_bounded;
+        }
+    }
     if bounded {
         inspection.issue(NpmIssueKind::CodeLimit, Some(member),
             "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
@@ -1142,15 +1202,12 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // The line pass reads the file as code. The body of an unquoted live
     // heredoc is also expanded as data, where `'`, `"` and `#` are plain
     // text, so once the descent is bounded its lines are read that way too.
-    // It also runs where the shells read the text differently (a `$${` or
-    // `$$(`, a backslash-newline inside `$(`/`${`, or a `$'`, one ANSI-C
-    // string in bash, zsh and ksh but a `$` and a plain quote in dash, so
-    // `$'it\'s'` ends in bash and opens a quote in dash), since the descent
-    // follows one reading only.
-    let reads_differently =
-        crate::extract::posix_text_reads_differently_across_shells(text) || text.contains("$'");
-    let found = grouped == ShellFetch::Found
-        || substituted == ShellFetch::Found
+    // It also runs where the shells read the text differently outside
+    // single quotes, comments and heredoc data (a `$${` or `$$(`, a
+    // backslash-newline inside `$(`/`${`, or a `$'...'` string holding a
+    // `\'`), since the descent follows one reading of those only.
+    let reads_differently = readings.dollars_differ || !readings.ansi_c_escaped_quotes.is_empty();
+    let found = found
         || ((bounded || heredocs.ambiguous || reads_differently)
             && any_line_feeds_shell(text, heredocs.ambiguous))
         || (bounded

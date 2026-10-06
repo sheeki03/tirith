@@ -103,7 +103,15 @@ file contents can produce a new hash in the downloaded report.
   (`<(...)`, `>(...)`), but not inside single-quoted text, comments or heredoc
   data. Quotes are read the way bash, dash, ksh and zsh read them (`$'...'`,
   nested quotes in a double-quoted `${...}`), and a substitution any of them
-  runs counts. The body of an unquoted heredoc is read the way the shell
+  runs counts. A `$'...'` string holding `\'` is one string in bash, zsh and
+  ksh but a quoted string and an open quote in dash, so a file holding one is
+  read both ways. A heredoc opened inside a double-quoted `$(...)`
+  (`git commit -m "$(cat <<'EOF'`) is a heredoc like any other. Where the
+  shells read a file differently outside single quotes, comments and heredoc
+  data (such a `$'...'` string, a `$$` before `{` or `(`, or a
+  backslash-newline that splits a `$(` or `${`), each line is also read on its
+  own, so quoted text or heredoc data in that file can count too. The body of
+  an unquoted heredoc is read the way the shell
   expands it: `'`, `"` and `#` are plain text there, so a substitution after
   an apostrophe still counts. Heredoc text is
   skipped only when the file provably just prints it: a heredoc given to

