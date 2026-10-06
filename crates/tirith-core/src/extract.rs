@@ -2020,14 +2020,16 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                 // curl's URL globbing reaches each host part the operand
                 // expands to (`http://{a,b}/`, `http://10.0.0.[1-2]/`). Past
                 // the budget the command rules report the operand unreadable.
-                let expanded = match curl_globbing.then(|| curl_host_glob(operand)) {
+                let expanded = match curl_globbing
+                    .then(|| curl_host_glob(&operand.text, operand.curl_variables))
+                {
                     Some(CurlHostGlob::Expanded(expansions)) if expansions.len() <= budget => {
                         budget -= expansions.len();
                         expansions
                     }
                     _ => Vec::new(),
                 };
-                for raw in std::iter::once(operand).chain(&expanded) {
+                for raw in std::iter::once(&operand.text).chain(&expanded) {
                     let parsed = if has_leading_uri_scheme(raw) {
                         // curl also accepts schemes outside URL_REGEX's generic
                         // shortlist, including explicit scp:// and sftp:// URLs.
@@ -2660,9 +2662,16 @@ enum CurlGlobError {
 /// before curl runs. When the operand is not curl glob syntax as written
 /// (`${HOSTS[0]}`, `$hosts[1]`: curl would reject the URL and make no
 /// request), it is read again with that shell text as an opaque value.
-pub(crate) fn curl_host_glob(raw: &str) -> CurlHostGlob {
-    let read = match read_curl_host_glob(raw, false) {
-        Err(CurlGlobError::Syntax) if raw.contains(['$', '`']) => read_curl_host_glob(raw, true),
+///
+/// With `curl_variables` (the value of `--expand-url` and the other
+/// `--expand-<option>` destinations) curl first replaces each `{{name}}`
+/// reference with the value of a `--variable`, so a reference is an opaque
+/// value and never glob syntax.
+pub(crate) fn curl_host_glob(raw: &str, curl_variables: bool) -> CurlHostGlob {
+    let read = match read_curl_host_glob(raw, false, curl_variables) {
+        Err(CurlGlobError::Syntax) if raw.contains(['$', '`']) => {
+            read_curl_host_glob(raw, true, curl_variables)
+        }
         read => read,
     };
     match read {
@@ -2762,8 +2771,13 @@ impl CurlGlobExpansion {
 
 /// The distinct expansions of `raw` up to the end of each host, in curl's
 /// order (the last glob varies fastest), or `None` when no glob comes before
-/// the end of the host. With `shell_text`, shell expansions are opaque text.
-fn read_curl_host_glob(raw: &str, shell_text: bool) -> Result<Option<Vec<String>>, CurlGlobError> {
+/// the end of the host. With `shell_text`, shell expansions are opaque text;
+/// with `curl_variables`, so are curl `{{name}}` variable references.
+fn read_curl_host_glob(
+    raw: &str,
+    shell_text: bool,
+    curl_variables: bool,
+) -> Result<Option<Vec<String>>, CurlGlobError> {
     let bytes = raw.as_bytes();
     let mut expansions = vec![CurlGlobExpansion {
         text: String::new(),
@@ -2773,6 +2787,20 @@ fn read_curl_host_glob(raw: &str, shell_text: bool) -> Result<Option<Vec<String>
     let mut has_glob = false;
     let mut index = 0usize;
     while index < bytes.len() && expansions.iter().any(|expansion| expansion.part.is_some()) {
+        if curl_variables {
+            // curl turns `\{{` into a literal `{{`, which its globbing then
+            // rejects as a nested set.
+            if raw[index..].starts_with("\\{{") {
+                return Err(CurlGlobError::Syntax);
+            }
+            if let Some(end) = curl_variable_reference_end(raw, index) {
+                for expansion in &mut expansions {
+                    expansion.push_shell_text(&raw[index..end]);
+                }
+                index = end;
+                continue;
+            }
+        }
         let (text, next) = match bytes[index] {
             b'\\' if matches!(bytes.get(index + 1), Some(b'{' | b'[' | b'}' | b']')) => {
                 (&raw[index + 1..index + 2], index + 2)
@@ -2854,6 +2882,25 @@ fn read_curl_host_glob(raw: &str, shell_text: bool) -> Result<Option<Vec<String>
         }
     }
     Ok(Some(texts))
+}
+
+/// The index after a curl variable reference starting at `raw[start]`:
+/// `{{name}}` or `{{name:function...}}`, with a name of 1 to 127 ASCII
+/// letters, digits and underscores, up to the first `}}`. Other `{{...}}`
+/// text curl keeps as written.
+fn curl_variable_reference_end(raw: &str, start: usize) -> Option<usize> {
+    let inner_start = start + 2;
+    if !raw.get(start..)?.starts_with("{{") {
+        return None;
+    }
+    let close = inner_start + raw.get(inner_start..)?.find("}}")?;
+    let inner = &raw[inner_start..close];
+    let name = inner.split(':').next().unwrap_or(inner);
+    let valid = (1..128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    valid.then_some(close + 2)
 }
 
 /// The end of the shell expansion that starts at `raw[start]`: `${...}`,
@@ -3106,7 +3153,7 @@ fn push_urls_from_source_with_curl_operands(
     shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
-    curl_operands: Option<&[String]>,
+    curl_operands: Option<&[crate::rules::command::FetchDestination]>,
     results: &mut Vec<ExtractedUrl>,
 ) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
@@ -3121,6 +3168,7 @@ fn push_urls_from_source_with_curl_operands(
             // only a proven suffix of that same spelling, including attached
             // --url= / -x values. Other embedded URL text keeps its old scan.
             let starts_inside_operand_scheme = operands.iter().any(|operand| {
+                let operand = &operand.text;
                 if !has_leading_uri_scheme(operand) || operand.len() <= raw.len() {
                     return false;
                 }
@@ -3134,7 +3182,9 @@ fn push_urls_from_source_with_curl_operands(
                 continue;
             }
         }
-        let url = if curl_operands.is_some_and(|operands| operands.contains(&raw)) {
+        let url = if curl_operands
+            .is_some_and(|operands| operands.iter().any(|operand| operand.text == raw))
+        {
             parse_curl_destination(&raw)
         } else {
             parse::parse_url(&raw)
@@ -4914,20 +4964,75 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
     }
 }
 
-/// Who reads a heredoc's body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeredocReader {
-    /// Data for a command that does not run it.
-    Data,
-    /// Code that this shell runs.
-    Shell(ShellType),
+/// Who reads a heredoc's body: a shell that runs it as code, and whether a
+/// reader may run it later or cannot be told (fail closed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeredocReading {
+    /// The shell that runs the body as code.
+    shell: Option<ShellType>,
     /// A shell, `.`/`source` or a bare `exec` holds the body on a descriptor
-    /// other than its script input, where a later read may run it.
-    Ambiguous,
+    /// other than its script input, where a later read may run it, or the
+    /// reader could not be found within the bounds.
+    ambiguous: bool,
+}
+
+impl HeredocReading {
+    /// Data for a command that does not run it.
+    const DATA: Self = Self {
+        shell: None,
+        ambiguous: false,
+    };
+    const AMBIGUOUS: Self = Self {
+        shell: None,
+        ambiguous: true,
+    };
+
+    fn shell(shell: ShellType) -> Self {
+        Self {
+            shell: Some(shell),
+            ambiguous: false,
+        }
+    }
+
+    /// The reading of a body that both `self` and `other` may read.
+    fn or(self, other: Self) -> Self {
+        Self {
+            shell: self.shell.or(other.shell),
+            ambiguous: self.ambiguous || other.ambiguous,
+        }
+    }
+}
+
+/// Most nested reserved words, groups and compound commands read through to
+/// find a heredoc's readers; deeper nesting is ambiguous.
+const MAX_HEREDOC_READER_DEPTH: usize = 16;
+/// Most shell text (bytes) the readers of all heredocs of one input may
+/// tokenize; past it a reading is ambiguous.
+const MAX_HEREDOC_READER_WORK_BYTES: usize = 128 * 1024;
+
+/// The descriptor a heredoc opens and the work left for finding its readers.
+struct HeredocReadContext<'a> {
+    fd: &'a str,
+    /// Bytes of shell text that may still be tokenized.
+    work: &'a mut usize,
+}
+
+impl HeredocReadContext<'_> {
+    /// The segments of `text`, or `None` once the work bound is spent.
+    fn tokenize(&mut self, text: &str) -> Option<Vec<tokenize::Segment>> {
+        let Some(left) = self.work.checked_sub(text.len()) else {
+            *self.work = 0;
+            return None;
+        };
+        *self.work = left;
+        Some(tokenize::tokenize(text, ShellType::Posix))
+    }
 }
 
 /// Who reads the heredoc whose operator spans `operator..operator_end` and
-/// opens descriptor `fd` in the (operator-masked) header `line`.
+/// opens descriptor `cx.fd` in the (operator-masked) text `text`. `None`
+/// when the heredoc follows a closing word (`fi`, `done`, `esac`, `}`)
+/// whose compound command does not start in `text`.
 ///
 /// A shell (or `.`/`source`) runs the body when it reads its script from
 /// stdin and stdin is the heredoc: a heredoc on stdin, or one on descriptor
@@ -4938,49 +5043,287 @@ enum HeredocReader {
 /// operand reads the heredoc directly. Redirection words are not operands.
 /// Any other heredoc on another descriptor of a shell, `.`/`source` or a bare
 /// `exec` (which keeps it open in the current shell) is ambiguous.
-fn heredoc_reader(line: &str, operator: usize, operator_end: usize, fd: &str) -> HeredocReader {
-    let segments = tokenize::tokenize(line, ShellType::Posix);
-    let Some(segment) = heredoc_operator_segment(line, &segments, operator) else {
-        return HeredocReader::Data;
+///
+/// Reserved words before the command (`!`, `if`, `then`, `elif`, `else`,
+/// `while`, `until`, `do`, `coproc`, a `{` or `(` group, a case arm's
+/// `pattern)`) leave its reader unchanged: `if true; then sh <<'EOF'; fi`
+/// is read by `sh`. A heredoc on a compound command (`{ ...; } <<EOF`,
+/// `( ... ) <<EOF`, `if ...; fi <<EOF`, `while ...; done <<EOF`,
+/// `case ... esac <<EOF`) is the standard input of every command in it, so
+/// the body is code when any of them runs it.
+fn heredoc_reader(
+    text: &str,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let Some(segments) = cx.tokenize(text) else {
+        return Some(HeredocReading::AMBIGUOUS);
     };
+    heredoc_reader_at(text, &segments, None, operator, operator_end, depth, cx)
+}
+
+/// [`heredoc_reader`] with the `segments` of `text` already read, and with
+/// their [`posix_compound_words`] when the caller has them.
+fn heredoc_reader_at(
+    text: &str,
+    segments: &[tokenize::Segment],
+    compound_words: Option<&[PosixCompoundWords]>,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let Some(depth) = depth.checked_sub(1) else {
+        return Some(HeredocReading::AMBIGUOUS);
+    };
+    let Some(index) = heredoc_operator_segment(text, segments, operator) else {
+        return Some(HeredocReading::DATA);
+    };
+    let segment = &segments[index];
+    let range = segment.byte_range.clone();
+    let after_operator = text
+        .get(operator_end.min(range.end)..range.end)
+        .unwrap_or_default();
+    let lead = posix_command_lead(text, range.clone(), operator);
+    let reading = match lead.end {
+        PosixLeadEnd::Group(open) => {
+            heredoc_group_reader(text, open, range.end, operator, operator_end, depth, cx)
+        }
+        PosixLeadEnd::Closer(closer, closer_start) => {
+            let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+            return heredoc_compound_reader(
+                text,
+                &segments[..index],
+                compound_words,
+                (closer, closer_start),
+                copied,
+                depth,
+                cx,
+            );
+        }
+        PosixLeadEnd::Nothing => HeredocReading::DATA,
+        // The command after its reserved words, read on its own.
+        PosixLeadEnd::Command(_) => match lead.words.last() {
+            Some(last) => heredoc_reader(
+                text.get(last.end..range.end).unwrap_or_default(),
+                operator.saturating_sub(last.end),
+                operator_end.saturating_sub(last.end),
+                depth,
+                cx,
+            )
+            .unwrap_or(HeredocReading::AMBIGUOUS),
+            None => {
+                let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+                let reading = heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied);
+                // zsh also reads reserved words after a leading redirection
+                // (`<<'EOF' { sh; }`, `<<'EOF' if true; then sh; fi`): the
+                // heredoc is the standard input of that compound command,
+                // read as the rest of the text.
+                let after = posix_command_lead(text, range.clone(), usize::MAX);
+                let compound = range.start >= operator
+                    && (!after.words.is_empty() || matches!(after.end, PosixLeadEnd::Group(_)));
+                if compound {
+                    let rest = text.get(operator_end.min(text.len())..).unwrap_or_default();
+                    reading.or(heredoc_list_reader(rest, copied, depth, cx))
+                } else {
+                    reading
+                }
+            }
+        },
+    };
+    Some(reading)
+}
+
+/// The reader of a heredoc whose operator is in, or after, the group that
+/// the `{` or `(` at `text[open]` opens in a segment ending at `end`.
+fn heredoc_group_reader(
+    text: &str,
+    open: usize,
+    end: usize,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> HeredocReading {
+    let Some((body, close)) = posix_group_body(text, open, end, cx) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    match close {
+        Some(close) if operator > close => {
+            let after_group = text.get(close + 1..end.max(close + 1)).unwrap_or_default();
+            let before_operator = text.get(close + 1..operator).unwrap_or_default();
+            // A command word after `(...)` makes it a case arm's `(pattern)`.
+            if text.as_bytes()[open] == b'('
+                && !crate::escalation::args_without_redirections(&tokenize::split_words(
+                    before_operator,
+                ))
+                .is_empty()
+            {
+                return heredoc_reader(
+                    after_group,
+                    operator - (close + 1),
+                    operator_end.saturating_sub(close + 1),
+                    depth,
+                    cx,
+                )
+                .unwrap_or(HeredocReading::AMBIGUOUS);
+            }
+            let after_operator = text.get(operator_end.min(end)..end).unwrap_or_default();
+            let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+            heredoc_list_reader(&text[body], copied, depth, cx)
+        }
+        _ => heredoc_reader(
+            &text[body.clone()],
+            operator.saturating_sub(body.start),
+            operator_end.saturating_sub(body.start),
+            depth,
+            cx,
+        )
+        .unwrap_or(HeredocReading::AMBIGUOUS),
+    }
+}
+
+/// The reader of a heredoc on the compound command that `closer` (at
+/// `closer_start`) ends, found among the `previous` segments of `text`:
+/// every command between the opening word and the closer reads it.
+/// `None` when no opening word is found.
+fn heredoc_compound_reader(
+    text: &str,
+    previous: &[tokenize::Segment],
+    compound_words: Option<&[PosixCompoundWords]>,
+    (closer, closer_start): (&str, usize),
+    copied: bool,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let openers: &[&str] = match closer {
+        "fi" => &["if"],
+        "done" => &["while", "until", "for", "select"],
+        "esac" => &["case"],
+        _ => &["{"],
+    };
+    let mut nested = 0usize;
+    for (index, segment) in previous.iter().enumerate().rev() {
+        let computed;
+        let words = match compound_words.and_then(|known| known.get(index)) {
+            Some(known) => known,
+            None => {
+                computed = posix_compound_words(text, segment.byte_range.clone());
+                &computed
+            }
+        };
+        for (position, &(word, word_end)) in words.iter().enumerate().rev() {
+            if word == closer {
+                nested += 1;
+                continue;
+            }
+            if !openers.contains(&word) {
+                continue;
+            }
+            if nested > 0 {
+                nested -= 1;
+                continue;
+            }
+            // The commands start after the opening word, after a `for` or
+            // `select` header and after the first pattern of a `case`.
+            let body_start = match word {
+                "for" | "select" => segment.byte_range.end,
+                "case" => match words.get(position + 1) {
+                    Some(&(")", pattern_end)) => pattern_end,
+                    _ => segment.byte_range.end,
+                },
+                _ => word_end,
+            };
+            let body = text.get(body_start..closer_start).unwrap_or_default();
+            return Some(heredoc_list_reader(body, copied, depth, cx));
+        }
+    }
+    None
+}
+
+/// How the commands of the list `text` read a heredoc that is their
+/// standard input (`cx.fd` 0) or that is on descriptor `cx.fd` (copied to
+/// stdin for all of them when `copied`).
+fn heredoc_list_reader(
+    text: &str,
+    copied: bool,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> HeredocReading {
+    let Some(depth) = depth.checked_sub(1) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    let Some(segments) = cx.tokenize(text) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    let mut reading = HeredocReading::DATA;
+    for segment in &segments {
+        let range = segment.byte_range.clone();
+        let lead = posix_command_lead(text, range.clone(), usize::MAX);
+        let next = match lead.end {
+            PosixLeadEnd::Group(open) => match posix_group_body(text, open, range.end, cx) {
+                Some((body, close)) => {
+                    let rest = close.map_or(range.end, |close| close + 1);
+                    heredoc_list_reader(&text[body], copied, depth, cx).or(heredoc_list_reader(
+                        text.get(rest..range.end).unwrap_or_default(),
+                        copied,
+                        depth,
+                        cx,
+                    ))
+                }
+                None => HeredocReading::AMBIGUOUS,
+            },
+            PosixLeadEnd::Command(_) => match lead.words.last() {
+                Some(last) => heredoc_list_reader(
+                    text.get(last.end..range.end).unwrap_or_default(),
+                    copied,
+                    depth,
+                    cx,
+                ),
+                None => {
+                    let on_stdin =
+                        cx.fd == "0" || copied || descriptor_copied_to_stdin(&segment.raw, cx.fd);
+                    heredoc_command_reader(segment, cx.fd, on_stdin)
+                }
+            },
+            PosixLeadEnd::Closer(..) | PosixLeadEnd::Nothing => HeredocReading::DATA,
+        };
+        reading = reading.or(next);
+    }
+    reading
+}
+
+/// Who reads the heredoc of the simple command `segment` (reserved words
+/// already read): `on_stdin` when the heredoc is its standard input.
+fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool) -> HeredocReading {
     let bare_exec = segment.command.as_deref().is_some_and(|command| {
         crate::rules::command::normalize_cmd_base(command, ShellType::Posix) == "exec"
     }) && crate::escalation::args_without_redirections(&segment.args)
         .iter()
         .all(|word| word.starts_with('-'));
     if bare_exec {
-        return HeredocReader::Ambiguous;
+        return HeredocReading::AMBIGUOUS;
     }
     let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
-        return HeredocReader::Data;
+        return HeredocReading::DATA;
     };
     let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
     let child_shell = match command.as_str() {
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
         | "source" => ShellType::Posix,
         "fish" => ShellType::Fish,
-        _ => return HeredocReader::Data,
+        _ => return HeredocReading::DATA,
     };
     let argv = crate::escalation::args_without_redirections(&args);
-    let on_stdin = fd == "0" || {
-        let after = line
-            .get(operator_end.min(segment.byte_range.end)..segment.byte_range.end)
-            .unwrap_or_default();
-        tokenize::split_words(after).iter().any(|word| {
-            let target = word
-                .strip_prefix("0<&")
-                .or_else(|| word.strip_prefix("<&"))
-                .map(|target| target.strip_suffix('-').unwrap_or(target));
-            target.is_some_and(|target| descriptor_number(target).as_deref() == Some(fd))
-        })
-    };
     let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
     if on_stdin && posix_command_accepts_pipeline_as_code(&command, &argv, 0, &mut remaining_bodies)
     {
-        return HeredocReader::Shell(child_shell);
+        return HeredocReading::shell(child_shell);
     }
     if fd == "0" {
-        return HeredocReader::Data;
+        return HeredocReading::DATA;
     }
     let names_heredoc = argv.iter().any(|word| {
         static_wrapper_word(word, ShellType::Posix).is_some_and(|path| {
@@ -4997,36 +5340,327 @@ fn heredoc_reader(line: &str, operator: usize, operator_end: usize, fd: &str) ->
         })
     });
     if names_heredoc {
-        HeredocReader::Shell(child_shell)
+        HeredocReading::shell(child_shell)
     } else {
-        HeredocReader::Ambiguous
+        HeredocReading::AMBIGUOUS
     }
 }
 
-/// The segment of `line` that holds the heredoc operator (masked to blanks)
-/// at `operator`: the one between the control operators (`;`, `&&`, `||`,
-/// `|`, `&`) around it. The operator may stand before the command word
-/// (`true; <<'EOF' sh` is read by `sh`) or after its last word
-/// (`sh <<'EOF'; true` by `sh`).
-fn heredoc_operator_segment<'a>(
+/// Whether a `<&fd` / `0<&fd` word in `text` copies descriptor `fd` to
+/// standard input.
+fn descriptor_copied_to_stdin(text: &str, fd: &str) -> bool {
+    tokenize::split_words(text).iter().any(|word| {
+        let target = word
+            .strip_prefix("0<&")
+            .or_else(|| word.strip_prefix("<&"))
+            .map(|target| target.strip_suffix('-').unwrap_or(target));
+        target.is_some_and(|target| descriptor_number(target).as_deref() == Some(fd))
+    })
+}
+
+/// The index of the segment of `line` that holds the heredoc operator
+/// (masked to blanks) at `operator`: the one between the control operators
+/// (`;`, `&&`, `||`, `|`, `&`, a newline) around it. The operator may stand
+/// before the command word (`true; <<'EOF' sh` is read by `sh`) or after its
+/// last word (`sh <<'EOF'; true` by `sh`).
+fn heredoc_operator_segment(
     line: &str,
-    segments: &'a [tokenize::Segment],
+    segments: &[tokenize::Segment],
     operator: usize,
-) -> Option<&'a tokenize::Segment> {
-    let mut holder = segments.first()?;
-    for pair in segments.windows(2) {
-        let gap = pair[0].byte_range.end..pair[1].byte_range.start;
-        // Only blanks and the control operator lie between two segments.
-        let separator = line
-            .get(gap.clone())
-            .and_then(|text| text.find(|character: char| !character.is_whitespace()))
-            .map_or(pair[1].byte_range.start, |offset| gap.start + offset);
-        if separator > operator {
-            break;
-        }
-        holder = &pair[1];
+) -> Option<usize> {
+    if segments.is_empty() {
+        return None;
     }
-    Some(holder)
+    // Only blanks and the control operator lie between two segments.
+    let separator_before = |index: usize| {
+        let gap = segments[index - 1].byte_range.end..segments[index].byte_range.start;
+        line.get(gap.clone())
+            .and_then(|text| text.find(|character: char| !character.is_whitespace()))
+            .map_or(segments[index].byte_range.start, |offset| {
+                gap.start + offset
+            })
+    };
+    // The separators increase with the segments: the holder is the last
+    // segment whose separator is not after the operator.
+    let (mut low, mut high) = (1usize, segments.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if separator_before(middle) <= operator {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Some(low - 1)
+}
+
+/// How the reserved words that lead a POSIX command end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PosixLeadEnd {
+    /// The command's first word starts at this byte.
+    Command(usize),
+    /// The `{` or `(` at this byte opens a group.
+    Group(usize),
+    /// The closing word (`fi`, `done`, `esac` or `}`) starting at this byte
+    /// ends a compound command.
+    Closer(&'static str, usize),
+    /// No command follows: a `for` / `select` header, a `case` header
+    /// before its first pattern, or nothing at all.
+    Nothing,
+}
+
+/// A reserved word (or `)` for a case arm's pattern) before a command, and
+/// the byte after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PosixLeadWord {
+    word: &'static str,
+    end: usize,
+}
+
+/// The reserved words that lead the command in `text[range]` and how they end.
+#[derive(Debug)]
+struct PosixLead {
+    words: Vec<PosixLeadWord>,
+    end: PosixLeadEnd,
+}
+
+/// Reserved words a command may follow in the same segment.
+const POSIX_LEAD_PREFIXES: &[&str] = &[
+    "!", "if", "then", "elif", "else", "while", "until", "do", "coproc",
+];
+/// Reserved words that end a compound command.
+const POSIX_LEAD_CLOSERS: &[&str] = &["fi", "done", "esac", "}"];
+
+/// Read the reserved words that lead the command in `text[range]`, as the
+/// shells read them at the start of a command. A word that starts at or
+/// after `limit` (the heredoc operator, masked to blanks) follows a
+/// redirection, so it is never reserved.
+fn posix_command_lead(text: &str, range: std::ops::Range<usize>, limit: usize) -> PosixLead {
+    let bytes = text.as_bytes();
+    let end = range.end.min(bytes.len());
+    let mut index = range.start;
+    let mut words = Vec::new();
+    // In a `case WORD in` header before its first pattern: the words left
+    // to skip (the subject, then `in`) before the patterns.
+    let mut case_header: Option<u8> = None;
+    let lead_end = loop {
+        while index < end {
+            match bytes[index] {
+                b' ' | b'\t' | b'\n' => index += 1,
+                b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+                _ => break,
+            }
+        }
+        if index >= end {
+            break PosixLeadEnd::Nothing;
+        }
+        if index >= limit {
+            break PosixLeadEnd::Command(index);
+        }
+        let word_end = posix_lead_word_end(bytes, index, end);
+        if word_end == index {
+            // An operator such as a redirection starts the command.
+            break PosixLeadEnd::Command(index);
+        }
+        let word = &text[index..word_end];
+        if let Some(skip) = case_header {
+            if skip > 0 {
+                case_header = Some(skip - 1);
+            } else if word.ends_with(')') {
+                words.push(PosixLeadWord {
+                    word: ")",
+                    end: word_end,
+                });
+                case_header = None;
+            }
+            index = word_end;
+            continue;
+        }
+        if bytes[index] == b'(' {
+            // `((` starts an arithmetic command.
+            break if bytes.get(index + 1) == Some(&b'(') {
+                PosixLeadEnd::Command(index)
+            } else {
+                PosixLeadEnd::Group(index)
+            };
+        }
+        let reserved = |expected: &str| posix_word_spells(word, expected);
+        if reserved("{") {
+            break PosixLeadEnd::Group(index);
+        }
+        if let Some(closer) = POSIX_LEAD_CLOSERS.iter().find(|closer| reserved(closer)) {
+            break PosixLeadEnd::Closer(closer, index);
+        }
+        let header = ["case", "for", "select"]
+            .into_iter()
+            .find(|header| reserved(header));
+        if let Some(word) = POSIX_LEAD_PREFIXES
+            .iter()
+            .copied()
+            .find(|prefix| reserved(prefix))
+            .or(header)
+        {
+            words.push(PosixLeadWord {
+                word,
+                end: word_end,
+            });
+            match word {
+                "for" | "select" => break PosixLeadEnd::Nothing,
+                "case" => case_header = Some(2),
+                _ => {}
+            }
+            index = word_end;
+            continue;
+        }
+        // A case arm's `pattern)` (after `;;` the tokenizer starts a new
+        // segment with it).
+        if word.ends_with(')')
+            && !word.ends_with("()")
+            && !word.contains("$(")
+            && !word.contains('`')
+        {
+            words.push(PosixLeadWord {
+                word: ")",
+                end: word_end,
+            });
+            index = word_end;
+            continue;
+        }
+        break PosixLeadEnd::Command(index);
+    };
+    PosixLead {
+        words,
+        end: lead_end,
+    }
+}
+
+/// Whether the shell word `word` is spelled `expected` once its
+/// backslash-newlines are removed (the shells join them before they read a
+/// reserved word); see [`is_strict_posix_reserved_word`].
+fn posix_word_spells(word: &str, expected: &str) -> bool {
+    let mut spelled = expected.bytes();
+    let bytes = word.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\n') {
+            index += 2;
+            continue;
+        }
+        if spelled.next() != Some(bytes[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    spelled.next().is_none()
+}
+
+/// The end of the shell word starting at `bytes[index]`, read up to an
+/// unquoted blank, `;`, `&`, `|`, `<` or `>`.
+fn posix_lead_word_end(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    let mut quote: Option<u8> = None;
+    while index < end {
+        let byte = bytes[index];
+        match quote {
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => match byte {
+                b'\\' => index += 1,
+                b'"' => quote = None,
+                _ => {}
+            },
+            None => match byte {
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => break,
+                b'\\' => index += 1,
+                b'\'' | b'"' => quote = Some(byte),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    index.min(end)
+}
+
+/// The words of one segment's lead that open or close compound commands,
+/// with the byte after each (see [`posix_compound_words`]).
+type PosixCompoundWords = Vec<(&'static str, usize)>;
+
+/// The words of `text[range]`'s lead that open or close compound commands
+/// (`if`, `while`, `until`, `for`, `select`, `case`, `{` and `fi`, `done`,
+/// `esac`, `}`; plus `)` after a case pattern), in order, with the byte
+/// after each. A group that starts the segment (`{ ...; }`, `( ... )`) is
+/// kept whole by the tokenizer with its own closer and adds nothing.
+fn posix_compound_words(text: &str, range: std::ops::Range<usize>) -> PosixCompoundWords {
+    const COUNTED: &[&str] = &["if", "while", "until", "for", "select", "case", ")"];
+    let mut words = Vec::new();
+    let mut start = range.start;
+    loop {
+        let lead = posix_command_lead(text, start..range.end, usize::MAX);
+        words.extend(
+            lead.words
+                .iter()
+                .filter(|word| COUNTED.contains(&word.word))
+                .map(|word| (word.word, word.end)),
+        );
+        match lead.end {
+            // A `{` after other reserved words (`then { a`) is not kept
+            // whole: the tokenizer ends the segment at its first `;`.
+            PosixLeadEnd::Group(open) if text.as_bytes()[open] == b'{' && open != range.start => {
+                words.push(("{", open + 1));
+                start = open + 1;
+            }
+            PosixLeadEnd::Closer(closer, closer_start) => {
+                words.push((closer, closer_start + closer.len()));
+                break;
+            }
+            _ => break,
+        }
+    }
+    words
+}
+
+/// The body of the group that the `{` or `(` at `text[open]` opens in a
+/// segment ending at `end`, and the byte of its closing `}` or `)` when it
+/// closes within the segment. `None` once the work bound is spent.
+fn posix_group_body(
+    text: &str,
+    open: usize,
+    end: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<(std::ops::Range<usize>, Option<usize>)> {
+    let start = open + 1;
+    let end = end.max(start);
+    let close = if text.as_bytes()[open] == b'(' {
+        // Read from the `(` itself: it starts a word in code.
+        text.get(open..end)
+            .and_then(|group| posix_innermost_open_body(group, 1))
+            .map(|body| open + body.end)
+            .filter(|&close| close < end && text.as_bytes().get(close) == Some(&b')'))
+    } else {
+        let body = text.get(start..end).unwrap_or_default();
+        let segments = cx.tokenize(body)?;
+        posix_brace_group_close(body, &segments).map(|offset| start + offset)
+    };
+    Some((start..close.unwrap_or(end), close))
+}
+
+/// The offset in `body` (the text after a `{`, read into `segments`) of the
+/// `}` that closes the group.
+fn posix_brace_group_close(body: &str, segments: &[tokenize::Segment]) -> Option<usize> {
+    let mut depth = 0usize;
+    for segment in segments {
+        for (word, end) in posix_compound_words(body, segment.byte_range.clone()) {
+            match word {
+                "{" => depth += 1,
+                "}" if depth == 0 => return Some(end - 1),
+                "}" => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// A descriptor number without its leading zeros (`03` is descriptor 3).
@@ -5043,37 +5677,55 @@ fn descriptor_number(digits: &str) -> Option<String> {
 /// body open at the operator (the tokenizer does not split inside `$(...)`,
 /// so for `x="$(sh <<'EOF'` the reader is found in that body). The body is
 /// code if either reads it as code and ambiguous if either is ambiguous.
+/// The flag is set when the line closes a compound command (`done <<'EOF'`)
+/// that starts on an earlier line: the whole program is read for it once
+/// every heredoc body is masked.
 fn heredoc_readers_for_header(
     line: &str,
     specs: &[PosixHeredocSpec],
     target: &PosixHeredocSpec,
-) -> (Option<ShellType>, bool) {
+    work: &mut usize,
+) -> (HeredocReading, bool) {
     let mut masked = line.as_bytes().to_vec();
     for spec in specs {
         mask_non_newline(&mut masked, spec.operator_range.clone());
     }
     let Ok(masked) = String::from_utf8(masked) else {
-        return (None, false);
+        return (HeredocReading::DATA, false);
     };
     let operator = target.operator_range.start;
     let operator_end = target.operator_range.end;
-    let mut readers = vec![heredoc_reader(&masked, operator, operator_end, &target.fd)];
+    let mut cx = HeredocReadContext {
+        fd: &target.fd,
+        work,
+    };
+    // The line and the body open at the operator are read once per heredoc
+    // outside the work bound; only what is read through them counts.
+    let line_reading = heredoc_reader_at(
+        &masked,
+        &tokenize::tokenize(&masked, ShellType::Posix),
+        None,
+        operator,
+        operator_end,
+        MAX_HEREDOC_READER_DEPTH,
+        &mut cx,
+    );
+    let mut reading = line_reading.unwrap_or(HeredocReading::DATA);
     if let Some(body) = posix_innermost_open_body(&masked, operator) {
         if let Some(text) = masked.get(body.clone()) {
-            readers.push(heredoc_reader(
+            reading = reading.or(heredoc_reader_at(
                 text,
+                &tokenize::tokenize(text, ShellType::Posix),
+                None,
                 operator - body.start,
                 operator_end.saturating_sub(body.start).min(text.len()),
-                &target.fd,
-            ));
+                MAX_HEREDOC_READER_DEPTH,
+                &mut cx,
+            )
+            .unwrap_or(HeredocReading::AMBIGUOUS));
         }
     }
-    let shell = readers.iter().find_map(|reader| match reader {
-        HeredocReader::Shell(shell) => Some(*shell),
-        _ => None,
-    });
-    let ambiguous = readers.contains(&HeredocReader::Ambiguous);
-    (shell, ambiguous)
+    (reading, line_reading.is_none())
 }
 
 /// The byte range of the innermost `(`, `$(`, `<(`, `>(` or backtick body
@@ -5295,6 +5947,10 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
     let mut cursor = 0usize;
     let mut count = 0usize;
     let mut header_lex = PosixHeaderLex::default();
+    // Shell text the heredoc readers may still tokenize, and the heredocs
+    // read again against the whole program.
+    let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+    let mut compound_heredocs: Vec<PendingHeredoc> = Vec::new();
     let line_end = |from: usize| {
         raw[from..]
             .find('\n')
@@ -5425,24 +6081,19 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 if !spec.quoted {
                     scan_unquoted_heredoc_expansions(&body, &mut recovery);
                 }
-                let (reader, ambiguous) =
-                    heredoc_readers_for_header(header, &relative_specs, relative);
-                if ambiguous {
-                    recovery
-                        .gap
-                        .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
-                }
-                if let Some(shell) = reader {
-                    let input = if spec.quoted {
-                        body
-                    } else {
-                        unescape_unquoted_heredoc(&body)
-                    };
-                    if !input.trim().is_empty() {
-                        recovery
-                            .bodies
-                            .push(ExecutableBody::without_origin(input, shell));
-                    }
+                let (reading, compound_before_line) =
+                    heredoc_readers_for_header(header, &relative_specs, relative, &mut work);
+                let heredoc = PendingHeredoc {
+                    reading,
+                    operator: spec.operator_range.clone(),
+                    fd: spec.fd.clone(),
+                    body,
+                    quoted: spec.quoted,
+                };
+                if compound_before_line {
+                    compound_heredocs.push(heredoc);
+                } else {
+                    recovery.record_heredoc(heredoc.reading, heredoc.body, heredoc.quoted);
                 }
             }
             body_cursor = if terminator_end < raw.len() {
@@ -5453,8 +6104,81 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
         }
         cursor = body_cursor;
     }
-    recovery.sanitized = String::from_utf8(masked).unwrap_or_else(|_| raw.to_string());
+    let program = String::from_utf8(masked);
+    // A heredoc whose header closes a compound command started on an earlier
+    // line (`while read l; do` ... `done <<'EOF'`): read the whole program,
+    // with every heredoc body masked, once for all of them.
+    if !compound_heredocs.is_empty() {
+        let segments = program
+            .as_deref()
+            .ok()
+            .map(|program| tokenize::tokenize(program, ShellType::Posix));
+        let compound_words: Option<Vec<PosixCompoundWords>> = program
+            .as_deref()
+            .ok()
+            .zip(segments.as_deref())
+            .map(|(program, segments)| {
+                segments
+                    .iter()
+                    .map(|segment| posix_compound_words(program, segment.byte_range.clone()))
+                    .collect()
+            });
+        for heredoc in compound_heredocs {
+            let reading = match (program.as_deref(), segments.as_deref()) {
+                (Ok(program), Some(segments)) => {
+                    let mut cx = HeredocReadContext {
+                        fd: &heredoc.fd,
+                        work: &mut work,
+                    };
+                    heredoc_reader_at(
+                        program,
+                        segments,
+                        compound_words.as_deref(),
+                        heredoc.operator.start,
+                        heredoc.operator.end,
+                        MAX_HEREDOC_READER_DEPTH,
+                        &mut cx,
+                    )
+                    .unwrap_or(HeredocReading::AMBIGUOUS)
+                }
+                _ => HeredocReading::AMBIGUOUS,
+            };
+            recovery.record_heredoc(heredoc.reading.or(reading), heredoc.body, heredoc.quoted);
+        }
+    }
+    recovery.sanitized = program.unwrap_or_else(|_| raw.to_string());
     recovery
+}
+
+/// A heredoc body and how it is read, before it is recorded.
+struct PendingHeredoc {
+    reading: HeredocReading,
+    operator: std::ops::Range<usize>,
+    fd: String,
+    body: String,
+    quoted: bool,
+}
+
+impl PosixHeredocRecovery {
+    /// Record a heredoc body: code for the shell that runs it, a gap when it
+    /// is ambiguous.
+    fn record_heredoc(&mut self, reading: HeredocReading, body: String, quoted: bool) {
+        if reading.ambiguous {
+            self.gap
+                .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        if let Some(shell) = reading.shell {
+            let input = if quoted {
+                body
+            } else {
+                unescape_unquoted_heredoc(&body)
+            };
+            if !input.trim().is_empty() {
+                self.bodies
+                    .push(ExecutableBody::without_origin(input, shell));
+            }
+        }
+    }
 }
 
 /// Return the shell source view with bounded heredoc payloads masked. This is
@@ -17096,6 +17820,96 @@ mod tests {
         );
     }
 
+    /// Reserved words, groups and compound commands around a heredoc's
+    /// reader, as bash, dash, zsh and ksh read them.
+    #[test]
+    fn heredoc_readers_read_through_reserved_words_and_compound_commands() {
+        let read = |header: &str| {
+            let recovery = recover_posix_heredocs(&format!("{header}\necho body\nEOF"));
+            let code = recovery
+                .bodies
+                .iter()
+                .any(|body| body.input.trim() == "echo body");
+            (code, recovery.gap)
+        };
+        for header in [
+            "if true; then sh <<'EOF'; fi",
+            "if false; then :; elif true; then sh <<'EOF'; fi",
+            "if sh <<'EOF'; then :; fi",
+            "! sh <<'EOF'",
+            "{ sh <<'EOF'; }",
+            "{ <<'EOF' sh; }",
+            "while true; do sh <<'EOF'; done",
+            "case x in x) sh <<'EOF';; esac",
+            "case x in (x) sh <<'EOF';; esac",
+            "case $(uname) in Linux) sh <<'EOF';; esac",
+            "case \"$v\" in a|b) sh <<'EOF';; esac",
+            "true; { sh; } <<'EOF'",
+            "if true; then sh; fi <<'EOF'",
+            "if true; then { sh; } <<'EOF'; fi",
+            "( sh ) <<'EOF'",
+            "(cd /tmp && sh) <<'EOF'",
+            "for i in 1; do sh; done <<'EOF'",
+            "case x in x) sh;; esac <<'EOF'",
+            "{ { true; }; sh; } <<'EOF'",
+            "{ sh 0<&3; } 3<<'EOF'",
+            "{ sh; } 3<<'EOF' 0<&3",
+            "while read l; do\n  sh\ndone <<'EOF'",
+            "if true; then\n  if false; then :; fi\n  sh\nfi <<'EOF'",
+            "case x in\n  x) sh;;\nesac <<'EOF'",
+            "{\n  sh\n} <<'EOF'",
+            "<<'EOF' { sh; }",
+            "<<'EOF' if true; then sh; fi",
+        ] {
+            assert!(read(header).0, "{header}: {:?}", read(header));
+        }
+        for header in [
+            "{ cat; } <<'EOF'",
+            "if true; then cat; fi <<'EOF'",
+            "if true; then cat <<'EOF'; fi",
+            "while read l; do echo \"$l\"; done <<'EOF'",
+            "( cat ) <<'EOF'",
+            "while read l; do\n  echo \"$l\"\ndone <<'EOF'",
+            "case x in x) cat <<'EOF';; esac",
+        ] {
+            assert_eq!(read(header), (false, None), "{header}");
+        }
+        // No compound command to close, or one nested past the bound.
+        let deep = format!(
+            "{}cat <<'EOF'{}",
+            "{ ".repeat(MAX_HEREDOC_READER_DEPTH + 1),
+            "; }".repeat(MAX_HEREDOC_READER_DEPTH + 1)
+        );
+        for header in ["done <<'EOF'", "true; fi <<'EOF'", deep.as_str()] {
+            assert_eq!(
+                read(header),
+                (false, Some(ShellExecutionGap::AmbiguousExecutableBody)),
+                "{header}"
+            );
+        }
+        // Past the work bound a group's readers are unknown: the header (the
+        // operator masked to blanks) is read, its group body is not.
+        let header = "{ sh; }         ";
+        let mut work = header.len() + 1;
+        let mut cx = HeredocReadContext {
+            fd: "0",
+            work: &mut work,
+        };
+        assert_eq!(
+            heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
+            Some(HeredocReading::AMBIGUOUS)
+        );
+        let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+        let mut cx = HeredocReadContext {
+            fd: "0",
+            work: &mut work,
+        };
+        assert_eq!(
+            heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
+            Some(HeredocReading::shell(ShellType::Posix))
+        );
+    }
+
     /// The terminator line is the delimiter word after quote removal, as the
     /// shell does it. Inside double quotes a backslash is removed only before
     /// `$`, `` ` ``, `"` and `\`: bash, dash, zsh and ksh93 all end
@@ -19603,7 +20417,7 @@ mod curl_glob_tests {
     /// bracketed IPv6 addresses as text, and globs after the host left alone.
     #[test]
     fn curl_host_glob_expands_the_host_part_as_curl_does() {
-        let expanded = |raw: &str| match curl_host_glob(raw) {
+        let expanded = |raw: &str| match curl_host_glob(raw, false) {
             CurlHostGlob::Expanded(values) => values,
             other => panic!("{raw}: {other:?}"),
         };
@@ -19687,7 +20501,7 @@ mod curl_glob_tests {
             "http://$(printf '%s' \"${H[0]}\")/x",
             "http://`echo ${H[0]}`/x",
         ] {
-            assert_eq!(curl_host_glob(plain), CurlHostGlob::Plain, "{plain}");
+            assert_eq!(curl_host_glob(plain, false), CurlHostGlob::Plain, "{plain}");
         }
         for unreadable in [
             "http://127.0.0.{1,{2,3}}/",
@@ -19705,12 +20519,70 @@ mod curl_glob_tests {
             "http://${x:-{169.254.169.254,a}}/",
             "http://${URLS[@]/",
             "http://$p[1-100]/",
+            // Without `--expand-`, curl reads `{{...}}` as a nested set.
+            "https://{{HOST}}/health",
         ] {
             assert_eq!(
-                curl_host_glob(unreadable),
+                curl_host_glob(unreadable, false),
                 CurlHostGlob::Unreadable,
                 "{unreadable}"
             );
         }
+    }
+
+    /// In an `--expand-<option>` value curl replaces each `{{name}}` with a
+    /// `--variable` value before it globs, so a reference is a value, not a
+    /// set; globs beside it still expand.
+    #[test]
+    fn curl_variable_references_are_values_in_expanded_operands() {
+        for plain in [
+            "https://{{HOST}}/health",
+            "http://{{h}}/",
+            "http://{{h:trim:url}}:{{port}}/x",
+            "{{base}}/v1/items",
+            "https://{{user}}@api.example.com/{a,b}",
+        ] {
+            assert_eq!(curl_host_glob(plain, true), CurlHostGlob::Plain, "{plain}");
+        }
+        assert_eq!(
+            curl_host_glob("http://{{h}}.{169.254.169.254,a}/x", true),
+            CurlHostGlob::Expanded(vec![
+                "http://{{h}}.169.254.169.254/x".to_string(),
+                "http://{{h}}.a/x".to_string(),
+            ])
+        );
+        assert_eq!(
+            curl_host_glob("http://{169.254.169.254,b}.{{h}}/x", true),
+            CurlHostGlob::Expanded(vec![
+                "http://169.254.169.254.{{h}}/x".to_string(),
+                "http://b.{{h}}/x".to_string(),
+            ])
+        );
+        for unreadable in [
+            // A reference inside a set, `\{{` (a literal `{{` after
+            // expansion), a name curl does not accept and an unclosed one
+            // are read as curl globs them: not glob syntax.
+            "http://{a,{{h}}}/x",
+            "http://\\{{h}}/x",
+            "http://{{a-b}}/x",
+            "http://{{}}/x",
+            "http://{{h/x",
+            "http://{{h}}.[0-255]/x",
+        ] {
+            assert_eq!(
+                curl_host_glob(unreadable, true),
+                CurlHostGlob::Unreadable,
+                "{unreadable}"
+            );
+        }
+        let reference = |name: &str| format!("http://{{{{{name}}}}}/x");
+        assert_eq!(
+            curl_host_glob(&reference(&"n".repeat(127)), true),
+            CurlHostGlob::Plain
+        );
+        assert_eq!(
+            curl_host_glob(&reference(&"n".repeat(128)), true),
+            CurlHostGlob::Unreadable
+        );
     }
 }

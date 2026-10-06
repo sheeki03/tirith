@@ -4357,14 +4357,14 @@ enum CurlOperandHosts {
 /// globbed operand past it is unreadable.
 fn curl_operand_hosts(
     args: &[String],
-    operand: &str,
+    operand: &FetchDestination,
     shell: ShellType,
     budget: &mut usize,
 ) -> CurlOperandHosts {
     if !curl_globbing_enabled(args, shell) {
         return CurlOperandHosts::Plain;
     }
-    match crate::extract::curl_host_glob(operand) {
+    match crate::extract::curl_host_glob(&operand.text, operand.curl_variables) {
         crate::extract::CurlHostGlob::Plain => CurlOperandHosts::Plain,
         crate::extract::CurlHostGlob::Expanded(expansions) if expansions.len() <= *budget => {
             *budget -= expansions.len();
@@ -4492,7 +4492,7 @@ fn check_network_destination(
                         }
                     }
                     CurlOperandHosts::Unreadable => {
-                        findings.push(curl_glob_unreadable_finding(&operand));
+                        findings.push(curl_glob_unreadable_finding(&operand.text));
                     }
                 }
             }
@@ -4937,18 +4937,28 @@ fn powershell_option_kind(name: &str) -> Option<FetchOptionValueKind> {
     }
 }
 
+/// curl 8.3+ reads `--expand-<option> VALUE` as `--<option>` with the
+/// `{{name}}` references to `--variable` values in VALUE replaced first.
+const CURL_EXPAND_OPTION_PREFIX: &str = "--expand-";
+
 fn fetch_option_value<'a>(command: &str, token: &'a str) -> Option<FetchOptionValue<'a>> {
     match command {
         "curl" => {
-            if token.starts_with("--") {
-                let (name, attached) = split_attached_option(token, '=');
+            if let Some(long) = token.strip_prefix("--") {
+                let (name, attached) = split_attached_option(long, '=');
+                let name = name.strip_prefix("expand-").unwrap_or(name);
+                let listed = |options: &[&str]| {
+                    options
+                        .iter()
+                        .any(|option| option.strip_prefix("--") == Some(name))
+                };
                 let kind = match name {
-                    "--connect-to" => FetchOptionValueKind::CurlConnectTo,
-                    "--resolve" => FetchOptionValueKind::CurlResolve,
-                    _ if CURL_DESTINATION_VALUE_OPTIONS.contains(&name) => {
+                    "connect-to" => FetchOptionValueKind::CurlConnectTo,
+                    "resolve" => FetchOptionValueKind::CurlResolve,
+                    _ if listed(CURL_DESTINATION_VALUE_OPTIONS) => {
                         FetchOptionValueKind::Destination
                     }
-                    _ if CURL_NON_DESTINATION_VALUE_OPTIONS.contains(&name) => {
+                    _ if listed(CURL_NON_DESTINATION_VALUE_OPTIONS) => {
                         FetchOptionValueKind::NonDestination
                     }
                     _ => return None,
@@ -5118,24 +5128,38 @@ fn httpie_proxy_peer(value: &str) -> &str {
     }
 }
 
+/// A destination operand of a URL-fetching command, after quote removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchDestination {
+    pub(crate) text: String,
+    /// The value of a curl `--expand-<option>`: curl replaces each
+    /// `{{name}}` in it with a `--variable` value before it reads the URL.
+    pub(crate) curl_variables: bool,
+}
+
 fn push_fetch_option_destinations(
-    destinations: &mut Vec<String>,
+    destinations: &mut Vec<FetchDestination>,
     kind: FetchOptionValueKind,
     value: &str,
     include_mapped_peers: bool,
+    curl_variables: bool,
 ) {
+    let mut push = |text: &str| {
+        destinations.push(FetchDestination {
+            text: text.to_string(),
+            curl_variables,
+        })
+    };
     match kind {
-        FetchOptionValueKind::Destination => destinations.push(value.to_string()),
-        FetchOptionValueKind::HttpieProxy => {
-            destinations.push(httpie_proxy_peer(value).to_string())
-        }
+        FetchOptionValueKind::Destination => push(value),
+        FetchOptionValueKind::HttpieProxy => push(httpie_proxy_peer(value)),
         FetchOptionValueKind::CurlConnectTo if include_mapped_peers => {
             if let Some(peer) = curl_connect_to_peer(value) {
-                destinations.push(peer.to_string());
+                push(peer);
             }
         }
         FetchOptionValueKind::CurlResolve if include_mapped_peers => {
-            destinations.extend(curl_resolve_peers(value).into_iter().map(str::to_string))
+            curl_resolve_peers(value).into_iter().for_each(push)
         }
         FetchOptionValueKind::CurlConnectTo
         | FetchOptionValueKind::CurlResolve
@@ -5145,11 +5169,15 @@ fn push_fetch_option_destinations(
 
 /// URL-like curl operands for extraction. Connection/DNS mapping fields remain
 /// network-policy peers, but are not themselves scheme-less URL operands.
-pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<String> {
+pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<FetchDestination> {
     fetch_destination_operands("curl", args, shell, false)
 }
 
-fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellType) -> Vec<String> {
+fn url_fetch_destination_operands(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Vec<FetchDestination> {
     fetch_destination_operands(command, args, shell, true)
 }
 
@@ -5158,19 +5186,22 @@ fn fetch_destination_operands(
     args: &[String],
     shell: ShellType,
     include_mapped_peers: bool,
-) -> Vec<String> {
+) -> Vec<FetchDestination> {
     let mut destinations = Vec::new();
     let mut pending = None;
     let mut options_terminated = false;
 
-    for arg in args {
+    // A redirection (`> 'report[1].json'`, `2>err.log`, `< in.txt`) and its
+    // target belong to the shell: the client never reads them as operands.
+    for arg in &crate::escalation::args_without_redirections(args) {
         let normalized = normalize_shell_token(arg, shell);
-        if let Some(kind) = pending.take() {
+        if let Some((kind, curl_variables)) = pending.take() {
             push_fetch_option_destinations(
                 &mut destinations,
                 kind,
                 &normalized,
                 include_mapped_peers,
+                curl_variables,
             );
             continue;
         }
@@ -5186,20 +5217,26 @@ fn fetch_destination_operands(
             };
         if !options_terminated && option_spelling.starts_with('-') && option_spelling != "-" {
             if let Some(option) = fetch_option_value(command, &option_spelling) {
+                let curl_variables =
+                    command == "curl" && option_spelling.starts_with(CURL_EXPAND_OPTION_PREFIX);
                 match (option.kind, option.attached) {
                     (kind, Some(value)) if !value.is_empty() => push_fetch_option_destinations(
                         &mut destinations,
                         kind,
                         value,
                         include_mapped_peers,
+                        curl_variables,
                     ),
                     (_, Some(_)) => {}
-                    (kind, None) => pending = Some(kind),
+                    (kind, None) => pending = Some((kind, curl_variables)),
                 }
             }
             continue;
         }
-        destinations.push(normalized);
+        destinations.push(FetchDestination {
+            text: normalized,
+            curl_variables: false,
+        });
     }
     destinations
 }
@@ -5332,7 +5369,7 @@ pub fn check_network_policy(
                     Some(CurlOperandHosts::Unreadable) => {
                         // Its hosts are unknown: report it and go on, so a
                         // denied destination after it is still found.
-                        findings.push(curl_glob_unreadable_finding(&destination));
+                        findings.push(curl_glob_unreadable_finding(&destination.text));
                         continue;
                     }
                     Some(CurlOperandHosts::Expanded(expansions)) => expansions
@@ -5340,7 +5377,7 @@ pub fn check_network_policy(
                         .filter_map(|expansion| extract_client_destination_host("curl", expansion))
                         .collect(),
                     Some(CurlOperandHosts::Plain) | None => {
-                        extract_client_destination_host(&cmd_base, &destination)
+                        extract_client_destination_host(&cmd_base, &destination.text)
                             .into_iter()
                             .collect()
                     }
@@ -5356,7 +5393,9 @@ pub fn check_network_policy(
                         description: format!(
                             "Command accesses {host}, which is on the network deny list"
                         ),
-                        evidence: vec![Evidence::Url { raw: destination }],
+                        evidence: vec![Evidence::Url {
+                            raw: destination.text,
+                        }],
                         human_view: None,
                         agent_view: None,
                         mitre_id: None,
@@ -9136,7 +9175,11 @@ fn upload_option_role<'a>(command: &str, token: &'a str) -> Option<UploadOptionR
                 attached,
             });
         }
-        if fetch_option_value(command, token).is_some() {
+        // An `--expand-<option>` value may be built from `--variable`
+        // contents (`f@file` reads a file), so the upload analysis keeps it
+        // unknown, which leaves the transfer incomplete.
+        let curl_expanded = command == "curl" && name.starts_with(CURL_EXPAND_OPTION_PREFIX);
+        if !curl_expanded && fetch_option_value(command, token).is_some() {
             return Some(UploadOptionRole::Value {
                 kind: UploadOptionValueKind::Other,
                 attached,
@@ -16091,6 +16134,12 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>()
         };
+        let url_fetch_destination_operands = |command: &str, args: &[String], shell| {
+            url_fetch_destination_operands(command, args, shell)
+                .into_iter()
+                .map(|destination| destination.text)
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(
             url_fetch_destination_operands(
@@ -16148,6 +16197,85 @@ mod tests {
                 ShellType::PowerShell,
             ),
             strings(&["https://proxy.example:8443", "allowed.example/path"]),
+        );
+
+        // curl 8.3+: `--expand-<option>` takes the value `<option>` takes,
+        // with `{{name}}` curl variables in it.
+        let expanded = strings(&[
+            "--variable",
+            "%TOKEN",
+            "--expand-header",
+            "Authorization: Bearer {{TOKEN}}",
+            "--expand-data",
+            "{\"id\":{{id}}}",
+            "--expand-url",
+            "https://{{HOST}}/health",
+            "--expand-resolve",
+            "allowed.example:443:{{ADDR}}",
+            "allowed.example/path",
+        ]);
+        assert_eq!(
+            url_fetch_destination_operands("curl", &expanded, ShellType::Posix),
+            strings(&[
+                "https://{{HOST}}/health",
+                "{{ADDR}}",
+                "allowed.example/path"
+            ]),
+        );
+        assert_eq!(
+            curl_url_operands(&expanded, ShellType::Posix)
+                .into_iter()
+                .map(|operand| (operand.text, operand.curl_variables))
+                .collect::<Vec<_>>(),
+            vec![
+                ("https://{{HOST}}/health".to_string(), true),
+                ("allowed.example/path".to_string(), false),
+            ],
+        );
+        // An unknown `--expand-` option keeps its value as an operand.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&["--expand-bogus", "x.example", "allowed.example/path"]),
+                ShellType::Posix,
+            ),
+            strings(&["x.example", "allowed.example/path"]),
+        );
+
+        // A redirection and its target belong to the shell.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&[
+                    "-s",
+                    "allowed.example/path",
+                    ">",
+                    "denied.example",
+                    "2>errors[1].log",
+                    "<",
+                    "in[x].txt",
+                    "&>out{a}.log",
+                ]),
+                ShellType::Posix,
+            ),
+            strings(&["allowed.example/path"]),
+        );
+        assert_eq!(
+            url_fetch_destination_operands(
+                "wget",
+                &strings(&["-q", "allowed.example/path", ">>", "denied.example"]),
+                ShellType::Posix,
+            ),
+            strings(&["allowed.example/path"]),
+        );
+        // A quoted operator is an operand.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&["'>'", "allowed.example/path"]),
+                ShellType::Posix,
+            ),
+            strings(&[">", "allowed.example/path"]),
         );
 
         for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {

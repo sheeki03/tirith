@@ -373,3 +373,107 @@ fn wrapped_curl_globs_are_read_like_direct_ones() {
     let input = "sudo curl -g 'http://169.254.169.[0-255]/latest/meta-data/'";
     assert!(!command_rules(input).contains(&RuleId::AnalysisIncomplete));
 }
+
+#[test]
+fn redirection_targets_are_not_curl_operands() {
+    // curl never reads a redirection target: its brackets are not globs and
+    // its name is not a destination for the deny list.
+    for input in [
+        "curl -s https://example.com/ > 'report[final].json'",
+        "curl -fsS https://api.example.com/v1/items 2>'errors[1].log'",
+        "curl -s https://example.com/ < 'in[x].txt'",
+        "curl -s https://example.com/ > 'h[1-100].txt'",
+        "> 'report[final].json' curl -s https://example.com/",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            !rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+        assert!(
+            denied(input, &["blocked.example"], &[]).is_empty(),
+            "{input}"
+        );
+    }
+    for input in [
+        "curl -s https://ok.example/ > blocked.example",
+        "curl -s https://ok.example/ 2> blocked.example",
+        "wget -q https://ok.example/ > blocked.example",
+    ] {
+        assert!(
+            denied(input, &["blocked.example"], &[]).is_empty(),
+            "{input}"
+        );
+    }
+    // The URL operand beside a redirection is still checked.
+    for input in [
+        "curl -s > out.txt https://blocked.example/",
+        "> out.txt curl -s https://blocked.example/",
+        "curl -s https://blocked.example/ > out.txt",
+        "wget -q > out.txt https://blocked.example/",
+    ] {
+        assert!(
+            denied(input, &["blocked.example"], &[]).contains(&RuleId::CommandNetworkDeny),
+            "{input}"
+        );
+    }
+    let input = "curl -s 'http://169.254.169.[0-255]/latest/' > 'r[1].txt'";
+    let unreadable = rules::command::check(input, ShellType::Posix, None, ScanContext::Exec)
+        .into_iter()
+        .filter(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+        .count();
+    assert_eq!(unreadable, 1, "{input}");
+}
+
+#[test]
+fn expanded_option_values_are_read_as_curl_reads_them() {
+    // curl 8.3+: `--expand-<option>` is `<option>` with `{{name}}`
+    // references to `--variable` values replaced first.
+    for input in [
+        "curl --variable %TOKEN --expand-header 'Authorization: Bearer {{TOKEN}}' https://api.example.com/v1/me",
+        "curl --variable 'tok@token.txt' --expand-header 'Authorization: Bearer {{tok}}' https://api.example.com/",
+        "curl --variable 'id=42' --expand-data '{\"id\":{{id}}}' https://api.example.com/items",
+        "curl --variable %HOST --expand-url 'https://{{HOST}}/health'",
+        "curl --variable 'u=x' --expand-user '{{u}}:pw' https://api.example.com/",
+        "curl --variable 'f=/tmp/o' --expand-output '{{f}}' https://api.example.com/",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            !rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+        assert!(
+            denied(input, &["blocked.example"], &[]).is_empty(),
+            "{input}"
+        );
+    }
+    // An expanded URL is still a destination: checked, denied and globbed.
+    let input = "curl --variable h=x --expand-url http://169.254.169.254/latest/meta-data/";
+    assert!(command_rules(input).contains(&RuleId::MetadataEndpoint));
+    for input in [
+        "curl --variable h=x --expand-url https://blocked.example/x",
+        "curl --variable h=x --expand-header 'X: {{h}}' https://blocked.example/x",
+        "curl --expand-url 'https://{blocked.example,{{h}}.example}/x' https://blocked.example/y",
+    ] {
+        assert!(
+            denied(input, &["blocked.example"], &[]).contains(&RuleId::CommandNetworkDeny),
+            "{input}"
+        );
+    }
+    for input in [
+        "curl --expand-url 'http://169.254.169.[0-255]/latest/'",
+        "curl --expand-url 'http://{169.254.169.254,{{h}}}/latest/'",
+        "curl --expand-url 'http://{{h}}.[0-255]/latest/'",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+    }
+    let input = "curl --expand-url 'http://{169.254.169.254,b}.{{h}}/x'";
+    assert!(!command_rules(input).contains(&RuleId::AnalysisIncomplete));
+    // Without `--expand-`, curl globs `{{` as a nested set.
+    let input = "curl --url 'https://{{HOST}}/health'";
+    assert!(command_rules(input).contains(&RuleId::AnalysisIncomplete));
+}
