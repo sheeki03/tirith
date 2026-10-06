@@ -7300,6 +7300,73 @@ fn gateway_starts_the_team_policy_background_refresh() {
     );
 }
 
+/// `tirith check` is the main trigger: hooks run it for every command. It
+/// starts the refresh before any analysis-dependent early return, so the
+/// `TIRITH=0` bypass and the hooks' `--approval-check` calls start it too;
+/// `--offline` and `TIRITH_OFFLINE=1` never do.
+#[cfg(unix)]
+#[test]
+fn check_starts_the_team_policy_background_refresh_unless_offline() {
+    use std::os::unix::fs::PermissionsExt;
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let root = stale_team_enrollment_root();
+        // `tirith check` also starts the ThreatDB auto-update; mark it as not
+        // due so this test never downloads the real database.
+        let state = root.path().join("state");
+        let tirith_state = state.join("tirith");
+        fs::create_dir_all(&tirith_state).expect("create state dir");
+        for dir in [&state, &tirith_state] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod state dir");
+        }
+        fs::write(tirith_state.join("threatdb-next-check-at"), "99999999999")
+            .expect("write threatdb next-check");
+        let mut cmd = tirith();
+        cmd.current_dir(root.path())
+            .arg("check")
+            .args(args)
+            .args(["--", "echo hi"]);
+        team_refresh_env(&mut cmd, root.path());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("run tirith check");
+        let threatdb_spawned = tirith_state.join("threatdb-spawned-at").exists();
+        assert!(!threatdb_spawned, "the ThreatDB auto-update must stay off");
+        (team_refresh_claimed(root.path()), out)
+    };
+    let check = ["--non-interactive", "--shell", "posix", "--format", "json"];
+    let approval = ["--approval-check", "--non-interactive", "--shell", "posix"];
+    let offline = [
+        "--offline",
+        "--non-interactive",
+        "--shell",
+        "posix",
+        "--format",
+        "json",
+    ];
+    for (case, args, env, expected) in [
+        ("tirith check", &check[..], &[][..], true),
+        ("TIRITH=0 bypass", &check[..], &[("TIRITH", "0")][..], true),
+        ("--approval-check", &approval[..], &[][..], true),
+        ("--offline", &offline[..], &[][..], false),
+        (
+            "TIRITH_OFFLINE=1",
+            &check[..],
+            &[("TIRITH_OFFLINE", "1")][..],
+            false,
+        ),
+    ] {
+        let (claimed, out) = run(args, env);
+        assert_eq!(
+            claimed,
+            expected,
+            "{case}: team policy refresh claimed={claimed}, expected {expected}; status={:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 // `--offline` / `TIRITH_OFFLINE` (roadmap M0.3). The offline switch suppresses the periodic
 // background threat-DB refresh that `tirith check` triggers on the hot path.
 
