@@ -374,6 +374,9 @@ mod tests {
         assert!(super::super::lock_foreground_update().is_ok());
     }
 
+    /// On Unix the held directory identity allows the rename, so the swap is
+    /// detected before publication.
+    #[cfg(unix)]
     #[test]
     fn dashboard_refresh_refuses_publication_after_the_data_directory_is_swapped() {
         let state = canonical_data_state();
@@ -385,6 +388,46 @@ mod tests {
         })
         .unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    /// On Windows the held directory identity opens the data directory and
+    /// its ancestors without delete sharing, so the swap itself is refused
+    /// while the refresh runs, and publication proceeds on the same directory.
+    #[cfg(windows)]
+    #[test]
+    fn dashboard_refresh_holds_the_data_directory_against_a_swap() {
+        let state = canonical_data_state();
+        let calls = std::cell::Cell::new(0);
+        live_refresh(&state.roots().cwd, |before_publish| {
+            calls.set(calls.get() + 1);
+            let (root, _) = data_paths()?;
+            assert!(std::fs::rename(&root, root.with_extension("moved")).is_err());
+            before_publish(true)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// A data-directory scope that changes during the refresh (the platform's
+    /// data root now points elsewhere) is refused before publication, on every
+    /// platform and without renaming the held directory.
+    #[test]
+    fn dashboard_refresh_refuses_publication_after_the_data_scope_changes() {
+        let mut state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        let elsewhere = state.roots().root.join("elsewhere-data");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let error = live_refresh(&cwd, |before_publish| {
+            let (root, _) = data_paths()?;
+            #[cfg(windows)]
+            state.set_env("APPDATA", &elsewhere);
+            #[cfg(not(windows))]
+            state.set_env("XDG_DATA_HOME", &elsewhere);
+            assert_ne!(data_paths()?.0, root);
+            before_publish(true)
+        })
+        .unwrap_err();
+        assert!(error.contains("data scope changed"), "{error}");
     }
 
     #[test]

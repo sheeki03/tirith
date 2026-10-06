@@ -1873,6 +1873,10 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             .as_ref()
             .filter(|command| command.name == "curl")
             .map(|command| crate::rules::command::curl_url_operands(&command.args, shell));
+        let curl_globbing = resolved.as_ref().is_some_and(|command| {
+            command.name == "curl"
+                && crate::rules::command::curl_globbing_enabled(&command.args, shell)
+        });
 
         // Suppress URL extraction ONLY for the arg span of a first-segment
         // tirith inspection subcommand — not the whole segment. Leading env
@@ -2011,22 +2015,35 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             // curl does not use SCP's user@host:path shorthand. Its option
             // grammar decides which words are URL operands; parse those as
             // URL authorities even when the generic regex resembles SCP.
-            for raw in destinations {
-                let parsed = if has_leading_uri_scheme(raw) {
-                    // curl also accepts schemes outside URL_REGEX's generic
-                    // shortlist, including explicit scp:// and sftp:// URLs.
-                    parse_curl_destination(raw)
-                } else if let Some(parsed) = parse_curl_schemeless_destination(raw, true) {
-                    parsed
-                } else {
-                    continue;
+            let mut budget = MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            for operand in destinations {
+                // curl's URL globbing reaches each host part the operand
+                // expands to (`http://{a,b}/`, `http://10.0.0.[1-2]/`). Past
+                // the budget the command rules report the operand unreadable.
+                let expanded = match curl_globbing.then(|| curl_host_glob(operand)) {
+                    Some(CurlHostGlob::Expanded(expansions)) if expansions.len() <= budget => {
+                        budget -= expansions.len();
+                        expansions
+                    }
+                    _ => Vec::new(),
                 };
-                results.push(ExtractedUrl {
-                    raw: raw.clone(),
-                    parsed,
-                    segment_index: seg_idx,
-                    in_sink_context: sink_context,
-                });
+                for raw in std::iter::once(operand).chain(&expanded) {
+                    let parsed = if has_leading_uri_scheme(raw) {
+                        // curl also accepts schemes outside URL_REGEX's generic
+                        // shortlist, including explicit scp:// and sftp:// URLs.
+                        parse_curl_destination(raw)
+                    } else if let Some(parsed) = parse_curl_schemeless_destination(raw, true) {
+                        parsed
+                    } else {
+                        continue;
+                    };
+                    results.push(ExtractedUrl {
+                        raw: raw.clone(),
+                        parsed,
+                        segment_index: seg_idx,
+                        in_sink_context: sink_context,
+                    });
+                }
             }
         }
 
@@ -2597,6 +2614,270 @@ pub(crate) fn curl_destination_host(raw: &str) -> Option<String> {
         parse_curl_schemeless_destination(raw, false)?
     };
     value.host().map(str::to_string)
+}
+
+/// Most combinations a curl URL glob before the end of the host is expanded
+/// to, and most distinct host parts (scheme, user, host and port) kept.
+const MAX_CURL_GLOB_COMBINATIONS: usize = 1024;
+const MAX_CURL_GLOB_HOST_PARTS: usize = 64;
+/// Most expanded host parts checked across all operands of one curl command;
+/// a globbed operand past it is unreadable.
+pub(crate) const MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND: usize = 1024;
+
+/// How curl's URL globbing reads the host part of an operand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurlHostGlob {
+    /// No `[...]` range or `{...}` set before the end of the host.
+    Plain,
+    /// The operand once per distinct expansion of its host part; the rest
+    /// of the operand is kept as written.
+    Expanded(Vec<String>),
+    /// More expansions than tirith checks, or a glob it cannot read where
+    /// curl may read one.
+    Unreadable,
+}
+
+/// The host part of a curl URL operand, read the way curl's URL globbing
+/// (on unless `-g`/`--globoff`) reads it: `{a,b}` sets and `[0-9]` / `[a-z]`
+/// ranges (zero-padded, with an optional `:step`), with `\[`, `\]`, `\{` and
+/// `\}` escaped and a bracketed IPv6 address (or `[]`) taken as text. Globs
+/// are expanded up to the first literal `/`, `?` or `#` after the scheme's
+/// `://`: the host cannot end later, and later globs never change it.
+pub(crate) fn curl_host_glob(raw: &str) -> CurlHostGlob {
+    let bytes = raw.as_bytes();
+    let mut pieces: Vec<Vec<String>> = Vec::new();
+    let mut literal = String::new();
+    let mut combinations = 1usize;
+    let mut has_glob = false;
+    let mut seen_scheme_separator = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if matches!(bytes.get(index + 1), Some(b'{' | b'[' | b'}' | b']')) => {
+                literal.push(char::from(bytes[index + 1]));
+                index += 2;
+            }
+            b'[' if raw[index + 1..].starts_with(']') => {
+                literal.push_str("[]");
+                index += 2;
+            }
+            b'[' if curl_glob_ipv6_literal_len(&raw[index..]).is_some() => {
+                let length = curl_glob_ipv6_literal_len(&raw[index..]).unwrap_or(1);
+                literal.push_str(&raw[index..index + length]);
+                index += length;
+            }
+            open @ (b'[' | b'{') => {
+                let parsed = if open == b'[' {
+                    curl_glob_range(raw, index + 1)
+                } else {
+                    curl_glob_set(raw, index + 1)
+                };
+                let Some((values, next)) = parsed else {
+                    return CurlHostGlob::Unreadable;
+                };
+                combinations = combinations.saturating_mul(values.len());
+                if combinations > MAX_CURL_GLOB_COMBINATIONS {
+                    return CurlHostGlob::Unreadable;
+                }
+                pieces.push(vec![std::mem::take(&mut literal)]);
+                pieces.push(values);
+                has_glob = true;
+                index = next;
+            }
+            b'}' | b']' => return CurlHostGlob::Unreadable,
+            b':' if !seen_scheme_separator && raw[index..].starts_with("://") => {
+                seen_scheme_separator = true;
+                literal.push_str("://");
+                index += 3;
+            }
+            b'/' | b'?' | b'#' => break,
+            _ => {
+                let next = raw[index..]
+                    .chars()
+                    .next()
+                    .map_or(index + 1, |character| index + character.len_utf8());
+                literal.push_str(&raw[index..next]);
+                index = next;
+            }
+        }
+    }
+    if !has_glob {
+        return CurlHostGlob::Plain;
+    }
+    pieces.push(vec![literal]);
+    let rest = &raw[index..];
+    let mut host_parts: Vec<String> = Vec::new();
+    let mut choice = vec![0usize; pieces.len()];
+    loop {
+        let part: String = pieces
+            .iter()
+            .zip(&choice)
+            .map(|(values, at)| values[*at].as_str())
+            .collect();
+        if !host_parts.contains(&part) {
+            if host_parts.len() == MAX_CURL_GLOB_HOST_PARTS {
+                return CurlHostGlob::Unreadable;
+            }
+            host_parts.push(part);
+        }
+        // Next combination, the last glob fastest (curl's order).
+        let mut position = pieces.len();
+        loop {
+            if position == 0 {
+                return CurlHostGlob::Expanded(
+                    host_parts
+                        .into_iter()
+                        .map(|part| format!("{part}{rest}"))
+                        .collect(),
+                );
+            }
+            position -= 1;
+            choice[position] += 1;
+            if choice[position] < pieces[position].len() {
+                break;
+            }
+            choice[position] = 0;
+        }
+    }
+}
+
+/// The length of a bracketed IPv6 address (`[::1]`, `[fe80::1%25eth0]`)
+/// at the start of `text`, which curl's globbing keeps as text.
+fn curl_glob_ipv6_literal_len(text: &str) -> Option<usize> {
+    let close = text.find(']')?;
+    if close + 1 >= 128 {
+        return None;
+    }
+    let inside = &text[1..close];
+    let address = inside.split('%').next().unwrap_or(inside);
+    address
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(|_| close + 1)
+}
+
+/// A curl `{a,b}` set starting after its `{`: its elements (a backslash
+/// escapes the next character; nested `{`/`[` and a stray `]` are errors) and
+/// the index after its `}`.
+fn curl_glob_set(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
+    let mut elements = Vec::new();
+    let mut element = String::new();
+    let mut characters = raw[start..].char_indices();
+    while let Some((offset, character)) = characters.next() {
+        match character {
+            '}' => {
+                if offset == 0 {
+                    return None;
+                }
+                elements.push(element);
+                if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
+                    return None;
+                }
+                return Some((elements, start + offset + 1));
+            }
+            ',' => {
+                elements.push(std::mem::take(&mut element));
+                if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
+                    return None;
+                }
+            }
+            '{' | '[' | ']' => return None,
+            '\\' => match characters.next() {
+                Some((_, escaped)) => element.push(escaped),
+                None => element.push('\\'),
+            },
+            other => element.push(other),
+        }
+    }
+    None
+}
+
+/// A curl `[a-z]` / `[0-9]` range starting after its `[`, with an optional
+/// `:step`, as its values (numbers zero-padded to the width of a leading-zero
+/// start) and the index after its `]`.
+fn curl_glob_range(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
+    let text = &raw[start..];
+    let bytes = text.as_bytes();
+    let first = *bytes.first()?;
+    let digits = |from: usize| {
+        bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        })
+    };
+    let (values, end): (Vec<String>, usize) = if first.is_ascii_alphabetic() {
+        let (min, max) = (first, *bytes.get(2)?);
+        if bytes.get(1) != Some(&b'-') {
+            return None;
+        }
+        let (step, end) = match bytes.get(3)? {
+            b']' => (1usize, 4),
+            b':' => {
+                let count = digits(4);
+                if count == 0 || bytes.get(4 + count) != Some(&b']') {
+                    return None;
+                }
+                (text[4..4 + count].parse().ok()?, 4 + count + 1)
+            }
+            _ => return None,
+        };
+        if step == 0
+            || (min == max && step != 1)
+            || (min != max && (min > max || step > usize::from(max - min) || max - min > 25))
+        {
+            return None;
+        }
+        let values = (min..=max)
+            .step_by(step)
+            .map(|byte| char::from(byte).to_string())
+            .collect();
+        (values, end)
+    } else if first.is_ascii_digit() {
+        let min_len = digits(0);
+        let pad = if first == b'0' { min_len } else { 0 };
+        let min: u64 = text[..min_len].parse().ok()?;
+        if bytes.get(min_len) != Some(&b'-') {
+            return None;
+        }
+        let mut at = min_len + 1;
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let max_len = digits(at);
+        if max_len == 0 {
+            return None;
+        }
+        let max: u64 = text[at..at + max_len].parse().ok()?;
+        at += max_len;
+        let step: u64 = if bytes.get(at) == Some(&b':') {
+            let count = digits(at + 1);
+            if count == 0 {
+                return None;
+            }
+            let step = text[at + 1..at + 1 + count].parse().ok()?;
+            at += 1 + count;
+            step
+        } else {
+            1
+        };
+        if bytes.get(at) != Some(&b']')
+            || step == 0
+            || (min == max && step != 1)
+            || (min != max && (min > max || step > max - min))
+        {
+            return None;
+        }
+        let count = (max - min) / step + 1;
+        if count > MAX_CURL_GLOB_COMBINATIONS as u64 {
+            return None;
+        }
+        let values = (0..count)
+            .map(|offset| format!("{:0pad$}", min + offset * step))
+            .collect();
+        (values, at + 1)
+    } else {
+        return None;
+    };
+    Some((values, start + end))
 }
 
 fn push_urls_from_source_with_curl_operands(
@@ -3884,7 +4165,8 @@ struct PosixHeredocSpec {
     /// the shells' delimiter is `delimiter` plus that CR.
     word_ends_in_cr: bool,
     operator_range: std::ops::Range<usize>,
-    stdin: bool,
+    /// The descriptor the heredoc opens, without leading zeros (`0`: stdin).
+    fd: String,
 }
 
 #[derive(Debug, Default)]
@@ -4073,6 +4355,20 @@ struct PosixHeaderLex {
     /// code with its own quotes, so `"$(cat <<'EOF'` opens a heredoc, and its
     /// closing `)` resumes the double-quoted text.
     double_quoted_bodies: Vec<usize>,
+    /// An arithmetic `((`/`$((` or a `${` left open at the end of a line,
+    /// with the number of `(` (or `{`) still open in it. A `<<` inside is a
+    /// shift or parameter text, never a heredoc operator.
+    inert: Option<(InertText, usize)>,
+    /// The line ended in a backslash-newline, so the next physical line
+    /// continues it; holds whether that line starts at a word start.
+    continued: Option<bool>,
+}
+
+/// Text the header reader skips without looking for operators.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InertText {
+    Arithmetic,
+    Parameter,
 }
 
 impl Default for PosixHeaderLex {
@@ -4080,6 +4376,8 @@ impl Default for PosixHeaderLex {
         Self {
             quote: ShellLexQuote::Normal,
             double_quoted_bodies: Vec::new(),
+            inert: None,
+            continued: None,
         }
     }
 }
@@ -4093,14 +4391,56 @@ fn posix_heredoc_specs(
     let PosixHeaderLex {
         mut quote,
         mut double_quoted_bodies,
+        mut inert,
+        continued,
     } = initial;
     let mut unsupported = false;
     let mut index = 0usize;
-    let mut word_start = true;
+    let mut word_start = continued.unwrap_or(true);
+    let mut continues = None;
     // The run of unescaped `$` just before `index` in double-quoted text.
     let mut dollar_run = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
+        // A trailing backslash joins the next line to this one, except in
+        // single quotes (and a comment, which ends the scan below).
+        if byte == b'\\' && index + 1 == bytes.len() && quote != ShellLexQuote::Single {
+            continues = Some(word_start && quote == ShellLexQuote::Normal);
+            index += 1;
+            continue;
+        }
+        if let Some((kind, open)) = inert.as_mut() {
+            match quote {
+                ShellLexQuote::Single => {
+                    if byte == b'\'' {
+                        quote = ShellLexQuote::Normal;
+                    }
+                }
+                ShellLexQuote::Double => {
+                    if byte == b'\\' {
+                        index += 1;
+                    } else if byte == b'"' {
+                        quote = ShellLexQuote::Normal;
+                    }
+                }
+                ShellLexQuote::Normal => match (byte, *kind) {
+                    (b'\\', _) => index += 1,
+                    (b'\'', _) => quote = ShellLexQuote::Single,
+                    (b'"', _) => quote = ShellLexQuote::Double,
+                    (b'(', InertText::Arithmetic) | (b'{', InertText::Parameter) => *open += 1,
+                    (b')', InertText::Arithmetic) | (b'}', InertText::Parameter) => {
+                        *open -= 1;
+                        if *open == 0 {
+                            inert = None;
+                            word_start = false;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            index += 1;
+            continue;
+        }
         match quote {
             ShellLexQuote::Single => {
                 if byte == b'\'' {
@@ -4150,12 +4490,28 @@ fn posix_heredoc_specs(
             index += 1;
             continue;
         }
-        if bytes.get(index..index + 3) == Some(b"$((") {
-            if let Some(close) = find_shell_delimiter_close(line, index + 1, ShellType::Posix) {
-                index = close + 1;
-                word_start = false;
-                continue;
+        // Arithmetic (`$((...))`, and `((...))` as a command, also after
+        // `for`) and `${...}` hold `<<` as a shift or as text. One left open
+        // at the line end stays inert on the next lines until it closes.
+        let inert_start = if bytes.get(index..index + 3) == Some(b"$((") {
+            Some((index + 1, InertText::Arithmetic, 2))
+        } else if word_start && bytes.get(index..index + 2) == Some(b"((") {
+            Some((index, InertText::Arithmetic, 2))
+        } else if bytes.get(index..index + 2) == Some(b"${") {
+            Some((index + 1, InertText::Parameter, 1))
+        } else {
+            None
+        };
+        if let Some((open, kind, depth)) = inert_start {
+            word_start = false;
+            match find_shell_delimiter_close(line, open, ShellType::Posix) {
+                Some(close) => index = close + 1,
+                None => {
+                    inert = Some((kind, depth));
+                    index = open + depth;
+                }
             }
+            continue;
         }
         if bytes.get(index..index + 3) == Some(b"<<<") {
             // Here-strings have a different expansion grammar and no delimiter
@@ -4193,9 +4549,20 @@ fn posix_heredoc_specs(
         match parse_posix_heredoc_delimiter(line, operator) {
             Ok((delimiter, quoted, end)) => {
                 let strip_tabs = bytes.get(operator + 2) == Some(&b'-');
+                // Digits are the descriptor only when they are the whole word
+                // (`3<<EOF`); `sh2<<EOF` runs `sh2` with a heredoc on stdin.
                 let digit_start = line[..operator]
                     .rfind(|character: char| !character.is_ascii_digit())
                     .map_or(0, |offset| offset + 1);
+                let digit_start = if digit_start == 0
+                    || matches!(
+                        bytes[digit_start - 1],
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                    ) {
+                    digit_start
+                } else {
+                    operator
+                };
                 let fd = line
                     .get(digit_start..operator)
                     .filter(|raw| !raw.is_empty());
@@ -4205,7 +4572,9 @@ fn posix_heredoc_specs(
                     strip_tabs,
                     word_ends_in_cr: bytes.get(end) == Some(&b'\r') && end + 1 == bytes.len(),
                     operator_range: digit_start..end,
-                    stdin: fd.is_none_or(|raw| raw == "0"),
+                    fd: fd
+                        .and_then(descriptor_number)
+                        .unwrap_or_else(|| "0".to_string()),
                 });
                 index = end;
                 word_start = false;
@@ -4219,14 +4588,16 @@ fn posix_heredoc_specs(
     // A quote can legitimately span physical lines. The caller carries this
     // state so `<<EOF` text on a later quoted line cannot be invented as a
     // heredoc operator. If a real heredoc header itself leaves a quote open,
-    // its body boundary is ambiguous and must remain fail-closed.
-    let quote_ambiguous_for_heredoc = !specs.is_empty() && quote != ShellLexQuote::Normal;
+    // its body boundary is ambiguous and must remain fail-closed (the caller
+    // checks this once the header's continued lines are joined).
     (
         specs,
-        unsupported || quote_ambiguous_for_heredoc,
+        unsupported,
         PosixHeaderLex {
             quote,
             double_quoted_bodies,
+            inert,
+            continued: continues,
         },
     )
 }
@@ -4322,84 +4693,148 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
     }
 }
 
-fn shell_reads_heredoc_from_stdin(command: &str, args: &[String]) -> Option<ShellType> {
-    let child_shell = match command {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
-            ShellType::Posix
-        }
-        "fish" => ShellType::Fish,
-        _ => return None,
-    };
-    let mut force_stdin = false;
-    let mut index = 0usize;
-    while index < args.len() {
-        let option = static_wrapper_word(&args[index], ShellType::Posix)?;
-        if option == "--" {
-            return (force_stdin || index + 1 == args.len()).then_some(child_shell);
-        }
-        if !option.starts_with('-') || option == "-" {
-            return force_stdin.then_some(child_shell);
-        }
-        if option == "-c"
-            || option == "--command"
-            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('c'))
-        {
-            return None;
-        }
-        if option == "-s"
-            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('s'))
-        {
-            force_stdin = true;
-        }
-        let takes_value = matches!(
-            option.as_str(),
-            "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
-        ) || (child_shell == ShellType::Fish
-            && matches!(
-                option.as_str(),
-                "-C" | "--init-command" | "--features" | "--profile-startup"
-            ));
-        index += if takes_value { 2 } else { 1 };
-    }
-    Some(child_shell)
+/// Who reads a heredoc's body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeredocReader {
+    /// Data for a command that does not run it.
+    Data,
+    /// Code that this shell runs.
+    Shell(ShellType),
+    /// A shell, `.`/`source` or a bare `exec` holds the body on a descriptor
+    /// other than its script input, where a later read may run it.
+    Ambiguous,
 }
 
-fn heredoc_interpreter_for_header(
+/// Who reads the heredoc whose operator spans `operator..operator_end` and
+/// opens descriptor `fd` in the (operator-masked) header `line`.
+///
+/// A shell (or `.`/`source`) runs the body when it reads its script from
+/// stdin and stdin is the heredoc: a heredoc on stdin, or one on descriptor
+/// `fd` that a later `<&fd` / `0<&fd` of the same command copies to stdin
+/// (redirections apply left to right, so `sh 0<&3 3<<EOF` does not). Its
+/// script comes from stdin with no operand, after `-`, `--` or `-s`, and with
+/// a `/dev/stdin`, `/dev/fd/0` or `/proc/self/fd/0` operand. A `/dev/fd/<fd>`
+/// operand reads the heredoc directly. Redirection words are not operands.
+/// Any other heredoc on another descriptor of a shell, `.`/`source` or a bare
+/// `exec` (which keeps it open in the current shell) is ambiguous.
+fn heredoc_reader(line: &str, operator: usize, operator_end: usize, fd: &str) -> HeredocReader {
+    // The operator (masked to blanks) belongs to the last segment that starts
+    // at or before it, so `cd /tmp; sh <<'EOF'` is read by `sh`; an operator
+    // before every command word (`<<EOF sh`) belongs to the first.
+    let segments = tokenize::tokenize(line, ShellType::Posix);
+    let Some(segment) = segments
+        .iter()
+        .rev()
+        .find(|segment| segment.byte_range.start <= operator)
+        .or_else(|| segments.first())
+    else {
+        return HeredocReader::Data;
+    };
+    let bare_exec = segment.command.as_deref().is_some_and(|command| {
+        crate::rules::command::normalize_cmd_base(command, ShellType::Posix) == "exec"
+    }) && crate::escalation::args_without_redirections(&segment.args)
+        .iter()
+        .all(|word| word.starts_with('-'));
+    if bare_exec {
+        return HeredocReader::Ambiguous;
+    }
+    let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
+        return HeredocReader::Data;
+    };
+    let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    let child_shell = match command.as_str() {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
+        | "source" => ShellType::Posix,
+        "fish" => ShellType::Fish,
+        _ => return HeredocReader::Data,
+    };
+    let argv = crate::escalation::args_without_redirections(&args);
+    let on_stdin = fd == "0" || {
+        let after = line
+            .get(operator_end.min(segment.byte_range.end)..segment.byte_range.end)
+            .unwrap_or_default();
+        tokenize::split_words(after).iter().any(|word| {
+            let target = word
+                .strip_prefix("0<&")
+                .or_else(|| word.strip_prefix("<&"))
+                .map(|target| target.strip_suffix('-').unwrap_or(target));
+            target.is_some_and(|target| descriptor_number(target).as_deref() == Some(fd))
+        })
+    };
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if on_stdin && posix_command_accepts_pipeline_as_code(&command, &argv, 0, &mut remaining_bodies)
+    {
+        return HeredocReader::Shell(child_shell);
+    }
+    if fd == "0" {
+        return HeredocReader::Data;
+    }
+    let names_heredoc = argv.iter().any(|word| {
+        static_wrapper_word(word, ShellType::Posix).is_some_and(|path| {
+            let parts = path
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect::<Vec<_>>();
+            match parts.as_slice() {
+                ["dev", "fd", number] | ["proc", "self", "fd", number] => {
+                    descriptor_number(number).as_deref() == Some(fd)
+                }
+                _ => false,
+            }
+        })
+    });
+    if names_heredoc {
+        HeredocReader::Shell(child_shell)
+    } else {
+        HeredocReader::Ambiguous
+    }
+}
+
+/// A descriptor number without its leading zeros (`03` is descriptor 3).
+fn descriptor_number(digits: &str) -> Option<String> {
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    Some(if trimmed.is_empty() { "0" } else { trimmed }.to_string())
+}
+
+/// The readers of the heredoc `target` on the header `line`: the command on
+/// the whole line, and the command inside the innermost `(`/`$(`/backtick
+/// body open at the operator (the tokenizer does not split inside `$(...)`,
+/// so for `x="$(sh <<'EOF'` the reader is found in that body). The body is
+/// code if either reads it as code and ambiguous if either is ambiguous.
+fn heredoc_readers_for_header(
     line: &str,
     specs: &[PosixHeredocSpec],
     target: &PosixHeredocSpec,
-) -> Option<ShellType> {
-    if !target.stdin {
-        return None;
-    }
+) -> (Option<ShellType>, bool) {
     let mut masked = line.as_bytes().to_vec();
     for spec in specs {
         mask_non_newline(&mut masked, spec.operator_range.clone());
     }
-    let masked = String::from_utf8(masked).ok()?;
+    let Ok(masked) = String::from_utf8(masked) else {
+        return (None, false);
+    };
     let operator = target.operator_range.start;
-    // The tokenizer does not split inside `$(...)`, so for an operator in a
-    // substitution, subshell or backtick body (`x="$(sh <<'EOF'`) the
-    // command that reads the heredoc is found in that body.
-    heredoc_consumer_shell(&masked, operator).or_else(|| {
-        let body = posix_innermost_open_body(&masked, operator)?;
-        heredoc_consumer_shell(masked.get(body.clone())?, operator - body.start)
-    })
-}
-
-/// The shell that reads the heredoc whose operator starts at `operator` in
-/// the (operator-masked) header `line` from stdin, if any.
-fn heredoc_consumer_shell(line: &str, operator: usize) -> Option<ShellType> {
-    let segment = tokenize::tokenize(line, ShellType::Posix)
-        .into_iter()
-        .find(|segment| segment.byte_range.start <= operator && operator <= segment.byte_range.end)
-        .or_else(|| {
-            tokenize::tokenize(line, ShellType::Posix)
-                .into_iter()
-                .next()
-        })?;
-    let (command, args) = resolve_wrapped_command_for_shell(&segment, ShellType::Posix)?;
-    shell_reads_heredoc_from_stdin(&command, &args)
+    let operator_end = target.operator_range.end;
+    let mut readers = vec![heredoc_reader(&masked, operator, operator_end, &target.fd)];
+    if let Some(body) = posix_innermost_open_body(&masked, operator) {
+        if let Some(text) = masked.get(body.clone()) {
+            readers.push(heredoc_reader(
+                text,
+                operator - body.start,
+                operator_end.saturating_sub(body.start).min(text.len()),
+                &target.fd,
+            ));
+        }
+    }
+    let shell = readers.iter().find_map(|reader| match reader {
+        HeredocReader::Shell(shell) => Some(*shell),
+        _ => None,
+    });
+    let ambiguous = readers.contains(&HeredocReader::Ambiguous);
+    (shell, ambiguous)
 }
 
 /// The byte range of the innermost `(`, `$(`, `<(`, `>(` or backtick body
@@ -4621,17 +5056,46 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
     let mut cursor = 0usize;
     let mut count = 0usize;
     let mut header_lex = PosixHeaderLex::default();
-    while cursor < raw.len() {
-        let header_end = raw[cursor..]
+    let line_end = |from: usize| {
+        raw[from..]
             .find('\n')
-            .map_or(raw.len(), |offset| cursor + offset);
+            .map_or(raw.len(), |offset| from + offset)
+    };
+    while cursor < raw.len() {
+        // The header is one logical line: a backslash-newline joins the next
+        // physical line to it, and the bodies start after its last line
+        // (`cat <<'EOF' \` + `| sh` pipes the body into sh).
+        let mut header_end = line_end(cursor);
+        let mut line_start = cursor;
+        let mut specs = Vec::new();
+        let mut unsupported = false;
+        loop {
+            let (mut found, line_unsupported, final_lex) = posix_heredoc_specs(
+                raw.get(line_start..header_end).unwrap_or_default(),
+                std::mem::take(&mut header_lex),
+            );
+            for spec in &mut found {
+                spec.operator_range = (spec.operator_range.start + line_start)
+                    ..(spec.operator_range.end + line_start);
+            }
+            specs.extend(found);
+            unsupported |= line_unsupported;
+            let continued = final_lex.continued.is_some();
+            header_lex = final_lex;
+            if !continued || header_end == raw.len() {
+                break;
+            }
+            line_start = header_end + 1;
+            header_end = line_end(line_start);
+        }
+        header_lex.continued = None;
         let header = raw.get(cursor..header_end).unwrap_or_default();
-        let (mut specs, unsupported, final_lex) =
-            posix_heredoc_specs(header, std::mem::take(&mut header_lex));
-        header_lex = final_lex;
-        for spec in &mut specs {
-            spec.operator_range =
-                (spec.operator_range.start + cursor)..(spec.operator_range.end + cursor);
+        // A heredoc header that leaves a quote, an arithmetic expression or
+        // a `${` open has no line where its bodies certainly start.
+        if !specs.is_empty()
+            && (header_lex.quote != ShellLexQuote::Normal || header_lex.inert.is_some())
+        {
+            unsupported = true;
         }
         for spec in &specs {
             mask_non_newline(&mut masked, spec.operator_range.clone());
@@ -4666,7 +5130,7 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 word_ends_in_cr: spec.word_ends_in_cr,
                 operator_range: (spec.operator_range.start - cursor)
                     ..(spec.operator_range.end - cursor),
-                stdin: spec.stdin,
+                fd: spec.fd.clone(),
             })
             .collect();
         let mut body_cursor = header_end + 1;
@@ -4722,9 +5186,14 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 if !spec.quoted {
                     scan_unquoted_heredoc_expansions(&body, &mut recovery);
                 }
-                if let Some(shell) =
-                    heredoc_interpreter_for_header(header, &relative_specs, relative)
-                {
+                let (reader, ambiguous) =
+                    heredoc_readers_for_header(header, &relative_specs, relative);
+                if ambiguous {
+                    recovery
+                        .gap
+                        .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                if let Some(shell) = reader {
                     let input = if spec.quoted {
                         body
                     } else {
@@ -18883,5 +19352,84 @@ mod dispatch_scan_budget_tests {
         let (_, gap) =
             lexical_executable_substitutions("f() { alias ls=rm; }; f", ShellType::Posix);
         assert_eq!(gap, Some(ShellExecutionGap::AmbiguousExecutableBody));
+    }
+}
+
+#[cfg(test)]
+mod curl_glob_tests {
+    use super::*;
+
+    /// curl's URL glob grammar as curl 8.7.1 expands it: ranges with padding
+    /// and a step, sets (an empty element included), escaped brackets and
+    /// bracketed IPv6 addresses as text, and globs after the host left alone.
+    #[test]
+    fn curl_host_glob_expands_the_host_part_as_curl_does() {
+        let expanded = |raw: &str| match curl_host_glob(raw) {
+            CurlHostGlob::Expanded(values) => values,
+            other => panic!("{raw}: {other:?}"),
+        };
+        assert_eq!(
+            expanded("http://127.0.0.[1-5:2]:9/x[1-3]"),
+            [
+                "http://127.0.0.1:9/x[1-3]",
+                "http://127.0.0.3:9/x[1-3]",
+                "http://127.0.0.5:9/x[1-3]"
+            ]
+        );
+        assert_eq!(
+            expanded("http://10.0.0.[08-10]/"),
+            [
+                "http://10.0.0.08/",
+                "http://10.0.0.09/",
+                "http://10.0.0.10/"
+            ]
+        );
+        assert_eq!(
+            expanded("http://loc[a-c:2]lhost/"),
+            ["http://localhost/", "http://locclhost/"]
+        );
+        assert_eq!(
+            expanded("{http,https}://{a,}b.example/"),
+            [
+                "http://ab.example/",
+                "http://b.example/",
+                "https://ab.example/",
+                "https://b.example/"
+            ]
+        );
+        assert_eq!(expanded("http://{a/x,b}/y"), ["http://a/x/y", "http://b/y"]);
+        assert_eq!(expanded("10.0.0.[1- 2]/a"), ["10.0.0.1/a", "10.0.0.2/a"]);
+        // Duplicate host parts are kept once.
+        assert_eq!(
+            expanded("http://h{,}.example:[80-80]/"),
+            ["http://h.example:80/"]
+        );
+        for plain in [
+            "http://example.com/a[1-3]",
+            "http://[::1]:8080/x",
+            "http://[fe80::1%25eth0]/x",
+            "http://example.com/a[]b",
+            "http://ex\\[1-2\\]ample.com/",
+            "https://example.com?q={a,b}",
+        ] {
+            assert_eq!(curl_host_glob(plain), CurlHostGlob::Plain, "{plain}");
+        }
+        for unreadable in [
+            "http://127.0.0.{1,{2,3}}/",
+            "http://127.0.0.[1-]/",
+            "http://127.0.0.[2-1]/",
+            "http://127.0.0.[1-3:0]/",
+            "http://127.0.0.[a-Z]/",
+            "http://127.0.0.1}/",
+            "http://{}.example/",
+            "http://10.[0-255].[0-255].1/",
+            "http://h[1-65].example/",
+        ] {
+            assert_eq!(
+                curl_host_glob(unreadable),
+                CurlHostGlob::Unreadable,
+                "{unreadable}"
+            );
+        }
     }
 }

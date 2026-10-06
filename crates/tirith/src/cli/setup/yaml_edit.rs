@@ -10,7 +10,9 @@
 //! collections, anchors, tags, multi-line scalars, sequences, tabs, several
 //! documents, mixed line endings) is refused with the requested change shown as
 //! a diff, so nothing is ever rewritten that the user did not ask for. A
-//! leading `---` and a trailing `...` that ends the one document are kept, and
+//! leading byte-order mark (unless serde_yaml could not read the edited file
+//! with it), a leading `---` and a trailing `...` that ends the one document
+//! are kept, and
 //! lines off the path (a multi-line flow collection closing in its key's
 //! column) are left as they are.
 //!
@@ -39,10 +41,22 @@ pub(super) fn set_field(
         return Err(refuse("a mapping in the file repeats a key"));
     }
     let edited = edit(text, &keys, value).map_err(refuse)?;
-    match parse(&edited) {
-        Ok(actual) if actual == expected && unique_keys(&edited) => Ok(edited),
-        _ => Err(refuse("the in-place edit could not be verified")),
+    let verified = |edited: &str| {
+        matches!(parse(edited), Ok(actual) if actual == expected) && unique_keys(edited)
+    };
+    if verified(&edited) {
+        return Ok(edited);
     }
+    // serde_yaml, and so the policy loader, reads a byte-order mark right
+    // before a block mapping of several keys as more than one document. Such
+    // an edit is written without the mark (as a whole-file rewrite always
+    // was); undo still restores the planned preimage byte for byte.
+    if let Some(unmarked) = edited.strip_prefix('\u{feff}') {
+        if verified(unmarked) {
+            return Ok(unmarked.to_string());
+        }
+    }
+    Err(refuse("the in-place edit could not be verified"))
 }
 
 /// The parsed comparison above keeps the last of two equal keys, so it cannot
@@ -190,6 +204,11 @@ struct Entry {
 }
 
 struct Document {
+    /// A leading UTF-8 byte-order mark (U+FEFF), written back unchanged.
+    /// serde_yaml and the policy loader skip it, so the lines are read
+    /// without it; otherwise the first key would read as `\u{feff}key` and a
+    /// first comment line would not be a comment.
+    bom: bool,
     lines: Vec<String>,
     eol: &'static str,
     final_newline: bool,
@@ -211,6 +230,10 @@ fn edit(text: &str, keys: &[&str], value: Option<&Value>) -> Result<String, Refu
 
 impl Document {
     fn read(text: &str) -> Result<Self, Refusal> {
+        let (bom, text) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
         let crlf = text.matches("\r\n").count();
         let lf = text.matches('\n').count();
         let cr = text.matches('\r').count();
@@ -250,6 +273,7 @@ impl Document {
         }
         let step = detect_step(&lines[root..]);
         Ok(Self {
+            bom,
             lines,
             eol,
             final_newline,
@@ -269,6 +293,9 @@ impl Document {
         let mut text = lines.join(self.eol);
         if self.final_newline && !lines.is_empty() {
             text.push_str(self.eol);
+        }
+        if self.bom {
+            text.insert(0, '\u{feff}');
         }
         text
     }
@@ -1200,5 +1227,75 @@ mod tests {
         assert!(error.contains("+   name: strict\n"), "{error}");
         assert!(!error.contains("policy_server"), "{error}");
         assert!(!error.contains("webhooks"), "{error}");
+    }
+
+    /// A UTF-8 byte-order mark (PowerShell 5.1 `Set-Content -Encoding UTF8`,
+    /// older Notepad) is skipped by the policy loader, so it is read past and
+    /// written back: the first key and a first comment line are seen, no
+    /// second entry is added, and an undone edit restores the exact bytes.
+    #[test]
+    fn leading_byte_order_mark_is_kept_and_read_past() {
+        let bom = "\u{feff}";
+        for (text, pointer, value, expected) in [
+            (
+                "\u{feff}paranoia: 2\n",
+                "/paranoia",
+                Some(json!(3)),
+                "\u{feff}paranoia: 3\n",
+            ),
+            ("\u{feff}paranoia: 2\n", "/paranoia", None, "\u{feff}{}\n"),
+            // serde_yaml reads a mark right before several keys as several
+            // documents, so that edit is written without it.
+            (
+                "\u{feff}paranoia: 2\n",
+                "/strict_warn",
+                Some(json!(true)),
+                "paranoia: 2\nstrict_warn: true\n",
+            ),
+            (
+                "\u{feff}# mine\nparanoia: 2\n",
+                "/paranoia",
+                Some(json!(3)),
+                "\u{feff}# mine\nparanoia: 3\n",
+            ),
+            (
+                "\u{feff}# mine\r\nparanoia: 2\r\n",
+                "/paranoia",
+                Some(json!(1)),
+                "\u{feff}# mine\r\nparanoia: 1\r\n",
+            ),
+            (
+                "\u{feff}",
+                "/paranoia",
+                Some(json!(2)),
+                "\u{feff}paranoia: 2\n",
+            ),
+        ] {
+            let edited = set_field(text, pointer, value.as_ref())
+                .unwrap_or_else(|error| panic!("{text:?} {pointer}: {error}"));
+            assert_eq!(edited, expected, "{text:?} {pointer}");
+            assert!(edited.matches(bom).count() <= 1, "{edited:?}");
+            assert!(parse(&edited).is_ok() && unique_keys(&edited), "{edited:?}");
+        }
+        // serde_yaml, like the policy loader, cannot read a mark before `---`
+        // and several keys, so that file is refused as before.
+        assert!(set_field(
+            "\u{feff}---\nscan:\n  require_complete: false\nparanoia: 2\n",
+            "/paranoia",
+            Some(&json!(3))
+        )
+        .unwrap_err()
+        .contains("not a valid YAML object"));
+        // Undo writes the field back: the edits round-trip byte for byte.
+        let original = "\u{feff}# mine\nparanoia: 2   # keep\nstrict_warn: false\n";
+        let edited = set(original, "/paranoia", json!(4));
+        assert_eq!(
+            edited,
+            "\u{feff}# mine\nparanoia: 4   # keep\nstrict_warn: false\n"
+        );
+        assert_eq!(set(&edited, "/paranoia", json!(2)), original);
+        let removed = remove(original, "/strict_warn");
+        assert_eq!(removed, "\u{feff}# mine\nparanoia: 2   # keep\n");
+        assert_eq!(set(&removed, "/strict_warn", json!(false)), original);
     }
 }

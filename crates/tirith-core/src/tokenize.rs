@@ -1940,6 +1940,9 @@ fn push_segment_impl(
         segments.note_word_budget(budget);
         if words_truncated || word_bytes_truncated {
             (None, Vec::new())
+        } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Posix
+        {
+            posix_command_and_args(words)
         } else {
             // Skip leading `VAR=VALUE` assignments.
             let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
@@ -1968,6 +1971,69 @@ fn push_segment_impl(
         preceding_separator: preceding_sep,
         byte_range,
     });
+}
+
+/// The command word and arguments of a POSIX simple command, read the way the
+/// shell builds argv. The shell takes redirections out of a simple
+/// command wherever they stand: before the command word (`>/dev/null sh`),
+/// joined to a word (`sh>/dev/null`, `rm>/dev/null -rf /`) or between the
+/// command word and its operands (`sudo >/dev/null sh`). So an unquoted
+/// operator is split off the end of a word (a word made only of a redirection,
+/// such as `2>/dev/null`, stays whole, and `sh2>/dev/null` runs `sh2`), leading
+/// assignments and redirections (with the separate target of a bare operator)
+/// are skipped to find the command word, and every redirection is kept, in
+/// order, after the argv words. Rules that look for a redirection in the
+/// arguments still see it; rules that read argv by position see the shell's
+/// argv, as for a trailing redirection. Inside `[[ ... ]]` and `(( ... ))`
+/// `<` and `>` compare, so those words are left as they are.
+fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+    use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
+
+    let Some(first) = words.iter().position(|word| !is_env_assignment(word)) else {
+        // All words are assignments — no command.
+        return (None, Vec::new());
+    };
+    if words[first] == "[[" || words[first].starts_with("((") {
+        let args = words[first + 1..].to_vec();
+        return (Some(words[first].clone()), args);
+    }
+
+    let mut split = Vec::with_capacity(words.len());
+    for word in words {
+        if shell_redirection_token(&word).is_none() {
+            if let Some((prefix, _)) = shell_redirection_suffix(&word) {
+                let at = prefix.len();
+                split.push(word[..at].to_owned());
+                split.push(word[at..].to_owned());
+                continue;
+            }
+        }
+        split.push(word);
+    }
+
+    let mut command = None;
+    let mut args = Vec::new();
+    let mut redirections = Vec::new();
+    let mut words = split.into_iter();
+    while let Some(word) = words.next() {
+        if let Some(target_is_separate) = shell_redirection_token(&word) {
+            redirections.push(word);
+            if target_is_separate {
+                redirections.extend(words.next());
+            }
+            continue;
+        }
+        if command.is_some() {
+            args.push(word);
+        } else if !is_env_assignment(&word) {
+            command = Some(word);
+        }
+    }
+    if command.is_none() {
+        return (None, Vec::new());
+    }
+    args.extend(redirections);
+    (command, args)
 }
 
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
@@ -2003,15 +2069,33 @@ pub(crate) fn leading_env_assignments_bounded(
     max_words: usize,
     max_word_bytes: usize,
 ) -> (Vec<(String, String)>, bool, bool) {
+    use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
+
     let mut assignments = Vec::new();
     let (words, words_truncated, word_bytes_truncated) =
         split_words_bounded(segment_raw.trim(), max_words, max_word_bytes);
-    for word in words {
-        if !is_env_assignment(&word) {
+    // Redirections may stand among the prefix assignments
+    // (`>/dev/null FOO=1 cmd`); they are not assignments and do not end them.
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        if let Some(target_is_separate) = shell_redirection_token(&word) {
+            if target_is_separate {
+                words.next();
+            }
+            continue;
+        }
+        let (word, suffix) = match shell_redirection_suffix(&word) {
+            Some((prefix, target_is_separate)) => (prefix, Some(target_is_separate)),
+            None => (word.as_str(), None),
+        };
+        if !is_env_assignment(word) {
             break;
         }
         if let Some((name, value)) = word.split_once('=') {
             assignments.push((name.to_string(), value.to_string()));
+        }
+        if suffix == Some(true) {
+            words.next();
         }
     }
     (assignments, words_truncated, word_bytes_truncated)
@@ -3606,5 +3690,100 @@ mod tests {
         assert_byte_ranges_match_raw(input, &segs);
         assert_eq!(segs[0].byte_range, 0..2); // "ls"
         assert_eq!(segs[1].byte_range, 6..15); // "echo done"
+    }
+
+    /// The shell takes redirections out of argv wherever they stand, so the
+    /// command word and the argv positions are read past them: before the
+    /// command word, joined to a word, or between the command word and its
+    /// operands. Redirections stay in the arguments, after the argv words.
+    #[test]
+    fn redirections_are_never_the_command_word_and_follow_the_argv() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("sh>/dev/null", "sh", &[">/dev/null"]),
+            ("bash&>/dev/null", "bash", &["&>/dev/null"]),
+            ("sh>&2", "sh", &[">&2"]),
+            ("sh<&0", "sh", &["<&0"]),
+            ("sh&>>log", "sh", &["&>>log"]),
+            ("sh<>f", "sh", &["<>f"]),
+            ("/bin/sh>/dev/null", "/bin/sh", &[">/dev/null"]),
+            ("python3>/dev/null -", "python3", &["-", ">/dev/null"]),
+            (">/dev/null sh", "sh", &[">/dev/null"]),
+            ("2>/dev/null sh", "sh", &["2>/dev/null"]),
+            ("> /dev/null sh -s", "sh", &["-s", ">", "/dev/null"]),
+            ("2> /dev/null bash", "bash", &["2>", "/dev/null"]),
+            (">/dev/null FOO=1 sh", "sh", &[">/dev/null"]),
+            ("FOO=1 >/dev/null sh", "sh", &[">/dev/null"]),
+            (
+                "</dev/null >/dev/null sh",
+                "sh",
+                &["</dev/null", ">/dev/null"],
+            ),
+            ("sudo >/dev/null sh", "sudo", &["sh", ">/dev/null"]),
+            ("sudo sh&>/dev/null", "sudo", &["sh", "&>/dev/null"]),
+            ("env >/dev/null sh", "env", &["sh", ">/dev/null"]),
+            ("rm>/dev/null -rf /", "rm", &["-rf", "/", ">/dev/null"]),
+            (">/dev/null rm -rf /", "rm", &["-rf", "/", ">/dev/null"]),
+            ("sh >/dev/null -c 'x'", "sh", &["-c", "'x'", ">/dev/null"]),
+            ("cp a >/dev/null .env", "cp", &["a", ".env", ">/dev/null"]),
+            (
+                "echo 2>&1 >/dev/null x",
+                "echo",
+                &["x", "2>&1", ">/dev/null"],
+            ),
+            ("sh 2>/dev/null", "sh", &["2>/dev/null"]),
+            ("cat<<EOF", "cat", &["<<EOF"]),
+            // `sh2>/dev/null` runs `sh2`: digits joined to a word are not a
+            // descriptor number.
+            ("sh2>/dev/null", "sh2", &[">/dev/null"]),
+            ("a2>b", "a2", &[">b"]),
+        ];
+        for (input, command, args) in cases {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+            assert_eq!(segs[0].raw, *input);
+        }
+        // Only redirections and assignments: no command word.
+        for input in [">/dev/null", "2> /dev/null", "FOO=1 >/dev/null"] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs[0].command, None, "{input:?}");
+            assert!(segs[0].args.is_empty(), "{input:?}");
+        }
+        // Quoted or escaped operators, process substitutions, operators inside
+        // expansions and `[[ ]]` comparisons are words, unchanged.
+        let words: &[(&str, &str, &[&str])] = &[
+            ("'sh>/dev/null'", "'sh>/dev/null'", &[]),
+            ("sh'>'/dev/null", "sh'>'/dev/null", &[]),
+            ("sh\\>/dev/null", "sh\\>/dev/null", &[]),
+            ("tee >(sh)", "tee", &[">(sh)"]),
+            ("echo ${x:->y}", "echo", &["${x:->y}"]),
+            ("echo $((1>2))", "echo", &["$((1>2))"]),
+            ("[[ a > b ]]", "[[", &["a", ">", "b", "]]"]),
+        ];
+        for (input, command, args) in words {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+        }
+        // Fish keeps its word reading.
+        let fish = tokenize("sh>/dev/null", ShellType::Fish);
+        assert_eq!(fish[0].command.as_deref(), Some("sh>/dev/null"));
+    }
+
+    #[test]
+    fn leading_assignments_are_read_past_redirections() {
+        assert_eq!(
+            leading_env_assignments(">/dev/null FOO=1 2> err BAR=2 cmd"),
+            vec![
+                ("FOO".to_string(), "1".to_string()),
+                ("BAR".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(
+            leading_env_assignments("PYTHONINSPECT=1>/dev/null python3"),
+            vec![("PYTHONINSPECT".to_string(), "1".to_string())]
+        );
+        assert!(leading_env_assignments("'>x' FOO=1 cmd").is_empty());
     }
 }

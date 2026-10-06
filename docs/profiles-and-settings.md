@@ -110,7 +110,10 @@ keeps your later edits.
   is refused before anything is saved; the error shows the change as a diff of
   that field to make by hand. A leading `---`, a trailing `...` document-end
   marker and other fields written in flow style (also when their closing `]` or
-  `}` is in the key's column) are kept as they are.
+  `}` is in the key's column) are kept as they are. A leading UTF-8 byte-order
+  mark (PowerShell 5.1 and older Notepad write one) is kept too, unless the YAML
+  parser could not read the edited file with it (a mark right before several
+  keys); then the edited file is written without it.
 - Undo checks fresh authorization, refuses a concurrent change to what it would
   restore, and never writes an old policy document over newer settings.
 - Unsupported fields, values, rules and paths are refused. Compound values

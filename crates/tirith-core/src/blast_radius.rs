@@ -758,10 +758,14 @@ fn parse_rsync(args: &[String]) -> Option<ParsedFsOp> {
         return None;
     }
 
-    let operands: Vec<String> = stripped
+    // Redirections are the shell's, not rsync operands: in
+    // `rsync --delete src/ dst/ >log` the destination is `dst/`.
+    let argv = crate::escalation::args_without_redirections(args);
+    let operands: Vec<String> = argv
         .iter()
+        .map(|a| strip_outer_quotes(a))
         .filter(|a| !a.starts_with('-'))
-        .map(|a| (*a).to_string())
+        .map(str::to_string)
         .collect();
     // Destination = last operand; the side `--delete` prunes.
     let targets = operands.last().cloned().into_iter().collect();

@@ -1292,17 +1292,29 @@ mod tests {
 
     #[test]
     fn pip_install_version_range_is_constraint() {
+        for command in [
+            "pip install 'requests>=2.0'",
+            "pip install \"requests>=2.0\"",
+            "pip install requests\\>=2.0",
+        ] {
+            let pkgs = tokenize_and_extract(command);
+            assert_eq!(pkgs.len(), 1, "{command}");
+            assert_eq!(pkgs[0].name, "requests");
+            // A range is now preserved as a parsed Constraint (no longer dropped).
+            match &pkgs[0].version {
+                VersionIntent::Constraint { raw, parsed } => {
+                    assert_eq!(raw, ">=2.0");
+                    assert!(parsed.is_some());
+                }
+                other => panic!("expected Constraint for {command}, got {other:?}"),
+            }
+        }
+        // Unquoted, `>=2.0` redirects stdout to a file named `=2.0`: pip
+        // installs `requests` with no version pinned.
         let pkgs = tokenize_and_extract("pip install requests>=2.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        // A range is now preserved as a parsed Constraint (no longer dropped).
-        match &pkgs[0].version {
-            VersionIntent::Constraint { raw, parsed } => {
-                assert_eq!(raw, ">=2.0");
-                assert!(parsed.is_some());
-            }
-            other => panic!("expected Constraint, got {other:?}"),
-        }
+        assert!(matches!(pkgs[0].version, VersionIntent::Unspecified));
     }
 
     #[test]

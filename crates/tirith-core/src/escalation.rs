@@ -1510,6 +1510,24 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<
     paths
 }
 
+/// A segment's arguments without its shell redirections: an operator word
+/// (`2>/dev/null`, `>&2`, `<in`) and the separate target of a bare operator
+/// (`> log`) belong to the shell, not to the command's argv.
+pub(crate) fn args_without_redirections(args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len());
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        match shell_redirection_token(word) {
+            Some(true) => {
+                words.next();
+            }
+            Some(false) => {}
+            None => argv.push(word.clone()),
+        }
+    }
+    argv
+}
+
 /// Split the first unquoted, unescaped redirection suffix from a preceding argv
 /// word. Returns the argv prefix plus whether the operator consumes the next
 /// shell word. Process substitutions stay part of the word.
@@ -2246,6 +2264,10 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
 
     // 3) Copy/move/tee/install destination. For cp/mv/install the destination is
     // normally the LAST non-flag arg; for tee it is the first non-flag arg.
+    // Redirections (written to `out` above) are not argv: `cp a .env >/dev/null`
+    // copies to `.env`.
+    let argv = args_without_redirections(args);
+    let args = argv.as_slice();
     match leader_base {
         "cp" | "mv" | "install" => {
             // `-t DIR` / `--target-directory=DIR` inverts the layout: the DIRECTORY

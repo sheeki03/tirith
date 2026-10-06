@@ -973,7 +973,7 @@ fn check_depth(
     }
 
     check_env_var_in_command(&segments, &mut findings);
-    check_network_destination(&segments, &mut findings);
+    check_network_destination(&segments, shell, &mut findings);
     check_base64_decode_execute(&segments, shell, &mut findings);
     if analyze_flow {
         let _ = check_data_exfiltration(&segments, shell, &mut findings);
@@ -4342,7 +4342,118 @@ fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Fin
     }
 }
 
-fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
+/// The destinations of one curl URL operand under curl's URL globbing.
+enum CurlOperandHosts {
+    /// Globbing is off, or the host part holds no glob.
+    Plain,
+    /// The operand once per distinct expansion of its host part.
+    Expanded(Vec<String>),
+    /// A host-part glob tirith cannot expand within its bounds.
+    Unreadable,
+}
+
+/// `budget` is the number of expanded host parts one command may still
+/// check (see [`crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND`]); a
+/// globbed operand past it is unreadable.
+fn curl_operand_hosts(
+    args: &[String],
+    operand: &str,
+    shell: ShellType,
+    budget: &mut usize,
+) -> CurlOperandHosts {
+    if !curl_globbing_enabled(args, shell) {
+        return CurlOperandHosts::Plain;
+    }
+    match crate::extract::curl_host_glob(operand) {
+        crate::extract::CurlHostGlob::Plain => CurlOperandHosts::Plain,
+        crate::extract::CurlHostGlob::Expanded(expansions) if expansions.len() <= *budget => {
+            *budget -= expansions.len();
+            CurlOperandHosts::Expanded(expansions)
+        }
+        crate::extract::CurlHostGlob::Expanded(_) | crate::extract::CurlHostGlob::Unreadable => {
+            CurlOperandHosts::Unreadable
+        }
+    }
+}
+
+/// Whether curl expands `[...]` / `{...}` globs in these arguments' URLs: on
+/// unless `-g` / `--globoff` (also inside a cluster of short flags such as
+/// `-sg`) turns it off; a later `--no-globoff` turns it back on. With `--next`
+/// (`-:`) options apply to one URL group each, so globbing is taken as on.
+pub(crate) fn curl_globbing_enabled(args: &[String], shell: ShellType) -> bool {
+    let mut enabled = true;
+    let mut takes_value = false;
+    for arg in args {
+        let word = normalize_shell_token(arg, shell);
+        if std::mem::take(&mut takes_value) {
+            continue;
+        }
+        if word == "--" {
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            continue;
+        }
+        match word.as_str() {
+            "--next" => return true,
+            "--globoff" => {
+                enabled = false;
+                continue;
+            }
+            "--no-globoff" => {
+                enabled = true;
+                continue;
+            }
+            _ => {}
+        }
+        let value = fetch_option_value("curl", &word);
+        takes_value = value.as_ref().is_some_and(|value| value.attached.is_none());
+        if word.starts_with("--") {
+            continue;
+        }
+        // Short flags before the first value-taking letter of the cluster.
+        let flags_end = match value.and_then(|value| value.attached) {
+            Some(attached) => word.len() - attached.len() - 1,
+            None if takes_value => word.len() - 1,
+            None => word.len(),
+        };
+        let flags = word.get(1..flags_end).unwrap_or_default();
+        if flags.contains(':') {
+            return true;
+        }
+        if flags.contains('g') {
+            enabled = false;
+        }
+    }
+    enabled
+}
+
+fn curl_glob_unreadable_finding(operand: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "curl URL glob in the host could not be checked".to_string(),
+        description: "curl expands `[...]` ranges and `{...}` sets in a URL (unless `-g` / \
+                      `--globoff` is given), so this operand may reach hosts that are not \
+                      written out. Its host part expands to more destinations than tirith \
+                      checks, or uses a glob tirith cannot read. List the hosts, or pass `-g` \
+                      when the brackets are literal."
+            .to_string(),
+        evidence: vec![Evidence::Url {
+            raw: operand.to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+fn check_network_destination(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
     for segment in segments {
         let Some(ref cmd) = segment.command else {
             continue;
@@ -4350,6 +4461,25 @@ fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<
         let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
         if !is_source_command(&cmd_base) {
             continue;
+        }
+
+        // curl expands URL globs: `http://169.254.169.[254-254]/` and
+        // `http://{10.0.0.1,x}/` reach the hosts they expand to.
+        if cmd_base == "curl" {
+            let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            for operand in curl_url_operands(&segment.args, shell) {
+                match curl_operand_hosts(&segment.args, &operand, shell, &mut budget) {
+                    CurlOperandHosts::Plain => {}
+                    CurlOperandHosts::Expanded(expansions) => {
+                        for expansion in expansions {
+                            check_host_for_network_issues(&expansion, "curl", findings);
+                        }
+                    }
+                    CurlOperandHosts::Unreadable => {
+                        findings.push(curl_glob_unreadable_finding(&operand));
+                    }
+                }
+            }
         }
 
         for arg in &segment.args {
@@ -5175,14 +5305,32 @@ pub fn check_network_policy(
         }
 
         if is_url_fetch_command(&cmd_base) {
+            let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
             for destination in url_fetch_destination_operands(&cmd_base, resolved_args, shell) {
-                let Some(host) = extract_client_destination_host(&cmd_base, &destination) else {
-                    continue;
+                // A curl URL glob reaches every host it expands to: the
+                // operand is denied if any of them is denied and not allowed,
+                // so the allow list admits it only if it covers each of them.
+                let hosts: Vec<String> = match (cmd_base == "curl")
+                    .then(|| curl_operand_hosts(resolved_args, &destination, shell, &mut budget))
+                {
+                    Some(CurlOperandHosts::Unreadable) => {
+                        findings.push(curl_glob_unreadable_finding(&destination));
+                        return findings;
+                    }
+                    Some(CurlOperandHosts::Expanded(expansions)) => expansions
+                        .iter()
+                        .filter_map(|expansion| extract_client_destination_host("curl", expansion))
+                        .collect(),
+                    Some(CurlOperandHosts::Plain) | None => {
+                        extract_client_destination_host(&cmd_base, &destination)
+                            .into_iter()
+                            .collect()
+                    }
                 };
-                if matches_client_network_list(&cmd_base, &host, allow, NetworkListUse::Allow) {
-                    continue;
-                }
-                if matches_client_network_list(&cmd_base, &host, deny, NetworkListUse::Deny) {
+                if let Some(host) = hosts.iter().find(|host| {
+                    !matches_client_network_list(&cmd_base, host, allow, NetworkListUse::Allow)
+                        && matches_client_network_list(&cmd_base, host, deny, NetworkListUse::Deny)
+                }) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,

@@ -2610,3 +2610,79 @@ context = "exec"
 expected_action = "warn"
 expected_rules = ["iac_apply_auto_approve"]
 forbidden_rules = ["analysis_incomplete"]
+
+# curl expands `[...]` ranges and `{...}` sets in a URL (unless -g/--globoff),
+# so a globbed host reaches every host it expands to.
+[[fixture]]
+name = "curl_metadata_range_glob"
+min_milestone = 1
+input = "curl 'http://169.254.169.[254-254]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint", "raw_ip_url"]
+
+[[fixture]]
+name = "curl_metadata_range_glob_schemeless"
+min_milestone = 1
+input = "curl '169.254.169.25[4-4]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_metadata_alibaba_range_glob"
+min_milestone = 1
+input = "curl -s 'http://100.100.100.[200-200]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_metadata_set_glob_url_option"
+min_milestone = 1
+input = "curl --url='http://{example.com,169.254.169.254}/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_private_range_glob"
+min_milestone = 1
+input = "curl 'http://10.0.0.[1-5]/admin'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_private_set_glob"
+min_milestone = 1
+input = "curl 'http://{10.0.0.1,10.0.0.2}/admin'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
+
+[[fixture]]
+name = "curl_host_glob_too_large_fails_closed"
+min_milestone = 1
+input = "curl 'http://10.[0-255].[0-255].1/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_globoff_reads_brackets_literally"
+min_milestone = 1
+input = "curl -g 'https://169.254.169.[254-254]/latest/meta-data/'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["metadata_endpoint", "analysis_incomplete"]
+
+[[fixture]]
+name = "curl_path_glob_does_not_change_the_host"
+min_milestone = 1
+input = "curl -fsSLO 'https://example.com/files/part[1-3].txt'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]

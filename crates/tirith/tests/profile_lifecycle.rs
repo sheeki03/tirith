@@ -574,3 +574,93 @@ fn setting_without_json_prints_human_text() {
     ));
     assert_eq!(json["no_op"], true);
 }
+
+/// A policy file saved with a UTF-8 byte-order mark (PowerShell 5.1
+/// `Set-Content -Encoding UTF8`, older Notepad) is edited in place like any
+/// other block-style file, and undo restores the exact bytes. The mark is kept
+/// unless serde_yaml (and so the policy loader) could not read the edited
+/// file with it: a mark right before several keys reads as several documents.
+#[test]
+fn byte_order_mark_policy_is_edited_in_place_and_undo_restores_exact_bytes() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let undo = |id: &Value| {
+        success(run(
+            &state,
+            &[
+                "policy",
+                "operation",
+                id.as_str().unwrap(),
+                "--action",
+                "undo",
+                "--json",
+            ],
+        ))
+    };
+    let loads = || {
+        let output = run(&state, &["policy", "validate"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    for original in ["\u{feff}# mine\nparanoia: 2\n", "\u{feff}paranoia: 2\n"] {
+        std::fs::write(&path, original).unwrap();
+        let setting = success(run(
+            &state,
+            &["policy", "setting", "paranoia", "3", "--json"],
+        ));
+        let after_setting = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_setting,
+            original.replace("paranoia: 2", "paranoia: 3")
+        );
+        loads();
+
+        let preview = success(run(
+            &state,
+            &["policy", "profile", "balanced", "--dry-run", "--json"],
+        ));
+        assert_eq!(preview["kind"], "profile_preview");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_setting);
+        let profile = success(run(&state, &["policy", "profile", "balanced", "--json"]));
+        let after_profile = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_profile.matches('\u{feff}').count() <= 1,
+            "{after_profile:?}"
+        );
+        assert_eq!(
+            after_profile.matches("paranoia:").count(),
+            1,
+            "{after_profile:?}"
+        );
+        if original.contains("# mine") {
+            assert!(
+                after_profile.starts_with("\u{feff}# mine\n"),
+                "{after_profile:?}"
+            );
+        }
+        loads();
+
+        undo(&profile["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_setting);
+        undo(&setting["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let reset = success(run(
+            &state,
+            &["policy", "setting", "paranoia", "reset", "--json"],
+        ));
+        let after_reset = std::fs::read_to_string(&path).unwrap();
+        assert!(after_reset.starts_with('\u{feff}'), "{after_reset:?}");
+        assert!(!after_reset.contains("paranoia"), "{after_reset:?}");
+        loads();
+        undo(&reset["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+}
