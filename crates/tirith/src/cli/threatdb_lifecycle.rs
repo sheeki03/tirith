@@ -163,11 +163,28 @@ fn data_paths() -> Result<(PathBuf, Vec<PathBuf>), String> {
     Ok((root, paths))
 }
 
+/// The account the refresh runs as. Tests substitute it to reach the root and
+/// directory-owner refusals.
+#[derive(Clone, Copy)]
+struct Account {
+    #[cfg(unix)]
+    euid: u32,
+}
+
+impl Account {
+    fn current() -> Self {
+        Self {
+            #[cfg(unix)]
+            euid: unsafe { libc::geteuid() },
+        }
+    }
+}
+
 /// Refuse a root service and an administrator-owned data directory, then hold
 /// the directory identity so a swap before publication is detected.
-fn owned_data_directory(root: &Path) -> Result<DirectoryIdentity, String> {
+fn owned_data_directory(root: &Path, account: Account) -> Result<DirectoryIdentity, String> {
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0 {
+    if account.euid == 0 {
         return Err("the dashboard does not refresh ThreatDB for the root account; run `tirith threatdb update` in the owning terminal".into());
     }
     if !root.exists() {
@@ -179,13 +196,15 @@ fn owned_data_directory(root: &Path) -> Result<DirectoryIdentity, String> {
         use std::os::unix::fs::MetadataExt;
         let metadata =
             std::fs::symlink_metadata(root).map_err(|_| "cannot inspect ThreatDB directory")?;
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.uid() != account.euid {
             return Err(
                 "ThreatDB directory is administrator-owned; use the owning terminal or installer"
                     .into(),
             );
         }
     }
+    #[cfg(not(unix))]
+    let _ = account;
     Ok(directory)
 }
 
@@ -202,18 +221,35 @@ fn require_mutable_policy(cwd: &Path) -> Result<(), String> {
 /// `tirith threatdb update` under the same foreground update lock, and
 /// rechecks the task lease, data directory and policy before each publication.
 pub(crate) fn guarded_refresh(cwd: &Path) -> Result<(), String> {
-    guarded_refresh_with(cwd, |before_publish| {
-        super::do_update_checked(false, before_publish)
-    })
+    guarded_refresh_with(
+        cwd,
+        crate::cli::selfupdate::authorize_threatdb_refresh,
+        Account::current(),
+        |before_publish| super::do_update_checked(false, before_publish),
+    )
 }
 
-fn guarded_refresh_with(
+/// The task-gate decision a refresh holds; it is rechecked before each
+/// publication.
+trait RefreshAuthorization {
+    fn revalidate(&self) -> Result<(), String>;
+}
+
+impl RefreshAuthorization for crate::cli::selfupdate::ThreatDbRefreshAuthorization {
+    fn revalidate(&self) -> Result<(), String> {
+        crate::cli::selfupdate::ThreatDbRefreshAuthorization::revalidate(self)
+    }
+}
+
+fn guarded_refresh_with<A: RefreshAuthorization>(
     cwd: &Path,
+    authorize: impl FnOnce() -> Result<A, String>,
+    account: Account,
     update: impl FnOnce(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let auth = crate::cli::selfupdate::authorize_threatdb_refresh()?;
+    let auth = authorize()?;
     let (root, _) = data_paths()?;
-    let directory = owned_data_directory(&root)?;
+    let directory = owned_data_directory(&root, account)?;
     require_mutable_policy(cwd)?;
     let _update_lock = super::lock_foreground_update()?;
     let check = |_will_publish: bool| -> Result<(), String> {
@@ -258,7 +294,38 @@ mod tests {
         let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
         state.remove_env("TIRITH_THREATDB_PATH");
         state.remove_env("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        state.remove_env("TIRITH_SERVER_URL");
+        state.remove_env("TIRITH_API_KEY");
         state
+    }
+
+    /// The dashboard route's own authorization and account.
+    fn live_refresh(
+        cwd: &Path,
+        update: impl FnOnce(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        guarded_refresh_with(
+            cwd,
+            crate::cli::selfupdate::authorize_threatdb_refresh,
+            Account::current(),
+            update,
+        )
+    }
+
+    /// A refusal must come before the update (and so before any network).
+    fn refused_before_update(
+        refresh: impl FnOnce(
+            &mut dyn FnMut(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
+        ) -> Result<(), String>,
+    ) -> String {
+        let mut called = false;
+        let error = refresh(&mut |_: &dyn Fn(bool) -> Result<(), String>| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called, "the update ran despite the refusal: {error}");
+        error
     }
 
     #[test]
@@ -266,7 +333,7 @@ mod tests {
         // The shared fixture redirects both ThreatDB paths.
         let state = tirith_test_support::GlobalStateGuard::new().unwrap();
         let called = std::cell::Cell::new(false);
-        let error = guarded_refresh_with(&state.roots().cwd, |_| {
+        let error = live_refresh(&state.roots().cwd, |_| {
             called.set(true);
             Ok(())
         })
@@ -280,7 +347,7 @@ mod tests {
         let state = canonical_data_state();
         let _held = super::super::lock_foreground_update().unwrap();
         let called = std::cell::Cell::new(false);
-        let error = guarded_refresh_with(&state.roots().cwd, |_| {
+        let error = live_refresh(&state.roots().cwd, |_| {
             called.set(true);
             Ok(())
         })
@@ -296,7 +363,7 @@ mod tests {
     fn dashboard_refresh_runs_the_update_under_the_cli_lock_and_rechecks_before_publish() {
         let state = canonical_data_state();
         let calls = std::cell::Cell::new(0);
-        guarded_refresh_with(&state.roots().cwd, |before_publish| {
+        live_refresh(&state.roots().cwd, |before_publish| {
             calls.set(calls.get() + 1);
             // The CLI and background updaters are excluded while it runs.
             assert!(super::super::lock_foreground_update().is_err());
@@ -310,7 +377,7 @@ mod tests {
     #[test]
     fn dashboard_refresh_refuses_publication_after_the_data_directory_is_swapped() {
         let state = canonical_data_state();
-        let error = guarded_refresh_with(&state.roots().cwd, |before_publish| {
+        let error = live_refresh(&state.roots().cwd, |before_publish| {
             let (root, _) = data_paths()?;
             std::fs::rename(&root, root.with_extension("moved")).unwrap();
             std::fs::create_dir(&root).unwrap();
@@ -318,5 +385,145 @@ mod tests {
         })
         .unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn dashboard_refresh_task_gate_refusal_is_audited_before_any_update() {
+        let mut state = canonical_data_state();
+        state.set_env("TIRITH_LOG", "1");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [network_egress, filesystem_write]\n",
+        )
+        .unwrap();
+        let cwd = state.roots().cwd.clone();
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("task gate refused"), "{error}");
+        let log_path = tirith_core::audit::audit_log_path().unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let audited = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|entry| {
+                entry["entry_type"] == "task_boundary"
+                    && entry["event"] == "owned_boundary_assessment"
+                    && entry["action"] == "deny"
+            });
+        assert!(
+            audited,
+            "the refusal must be audited in {log_path:?}: {log}"
+        );
+    }
+
+    struct Revocable(std::rc::Rc<std::cell::Cell<bool>>);
+
+    impl RefreshAuthorization for Revocable {
+        fn revalidate(&self) -> Result<(), String> {
+            if self.0.get() {
+                Err("task authorization is no longer valid: revoked".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_refresh_rechecks_the_task_authorization_before_the_update_and_each_publish() {
+        let state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // Lapsed before the update starts: refused before any download.
+        let revoked = std::rc::Rc::new(std::cell::Cell::new(true));
+        let auth = Revocable(std::rc::Rc::clone(&revoked));
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(&cwd, || Ok(auth), Account::current(), update)
+        });
+        assert!(error.contains("revoked"), "{error}");
+        // Lapsed during the update: the publication is refused.
+        let revoked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let auth = Revocable(std::rc::Rc::clone(&revoked));
+        let error = guarded_refresh_with(
+            &cwd,
+            || Ok(auth),
+            Account::current(),
+            |before_publish| {
+                before_publish(false)?;
+                revoked.set(true);
+                before_publish(true)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("revoked"), "{error}");
+    }
+
+    #[test]
+    fn dashboard_refresh_refuses_a_remote_policy_before_the_lock_and_before_publish() {
+        let mut state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // A legacy policy server; plain HTTP is refused before any socket opens.
+        state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        state.set_env("TIRITH_API_KEY", "fixture-key");
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("remote policy authority"), "{error}");
+        // Checked before the update lock, so a concurrent update cannot mask it.
+        let held = super::super::lock_foreground_update().unwrap();
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("remote policy authority"), "{error}");
+        drop(held);
+
+        // Configured while the update runs: the publication is refused.
+        state.remove_env("TIRITH_SERVER_URL");
+        state.remove_env("TIRITH_API_KEY");
+        let error = live_refresh(&cwd, |before_publish| {
+            before_publish(false)?;
+            state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+            state.set_env("TIRITH_API_KEY", "fixture-key");
+            before_publish(true)
+        })
+        .unwrap_err();
+        assert!(error.contains("remote policy authority"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_refresh_refuses_the_root_account_before_touching_the_data_directory() {
+        let mut state = canonical_data_state();
+        state.set_env("TIRITH_LOG", "0");
+        let cwd = state.roots().cwd.clone();
+        let (root, _) = data_paths().unwrap();
+        assert!(!root.exists());
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(
+                &cwd,
+                crate::cli::selfupdate::authorize_threatdb_refresh,
+                Account { euid: 0 },
+                update,
+            )
+        });
+        assert!(error.contains("root account"), "{error}");
+        assert!(!root.exists(), "the root refusal must not create {root:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_refresh_refuses_a_data_directory_owned_by_another_account() {
+        let state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // The refresh creates the directory as this test's account but runs
+        // as another, non-root one.
+        let owner = Account::current().euid;
+        let other = Account {
+            euid: if owner == 1 { 2 } else { 1 },
+        };
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(
+                &cwd,
+                crate::cli::selfupdate::authorize_threatdb_refresh,
+                other,
+                update,
+            )
+        });
+        assert!(error.contains("administrator-owned"), "{error}");
     }
 }
