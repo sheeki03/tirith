@@ -1803,3 +1803,64 @@ fn test_unsafe_user_policy_symlink_targets_fail_closed_without_blocking() {
     symlink(&directory, &link).unwrap();
     assert_fails_closed("directory target");
 }
+
+#[test]
+fn test_unreadable_curl_glob_does_not_hide_a_denied_destination() {
+    // An operand whose host glob tirith cannot read is reported once, and the
+    // deny check still covers the operands and commands after it: also when
+    // an allowlist entry matches the operand's text and the operator lowered
+    // `analysis_incomplete`.
+    let mut global = isolated_policy_state();
+    set_org_policy(
+        &mut global,
+        r#"
+network_deny:
+  - blocked.example
+  - 10.0.0.0/8
+allowlist:
+  - github.com
+severity_overrides:
+  analysis_incomplete: LOW
+"#,
+    );
+    let cwd_dir = TempDir::new().unwrap();
+    let cwd = cwd_dir.path().to_str().unwrap();
+    for input in [
+        "curl 'https://h[10-99].github.com/' https://blocked.example/x",
+        "curl 'https://h[10-99].github.com/'; curl https://blocked.example/x",
+        "curl 'https://{{x}}/a' https://blocked.example/x",
+        "curl 'https://{{x}}/a'; curl https://blocked.example/x",
+    ] {
+        let verdict = analyze_exec(input, cwd);
+        let rules: Vec<RuleId> = verdict.findings.iter().map(|f| f.rule_id).collect();
+        assert_eq!(verdict.action, Action::Block, "{input}: {rules:?}");
+        assert!(
+            rules.contains(&RuleId::CommandNetworkDeny),
+            "{input}: {rules:?}"
+        );
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| **rule == RuleId::AnalysisIncomplete)
+                .count(),
+            1,
+            "{input}: {rules:?}"
+        );
+    }
+    global.remove_env("TIRITH_POLICY_ROOT");
+}
+
+#[test]
+fn test_allowlist_does_not_drop_an_unreadable_curl_glob() {
+    // The allowlist entry matches the operand's text, but tirith cannot tell
+    // which hosts the glob reaches, so the finding is kept.
+    let mut global = isolated_policy_state();
+    set_org_policy(&mut global, "allowlist:\n  - github.com\n");
+    let cwd_dir = TempDir::new().unwrap();
+    let cwd = cwd_dir.path().to_str().unwrap();
+    let verdict = analyze_exec("curl 'https://h[10-99].github.com/'", cwd);
+    global.remove_env("TIRITH_POLICY_ROOT");
+    let rules: Vec<RuleId> = verdict.findings.iter().map(|f| f.rule_id).collect();
+    assert_eq!(verdict.action, Action::Block, "{rules:?}");
+    assert!(rules.contains(&RuleId::AnalysisIncomplete), "{rules:?}");
+}

@@ -2637,108 +2637,320 @@ pub(crate) enum CurlHostGlob {
     Unreadable,
 }
 
+/// Why the host part of a curl URL operand could not be expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurlGlobError {
+    /// Not curl glob syntax: curl rejects the URL and makes no request.
+    Syntax,
+    /// More expansions than tirith checks.
+    TooLarge,
+}
+
 /// The host part of a curl URL operand, read the way curl's URL globbing
 /// (on unless `-g`/`--globoff`) reads it: `{a,b}` sets and `[0-9]` / `[a-z]`
 /// ranges (zero-padded, with an optional `:step`), with `\[`, `\]`, `\{` and
-/// `\}` escaped and a bracketed IPv6 address (or `[]`) taken as text. Globs
-/// are expanded up to the first literal `/`, `?` or `#` after the scheme's
-/// `://`: the host cannot end later, and later globs never change it.
+/// `\}` escaped and a bracketed IPv6 address (or `[]`) taken as text. Each
+/// expansion is read up to the `/`, `?` or `#` that ends its host; curl takes
+/// one to three slashes after `scheme:`, so a glob can complete that separator
+/// (`http:/{/169.254.169.254,}`). Globs after the host never change it and are
+/// kept as written.
+///
+/// The operand is the word after quote removal, so a `${...}`, `$(...)`,
+/// `$[...]`, `$name[...]` or backtick in it may be text the shell replaces
+/// before curl runs. When the operand is not curl glob syntax as written
+/// (`${HOSTS[0]}`, `$hosts[1]`: curl would reject the URL and make no
+/// request), it is read again with that shell text as an opaque value.
 pub(crate) fn curl_host_glob(raw: &str) -> CurlHostGlob {
+    let read = match read_curl_host_glob(raw, false) {
+        Err(CurlGlobError::Syntax) if raw.contains(['$', '`']) => read_curl_host_glob(raw, true),
+        read => read,
+    };
+    match read {
+        Ok(None) => CurlHostGlob::Plain,
+        Ok(Some(expansions)) => CurlHostGlob::Expanded(expansions),
+        Err(_) => CurlHostGlob::Unreadable,
+    }
+}
+
+/// Where curl's URL parser is in one expansion of an operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurlUrlPart {
+    /// Before any `:`: a scheme name (`scheme`: still a valid one) or a
+    /// schemeless host.
+    Start { scheme: bool, empty: bool },
+    /// After `scheme:` and this many slashes.
+    Separator(u8),
+    /// The user, host and port.
+    Authority,
+}
+
+impl CurlUrlPart {
+    const BEGIN: Self = Self::Start {
+        scheme: true,
+        empty: true,
+    };
+
+    /// The part after `character`, or `None` when `character` ends the host.
+    fn after(self, character: char) -> Option<Self> {
+        match (self, character) {
+            (_, '?' | '#') => None,
+            (
+                Self::Start {
+                    scheme: true,
+                    empty: false,
+                },
+                ':',
+            ) => Some(Self::Separator(0)),
+            (Self::Start { .. } | Self::Authority, '/') => None,
+            (Self::Start { scheme, empty }, _) => Some(Self::Start {
+                scheme: scheme
+                    && if empty {
+                        character.is_ascii_alphabetic()
+                    } else {
+                        character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
+                    },
+                empty: false,
+            }),
+            // curl takes one to three slashes; a fourth is an error.
+            (Self::Separator(slashes), '/') => {
+                (slashes < 3).then_some(Self::Separator(slashes + 1))
+            }
+            (Self::Separator(_) | Self::Authority, _) => Some(Self::Authority),
+        }
+    }
+}
+
+/// One expansion of a curl URL operand: open while its host part is read,
+/// then closed with the rest of the operand as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurlGlobExpansion {
+    text: String,
+    /// `None` once the host has ended.
+    part: Option<CurlUrlPart>,
+}
+
+impl CurlGlobExpansion {
+    /// Append URL text. When a character of it ends the host, the rest of
+    /// `text` and then `rest` (the operand after it, as written) follow.
+    fn push_url_text(&mut self, text: &str, rest: &str) {
+        let Some(mut part) = self.part else {
+            return;
+        };
+        for (offset, character) in text.char_indices() {
+            self.text.push(character);
+            match part.after(character) {
+                Some(next) => part = next,
+                None => {
+                    self.text.push_str(&text[offset + character.len_utf8()..]);
+                    self.text.push_str(rest);
+                    self.part = None;
+                    return;
+                }
+            }
+        }
+        self.part = Some(part);
+    }
+
+    /// Append shell text whose value is unknown; it stays in the host part.
+    fn push_shell_text(&mut self, text: &str) {
+        if self.part.is_some() {
+            self.text.push_str(text);
+            self.part = Some(CurlUrlPart::Authority);
+        }
+    }
+}
+
+/// The distinct expansions of `raw` up to the end of each host, in curl's
+/// order (the last glob varies fastest), or `None` when no glob comes before
+/// the end of the host. With `shell_text`, shell expansions are opaque text.
+fn read_curl_host_glob(raw: &str, shell_text: bool) -> Result<Option<Vec<String>>, CurlGlobError> {
     let bytes = raw.as_bytes();
-    let mut pieces: Vec<Vec<String>> = Vec::new();
-    let mut literal = String::new();
+    let mut expansions = vec![CurlGlobExpansion {
+        text: String::new(),
+        part: Some(CurlUrlPart::BEGIN),
+    }];
     let mut combinations = 1usize;
     let mut has_glob = false;
-    let mut seen_scheme_separator = false;
     let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
+    while index < bytes.len() && expansions.iter().any(|expansion| expansion.part.is_some()) {
+        let (text, next) = match bytes[index] {
             b'\\' if matches!(bytes.get(index + 1), Some(b'{' | b'[' | b'}' | b']')) => {
-                literal.push(char::from(bytes[index + 1]));
-                index += 2;
+                (&raw[index + 1..index + 2], index + 2)
             }
-            b'[' if raw[index + 1..].starts_with(']') => {
-                literal.push_str("[]");
-                index += 2;
-            }
+            b'[' if raw[index + 1..].starts_with(']') => (&raw[index..index + 2], index + 2),
             b'[' if curl_glob_ipv6_literal_len(&raw[index..]).is_some() => {
                 let length = curl_glob_ipv6_literal_len(&raw[index..]).unwrap_or(1);
-                literal.push_str(&raw[index..index + length]);
-                index += length;
+                (&raw[index..index + length], index + length)
             }
+            b'$' | b'`' if shell_text => match shell_expansion_end(raw, index) {
+                Some(end) => {
+                    let end = end.ok_or(CurlGlobError::Syntax)?;
+                    for expansion in &mut expansions {
+                        expansion.push_shell_text(&raw[index..end]);
+                    }
+                    index = end;
+                    continue;
+                }
+                None => (&raw[index..index + 1], index + 1),
+            },
             open @ (b'[' | b'{') => {
-                let parsed = if open == b'[' {
-                    curl_glob_range(raw, index + 1)
+                let (values, next) = if open == b'[' {
+                    curl_glob_range(raw, index + 1)?
                 } else {
-                    curl_glob_set(raw, index + 1)
-                };
-                let Some((values, next)) = parsed else {
-                    return CurlHostGlob::Unreadable;
+                    curl_glob_set(raw, index + 1)?
                 };
                 combinations = combinations.saturating_mul(values.len());
                 if combinations > MAX_CURL_GLOB_COMBINATIONS {
-                    return CurlHostGlob::Unreadable;
+                    return Err(CurlGlobError::TooLarge);
                 }
-                pieces.push(vec![std::mem::take(&mut literal)]);
-                pieces.push(values);
                 has_glob = true;
+                let rest = &raw[next..];
+                let mut expanded: Vec<CurlGlobExpansion> = Vec::new();
+                for expansion in expansions {
+                    let choices = if expansion.part.is_some() {
+                        values
+                            .iter()
+                            .map(|value| {
+                                let mut choice = expansion.clone();
+                                choice.push_url_text(value, rest);
+                                choice
+                            })
+                            .collect()
+                    } else {
+                        vec![expansion]
+                    };
+                    for choice in choices {
+                        if expanded.contains(&choice) {
+                            continue;
+                        }
+                        if expanded.len() == MAX_CURL_GLOB_HOST_PARTS {
+                            return Err(CurlGlobError::TooLarge);
+                        }
+                        expanded.push(choice);
+                    }
+                }
+                expansions = expanded;
                 index = next;
+                continue;
             }
-            b'}' | b']' => return CurlHostGlob::Unreadable,
-            b':' if !seen_scheme_separator && raw[index..].starts_with("://") => {
-                seen_scheme_separator = true;
-                literal.push_str("://");
-                index += 3;
-            }
-            b'/' | b'?' | b'#' => break,
+            b'}' | b']' => return Err(CurlGlobError::Syntax),
             _ => {
-                let next = raw[index..]
-                    .chars()
-                    .next()
-                    .map_or(index + 1, |character| index + character.len_utf8());
-                literal.push_str(&raw[index..next]);
-                index = next;
+                let length = raw[index..].chars().next().map_or(1, char::len_utf8);
+                (&raw[index..index + length], index + length)
             }
+        };
+        for expansion in &mut expansions {
+            expansion.push_url_text(text, &raw[next..]);
         }
+        index = next;
     }
     if !has_glob {
-        return CurlHostGlob::Plain;
+        return Ok(None);
     }
-    pieces.push(vec![literal]);
-    let rest = &raw[index..];
-    let mut host_parts: Vec<String> = Vec::new();
-    let mut choice = vec![0usize; pieces.len()];
-    loop {
-        let part: String = pieces
-            .iter()
-            .zip(&choice)
-            .map(|(values, at)| values[*at].as_str())
-            .collect();
-        if !host_parts.contains(&part) {
-            if host_parts.len() == MAX_CURL_GLOB_HOST_PARTS {
-                return CurlHostGlob::Unreadable;
-            }
-            host_parts.push(part);
-        }
-        // Next combination, the last glob fastest (curl's order).
-        let mut position = pieces.len();
-        loop {
-            if position == 0 {
-                return CurlHostGlob::Expanded(
-                    host_parts
-                        .into_iter()
-                        .map(|part| format!("{part}{rest}"))
-                        .collect(),
-                );
-            }
-            position -= 1;
-            choice[position] += 1;
-            if choice[position] < pieces[position].len() {
-                break;
-            }
-            choice[position] = 0;
+    let mut texts: Vec<String> = Vec::new();
+    for expansion in expansions {
+        if !texts.contains(&expansion.text) {
+            texts.push(expansion.text);
         }
     }
+    Ok(Some(texts))
+}
+
+/// The end of the shell expansion that starts at `raw[start]`: `${...}`,
+/// `$(...)`, `$[...]`, `$name[...]` or a backtick body. `None` when none
+/// starts there; `Some(None)` when it is not closed. Inside `${...}` only a
+/// nested `${`, `$(` or backtick opens a scope: the first other `}` closes it.
+fn shell_expansion_end(raw: &str, start: usize) -> Option<Option<usize>> {
+    let bytes = raw.as_bytes();
+    match (bytes[start], bytes.get(start + 1)) {
+        (b'`', _) => Some(backtick_body_end(bytes, start + 1)),
+        (b'$', Some(b'{')) => Some(parameter_expansion_end(bytes, start + 2)),
+        (b'$', Some(b'(')) => Some(balanced_end(bytes, start + 2, b'(', b')')),
+        (b'$', Some(b'[')) => Some(balanced_end(bytes, start + 2, b'[', b']')),
+        (b'$', Some(first)) if first.is_ascii_alphabetic() || *first == b'_' => {
+            let name_end = start
+                + 1
+                + bytes[start + 1..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                    .count();
+            (bytes.get(name_end) == Some(&b'['))
+                .then(|| balanced_end(bytes, name_end + 1, b'[', b']'))
+        }
+        _ => None,
+    }
+}
+
+/// The index after the backtick that closes a body starting at `from`.
+fn backtick_body_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut index = from;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'`' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The index after the `close` that balances an `open` before `from`.
+fn balanced_end(bytes: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = from;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index += 2;
+            continue;
+        }
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index + 1);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The index after the `}` that closes a `${` before `from`.
+fn parameter_expansion_end(bytes: &[u8], from: usize) -> Option<usize> {
+    // The closer of each open scope: `}` for `${`, `)` for `$(` and for a
+    // `(` inside a `$(...)` body.
+    let mut closers = vec![b'}'];
+    let mut index = from;
+    while index < bytes.len() {
+        let closer = *closers.last()?;
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'$' if matches!(bytes.get(index + 1), Some(b'{' | b'(')) => {
+                closers.push(if bytes[index + 1] == b'{' { b'}' } else { b')' });
+                index += 2;
+                continue;
+            }
+            b'`' => {
+                index = backtick_body_end(bytes, index + 1)?;
+                continue;
+            }
+            b'(' if closer == b')' => closers.push(b')'),
+            byte if byte == closer => {
+                closers.pop();
+                if closers.is_empty() {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The length of a bracketed IPv6 address (`[::1]`, `[fe80::1%25eth0]`)
@@ -2759,7 +2971,7 @@ fn curl_glob_ipv6_literal_len(text: &str) -> Option<usize> {
 /// A curl `{a,b}` set starting after its `{`: its elements (a backslash
 /// escapes the next character; nested `{`/`[` and a stray `]` are errors) and
 /// the index after its `}`.
-fn curl_glob_set(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
+fn curl_glob_set(raw: &str, start: usize) -> Result<(Vec<String>, usize), CurlGlobError> {
     let mut elements = Vec::new();
     let mut element = String::new();
     let mut characters = raw[start..].char_indices();
@@ -2767,21 +2979,21 @@ fn curl_glob_set(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
         match character {
             '}' => {
                 if offset == 0 {
-                    return None;
+                    return Err(CurlGlobError::Syntax);
                 }
                 elements.push(element);
                 if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
-                    return None;
+                    return Err(CurlGlobError::TooLarge);
                 }
-                return Some((elements, start + offset + 1));
+                return Ok((elements, start + offset + 1));
             }
             ',' => {
                 elements.push(std::mem::take(&mut element));
                 if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
-                    return None;
+                    return Err(CurlGlobError::TooLarge);
                 }
             }
-            '{' | '[' | ']' => return None,
+            '{' | '[' | ']' => return Err(CurlGlobError::Syntax),
             '\\' => match characters.next() {
                 Some((_, escaped)) => element.push(escaped),
                 None => element.push('\\'),
@@ -2789,42 +3001,47 @@ fn curl_glob_set(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
             other => element.push(other),
         }
     }
-    None
+    Err(CurlGlobError::Syntax)
 }
 
 /// A curl `[a-z]` / `[0-9]` range starting after its `[`, with an optional
 /// `:step`, as its values (numbers zero-padded to the width of a leading-zero
 /// start) and the index after its `]`.
-fn curl_glob_range(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
+fn curl_glob_range(raw: &str, start: usize) -> Result<(Vec<String>, usize), CurlGlobError> {
     let text = &raw[start..];
     let bytes = text.as_bytes();
-    let first = *bytes.first()?;
+    let first = *bytes.first().ok_or(CurlGlobError::Syntax)?;
     let digits = |from: usize| {
         bytes.get(from..).map_or(0, |rest| {
             rest.iter().take_while(|byte| byte.is_ascii_digit()).count()
         })
     };
     let (values, end): (Vec<String>, usize) = if first.is_ascii_alphabetic() {
-        let (min, max) = (first, *bytes.get(2)?);
+        let (min, max) = (first, *bytes.get(2).ok_or(CurlGlobError::Syntax)?);
         if bytes.get(1) != Some(&b'-') {
-            return None;
+            return Err(CurlGlobError::Syntax);
         }
-        let (step, end) = match bytes.get(3)? {
+        let (step, end) = match bytes.get(3).ok_or(CurlGlobError::Syntax)? {
             b']' => (1usize, 4),
             b':' => {
                 let count = digits(4);
                 if count == 0 || bytes.get(4 + count) != Some(&b']') {
-                    return None;
+                    return Err(CurlGlobError::Syntax);
                 }
-                (text[4..4 + count].parse().ok()?, 4 + count + 1)
+                (
+                    text[4..4 + count]
+                        .parse()
+                        .map_err(|_| CurlGlobError::Syntax)?,
+                    4 + count + 1,
+                )
             }
-            _ => return None,
+            _ => return Err(CurlGlobError::Syntax),
         };
         if step == 0
             || (min == max && step != 1)
             || (min != max && (min > max || step > usize::from(max - min) || max - min > 25))
         {
-            return None;
+            return Err(CurlGlobError::Syntax);
         }
         let values = (min..=max)
             .step_by(step)
@@ -2834,9 +3051,9 @@ fn curl_glob_range(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
     } else if first.is_ascii_digit() {
         let min_len = digits(0);
         let pad = if first == b'0' { min_len } else { 0 };
-        let min: u64 = text[..min_len].parse().ok()?;
+        let min: u64 = text[..min_len].parse().map_err(|_| CurlGlobError::Syntax)?;
         if bytes.get(min_len) != Some(&b'-') {
-            return None;
+            return Err(CurlGlobError::Syntax);
         }
         let mut at = min_len + 1;
         while matches!(bytes.get(at), Some(b' ' | b'\t')) {
@@ -2844,16 +3061,20 @@ fn curl_glob_range(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
         }
         let max_len = digits(at);
         if max_len == 0 {
-            return None;
+            return Err(CurlGlobError::Syntax);
         }
-        let max: u64 = text[at..at + max_len].parse().ok()?;
+        let max: u64 = text[at..at + max_len]
+            .parse()
+            .map_err(|_| CurlGlobError::Syntax)?;
         at += max_len;
         let step: u64 = if bytes.get(at) == Some(&b':') {
             let count = digits(at + 1);
             if count == 0 {
-                return None;
+                return Err(CurlGlobError::Syntax);
             }
-            let step = text[at + 1..at + 1 + count].parse().ok()?;
+            let step = text[at + 1..at + 1 + count]
+                .parse()
+                .map_err(|_| CurlGlobError::Syntax)?;
             at += 1 + count;
             step
         } else {
@@ -2864,20 +3085,20 @@ fn curl_glob_range(raw: &str, start: usize) -> Option<(Vec<String>, usize)> {
             || (min == max && step != 1)
             || (min != max && (min > max || step > max - min))
         {
-            return None;
+            return Err(CurlGlobError::Syntax);
         }
         let count = (max - min) / step + 1;
         if count > MAX_CURL_GLOB_COMBINATIONS as u64 {
-            return None;
+            return Err(CurlGlobError::TooLarge);
         }
         let values = (0..count)
             .map(|offset| format!("{:0pad$}", min + offset * step))
             .collect();
         (values, at + 1)
     } else {
-        return None;
+        return Err(CurlGlobError::Syntax);
     };
-    Some((values, start + end))
+    Ok((values, start + end))
 }
 
 fn push_urls_from_source_with_curl_operands(
@@ -4718,16 +4939,8 @@ enum HeredocReader {
 /// Any other heredoc on another descriptor of a shell, `.`/`source` or a bare
 /// `exec` (which keeps it open in the current shell) is ambiguous.
 fn heredoc_reader(line: &str, operator: usize, operator_end: usize, fd: &str) -> HeredocReader {
-    // The operator (masked to blanks) belongs to the last segment that starts
-    // at or before it, so `cd /tmp; sh <<'EOF'` is read by `sh`; an operator
-    // before every command word (`<<EOF sh`) belongs to the first.
     let segments = tokenize::tokenize(line, ShellType::Posix);
-    let Some(segment) = segments
-        .iter()
-        .rev()
-        .find(|segment| segment.byte_range.start <= operator)
-        .or_else(|| segments.first())
-    else {
+    let Some(segment) = heredoc_operator_segment(line, &segments, operator) else {
         return HeredocReader::Data;
     };
     let bare_exec = segment.command.as_deref().is_some_and(|command| {
@@ -4788,6 +5001,32 @@ fn heredoc_reader(line: &str, operator: usize, operator_end: usize, fd: &str) ->
     } else {
         HeredocReader::Ambiguous
     }
+}
+
+/// The segment of `line` that holds the heredoc operator (masked to blanks)
+/// at `operator`: the one between the control operators (`;`, `&&`, `||`,
+/// `|`, `&`) around it. The operator may stand before the command word
+/// (`true; <<'EOF' sh` is read by `sh`) or after its last word
+/// (`sh <<'EOF'; true` by `sh`).
+fn heredoc_operator_segment<'a>(
+    line: &str,
+    segments: &'a [tokenize::Segment],
+    operator: usize,
+) -> Option<&'a tokenize::Segment> {
+    let mut holder = segments.first()?;
+    for pair in segments.windows(2) {
+        let gap = pair[0].byte_range.end..pair[1].byte_range.start;
+        // Only blanks and the control operator lie between two segments.
+        let separator = line
+            .get(gap.clone())
+            .and_then(|text| text.find(|character: char| !character.is_whitespace()))
+            .map_or(pair[1].byte_range.start, |offset| gap.start + offset);
+        if separator > operator {
+            break;
+        }
+        holder = &pair[1];
+    }
+    Some(holder)
 }
 
 /// A descriptor number without its leading zeros (`03` is descriptor 3).
@@ -19399,6 +19638,32 @@ mod curl_glob_tests {
         );
         assert_eq!(expanded("http://{a/x,b}/y"), ["http://a/x/y", "http://b/y"]);
         assert_eq!(expanded("10.0.0.[1- 2]/a"), ["10.0.0.1/a", "10.0.0.2/a"]);
+        // curl takes one to three slashes after `scheme:`, so a glob can
+        // complete the separator and the host starts after it.
+        assert_eq!(
+            expanded("http:/{/169.254.169.254,}/latest/"),
+            ["http://169.254.169.254/latest/", "http://latest/"]
+        );
+        assert_eq!(expanded("http:/{/a}/x"), ["http://a/x"]);
+        assert_eq!(
+            expanded("http:///{a,b}/[1-3]"),
+            ["http:///a/[1-3]", "http:///b/[1-3]"]
+        );
+        assert_eq!(
+            expanded("{a,b}.example.com/[1-100].txt"),
+            ["a.example.com/[1-100].txt", "b.example.com/[1-100].txt"]
+        );
+        // Shell expansions the shell replaces before curl runs are not curl
+        // globs when curl could not read them as written; curl globs next to
+        // them still expand, and `$` text that is a glob keeps curl's reading.
+        assert_eq!(
+            expanded("http://${CRED[0]}@{169.254.169.254,a}/"),
+            ["http://${CRED[0]}@169.254.169.254/", "http://${CRED[0]}@a/"]
+        );
+        assert_eq!(
+            expanded("http://${x@,}169.254.169.254/"),
+            ["http://$x@169.254.169.254/", "http://$169.254.169.254/"]
+        );
         // Duplicate host parts are kept once.
         assert_eq!(
             expanded("http://h{,}.example:[80-80]/"),
@@ -19411,6 +19676,16 @@ mod curl_glob_tests {
             "http://example.com/a[]b",
             "http://ex\\[1-2\\]ample.com/",
             "https://example.com?q={a,b}",
+            "example.com/a[1-100].txt",
+            "${URLS[@]}",
+            "http://${NODES[$i]}:9200/_cluster/health",
+            "https://${HOSTS[0]}/health",
+            "${API[base]}/v1/status",
+            "$hosts[1]/x",
+            "http://10.0.0.$[i+1]/",
+            "http://${x/[a-z]/y}/",
+            "http://$(printf '%s' \"${H[0]}\")/x",
+            "http://`echo ${H[0]}`/x",
         ] {
             assert_eq!(curl_host_glob(plain), CurlHostGlob::Plain, "{plain}");
         }
@@ -19424,6 +19699,12 @@ mod curl_glob_tests {
             "http://{}.example/",
             "http://10.[0-255].[0-255].1/",
             "http://h[1-65].example/",
+            "http:/{/,}h[1-65].example/",
+            // `${x:-{` ends at the first `}` in the shells, so a `}` is left
+            // over: with `x` unset curl reads `{169.254.169.254,a}`.
+            "http://${x:-{169.254.169.254,a}}/",
+            "http://${URLS[@]/",
+            "http://$p[1-100]/",
         ] {
             assert_eq!(
                 curl_host_glob(unreadable),

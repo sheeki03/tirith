@@ -2381,6 +2381,29 @@ fn baseline_host_hash_for_finding(
     crate::baseline::hash_host(&host)
 }
 
+/// Whether `finding` is an incomplete-analysis finding with text evidence
+/// that `findings` already holds with the same title, description and text.
+fn repeats_reported_analysis_gap(findings: &[Finding], finding: &Finding) -> bool {
+    fn text_evidence(finding: &Finding) -> Option<Vec<&str>> {
+        finding
+            .evidence
+            .iter()
+            .map(|evidence| match evidence {
+                crate::verdict::Evidence::Text { detail } => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+    finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
+        && text_evidence(finding).is_some()
+        && findings.iter().any(|reported| {
+            reported.rule_id == finding.rule_id
+                && reported.title == finding.title
+                && reported.description == finding.description
+                && text_evidence(reported) == text_evidence(finding)
+        })
+}
+
 fn urls_associated_with_finding(
     finding: &Finding,
     extracted: &[crate::extract::ExtractedUrl],
@@ -3651,12 +3674,18 @@ fn analyze_with_observation(
 
         if !policy.network_deny.is_empty() {
             for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::command::check_network_policy(
+                for finding in crate::rules::command::check_network_policy(
                     executable_input,
                     executable_shell,
                     &policy.network_deny,
                     &policy.network_allow,
-                ));
+                ) {
+                    // The command rules already report a curl URL operand
+                    // whose host glob could not be read; keep one finding.
+                    if !repeats_reported_analysis_gap(&findings, &finding) {
+                        findings.push(finding);
+                    }
+                }
             }
         }
 

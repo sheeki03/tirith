@@ -218,3 +218,158 @@ fn host_globs_too_large_or_unreadable_fail_closed() {
     let few = format!("curl {}", vec!["'http://h[1-64].example/'"; 16].join(" "));
     assert!(!command_rules(&few).contains(&RuleId::AnalysisIncomplete));
 }
+
+#[test]
+fn an_unreadable_operand_does_not_hide_a_later_denied_one() {
+    // The deny check goes on past an operand whose host glob tirith cannot
+    // read, in the same command and in later commands.
+    for input in [
+        "curl 'https://{{x}}/a' https://blocked.example/x",
+        "curl 'https://{{x}}/a'; curl https://blocked.example/x",
+        "curl 'https://h[10-99].github.com/' https://blocked.example/x",
+        "curl 'https://h[10-99].github.com/'; curl https://blocked.example/x",
+        "curl 'https://h{a,b,c,d,e,f,g,h}{a,b,c,d,e,f,g,h}{a,b}.github.com/' https://blocked.example/x",
+    ] {
+        let rules = denied(input, &["blocked.example"], &["github.com"]);
+        assert!(
+            rules.contains(&RuleId::CommandNetworkDeny),
+            "{input}: {rules:?}"
+        );
+        assert!(
+            rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+    }
+}
+
+#[test]
+fn shell_expansions_in_an_operand_are_not_curl_globs() {
+    // The shell replaces these before curl runs (written out, curl would
+    // reject them), so they are not unreadable host globs.
+    for input in [
+        "curl \"${URLS[@]}\"",
+        "curl -fsS \"http://${NODES[$i]}:9200/_cluster/health\"",
+        "curl \"https://${HOSTS[0]}/health\"",
+        "curl -sS \"${API[base]}/v1/status\"",
+        "curl \"$hosts[1]/x\"",
+        "curl \"http://10.0.0.$[i+1]/\"",
+        "curl \"http://${x/[a-z]/y}/\"",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            !rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+        assert!(
+            denied(input, &["blocked.example"], &[]).is_empty(),
+            "{input}"
+        );
+    }
+    // A curl glob beside shell text is still expanded.
+    let input = "curl \"http://${CRED[0]}@{169.254.169.254,example.com}/latest/\"";
+    assert!(
+        command_rules(input).contains(&RuleId::MetadataEndpoint),
+        "{input}: {:?}",
+        command_rules(input)
+    );
+    let input = "curl \"https://${CRED[0]}@{blocked.example,x}/x\"";
+    assert!(denied(input, &["blocked.example"], &[]).contains(&RuleId::CommandNetworkDeny));
+    // `$` text curl reads as written keeps curl's reading (single quotes).
+    let input = "curl 'http://${x@,}169.254.169.254/latest/'";
+    assert!(command_rules(input).contains(&RuleId::MetadataEndpoint));
+    // With `x` unset, the shells pass `{169.254.169.254,a}` to curl.
+    let input = "curl \"http://${x:-{169.254.169.254,a}}/latest/\"";
+    assert!(command_rules(input).contains(&RuleId::AnalysisIncomplete));
+}
+
+#[test]
+fn a_glob_that_completes_the_scheme_separator_reaches_its_host() {
+    // curl takes one to three slashes after `scheme:`.
+    for (input, rule) in [
+        (
+            "curl 'http:/{/169.254.169.254,}/latest/meta-data/'",
+            RuleId::MetadataEndpoint,
+        ),
+        (
+            "curl 'http:/{/169.254.169.254}/x'",
+            RuleId::MetadataEndpoint,
+        ),
+        (
+            "curl 'http:///{169.254.169.254,x}/latest/'",
+            RuleId::MetadataEndpoint,
+        ),
+        (
+            "curl 'http:/{/10.0.0.1,}/admin'",
+            RuleId::PrivateNetworkAccess,
+        ),
+        (
+            "curl 'http:/{/,}h[1-65].example/'",
+            RuleId::AnalysisIncomplete,
+        ),
+    ] {
+        assert!(
+            command_rules(input).contains(&rule),
+            "{input}: {:?}",
+            command_rules(input)
+        );
+    }
+    for input in [
+        "curl 'https:/{/blocked.example,}/x'",
+        "curl 'https:///{blocked.example,x}/x'",
+    ] {
+        assert!(
+            denied(input, &["blocked.example"], &[]).contains(&RuleId::CommandNetworkDeny),
+            "{input}"
+        );
+    }
+    // Globs after a schemeless host are still path globs.
+    for input in [
+        "curl 'example.com/a[1-100].txt'",
+        "curl '{a,b}.example.com/[1-100].txt'",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            !rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+    }
+}
+
+#[test]
+fn wrapped_curl_globs_are_read_like_direct_ones() {
+    for input in [
+        "sudo curl 'http://169.254.169.[0-255]/latest/meta-data/'",
+        "env curl 'http://169.254.169.[0-255]/latest/meta-data/'",
+        "nohup curl 'http://169.254.169.[0-255]/latest/meta-data/'",
+        "command curl 'http://169.254.169.[0-255]/latest/meta-data/'",
+    ] {
+        let rules = command_rules(input);
+        assert!(
+            rules.contains(&RuleId::AnalysisIncomplete),
+            "{input}: {rules:?}"
+        );
+    }
+    for (input, rule) in [
+        (
+            "sudo curl 'http://169.254.169.[254-254]/latest/'",
+            RuleId::MetadataEndpoint,
+        ),
+        (
+            "env curl 'http://10.0.0.[1-2]/admin'",
+            RuleId::PrivateNetworkAccess,
+        ),
+        ("sudo curl https://10.0.0.1/", RuleId::PrivateNetworkAccess),
+        (
+            "sudo curl http://169.254.169.254/latest/meta-data/",
+            RuleId::MetadataEndpoint,
+        ),
+    ] {
+        assert!(
+            command_rules(input).contains(&rule),
+            "{input}: {:?}",
+            command_rules(input)
+        );
+    }
+    let input = "sudo curl -g 'http://169.254.169.[0-255]/latest/meta-data/'";
+    assert!(!command_rules(input).contains(&RuleId::AnalysisIncomplete));
+}

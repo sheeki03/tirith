@@ -4436,11 +4436,15 @@ fn curl_glob_unreadable_finding(operand: &str) -> Finding {
         description: "curl expands `[...]` ranges and `{...}` sets in a URL (unless `-g` / \
                       `--globoff` is given), so this operand may reach hosts that are not \
                       written out. Its host part expands to more destinations than tirith \
-                      checks, or uses a glob tirith cannot read. List the hosts, or pass `-g` \
-                      when the brackets are literal."
+                      checks, or uses a glob tirith cannot read. An allowlist entry does not \
+                      cover it, since the hosts it reaches are unknown. List the hosts, or pass \
+                      `-g` when the brackets are literal."
             .to_string(),
-        evidence: vec![Evidence::Url {
-            raw: operand.to_string(),
+        // Text, not URL evidence: the written operand says nothing reliable
+        // about the hosts curl reaches, so URL allowlist entries and trusted
+        // targets must not drop the finding.
+        evidence: vec![Evidence::Text {
+            detail: format!("curl URL operand: {operand}"),
         }],
         human_view: None,
         agent_view: None,
@@ -4455,10 +4459,22 @@ fn check_network_destination(
     findings: &mut Vec<Finding>,
 ) {
     for segment in segments {
-        let Some(ref cmd) = segment.command else {
-            continue;
-        };
-        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+        // Read through execution wrappers (`sudo`, `env`, `nohup`, `command`)
+        // as the URL extractor and the network policy do. A chain that cannot
+        // be resolved keeps the segment's own command word.
+        let (cmd_base, args) =
+            match crate::extract::resolve_wrapped_command_for_shell(segment, shell) {
+                Some((name, args)) => (name.to_lowercase(), args),
+                None => {
+                    let Some(ref cmd) = segment.command else {
+                        continue;
+                    };
+                    (
+                        cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase(),
+                        segment.args.clone(),
+                    )
+                }
+            };
         if !is_source_command(&cmd_base) {
             continue;
         }
@@ -4467,8 +4483,8 @@ fn check_network_destination(
         // `http://{10.0.0.1,x}/` reach the hosts they expand to.
         if cmd_base == "curl" {
             let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
-            for operand in curl_url_operands(&segment.args, shell) {
-                match curl_operand_hosts(&segment.args, &operand, shell, &mut budget) {
+            for operand in curl_url_operands(&args, shell) {
+                match curl_operand_hosts(&args, &operand, shell, &mut budget) {
                     CurlOperandHosts::Plain => {}
                     CurlOperandHosts::Expanded(expansions) => {
                         for expansion in expansions {
@@ -4482,7 +4498,7 @@ fn check_network_destination(
             }
         }
 
-        for arg in &segment.args {
+        for arg in &args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
                 // `--url=http://evil.com` style — URL is wedged into the flag value.
@@ -5314,8 +5330,10 @@ pub fn check_network_policy(
                     .then(|| curl_operand_hosts(resolved_args, &destination, shell, &mut budget))
                 {
                     Some(CurlOperandHosts::Unreadable) => {
+                        // Its hosts are unknown: report it and go on, so a
+                        // denied destination after it is still found.
                         findings.push(curl_glob_unreadable_finding(&destination));
-                        return findings;
+                        continue;
                     }
                     Some(CurlOperandHosts::Expanded(expansions)) => expansions
                         .iter()

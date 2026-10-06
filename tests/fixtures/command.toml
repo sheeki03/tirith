@@ -2686,3 +2686,103 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["analysis_incomplete"]
+
+# The shell replaces `${...}`, `$name[...]` and `$[...]` before curl runs, so
+# their brackets and braces are not curl URL globs.
+[[fixture]]
+name = "curl_shell_array_expansion_is_not_a_url_glob"
+min_milestone = 1
+input = 'curl "${URLS[@]}"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_shell_array_expansion_is_not_a_url_glob_paste"
+min_milestone = 1
+input = 'curl "${URLS[@]}"'
+context = "paste"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_shell_array_element_host_is_not_a_url_glob"
+min_milestone = 1
+input = 'curl -fsS "http://${NODES[$i]}:9200/_cluster/health"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_zsh_subscript_is_not_a_url_glob"
+min_milestone = 1
+input = 'curl "$hosts[1]/x"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_bash_arithmetic_is_not_a_url_glob"
+min_milestone = 1
+input = 'curl "http://10.0.0.$[i+1]/"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+# curl takes one to three slashes after `scheme:`, so a glob can complete the
+# separator: `http:/{/169.254.169.254,}` reaches 169.254.169.254.
+[[fixture]]
+name = "curl_glob_completing_the_scheme_separator_reaches_metadata"
+min_milestone = 1
+input = "curl 'http:/{/169.254.169.254,}/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_glob_after_three_slashes_reaches_metadata"
+min_milestone = 1
+input = "curl 'http:///{169.254.169.254,x}/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_schemeless_path_glob_does_not_change_the_host"
+min_milestone = 1
+input = "curl 'example.com/a[1-100].txt'"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]
+forbidden_rules = ["analysis_incomplete"]
+
+# A curl run through a wrapper (`sudo`, `env`, `nohup`, `command`) reaches the
+# same destinations as a direct one.
+[[fixture]]
+name = "curl_wrapped_host_glob_too_large_fails_closed"
+min_milestone = 1
+input = "sudo curl 'http://169.254.169.[0-255]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "curl_wrapped_metadata_range_glob"
+min_milestone = 1
+input = "env curl 'http://169.254.169.[254-254]/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_wrapped_private_network_destination"
+min_milestone = 1
+input = "sudo curl https://10.0.0.1/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["private_network_access"]
