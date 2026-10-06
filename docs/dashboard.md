@@ -89,8 +89,11 @@ are not affected. See `tirith dashboard --help`.
 - It never replaces the Tirith binary, asks for credentials or elevates. Binary
   updates stay in the terminal.
 - "Refresh threat DB now" refuses a redirected database path, an
-  administrator-owned data directory, the root account, and a remote policy
-  that forbids local changes. Only one refresh runs at a time.
+  administrator-owned data directory, the root account, a remote policy that
+  forbids local changes, and a refusal by the task gate (`self_update`
+  boundary; under `task_gate.mode: enforce` with
+  `action_incomplete_analysis: block` it is always refused). Only one refresh
+  runs at a time.
 - Read-only views (state, integrations, activity, history, freshness,
   operation status and the job list) never contact a policy server. The
   effective-policy view and applying or undoing a change resolve the full

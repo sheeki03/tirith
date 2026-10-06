@@ -223,7 +223,7 @@ policy that tries to LOOSEN the mode is refused and reported as neutralized by
 ```yaml
 task_gate:
   mode: enforce
-  action_incomplete_analysis: block   # refuses unmodelled shell at 5 of 9 boundaries
+  action_incomplete_analysis: block   # refuses unmodelled shell and narrative actions
 ```
 
 Because effect inference models only the Web3 shell grammar, nearly every
@@ -241,11 +241,16 @@ one-action `package_install` envelope returns `"complete": true`, a
 `config_write` envelope returns `"complete": true`, and
 `{"shell":{"command":"pip install requests"}}` returns `"complete": false`.
 
-So the setting bites at exactly the five boundaries that submit a shell
-envelope (`capsule_preset_run`, `remote_script_run`, `gateway_forward`,
-`package_manager_network`, and `package_manager_execution`) and is a no-op at
-the four that submit package or config-write envelopes (`package_approval`,
-`package_resolve`, `package_install_preparation`, `config_write`).
+So the setting refuses unmodelled shell at the five boundaries that submit a
+shell envelope (`capsule_preset_run`, `remote_script_run`, `gateway_forward`,
+`package_manager_network`, and `package_manager_execution`). It also refuses
+the narrative actions that `gateway_forward` (MCP tool calls it cannot model),
+`verify_self` and `self_update` submit when the operation names no destination
+file: `tirith verify-self`, `tirith update --dry-run` and the dashboard's
+"Refresh threat DB now". It changes nothing at `config_write`, at
+`fetch_cloaking` (the probe envelope has no action), or at a real
+`tirith update` or rollback, which submit a config-write envelope for the
+binary they replace.
 These assessment results do not qualify the package execution backend.
 `tirith pkg install` currently refuses on every host with
 `private_input_execution_unqualified`, before resolver, quarantine, checkpoint,
@@ -264,7 +269,10 @@ under their existing policies.
 `effects_denied_for_untrusted_sources` is the blunter control. But `block` is a
 usable protection for the five shell boundaries, not a switch that breaks the
 product, and an operator who wants unmodelled shell to fail closed there should
-know the option is open. Read the next section before choosing the alternative.
+know the option is open. Under `block`, `tirith verify-self`,
+`tirith update --dry-run` and the dashboard's ThreatDB refresh are refused too;
+`tirith update` itself is not. Read the next section before choosing the
+alternative.
 
 ### `effects_denied_for_untrusted_sources` denies unconditionally
 
@@ -296,7 +304,7 @@ These tirith-owned irreversible transitions, and nowhere else:
 | `fetch_cloaking` | `tirith fetch` or its MCP tool runs the cloaking probe set |
 | `config_write` | a tirith-owned config file is published by rename |
 | `verify_self` | `tirith verify-self` creates private state and contacts the release origin |
-| `self_update` | `tirith update` contacts the release origin and updates or rolls back |
+| `self_update` | `tirith update` contacts the release origin and updates or rolls back, or the dashboard's "Refresh threat DB now" refreshes the threat database |
 | `capsule_preset_run` | `capsule run --preset untrusted-project` copies or spawns anything |
 
 Four properties, each pinned by a test:

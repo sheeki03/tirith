@@ -160,7 +160,8 @@ and only these boundaries have a production writer:
   `audit::log_task_boundary_assessment`.
 - `package_manager_network` and `package_manager_execution`: the local
   `tirith install` authorization, through the same writer.
-- `verify_self` and `self_update`: `tirith verify-self` and `tirith update`,
+- `verify_self` and `self_update`: `tirith verify-self`, `tirith update` (not
+  `--dry-run`, which records nothing) and the dashboard's ThreatDB refresh,
   through the same writer.
 
 `config_write` and `capsule_preset_run` evaluate the gate but write no
@@ -199,9 +200,10 @@ Do not promote until all of these hold:
 - no verified secret material in any output or persistent artifact;
 - no false production-policy block in the reviewed corpus or in real use;
 - no material wallet-path false-positive cluster;
-- the incomplete rate is understood per tool and per boundary. Only the gateway
-  can supply this from records; for the other eight boundaries it has to come
-  from `tirith task check` against representative commands, or from your own
+- the incomplete rate is understood per tool and per boundary. The seven
+  recording boundaries (Stage 2) can supply this from records; for
+  `config_write` and `capsule_preset_run` it has to come from
+  `tirith task check` against representative commands, or from your own
   instrumentation;
 - CLI, MCP, and gateway decisions agree;
 - hot-path budgets are met;

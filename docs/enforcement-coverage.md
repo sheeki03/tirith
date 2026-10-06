@@ -54,7 +54,7 @@ absent from this branch, not that it is coming.
 |---|---|---|---|---|---|---|
 | Task envelope, source provenance, capability decision | Full | Full | None (the decision by itself stops nothing) | None | Partial (content-bound provenance receipts, verified not issued) | none |
 | `tirith task check` and the `tirith_check_task` MCP tool | Full | Full | None (both declare `observe_only`) | None | None | MCP tool is refused unless `TIRITH_MCP_PREVIEW=1` |
-| Task gate at tirith-owned transitions | Full | Full | Partial, and **inert by default** | Partial (a denied effect tightens the capsule spec) | Partial (an audit-chain line at the gateway-forward boundary only; no separate receipt) | the other eight owned boundaries write no record in any mode |
+| Task gate at tirith-owned transitions | Full | Full | Partial, and **inert by default** | Partial (a denied effect tightens the capsule spec) | Partial (an audit-chain line at seven of the nine owned boundaries; no separate receipt) | `config_write` and `capsule_preset_run` write no record in any mode |
 
 ### Supply chain
 
@@ -285,7 +285,7 @@ tool.
 | `fetch_cloaking` | before `tirith fetch` or its MCP tool runs the cloaking probe set |
 | `config_write` | before a tirith-owned config file is published by rename |
 | `verify_self` | before `tirith verify-self` creates private state and contacts the release origin |
-| `self_update` | before `tirith update` contacts the release origin and updates or rolls back |
+| `self_update` | before `tirith update` contacts the release origin and updates or rolls back, and before the dashboard's "Refresh threat DB now" refreshes the threat database |
 | `capsule_preset_run` | before `capsule run --preset untrusted-project` copies or spawns |
 
 `package_approval`, `package_resolve` and `package_install_preparation` are
@@ -312,8 +312,9 @@ these boundaries: `gateway_forward` (`write_task_boundary_audit` in
 MCP `tirith_fetch_cloaking` tool), `remote_script_run` (`tirith run`, the
 `tirith install` remote-URL path, command cards and the core runner),
 `package_manager_network` and `package_manager_execution` (`tirith install`),
-and `verify_self` and `self_update` (`tirith verify-self` and `tirith update`).
-All but the gateway write through `audit::log_task_boundary_assessment`.
+and `verify_self` and `self_update` (`tirith verify-self`, `tirith update` but
+not `--dry-run`, and the dashboard's ThreatDB refresh). All but the gateway
+write through `audit::log_task_boundary_assessment`.
 `config_write` and `capsule_preset_run` decide, refuse or allow, and write
 nothing anywhere. An observation burn-in run against `tirith policy init` under
 `mode: observe` produces no audit file at all.
@@ -341,14 +342,15 @@ envelopes come from `capsule_preset_run` (the `shell_envelope` call in
 `package_manager_network` plus `package_manager_execution` (the
 `tirith install <manager>` authorization in `install.rs`). A
 `ProposedAction::Narrative` action is also incomplete: `gateway_forward` submits
-one for an MCP tool call it does not model, and `verify_self` and `self_update`
-submit one when the operation names no destination file (for example the
-dashboard's threat-DB refresh).
+one for an MCP tool call it does not model, `verify_self` always submits one
+(`tirith verify-self` names no destination file), and `self_update` submits one
+for `tirith update --dry-run` and the dashboard's threat-DB refresh.
 
-It never fires at `config_write` or `fetch_cloaking`, or at `verify_self` and
-`self_update` when they name a destination file. The `ProposedAction::ConfigWrite`
-and `ProposedAction::PackageInstall` arms of `infer_effects_detailed_with_context`
-(`crates/tirith-core/src/task.rs`) leave `complete = true`, and the cloaking
+It never fires at `config_write` or `fetch_cloaking`, or at `self_update` for a
+real `tirith update` or rollback, which name the binary they replace. The
+`ProposedAction::ConfigWrite` and `ProposedAction::PackageInstall` arms of
+`infer_effects_detailed_with_context` (`crates/tirith-core/src/task.rs`) leave
+`complete = true`, and the cloaking
 probe envelope carries no action at all, so every tirith-owned config write
 assesses as complete and is unaffected by this setting. A one-action
 `package_install` envelope returns `"complete": true`; a `config_write` envelope

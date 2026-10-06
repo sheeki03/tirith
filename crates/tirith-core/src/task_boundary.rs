@@ -126,7 +126,9 @@ pub enum OwnedBoundary {
     /// contact the fixed Tirith release origin.
     VerifySelf,
     /// `tirith update` is about to contact the fixed release origin and perform
-    /// a retained, paired binary/helper update or rollback transaction.
+    /// a retained, paired binary/helper update or rollback transaction, or the
+    /// dashboard's "Refresh threat DB now" is about to refresh the threat
+    /// database (`authorize_threatdb_refresh` in the CLI).
     SelfUpdate,
     /// `tirith capsule run --preset untrusted-project` is about to copy an
     /// untrusted project into a held ephemeral directory and launch the

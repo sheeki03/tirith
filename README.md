@@ -292,9 +292,12 @@ contains, and attests.
 - **Task-gate coverage:** task effect inference models the Web3 shell grammar
   and nothing else, so nearly every ordinary SHELL command is reported
   INCOMPLETE. `task_gate.mode: enforce` with `action_incomplete_analysis: block`
-  refuses those at the five boundaries that submit a shell envelope, and changes
-  nothing at the four package and config-write boundaries, which always assess
-  as complete. `warn` is the default. The alternative,
+  refuses those at the five boundaries that submit a shell envelope. It also
+  refuses the narrative actions that MCP tool calls the gateway cannot model,
+  `tirith verify-self`, `tirith update --dry-run` and the dashboard's ThreatDB
+  refresh submit. It changes nothing at config writes, `tirith fetch`, or a real
+  `tirith update` or rollback, which always assess as complete. `warn` is the
+  default. The alternative,
   `effects_denied_for_untrusted_sources`, denies the named effect on every call
   at every owned boundary, including commands you typed yourself, because no
   source at those boundaries is ever treated as trusted.
