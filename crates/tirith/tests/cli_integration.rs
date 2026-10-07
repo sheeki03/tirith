@@ -2196,9 +2196,19 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// The production capsule refuses `clone(CLONE_PARENT | signal)` on x86_64 and
+/// aarch64 (14f, clone_policy.rs), so a contained target cannot give the guard
+/// a sibling child or choose that child's exit signal. Before 14f, x86_64
+/// allowed the call and this receipt checked that the guard reaped such
+/// siblings. The guard's `__WALL` reaping loop is still covered, without
+/// seccomp, by the capsule_child unit test
+/// `contained_guard_reaps_clone_parent_children_with_wall`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
-fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
+fn capsule_refuses_clone_parent_children_with_untrusted_exit_signals() {
     use std::io::{BufRead as _, BufReader};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -2216,9 +2226,13 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
         .expect("create clone-parent probe directory");
     let helper_source = helper_dir.path().join("clone_parent_probe.c");
     let helper_binary = helper_dir.path().join("clone-parent-probe");
+    // The probe publishes its pid, waits for "g", then asks for a CLONE_PARENT
+    // child with exit signal 0, SIGCHLD and the attack signal. A child that is
+    // created exits at once. Each attempt prints "<signal> <result> <errno>";
+    // then the probe prints "ready" and spins until the group is killed.
     fs::write(
         &helper_source,
-        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int sig = atoi(argv[1]); dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int kind = 0; kind < 2; ++kind) { int child_signal = kind == 0 ? 0 : SIGCHLD; for (int i = 0; i < 16; ++i) { long reaped = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)child_signal, 0, 0, 0, 0); if (reaped < 0) return 22; if (reaped == 0) _exit(0); dprintf(STDOUT_FILENO, \"%ld\\n\", reaped); } } dprintf(STDOUT_FILENO, \"ready\\n\"); if (read(STDIN_FILENO, &go, 1) != 1) return 23; int gate[2]; if (pipe(gate) != 0) return 24; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)sig, 0, 0, 0, 0); if (child < 0) { dprintf(STDERR_FILENO, \"clone-failed-%d\\n\", errno); return 25; } if (child == 0) { close(gate[1]); if (read(gate[0], &go, 1) != 1) _exit(26); _exit(0); } close(gate[0]); dprintf(STDOUT_FILENO, \"%ld\\n\", child); if (write(gate[1], \"x\", 1) != 1) return 27; for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
+        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int requested[3] = {0, SIGCHLD, atoi(argv[1])}; dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int i = 0; i < 3; ++i) { errno = 0; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)requested[i], 0, 0, 0, 0); if (child == 0) _exit(0); dprintf(STDOUT_FILENO, \"%d %ld %d\\n\", requested[i], child, child < 0 ? errno : 0); } dprintf(STDOUT_FILENO, \"ready\\n\"); for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
     )
     .expect("write clone-parent probe source");
     let compile = Command::new("cc")
@@ -2345,120 +2359,52 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
         let mut guard_stdin = guard.stdin.take().expect("guard stdin");
         guard_stdin
             .write_all(b"g")
-            .expect("trigger reaped clone-parent children");
-        let mut reaped_clone_pids = Vec::new();
-        for _ in 0..32 {
-            let mut reaped_line = String::new();
-            let bytes = target_output
-                .read_line(&mut reaped_line)
-                .expect("read reaped clone child pid");
-            assert_ne!(bytes, 0, "target stopped publishing clone child pids");
-            reaped_clone_pids.push(
-                reaped_line
-                    .trim()
-                    .parse::<libc::pid_t>()
-                    .expect("numeric reaped clone child pid"),
-            );
-        }
-        let mut ready_line = String::new();
-        target_output
-            .read_line(&mut ready_line)
-            .expect("read clone-reap ready marker");
-        assert_eq!(ready_line.trim(), "ready");
+            .expect("trigger the clone-parent attempts");
 
-        // The target remains alive while the guard reaps both ordinary SIGCHLD
-        // children and exit-signal-0 clone children (the latter require __WALL).
-        // `/proc/.../children` includes zombies, so converging to only the primary
-        // target is a direct no-zombie receipt before group teardown begins.
-        let guard_children = PathBuf::from(format!("/proc/{group}/task/{group}/children"));
-        let reaped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Collect every report before asserting, so a failed assertion below
+        // never leaks the spinning target or its guard into the suite.
+        let mut attempts = Vec::new();
+        let mut ready = false;
         loop {
-            let children = fs::read_to_string(&guard_children)
-                .expect("inspect contained guard direct children")
-                .split_whitespace()
-                .map(str::parse::<libc::pid_t>)
-                .collect::<Result<Vec<_>, _>>()
-                .expect("numeric guard child list");
-            if children == [target_pid] {
+            let mut line = String::new();
+            let bytes = target_output
+                .read_line(&mut line)
+                .expect("read a clone-parent attempt report");
+            if bytes == 0 {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < reaped_deadline,
-                "guard retained clone children or zombies while target stayed alive: {children:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if line.trim() == "ready" {
+                ready = true;
+                break;
+            }
+            attempts.push(line.trim().to_string());
         }
-        assert!(
-            reaped_clone_pids
-                .iter()
-                .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists()),
-            "a recorded CLONE_PARENT child remained present after the guard's __WALL reap"
-        );
 
-        guard_stdin
-            .write_all(b"g")
-            .expect("trigger fatal clone-parent adversary");
-        drop(guard_stdin);
-        let mut clone_line = String::new();
-        let clone_line_bytes = target_output
-            .read_line(&mut clone_line)
-            .expect("read hostile clone child pid");
-        assert_ne!(
-            clone_line_bytes, 0,
-            "target did not publish its clone child pid"
-        );
-        let clone_pid: libc::pid_t = clone_line
-            .trim()
-            .parse()
-            .expect("numeric hostile clone child pid");
-
-        // CLONE_PARENT makes the clone a direct child of the guard, but Linux
-        // deliberately does not let the cloner choose that sibling's
-        // termination signal. For legacy clone(2), the kernel replaces the low
-        // byte with the cloner's inherited exit signal; clone3(2) rejects
-        // CLONE_PARENT plus a nonzero exit signal outright. The security
-        // receipt is therefore that even a requested SIGKILL or SIGSTOP is
-        // reaped as an ordinary guard child without killing or stopping the
-        // guard.
-        let receipt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let receipt = loop {
-            let children = fs::read_to_string(&guard_children)
-                .map_err(|error| format!("inspect guard after hostile clone: {error}"))
-                .and_then(|children| {
-                    children
-                        .split_whitespace()
-                        .map(str::parse::<libc::pid_t>)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| format!("parse guard child list: {error}"))
-                });
-            let clone_present = PathBuf::from(format!("/proc/{clone_pid}")).exists();
-            if matches!(&children, Ok(children) if children == &[target_pid]) && !clone_present {
-                let guard_state = fs::read_to_string(format!("/proc/{group}/stat"))
-                    .ok()
-                    .and_then(|line| {
-                        line.rsplit_once(')').and_then(|(_, rest)| {
-                            rest.split_whitespace().next().map(str::to_string)
-                        })
-                    });
-                break Ok(guard_state);
-            }
-            if std::time::Instant::now() >= receipt_deadline {
-                break Err(format!(
-                    "guard did not reap CLONE_PARENT child {clone_pid} requested with signal \
-                     {attack_signal}: children={children:?} clone-present={clone_present}"
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+        // The target is alive (spinning) once it printed "ready". The guard
+        // must still be running, not stopped, with the target as its only
+        // child: no CLONE_PARENT sibling and no zombie.
+        let guard_children = fs::read_to_string(format!("/proc/{group}/task/{group}/children"))
+            .map_err(|error| format!("inspect guard children: {error}"))
+            .and_then(|children| {
+                children
+                    .split_whitespace()
+                    .map(str::parse::<libc::pid_t>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("parse guard child list: {error}"))
+            });
+        let guard_state = fs::read_to_string(format!("/proc/{group}/stat"))
+            .ok()
+            .and_then(|line| {
+                line.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            });
         let direct_exit = observe_test_child_without_reaping(group as libc::pid_t);
         let direct_exit_observed = matches!(&direct_exit, Ok(true));
+        drop(guard_stdin);
 
-        // This is the same safety ordering as the production supervisor: signal
-        // the complete group while its direct guard is still unreaped, then reap
-        // that leader and require ESRCH before releasing its temporary HOME.
-        // Cleanup is attempted before validating the receipt so a failed
-        // assertion cannot leak a stopped guard or its spinning target into the
-        // rest of the suite.
+        // Same safety ordering as the production supervisor: signal the whole
+        // group while its direct guard is still unreaped, then reap that leader
+        // and require ESRCH before releasing its temporary HOME.
         let cleanup = finish_test_process_group(
             &mut guard,
             group as libc::pid_t,
@@ -2481,28 +2427,32 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        assert_ne!(
-            unsafe { libc::kill(clone_pid, 0) },
-            0,
-            "hostile clone child {clone_pid} remained runnable or zombie"
-        );
+
+        let expected: Vec<String> = [0, libc::SIGCHLD, attack_signal]
+            .iter()
+            .map(|signal| format!("{signal} -1 {}", libc::EPERM))
+            .collect();
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            attempts, expected,
+            "the capsule must refuse CLONE_PARENT with EPERM whatever exit signal is requested \
+             (attack signal {attack_signal}); ready={ready}"
         );
-        let guard_state = receipt.unwrap_or_else(|error| {
-            panic!("verify untrusted clone exit signal containment: {error}")
-        });
+        assert!(ready, "target did not finish its clone-parent attempts");
+        assert_eq!(
+            guard_children,
+            Ok(vec![target_pid]),
+            "the guard must have only the contained target as a child"
+        );
         assert!(
             !direct_exit.unwrap_or_else(|error| panic!("observe guarded capsule leader: {error}")),
-            "untrusted clone exit signal terminated the guard before anchored cleanup"
+            "the guard exited before anchored cleanup"
         );
         assert!(
             !matches!(
                 guard_state.as_deref(),
                 Some("T" | "t" | "Z" | "X" | "x") | None
             ),
-            "untrusted clone exit signal stopped or terminated the guard: state={guard_state:?}"
+            "the guard was stopped or terminated: state={guard_state:?}"
         );
         assert_eq!(
             status.signal(),
