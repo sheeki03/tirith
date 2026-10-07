@@ -2074,7 +2074,26 @@ mod tests {
                 WorkDir::Unknown,
             ),
             ("cd infra & terraform apply tfplan", WorkDir::Unknown),
-            ("cd \"$D\"; cd /srv; terraform apply tfplan", known("/srv")),
+            // After an unknown directory only an absolute target is known
+            // again. A rooted POSIX path has no drive on Windows, so it is
+            // not absolute there (Git Bash maps `/` to its own install
+            // directory) and stays unknown; a drive path is absolute.
+            (
+                "cd \"$D\"; cd /srv; terraform apply tfplan",
+                if cfg!(windows) {
+                    WorkDir::Unknown
+                } else {
+                    known("/srv")
+                },
+            ),
+            (
+                "cd \"$D\"; cd C:/srv; terraform apply tfplan",
+                if cfg!(windows) {
+                    known("C:/srv")
+                } else {
+                    WorkDir::Unknown
+                },
+            ),
             // R4 fix round 2: a cd that may not run, or that runs in a
             // background subshell, and the `||` branch taken when it fails.
             (
@@ -2387,7 +2406,6 @@ mod tests {
                 "/srv",
             ),
             ("ls *(.); cd /srv; terraform apply tfplan", "/srv"),
-            ("cd \"$D\"; cd /srv; terraform apply tfplan", "/srv"),
             ("cd .; terraform apply tfplan", "."),
             (
                 "export TF_VAR_region=\"$REGION\"; cd /srv; terraform apply tfplan",
@@ -2401,6 +2419,15 @@ mod tests {
                 "{input:?}"
             );
         }
+        // After an unknown directory: `/srv` is not absolute on Windows.
+        assert_eq!(
+            work_dir_at_last_segment("cd \"$D\"; cd /srv; terraform apply tfplan"),
+            if cfg!(windows) {
+                WorkDir::Unknown
+            } else {
+                WorkDir::Known(PathBuf::from("/srv"))
+            }
+        );
     }
 
     #[test]

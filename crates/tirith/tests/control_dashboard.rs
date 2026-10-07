@@ -434,7 +434,8 @@ fn browser_profile_plan_is_read_only_until_apply_and_retries_keep_identity() {
         .cloned()
         .unwrap();
     assert_eq!(row["state"], "completed", "{row}");
-    assert_eq!(row["recovery"], cfg!(windows), "{row}");
+    // The edit created policy.yaml, so no displaced original was retained.
+    assert_eq!(row["recovery"], false, "{row}");
     let (status, changed_intent) = server.request(
         "POST",
         "/api/plans",

@@ -2874,11 +2874,26 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
             .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
     };
 
+    // The lines are POSIX shell text. On Windows spell the absolute
+    // directory as a POSIX shell (Git Bash) reads it: drive letter and
+    // forward slashes, without the `\\?\` verbatim prefix, whose
+    // backslashes the shell would read as escapes.
+    let shell_path = |path: &std::path::Path| {
+        let text = path.display().to_string();
+        if cfg!(windows) {
+            text.trim_start_matches(r"\\?\").replace('\\', "/")
+        } else {
+            text
+        }
+    };
     let infra_abs = format!(
         "cd {} && terraform apply tfplan",
-        root.join("infra").display()
+        shell_path(&root.join("infra"))
     );
-    let rec_abs = format!("cd {}; terraform apply tfplan2", root.join("rec").display());
+    let rec_abs = format!(
+        "cd {}; terraform apply tfplan2",
+        shell_path(&root.join("rec"))
+    );
     let wrong = [
         // Baseline: the recorded plan in the cwd passes, the unrecorded one blocks.
         ("terraform apply tfplan", false),

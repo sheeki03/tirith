@@ -1699,22 +1699,48 @@ mod tests {
         let get = "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
         let bad = "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
 
-        // HEAD: the GET status and headers, no body.
+        // A GET carries the whole body its Content-Length announces.
+        let announced = |answer: &Answer| {
+            answer
+                .headers
+                .get("content-length")
+                .and_then(|v| v.parse::<usize>().ok())
+        };
         let (full, _) = run(
             &get.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"),
             &[],
         );
-        let (head, trailing) = run(
-            "HEAD /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
-            &[true],
-        );
-        assert_eq!(statuses(&head), ["HTTP/1.1 200 OK"]);
-        assert_eq!(trailing, 0, "HEAD must not send a body");
-        assert_eq!(
-            head[0].headers.get("content-length"),
-            full[0].headers.get("content-length")
-        );
         assert!(!full[0].body.is_empty());
+        assert_eq!(announced(&full[0]), Some(full[0].body.len()));
+        // HEAD: the GET status and headers, no body. Every request renders
+        // the page afresh, and its three RFC 3339 timestamps print 0, 3, 6
+        // or 9 fractional digits depending on the clock value, so two
+        // renders can differ in length (often with Windows' 100 ns clock).
+        // Compare with a GET rendered the same length, retrying a bounded
+        // number of times.
+        let mut mismatches = Vec::new();
+        loop {
+            let (get_again, _) = run(
+                &get.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            let (head, trailing) = run(
+                "HEAD /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                &[true],
+            );
+            assert_eq!(statuses(&head), ["HTTP/1.1 200 OK"]);
+            assert_eq!(trailing, 0, "HEAD must not send a body");
+            assert!(head[0].body.is_empty(), "HEAD must not send a body");
+            let lengths = (announced(&get_again[0]), announced(&head[0]));
+            if lengths.0.is_some() && lengths.0 == lengths.1 {
+                break;
+            }
+            mismatches.push(lengths);
+            assert!(
+                mismatches.len() < 10,
+                "HEAD Content-Length never matched a GET: {mismatches:?}"
+            );
+        }
         let (head401, trailing) = run(
             "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
             &[true],
@@ -1751,7 +1777,8 @@ mod tests {
             "head /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
             &[false],
         );
-        assert_eq!(lower_head[0].body.len(), full[0].body.len());
+        assert!(!lower_head[0].body.is_empty());
+        assert_eq!(announced(&lower_head[0]), Some(lower_head[0].body.len()));
 
         // Absolute-form: accepted with a loopback authority; the authority and
         // the Host header must both be loopback.

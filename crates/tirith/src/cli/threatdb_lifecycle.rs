@@ -342,16 +342,32 @@ mod tests {
         assert!(!called.get());
     }
 
+    /// The other updater holds the lock on its own thread: on Windows the
+    /// lock is a named mutex, which the thread that owns it may take again,
+    /// so exclusion is between threads and processes, as in production.
     #[test]
     fn dashboard_refresh_refuses_while_another_update_holds_the_cli_lock() {
         let state = canonical_data_state();
-        let _held = super::super::lock_foreground_update().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || match super::super::lock_foreground_update() {
+            Ok(lock) => {
+                held_tx.send(None).unwrap();
+                let _ = release_rx.recv();
+                drop(lock);
+            }
+            Err(error) => held_tx.send(Some(error)).unwrap(),
+        });
+        let held = held_rx.recv().unwrap();
+        assert!(held.is_none(), "take the competing update lock: {held:?}");
         let called = std::cell::Cell::new(false);
-        let error = live_refresh(&state.roots().cwd, |_| {
+        let result = live_refresh(&state.roots().cwd, |_| {
             called.set(true);
             Ok(())
-        })
-        .unwrap_err();
+        });
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let error = result.unwrap_err();
         assert!(
             error.contains("another ThreatDB update is active"),
             "{error}"
@@ -365,8 +381,11 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         live_refresh(&state.roots().cwd, |before_publish| {
             calls.set(calls.get() + 1);
-            // The CLI and background updaters are excluded while it runs.
-            assert!(super::super::lock_foreground_update().is_err());
+            // The CLI and background updaters (other threads or processes)
+            // are excluded while it runs.
+            let other_updater =
+                std::thread::spawn(|| super::super::lock_foreground_update().is_err());
+            assert!(other_updater.join().unwrap());
             before_publish(true)
         })
         .unwrap();
