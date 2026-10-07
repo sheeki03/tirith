@@ -2980,7 +2980,8 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
 /// while tirith hashed the recorded one before this fix. Fix round 2 adds
 /// arithmetic over data, a `${ cmd; }` whose command word is built from a
 /// variable, a fish command substitution and code that may redefine
-/// `tirith` before a check-plan chain, and the PowerShell and cmd rows.
+/// `tirith` before a check-plan chain, and the PowerShell and cmd rows. Fix
+/// round 3 adds the check-plan chain on PowerShell and cmd lines.
 #[test]
 fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
     use tirith_core::iac_plan::{self, PlanSummary};
@@ -3233,6 +3234,37 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
         ),
         (ShellType::PowerShell, "cd..; terraform apply tfplan", true),
         (ShellType::Cmd, "cd.. & terraform apply tfplan", true),
+        // Fix round 3: a PowerShell line trusts the check-plan chain only
+        // when nothing but IaC commands share it (`InvokeScript` can define a
+        // `tirith` function from string pieces), and cmd never trusts it
+        // (it runs a `tirith.bat` / `tirith.cmd` in the current directory
+        // before it searches `PATH`; `P^ATH` is `PATH`), so the unrecorded
+        // plan is read before the line runs.
+        (
+            ShellType::PowerShell,
+            "$ExecutionContext.InvokeCommand.InvokeScript('func'+'tion global:tir'+'ith { }'); tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::PowerShell,
+            "Write-Host hi; tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::PowerShell,
+            "terraform plan -out tfplan2 && tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            false,
+        ),
+        (
+            ShellType::Cmd,
+            "set P^ATH=C:\\x & tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::Cmd,
+            "tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
         (ShellType::Fish, "terraform apply tfplan", false),
         (
             ShellType::Fish,

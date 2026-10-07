@@ -132,13 +132,14 @@ fn check_segments(
     // can define `tirith` as well as `cd`.
     let tirith_may_be_rebound =
         dirs.hazard == CdHazard::Rebind || tirith_lookup_may_be_rebound(segments, shell);
+    let and_only = and_only_through(segments);
     let mut findings = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
         dirs.enter(seg);
         let recorded_by_previous = if tirith_may_be_rebound {
             None
         } else {
-            check_plan_chained_before(segments, i)
+            check_plan_chained_before(segments, &and_only, i)
         };
         // The segment's own words expand before its command runs, and an
         // expansion can change the directory (bash 5.3 `${ cd x; }` runs in
@@ -751,10 +752,17 @@ fn has_current_shell_substitution(text: &str, shell: ShellType) -> bool {
 /// `(`) whose list, up to the next `)`, holds an `e` or a `+`. Quoted text
 /// becomes a pattern only through `globsubst`, `${~z}` or `eval`, which
 /// count on their own.
+///
+/// Linear in the length of `text`: the list read for one `(` ends at the
+/// next `)` (or the end of the text), and a later `(` before that point
+/// would read the rest of the same list, which the scan only gets past when
+/// it holds no `e` or `+`, so it is not read again.
 fn has_glob_qualifier_code(text: &str) -> bool {
     let bytes = text.as_bytes();
     // The open quote, and whether it is an ANSI-C `$'...'` string.
     let mut quote: Option<(u8, bool)> = None;
+    // Where the last list read ends: its `)`, or the end of the text.
+    let mut read_to = 0;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -774,7 +782,8 @@ fn has_glob_qualifier_code(text: &str) -> bool {
                     continue;
                 }
                 b'\'' | b'"' => quote = Some((b, b == b'\'' && i > 0 && bytes[i - 1] == b'$')),
-                b'(' if i > 0
+                b'(' if i >= read_to
+                    && i > 0
                     && (bytes[i - 1].is_ascii_alphanumeric()
                         || matches!(
                             bytes[i - 1],
@@ -789,13 +798,14 @@ fn has_glob_qualifier_code(text: &str) -> bool {
                                 | b'~'
                                 | b'\''
                                 | b'"'
-                        ))
-                    && bytes[i + 1..]
-                        .iter()
-                        .take_while(|&&c| c != b')')
-                        .any(|&c| c == b'e' || c == b'+') =>
+                        )) =>
                 {
-                    return true;
+                    let list = &bytes[i + 1..];
+                    let len = list.iter().position(|&c| c == b')').unwrap_or(list.len());
+                    if list[..len].iter().any(|&c| c == b'e' || c == b'+') {
+                        return true;
+                    }
+                    read_to = i + 1 + len;
                 }
                 _ => {}
             },
@@ -1106,41 +1116,58 @@ fn cd_runs_unconditionally(segments: &[tokenize::Segment], i: usize) -> bool {
     true
 }
 
+/// For each segment, `true` when every separator from the start of its
+/// and-or list up to it is `&&` (no `||` or pipe can skip a segment of the
+/// list before it). One pass, so a long `&&` chain is not walked back again
+/// for every segment.
+fn and_only_through(segments: &[tokenize::Segment]) -> Vec<bool> {
+    let mut and_only = false;
+    segments
+        .iter()
+        .map(|seg| {
+            let sep = seg.preceding_separator.as_deref();
+            and_only = starts_and_or_list(sep) || (sep == Some("&&") && and_only);
+            and_only
+        })
+        .collect()
+}
+
 /// The plan path that `tirith iac check-plan` records in `segments[i - 1]`
 /// when that check-plan surely runs, and succeeds, before `segments[i]`:
 /// `segments[i]` follows it with `&&`, and every separator back to the start
-/// of the and-or list is `&&` too (no `||` or pipe can skip it).
-fn check_plan_chained_before(segments: &[tokenize::Segment], i: usize) -> Option<PathBuf> {
+/// of the and-or list is `&&` too (no `||` or pipe can skip it). `and_only`
+/// is `and_only_through(segments)`.
+fn check_plan_chained_before(
+    segments: &[tokenize::Segment],
+    and_only: &[bool],
+    i: usize,
+) -> Option<PathBuf> {
     let prev = i.checked_sub(1)?;
-    if segments[i].preceding_separator.as_deref() != Some("&&") {
+    if segments[i].preceding_separator.as_deref() != Some("&&") || !and_only[prev] {
         return None;
-    }
-    let mut j = prev;
-    loop {
-        let sep = segments[j].preceding_separator.as_deref();
-        if starts_and_or_list(sep) {
-            break;
-        }
-        if sep != Some("&&") || j == 0 {
-            return None;
-        }
-        j -= 1;
     }
     check_plan_recorded_path(&segments[prev])
 }
 
-/// `true` when some segment other than a plain `tirith iac check-plan` could
-/// make the bare word `tirith` run something else: it names `tirith` (an
-/// alias, function or `hash` entry), changes `PATH`, defines a function, or
-/// evaluates code that could. In a POSIX shell or fish, so does any segment
-/// that runs code tirith cannot read in the shell (`CdHazard::Rebind`: a
-/// trap, a command word built by an expansion, a bash 5.3 `${ cmd; }`,
-/// arithmetic over data, `export "$n=/x"` for `PATH`, ...), and an IaC
-/// segment whose own words may (`apply_words_may_move`). Over-approximates:
-/// a false positive only means the plan file is read at preexec time as
-/// usual.
+/// `true` when the bare word `tirith` in a check-plan chain may run something
+/// other than tirith. In cmd it always may: cmd runs a `tirith.bat`,
+/// `tirith.cmd` or `tirith.exe` in the current directory before it searches
+/// `PATH`. Elsewhere, when some segment other than a plain `tirith iac
+/// check-plan` could make the word run something else: it names `tirith` (an
+/// alias, function or `hash` entry), changes `PATH`, defines a function,
+/// evaluates code that could, or runs code tirith cannot read in the shell
+/// (`CdHazard::Rebind`: a trap, a command word built by an expansion, a bash
+/// 5.3 `${ cmd; }`, arithmetic over data, `export "$n=/x"` for `PATH`, and
+/// any PowerShell command, since tirith models neither PowerShell's
+/// functions nor how a string becomes code, as in `InvokeScript('func' +
+/// 'tion global:tir' + 'ith { }')`), or it is an IaC segment whose own words
+/// may (`apply_words_may_move`). Every segment of the line counts, also one
+/// after the chain, which a loop may run before it. Over-approximates: a
+/// false positive only means the plan file is read at preexec time as usual.
 fn tirith_lookup_may_be_rebound(segments: &[tokenize::Segment], shell: ShellType) -> bool {
-    let models_shell = matches!(shell, ShellType::Posix | ShellType::Fish);
+    if shell == ShellType::Cmd {
+        return true;
+    }
     segments
         .iter()
         .filter(|seg| check_plan_recorded_path(seg).is_none())
@@ -1148,12 +1175,11 @@ fn tirith_lookup_may_be_rebound(segments: &[tokenize::Segment], shell: ShellType
             let squeezed: String = seg.raw.chars().filter(|c| !c.is_whitespace()).collect();
             squeezed.contains("()")
                 || seg_words(&seg.raw).any(|w| word_may_rebind_tirith(&w))
-                || (models_shell
-                    && if iac_tool(seg, shell).is_some() {
-                        apply_words_may_move(seg, shell)
-                    } else {
-                        segment_cd_hazard(seg, shell) == CdHazard::Rebind
-                    })
+                || if iac_tool(seg, shell).is_some() {
+                    apply_words_may_move(seg, shell)
+                } else {
+                    segment_cd_hazard(seg, shell) == CdHazard::Rebind
+                }
         })
 }
 
@@ -1497,6 +1523,13 @@ fn check_segment(
 
     // Plan-before-apply gate (opt-in).
     if is_apply && policy.iac_require_plan_before_apply {
+        // cmd never trusts the chain (`tirith_lookup_may_be_rebound`), so
+        // there each step is its own command.
+        let then = if shell == ShellType::Cmd {
+            "`, then `"
+        } else {
+            " && "
+        };
         match plan_file {
             None => {
                 findings.push(make_finding(
@@ -1506,7 +1539,7 @@ fn check_segment(
                     format!(
                         "`{}` was invoked with no positional plan file and \
                          `iac_require_plan_before_apply` is on. Run \
-                         `{} plan -out tfplan && tirith iac check-plan tfplan && \
+                         `{} plan -out tfplan{then}tirith iac check-plan tfplan{then}\
                          {} apply tfplan`.",
                         tool.as_str(),
                         tool.as_str(),
@@ -1560,7 +1593,7 @@ fn check_segment(
                              cannot resolve, or in a shell started on another host, in a \
                              container or under another root, so it cannot verify which plan \
                              file will be applied. Use an absolute plan path, or run `tirith \
-                             iac check-plan <plan> && {} apply <plan>` from the plan's \
+                             iac check-plan <plan>{then}{} apply <plan>` from the plan's \
                              directory.",
                             tool.as_str(),
                             path,
@@ -2414,7 +2447,7 @@ mod tests {
             if tirith_lookup_may_be_rebound(&segments, ShellType::Posix) {
                 return None;
             }
-            check_plan_chained_before(&segments, last)
+            check_plan_chained_before(&segments, &and_only_through(&segments), last)
         };
         for (input, plan) in [
             ("tirith iac check-plan p && terraform apply p", "p"),
@@ -2468,6 +2501,327 @@ mod tests {
             "terraform plan -out p ${ $e \"$s\"; } && tirith iac check-plan p && terraform apply p",
         ] {
             assert_eq!(shortcut(input), None, "{input:?}");
+        }
+    }
+
+    /// Fix round 3: tirith models neither PowerShell nor cmd, so a PowerShell
+    /// line trusts the chain only when nothing but IaC commands share it
+    /// (`InvokeScript` can define `tirith` from string pieces), and cmd never
+    /// trusts it (cmd runs a `tirith.bat` / `tirith.cmd` in the current
+    /// directory before it searches `PATH`; `set P^ATH=...` sets `PATH`).
+    #[test]
+    fn check_plan_shortcut_on_powershell_and_cmd_lines() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let shortcut = |shell: ShellType, input: &str| {
+            let segments = tokenize::tokenize(input, shell);
+            let last = segments.len() - 1;
+            if tirith_lookup_may_be_rebound(&segments, shell) {
+                return None;
+            }
+            check_plan_chained_before(&segments, &and_only_through(&segments), last)
+        };
+        for input in [
+            "tirith iac check-plan p && terraform apply p",
+            "terraform plan -out p && tirith iac check-plan p && terraform apply p",
+        ] {
+            assert_eq!(
+                shortcut(ShellType::PowerShell, input),
+                Some(PathBuf::from("p")),
+                "{input:?}"
+            );
+        }
+        for (shell, input) in [
+            (
+                ShellType::PowerShell,
+                "$ExecutionContext.InvokeCommand.InvokeScript('func'+'tion global:tir'+'ith { }'); tirith iac check-plan p && terraform apply p",
+            ),
+            (
+                ShellType::PowerShell,
+                "Write-Host hi; tirith iac check-plan p && terraform apply p",
+            ),
+            (
+                ShellType::PowerShell,
+                "$f = 'tir' + 'ith'; tirith iac check-plan p && terraform apply p",
+            ),
+            // A later command of the line may run first in a loop.
+            (
+                ShellType::PowerShell,
+                "tirith iac check-plan p && terraform apply p; Write-Host done",
+            ),
+            (
+                ShellType::PowerShell,
+                "terraform plan -out p $(& $f) && tirith iac check-plan p && terraform apply p",
+            ),
+            (
+                ShellType::Cmd,
+                "tirith iac check-plan p && terraform apply p",
+            ),
+            (
+                ShellType::Cmd,
+                "terraform plan -out p && tirith iac check-plan p && terraform apply p",
+            ),
+            (
+                ShellType::Cmd,
+                "set P^ATH=C:\\x & tirith iac check-plan p && terraform apply p",
+            ),
+        ] {
+            assert_eq!(shortcut(shell, input), None, "{shell:?} {input:?}");
+        }
+    }
+
+    /// The pre-fix-round-3 chain lookup (it walked the `&&` chain back from
+    /// every segment), kept as the reference for `check_plan_chained_before`.
+    fn check_plan_chained_before_reference(
+        segments: &[tokenize::Segment],
+        i: usize,
+    ) -> Option<PathBuf> {
+        let prev = i.checked_sub(1)?;
+        if segments[i].preceding_separator.as_deref() != Some("&&") {
+            return None;
+        }
+        let mut j = prev;
+        loop {
+            let sep = segments[j].preceding_separator.as_deref();
+            if starts_and_or_list(sep) {
+                break;
+            }
+            if sep != Some("&&") || j == 0 {
+                return None;
+            }
+            j -= 1;
+        }
+        check_plan_recorded_path(&segments[prev])
+    }
+
+    /// Fix round 3: the one-pass chain lookup gives the reference's answer
+    /// at every segment of every line of up to four commands (`true`, the
+    /// check-plan, the apply) joined by any separator.
+    #[test]
+    fn check_plan_chain_lookup_matches_the_reference_on_every_separator_sequence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let commands = ["true", "tirith iac check-plan p", "terraform apply p"];
+        let separators = [" ; ", " && ", " || ", " | ", " |& ", " & ", "\n"];
+        let mut lines = vec![String::new()];
+        let mut checked = 0;
+        for len in 1..=4 {
+            let mut next = Vec::new();
+            for line in &lines {
+                let joins: &[&str] = if len == 1 { &[""] } else { &separators };
+                for join in joins {
+                    for cmd in commands {
+                        next.push(format!("{line}{join}{cmd}"));
+                    }
+                }
+            }
+            lines = next;
+            for line in &lines {
+                let segments = tokenize::tokenize(line, ShellType::Posix);
+                let and_only = and_only_through(&segments);
+                for i in 0..segments.len() {
+                    assert_eq!(
+                        check_plan_chained_before(&segments, &and_only, i),
+                        check_plan_chained_before_reference(&segments, i),
+                        "{line:?} at {i}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40_000, "{checked}");
+    }
+
+    /// Fix round 3: on cmd, where the chain is never trusted, the plan gate's
+    /// advice names each step as its own command.
+    #[test]
+    fn plan_gate_advice_on_cmd_names_separate_commands() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        let advice = |shell: ShellType, input: &str| {
+            check(input, shell, &gated)
+                .into_iter()
+                .map(|f| f.description)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let no_plan = advice(ShellType::Cmd, "terraform apply");
+        assert!(
+            no_plan.contains(
+                "Run `terraform plan -out tfplan`, then `tirith iac check-plan tfplan`, then \
+                 `terraform apply tfplan`."
+            ),
+            "{no_plan}"
+        );
+        let unlocatable = advice(ShellType::Cmd, "cd.. & terraform apply tfplan");
+        assert!(
+            unlocatable
+                .contains("run `tirith iac check-plan <plan>`, then `terraform apply <plan>`"),
+            "{unlocatable}"
+        );
+        for shell in [ShellType::Posix, ShellType::PowerShell] {
+            let no_plan = advice(shell, "terraform apply");
+            assert!(
+                no_plan.contains(
+                    "Run `terraform plan -out tfplan && tirith iac check-plan tfplan && \
+                     terraform apply tfplan`."
+                ),
+                "{shell:?}: {no_plan}"
+            );
+        }
+    }
+
+    /// The pre-fix-round-3 scan (quadratic: it read the list of every `(`
+    /// again), kept as the reference for `has_glob_qualifier_code`.
+    fn glob_qualifier_code_reference(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut quote: Option<(u8, bool)> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match quote {
+                Some((q, ansi_c)) => {
+                    if b == b'\\' && (q == b'"' || ansi_c) {
+                        i += 2;
+                        continue;
+                    }
+                    if b == q {
+                        quote = None;
+                    }
+                }
+                None => match b {
+                    b'\\' => {
+                        i += 2;
+                        continue;
+                    }
+                    b'\'' | b'"' => quote = Some((b, b == b'\'' && i > 0 && bytes[i - 1] == b'$')),
+                    b'(' if i > 0
+                        && (bytes[i - 1].is_ascii_alphanumeric()
+                            || b"_*?]})./-~'\"".contains(&bytes[i - 1]))
+                        && bytes[i + 1..]
+                            .iter()
+                            .take_while(|&&c| c != b')')
+                            .any(|&c| c == b'e' || c == b'+') =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Fix round 3: reading each qualifier list once gives the same answer
+    /// as reading it again for every `(`, on every string of up to five
+    /// characters over the characters the scan looks at, and of six over
+    /// the ones that open, close and fill a list.
+    #[test]
+    fn glob_qualifier_scan_matches_the_reference_on_all_short_strings() {
+        fn strings(alphabet: &[u8], len: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut level = vec![String::new()];
+            for _ in 0..len {
+                level = level
+                    .iter()
+                    .flat_map(|s| {
+                        alphabet.iter().map(move |&c| {
+                            let mut t = s.clone();
+                            t.push(char::from(c));
+                            t
+                        })
+                    })
+                    .collect();
+                all.extend(level.iter().cloned());
+            }
+            all
+        }
+        let mut checked = 0;
+        for text in strings(b"a()e+'\"\\$ ", 5)
+            .into_iter()
+            .chain(strings(b"a()e'\\", 6))
+        {
+            assert_eq!(
+                has_glob_qualifier_code(&text),
+                glob_qualifier_code_reference(&text),
+                "{text:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 150_000, "{checked}");
+        // Spot checks of the answers themselves.
+        for (text, expected) in [
+            (": *(e:'$c x':)", true),
+            ("print -l *(+$c)", true),
+            ("a(b) c(e)", true),
+            ("a(x(y)(e)", true),
+            ("a(b(c) x(+)", true),
+            ("a(a(a(a(", false),
+            ("echo 'a(e)'", false),
+            ("x=(e)", false),
+            ("$(e)", false),
+        ] {
+            assert_eq!(has_glob_qualifier_code(text), expected, "{text:?}");
+        }
+    }
+
+    /// Fix round 3: the hazard scans and the chain lookup run on every
+    /// segment of any input with an IaC command, whatever the policy says, so
+    /// they must stay linear. `has_glob_qualifier_code` used to read forward
+    /// from every `(` after a word character to the next `)`: `terraform
+    /// version; echo a(a(...` took 2.2 s of CPU at 64 KB and 37 s at 256 KB
+    /// in a release build. The bound is on this thread's CPU time
+    /// (`crate::util::thread_cpu_time`).
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn adversarial_iac_inputs_are_analyzed_in_linear_time() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let size = 128 * 1024;
+        let inputs = [
+            (
+                ShellType::Posix,
+                format!("terraform version; echo {}", "a(".repeat(size / 2)),
+            ),
+            (
+                ShellType::Posix,
+                format!("terraform apply tfplan {}", "a(".repeat(size / 2)),
+            ),
+            (
+                ShellType::Posix,
+                format!(
+                    "tirith iac check-plan p && terraform apply p; : {}",
+                    "*(".repeat(size / 2)
+                ),
+            ),
+            (
+                ShellType::Posix,
+                format!("terraform version; echo {}", "a(b(".repeat(size / 4)),
+            ),
+            // The check-plan chain lookup used to walk a `&&` chain back from
+            // every segment (55 s of CPU at 1 MB in a release build).
+            (
+                ShellType::Posix,
+                format!("terraform version && {}", "a && ".repeat(4 * size / 5)),
+            ),
+            (
+                ShellType::Posix,
+                "terraform apply p && ".repeat(4 * size / 21),
+            ),
+        ];
+        for (shell, input) in &inputs {
+            let wall = std::time::Instant::now();
+            let cpu = crate::util::thread_cpu_time();
+            let _ = check(input, *shell, &Policy::default());
+            let used = crate::util::thread_cpu_time().saturating_sub(cpu);
+            assert!(
+                used < std::time::Duration::from_secs(5),
+                "{:?} used {:?} of CPU ({:?} wall)",
+                &input[..40],
+                used,
+                wall.elapsed()
+            );
         }
     }
 
@@ -2639,19 +2993,20 @@ mod tests {
             );
         }
         // The recommended chain still records the plan right before the
-        // apply on every shell.
-        for shell in [
-            ShellType::Posix,
-            ShellType::Fish,
-            ShellType::PowerShell,
-            ShellType::Cmd,
-        ] {
-            let found = titles(
-                shell,
-                "terraform plan -out tfplan && tirith iac check-plan tfplan && terraform apply tfplan",
-            );
+        // apply on every shell but cmd. Fix round 3: cmd may run a
+        // `tirith.bat` / `tirith.cmd` from the current directory, so there the
+        // chain is not trusted and, after the earlier commands, the plan
+        // cannot be located (the advice names separate commands on cmd).
+        let chain =
+            "terraform plan -out tfplan && tirith iac check-plan tfplan && terraform apply tfplan";
+        for shell in [ShellType::Posix, ShellType::Fish, ShellType::PowerShell] {
+            let found = titles(shell, chain);
             assert!(found.is_empty(), "{shell:?}: {found:?}");
         }
+        assert_eq!(
+            titles(ShellType::Cmd, chain),
+            ["terraform apply: plan file 'tfplan' cannot be located"]
+        );
     }
 
     #[test]
