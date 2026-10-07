@@ -2920,7 +2920,9 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
         ("cd rec && terraform apply tfplan2", false),
         (rec_abs.as_str(), false),
         ("terraform -chdir=rec apply tfplan2", false),
-        ("cd rec; cd ..; terraform apply tfplan", false),
+        // A `..` component is resolved against the shell's logical
+        // directory, which tirith cannot see: it fails closed.
+        ("cd rec; cd ..; terraform apply tfplan", true),
         // A directory change tirith cannot resolve fails closed.
         ("cd \"$D\" && terraform apply tfplan", true),
         ("pushd infra >/dev/null; popd; terraform apply tfplan", true),
@@ -3071,7 +3073,7 @@ fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
         ("terraform apply infra/tfplan", true),
         ("terraform -chdir=infra apply tfplan", true),
         ("cd infra && terraform apply tfplan", true),
-        ("cd infra; cd ..; terraform apply tfplan", false),
+        ("cd infra; cd ..; terraform apply tfplan", true),
         ("bash -c 'terraform apply tfplan'", false),
         ("bash -c 'terraform apply infra/tfplan'", true),
     ]
@@ -3081,6 +3083,281 @@ fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
     assert!(
         wrong.is_empty(),
         "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
+/// Review of PR #274: the plan gate follows a literal `cd` only where it
+/// runs whenever the line runs. A `cd` inside a compound command (an `if`,
+/// a loop, a `case`, a brace group, a fish block) may not run, and a loop
+/// runs its earlier commands again after it, so the plan file it leads to
+/// is not the one the apply reads. Before this fix the tracker followed
+/// such a `cd` into the recorded `infra/tfplan` while the shell, which
+/// never ran it, applied the unrecorded `./tfplan`. Also here: a `cd`
+/// through a symlink and back with `..` (bash resolves `..` logically), and
+/// a caller directory whose name was not valid UTF-8.
+#[test]
+fn iac_plan_gate_does_not_follow_a_cd_that_may_not_run() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_cwd(&root).unwrap();
+
+    // infra/tfplan is recorded; ./tfplan, where the shell stays when the
+    // cd does not run, is not.
+    let summary = PlanSummary::default();
+    let write = |path: PathBuf, bytes: &[u8], recorded: bool| {
+        fs::write(&path, bytes).unwrap();
+        if recorded {
+            iac_plan::record_plan_hash(bytes, &path, &summary).unwrap();
+        }
+    };
+    fs::create_dir_all(root.join("infra/ops")).unwrap();
+    write(root.join("tfplan"), b"UNRECORDED ROOT PLAN", false);
+    write(root.join("infra/tfplan"), b"RECORDED INFRA PLAN", true);
+    write(root.join("infra/ops/tfplan"), b"UNRECORDED OPS PLAN", false);
+
+    let mismatch = |input: &str, shell: ShellType, cwd: &std::path::Path| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(cwd.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    let posix = ShellType::Posix;
+    let fish = ShellType::Fish;
+    // (input, shell, expected): `true` = the plan gate blocks.
+    let rows = [
+        // The body does not run: the shell applies the unrecorded ./tfplan.
+        (
+            "if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then\ncd ./infra\nfi\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if true; then :; else :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then :; elif false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "while false; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "until true; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "for d in; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "case x in y) :; cd ./infra;; esac; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "case x in\ny)\ncd ./infra\n;;\nesac\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then { :; cd ./infra; }; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "false && if true; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then cat <<E\nfi\nE\ncd ./infra\nfi\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "bash -c 'if false; then :; cd ./infra; fi; terraform apply tfplan'",
+            posix,
+            true,
+        ),
+        (
+            "if false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "if false\ncd ./infra\nend\nterraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "while false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "switch x; case y; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "false; and begin; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "if false; :; else if false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        // The second pass of the loop applies infra/ops/tfplan.
+        (
+            "cd ./infra; for i in 1 2; do :; terraform apply tfplan; cd ./ops; done",
+            posix,
+            true,
+        ),
+        (
+            "cd ./infra; for i in 1 2; :; terraform apply tfplan; cd ./ops; end",
+            fish,
+            true,
+        ),
+        // The body runs, but tirith cannot prove it: fails closed.
+        (
+            "if true; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        // Controls: a cd outside any compound command still moves it.
+        ("cd ./infra; terraform apply tfplan", posix, false),
+        (
+            "if true; then :; fi; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "for d in a; do :; done; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "case x in y) :;; esac; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "cd ./infra; for i in 1 2; do :; terraform apply tfplan; done",
+            posix,
+            false,
+        ),
+        (
+            "if true; :; end; cd ./infra; terraform apply tfplan",
+            fish,
+            false,
+        ),
+        (
+            "if false; :; else if true; :; end; cd ./infra; terraform apply tfplan",
+            fish,
+            false,
+        ),
+        ("terraform apply tfplan", posix, true),
+        ("terraform apply infra/tfplan", posix, false),
+    ];
+    let mut wrong = rows
+        .into_iter()
+        .filter(|(input, shell, expected)| mismatch(input, *shell, &root) != *expected)
+        .map(|(input, shell, expected)| (input.to_string(), shell, expected))
+        .collect::<Vec<_>>();
+
+    // `cd link; cd ..`: bash returns to the directory holding `link`
+    // (./tfplan, unrecorded); the physical parent of its target holds a
+    // recorded plan.
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(root.join("deep/target")).unwrap();
+        write(root.join("deep/tfplan"), b"RECORDED DEEP PLAN", true);
+        std::os::unix::fs::symlink(root.join("deep/target"), root.join("link")).unwrap();
+        for input in [
+            "cd ./link; cd ..; terraform apply tfplan",
+            "cd ./link/..; terraform apply tfplan",
+        ] {
+            if !mismatch(input, posix, &root) {
+                wrong.push((input.to_string(), posix, true));
+            }
+        }
+    }
+
+    // A caller directory that was not valid UTF-8 reaches tirith with
+    // U+FFFD in place of its bad bytes; the directory of that name (here
+    // one with a recorded plan) is not where the shell runs.
+    let lossy = root.join("caf\u{FFFD}-infra");
+    fs::create_dir_all(&lossy).unwrap();
+    write(lossy.join("tfplan"), b"RECORDED LOSSY PLAN", true);
+    if !mismatch("terraform apply tfplan", posix, &lossy) {
+        wrong.push((
+            "terraform apply tfplan (lossy cwd)".to_string(),
+            posix,
+            true,
+        ));
+    }
+    if mismatch(
+        &format!("terraform apply {}", lossy.join("tfplan").display()),
+        posix,
+        &lossy,
+    ) && !cfg!(windows)
+    {
+        wrong.push((
+            "terraform apply <absolute> (lossy cwd)".to_string(),
+            posix,
+            false,
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, shell, expected): {wrong:#?}"
     );
 }
 

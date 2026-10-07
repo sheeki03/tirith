@@ -125,7 +125,7 @@ where
         }
         let dirs = if k == 0 {
             // An unquoted heredoc body expands before its command runs.
-            let (dir, hazard) = nested_start(&start_dir, masked().into_iter());
+            let (dir, hazard) = nested_start(start_dir.as_deref(), masked().into_iter());
             DirTracker::start(dir, hazard.max(inherited))
         } else {
             let effects = effects.get_or_insert_with(|| {
@@ -139,7 +139,7 @@ where
                 .enumerate()
                 .filter(|&(j, _)| j != k)
                 .map(|(_, other)| *other);
-            let (dir, hazard) = nested_start(&start_dir, others);
+            let (dir, hazard) = nested_start(start_dir.as_deref(), others);
             DirTracker::start(dir, hazard.max(inherited))
         };
         findings.extend(check_segments(input, shell, policy, &segments, dirs));
@@ -161,9 +161,10 @@ fn check_segments(
     let tirith_may_be_rebound =
         dirs.hazard == CdHazard::Rebind || tirith_lookup_may_be_rebound(segments, shell);
     let and_only = and_only_through(segments);
+    let scopes = compound_scopes(segments, shell);
     let mut findings = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
-        dirs.enter(seg);
+        dirs.enter(seg, scopes[i]);
         let recorded_by_previous = if tirith_may_be_rebound {
             None
         } else {
@@ -184,7 +185,7 @@ fn check_segments(
             recorded_by_previous: recorded_by_previous.as_deref(),
         };
         findings.extend(check_segment(input, shell, policy, seg, &plan_env));
-        dirs.leave(segments, i, shell);
+        dirs.leave(segments, i, shell, scopes[i]);
     }
     findings
 }
@@ -193,11 +194,18 @@ fn check_segments(
 /// tirith's own cwd (empty) when the analysis has none. A Windows verbatim
 /// drive path (`\\?\C:\x`, as `canonicalize` returns it) turns off
 /// Windows' reading of `..` and `/` in the paths later joined to it, so it
-/// is used in its plain drive form.
-fn tracking_start_dir(cwd: Option<&Path>) -> PathBuf {
+/// is used in its plain drive form. `None` (unknown) for a directory name
+/// with a U+FFFD replacement character: callers pass the directory as text
+/// (`AnalysisContext.cwd`, the daemon request), and a name that is not
+/// valid UTF-8 reaches tirith with its bad bytes replaced, naming another
+/// path or none.
+fn tracking_start_dir(cwd: Option<&Path>) -> Option<PathBuf> {
     let Some(cwd) = cwd else {
-        return PathBuf::new();
+        return Some(PathBuf::new());
     };
+    if cwd.to_string_lossy().contains(char::REPLACEMENT_CHARACTER) {
+        return None;
+    }
     #[cfg(windows)]
     if let Some(plain) = cwd
         .to_str()
@@ -210,9 +218,9 @@ fn tracking_start_dir(cwd: Option<&Path>) -> PathBuf {
                 && bytes[2] == b'\\'
         })
     {
-        return PathBuf::from(plain);
+        return Some(PathBuf::from(plain));
     }
-    cwd.to_path_buf()
+    Some(cwd.to_path_buf())
 }
 
 /// `true` when a segment with this preceding separator starts a new and-or
@@ -259,7 +267,19 @@ impl WorkDir {
 /// The cd then runs, and it succeeds whenever the plan file tirith reads
 /// below it exists. Inside the rest of that and-or list, a segment reached
 /// through `||` may run because the cd failed, so its directory is unknown.
-/// A conditional cd (after `&&` / `||`) makes the directory unknown.
+/// A conditional cd (after `&&` / `||`) makes the directory unknown, and so
+/// does any cd inside a compound command (`if`, a loop, `case`, a brace
+/// group, a fish block), whose body may not run: `compound_scopes`. A
+/// compound command that may change the directory anywhere in it makes the
+/// directory unknown from its first segment on, since a loop runs its
+/// earlier segments again after the change. A cd whose path has a `..`
+/// component is not followed either: the shells resolve `..` against their
+/// logical working directory (`cd link; cd ..` returns to where `link`
+/// is, not to the parent of its target) unless `cd -P` or
+/// `set -o physical`, while reading a file through the joined path
+/// resolves it physically, and the start directory is itself the physical
+/// one. On Windows a POSIX line's rooted path without a drive (`cd /srv`)
+/// is not followed: Git Bash maps `/` to its own install directory.
 ///
 /// After a segment that may run code later or redefine `cd`
 /// (`CdHazard::Rebind`, in this input or around a nested body) the directory
@@ -291,14 +311,18 @@ impl DirTracker {
         }
     }
 
-    /// Update the and-or list state for the segment about to be checked.
-    fn enter(&mut self, seg: &tokenize::Segment) {
+    /// Update the and-or list state for the segment about to be checked
+    /// (`scope`: where it sits among the line's compound commands).
+    fn enter(&mut self, seg: &tokenize::Segment, scope: CompoundScope) {
         let sep = seg.preceding_separator.as_deref();
         if starts_and_or_list(sep) {
             self.cd_in_list = false;
             self.or_after_cd = false;
         } else if sep == Some("||") && self.cd_in_list {
             self.or_after_cd = true;
+        }
+        if scope.moves && self.dir != WorkDir::Elsewhere {
+            self.dir = WorkDir::Unknown;
         }
     }
 
@@ -327,7 +351,13 @@ impl DirTracker {
     }
 
     /// Apply the directory change (if any) of `segments[i]`.
-    fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
+    fn leave(
+        &mut self,
+        segments: &[tokenize::Segment],
+        i: usize,
+        shell: ShellType,
+        scope: CompoundScope,
+    ) {
         let seg = &segments[i];
         if self.dir == WorkDir::Elsewhere {
             return;
@@ -344,14 +374,20 @@ impl DirTracker {
         if !segment_may_change_dir(seg, shell) {
             return;
         }
-        let target = if cd_runs_unconditionally(segments, i) {
+        let target = if !scope.inside && cd_runs_unconditionally(segments, i) {
             literal_cd_target(seg, shell)
         } else {
             None
         };
         let target = target
             .filter(|target| !is_bare_cd_name(target) || hazard == CdHazard::None)
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .filter(|target| {
+                joins_like_a_posix_shell(target)
+                    && !target
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir)
+            });
         let dir = std::mem::replace(&mut self.dir, WorkDir::Unknown);
         self.dir = match (dir, target) {
             (WorkDir::Known(base), Some(target)) => WorkDir::Known(base.join(target)),
@@ -362,6 +398,218 @@ impl DirTracker {
             self.cd_in_list = true;
         }
     }
+}
+
+/// `true` when a path on a POSIX or fish line names what joining it to a
+/// known directory gives: an absolute path or a relative one. Not, on
+/// Windows, a rooted path without a drive (`/srv`), which Git Bash and MSYS
+/// map to their own install directory (also when they pass it to a native
+/// program such as `terraform.exe`), not to the root of the current drive
+/// that `Path::join` gives, nor a drive-relative one (`C:srv`). Elsewhere a
+/// rooted path is absolute.
+fn joins_like_a_posix_shell(path: &Path) -> bool {
+    path.is_absolute()
+        || !(path.has_root()
+            || matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(_))
+            ))
+}
+
+/// Where a segment sits among the compound commands of its input
+/// (`compound_scopes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CompoundScope {
+    /// The segment may be in the condition or body of a compound command:
+    /// it may not run, or may run more than once.
+    inside: bool,
+    /// The outermost compound command around the segment has a segment
+    /// that may change the directory or run code later
+    /// (`segment_may_change_dir`, `CdHazard::Rebind`).
+    moves: bool,
+}
+
+/// Reserved words that open a compound command whose next word is a
+/// command, in a POSIX shell (bash, zsh, sh) and in fish.
+const POSIX_OPENERS_BEFORE_COMMAND: &[&str] = &["if", "until", "while", "{"];
+const FISH_OPENERS_BEFORE_COMMAND: &[&str] = &["begin", "if", "while", "{"];
+/// ... and those whose next word is a name or a word list.
+const POSIX_OPENERS_BEFORE_WORD: &[&str] = &["case", "for", "foreach", "repeat", "select"];
+const FISH_OPENERS_BEFORE_WORD: &[&str] = &["for", "function", "switch"];
+/// Words after which the next word is still in command position.
+const POSIX_COMMAND_PREFIXES: &[&str] = &["!", "coproc", "do", "elif", "else", "then", "time"];
+const FISH_COMMAND_PREFIXES: &[&str] = &["!", "and", "else", "not", "or", "time"];
+/// Reserved words that close a compound command.
+const POSIX_CLOSERS: &[&str] = &["done", "esac", "fi", "}"];
+const FISH_CLOSERS: &[&str] = &["end", "}"];
+
+/// Where each segment of a POSIX or fish input sits among its compound
+/// commands (`if`, `while`, `until`, `for`, `select`, `case`, zsh `repeat`
+/// and `foreach`, a `{ ...; }` group; fish `if`, `while`, `for`, `switch`,
+/// `begin`, `function`). The tokenizer splits their bodies into segments
+/// (`if false; then :; cd x; fi`), so a cd there is a segment of its own
+/// that may not run. Errs toward "inside": an opener counts in every
+/// command position a segment starts with, also quoted (to the shell a
+/// quoted one is a plain word), and a closer only as the plain first word
+/// of a segment that is not piped and has no `)` (not a `case` pattern such
+/// as `fi )`), before any heredoc or backquote on the line (the tokenizer
+/// splits their bodies into segments too, `cat <<E` + newline + `fi`) and
+/// before any group the tokenizer may have ended early
+/// (`compound_openers`). A group the tokenizer keeps in one segment opens
+/// nothing that outlasts it. Other shells: all outside (tirith follows no
+/// cd there).
+fn compound_scopes(segments: &[tokenize::Segment], shell: ShellType) -> Vec<CompoundScope> {
+    let mut scopes = vec![CompoundScope::default(); segments.len()];
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return scopes;
+    }
+    let closers = if shell == ShellType::Fish {
+        FISH_CLOSERS
+    } else {
+        POSIX_CLOSERS
+    };
+    let mut depth = 0usize;
+    let mut closers_trusted = true;
+    // The first segment of the outermost compound command still open, and
+    // whether one of its segments so far may move the directory.
+    let mut outermost: Option<(usize, bool)> = None;
+    for (i, seg) in segments.iter().enumerate() {
+        let raw = seg.raw.trim_start();
+        let depth_before = depth;
+        let first_word = raw
+            .split(|c: char| c.is_whitespace() || matches!(c, '<' | '>'))
+            .next()
+            .unwrap_or("");
+        // A `case` pattern list holds `)` (`fi )`) or is split at its `|`
+        // (`fi|x)` is the segments `fi` and `x)`).
+        let pattern_like = raw.contains(')')
+            || segments.get(i + 1).is_some_and(|next| {
+                matches!(next.preceding_separator.as_deref(), Some("|" | "|&"))
+            });
+        if closers_trusted && closers.contains(&first_word) && !pattern_like {
+            depth = depth.saturating_sub(1);
+        }
+        let (opens, group_may_run_on) = compound_openers(raw, shell);
+        depth = depth.saturating_add(opens);
+        if group_may_run_on || raw.contains("<<") || raw.contains('`') {
+            closers_trusted = false;
+        }
+        if depth_before == 0 && opens == 0 {
+            continue;
+        }
+        scopes[i].inside = true;
+        let (start, moves) = outermost.get_or_insert((i, false));
+        *moves |=
+            segment_may_change_dir(seg, shell) || segment_cd_hazard(seg, shell) == CdHazard::Rebind;
+        if depth == 0 {
+            let (start, moves) = (*start, *moves);
+            outermost = None;
+            if moves {
+                scopes[start..=i].iter_mut().for_each(|s| s.moves = true);
+            }
+        }
+    }
+    if let Some((start, true)) = outermost {
+        scopes[start..].iter_mut().for_each(|s| s.moves = true);
+    }
+    scopes
+}
+
+/// How many compound commands a segment (its text `raw`, trimmed) opens
+/// that its later segments are inside: the openers in the run of
+/// command-position words it starts with (`then if`, `! while`, `do {`,
+/// fish `and begin`; fish `else if` opens nothing), and whether a group the
+/// tokenizer ended in it may in fact run on into later segments. A group
+/// the tokenizer keeps whole (a segment that starts with `{ ` or `(`, a
+/// `coproc` body) opens nothing when it plainly ends the segment: its `}`
+/// in command position (after `;`, `&` or a newline) or its `)`, then only
+/// redirections. Otherwise the tokenizer may have ended it early where the
+/// shell does not: a `}` that is an argument (`{ echo }; cd x; }`), or the
+/// `)` of a `case` pattern inside parentheses (`( case x in y) ...`,
+/// `$(case ...)`): then the segment opens one, and no later closer is
+/// trusted.
+fn compound_openers(raw: &str, shell: ShellType) -> (usize, bool) {
+    let fish = shell == ShellType::Fish;
+    let (before_command, before_word, prefixes) = if fish {
+        (
+            FISH_OPENERS_BEFORE_COMMAND,
+            FISH_OPENERS_BEFORE_WORD,
+            FISH_COMMAND_PREFIXES,
+        )
+    } else {
+        (
+            POSIX_OPENERS_BEFORE_COMMAND,
+            POSIX_OPENERS_BEFORE_WORD,
+            POSIX_COMMAND_PREFIXES,
+        )
+    };
+    let text = without_continuations(raw);
+    let may_run_on = (1, true);
+    if !fish
+        && text.find('(').is_some_and(|open| {
+            text[open..]
+                .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';' | '&' | '|'))
+                .any(|w| normalize_shell_token(w, shell) == "case")
+        })
+    {
+        return may_run_on;
+    }
+    let held_brace = (text.starts_with('{') && text[1..].starts_with(char::is_whitespace))
+        || (!fish
+            && text.split_whitespace().next() == Some("coproc")
+            && text.split_whitespace().any(|w| w == "{"));
+    if held_brace || text.starts_with('(') {
+        let closer = if text.starts_with('(') { ')' } else { '}' };
+        return if group_ends_segment(&text, closer) {
+            (0, false)
+        } else {
+            may_run_on
+        };
+    }
+    let mut opens = 0;
+    let mut previous = String::new();
+    for word in text.split_whitespace() {
+        let word = normalize_shell_token(word, shell).to_ascii_lowercase();
+        // bash `coproc NAME while ...`: a name may sit between them.
+        let after_coproc = !fish && previous == "coproc";
+        if before_command.contains(&word.as_str()) {
+            if !(fish && word == "if" && previous == "else") {
+                opens += 1;
+            }
+        } else if before_word.contains(&word.as_str()) {
+            opens += 1;
+            break;
+        } else if !prefixes.contains(&word.as_str()) && !after_coproc {
+            break;
+        }
+        previous = word;
+    }
+    (opens, false)
+}
+
+/// `true` when the segment `text` ends with the group closer `closer`
+/// (`}` or `)`) followed by nothing but redirections (`> log`,
+/// `2>/dev/null`), a `}` also in command position: after an unescaped `;`
+/// or `&`, or a newline.
+fn group_ends_segment(text: &str, closer: char) -> bool {
+    let Some(at) = text.rfind(closer) else {
+        return false;
+    };
+    let rest = text[at + 1..].trim_start();
+    let redirections_only = rest.is_empty()
+        || rest
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with(['<', '>'])
+        || rest.starts_with("&>");
+    if !redirections_only {
+        return false;
+    }
+    if closer == ')' {
+        return true;
+    }
+    let before = text[..at].trim_end_matches([' ', '\t']);
+    before.ends_with('\n')
+        || (before.ends_with([';', '&']) && !before[..before.len() - 1].ends_with('\\'))
 }
 
 /// What a segment may do to a later literal `cd`, worst last.
@@ -533,9 +781,9 @@ fn starts_child_on_other_filesystem(seg: &tokenize::Segment, shell: ShellType) -
 /// inherits their worst `CdHazard` (`CDPATH=/x bash -c '...'`).
 /// Over-approximates: a false positive only makes a plan path in the body
 /// unresolvable. Otherwise it starts in `start_dir`, the command's own
-/// directory.
+/// directory (`None`: unknown).
 fn nested_start(
-    start_dir: &Path,
+    start_dir: Option<&Path>,
     others: impl Iterator<Item = InputEffects>,
 ) -> (WorkDir, CdHazard) {
     let (changes_dir, elsewhere, hazard) = others.fold(
@@ -548,12 +796,12 @@ fn nested_start(
             )
         },
     );
-    if elsewhere {
-        (WorkDir::Elsewhere, hazard)
-    } else if changes_dir || hazard == CdHazard::Rebind {
-        (WorkDir::Unknown, hazard)
-    } else {
-        (WorkDir::Known(start_dir.to_path_buf()), hazard)
+    match start_dir {
+        _ if elsewhere => (WorkDir::Elsewhere, hazard),
+        Some(dir) if !changes_dir && hazard != CdHazard::Rebind => {
+            (WorkDir::Known(dir.to_path_buf()), hazard)
+        }
+        _ => (WorkDir::Unknown, hazard),
     }
 }
 
@@ -1623,6 +1871,10 @@ fn check_segment(
                 );
                 let resolved = in_segment_dir
                     .ok()
+                    .filter(|p| {
+                        !matches!(shell, ShellType::Posix | ShellType::Fish)
+                            || joins_like_a_posix_shell(p)
+                    })
                     .and_then(|p| plan_env.work_dir.resolve(&p));
                 if recorded_by_previous {
                     // `tirith iac check-plan <plan> && <tool> apply <plan>`:
@@ -2093,37 +2345,70 @@ mod tests {
     /// shell that runs the line already has a `CDPATH`).
     fn work_dir_at_last_segment_from(input: &str, shell: ShellType, hazard: CdHazard) -> WorkDir {
         let segments = tokenize::tokenize(input, shell);
+        let scopes = compound_scopes(&segments, shell);
         let mut dirs = DirTracker::start(WorkDir::Known(PathBuf::new()), hazard);
         for (i, seg) in segments.iter().enumerate() {
-            dirs.enter(seg);
+            dirs.enter(seg, scopes[i]);
             if i + 1 == segments.len() {
                 break;
             }
-            dirs.leave(&segments, i, shell);
+            dirs.leave(&segments, i, shell, scopes[i]);
         }
         dirs.current()
     }
 
+    /// The working directory `DirTracker` gives the first segment of
+    /// `input` whose text is `raw`.
+    fn work_dir_at_segment(input: &str, shell: ShellType, raw: &str) -> WorkDir {
+        let segments = tokenize::tokenize(input, shell);
+        let scopes = compound_scopes(&segments, shell);
+        let mut dirs = DirTracker::start(WorkDir::Known(PathBuf::new()), CdHazard::None);
+        for (i, seg) in segments.iter().enumerate() {
+            dirs.enter(seg, scopes[i]);
+            if seg.raw.trim() == raw {
+                return dirs.current();
+            }
+            dirs.leave(&segments, i, shell, scopes[i]);
+        }
+        panic!("no segment {raw:?} in {input:?}");
+    }
+
+    /// `WorkDir::Known(path)`, except for a rooted POSIX path on Windows,
+    /// which Git Bash maps to its own install directory: unknown there.
+    fn known_dir(path: &str) -> WorkDir {
+        if cfg!(windows) && path.starts_with('/') {
+            WorkDir::Unknown
+        } else {
+            WorkDir::Known(PathBuf::from(path))
+        }
+    }
+
     #[test]
     fn tracking_starts_in_the_callers_directory() {
-        assert_eq!(tracking_start_dir(None), PathBuf::new());
+        assert_eq!(tracking_start_dir(None), Some(PathBuf::new()));
         assert_eq!(
             tracking_start_dir(Some(Path::new("/srv/app"))),
-            PathBuf::from("/srv/app")
+            Some(PathBuf::from("/srv/app"))
+        );
+        // A directory name that was not valid UTF-8 arrives with its bad
+        // bytes replaced by U+FFFD (`Path::display`), naming another path.
+        assert_eq!(
+            tracking_start_dir(Some(Path::new("/srv/caf\u{FFFD}-infra"))),
+            None
         );
         // Windows does not read `..` or `/` in a path under a verbatim drive
         // prefix, so that prefix is dropped there; other verbatim forms stay.
         let verbatim = Path::new(r"\\?\C:\work\app");
         assert_eq!(
             tracking_start_dir(Some(verbatim)),
-            if cfg!(windows) {
+            Some(if cfg!(windows) {
                 PathBuf::from(r"C:\work\app")
             } else {
                 verbatim.to_path_buf()
-            }
+            })
         );
         let unc = Path::new(r"\\?\UNC\server\share\app");
-        assert_eq!(tracking_start_dir(Some(unc)), unc.to_path_buf());
+        assert_eq!(tracking_start_dir(Some(unc)), Some(unc.to_path_buf()));
     }
 
     #[test]
@@ -2139,11 +2424,34 @@ mod tests {
                 "cd -P -- ./infra || exit; terraform apply tfplan",
                 known("./infra"),
             ),
+            // A `..` component: the shells resolve it against their
+            // logical directory, not through a symlink's target.
             (
                 "cd infra; cd ../ops; terraform apply tfplan",
-                known("infra/../ops"),
+                WorkDir::Unknown,
             ),
-            ("cd /srv/infra; terraform apply tfplan", known("/srv/infra")),
+            ("cd infra; cd ..; terraform apply tfplan", WorkDir::Unknown),
+            ("cd infra/..; terraform apply tfplan", WorkDir::Unknown),
+            ("cd /srv/x/..; terraform apply tfplan", WorkDir::Unknown),
+            (
+                "cd \"$D\"; cd /srv/x/..; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            ("cd ./infra/.; terraform apply tfplan", known("./infra/.")),
+            (
+                "cd /srv/infra; terraform apply tfplan",
+                known_dir("/srv/infra"),
+            ),
+            // A drive-relative path names the current directory of that
+            // drive, not one under the known directory.
+            (
+                "cd C:srv; terraform apply tfplan",
+                if cfg!(windows) {
+                    WorkDir::Unknown
+                } else {
+                    known("C:srv")
+                },
+            ),
             ("cd \"$D\"; terraform apply tfplan", WorkDir::Unknown),
             ("cd ~/infra; terraform apply tfplan", WorkDir::Unknown),
             ("cd; terraform apply tfplan", WorkDir::Unknown),
@@ -2255,6 +2563,358 @@ mod tests {
             ("cd infra; echo ok; terraform apply tfplan", known("infra")),
         ] {
             assert_eq!(work_dir_at_last_segment(input), expected, "{input:?}");
+        }
+    }
+
+    /// Review of PR #274: the tokenizer splits a compound command's body
+    /// into segments, so a cd in an `if` / loop / `case` body (or a fish
+    /// block) is a segment of its own, which may not run. Before this fix
+    /// the tracker followed it.
+    #[test]
+    fn cd_inside_a_compound_command_is_not_followed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let known = |p: &str| WorkDir::Known(PathBuf::from(p));
+        let posix = ShellType::Posix;
+        let fish = ShellType::Fish;
+        for (input, shell, expected) in [
+            ("if false; then :; cd infra; fi; x", posix, WorkDir::Unknown),
+            ("if false; then cd infra; fi; x", posix, WorkDir::Unknown),
+            ("if false; then\ncd infra\nfi\nx", posix, WorkDir::Unknown),
+            (
+                "if true; then :; else :; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then :; elif false; then :; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "while false; do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "while false\ndo\ncd infra\ndone\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "until true; do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            ("for d in; do :; cd infra; done; x", posix, WorkDir::Unknown),
+            (
+                "for ((;0;)); do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "select d in; do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            ("repeat 0; do :; cd infra; done; x", posix, WorkDir::Unknown),
+            ("foreach d ()\ncd infra\nend\nx", posix, WorkDir::Unknown),
+            (
+                "case x in y) :; cd infra;; esac; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "case x in\ny)\ncd infra\n;;\nesac\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then { :; cd infra; }; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then if true; then :; cd infra; fi; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "false && if true; then :; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "! while false; do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            ("false || { :\ncd infra\n}\nx", posix, WorkDir::Unknown),
+            ("! { :; cd infra; }; x", posix, WorkDir::Unknown),
+            (
+                "coproc w while false; do :; cd infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            ("while false { :; cd infra; }; x", posix, WorkDir::Unknown),
+            ("for d in; cd infra; x", posix, WorkDir::Unknown),
+            (
+                "i\\\nf false; then :; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then # c\ncd infra\nfi\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            // A closer that is not one: quoted, a `case` pattern (also one
+            // split at its `|`), a heredoc or backquote body line.
+            (
+                "if false; then :; \"fi\"; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "case x in\nfi )\ncd infra;;\nesac\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "case x in\nfi|y)\ncd infra;;\nesac\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then cat <<E\nfi\nE\ncd infra\nfi\nx",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; then echo `:\nfi\n`; cd infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            // A group the tokenizer ends early: at a `}` that is an
+            // argument, or at a `case` pattern's `)` inside parentheses.
+            ("false && { echo }; cd infra; }; x", posix, WorkDir::Unknown),
+            (
+                "false && ( case x in y) :;; esac\ncd infra\n); x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "x=$(case x in y)\ncd infra\n;; esac); x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            ("coproc w { echo }; cd infra; }; x", posix, WorkDir::Unknown),
+            // After a compound command that may move the shell, the
+            // directory stays unknown.
+            ("if true; then :; cd infra; fi; x", posix, WorkDir::Unknown),
+            // fish blocks.
+            ("if false; :; cd infra; end; x", fish, WorkDir::Unknown),
+            ("if false\ncd infra\nend\nx", fish, WorkDir::Unknown),
+            (
+                "if true; :; else; :; cd infra; end; x",
+                fish,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; :; else if false; :; cd infra; end; x",
+                fish,
+                WorkDir::Unknown,
+            ),
+            ("while false; :; cd infra; end; x", fish, WorkDir::Unknown),
+            ("for d in; :; cd infra; end; x", fish, WorkDir::Unknown),
+            (
+                "switch x; case y; :; cd infra; end; x",
+                fish,
+                WorkDir::Unknown,
+            ),
+            (
+                "false; and begin; :; cd infra; end; x",
+                fish,
+                WorkDir::Unknown,
+            ),
+            (
+                "not true; or begin\ncd infra\nend\nx",
+                fish,
+                WorkDir::Unknown,
+            ),
+            ("function f; :; cd infra; end; x", fish, WorkDir::Unknown),
+            // Controls: a cd before, or after a compound command that has
+            // closed, still runs whenever the line runs.
+            (
+                "cd ./infra; if true; then :; fi; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "if true; then :; fi; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "for d in a; do :; done; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "while read -r l; do :; done < f; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "case x in y) :;; esac; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "case x in fi) :;; esac; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "if false; then if true; then :; fi; fi\ncd ./infra\nx",
+                posix,
+                known("./infra"),
+            ),
+            ("{ :; }; cd ./infra; x", posix, known("./infra")),
+            ("{ :; } > log; cd ./infra; x", posix, known("./infra")),
+            ("{ :\n} 2>/dev/null; cd ./infra; x", posix, known("./infra")),
+            ("( :; ) &>/dev/null; cd ./infra; x", posix, known("./infra")),
+            ("(echo a); cd ./infra; x", posix, known("./infra")),
+            (
+                "if true; then { :; }; fi; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "x=$(if :; then :; fi); cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            (
+                "cd ./infra; for i in 1 2; do :; x; done",
+                posix,
+                known("./infra"),
+            ),
+            ("echo for; cd ./infra; x", posix, known("./infra")),
+            ("if true; :; end; cd ./infra; x", fish, known("./infra")),
+            (
+                "if false; :; else if true; :; end; cd ./infra; x",
+                fish,
+                known("./infra"),
+            ),
+            ("begin; :; end; cd ./infra; x", fish, known("./infra")),
+            (
+                "cd ./infra; switch x; case y; :; end; x",
+                fish,
+                known("./infra"),
+            ),
+        ] {
+            assert_eq!(
+                work_dir_at_last_segment_in(input, shell),
+                expected,
+                "{input:?} ({shell:?})"
+            );
+        }
+        // A loop runs its earlier segments again after a later one moved
+        // the shell, or after a trap set in it ran: the directory is
+        // unknown from the loop's first segment on.
+        for (input, shell) in [
+            ("cd ./infra; for i in 1 2; do :; x; cd ./ops; done", posix),
+            ("cd ./infra; while :; do :; x; pushd /srv; done", posix),
+            (
+                "cd ./infra; while :; do :; x; trap \"$t\" DEBUG; done",
+                posix,
+            ),
+            ("cd ./infra; while true; :; x; cd ./ops; end", fish),
+            ("cd ./infra; for i in 1 2; :; x; cd ./ops; end", fish),
+        ] {
+            assert_eq!(
+                work_dir_at_segment(input, shell, "x"),
+                WorkDir::Unknown,
+                "{input:?} ({shell:?})"
+            );
+        }
+        assert_eq!(
+            work_dir_at_segment("cd ./infra; for i in 1 2; do :; x; done", posix, "x"),
+            known("./infra")
+        );
+        // Each segment's scope, for a loop that moves the shell.
+        let segments = tokenize::tokenize("x; for i in a; do y; cd z; done; w", posix);
+        let scopes = compound_scopes(&segments, posix);
+        let inside = scopes.iter().map(|s| s.inside).collect::<Vec<_>>();
+        let moves = scopes.iter().map(|s| s.moves).collect::<Vec<_>>();
+        assert_eq!(inside, [false, true, true, true, true, false]);
+        assert_eq!(moves, [false, true, true, true, true, false]);
+        // Other shells: tirith follows no cd there.
+        assert!(compound_scopes(
+            &tokenize::tokenize("if ($x) { cd y }; z", ShellType::PowerShell),
+            ShellType::PowerShell
+        )
+        .iter()
+        .all(|s| *s == CompoundScope::default()));
+    }
+
+    /// On Windows a POSIX or fish line's rooted path without a drive is not
+    /// the current drive's root: Git Bash maps `/` to its install directory,
+    /// also in the arguments it passes to a native `terraform.exe`.
+    #[test]
+    fn rooted_posix_plan_paths_resolve_only_where_they_are_absolute() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        let expected = if cfg!(windows) {
+            "cannot be located"
+        } else {
+            "could not be read"
+        };
+        for (input, shell) in [
+            (
+                "terraform apply /tirith-no-such-dir/tfplan",
+                ShellType::Posix,
+            ),
+            (
+                "terraform -chdir=/tirith-no-such-dir apply tfplan",
+                ShellType::Posix,
+            ),
+            (
+                "terraform apply /tirith-no-such-dir/tfplan",
+                ShellType::Fish,
+            ),
+        ] {
+            let titles = check_executable_inputs(
+                || std::iter::once((input, shell)),
+                None,
+                None,
+                false,
+                &gated,
+            )
+            .into_iter()
+            .map(|f| f.title)
+            .collect::<Vec<_>>();
+            assert!(
+                titles.len() == 1 && titles[0].contains(expected),
+                "{input:?} ({shell:?}): {titles:?}"
+            );
+        }
+        for path in ["/srv", "/srv/x", "C:srv"] {
+            assert_eq!(
+                joins_like_a_posix_shell(Path::new(path)),
+                !cfg!(windows),
+                "{path:?}"
+            );
+        }
+        for path in ["srv", "./srv", "../srv", ""] {
+            assert!(joins_like_a_posix_shell(Path::new(path)), "{path:?}");
+        }
+        if cfg!(windows) {
+            assert!(joins_like_a_posix_shell(Path::new("C:/srv")));
+            assert!(joins_like_a_posix_shell(Path::new(r"\\server\share\x")));
         }
     }
 
@@ -2379,8 +3039,8 @@ mod tests {
         for (input, expected) in [
             ("CDPATH=/srv; cd ./infra; terraform apply tfplan", "./infra"),
             (
-                "export CD''PATH=/srv; cd ../infra; terraform apply tfplan",
-                "../infra",
+                "export CD''PATH=/srv; cd ./infra/x; terraform apply tfplan",
+                "./infra/x",
             ),
             (
                 "export TF_VAR_region=$REGION; cd /srv/infra; terraform apply tfplan",
@@ -2422,7 +3082,7 @@ mod tests {
         ] {
             assert_eq!(
                 work_dir_at_last_segment(input),
-                WorkDir::Known(PathBuf::from(expected)),
+                known_dir(expected),
                 "{input:?}"
             );
         }
@@ -2539,7 +3199,7 @@ mod tests {
         ] {
             assert_eq!(
                 work_dir_at_last_segment(input),
-                WorkDir::Known(PathBuf::from(expected)),
+                known_dir(expected),
                 "{input:?}"
             );
         }
@@ -3365,12 +4025,12 @@ mod tests {
             // A value (not a name) tirith cannot read only rules out a bare
             // name, and a startup variable only counts where it is assigned.
             (
-                "export TF_VAR_region=\"$REGION\"; bash -c 'cd /srv/infra && terraform apply tfplan'",
-                "cd /srv/infra && terraform apply tfplan",
+                "export TF_VAR_region=\"$REGION\"; bash -c 'cd ./infra && terraform apply tfplan'",
+                "cd ./infra && terraform apply tfplan",
             ),
             (
-                "echo \"$HOME\"; env -u CDPATH bash -c 'cd /srv/infra && terraform apply tfplan'",
-                "cd /srv/infra && terraform apply tfplan",
+                "echo \"$HOME\"; env -u CDPATH bash -c 'cd ./infra && terraform apply tfplan'",
+                "cd ./infra && terraform apply tfplan",
             ),
         ] {
             let found = titles(&[(outer, posix), (body, posix)], None);
