@@ -1612,6 +1612,7 @@ const TAINT_SOURCE_LEADERS: &[&str] = &["source", "."];
 fn check_command_manifest_hot(
     ctx: &AnalysisContext,
     engine_findings: &[Finding],
+    literal_view: Option<&str>,
 ) -> (Vec<Finding>, Option<String>) {
     use crate::commands_manifest::CommandsManifest;
 
@@ -1650,7 +1651,41 @@ fn check_command_manifest_hot(
                 finding.rule_id == crate::verdict::RuleId::RepoCommandDangerousPattern
             }));
     }
+    // Issue #264: tier 3 analyzes a resolved variable command as its literal
+    // view (`R=rm; "$R" -rf x` -> `R=rm; rm -rf x`), so `dangerous[]` must see
+    // that spelling (and its nested bodies) too. A pattern already reported
+    // for the typed text is not reported again.
+    if let Some(view) = literal_view {
+        let mut literal_inputs = vec![view.to_string()];
+        literal_inputs.extend(
+            collect_nested_executable_inputs(view, ctx.shell)
+                .0
+                .into_iter()
+                .map(|body| body.input),
+        );
+        for input in literal_inputs {
+            for finding in manifest.evaluate(&input, engine_findings).findings {
+                let already_reported = outcome.findings.iter().any(|existing| {
+                    existing.rule_id == finding.rule_id
+                        && manifest_pattern(existing) == manifest_pattern(&finding)
+                });
+                if finding.rule_id == crate::verdict::RuleId::RepoCommandDangerousPattern
+                    && !already_reported
+                {
+                    outcome.findings.push(finding);
+                }
+            }
+        }
+    }
     (outcome.findings, outcome.matched_allowed_name)
+}
+
+/// The `dangerous[]` pattern a manifest finding reports.
+fn manifest_pattern(finding: &Finding) -> Option<&str> {
+    finding.evidence.iter().find_map(|evidence| match evidence {
+        crate::verdict::Evidence::CommandPattern { pattern, .. } => Some(pattern.as_str()),
+        _ => None,
+    })
 }
 
 /// Read cap for a command-card path. A card is a tiny JSON object; 64 KiB is
@@ -3696,7 +3731,8 @@ fn analyze_with_observation(
         // Exec ONLY — else a repo `action: block` glob could BLOCK a paste pulled
         // past tier-1 by another signal. No-op without a manifest.
         if ctx.scan_context == ScanContext::Exec {
-            let (manifest_findings, manifest_match) = check_command_manifest_hot(ctx, &findings);
+            let (manifest_findings, manifest_match) =
+                check_command_manifest_hot(ctx, &findings, literal_view.as_deref());
             findings.extend(manifest_findings);
             manifest_allowed_match = manifest_match;
         }
@@ -8019,6 +8055,57 @@ mod tests {
             );
             assert_eq!(verdict.action, Action::Block);
         }
+    }
+
+    /// Issue #264's literal view must not hide a command from `dangerous[]`:
+    /// `R=rm; "$R" -rf x` runs `rm -rf x`, so a repo pattern for that shape
+    /// still blocks it (the engine itself analyzes the literal view, and the
+    /// 0.4.2 build blocked the unresolved command word). `allowed[]` keeps
+    /// matching the command as typed.
+    #[test]
+    fn manifest_dangerous_pattern_applies_to_the_literal_view_of_a_variable_command() {
+        let _state = isolate_state();
+        use crate::verdict::{Action, RuleId, Severity};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_commands_manifest(
+            dir.path(),
+            "allowed:\n  - name: cleanup\n    command: \"R=rm; \\\"$R\\\" -rf build\"\n\
+             dangerous:\n  - pattern: \"*rm -rf*\"\n    action: block\n",
+        );
+
+        for input in ["R=rm; \"$R\" -rf build", "R=rm\n\"$R\" -rf build"] {
+            let verdict = analyze(&exec_ctx_in(input, dir.path()));
+            let dangerous: Vec<_> = verdict
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == RuleId::RepoCommandDangerousPattern)
+                .collect();
+            assert_eq!(
+                dangerous.len(),
+                1,
+                "one dangerous finding per pattern: {input} -> {:?}",
+                verdict.findings
+            );
+            assert_eq!(dangerous[0].severity, Severity::High);
+            assert_eq!(verdict.action, Action::Block, "{input}");
+        }
+        // The typed spelling still decides the allowed[] audit match.
+        let verdict = analyze(&exec_ctx_in("R=rm; \"$R\" -rf build", dir.path()));
+        assert_eq!(verdict.manifest_allowed_match.as_deref(), Some("cleanup"));
+        // A pattern matched by the typed text is reported once, not again for
+        // the literal view.
+        let verdict = analyze(&exec_ctx_in("R=rm; \"$R\" -rf build; rm -rf x", dir.path()));
+        assert_eq!(
+            verdict
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == RuleId::RepoCommandDangerousPattern)
+                .count(),
+            1,
+            "{:?}",
+            verdict.findings
+        );
     }
 
     /// Acceptance: an `allowed[]` command that the engine clears → Allow, and
