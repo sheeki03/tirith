@@ -814,18 +814,30 @@ fn split_key(key: &str) -> (String, String, Option<String>) {
 /// Build a snapshot of the current full trust set (all scopes, including
 /// expired entries — diff cares about set membership, not expiry). The second
 /// value explains why the snapshot is incomplete (an unreadable operator grant
-/// store), in which case it must not become a recorded baseline.
+/// store, or a trust store that could not be read at all), in which case it
+/// must not become a recorded baseline.
 fn current_trust_snapshot() -> (TrustSnapshot, Option<String>) {
-    let (rows, incomplete) = collect_rows("all", true).unwrap_or_default();
+    let (rows, incomplete) = match collect_rows("all", true) {
+        Ok((rows, grant_store_error)) => (
+            rows,
+            grant_store_error.map(|error| {
+                format!(
+                    "{error}; its grants are not applied and are left out of this diff, \
+                     and this snapshot was not recorded as a baseline"
+                )
+            }),
+        ),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "{error}; the trust set could not be read, so every earlier entry \
+                 shows as removed, and this snapshot was not recorded as a baseline"
+            )),
+        ),
+    };
     let mut entries: Vec<String> = rows.iter().map(row_key).collect();
     entries.sort();
     entries.dedup();
-    let incomplete = incomplete.map(|error| {
-        format!(
-            "{error}; its grants are not applied and are left out of this diff, \
-             and this snapshot was not recorded as a baseline"
-        )
-    });
     (
         TrustSnapshot {
             recorded_at: chrono::Utc::now().to_rfc3339(),
@@ -2408,6 +2420,34 @@ mod tests {
 
         // Once the store is readable again nothing looks added or removed.
         fs::remove_file(config.join(STORE_FILE)).unwrap();
+        assert_eq!(diff(true), 0);
+        let (history, _) = load_trust_history();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_trust_store_is_never_recorded_as_baseline() {
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("allowlist"), "allowed.example\n").unwrap();
+        let (complete, incomplete) = current_trust_snapshot();
+        assert!(incomplete.is_none());
+        record_trust_snapshot(&complete);
+
+        // A corrupt user trust store makes the whole read fail.
+        fs::write(config.join("trust.json"), "{not json").unwrap();
+        let (current, incomplete) = current_trust_snapshot();
+        assert!(current.entries.is_empty());
+        let note = incomplete.expect("the unreadable store is reported");
+        assert!(note.contains("corrupt trust store"), "{note}");
+        assert_eq!(diff(true), 0);
+        let (history, _) = load_trust_history();
+        assert_eq!(history.len(), 1, "an unreadable snapshot is not recorded");
+        assert_eq!(history[0].entries, complete.entries);
+
+        // Once the store is readable again the baseline is still the complete one.
+        fs::remove_file(config.join("trust.json")).unwrap();
         assert_eq!(diff(true), 0);
         let (history, _) = load_trust_history();
         assert_eq!(history.len(), 1);
