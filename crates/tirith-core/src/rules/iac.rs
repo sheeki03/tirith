@@ -166,7 +166,12 @@ impl DirTracker {
     /// Apply the directory change (if any) of `segments[i]`.
     fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
         let seg = &segments[i];
-        if seg.raw.to_ascii_lowercase().contains("cdpath") {
+        if seg
+            .raw
+            .as_bytes()
+            .windows(b"cdpath".len())
+            .any(|window| window.eq_ignore_ascii_case(b"cdpath"))
+        {
             self.input_set_cdpath = true;
         }
         if !segment_may_change_dir(seg, shell) {
