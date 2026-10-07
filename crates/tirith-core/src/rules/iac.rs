@@ -127,6 +127,10 @@ struct DirTracker {
     cd_in_list: bool,
     /// ... and a `||` has followed that cd in the list.
     or_after_cd: bool,
+    /// An earlier segment of the input names `CDPATH` (or zsh's `cdpath`):
+    /// the shell's cd may then search it even when tirith's own environment
+    /// has none (an unexported shell variable is enough).
+    input_set_cdpath: bool,
 }
 
 impl DirTracker {
@@ -135,6 +139,7 @@ impl DirTracker {
             dir: WorkDir::Known(PathBuf::new()),
             cd_in_list: false,
             or_after_cd: false,
+            input_set_cdpath: false,
         }
     }
 
@@ -161,11 +166,14 @@ impl DirTracker {
     /// Apply the directory change (if any) of `segments[i]`.
     fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
         let seg = &segments[i];
+        if seg.raw.to_ascii_lowercase().contains("cdpath") {
+            self.input_set_cdpath = true;
+        }
         if !segment_may_change_dir(seg, shell) {
             return;
         }
         let target = cd_runs_unconditionally(segments, i)
-            .then(|| literal_cd_target(seg, shell))
+            .then(|| literal_cd_target(seg, shell, self.input_set_cdpath))
             .flatten();
         let dir = std::mem::replace(&mut self.dir, WorkDir::Unknown);
         self.dir = match (dir, target) {
@@ -303,8 +311,14 @@ fn split_shell_words(raw: &str) -> impl Iterator<Item = &str> {
 /// The target of a plain `cd <literal>` / `pushd <literal>` segment in a POSIX
 /// or fish shell; `None` for anything else (no or several operands, `-`,
 /// `+N`, expansions, quoting inside the word, a `CDPATH` that could redirect
-/// a bare name, PowerShell / cmd syntax).
-fn literal_cd_target(seg: &tokenize::Segment, shell: ShellType) -> Option<PathBuf> {
+/// a bare name, PowerShell / cmd syntax). `input_set_cdpath`: an earlier
+/// segment of the input names `CDPATH`, so a bare name may be redirected even
+/// when tirith's environment has no `CDPATH`.
+fn literal_cd_target(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    input_set_cdpath: bool,
+) -> Option<PathBuf> {
     if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
         return None;
     }
@@ -330,7 +344,8 @@ fn literal_cd_target(seg: &tokenize::Segment, shell: ShellType) -> Option<PathBu
         || target.starts_with("../")
         || target == "."
         || target == "..");
-    if bare_name && std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()) {
+    if bare_name && (input_set_cdpath || std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()))
+    {
         return None;
     }
     Some(PathBuf::from(target))
@@ -1203,6 +1218,30 @@ mod tests {
             work_dir_at_last_segment("cd infra; terraform apply tfplan"),
             WorkDir::Known(PathBuf::from("infra"))
         );
+        // A CDPATH the input sets (in any segment, in any spelling) counts too.
+        for input in [
+            "CDPATH=/srv; cd infra; terraform apply tfplan",
+            "export CDPATH=/srv; cd infra; terraform apply tfplan",
+            "cdpath=(/srv); cd infra; terraform apply tfplan",
+            "set CDPATH /srv\ncd infra\nterraform apply tfplan",
+        ] {
+            assert_eq!(
+                work_dir_at_last_segment(input),
+                WorkDir::Unknown,
+                "{input:?}"
+            );
+        }
+        for (input, expected) in [
+            ("CDPATH=/srv; cd ./infra; terraform apply tfplan", "./infra"),
+            // Set only after the cd ran.
+            ("cd infra; CDPATH=/srv; terraform apply tfplan", "infra"),
+        ] {
+            assert_eq!(
+                work_dir_at_last_segment(input),
+                WorkDir::Known(PathBuf::from(expected)),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -1321,6 +1360,12 @@ mod tests {
             "cd \"$D\" && terraform apply tfplan",
             "terraform -chdir=$D apply tfplan",
             "popd; terraform apply tfplan",
+            // The input itself sets a CDPATH, which can send a bare-name cd
+            // elsewhere (an unexported shell variable is enough for cd).
+            "CDPATH=/x; cd infra; terraform apply tfplan",
+            "export CDPATH=/x; cd infra && terraform apply tfplan",
+            "cdpath=(/x); cd infra; terraform apply tfplan",
+            "set CDPATH /x; cd infra; terraform apply tfplan",
         ] {
             let found = rules(input);
             assert!(
