@@ -122,6 +122,35 @@ fn parse_expected_action(s: &str) -> Result<Action, String> {
 /// failed mid-loop (distinct so callers can tell a TTY break from a corpus
 /// failure). `score`: add a deterministic 0-100 risk score (see
 /// [`scenario_score`]) per entry / a `Score` column.
+/// The analysis context of one scenario. `tirith lab` is deterministic: it
+/// reads no ambient state, so the result of a scenario is the same on every
+/// machine and in every shell.
+fn scenario_context(
+    scenario: &LabScenario,
+    shell: ShellType,
+    scan_context: ScanContext,
+    raw_bytes: Option<Vec<u8>>,
+) -> AnalysisContext {
+    AnalysisContext {
+        input: scenario.input.clone(),
+        shell,
+        scan_context,
+        raw_bytes,
+        interactive: true,
+        cwd: None,
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+        card_ref: None,
+        // AbsentOrInvalid, not Unread (CodeRabbit R6): skip the ambient
+        // `clipboard_source.json` disk read.
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        // Not the caller's PYTHONINSPECT: a scenario never inherits it.
+        python_inspect_inherited: false,
+    }
+}
+
 pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> i32 {
     let corpus: LabCorpus = match toml::from_str(LAB_CORPUS) {
         Ok(c) => c,
@@ -208,24 +237,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             (bytes, _) => Some(bytes.to_vec()),
         };
 
-        let ctx = AnalysisContext {
-            input: scenario.input.clone(),
-            shell,
-            scan_context,
-            raw_bytes,
-            interactive: true,
-            cwd: None,
-            file_path: None,
-            repo_root: None,
-            is_config_override: false,
-            clipboard_html: None,
-            card_ref: None,
-            // AbsentOrInvalid, not Unread (CodeRabbit R6): `tirith lab` is
-            // deterministic, so it must skip the ambient `clipboard_source.json`
-            // disk read.
-            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
-            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
-        };
+        let ctx = scenario_context(scenario, shell, scan_context, raw_bytes);
 
         // Interactive prelude — prompt before revealing the verdict; `q` aborts.
         if interactive {
@@ -678,6 +690,15 @@ mod tests {
         // A plain relative member resolves under the fixtures dir.
         let p = resolve_artifact_asset("pth_cross_runtime.pth").unwrap();
         assert!(p.ends_with("assets/lab_artifacts/pth_cross_runtime.pth"));
+    }
+
+    #[test]
+    fn scenario_context_ignores_the_callers_python_inspect() {
+        let mut global = tirith_test_support::GlobalStateGuard::new().unwrap();
+        global.set_env("PYTHONINSPECT", "1");
+        let scenario = corpus().scenarios.into_iter().next().unwrap();
+        let ctx = scenario_context(&scenario, ShellType::Posix, ScanContext::Exec, None);
+        assert!(!ctx.python_inspect_inherited);
     }
 
     #[test]
