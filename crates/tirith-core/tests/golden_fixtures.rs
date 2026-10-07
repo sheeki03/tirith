@@ -2977,7 +2977,10 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
 /// in the directory, and with the startup files, the commands around it
 /// leave; and code that runs later, or the apply's own expansion, can move
 /// the apply. Each `true` row applied (or could apply) an unrecorded plan
-/// while tirith hashed the recorded one before this fix.
+/// while tirith hashed the recorded one before this fix. Fix round 2 adds
+/// arithmetic over data, a `${ cmd; }` whose command word is built from a
+/// variable, a fish command substitution and code that may redefine
+/// `tirith` before a check-plan chain, and the PowerShell and cmd rows.
 #[test]
 fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
     use tirith_core::iac_plan::{self, PlanSummary};
@@ -3016,11 +3019,16 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
     }
     fs::write(root.join("other/tfplan"), b"UNRECORDED OTHER PLAN").unwrap();
     fs::write(root.join("other/infra/tfplan"), b"UNRECORDED OTHER INFRA").unwrap();
+    // Fix round 2: where an arithmetic `CDPATH=5` leads, and an unrecorded
+    // plan in the root that only a trusted check-plan chain may skip.
+    fs::create_dir_all(root.join("5/infra")).unwrap();
+    fs::write(root.join("5/infra/tfplan"), b"UNRECORDED 5 INFRA").unwrap();
+    fs::write(root.join("tfplan2"), b"UNRECORDED ROOT PLAN2").unwrap();
 
-    let mismatch = |input: &str| {
+    let mismatch_in = |shell: ShellType, input: &str| {
         let ctx = AnalysisContext {
             input: input.to_string(),
-            shell: ShellType::Posix,
+            shell,
             scan_context: ScanContext::Exec,
             raw_bytes: None,
             interactive: true,
@@ -3038,6 +3046,7 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
             .iter()
             .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
     };
+    let mismatch = |input: &str| mismatch_in(ShellType::Posix, input);
 
     // `$n` may be BASH_ENV (a startup file that redefines `cd`).
     let dynamic_env = format!(
@@ -3112,6 +3121,64 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
             ": <<EOF\n${CDPATH:=other}\nEOF\ncd infra\nterraform apply tfplan",
             true,
         ),
+        // Fix round 2: arithmetic assigns CDPATH from data that never spells
+        // it (`z=CDPATH=5`, built with `+=`).
+        (
+            "z=CD; z+=PATH=5; (( z )); cd infra; terraform apply tfplan",
+            true,
+        ),
+        ("z=CD; z+=PATH=5; let z; cd infra; terraform apply tfplan", true),
+        (
+            "z=CD; z+=PATH=5; [[ z -eq 5 ]]; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "declare -i n; z=CD; z+=PATH=5; n=z; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "bash -c 'z=CD; z+=PATH=5; let z; cd infra; terraform apply tfplan'",
+            true,
+        ),
+        // ... and runs a bash 5.3 `${ ...; }` held in data, in the shell.
+        (
+            "z='a[$'; z+='{ c'; z+='d other; }]'; (( z )); terraform apply tfplan",
+            true,
+        ),
+        (
+            "z='$'; z+='{ c'; z+='d other; }'; : ${z@P}; terraform apply tfplan",
+            true,
+        ),
+        // A `${ cmd; }` whose command word is built from a variable, in the
+        // apply's own words or before it.
+        ("f=c; f+=d; terraform apply tfplan ${ $f other; }", true),
+        ("f=c; f+=d; : ${ $f other; }; terraform apply tfplan", true),
+        (
+            "f=c; f+=d; [[ -v a[${ $f other; }] ]]; terraform apply tfplan",
+            true,
+        ),
+        // A zsh glob qualifier that runs code for each match, and bash
+        // `autocd` (a directory name runs as cd) switched on by the line.
+        ("c=c; c+=d; : *(e:'$c other':); terraform apply tfplan", true),
+        ("shopt -s autocd; other; terraform apply tfplan", true),
+        // Code tirith cannot read may define `tirith`, so the chain no longer
+        // skips reading the (unrecorded) plan.
+        (
+            "e=ev; e+=al; p='('; p+=')'; : ${ $e \"tirith$p { :; }\"; }; tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            "BASH_ENV=./x.sh bash -c 'tirith iac check-plan tfplan2 && terraform apply tfplan2'",
+            true,
+        ),
+        ("tirith iac check-plan tfplan2 && terraform apply tfplan2", false),
+        (
+            "bash -c 'tirith iac check-plan tfplan2 && terraform apply tfplan2'",
+            false,
+        ),
+        // A plain apply's own words move nothing.
+        ("ENV=staging terraform apply tfplan", false),
+        ("n=1; echo \"$n\"; cd ./infra; terraform apply tfplan", false),
         // Controls: nothing reaches CDPATH or the nested body's directory.
         ("cd infra; terraform apply tfplan", false),
         ("export TF_LOG=1; cd infra; terraform apply tfplan", false),
@@ -3141,6 +3208,49 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
     assert!(
         wrong.is_empty(),
         "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+
+    // Fix round 2: a PowerShell or cmd apply of the recorded plan in the
+    // current directory is allowed again; code in its own words, anything
+    // before it on the line (`cd..` is a PowerShell function and a cmd
+    // command), and a fish command substitution (it runs in the shell
+    // itself) make the plan unlocatable.
+    let wrong = [
+        (ShellType::PowerShell, "terraform apply tfplan", false),
+        (ShellType::PowerShell, "terraform apply ./tfplan", false),
+        (ShellType::Cmd, "terraform apply tfplan", false),
+        (
+            ShellType::PowerShell,
+            "tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            false,
+        ),
+        (ShellType::PowerShell, "terraform apply tfplan2", true),
+        (ShellType::Cmd, "terraform apply tfplan2", true),
+        (
+            ShellType::PowerShell,
+            "terraform apply tfplan $(Set-Location other)",
+            true,
+        ),
+        (ShellType::PowerShell, "cd..; terraform apply tfplan", true),
+        (ShellType::Cmd, "cd.. & terraform apply tfplan", true),
+        (ShellType::Fish, "terraform apply tfplan", false),
+        (
+            ShellType::Fish,
+            "set c (string join '' c d); terraform apply tfplan ($c other)",
+            true,
+        ),
+        (
+            ShellType::Fish,
+            "set c (string join '' c d); echo ($c other); terraform apply tfplan",
+            true,
+        ),
+    ]
+    .into_iter()
+    .filter(|(shell, input, expect_mismatch)| mismatch_in(*shell, input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (shell, input, expected): {wrong:#?}"
     );
 }
 
