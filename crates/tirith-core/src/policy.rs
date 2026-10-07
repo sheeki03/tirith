@@ -6758,6 +6758,7 @@ custom_rules:
                 card_ref: None,
                 clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
                 python_inspect_inherited: false,
+                cdpath_inherited: false,
             };
             let v = analyze(&ctx);
             assert!(

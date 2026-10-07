@@ -146,8 +146,10 @@ fn scenario_context(
         // AbsentOrInvalid, not Unread (CodeRabbit R6): skip the ambient
         // `clipboard_source.json` disk read.
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
-        // Not the caller's PYTHONINSPECT: a scenario never inherits it.
+        // Not the caller's PYTHONINSPECT or CDPATH: a scenario never
+        // inherits them.
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     }
 }
 
@@ -724,6 +726,7 @@ mod tests {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         assert!(evaluate_scenario(&s, &ctx).is_err());
     }

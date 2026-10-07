@@ -24154,3 +24154,200 @@ fn daemon_check_uses_the_clients_python_inspect_not_the_daemons() {
         "the client's PYTHONINSPECT must refuse the exemption: {with}"
     );
 }
+
+/// Review of PR #274: the daemon reads a relative plan from the client's
+/// directory, so whether the IaC plan gate follows a `cd` to a bare name
+/// must come from the client's environment too. With `CDPATH` exported
+/// there, the client's shell changes to `$CDPATH/infra`, not to the
+/// `infra` tirith reads. A daemon started without `CDPATH` used to follow
+/// `cd infra` into the recorded plan and allow the apply, while the same
+/// check without the daemon blocked.
+#[cfg(unix)]
+#[test]
+fn daemon_check_uses_the_clients_cdpath_not_the_daemons() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The daemon socket and the recorded plan hashes live in the state dir;
+    // client and daemon share it. A short path keeps the socket under the
+    // platform's sun_path limit.
+    let state = tmp.path().join("s");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    // A daemon-only policy root that turns the plan gate on:
+    // `policy_path_used` naming it proves that the daemon, not a local
+    // fallback, produced the verdict.
+    let org = tmp.path().join("org");
+    fs::create_dir_all(org.join(".tirith")).expect("org policy dir");
+    fs::write(
+        org.join(".tirith/policy.yaml"),
+        "fail_mode: open\niac_require_plan_before_apply: true\n",
+    )
+    .expect("org policy");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("git marker");
+    fs::create_dir_all(project.join("infra")).expect("project infra dir");
+    // The client's CDPATH, where its shell's `cd infra` leads.
+    let cdpath = tmp.path().join("cdpath");
+    fs::create_dir_all(cdpath.join("infra")).expect("CDPATH infra dir");
+    let plan = |marker: &str| {
+        serde_json::json!({"format_version": "1.2", "resource_changes": [], "marker": marker})
+            .to_string()
+    };
+    fs::write(project.join("infra/tfplan"), plan("recorded")).expect("recorded plan");
+    fs::write(cdpath.join("infra/tfplan"), plan("not recorded")).expect("unrecorded plan");
+    let recorded = tirith_in_proj(&project)
+        .env("XDG_STATE_HOME", &state)
+        .args(["iac", "check-plan", "infra/tfplan"])
+        .output()
+        .expect("tirith iac check-plan");
+    assert!(
+        recorded.status.success(),
+        "check-plan failed: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+
+    let mut daemon_cmd = tirith();
+    daemon_cmd
+        .env("XDG_STATE_HOME", &state)
+        .env("TIRITH_POLICY_ROOT", &org)
+        .env_remove("CDPATH")
+        .args(["daemon", "start"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = KillOnDrop(daemon_cmd.spawn().expect("spawn daemon"));
+    let socket = state.join("tirith").join("daemon.sock");
+    let started = std::time::Instant::now();
+    while !socket.exists() {
+        assert!(
+            daemon.0.try_wait().expect("poll daemon").is_none(),
+            "daemon exited before binding its socket"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "daemon did not bind {}",
+            socket.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let answered_by_daemon = |json: &serde_json::Value| {
+        json["policy_path_used"]
+            .as_str()
+            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
+    };
+    let blocks_plan = |json: &serde_json::Value| {
+        json["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|f| f["rule_id"].as_str() == Some("iac_plan_hash_mismatch"))
+        })
+    };
+    let command = "cd infra; terraform apply tfplan";
+
+    // Warm the daemon with the requests a client sends (see
+    // `daemon_check_uses_the_clients_python_inspect_not_the_daemons`); they
+    // also show the daemon's own decision, including for an older client
+    // that does not send the field.
+    let project_cwd = fs::canonicalize(&project).expect("canonical project dir");
+    let ask_daemon = |cdpath_inherited: Option<bool>| -> serde_json::Value {
+        use std::io::{BufRead as _, Write as _};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket).expect("connect to the daemon");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+            .expect("bounded warm-up read");
+        let mut request = serde_json::json!({
+            "command": "check",
+            "input": command,
+            "context": "exec",
+            "cwd": project_cwd.display().to_string(),
+            "shell": "posix",
+            "interactive": false,
+            "bypass_requested": false,
+            "offline": true,
+            "python_inspect_inherited": false,
+        });
+        if let Some(value) = cdpath_inherited {
+            request["cdpath_inherited"] = value.into();
+        }
+        writeln!(stream, "{request}").expect("send the request");
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("daemon answer");
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("daemon answer must be JSON: {error}: {line}"))
+    };
+    for (cdpath_inherited, expect_block, why) in [
+        (
+            Some(false),
+            false,
+            "a client without CDPATH: `cd infra` reaches the recorded plan",
+        ),
+        (
+            Some(true),
+            true,
+            "a client with CDPATH: `cd infra` may lead elsewhere",
+        ),
+        (None, true, "an older client counts as having CDPATH"),
+    ] {
+        let answer = ask_daemon(cdpath_inherited);
+        assert!(
+            answered_by_daemon(&answer),
+            "warm-up answer did not come from the daemon's policy: {answer}"
+        );
+        assert_eq!(blocks_plan(&answer), expect_block, "{why}: {answer}");
+    }
+
+    let check = |client_cdpath: Option<&std::path::Path>| -> serde_json::Value {
+        let mut cmd = tirith_in_proj(&project);
+        cmd.env("XDG_STATE_HOME", &state).env_remove("CDPATH");
+        if let Some(value) = client_cdpath {
+            cmd.env("CDPATH", value);
+        }
+        let out = cmd
+            .args([
+                "check",
+                "--json",
+                "--offline",
+                "--shell",
+                "posix",
+                "--non-interactive",
+                "--",
+                command,
+            ])
+            .output()
+            .expect("tirith check");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "check output must be JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    let without = check(None);
+    assert!(
+        answered_by_daemon(&without),
+        "daemon did not answer: {without}"
+    );
+    assert!(
+        !blocks_plan(&without),
+        "without CDPATH the daemon follows `cd infra` to the recorded plan: {without}"
+    );
+    let with = check(Some(&cdpath));
+    assert!(answered_by_daemon(&with), "daemon did not answer: {with}");
+    assert!(
+        blocks_plan(&with),
+        "the client's CDPATH must stop the daemon following `cd infra`: {with}"
+    );
+}

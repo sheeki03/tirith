@@ -24,6 +24,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     };
 
     let (verdict, policy) = engine::analyze_returning_policy(&ctx);

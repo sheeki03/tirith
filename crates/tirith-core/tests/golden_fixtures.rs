@@ -362,6 +362,7 @@ fn run_fixture(fixture: &Fixture) {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2028,6 +2029,7 @@ fn test_tier1_does_not_gate_findings() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2082,6 +2084,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -2253,6 +2256,7 @@ fn test_lab_corpus_reaches_tier3() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2356,6 +2360,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2422,6 +2427,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2483,6 +2489,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2534,6 +2541,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2587,6 +2595,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2645,6 +2654,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2702,6 +2712,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2767,6 +2778,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -2867,6 +2879,7 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
             .findings
@@ -3045,6 +3058,7 @@ fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
             .findings
@@ -3067,6 +3081,117 @@ fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
     assert!(
         wrong.is_empty(),
         "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
+/// The plan gate follows a `cd` to a bare name only while the shell that
+/// runs the line has no `CDPATH`, and that is the caller's environment
+/// (`AnalysisContext.cdpath_inherited`), not tirith's own: the daemon
+/// analyses commands for clients whose environment it does not share
+/// (review of PR #274). Before this fix a daemon started without `CDPATH`
+/// followed `cd infra` into the caller's recorded plan while the client's
+/// shell, with `CDPATH` exported, applied the unrecorded one it leads to.
+#[test]
+fn iac_plan_gate_takes_cdpath_from_the_caller_not_from_tirith() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+
+    // The caller's infra/tfplan is recorded; the infra/tfplan under its
+    // CDPATH, where the shell's `cd infra` leads, is not.
+    let caller = root.join("caller");
+    let cdpath = root.join("cdpath");
+    fs::create_dir_all(caller.join("infra")).unwrap();
+    fs::create_dir_all(cdpath.join("infra")).unwrap();
+    let recorded = b"CALLER INFRA PLAN";
+    fs::write(caller.join("infra/tfplan"), recorded).unwrap();
+    iac_plan::record_plan_hash(
+        recorded,
+        &caller.join("infra/tfplan"),
+        &PlanSummary::default(),
+    )
+    .unwrap();
+    fs::write(cdpath.join("infra/tfplan"), b"CDPATH INFRA PLAN").unwrap();
+    global.set_cwd(&root).unwrap();
+
+    let mismatch = |input: &str, cdpath_inherited: bool| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(caller.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    // (tirith's own CDPATH set, the caller's CDPATH set, input, expected).
+    let rows = [
+        // The caller's CDPATH decides, also for a nested shell, which
+        // inherits it ...
+        (false, true, "cd infra; terraform apply tfplan", true),
+        (false, true, "cd infra && terraform apply tfplan", true),
+        (
+            false,
+            true,
+            "bash -c 'cd infra && terraform apply tfplan'",
+            true,
+        ),
+        // ... and tirith's own does not.
+        (true, false, "cd infra; terraform apply tfplan", false),
+        (
+            true,
+            false,
+            "bash -c 'cd infra && terraform apply tfplan'",
+            false,
+        ),
+        // Controls: no CDPATH anywhere, a cd CDPATH does not search, and
+        // CDPATH in both.
+        (false, false, "cd infra; terraform apply tfplan", false),
+        (false, true, "cd ./infra; terraform apply tfplan", false),
+        (true, true, "cd infra; terraform apply tfplan", true),
+    ];
+    let mut wrong = Vec::new();
+    for (own, inherited, input, expected) in rows {
+        if own {
+            global.set_env("CDPATH", &cdpath);
+        } else {
+            global.remove_env("CDPATH");
+        }
+        if mismatch(input, inherited) != expected {
+            wrong.push((own, inherited, input, expected));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (tirith's CDPATH, caller's CDPATH, input, expected): {wrong:#?}"
     );
 }
 
@@ -3141,6 +3266,7 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
             .findings
@@ -3441,6 +3567,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             card_ref: None,
             clipboard_source: state,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -3543,6 +3670,7 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
             card_ref: None,
             clipboard_source: state,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -3635,6 +3763,7 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
             card_ref: None,
             clipboard_source: state,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };

@@ -64,6 +64,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     engine::analyze(&ctx)
 }
@@ -663,6 +664,7 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     engine::analyze(&ctx)
 }

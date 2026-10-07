@@ -23,6 +23,7 @@ fn analyze(input: &str, scan_context: ScanContext, force_full: bool) -> Verdict 
         card_ref: None,
         clipboard_source: ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     if force_full {
         engine::analyze_force_full_returning_policy(&ctx).0

@@ -81,6 +81,7 @@ fn bounded_runtime_refuses_oversize_without_silently_dropping_a_blocklist() {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let (verdict, _) = crate::engine::analyze_returning_policy(&context);
         assert_eq!(verdict.action, crate::verdict::Action::Block);

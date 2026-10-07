@@ -868,6 +868,7 @@ fn analyze_as_paste_with_patterns(
         card_ref: None,
         clipboard_source,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     };
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
     // Paranoia-filter against the exact policy snapshot used by analysis so the

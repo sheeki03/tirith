@@ -330,6 +330,7 @@ pub fn run(
                     card_ref: card.clone(),
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                     python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                    cdpath_inherited: tirith_core::engine::cdpath_env_active(),
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -349,6 +350,7 @@ pub fn run(
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                 python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                cdpath_inherited: tirith_core::engine::cdpath_env_active(),
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -368,6 +370,7 @@ pub fn run(
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
         };
         let (v, p) = if execution_receipt.is_some() {
             // A durable receipt must freeze every effective policy overlay even
@@ -728,6 +731,7 @@ pub fn run(
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
         };
         if ran_locally {
             tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
@@ -2597,6 +2601,7 @@ pub(super) fn prepare_receipt_consumption_with_network(
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));

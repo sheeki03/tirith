@@ -1576,6 +1576,7 @@ fn review_script_bytes_for_session(
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
     };
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::engine::analyze_force_full_without_bypass_returning_policy(&ctx)

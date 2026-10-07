@@ -351,6 +351,13 @@ pub struct AnalysisContext {
     /// rules never read the variable, so a daemon's own environment does not
     /// change verdicts.
     pub python_inspect_inherited: bool,
+    /// Whether the environment the analyzed command will run in already has
+    /// a non-empty `CDPATH`, under which a `cd` to a bare directory name
+    /// (`cd infra`) may change to another directory than the one named, so
+    /// the IaC plan gate does not follow it. Decided by the caller like
+    /// `python_inspect_inherited`, usually with [`cdpath_env_active`]; a
+    /// daemon takes it from the request. Core rules never read the variable.
+    pub cdpath_inherited: bool,
 }
 
 /// Whether this process's environment has a non-empty `PYTHONINSPECT`. For
@@ -358,6 +365,13 @@ pub struct AnalysisContext {
 /// process's environment.
 pub fn python_inspect_env_active() -> bool {
     std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty())
+}
+
+/// Whether this process's environment has a non-empty `CDPATH`. For callers
+/// building an [`AnalysisContext`] for a command that runs in this process's
+/// environment.
+pub fn cdpath_env_active() -> bool {
+    std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty())
 }
 
 /// Whether a VAR=VALUE word is `TIRITH=0` (stripping optional value quotes).
@@ -3550,6 +3564,7 @@ fn analyze_with_observation(
                 executable_inputs,
                 masked_root,
                 ctx.cwd.as_deref().map(std::path::Path::new),
+                ctx.cdpath_inherited,
                 &policy,
             ));
 
@@ -4366,6 +4381,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let fragments = [
             crate::rules::rendered::PdfTextFragment {
@@ -4411,6 +4427,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let second = "tions";
         let suffix = "\nignore previous instruc";
@@ -4471,6 +4488,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let fragment = crate::rules::rendered::PdfTextFragment {
             text: format!("embedded credential {canary}"),
@@ -4512,6 +4530,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(verdict.findings.iter().any(|finding| {
@@ -4566,6 +4585,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         });
         assert!(verdict.findings.iter().any(|finding| {
             finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
@@ -4591,6 +4611,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
 
         let (verdict, coverage) = analyze_file_with_pdf_coverage(&ctx);
@@ -4953,6 +4974,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -4994,6 +5016,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert_eq!(verdict.action, crate::verdict::Action::Block);
@@ -5047,6 +5070,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -5682,6 +5706,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -6497,6 +6522,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         }
     }
 
@@ -7091,6 +7117,7 @@ mod tests {
                     card_ref: None,
                     clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
                     python_inspect_inherited: false,
+                    cdpath_inherited: false,
                 };
                 let label = format!(
                     "{}/{}",
@@ -7167,6 +7194,7 @@ mod tests {
                 card_ref: None,
                 clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
+                cdpath_inherited: false,
             };
             assert_fast_full_security_equivalence(&ctx, &format!("generated-case-{case}"));
         }
@@ -7229,6 +7257,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         }
     }
 
@@ -7539,6 +7568,7 @@ mod tests {
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
+            cdpath_inherited: false,
         }
     }
 

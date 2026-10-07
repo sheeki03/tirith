@@ -1398,8 +1398,10 @@ fn scan_candidate_at(
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         // Scanned file content runs later, in some other process's
-        // environment, so the scanner's own PYTHONINSPECT is irrelevant.
+        // environment, so the scanner's own PYTHONINSPECT and CDPATH are
+        // irrelevant.
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
@@ -1560,8 +1562,10 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         // Scanned file content runs later, in some other process's
-        // environment, so the scanner's own PYTHONINSPECT is irrelevant.
+        // environment, so the scanner's own PYTHONINSPECT and CDPATH are
+        // irrelevant.
         python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);

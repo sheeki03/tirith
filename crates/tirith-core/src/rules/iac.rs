@@ -58,9 +58,17 @@ impl IacTool {
 /// a plan file that `tirith iac check-plan` records right before the apply,
 /// in the same `&&` chain (`check_plan_chained_before`).
 ///
-/// Relative plan paths resolve against tirith's own working directory.
+/// Relative plan paths resolve against tirith's own working directory, and a
+/// `cd` to a bare name is followed only while tirith's own environment has no
+/// `CDPATH`: the command is taken to run in this process's environment.
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    check_executable_inputs(|| std::iter::once((input, shell)), None, None, policy)
+    check_executable_inputs(
+        || std::iter::once((input, shell)),
+        None,
+        None,
+        crate::engine::cdpath_env_active(),
+        policy,
+    )
 }
 
 /// [`check`] over every executable input of one command: the analysed
@@ -77,17 +85,29 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 /// runs in (`AnalysisContext.cwd`): relative plan paths resolve against
 /// it, not against tirith's own working directory, which differs in the
 /// daemon (it passes the client's directory; the MCP server and the
-/// gateway pass their own); `None` uses tirith's own.
+/// gateway pass their own); `None` uses tirith's own. `cdpath_inherited`:
+/// the shell that runs the command has a non-empty `CDPATH`
+/// (`AnalysisContext.cdpath_inherited`), so a `cd` to a bare name in any of
+/// its inputs is not followed. tirith's own environment is not read here:
+/// in the daemon it is not the client's.
 pub(crate) fn check_executable_inputs<'a, I>(
     inputs: impl Fn() -> I,
     masked_root: Option<&str>,
     cwd: Option<&Path>,
+    cdpath_inherited: bool,
     policy: &Policy,
 ) -> Vec<Finding>
 where
     I: Iterator<Item = (&'a str, ShellType)>,
 {
     let start_dir = tracking_start_dir(cwd);
+    // A `CDPATH` the shell already has counts like one an earlier command on
+    // the line sets; nested shells inherit it with the environment.
+    let inherited = if cdpath_inherited {
+        CdHazard::Cdpath
+    } else {
+        CdHazard::None
+    };
     let mut findings = Vec::new();
     // What each input may do to a nested body, computed once when a nested
     // body first needs it (`input_effects`).
@@ -106,7 +126,7 @@ where
         let dirs = if k == 0 {
             // An unquoted heredoc body expands before its command runs.
             let (dir, hazard) = nested_start(&start_dir, masked().into_iter());
-            DirTracker::start(dir, hazard)
+            DirTracker::start(dir, hazard.max(inherited))
         } else {
             let effects = effects.get_or_insert_with(|| {
                 inputs()
@@ -120,7 +140,7 @@ where
                 .filter(|&(j, _)| j != k)
                 .map(|(_, other)| *other);
             let (dir, hazard) = nested_start(&start_dir, others);
-            DirTracker::start(dir, hazard)
+            DirTracker::start(dir, hazard.max(inherited))
         };
         findings.extend(check_segments(input, shell, policy, &segments, dirs));
     }
@@ -244,7 +264,8 @@ impl WorkDir {
 /// After a segment that may run code later or redefine `cd`
 /// (`CdHazard::Rebind`, in this input or around a nested body) the directory
 /// is unknown and no literal cd is followed. A cd to a bare name is followed
-/// only while nothing may have set `CDPATH` (`CdHazard::Cdpath`).
+/// only while nothing may have set `CDPATH` (`CdHazard::Cdpath`), the
+/// environment of the shell that runs the command included.
 #[derive(Debug, Clone)]
 struct DirTracker {
     dir: WorkDir,
@@ -329,11 +350,7 @@ impl DirTracker {
             None
         };
         let target = target
-            .filter(|target| {
-                !is_bare_cd_name(target)
-                    || (hazard == CdHazard::None
-                        && std::env::var_os("CDPATH").is_none_or(|v| v.is_empty()))
-            })
+            .filter(|target| !is_bare_cd_name(target) || hazard == CdHazard::None)
             .map(PathBuf::from);
         let dir = std::mem::replace(&mut self.dir, WorkDir::Unknown);
         self.dir = match (dir, target) {
@@ -353,7 +370,9 @@ enum CdHazard {
     None,
     /// It may set `CDPATH` (zsh: `cdpath`), which a cd to a bare directory
     /// name searches before the working directory: an unexported shell
-    /// variable is enough, so tirith's own environment cannot show it.
+    /// variable is enough, so tirith's own environment cannot show it. The
+    /// tracking also starts at this hazard when the shell's environment
+    /// already has a `CDPATH` (`AnalysisContext.cdpath_inherited`).
     Cdpath,
     /// It may redefine what `cd` / `pushd` run (a function, an alias, a
     /// disabled builtin, a startup file of a nested shell), run code later
@@ -2067,8 +2086,14 @@ mod tests {
     }
 
     fn work_dir_at_last_segment_in(input: &str, shell: ShellType) -> WorkDir {
+        work_dir_at_last_segment_from(input, shell, CdHazard::None)
+    }
+
+    /// ... when the tracking starts at `hazard` (`CdHazard::Cdpath`: the
+    /// shell that runs the line already has a `CDPATH`).
+    fn work_dir_at_last_segment_from(input: &str, shell: ShellType, hazard: CdHazard) -> WorkDir {
         let segments = tokenize::tokenize(input, shell);
-        let mut dirs = DirTracker::start(WorkDir::Known(PathBuf::new()), CdHazard::None);
+        let mut dirs = DirTracker::start(WorkDir::Known(PathBuf::new()), hazard);
         for (i, seg) in segments.iter().enumerate() {
             dirs.enter(seg);
             if i + 1 == segments.len() {
@@ -2235,20 +2260,50 @@ mod tests {
 
     #[test]
     fn literal_cd_target_refuses_bare_names_under_cdpath() {
+        // A CDPATH the shell that runs the line already has
+        // (`AnalysisContext.cdpath_inherited`).
+        let inherited =
+            |input: &str| work_dir_at_last_segment_from(input, ShellType::Posix, CdHazard::Cdpath);
+        assert_eq!(
+            inherited("cd infra; terraform apply tfplan"),
+            WorkDir::Unknown
+        );
+        assert_eq!(
+            inherited("cd ./infra; terraform apply tfplan"),
+            WorkDir::Known(PathBuf::from("./infra"))
+        );
+        assert_eq!(
+            work_dir_at_last_segment("cd infra; terraform apply tfplan"),
+            WorkDir::Known(PathBuf::from("infra"))
+        );
+        // The tracker never reads tirith's own environment: in the daemon it
+        // is not the client's (review of PR #274). The public `check`, for a
+        // command that runs in this process's environment, does.
         let mut global = tirith_test_support::GlobalStateGuard::new().unwrap();
         global.set_env("CDPATH", "/srv/projects");
         assert_eq!(
             work_dir_at_last_segment("cd infra; terraform apply tfplan"),
-            WorkDir::Unknown
+            WorkDir::Known(PathBuf::from("infra"))
         );
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        let titles = |input: &str| {
+            check(input, ShellType::Posix, &gated)
+                .into_iter()
+                .map(|f| f.title)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            work_dir_at_last_segment("cd ./infra; terraform apply tfplan"),
-            WorkDir::Known(PathBuf::from("./infra"))
+            titles("cd infra; terraform apply tfplan"),
+            ["terraform apply: plan file 'tfplan' cannot be located"]
         );
         global.remove_env("CDPATH");
-        assert_eq!(
-            work_dir_at_last_segment("cd infra; terraform apply tfplan"),
-            WorkDir::Known(PathBuf::from("infra"))
+        let followed = titles("cd infra; terraform apply tfplan");
+        assert!(
+            !followed.is_empty() && !followed.iter().any(|t| t.contains("cannot be located")),
+            "{followed:?}"
         );
         // A CDPATH the input sets (in any segment) counts too.
         for input in [
@@ -3115,7 +3170,7 @@ mod tests {
         // The executable inputs the engine passes: the command, then the
         // nested body it runs.
         let titles = |inputs: &[(&str, ShellType)], masked_root: Option<&str>| {
-            check_executable_inputs(|| inputs.iter().copied(), masked_root, None, &gated)
+            check_executable_inputs(|| inputs.iter().copied(), masked_root, None, false, &gated)
                 .into_iter()
                 .map(|f| f.title)
                 .collect::<Vec<_>>()
