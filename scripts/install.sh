@@ -607,7 +607,7 @@ main() {
 
   info ""
   info "tirith installed to ${INSTALL_DIR}/tirith"
-  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ "$PAIRED_HELPER_MANAGED" = "0" ]; then
+  if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
     info "Package approval is disabled in this release: tirith pkg approve issues no approvals."
     info "The root-owned approval helper and sudo do not enable it; ordinary command checks and shell protection do not require them."
   fi
