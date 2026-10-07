@@ -2985,6 +2985,91 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
     );
 }
 
+/// The plan gate reads a relative plan from the directory the command runs
+/// in (`AnalysisContext.cwd`), not from tirith's own working directory: a
+/// daemon, MCP server or gateway analyses commands for shells in other
+/// directories (review of PR #274).
+#[test]
+fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+
+    // The caller's directory and tirith's own hold plans of the same
+    // names with opposite recorded states.
+    let caller = root.join("caller");
+    let own = root.join("own");
+    fs::create_dir_all(caller.join("infra")).unwrap();
+    fs::create_dir_all(own.join("infra")).unwrap();
+    let summary = PlanSummary::default();
+    let write = |path: PathBuf, bytes: &[u8], recorded: bool| {
+        fs::write(&path, bytes).unwrap();
+        if recorded {
+            iac_plan::record_plan_hash(bytes, &path, &summary).unwrap();
+        }
+    };
+    write(caller.join("tfplan"), b"CALLER ROOT PLAN", true);
+    write(own.join("tfplan"), b"OWN ROOT PLAN", false);
+    write(caller.join("infra/tfplan"), b"CALLER INFRA PLAN", false);
+    write(own.join("infra/tfplan"), b"OWN INFRA PLAN", true);
+    global.set_cwd(&own).unwrap();
+
+    let mismatch = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(caller.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    let wrong = [
+        ("terraform apply tfplan", false),
+        ("terraform apply ./tfplan", false),
+        ("terraform apply infra/tfplan", true),
+        ("terraform -chdir=infra apply tfplan", true),
+        ("cd infra && terraform apply tfplan", true),
+        ("cd infra; cd ..; terraform apply tfplan", false),
+        ("bash -c 'terraform apply tfplan'", false),
+        ("bash -c 'terraform apply infra/tfplan'", true),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
 /// Fix round 1 of the CodeRabbit review (CDPATH, core-detect-2): a `cd` to a
 /// bare name may follow `CDPATH`, which the line can set in a spelling the
 /// shell decodes, through an expansion (also one bash evaluates later from

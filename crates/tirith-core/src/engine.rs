@@ -3549,6 +3549,7 @@ fn analyze_with_observation(
             findings.extend(crate::rules::iac::check_executable_inputs(
                 executable_inputs,
                 masked_root,
+                ctx.cwd.as_deref().map(std::path::Path::new),
                 &policy,
             ));
 

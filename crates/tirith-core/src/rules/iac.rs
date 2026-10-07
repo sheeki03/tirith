@@ -57,8 +57,10 @@ impl IacTool {
 /// tracks the working directory across segments (`DirTracker`) and recognizes
 /// a plan file that `tirith iac check-plan` records right before the apply,
 /// in the same `&&` chain (`check_plan_chained_before`).
+///
+/// Relative plan paths resolve against tirith's own working directory.
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    check_executable_inputs(|| std::iter::once((input, shell)), None, policy)
+    check_executable_inputs(|| std::iter::once((input, shell)), None, None, policy)
 }
 
 /// [`check`] over every executable input of one command: the analysed
@@ -71,15 +73,20 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 /// bodies were blanked out of its execution view (the first input), when
 /// they were: an unquoted heredoc body still expands before its command
 /// runs (`: <<EOF` + `${CDPATH:=/x}`; a bash 5.3 `${ cd x; }` in it moves
-/// the command, also an external one).
+/// the command, also an external one). `cwd` is the directory the command
+/// runs in (`AnalysisContext.cwd`): relative plan paths resolve against
+/// it, not against tirith's own working directory, which differs in a
+/// daemon, MCP server or gateway; `None` uses tirith's own.
 pub(crate) fn check_executable_inputs<'a, I>(
     inputs: impl Fn() -> I,
     masked_root: Option<&str>,
+    cwd: Option<&Path>,
     policy: &Policy,
 ) -> Vec<Finding>
 where
     I: Iterator<Item = (&'a str, ShellType)>,
 {
+    let start_dir = tracking_start_dir(cwd);
     let mut findings = Vec::new();
     // What each input may do to a nested body, computed once when a nested
     // body first needs it (`input_effects`).
@@ -97,7 +104,7 @@ where
         }
         let dirs = if k == 0 {
             // An unquoted heredoc body expands before its command runs.
-            let (dir, hazard) = nested_start(masked().into_iter());
+            let (dir, hazard) = nested_start(&start_dir, masked().into_iter());
             DirTracker::start(dir, hazard)
         } else {
             let effects = effects.get_or_insert_with(|| {
@@ -111,7 +118,7 @@ where
                 .enumerate()
                 .filter(|&(j, _)| j != k)
                 .map(|(_, other)| *other);
-            let (dir, hazard) = nested_start(others);
+            let (dir, hazard) = nested_start(&start_dir, others);
             DirTracker::start(dir, hazard)
         };
         findings.extend(check_segments(input, shell, policy, &segments, dirs));
@@ -161,18 +168,46 @@ fn check_segments(
     findings
 }
 
+/// Where the directory tracking starts: the command's own directory, or
+/// tirith's own cwd (empty) when the analysis has none. A Windows verbatim
+/// drive path (`\\?\C:\x`, as `canonicalize` returns it) turns off
+/// Windows' reading of `..` and `/` in the paths later joined to it, so it
+/// is used in its plain drive form.
+fn tracking_start_dir(cwd: Option<&Path>) -> PathBuf {
+    let Some(cwd) = cwd else {
+        return PathBuf::new();
+    };
+    #[cfg(windows)]
+    if let Some(plain) = cwd
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| {
+            let bytes = rest.as_bytes();
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+        })
+    {
+        return PathBuf::from(plain);
+    }
+    cwd.to_path_buf()
+}
+
 /// `true` when a segment with this preceding separator starts a new and-or
 /// list, i.e. runs regardless of how the previous command exited.
 fn starts_and_or_list(sep: Option<&str>) -> bool {
     matches!(sep, None | Some(";" | "\n" | "&"))
 }
 
-/// The shell's working directory at a segment, relative to the directory
-/// tirith resolves plain relative paths against (its own cwd).
+/// The shell's working directory at a segment. It starts as the caller's
+/// directory (`AnalysisContext.cwd`) when the analysis has one, else as
+/// tirith's own cwd, against which relative paths resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkDir {
-    /// Statically known: the tirith cwd joined with this path (empty = no
-    /// change; absolute after `cd /abs`).
+    /// Statically known: this path, relative to tirith's own cwd (empty =
+    /// that cwd; absolute from an absolute caller directory or after
+    /// `cd /abs`).
     Known(PathBuf),
     /// An earlier segment changed directory in a way tirith cannot resolve.
     Unknown,
@@ -477,8 +512,12 @@ fn starts_child_on_other_filesystem(seg: &tokenize::Segment, shell: ShellType) -
 /// host or filesystem (`ssh host '...'`: `WorkDir::Elsewhere`), and it
 /// inherits their worst `CdHazard` (`CDPATH=/x bash -c '...'`).
 /// Over-approximates: a false positive only makes a plan path in the body
-/// unresolvable.
-fn nested_start(others: impl Iterator<Item = InputEffects>) -> (WorkDir, CdHazard) {
+/// unresolvable. Otherwise it starts in `start_dir`, the command's own
+/// directory.
+fn nested_start(
+    start_dir: &Path,
+    others: impl Iterator<Item = InputEffects>,
+) -> (WorkDir, CdHazard) {
     let (changes_dir, elsewhere, hazard) = others.fold(
         (false, false, CdHazard::None),
         |(dir, elsewhere, hazard), other| {
@@ -494,7 +533,7 @@ fn nested_start(others: impl Iterator<Item = InputEffects>) -> (WorkDir, CdHazar
     } else if changes_dir || hazard == CdHazard::Rebind {
         (WorkDir::Unknown, hazard)
     } else {
-        (WorkDir::Known(PathBuf::new()), hazard)
+        (WorkDir::Known(start_dir.to_path_buf()), hazard)
     }
 }
 
@@ -2040,6 +2079,28 @@ mod tests {
     }
 
     #[test]
+    fn tracking_starts_in_the_callers_directory() {
+        assert_eq!(tracking_start_dir(None), PathBuf::new());
+        assert_eq!(
+            tracking_start_dir(Some(Path::new("/srv/app"))),
+            PathBuf::from("/srv/app")
+        );
+        // Windows does not read `..` or `/` in a path under a verbatim drive
+        // prefix, so that prefix is dropped there; other verbatim forms stay.
+        let verbatim = Path::new(r"\\?\C:\work\app");
+        assert_eq!(
+            tracking_start_dir(Some(verbatim)),
+            if cfg!(windows) {
+                PathBuf::from(r"C:\work\app")
+            } else {
+                verbatim.to_path_buf()
+            }
+        );
+        let unc = Path::new(r"\\?\UNC\server\share\app");
+        assert_eq!(tracking_start_dir(Some(unc)), unc.to_path_buf());
+    }
+
+    #[test]
     fn work_dir_follows_literal_cd_and_gives_up_on_anything_else() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let known = |p: &str| WorkDir::Known(PathBuf::from(p));
@@ -3053,7 +3114,7 @@ mod tests {
         // The executable inputs the engine passes: the command, then the
         // nested body it runs.
         let titles = |inputs: &[(&str, ShellType)], masked_root: Option<&str>| {
-            check_executable_inputs(|| inputs.iter().copied(), masked_root, &gated)
+            check_executable_inputs(|| inputs.iter().copied(), masked_root, None, &gated)
                 .into_iter()
                 .map(|f| f.title)
                 .collect::<Vec<_>>()
