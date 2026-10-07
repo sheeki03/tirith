@@ -52,7 +52,7 @@ tirith policy team enrollment status
 tirith policy team enrollment sync --expected-connection-id CONNECTION_UUID --expected-activation-id ACTIVATION_UUID
 ```
 
-Activation and sync do not send Applied reports. Commands read the enrolled local cache and never contact the team server. Repository restrictions and the ordinary local overlays still apply.
+Activation and sync do not send Applied reports. Commands enforce the enrolled local cache and never wait for the team server; `tirith check`, `tirith mcp-server` and `tirith gateway run` may start a detached background sync that contacts it (see [Automatic refresh and the offline grace period](#automatic-refresh-and-the-offline-grace-period)). Repository restrictions and the ordinary local overlays still apply.
 
 Touching or changing the permissions of the saved connection file does not invalidate an activation. Replacing the file with a different file (even one with the same bytes) does; activate again. The activation binds the file's index on its volume and, on Linux (glibc and musl builds, such as the aarch64 musl release, alike) and on Android 11 (API level 30) and later, its birth time, so a replacement that reuses a freed inode number (as ext4 does) is still a different file. Where the kernel has no `statx` (before Linux 4.11) or the filesystem keeps no birth time, the index alone is bound. Android 10 and earlier also bind the index alone: their app sandbox kills a process that calls `statx`, so tirith does not call it there. On macOS, setting the file's modification time to before its creation time also moves its birth time; tirith does not bind birth time there, so this does not matter.
 

@@ -375,8 +375,9 @@ task_gate:
 ```
 
 **That denied-effect set applies to YOUR commands too.** Every tirith-owned
-boundary reports its source as unattributed and untrusted, so the effect is
-denied on every call. With the snippet above, `tirith policy init` refuses.
+boundary reports an untrusted source (unattributed, or for `verify_self` and
+`self_update` an operator ingest of unknown kind), so the effect is denied on
+every call. With the snippet above, `tirith policy init` refuses.
 Under `mode: observe` it does not. Enable it
 knowing that.
 
