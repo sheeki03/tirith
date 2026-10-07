@@ -58,24 +58,104 @@ impl IacTool {
 /// a plan file that `tirith iac check-plan` records right before the apply,
 /// in the same `&&` chain (`check_plan_chained_before`).
 pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
-    let segments = tokenize::tokenize(input, shell);
-    let tirith_may_be_rebound = tirith_lookup_may_be_rebound(&segments);
-    let mut dirs = DirTracker::start();
+    check_executable_inputs(|| std::iter::once((input, shell)), None, policy)
+}
+
+/// [`check`] over every executable input of one command: the analysed
+/// command first, then the nested shell bodies it runs (`bash -c '...'`,
+/// `$(...)`, ...). A nested body does not start where tirith runs: it starts
+/// in whatever directory, and with whatever `CDPATH`, `cd` functions and
+/// aliases, the commands around it leave (`cd x; bash -c '...'`,
+/// `CDPATH=/x bash -c '...'`), so it inherits what the other inputs may do
+/// (`nested_start`). `masked_root` is the analysed command before heredoc
+/// bodies were blanked out of its execution view (the first input), when
+/// they were: an unquoted heredoc body still expands before its command
+/// runs (`: <<EOF` + `${CDPATH:=/x}`; a bash 5.3 `${ cd x; }` in it moves
+/// the command, also an external one).
+pub(crate) fn check_executable_inputs<'a, I>(
+    inputs: impl Fn() -> I,
+    masked_root: Option<&str>,
+    policy: &Policy,
+) -> Vec<Finding>
+where
+    I: Iterator<Item = (&'a str, ShellType)>,
+{
+    let mut findings = Vec::new();
+    // What each input may do to a nested body, computed once when a nested
+    // body first needs it (`input_effects`).
+    let mut effects: Option<Vec<InputEffects>> = None;
+    // What the heredoc bodies blanked out of the root's view may do.
+    let masked = || {
+        let (view, shell) = inputs().next()?;
+        masked_root.map(|raw| heredoc_effects(raw, view, shell))
+    };
+    for (k, (input, shell)) in inputs().enumerate() {
+        let segments = tokenize::tokenize(input, shell);
+        // Every rule here needs an IaC command in this input.
+        if !segments.iter().any(|seg| iac_tool(seg, shell).is_some()) {
+            continue;
+        }
+        let dirs = if k == 0 {
+            // An unquoted heredoc body expands before its command runs.
+            let (dir, hazard) = nested_start(masked().into_iter());
+            DirTracker::start(dir, hazard)
+        } else {
+            let effects = effects.get_or_insert_with(|| {
+                inputs()
+                    .map(|(input, shell)| input_effects(input, shell))
+                    .chain(masked())
+                    .collect()
+            });
+            let others = effects
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != k)
+                .map(|(_, other)| *other);
+            let (dir, hazard) = nested_start(others);
+            DirTracker::start(dir, hazard)
+        };
+        findings.extend(check_segments(input, shell, policy, &segments, dirs));
+    }
+    findings
+}
+
+/// The IaC rules over the segments of one executable input, with the working
+/// directory state it starts with.
+fn check_segments(
+    input: &str,
+    shell: ShellType,
+    policy: &Policy,
+    segments: &[tokenize::Segment],
+    mut dirs: DirTracker,
+) -> Vec<Finding> {
+    let tirith_may_be_rebound = tirith_lookup_may_be_rebound(segments);
     let mut findings = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
         dirs.enter(seg);
         let recorded_by_previous = if tirith_may_be_rebound {
             None
         } else {
-            check_plan_chained_before(&segments, i)
+            check_plan_chained_before(segments, i)
         };
-        let work_dir = dirs.current();
+        // The segment's own words expand before its command runs, and an
+        // expansion can change the directory (bash 5.3 `${ cd x; }` runs in
+        // the shell) or run code that does.
+        let work_dir = match dirs.current() {
+            WorkDir::Elsewhere => WorkDir::Elsewhere,
+            _ if iac_tool(seg, shell).is_some()
+                && (segment_may_change_dir(seg, shell)
+                    || segment_cd_hazard(seg, shell) == CdHazard::Rebind) =>
+            {
+                WorkDir::Unknown
+            }
+            dir => dir,
+        };
         let plan_env = PlanEnv {
             work_dir: &work_dir,
             recorded_by_previous: recorded_by_previous.as_deref(),
         };
         findings.extend(check_segment(input, shell, policy, seg, &plan_env));
-        dirs.leave(&segments, i, shell);
+        dirs.leave(segments, i, shell);
     }
     findings
 }
@@ -95,16 +175,19 @@ enum WorkDir {
     Known(PathBuf),
     /// An earlier segment changed directory in a way tirith cannot resolve.
     Unknown,
+    /// A nested shell started on another host, in a container or under
+    /// another root directory (`ssh`, `docker exec`, `chroot`, ...): no path,
+    /// not even an absolute one, names the file tirith can read.
+    Elsewhere,
 }
 
 impl WorkDir {
     /// Where the shell will find `path` (already relative to the segment's
     /// working directory); `None` when that cannot be resolved statically.
     fn resolve(&self, path: &Path) -> Option<PathBuf> {
-        if path.is_absolute() {
-            return Some(path.to_path_buf());
-        }
         match self {
+            Self::Elsewhere => None,
+            _ if path.is_absolute() => Some(path.to_path_buf()),
             Self::Known(base) => Some(base.join(path)),
             Self::Unknown => None,
         }
@@ -120,6 +203,11 @@ impl WorkDir {
 /// below it exists. Inside the rest of that and-or list, a segment reached
 /// through `||` may run because the cd failed, so its directory is unknown.
 /// A conditional cd (after `&&` / `||`) makes the directory unknown.
+///
+/// After a segment that may run code later or redefine `cd`
+/// (`CdHazard::Rebind`, in this input or around a nested body) the directory
+/// is unknown and no literal cd is followed. A cd to a bare name is followed
+/// only while nothing may have set `CDPATH` (`CdHazard::Cdpath`).
 #[derive(Debug, Clone)]
 struct DirTracker {
     dir: WorkDir,
@@ -127,19 +215,21 @@ struct DirTracker {
     cd_in_list: bool,
     /// ... and a `||` has followed that cd in the list.
     or_after_cd: bool,
-    /// An earlier segment of the input names `CDPATH` (or zsh's `cdpath`):
-    /// the shell's cd may then search it even when tirith's own environment
-    /// has none (an unexported shell variable is enough).
-    input_set_cdpath: bool,
+    /// The worst hazard of the segments scanned so far (and of the inputs
+    /// around a nested body).
+    hazard: CdHazard,
+    /// Segments `[0, hazard_scanned)` of the input are folded into `hazard`.
+    hazard_scanned: usize,
 }
 
 impl DirTracker {
-    fn start() -> Self {
+    fn start(dir: WorkDir, hazard: CdHazard) -> Self {
         Self {
-            dir: WorkDir::Known(PathBuf::new()),
+            dir,
             cd_in_list: false,
             or_after_cd: false,
-            input_set_cdpath: false,
+            hazard,
+            hazard_scanned: 0,
         }
     }
 
@@ -156,30 +246,58 @@ impl DirTracker {
 
     /// The working directory of the segment last passed to `enter`.
     fn current(&self) -> WorkDir {
-        if self.or_after_cd {
+        if self.or_after_cd && self.dir != WorkDir::Elsewhere {
             WorkDir::Unknown
         } else {
             self.dir.clone()
         }
     }
 
+    /// The worst hazard of `segments[..=i]` and of the start state.
+    fn hazard_through(
+        &mut self,
+        segments: &[tokenize::Segment],
+        i: usize,
+        shell: ShellType,
+    ) -> CdHazard {
+        while self.hazard < CdHazard::Rebind && self.hazard_scanned <= i {
+            let seg = &segments[self.hazard_scanned];
+            self.hazard = self.hazard.max(segment_cd_hazard(seg, shell));
+            self.hazard_scanned += 1;
+        }
+        self.hazard
+    }
+
     /// Apply the directory change (if any) of `segments[i]`.
     fn leave(&mut self, segments: &[tokenize::Segment], i: usize, shell: ShellType) {
         let seg = &segments[i];
-        if seg
-            .raw
-            .as_bytes()
-            .windows(b"cdpath".len())
-            .any(|window| window.eq_ignore_ascii_case(b"cdpath"))
-        {
-            self.input_set_cdpath = true;
+        if self.dir == WorkDir::Elsewhere {
+            return;
+        }
+        // The hazard counts this segment too (`CDPATH=/x cd infra`).
+        let hazard = self.hazard_through(segments, i, shell);
+        // Code that may run before a later segment (a `DEBUG` trap, a `PS4`
+        // traced by `set -x`, an alias or function for a later command, `fc`)
+        // can change the directory there.
+        if hazard == CdHazard::Rebind {
+            self.dir = WorkDir::Unknown;
+            return;
         }
         if !segment_may_change_dir(seg, shell) {
             return;
         }
-        let target = cd_runs_unconditionally(segments, i)
-            .then(|| literal_cd_target(seg, shell, self.input_set_cdpath))
-            .flatten();
+        let target = if cd_runs_unconditionally(segments, i) {
+            literal_cd_target(seg, shell)
+        } else {
+            None
+        };
+        let target = target
+            .filter(|target| {
+                !is_bare_cd_name(target)
+                    || (hazard == CdHazard::None
+                        && std::env::var_os("CDPATH").is_none_or(|v| v.is_empty()))
+            })
+            .map(PathBuf::from);
         let dir = std::mem::replace(&mut self.dir, WorkDir::Unknown);
         self.dir = match (dir, target) {
             (WorkDir::Known(base), Some(target)) => WorkDir::Known(base.join(target)),
@@ -190,6 +308,488 @@ impl DirTracker {
             self.cd_in_list = true;
         }
     }
+}
+
+/// What a segment may do to a later literal `cd`, worst last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CdHazard {
+    None,
+    /// It may set `CDPATH` (zsh: `cdpath`), which a cd to a bare directory
+    /// name searches before the working directory: an unexported shell
+    /// variable is enough, so tirith's own environment cannot show it.
+    Cdpath,
+    /// It may redefine what `cd` / `pushd` run (a function, an alias, a
+    /// disabled builtin, a startup file of a nested shell), or run code later
+    /// (a trap, a traced `PS4`): the directory becomes unknown and no later
+    /// literal cd is trusted.
+    Rebind,
+}
+
+/// The hazard of every segment of `text` (a whole command, where segment
+/// positions are not known).
+fn text_cd_hazard(text: &str, shell: ShellType) -> CdHazard {
+    tokenize::tokenize(text, shell)
+        .iter()
+        .map(|seg| segment_cd_hazard(seg, shell))
+        .max()
+        .unwrap_or(CdHazard::None)
+}
+
+/// What the heredoc bodies that `shell_execution_view` blanked out of the
+/// root's view (`raw` -> `view`) may do. An unquoted heredoc body expands in
+/// the shell before its command runs, so a directory-changing word in a body
+/// (bash 5.3 `${ cd x; }`) makes the whole line start in an unknown
+/// directory, and the worst hazard of the raw line counts from its start.
+fn heredoc_effects(raw: &str, view: &str, shell: ShellType) -> InputEffects {
+    let dir_change_words = |text: &str| {
+        let is_dir_change = |w: &str| DIR_CHANGE_WORDS.contains(&w.to_ascii_lowercase().as_str());
+        split_shell_words(text)
+            .filter(|w| is_dir_change(&normalize_shell_token(w, shell)))
+            .count()
+            + split_shell_words(&without_quoting(text))
+                .filter(|w| is_dir_change(w))
+                .count()
+    };
+    InputEffects {
+        changes_dir: dir_change_words(raw) > dir_change_words(view),
+        elsewhere: false,
+        hazard: text_cd_hazard(raw, shell),
+    }
+}
+
+/// What one executable input may do to a nested body run by the command.
+#[derive(Debug, Clone, Copy)]
+struct InputEffects {
+    /// A segment other than the last may change the directory (a later
+    /// segment may run the body there), or starts its child in another one.
+    changes_dir: bool,
+    /// A segment starts its child on another host, in a container or under
+    /// another root (`starts_child_on_other_filesystem`).
+    elsewhere: bool,
+    /// The worst `CdHazard` of its segments.
+    hazard: CdHazard,
+}
+
+fn input_effects(input: &str, shell: ShellType) -> InputEffects {
+    let segments = tokenize::tokenize(input, shell);
+    let mut effects = InputEffects {
+        changes_dir: false,
+        elsewhere: false,
+        hazard: CdHazard::None,
+    };
+    for (i, seg) in segments.iter().enumerate() {
+        effects.elsewhere |= starts_child_on_other_filesystem(seg, shell);
+        effects.changes_dir |= starts_child_elsewhere(seg, shell)
+            || (i + 1 < segments.len()
+                && !runs_in_child_process(seg, shell)
+                && segment_may_change_dir(seg, shell));
+        if effects.hazard < CdHazard::Rebind {
+            effects.hazard = effects.hazard.max(segment_cd_hazard(seg, shell));
+        }
+    }
+    effects
+}
+
+/// `true` when the segment's command is a program that runs its arguments
+/// in another process (a shell, `env`, `sudo`, ...), so a `cd` among them
+/// (`sh -c 'cd infra && ...'`) cannot change this shell's directory. A
+/// function or alias of that name defined on the line is a
+/// `CdHazard::Rebind`, which makes a nested body start in an unknown
+/// directory anyway.
+fn runs_in_child_process(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    seg.command
+        .as_deref()
+        .is_some_and(|cmd| CHILD_RUNNERS.contains(&command_basename(cmd, shell).as_str()))
+}
+
+/// `true` when the segment's command starts the program it runs (a nested
+/// shell body among them) in another directory: `env -C dir`, `sudo -D dir`
+/// or a login `sudo -i` / `su -`, PowerShell `-WorkingDirectory`, `find
+/// -execdir`, or anywhere `starts_child_on_other_filesystem` covers.
+fn starts_child_elsewhere(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    if starts_child_on_other_filesystem(seg, shell) {
+        return true;
+    }
+    let Some(cmd) = seg.command.as_deref() else {
+        return false;
+    };
+    let args: Vec<String> = seg
+        .args
+        .iter()
+        .map(|arg| normalize_shell_token(arg, shell))
+        .collect();
+    let short_option_with = |word: &str, letters: &[char]| {
+        word.starts_with('-')
+            && !word.starts_with("--")
+            && word.chars().skip(1).any(|c| letters.contains(&c))
+    };
+    let any_arg = |pred: &dyn Fn(&str) -> bool| args.iter().any(|arg| pred(arg));
+    match command_basename(cmd, shell).as_str() {
+        "env" => any_arg(&|a| short_option_with(a, &['C']) || a.starts_with("--chdir")),
+        "sudo" => any_arg(&|a| {
+            short_option_with(a, &['D', 'i']) || a.starts_with("--chdir") || a == "--login"
+        }),
+        "su" | "runuser" => {
+            any_arg(&|a| a == "-" || short_option_with(a, &['l']) || a == "--login")
+        }
+        "pwsh" | "powershell" => any_arg(&|a| a.to_ascii_lowercase().starts_with("-w")),
+        "find" => any_arg(&|a| a == "-execdir" || a == "-okdir"),
+        _ => false,
+    }
+}
+
+/// `true` when the segment's command starts the program it runs on another
+/// host, in a container, or under another root or mount namespace (`ssh`,
+/// `docker`, `kubectl`, `chroot`, `bwrap`, ...), where even an absolute path
+/// may name a file tirith cannot read.
+fn starts_child_on_other_filesystem(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    const RUNNERS: &[&str] = &[
+        "bwrap",
+        "chroot",
+        "docker",
+        "firejail",
+        "incus",
+        "kubectl",
+        "lxc",
+        "machinectl",
+        "nerdctl",
+        "nsenter",
+        "podman",
+        "ssh",
+        "systemd-run",
+        "unshare",
+        "vagrant",
+    ];
+    seg.command
+        .as_deref()
+        .is_some_and(|cmd| RUNNERS.contains(&command_basename(cmd, shell).as_str()))
+}
+
+/// Where a nested shell body starts, from the effects of the other
+/// executable inputs of the same command (the enclosing command and its
+/// other nested bodies: which of them encloses the body, and where, is not
+/// known). The body starts in an unknown directory when one of them may
+/// change the directory before a later segment (`cd x; bash -c '...'`),
+/// starts its child elsewhere (`env -C x sh -c '...'`) or may run code
+/// later or in the child (`trap`, functions, startup files), on another
+/// host or filesystem (`ssh host '...'`: `WorkDir::Elsewhere`), and it
+/// inherits their worst `CdHazard` (`CDPATH=/x bash -c '...'`).
+/// Over-approximates: a false positive only makes a plan path in the body
+/// unresolvable.
+fn nested_start(others: impl Iterator<Item = InputEffects>) -> (WorkDir, CdHazard) {
+    let (changes_dir, elsewhere, hazard) = others.fold(
+        (false, false, CdHazard::None),
+        |(dir, elsewhere, hazard), other| {
+            (
+                dir || other.changes_dir,
+                elsewhere || other.elsewhere,
+                hazard.max(other.hazard),
+            )
+        },
+    );
+    if elsewhere {
+        (WorkDir::Elsewhere, hazard)
+    } else if changes_dir || hazard == CdHazard::Rebind {
+        (WorkDir::Unknown, hazard)
+    } else {
+        (WorkDir::Known(PathBuf::new()), hazard)
+    }
+}
+
+/// Words that redefine commands, disable builtins, or run code from
+/// elsewhere: `fc` re-runs a history entry, zsh `emulate -c` evaluates its
+/// argument and `zmodload` can load a builtin (`.` and zsh's `r` count only
+/// as a command, see `runs_as_command`).
+const CD_REBINDING_WORDS: &[&str] = &[
+    "alias",
+    "aliases",
+    "autoload",
+    "disable",
+    "emulate",
+    "enable",
+    "eval",
+    "fc",
+    "function",
+    "functions",
+    "source",
+    "trap",
+    "zmodload",
+];
+
+/// Variables and options whose value runs as code, in this shell or in a
+/// nested one, or chooses the startup files a nested shell runs (which may
+/// set `CDPATH` or define `cd`): bash `PS4` (a `${ ...; }` substitution in it
+/// runs in this shell at every command traced by `set -x`, bash 5.3+),
+/// `BASH_ENV`, `--rcfile`, `--init-file` and exported `BASH_FUNC_*`
+/// functions, zsh `ZDOTDIR`, and fish `--init-command` and its configuration
+/// under the XDG directories. Looked for anywhere in a segment.
+const CODE_VARIABLE_NAMES: &[&str] = &[
+    "bash_env",
+    "bash_func_",
+    "init-command",
+    "init-file",
+    "ps4",
+    "rcfile",
+    "xdg_config_dirs",
+    "xdg_config_home",
+    "xdg_data_dirs",
+    "zdotdir",
+];
+
+/// Variables that also choose a nested shell's startup files, but whose
+/// names are too short to look for as a substring: `HOME` (zsh's
+/// `~/.zshenv`, fish's configuration, login shells) and `ENV` (an
+/// interactive `sh`). They count where a segment assigns them.
+const STARTUP_VARIABLES: &[&str] = &["env", "home"];
+
+/// Builtins that set a variable from data or from their arguments' values
+/// (`read y < f; (( y ))` sets whatever `f` names; `printf -v y %s%s CD
+/// PATH`), so the variable a later expansion or arithmetic evaluation
+/// assigns cannot be read from the line.
+const VARIABLE_READING_WORDS: &[&str] = &[
+    "for",
+    "getln",
+    "getopts",
+    "mapfile",
+    "readarray",
+    "read",
+    "select",
+    "sysread",
+    "vared",
+    "zparseopts",
+];
+
+/// Builtins that assign the variables their arguments name.
+const DECLARING_WORDS: &[&str] = &[
+    "declare", "export", "float", "integer", "let", "local", "nameref", "private", "readonly",
+    "set", "typeset",
+];
+
+/// Programs that run their arguments in a child process (a shell, `env`,
+/// `sudo`, ...); see `runs_in_child_process`.
+const CHILD_RUNNERS: &[&str] = &[
+    "ash", "bash", "dash", "doas", "env", "fish", "ksh", "mksh", "nice", "nohup", "pwsh", "setsid",
+    "sh", "stdbuf", "su", "sudo", "timeout", "xargs", "zsh",
+];
+
+/// What `seg` may do to a later literal `cd` (see `CdHazard`). This is a
+/// list of known shell features, checked with over-approximation, not a
+/// proof: words count as the shell decodes them and with every quote and
+/// escape character dropped, as in `segment_may_change_dir`, and expansion
+/// syntax counts even inside single quotes.
+///
+/// `Rebind`: a function definition; `alias`, `enable` / `disable`, `eval`,
+/// `source`, `.`, `trap`, `autoload`, `fc`, zsh `r`, `emulate` or
+/// `zmodload`; a command word built by an expansion; a variable or option
+/// that runs code or picks a nested shell's startup files
+/// (`CODE_VARIABLE_NAMES`, an assigned `HOME` or `ENV`, fish `-C`); a
+/// variable named through an expansion, brace or glob by a builtin that
+/// assigns it or by a program that passes it to a child (`export "$n=$v"`,
+/// `export C{D,}PATH=/x`, `env "$n=$v" bash -c '...'`), or a nameref
+/// (`declare -n`), since such a variable may be any of those; or any
+/// PowerShell / cmd segment (tirith models neither language's variables,
+/// functions or aliases).
+///
+/// `Cdpath`: the segment names `CDPATH` in any such spelling (`CD''PATH`,
+/// `CD\PATH`, `$'\x43DPATH'`, a backslash-newline inside the name); has any
+/// expansion syntax (`v=CD; y=${v}PATH=5; : $((y))` assigns the variable the
+/// value of `y` names, and text the shell keeps literal can still be
+/// evaluated later in this shell, as in `declare -a 'a=($((...)))'`); reads
+/// a variable from data or arguments (`read`, `printf -v`, `for`, ...); or
+/// passes a brace or glob pattern to a declaring builtin or into an array
+/// assignment (`y=(*); (( y ))` assigns whatever a file name says).
+fn segment_cd_hazard(seg: &tokenize::Segment, shell: ShellType) -> CdHazard {
+    if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
+        return CdHazard::Rebind;
+    }
+    let raw = seg.raw.as_str();
+    let stripped = without_quoting(raw);
+    // The whole segment as the shell decodes its quoting (a `$'...'` string
+    // may hold spaces and brackets), and each word decoded, then lower-cased.
+    let decoded_raw = normalize_shell_token(raw, shell);
+    let words: Vec<String> = split_shell_words(raw)
+        .filter(|w| !w.is_empty())
+        .map(|w| normalize_shell_token(w, shell))
+        .collect();
+    let decoded: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    let names = |needle: &str| {
+        contains_ignore_ascii_case(raw, needle)
+            || contains_ignore_ascii_case(&stripped, needle)
+            || contains_ignore_ascii_case(&decoded_raw, needle)
+            || decoded.iter().any(|w| w.contains(needle))
+    };
+    let has_word = |list: &[&str]| {
+        decoded.iter().any(|w| list.contains(&w.as_str()))
+            || split_shell_words(&stripped)
+                .any(|w| list.iter().any(|entry| w.eq_ignore_ascii_case(entry)))
+    };
+    let declaring = has_word(DECLARING_WORDS);
+    let assigns = |name: &str| {
+        decoded.iter().any(|w| {
+            w.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('=') || rest.starts_with("+="))
+        }) || (declaring && decoded.iter().any(|w| w == name))
+    };
+    let expands = has_expansion_syntax(raw, shell) || has_expansion_syntax(&decoded_raw, shell);
+    let sets_from_data = has_word(VARIABLE_READING_WORDS)
+        || (has_word(&["printf"]) && decoded.iter().any(|w| w.starts_with("-v")));
+    let passes_to_child = decoded.iter().any(|w| {
+        let base = w.rsplit('/').next().unwrap_or(w);
+        CHILD_RUNNERS.contains(&base)
+    });
+    let nameref = has_word(&["nameref"])
+        || (declaring
+            && decoded
+                .iter()
+                .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('n')));
+    let command_is_expanded = seg.command.as_deref().is_some_and(|cmd| {
+        cmd.contains(['$', '`']) || (shell == ShellType::Fish && cmd.contains('('))
+    });
+
+    if command_is_expanded
+        || has_word(CD_REBINDING_WORDS)
+        || runs_as_command(seg, shell, &[".", "r"])
+        || defines_a_function(raw)
+        || CODE_VARIABLE_NAMES.iter().any(|name| names(name))
+        || STARTUP_VARIABLES.iter().any(|name| assigns(name))
+        || runs_fish_init_command(&words)
+        || nameref
+        || ((declaring || sets_from_data || passes_to_child)
+            && names_a_variable_dynamically(raw, shell))
+    {
+        return CdHazard::Rebind;
+    }
+
+    if names("cdpath")
+        || expands
+        || sets_from_data
+        || (declaring && raw.contains(['{', '}', '*', '?', '[', ']']))
+        || (raw.contains("=(") && raw.contains(['{', '*', '?', '[']))
+    {
+        return CdHazard::Cdpath;
+    }
+    CdHazard::None
+}
+
+/// `true` when some word of `raw` (split at whitespace only) names a
+/// variable through an expansion, a brace or a glob: the part before its
+/// first `=` (all of it when there is none) has expansion syntax or one of
+/// `{ } * ? [ ]` (`"$n=$v"`, `${v}PATH=/x`, `C{D,}PATH=/x`, `$x`).
+fn names_a_variable_dynamically(raw: &str, shell: ShellType) -> bool {
+    raw.split_whitespace().any(|word| {
+        let name = word.split('=').next().unwrap_or(word);
+        has_expansion_syntax(name, shell) || name.contains(['{', '}', '*', '?', '[', ']'])
+    })
+}
+
+/// `true` when the segment runs fish with an init command (`-C`, also
+/// bundled with other short options, or a prefix of `--init-command`),
+/// which runs before the body and may define `cd`.
+fn runs_fish_init_command(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|w| w.rsplit('/').next().is_some_and(|base| base == "fish"))
+        && words.iter().any(|w| {
+            (w.starts_with('-') && !w.starts_with("--") && w.contains('C'))
+                || w.starts_with("--ini")
+        })
+}
+
+/// `raw` with backslash-newline continuations removed and then every quote
+/// and escape character dropped (`CD''PATH`, `C"D"PATH`, `CD\` + newline +
+/// `PATH` all become `CDPATH`).
+fn without_quoting(raw: &str) -> String {
+    raw.replace("\\\r\n", "")
+        .replace("\\\n", "")
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
+        .collect()
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// `true` when the segment defines a shell function (`f() { ...; }`,
+/// `function f { ...; }`): `(` then `)` with only whitespace between.
+fn defines_a_function(raw: &str) -> bool {
+    let mut open = false;
+    for c in raw.chars() {
+        match c {
+            '(' => open = true,
+            ')' if open => return true,
+            c if c.is_whitespace() => {}
+            _ => open = false,
+        }
+    }
+    false
+}
+
+/// `true` when the segment runs one of `words` as a command: its command
+/// word, or such a word in command position anywhere in it (`{ . env.sh; }`,
+/// `if . env.sh`, `builtin . env.sh`, `X=1 . env.sh`). For `.` (source a
+/// file), `cd .` and `find . -name x` do not count; for zsh's `r` (re-run
+/// the previous command), `grep r` does not.
+fn runs_as_command(seg: &tokenize::Segment, shell: ShellType, words: &[&str]) -> bool {
+    const COMMAND_STARTERS: &[&str] = &[
+        "!", "builtin", "command", "do", "elif", "else", "exec", "if", "then", "time", "until",
+        "while",
+    ];
+    if seg
+        .command
+        .as_deref()
+        .is_some_and(|cmd| words.contains(&normalize_shell_token(cmd, shell).as_str()))
+    {
+        return true;
+    }
+    let is_assignment = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    // `true` while the next word is in command position.
+    let mut command_position = true;
+    for word in split_shell_words(&seg.raw).filter(|w| !w.is_empty()) {
+        let word = normalize_shell_token(word, shell);
+        if command_position && words.contains(&word.as_str()) {
+            return true;
+        }
+        command_position = COMMAND_STARTERS.contains(&word.to_ascii_lowercase().as_str())
+            || (command_position && is_assignment(&word));
+    }
+    false
+}
+
+/// `true` when `text` has expansion syntax anywhere, quoted or not: a `$`
+/// parameter, arithmetic or command expansion (`$?`, `$#`, `$$`, `$!` and
+/// `$-` are numbers or flags and cannot spell a name; `$'...'` and `$"..."`
+/// are quotes), a backquote, or, in fish, a `(command)` substitution.
+/// Quoting is ignored on purpose: text the shell keeps literal here can still
+/// be evaluated later in this shell (`PS4='$((...))'` under `set -x`,
+/// `declare -a 'a=($((...)))'`, `[ -v 'a[$((...))]' ]`).
+fn has_expansion_syntax(text: &str, shell: ShellType) -> bool {
+    let fish = shell == ShellType::Fish;
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'$' => match bytes.get(i + 1) {
+            Some(b'?' | b'#' | b'$' | b'!' | b'-') | None => false,
+            Some(c) => {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        b'_' | b'{' | b'(' | b'[' | b'@' | b'*' | b'=' | b'~' | b'^' | b'+'
+                    )
+            }
+        },
+        b'`' => !fish,
+        b'(' => fish,
+        _ => false,
+    })
 }
 
 /// `true` when `segments[i]` runs whenever the line runs, in the shell
@@ -280,16 +880,20 @@ const DIR_CHANGE_WORDS: &[&str] = &[
 
 /// `true` when the segment contains a word that can change the working
 /// directory (as its command, behind `builtin` / `command` / `time`, or inside
-/// a `{ ...; }` group), sources a file (`. file`), or has a command word built
-/// by an expansion (`$X ..`). A word counts with its quoting and escapes
-/// removed, the way the shell reads it (`\cd`, `c''d`, `'c'd`, `$'\x63d'`,
-/// PowerShell `` c`d ``, cmd `c^d` are all `cd`). Over-approximates: a false
-/// positive only makes a later relative plan path unresolvable.
+/// a `{ ...; }` group), sources a file (`. file`, also `{ . file; }`), or has
+/// a command word built by an expansion (`$X ..`). A word counts with its
+/// quoting and escapes removed, the way the shell reads it (`\cd`, `c''d`,
+/// `'c'd`, `$'\x63d'`, `c\` + newline + `d`, PowerShell `` c`d ``, cmd `c^d`
+/// are all `cd`). Over-approximates: a false positive only makes a later
+/// relative plan path unresolvable.
 fn segment_may_change_dir(seg: &tokenize::Segment, shell: ShellType) -> bool {
-    if let Some(cmd) = seg.command.as_deref() {
-        if normalize_shell_token(cmd, shell) == "." || cmd.contains(['$', '`']) {
-            return true;
-        }
+    if seg
+        .command
+        .as_deref()
+        .is_some_and(|cmd| cmd.contains(['$', '`']))
+        || runs_as_command(seg, shell, &["."])
+    {
+        return true;
     }
     let is_dir_change = |w: &str| DIR_CHANGE_WORDS.contains(&w.to_ascii_lowercase().as_str());
     // Each word as the shell decodes it (quotes, backslashes, ANSI-C escapes).
@@ -298,12 +902,7 @@ fn segment_may_change_dir(seg: &tokenize::Segment, shell: ShellType) -> bool {
     // And with every quote and escape character simply dropped, so an escape
     // character that is also a separator above (PowerShell's backtick) or a
     // quoting form the decoder leaves alone cannot hide the word either.
-    let stripped: String = seg
-        .raw
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
-        .collect();
-    decoded || split_shell_words(&stripped).any(is_dir_change)
+    decoded || split_shell_words(&without_quoting(&seg.raw)).any(is_dir_change)
 }
 
 /// `raw` split at whitespace, operators and brackets (quotes are kept).
@@ -315,15 +914,10 @@ fn split_shell_words(raw: &str) -> impl Iterator<Item = &str> {
 
 /// The target of a plain `cd <literal>` / `pushd <literal>` segment in a POSIX
 /// or fish shell; `None` for anything else (no or several operands, `-`,
-/// `+N`, expansions, quoting inside the word, a `CDPATH` that could redirect
-/// a bare name, PowerShell / cmd syntax). `input_set_cdpath`: an earlier
-/// segment of the input names `CDPATH`, so a bare name may be redirected even
-/// when tirith's environment has no `CDPATH`.
-fn literal_cd_target(
-    seg: &tokenize::Segment,
-    shell: ShellType,
-    input_set_cdpath: bool,
-) -> Option<PathBuf> {
+/// `+N`, expansions, quoting inside the word, PowerShell / cmd syntax).
+/// Whether a `CDPATH` or a redefined `cd` may send it elsewhere is
+/// `DirTracker::leave`'s call.
+fn literal_cd_target(seg: &tokenize::Segment, shell: ShellType) -> Option<&str> {
     if matches!(shell, ShellType::PowerShell | ShellType::Cmd) {
         return None;
     }
@@ -343,17 +937,17 @@ fn literal_cd_target(
     if operands.next().is_some() {
         return None;
     }
-    let target = literal_path_word(target)?;
-    let bare_name = !(target.starts_with('/')
+    literal_path_word(target)
+}
+
+/// `true` for a cd operand the shells look up in `CDPATH`: not absolute and
+/// not starting with a `.` or `..` component.
+fn is_bare_cd_name(target: &str) -> bool {
+    !(target.starts_with('/')
         || target.starts_with("./")
         || target.starts_with("../")
         || target == "."
-        || target == "..");
-    if bare_name && (input_set_cdpath || std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()))
-    {
-        return None;
-    }
-    Some(PathBuf::from(target))
+        || target == "..")
 }
 
 /// `word` when it is a plain path with no shell expansion, quoting or option
@@ -488,6 +1082,16 @@ fn chdir_option(tool: IacTool, pre_verb: &[String]) -> Result<Option<PathBuf>, (
     Ok(dir)
 }
 
+/// The IaC tool a segment runs as its command, if any.
+fn iac_tool(seg: &tokenize::Segment, shell: ShellType) -> Option<IacTool> {
+    match command_basename(seg.command.as_deref()?, shell).as_str() {
+        "terraform" => Some(IacTool::Terraform),
+        "pulumi" => Some(IacTool::Pulumi),
+        "tofu" => Some(IacTool::Tofu),
+        _ => None,
+    }
+}
+
 fn check_segment(
     input: &str,
     shell: ShellType,
@@ -495,16 +1099,8 @@ fn check_segment(
     seg: &tokenize::Segment,
     plan_env: &PlanEnv<'_>,
 ) -> Vec<Finding> {
-    let Some(cmd) = seg.command.as_deref() else {
+    let Some(tool) = iac_tool(seg, shell) else {
         return Vec::new();
-    };
-    let leader = command_basename(cmd, shell);
-
-    let tool = match leader.as_str() {
-        "terraform" => IacTool::Terraform,
-        "pulumi" => IacTool::Pulumi,
-        "tofu" => IacTool::Tofu,
-        _ => return Vec::new(),
     };
 
     let args: Vec<String> = seg
@@ -656,10 +1252,12 @@ fn check_segment(
                         ),
                         format!(
                             "`{}` was invoked with plan file `{}` after a directory change \
-                             (`cd`, `pushd`, `-chdir=`, ...) that tirith cannot resolve, so \
-                             it cannot verify which plan file will be applied. Use an \
-                             absolute plan path, or run `tirith iac check-plan <plan> && \
-                             {} apply <plan>` from the plan's directory.",
+                             (`cd`, `pushd`, `-chdir=`, ...) or other shell code that tirith \
+                             cannot resolve, or in a shell started on another host, in a \
+                             container or under another root, so it cannot verify which plan \
+                             file will be applied. Use an absolute plan path, or run `tirith \
+                             iac check-plan <plan> && {} apply <plan>` from the plan's \
+                             directory.",
                             tool.as_str(),
                             path,
                             tool.as_str(),
@@ -1088,14 +1686,18 @@ mod tests {
 
     /// The working directory `DirTracker` gives the last segment of `input`.
     fn work_dir_at_last_segment(input: &str) -> WorkDir {
-        let segments = tokenize::tokenize(input, ShellType::Posix);
-        let mut dirs = DirTracker::start();
+        work_dir_at_last_segment_in(input, ShellType::Posix)
+    }
+
+    fn work_dir_at_last_segment_in(input: &str, shell: ShellType) -> WorkDir {
+        let segments = tokenize::tokenize(input, shell);
+        let mut dirs = DirTracker::start(WorkDir::Known(PathBuf::new()), CdHazard::None);
         for (i, seg) in segments.iter().enumerate() {
             dirs.enter(seg);
             if i + 1 == segments.len() {
                 break;
             }
-            dirs.leave(&segments, i, ShellType::Posix);
+            dirs.leave(&segments, i, shell);
         }
         dirs.current()
     }
@@ -1223,12 +1825,146 @@ mod tests {
             work_dir_at_last_segment("cd infra; terraform apply tfplan"),
             WorkDir::Known(PathBuf::from("infra"))
         );
-        // A CDPATH the input sets (in any segment, in any spelling) counts too.
+        // A CDPATH the input sets (in any segment) counts too.
         for input in [
             "CDPATH=/srv; cd infra; terraform apply tfplan",
             "export CDPATH=/srv; cd infra; terraform apply tfplan",
             "cdpath=(/srv); cd infra; terraform apply tfplan",
             "set CDPATH /srv\ncd infra\nterraform apply tfplan",
+            // Fix round 1: in any spelling the shell decodes to CDPATH ...
+            "export CD''PATH=/srv; cd infra; terraform apply tfplan",
+            "export C''DPATH=/srv; cd infra; terraform apply tfplan",
+            "export CD\\PATH=/srv; cd infra; terraform apply tfplan",
+            "declare -x CD\\PATH=/srv; cd infra; terraform apply tfplan",
+            "export C\"D\"PATH=/srv; cd infra; terraform apply tfplan",
+            "declare -x \"CD\"\"PATH=/srv\"; cd infra; terraform apply tfplan",
+            "export $'\\x43DPATH'=/srv; cd infra; terraform apply tfplan",
+            "printf -v C''DPATH /srv; cd infra; terraform apply tfplan",
+            "export CD\\\nPATH=/srv\ncd infra\nterraform apply tfplan",
+            // ... or through a name or value built by an expansion ...
+            "v=CD; export \"${v}PATH=/srv\"; cd infra; terraform apply tfplan",
+            "n=CD; export ${n}PATH=/srv; cd infra; terraform apply tfplan",
+            "x=CD; y=\"${x}PATH=5\"; : $((y)); cd infra; terraform apply tfplan",
+            "a=CD b=PATH=5; [[ $a$b -eq 1 ]]; cd infra; terraform apply tfplan",
+            "export `echo CD`PATH=/srv; cd infra; terraform apply tfplan",
+            // ... a brace or glob pattern, a variable read from data or
+            // arguments, or a nameref.
+            "export C{D,}PATH=/srv; cd infra; terraform apply tfplan",
+            "export {CD,X}PATH=/srv; cd infra; terraform apply tfplan",
+            "export C?PATH=x; cd infra; terraform apply tfplan",
+            "read y < f; (( y )); cd infra; terraform apply tfplan",
+            "printf -v y %s%s=5 CD PATH; (( y )); cd infra; terraform apply tfplan",
+            "for y in C{D,}PATH=5; do (( y )); done; cd infra; terraform apply tfplan",
+            "declare -n r; r=x; cd infra; terraform apply tfplan",
+            // Expansion syntax counts inside single quotes too: bash later
+            // evaluates it in a traced `PS4`, a quoted compound array
+            // assignment or a `-v` subscript (`CDPATH=5` from `$y$z`).
+            "y=CD; z=PATH; PS4='$(($y$z=5))'; set -x; cd infra; terraform apply tfplan",
+            "y=CD; z=PATH; declare -a 'a=($(($y$z=5)))'; cd infra; terraform apply tfplan",
+            "y=CD; z=PATH; [ -v 'a[$(($y$z=5))]' ]; cd infra; terraform apply tfplan",
+            "declare -a $'a=(\\x24((y=5)))'; cd infra; terraform apply tfplan",
+            "echo '$HOME'; cd infra; terraform apply tfplan",
+            // An array assignment of a glob or brace pattern (a file named
+            // `CDPATH=5`, then `(( y ))`).
+            "y=(*); (( y )); cd infra; terraform apply tfplan",
+            "y=(C{D,}PATH=5); (( y )); cd infra; terraform apply tfplan",
+        ] {
+            assert_eq!(
+                work_dir_at_last_segment(input),
+                WorkDir::Unknown,
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            work_dir_at_last_segment_in(
+                "set -gx (echo CD)PATH /srv\ncd infra\nterraform apply tfplan",
+                ShellType::Fish
+            ),
+            WorkDir::Unknown
+        );
+        for (input, expected) in [
+            ("CDPATH=/srv; cd ./infra; terraform apply tfplan", "./infra"),
+            (
+                "export CD''PATH=/srv; cd ../infra; terraform apply tfplan",
+                "../infra",
+            ),
+            (
+                "export TF_VAR_region=$REGION; cd /srv/infra; terraform apply tfplan",
+                "/srv/infra",
+            ),
+            // Set only after the cd ran.
+            ("cd infra; CDPATH=/srv; terraform apply tfplan", "infra"),
+            (
+                "cd infra; export C''DPATH=/srv; terraform apply tfplan",
+                "infra",
+            ),
+            // Nothing that can reach CDPATH.
+            (
+                "export TF_LOG=1 AWS_PROFILE=dev; cd infra; terraform apply tfplan",
+                "infra",
+            ),
+            (
+                "set -euo pipefail; cd infra; terraform apply tfplan",
+                "infra",
+            ),
+            (
+                "echo \"exit=$?\"; cd infra; terraform apply tfplan",
+                "infra",
+            ),
+            (
+                "echo 'plain text'; cd infra; terraform apply tfplan",
+                "infra",
+            ),
+            ("find . -name x; cd infra; terraform apply tfplan", "infra"),
+            (
+                "grep r notes.txt; cd infra; terraform apply tfplan",
+                "infra",
+            ),
+        ] {
+            assert_eq!(
+                work_dir_at_last_segment(input),
+                WorkDir::Known(PathBuf::from(expected)),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_cd_is_not_trusted_after_cd_may_be_redefined() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        // A function, alias, disabled builtin, sourced file, eval or trap can
+        // make a later `cd`, even to an absolute path, go elsewhere.
+        for input in [
+            "cd() { builtin cd /x/\"$1\"; }; cd /srv/infra; terraform apply tfplan",
+            "function cd { builtin cd /x; }; cd /srv/infra; terraform apply tfplan",
+            "alias cd='cd /x/'\ncd ./infra\nterraform apply tfplan",
+            "enable -n cd; cd /srv/infra; terraform apply tfplan",
+            "source env.sh; cd /srv/infra; terraform apply tfplan",
+            "{ . ./env.sh; }; cd /srv/infra; terraform apply tfplan",
+            "eval \"$DEF\"; cd /srv/infra; terraform apply tfplan",
+            "trap 'cd /x' DEBUG; cd /srv/infra; terraform apply tfplan",
+            "$X; cd /srv/infra; terraform apply tfplan",
+            // `.` in command position sources a file, which may cd.
+            "{ . ./env.sh; }; terraform apply tfplan",
+            "if . ./env.sh; then terraform apply tfplan; fi",
+            // A backslash-newline inside the `cd` word.
+            "cd infra\nc\\\nd ..\nterraform apply tfplan",
+            // Fix round 1: a traced `PS4` runs a bash 5.3 `${ ...; }` in the
+            // shell; a variable named through an expansion, brace or
+            // nameref may be `PS4`; `fc`, zsh `r` and `emulate` run code.
+            "PS4=\"$v\"; set -x; cd /srv/infra; terraform apply tfplan",
+            "n=PS4; export \"$n=$v\"; set -x; cd /srv/infra; terraform apply tfplan",
+            "export {P,Q}S4=\"$v\"; set -x; cd /srv/infra; terraform apply tfplan",
+            "printf -v \"$n\" %s \"$v\"; cd /srv/infra; terraform apply tfplan",
+            "declare -n r=\"$n\"; cd /srv/infra; terraform apply tfplan",
+            "fc -s; cd /srv/infra; terraform apply tfplan",
+            "r; cd /srv/infra; terraform apply tfplan",
+            "emulate sh -c \"$x\"; cd /srv/infra; terraform apply tfplan",
+            // Code that runs later can move the directory with no later cd.
+            "trap \"$x\" DEBUG; terraform apply tfplan",
+            "PS4=\"$v\"; set -x; terraform apply tfplan",
+            "alias terraform=\"$x\"\nterraform apply tfplan",
+            "cd /srv/infra; trap \"$x\" DEBUG; terraform apply tfplan",
         ] {
             assert_eq!(
                 work_dir_at_last_segment(input),
@@ -1237,9 +1973,15 @@ mod tests {
             );
         }
         for (input, expected) in [
-            ("CDPATH=/srv; cd ./infra; terraform apply tfplan", "./infra"),
-            // Set only after the cd ran.
-            ("cd infra; CDPATH=/srv; terraform apply tfplan", "infra"),
+            ("cd /srv/infra; terraform apply tfplan", "/srv/infra"),
+            ("echo hi; cd /srv; terraform apply tfplan", "/srv"),
+            ("cd \"$D\"; cd /srv; terraform apply tfplan", "/srv"),
+            ("cd .; terraform apply tfplan", "."),
+            (
+                "export TF_VAR_region=\"$REGION\"; cd /srv; terraform apply tfplan",
+                "/srv",
+            ),
+            ("grep r notes.txt; cd /srv; terraform apply tfplan", "/srv"),
         ] {
             assert_eq!(
                 work_dir_at_last_segment(input),
@@ -1371,6 +2113,23 @@ mod tests {
             "export CDPATH=/x; cd infra && terraform apply tfplan",
             "cdpath=(/x); cd infra; terraform apply tfplan",
             "set CDPATH /x; cd infra; terraform apply tfplan",
+            // Fix round 1: the spellings reviewers ran through bash.
+            "export CD''PATH=/x; cd infra; terraform apply tfplan",
+            "export CD\\PATH=/x; cd infra; terraform apply tfplan",
+            "declare -x \"CD\"\"PATH=/x\"; cd infra; terraform apply tfplan",
+            "v=CD; export \"${v}PATH=/x\"; cd infra; terraform apply tfplan",
+            "export $'\\x43DPATH'=/x; cd infra; terraform apply tfplan",
+            "export C''DPATH=/x; cd infra; terraform apply tfplan",
+            "export C\"D\"PATH=/x; cd infra; terraform apply tfplan",
+            "declare -x CD\\PATH=/x; cd infra; terraform apply tfplan",
+            "printf -v C''DPATH /x; cd infra; terraform apply tfplan",
+            "n=CD; export ${n}PATH=/x; cd infra; terraform apply tfplan",
+            "y=CD; z=PATH; PS4='$(($y$z=5))'; set -x; cd infra; terraform apply tfplan",
+            "y=CD; z=PATH; declare -a 'a=($(($y$z=5)))'; cd infra; terraform apply tfplan",
+            // Code that may run before the apply, and the apply's own
+            // expansions (bash 5.3 `${ cd x; }` runs in the shell).
+            "trap \"$x\" DEBUG; terraform apply tfplan",
+            "terraform apply tfplan \"${ cd /x; }\"",
         ] {
             let found = rules(input);
             assert!(
@@ -1381,6 +2140,213 @@ mod tests {
                 "{input:?}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn nested_bodies_start_where_the_enclosing_command_leaves_them() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let gated = Policy {
+            iac_require_plan_before_apply: true,
+            ..Policy::default()
+        };
+        // The executable inputs the engine passes: the command, then the
+        // nested body it runs.
+        let titles = |inputs: &[(&str, ShellType)], masked_root: Option<&str>| {
+            check_executable_inputs(|| inputs.iter().copied(), masked_root, &gated)
+                .into_iter()
+                .map(|f| f.title)
+                .collect::<Vec<_>>()
+        };
+        let unlocatable =
+            |titles: &[String]| titles.len() == 1 && titles[0].contains("cannot be located");
+        let posix = ShellType::Posix;
+        for (outer, body) in [
+            // A CDPATH the outer command gives the nested shell.
+            (
+                "CDPATH=/x bash -c 'cd infra; terraform apply tfplan'",
+                "cd infra; terraform apply tfplan",
+            ),
+            (
+                "export CDPATH=/x; bash -c 'cd infra; terraform apply tfplan'",
+                "cd infra; terraform apply tfplan",
+            ),
+            (
+                "env CDPATH=/x sh -c 'cd infra && terraform apply tfplan'",
+                "cd infra && terraform apply tfplan",
+            ),
+            (
+                "export C''DPATH=/x; bash -c 'cd infra; terraform apply tfplan'",
+                "cd infra; terraform apply tfplan",
+            ),
+            // A directory change before the nested shell runs.
+            (
+                "cd other; bash -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "cd other && sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            // A startup file or a trap of the outer command.
+            (
+                "BASH_ENV=./x.sh bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "trap \"bash -c 'terraform apply tfplan'\" EXIT; cd other",
+                "terraform apply tfplan",
+            ),
+            // A wrapper that starts the nested shell in another directory.
+            (
+                "env -C other sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "sudo -D other sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "sudo -i sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "find . -name other -execdir sh -c 'terraform apply tfplan' \\;",
+                "terraform apply tfplan",
+            ),
+            // Fix round 1: the outer command picks the nested shell's
+            // startup files or init code, or passes it a variable whose name
+            // tirith cannot read (which may be one of those, or a
+            // `BASH_FUNC_cd%%` function).
+            (
+                "ENV=./e.sh sh -ic 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "HOME=./h zsh -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "env \"$n=$v\" bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "export \"$n=$v\"; bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "env 'BASH_FUNC_cd%%=() { builtin cd /x; }' bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            // A remote host or container: tirith cannot read its files.
+            (
+                "ssh host 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "docker exec box sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "ssh host 'terraform apply /srv/infra/tfplan'",
+                "terraform apply /srv/infra/tfplan",
+            ),
+            (
+                "chroot /mnt sh -c 'cd /srv/infra || exit; terraform apply tfplan'",
+                "cd /srv/infra || exit; terraform apply tfplan",
+            ),
+        ] {
+            let found = titles(&[(outer, posix), (body, posix)], None);
+            assert!(unlocatable(&found), "{outer:?}: {found:?}");
+        }
+        // fish reads its configuration from HOME or XDG_CONFIG_HOME and runs
+        // `-C` / `--init-command` code before the body.
+        for outer in [
+            "XDG_CONFIG_HOME=./h fish -c 'cd /srv/infra; terraform apply tfplan'",
+            "HOME=./h fish -c 'cd /srv/infra; terraform apply tfplan'",
+            "fish -C \"$x\" -c 'cd /srv/infra; terraform apply tfplan'",
+            "fish --init-command=\"$x\" -c 'cd /srv/infra; terraform apply tfplan'",
+        ] {
+            let found = titles(
+                &[
+                    (outer, posix),
+                    ("cd /srv/infra; terraform apply tfplan", ShellType::Fish),
+                ],
+                None,
+            );
+            assert!(unlocatable(&found), "{outer:?}: {found:?}");
+        }
+        // tirith models no PowerShell or cmd assignments around a POSIX body.
+        let found = titles(
+            &[
+                (
+                    "bash -c 'cd infra; terraform apply tfplan'",
+                    ShellType::PowerShell,
+                ),
+                ("cd infra; terraform apply tfplan", posix),
+            ],
+            None,
+        );
+        assert!(unlocatable(&found), "{found:?}");
+        // The plain cases still resolve (the plan file is then read).
+        for (outer, body) in [
+            (
+                "bash -c 'cd infra && terraform apply tfplan'",
+                "cd infra && terraform apply tfplan",
+            ),
+            (
+                "CDPATH=/x bash -c 'cd ./infra && terraform apply tfplan'",
+                "cd ./infra && terraform apply tfplan",
+            ),
+            (
+                "bash -c 'terraform apply tfplan'; cd other",
+                "terraform apply tfplan",
+            ),
+            (
+                "env TF_LOG=1 sh -c 'terraform apply tfplan'",
+                "terraform apply tfplan",
+            ),
+            (
+                "sh -c 'cd infra && terraform apply tfplan'; echo \"exit=$?\"",
+                "cd infra && terraform apply tfplan",
+            ),
+            // A value (not a name) tirith cannot read only rules out a bare
+            // name, and a startup variable only counts where it is assigned.
+            (
+                "export TF_VAR_region=\"$REGION\"; bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+            (
+                "echo \"$HOME\"; env -u CDPATH bash -c 'cd /srv/infra && terraform apply tfplan'",
+                "cd /srv/infra && terraform apply tfplan",
+            ),
+        ] {
+            let found = titles(&[(outer, posix), (body, posix)], None);
+            assert!(
+                found.len() == 1 && found[0].contains("could not be read"),
+                "{outer:?}: {found:?}"
+            );
+        }
+        // A heredoc body blanked out of the execution view still counts.
+        let raw = ": <<EOF\n${CDPATH:=/x}\nEOF\ncd infra\nterraform apply tfplan";
+        let view = crate::extract::shell_execution_view(raw, posix);
+        assert_ne!(view, raw);
+        assert!(
+            !titles(&[(&view, posix)], None)[0].contains("cannot be located"),
+            "the view alone hides the heredoc"
+        );
+        let found = titles(&[(&view, posix)], Some(raw));
+        assert!(unlocatable(&found), "{found:?}");
+        // A heredoc body that changes the directory as it expands (bash 5.3
+        // `${ cd x; }`) before the apply runs.
+        let raw = "terraform apply tfplan <<EOF\n${ cd /x; }\nEOF";
+        let view = crate::extract::shell_execution_view(raw, posix);
+        assert_ne!(view, raw);
+        let found = titles(&[(&view, posix)], Some(raw));
+        assert!(unlocatable(&found), "{found:?}");
+        let raw = "cat <<EOF\n${ cd /x; }\nEOF\nterraform apply tfplan";
+        let view = crate::extract::shell_execution_view(raw, posix);
+        let found = titles(&[(&view, posix)], Some(raw));
+        assert!(unlocatable(&found), "{found:?}");
     }
 
     #[test]

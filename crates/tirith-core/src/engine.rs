@@ -3540,14 +3540,17 @@ fn analyze_with_observation(
                 ));
             }
 
-            // ch3 — IaC (tier-1 gate: `iac_cmd`).
-            for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::iac::check(
-                    executable_input,
-                    executable_shell,
-                    &policy,
-                ));
-            }
+            // ch3 — IaC (tier-1 gate: `iac_cmd`). One call over every input:
+            // a nested body starts where the commands around it leave it.
+            // Heredoc bodies are blanked out of the root's execution view,
+            // but one a builtin reads still expands in the shell.
+            let masked_root =
+                matches!(root_execution_view, std::borrow::Cow::Owned(_)).then_some(analyzed_input);
+            findings.extend(crate::rules::iac::check_executable_inputs(
+                executable_inputs,
+                masked_root,
+                &policy,
+            ));
 
             // ch4 — sudo-escalation (tier-1 gate: `sudo_cmd`; lazy session lookup).
             for (executable_input, executable_shell) in executable_inputs() {

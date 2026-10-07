@@ -2970,6 +2970,180 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
     );
 }
 
+/// Fix round 1 of the CodeRabbit review (CDPATH, core-detect-2): a `cd` to a
+/// bare name may follow `CDPATH`, which the line can set in a spelling the
+/// shell decodes, through an expansion (also one bash evaluates later from
+/// single quotes), or around a nested shell body; a nested body also starts
+/// in the directory, and with the startup files, the commands around it
+/// leave; and code that runs later, or the apply's own expansion, can move
+/// the apply. Each `true` row applied (or could apply) an unrecorded plan
+/// while tirith hashed the recorded one before this fix.
+#[test]
+fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.remove_env("CDPATH");
+    global.set_cwd(&root).unwrap();
+
+    // ./tfplan and ./infra/tfplan are recorded; other/tfplan and
+    // other/infra/tfplan (where CDPATH=other or `cd other` leads) are not.
+    let summary = PlanSummary::default();
+    fs::create_dir_all(root.join("infra")).unwrap();
+    fs::create_dir_all(root.join("other/infra")).unwrap();
+    for (path, bytes) in [
+        ("tfplan", &b"RECORDED ROOT PLAN"[..]),
+        ("infra/tfplan", &b"RECORDED INFRA PLAN"[..]),
+    ] {
+        fs::write(root.join(path), bytes).unwrap();
+        iac_plan::record_plan_hash(bytes, &root.join(path), &summary).unwrap();
+    }
+    fs::write(root.join("other/tfplan"), b"UNRECORDED OTHER PLAN").unwrap();
+    fs::write(root.join("other/infra/tfplan"), b"UNRECORDED OTHER INFRA").unwrap();
+
+    let mismatch = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(root.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+
+    // `$n` may be BASH_ENV (a startup file that redefines `cd`).
+    let dynamic_env = format!(
+        "export \"$n=$v\"; bash -c 'cd {} && terraform apply tfplan'",
+        root.join("infra").display()
+    );
+    let wrong = [
+        // CDPATH in spellings the shell decodes, or built by an expansion.
+        (
+            "export CD''PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // ... also inside single quotes that bash evaluates later.
+        (
+            "y=CD; z=PATH; PS4='$(($y$z=5))'; set -x; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "y=CD; z=PATH; declare -a 'a=($(($y$z=5)))'; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // Code that may run before the apply, or the apply's own expansion.
+        ("trap \"$x\" DEBUG; terraform apply tfplan", true),
+        ("terraform apply tfplan \"${ cd other; }\"", true),
+        // A nested shell whose startup files or functions the line picks.
+        (
+            "HOME=other fish -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (dynamic_env.as_str(), true),
+        (
+            "export CD\\PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "declare -x \"CD\"\"PATH=other\"; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "v=CD; export \"${v}PATH=other\"; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "export $'\\x43DPATH'=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "printf -v C''DPATH other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "export C{D,}PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // Around a nested shell body.
+        (
+            "CDPATH=other bash -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (
+            "export CDPATH=other; bash -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (
+            "env CDPATH=other sh -c 'cd infra && terraform apply tfplan'",
+            true,
+        ),
+        ("cd other; bash -c 'terraform apply tfplan'", true),
+        ("env -C other sh -c 'terraform apply tfplan'", true),
+        // In a heredoc body a builtin reads (blanked out of the view).
+        (
+            ": <<EOF\n${CDPATH:=other}\nEOF\ncd infra\nterraform apply tfplan",
+            true,
+        ),
+        // Controls: nothing reaches CDPATH or the nested body's directory.
+        ("cd infra; terraform apply tfplan", false),
+        ("export TF_LOG=1; cd infra; terraform apply tfplan", false),
+        (
+            "export TF_VAR_region=$REGION; cd ./infra; terraform apply tfplan",
+            false,
+        ),
+        ("grep r notes.txt; cd infra; terraform apply tfplan", false),
+        (
+            "export CD''PATH=other; cd ./infra; terraform apply tfplan",
+            false,
+        ),
+        ("bash -c 'cd infra && terraform apply tfplan'", false),
+        (
+            "CDPATH=other bash -c 'cd ./infra && terraform apply tfplan'",
+            false,
+        ),
+        (
+            "sh -c 'cd infra && terraform apply tfplan'; echo \"exit=$?\"",
+            false,
+        ),
+        ("bash -c 'terraform apply tfplan'", false),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
 // M12 ch1 (G1 TOCTOU fix): when the caller found no sidecar it sets
 // `AbsentOrInvalid`, and the engine must NOT re-read `clipboard_source.json`.
 // Plant a MATCHING sidecar (a disk read WOULD fire the rule), then prove
