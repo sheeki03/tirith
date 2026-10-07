@@ -2077,7 +2077,10 @@ mod tests {
             // After an unknown directory only an absolute target is known
             // again. A rooted POSIX path has no drive on Windows, so it is
             // not absolute there (Git Bash maps `/` to its own install
-            // directory) and stays unknown; a drive path is absolute.
+            // directory) and stays unknown; a drive path is absolute. A
+            // drive path does not start with `/`, so bash looks it up in
+            // `CDPATH`: it is followed only where nothing may set `CDPATH`
+            // (`"$D"` may), here after a conditional cd.
             (
                 "cd \"$D\"; cd /srv; terraform apply tfplan",
                 if cfg!(windows) {
@@ -2088,6 +2091,10 @@ mod tests {
             ),
             (
                 "cd \"$D\"; cd C:/srv; terraform apply tfplan",
+                WorkDir::Unknown,
+            ),
+            (
+                "false && cd infra; cd C:/srv; terraform apply tfplan",
                 if cfg!(windows) {
                     known("C:/srv")
                 } else {
