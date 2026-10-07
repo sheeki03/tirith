@@ -75,8 +75,9 @@ pub fn check(input: &str, shell: ShellType, policy: &Policy) -> Vec<Finding> {
 /// runs (`: <<EOF` + `${CDPATH:=/x}`; a bash 5.3 `${ cd x; }` in it moves
 /// the command, also an external one). `cwd` is the directory the command
 /// runs in (`AnalysisContext.cwd`): relative plan paths resolve against
-/// it, not against tirith's own working directory, which differs in a
-/// daemon, MCP server or gateway; `None` uses tirith's own.
+/// it, not against tirith's own working directory, which differs in the
+/// daemon (it passes the client's directory; the MCP server and the
+/// gateway pass their own); `None` uses tirith's own.
 pub(crate) fn check_executable_inputs<'a, I>(
     inputs: impl Fn() -> I,
     masked_root: Option<&str>,

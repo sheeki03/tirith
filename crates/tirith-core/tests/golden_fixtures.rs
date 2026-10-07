@@ -2986,9 +2986,9 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
 }
 
 /// The plan gate reads a relative plan from the directory the command runs
-/// in (`AnalysisContext.cwd`), not from tirith's own working directory: a
-/// daemon, MCP server or gateway analyses commands for shells in other
-/// directories (review of PR #274).
+/// in (`AnalysisContext.cwd`), not from tirith's own working directory: the
+/// daemon analyses commands for clients in other directories (review of
+/// PR #274).
 #[test]
 fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
     use tirith_core::iac_plan::{self, PlanSummary};
