@@ -1284,6 +1284,32 @@ fn download_pipeline_inside_a_command_substitution_is_a_review_signal() {
     // A bound hit by substitutions alone is not a download claim.
     let piped_only = "x=$(echo a | tr a b)\n".repeat(300);
     assert!(!shell_file_has_download_signal(&piped_only));
+
+    // Nested deeper than the descent's depth bound in one line: the line
+    // pass has the same depth bound, and a piped body still left there counts
+    // as found, as running out of its body budget does (it fails toward the
+    // signal).
+    for depth in [9, 12] {
+        let nested = format!(
+            "x=\"{}$({pipeline}){}\"\n",
+            "$(echo a | cat; echo ".repeat(depth),
+            ")".repeat(depth)
+        );
+        let result = inspect(&package(
+            br#"{"name":"fixture","version":"1"}"#,
+            &[("package/install.sh", nested.as_bytes())],
+        ));
+        assert!(
+            result
+                .coverage
+                .issues
+                .iter()
+                .any(|issue| issue.kind == NpmIssueKind::CodeLimit),
+            "{nested:?}: {:?}",
+            result.coverage.issues
+        );
+        assert!(shell_file_has_download_signal(&nested), "{nested:?}");
+    }
 }
 
 /// Shown-only heredoc text is masked only where the shell ends the heredoc

@@ -1037,18 +1037,17 @@ fn any_line_feeds_shell(text: &str, expanded: bool) -> bool {
 }
 
 /// The line pass reads inside a line's substitutions too, within `budget`
-/// piped bodies per line. Running out counts as found: the line pass is the
+/// piped bodies per line and [`SHELL_BODY_DEPTH`] levels. Running out of
+/// either with a piped body left counts as found: the line pass is the
 /// fallback, which fails toward the signal.
 fn substitution_feeds_shell(bodies: &[String], depth: usize, budget: &mut usize) -> bool {
-    depth < SHELL_BODY_DEPTH
-        && bodies.iter().filter(|body| body.contains('|')).any(|body| {
-            if *budget == 0 {
-                return true;
-            }
-            *budget -= 1;
-            feeds_shell(body)
-                || substitution_feeds_shell(&substitution_bodies(body), depth + 1, budget)
-        })
+    bodies.iter().filter(|body| body.contains('|')).any(|body| {
+        if *budget == 0 || depth >= SHELL_BODY_DEPTH {
+            return true;
+        }
+        *budget -= 1;
+        feeds_shell(body) || substitution_feeds_shell(&substitution_bodies(body), depth + 1, budget)
+    })
 }
 
 /// One bounded descent over the file, then over each live heredoc body.
