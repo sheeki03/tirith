@@ -1004,15 +1004,36 @@ pub(crate) fn start_server_background_refresh() {
     let _ = std::thread::Builder::new()
         .name("tirith-team-refresh".into())
         .spawn(move || {
+            let interval = std::time::Duration::from_millis(REFRESH_CLAIM_INTERVAL_MS);
             let mut child = first;
             loop {
-                if let Some(mut running) = child.take() {
-                    let _ = running.wait();
+                if let Some(running) = child.take() {
+                    reap_refresh_child(running, interval);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(REFRESH_CLAIM_INTERVAL_MS));
+                std::thread::sleep(interval);
                 child = start_background_refresh(false);
             }
         });
+}
+
+/// Wait up to `limit` for a refresh child, then kill it if it still runs, and
+/// reap it. A sync bounds its own network requests, but a child stuck anyway
+/// (a hung filesystem, a stopped process) must not end the server's refreshes.
+/// The sync replaces the enrollment by an atomic compare-and-swap write, so a
+/// killed child leaves the last good cache in place.
+fn reap_refresh_child(mut child: std::process::Child, limit: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn start_background_refresh(offline_flag: bool) -> Option<std::process::Child> {

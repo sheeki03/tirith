@@ -699,6 +699,31 @@ mod background_refresh {
         assert!(TeamEnrollment::background_refresh_target(now_ms().unwrap()).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_child_that_outlives_its_limit_is_killed_and_reaped() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        reap_refresh_child(child, std::time::Duration::from_millis(200));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the server refresh thread must not wait for a stuck child: {:?}",
+            started.elapsed()
+        );
+        // Reaped: the pid no longer names our child.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "child {pid} is still running");
+    }
+
     #[test]
     fn background_child_arguments_parse_as_a_hidden_exact_sync() {
         use clap::Parser;
