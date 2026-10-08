@@ -1113,6 +1113,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
     ("threat_safe_browsing", "ThreatSafeBrowsing"),
+    // Runtime package lookup could not be completed (threatdb_api, post-engine).
+    ("package_lookup_incomplete", "PackageLookupIncomplete"),
     // Package reputation rules (M6 ch6).
     ("package_not_found_in_registry", "PackageNotFoundInRegistry"),
     (

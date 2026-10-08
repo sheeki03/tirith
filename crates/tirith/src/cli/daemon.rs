@@ -1580,7 +1580,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             org_policy.join("policy.yaml"),
-            "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+            "severity_overrides:\n  package_lookup_incomplete: CRITICAL\n",
         )
         .unwrap();
         global.set_env("TIRITH_POLICY_ROOT", &org_root);
@@ -1618,7 +1618,7 @@ mod tests {
         let policy_path = policy_dir.join("policy.yaml");
         std::fs::write(
             &policy_path,
-            "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
+            "severity_overrides:\n  package_lookup_incomplete: CRITICAL\n",
         )
         .unwrap();
         let req = super::DaemonRequest {
@@ -1639,14 +1639,14 @@ mod tests {
             assert_eq!(
                 analyzed
                     .1
-                    .severity_override(&tirith_core::verdict::RuleId::AnalysisIncomplete),
+                    .severity_override(&tirith_core::verdict::RuleId::PackageLookupIncomplete),
                 Some(tirith_core::verdict::Severity::Critical)
             );
             // Model a policy deployment immediately after initial analysis.
             // A second discovery would weaken the late offline-coverage finding.
             std::fs::write(
                 &policy_path,
-                "severity_overrides:\n  analysis_incomplete: INFO\n",
+                "severity_overrides:\n  package_lookup_incomplete: INFO\n",
             )
             .unwrap();
             analyzed

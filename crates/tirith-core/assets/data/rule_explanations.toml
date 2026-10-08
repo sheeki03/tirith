@@ -1521,6 +1521,17 @@ examples_good = ["curl https://github.com/user/repo/install.sh"]
 false_positive_guidance = "Google Safe Browsing has a low false positive rate. If a legitimate URL is flagged, it may have been temporarily compromised. Check the Safe Browsing transparency report."
 remediation = "Do not fetch content from the flagged URL. If the URL is expected, verify it has not been compromised."
 
+[[rule]]
+id = "package_lookup_incomplete"
+title = "Package threat intelligence could not be completed"
+category = "threatintel"
+severity_rationale = "Medium: a live package lookup (OSV.dev, deps.dev) that did not finish is incomplete verification of one package, not evidence of malice, so it warns and never blocks by default. The strict protection profile blocks it with analysis_incomplete. It is a separate id from analysis_incomplete so that a missed lookup (offline, slow or unreachable registry) and an unanalyzable command structure can be handled differently by policy."
+description = "Tirith looks up packages a command installs (pip, npm, cargo and other installers) against live vulnerability and package-health services after the local checks. This finding means at least one of those lookups did not complete: offline mode (--offline or TIRITH_OFFLINE) with no cached answer, the lookup ran out of its time budget, or the service was unreachable or returned an error or an invalid response. The local threat database checks (known malicious packages, typosquats) still ran. Emitted after the engine by the runtime lookup, so it has no tier-1 PATTERN_TABLE entry."
+examples_bad = ["tirith check --offline -- 'pip install requests' on a machine whose package lookup cache has no answer for requests"]
+examples_good = ["pip install requests after an online lookup has cached its result", "npm install with no package names (installs the lockfile)"]
+false_positive_guidance = "Expected when working offline or behind a proxy that blocks OSV.dev or deps.dev. Run the command online once so the result is cached, or, if you accept installing without the live lookup, lower this rule in policy (severity_overrides or action_overrides for package_lookup_incomplete). Do not silence analysis_incomplete for this: that id covers commands tirith could not analyze."
+remediation = "Re-run online so the lookup can complete, or verify the package by other means (pinned version, lockfile, provenance) before installing."
+
 # ── Package reputation rules (M6 ch6 — 7 new signals) ──────────────────
 
 [[rule]]

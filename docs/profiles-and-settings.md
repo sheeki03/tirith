@@ -14,7 +14,7 @@ your policy file.
 | `raw_ip_url` alone | Low | Medium advisory | Medium acknowledgement |
 | `shortened_url`, `package_repo_mismatch` when not already blocked | Advisory | Selected confirmation, 120 seconds, timeout blocks | Warning acknowledgement |
 | Other Medium findings | Advisory | Advisory | Warning acknowledgement |
-| `analysis_incomplete`, `wrapper_chain_too_deep` | Existing behavior | Existing behavior | Action override blocks |
+| `analysis_incomplete`, `package_lookup_incomplete`, `wrapper_chain_too_deep` | Existing behavior | Existing behavior | Action override blocks |
 | Internal failure | Open | Open | Closed |
 | Interactive environment bypass | Permitted | Permitted | Disabled |
 | Noninteractive environment bypass | Disabled | Disabled | Disabled |

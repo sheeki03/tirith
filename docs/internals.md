@@ -315,8 +315,13 @@ hook cannot enforce acknowledgement. These labels describe the decision and
 supplied integration capability, not independently observed interception or
 execution.
 
-Existing `analysis_incomplete`, `output_analysis_overflow`, and
-`wrapper_chain_too_deep` findings add an explicit ANALYSIS INCOMPLETE note. The
+Existing `analysis_incomplete`, `package_lookup_incomplete`,
+`output_analysis_overflow`, and `wrapper_chain_too_deep` findings add an
+explicit ANALYSIS INCOMPLETE note. `package_lookup_incomplete` (Medium) means a
+live package lookup (OSV.dev, deps.dev) for a package being installed did not
+complete, for example offline with no cached answer; `analysis_incomplete` is
+kept for command structure tirith could not analyze, so a policy can treat the
+two differently. The
 note does not replace the final action or reinterpret incomplete coverage as
 proof of malicious content. Findings continue to provide the specific gap and
 reason.

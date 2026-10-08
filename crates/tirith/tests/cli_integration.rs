@@ -722,6 +722,47 @@ fn check_rejects_an_unknown_option_without_a_verdict() {
     assert_eq!(verdict["action"], "block");
 }
 
+/// Offline, an uncached package lookup is `package_lookup_incomplete`, a
+/// Medium warning (exit 2), not the High `analysis_incomplete`.
+#[test]
+fn check_offline_package_lookup_gap_is_a_warning_with_its_own_rule() {
+    let out = tirith()
+        .args([
+            "check",
+            "--json",
+            "--non-interactive",
+            "--no-daemon",
+            "--offline",
+            "--shell",
+            "posix",
+            "--",
+            "pip install tirith-offline-cli-fixture",
+        ])
+        .output()
+        .expect("run tirith");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let verdict: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON verdict");
+    assert_eq!(verdict["action"], "warn");
+    let findings = verdict["findings"].as_array().expect("findings");
+    assert!(
+        findings.iter().any(|finding| {
+            finding["rule_id"] == "package_lookup_incomplete" && finding["severity"] == "MEDIUM"
+        }),
+        "{findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["rule_id"] != "analysis_incomplete"),
+        "{findings:?}"
+    );
+}
+
 #[test]
 fn check_curl_pipe_bash_shows_remediation_hint() {
     let out = tirith()
@@ -6987,58 +7028,67 @@ severity_overrides:
 
 #[test]
 fn offline_runtime_findings_honor_operator_severity_overrides() {
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let state_dir = tmpdir.path().join("state");
-    let org_dir = tmpdir.path().join("org/.tirith");
-    let project_dir = tmpdir.path().join("project");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::create_dir_all(&org_dir).unwrap();
-    fs::create_dir_all(&project_dir).unwrap();
-    fs::write(
-        org_dir.join("policy.yaml"),
-        "severity_overrides:\n  analysis_incomplete: CRITICAL\n",
-    )
-    .unwrap();
+    // (overridden rule, expected exit, expected severity, expected action):
+    // the package-lookup finding has its own id, so an `analysis_incomplete`
+    // override no longer reaches it.
+    for (rule, code, severity, action) in [
+        ("package_lookup_incomplete", 1, "CRITICAL", "block"),
+        ("analysis_incomplete", 2, "MEDIUM", "warn"),
+    ] {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmpdir.path().join("state");
+        let org_dir = tmpdir.path().join("org/.tirith");
+        let project_dir = tmpdir.path().join("project");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&org_dir).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            org_dir.join("policy.yaml"),
+            format!("severity_overrides:\n  {rule}: CRITICAL\n"),
+        )
+        .unwrap();
 
-    let out = tirith_isolated(
-        "test-offline-runtime-severity-override",
-        &state_dir,
-        &project_dir,
-    )
-    .env("TIRITH_POLICY_ROOT", tmpdir.path().join("org"))
-    .args([
-        "check",
-        "--offline",
-        "--non-interactive",
-        "--no-daemon",
-        "--json",
-        "--shell",
-        "posix",
-        "--",
-        "pip install tirith-offline-override-fixture==9.9.9",
-    ])
-    .output()
-    .expect("run offline check");
+        let out = tirith_isolated(
+            "test-offline-runtime-severity-override",
+            &state_dir,
+            &project_dir,
+        )
+        .env("TIRITH_POLICY_ROOT", tmpdir.path().join("org"))
+        .args([
+            "check",
+            "--offline",
+            "--non-interactive",
+            "--no-daemon",
+            "--json",
+            "--shell",
+            "posix",
+            "--",
+            "pip install tirith-offline-override-fixture==9.9.9",
+        ])
+        .output()
+        .expect("run offline check");
 
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON verdict");
-    let runtime = json["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .find(|finding| {
-            finding["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("skipped by offline mode"))
-        })
-        .expect("offline runtime finding");
-    assert_eq!(runtime["severity"], "CRITICAL");
-    assert_eq!(json["action"], "block");
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{rule}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON verdict");
+        let runtime = json["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| {
+                finding["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("skipped by offline mode"))
+            })
+            .expect("offline runtime finding");
+        assert_eq!(runtime["rule_id"], "package_lookup_incomplete", "{rule}");
+        assert_eq!(runtime["severity"], severity, "{rule}");
+        assert_eq!(json["action"], action, "{rule}");
+    }
 }
 
 /// F9 SECURITY notice: when a repo-scoped `.tirith/policy.yaml` carries a WEAKENING field

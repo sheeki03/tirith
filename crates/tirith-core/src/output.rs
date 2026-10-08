@@ -419,6 +419,7 @@ fn write_analysis_coverage_note(verdict: &Verdict, mut w: impl Write) -> std::io
         matches!(
             finding.rule_id,
             RuleId::AnalysisIncomplete
+                | RuleId::PackageLookupIncomplete
                 | RuleId::OutputAnalysisOverflow
                 | RuleId::WrapperChainTooDeep
         )

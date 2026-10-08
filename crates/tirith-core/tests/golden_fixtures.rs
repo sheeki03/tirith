@@ -1000,6 +1000,7 @@ const ALL_RULE_IDS: &[&str] = &[
     "threat_cisa_kev",
     "threat_suspicious_package",
     "threat_safe_browsing",
+    "package_lookup_incomplete",
     // Package reputation rules (M6 ch6)
     "package_not_found_in_registry",
     "package_maintainer_change_recent",
@@ -1236,6 +1237,10 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     "threat_cisa_kev",           // requires live CISA KEV correlation
     "threat_suspicious_package", // requires live package-health lookups
     "threat_safe_browsing",      // requires a Google Safe Browsing API key
+    // Emitted by the runtime package lookup after `engine::analyze` (the CLI,
+    // daemon and MCP check paths), which golden fixtures do not run. Covered
+    // by `threatdb_api` unit tests and the `check --offline` CLI test.
+    "package_lookup_incomplete",
     // M6 ch6 — package reputation rules from package_risk / install_txn /
     // ecosystem_scan, not the engine; need an `--online` registry-API run.
     "package_not_found_in_registry",
@@ -1680,6 +1685,7 @@ rule_id_variant_registry! {
     ThreatMaliciousUrl, ThreatPhishingUrl, ThreatTorExitNode, ThreatThreatFoxIoc,
     // Threat intelligence — real-time lookups
     ThreatOsvVulnerable, ThreatCisaKev, ThreatSuspiciousPackage, ThreatSafeBrowsing,
+    PackageLookupIncomplete,
     // Package reputation rules (M6 ch6)
     PackageNotFoundInRegistry, PackageMaintainerChangeRecent, PackageOwnershipTransferred,
     PackageOsvAdvisoryActive, PackageDependencyConfusion, PackageInstallScriptNetworkCall,

@@ -151,7 +151,11 @@ pub fn definition(name: ProtectionProfile, version: u32) -> Result<ProfileDefini
                 "action_overrides.wrapper_chain_too_deep".into(),
                 json!("block"),
             );
-            ("detailed", "analysis_incomplete and wrapper_chain_too_deep block; internal failures close; scans require complete coverage",
+            settings.insert(
+                "action_overrides.package_lookup_incomplete".into(),
+                json!("block"),
+            );
+            ("detailed", "analysis_incomplete, package_lookup_incomplete and wrapper_chain_too_deep block; internal failures close; scans require complete coverage",
                 "every remaining warning requires acknowledgement at a supported interactive boundary")
         }
     };
@@ -516,7 +520,11 @@ mod tests {
             CallerContext::Cli,
         );
         assert_eq!(balanced.requires_approval, Some(true));
-        for rule in [RuleId::AnalysisIncomplete, RuleId::WrapperChainTooDeep] {
+        for rule in [
+            RuleId::AnalysisIncomplete,
+            RuleId::PackageLookupIncomplete,
+            RuleId::WrapperChainTooDeep,
+        ] {
             raw.findings[0].rule_id = rule;
             let strict = crate::escalation::apply_stateless_policy_effects(
                 &raw,

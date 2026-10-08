@@ -268,7 +268,7 @@ fn package_incomplete_finding(
         return None;
     }
     Some(Finding {
-        rule_id: RuleId::AnalysisIncomplete,
+        rule_id: RuleId::PackageLookupIncomplete,
         severity: Severity::Medium,
         title: "Package threat intelligence could not be completed".to_string(),
         description: format!(
@@ -513,9 +513,12 @@ pub(crate) fn capture_cached_enrichment(
             Duration::from_millis(500),
         ),
     );
-    let complete = !findings
-        .iter()
-        .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete);
+    let complete = !findings.iter().any(|finding| {
+        matches!(
+            finding.rule_id,
+            RuleId::AnalysisIncomplete | RuleId::PackageLookupIncomplete
+        )
+    });
     (findings, complete)
 }
 
@@ -2482,7 +2485,7 @@ mod tests {
                 "later package was starved for {command}: {findings:?}"
             );
             assert!(findings.iter().any(|finding| {
-                finding.rule_id == RuleId::AnalysisIncomplete
+                finding.rule_id == RuleId::PackageLookupIncomplete
                     && finding.description.contains("slow-pkg")
                     && finding
                         .description
@@ -2501,7 +2504,7 @@ mod tests {
             &failed,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding.description.contains("OSV lookup transport failed")
                 && finding.description.contains("not evidence")
         }));
@@ -2520,7 +2523,7 @@ mod tests {
             &unsatisfied,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("registry default does not satisfy constraint")
@@ -2543,7 +2546,7 @@ mod tests {
             &backend,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("default-version resolution deadline exhausted")
@@ -2612,7 +2615,7 @@ mod tests {
         );
 
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("OSV lookup was skipped by offline mode")
@@ -2623,6 +2626,57 @@ mod tests {
                     .description
                     .contains("offline mode forbids DNS and HTTP")
         }));
+    }
+
+    /// A package lookup that could not be completed (here: offline with no
+    /// cached answer) is its own Medium rule, a warning rather than a block,
+    /// and never the High `analysis_incomplete` that unanalyzable command
+    /// structure produces. It still marks the enrichment as incomplete.
+    #[test]
+    fn package_lookup_gaps_have_their_own_rule_id_and_stay_medium() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: true,
+            ..ThreatIntelConfig::default()
+        };
+        for input in [
+            "pip install tirith-offline-command-fixture",
+            "npm install tirith-offline-npm-fixture@9.9.9",
+        ] {
+            let findings = enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            );
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::PackageLookupIncomplete
+                        && finding.severity == Severity::Medium
+                }),
+                "{input}: {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+            assert_eq!(
+                crate::verdict::action_from_findings(&findings),
+                crate::verdict::Action::Warn,
+                "{input}"
+            );
+            let (_, complete) = capture_cached_enrichment(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                chrono::Utc::now(),
+            );
+            assert!(!complete, "{input}");
+        }
     }
 
     /// Issue #264: a package manager named through a proven literal variable is
@@ -2659,7 +2713,7 @@ mod tests {
             assert!(
                 literal_findings
                     .iter()
-                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                    .any(|finding| finding.rule_id == RuleId::PackageLookupIncomplete),
                 "{literal}: {literal_findings:?}"
             );
             let describe = |findings: &[Finding]| {
