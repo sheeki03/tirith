@@ -117,11 +117,11 @@ remediation = "Remove the trailing dot or whitespace from the hostname."
 id = "lookalike_tld"
 title = "File-extension lookalike TLD"
 category = "hostname"
-severity_rationale = "Medium — TLDs like .zip, .mov, and .app look like file extensions, enabling social engineering attacks."
-description = "The URL uses a TLD that resembles a common file extension (.zip, .mov, .app, .dev, .run). Attackers register these domains to trick users into thinking a URL is a file download."
+severity_rationale = "Medium — TLDs like .zip, .mov, and .run look like file names, enabling social engineering attacks."
+description = "The URL uses a TLD that resembles a common file extension (.zip, .mov, .run). Attackers register these domains to trick users into thinking a URL is a file download. The developer TLDs .app and .dev are not flagged."
 examples_bad = ["curl https://update.zip/latest"]
 examples_good = ["curl https://example-cli.dev/install.sh"]
-false_positive_guidance = "Some legitimate services use .dev, .app, or .run TLDs. Add trusted domains to your allowlist."
+false_positive_guidance = "Some legitimate services use .zip, .mov, or .run domains (for example a .run installer host). Add trusted domains to your allowlist."
 remediation = "Verify the domain is legitimate and not impersonating a file download."
 
 # ── Path rules ──────────────────────────────────────────────────────────

@@ -779,8 +779,8 @@ fn check_curl_pipe_bash_shows_remediation_hint() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("getvet.sh"),
-        "human output should contain vet hint: {stderr}"
+        stderr.contains("tirith check --suggest") && !stderr.contains("getvet.sh"),
+        "human output should contain the remediation hint, without a third-party tool: {stderr}"
     );
 }
 
@@ -2939,8 +2939,8 @@ fn check_iwr_pipe_iex_no_tirith_run_hint() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("getvet.sh"),
-        "PowerShell fetch should show vet hint: {stderr}"
+        stderr.contains("tirith check --suggest") && !stderr.contains("getvet.sh"),
+        "PowerShell fetch should show the remediation hint, without a third-party tool: {stderr}"
     );
     assert!(
         !stderr.contains("tirith run"),

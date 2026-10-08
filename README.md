@@ -161,7 +161,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Steganography defense** | Invisible whitespace encoding (12 Unicode space variants), Mongolian Vowel Separator, Hangul Filler characters, math alphanumeric substitution, defenses against st3gg-style text steganography |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)`, plus many wrapper, decode, and indirection paths |
 | **Base64 decode-execute** | `base64 -d \| bash`, `python -c "exec(b64decode(...))"`, `powershell -EncodedCommand`, decode chains through sudo/env wrappers |
-| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
+| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, uploads of project secret files (`.env`, `.env.production`, `secrets.yaml`), env var uploads in request bodies (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil. A credential in a request header (`-H "Authorization: Bearer $TOKEN"`) is treated as authentication, like `--user` |
 | **Code file scanning** | Obfuscated payloads (`eval(atob(...))`), dynamic code execution (`exec(b64decode(...))`), secret exfiltration via `fetch`/`requests.post` in JS/Python files |
 | **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
 | **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps, calibrated against TeamPCP and UNC1069 post-compromise tooling |

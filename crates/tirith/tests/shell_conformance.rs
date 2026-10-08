@@ -429,7 +429,10 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
         "printf 'true' | bash && touch '{}'",
         marker.display()
     ));
-    sess.expect_any(&["BLOCKED", "getvet.sh", "tirith run"], VERDICT_IDLE);
+    sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
     sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
     let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
     assert_eq!(
@@ -1426,7 +1429,7 @@ fn fish_blocked_command_does_not_execute() {
     // since the hook's `tirith check` subprocess emits nothing until it returns
     // — `wait_idle` would return mid-subprocess, the no-output race).
     let out = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
     );
     sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
@@ -1439,7 +1442,9 @@ fn fish_blocked_command_does_not_execute() {
     sess.close();
 
     assert!(
-        out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
+        out.contains("BLOCKED")
+            || out.contains("tirith check --suggest")
+            || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
     );
     // The verdict surfaced only after `tirith check` returned, so the hook has
@@ -1808,11 +1813,13 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         blocked.display()
     ));
     let output = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
     );
     assert!(
-        output.contains("BLOCKED") || output.contains("getvet.sh") || output.contains("tirith run"),
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
         "zsh blocked command must surface a Tirith verdict, got:\n{output}"
     );
     assert!(!blocked.exists(), "zsh blocked command must not execute");

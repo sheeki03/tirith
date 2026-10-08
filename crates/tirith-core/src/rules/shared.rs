@@ -195,6 +195,19 @@ pub fn is_loopback_host(host: &str) -> bool {
         || host.ends_with(".localhost")
 }
 
+/// An RFC 1918 private IPv4 address in dotted-quad form (`10.0.0.0/8`,
+/// `172.16.0.0/12`, `192.168.0.0/16`): a LAN host. Loopback, link-local
+/// (`169.254.0.0/16`, where cloud metadata services live), IPv6 and every
+/// other spelling of an address (`0xC0A80114`, `3232235796`) are not.
+pub fn is_rfc1918_ipv4_host(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+        let octets = ip.octets();
+        octets[0] == 10
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+            || (octets[0] == 192 && octets[1] == 168)
+    })
+}
+
 /// Canonical "critical" criticality labels for the M8 context/SSH/IaC/container
 /// rules; a label outside this set never fires. Centralised to avoid the
 /// four-copy drift hazard (PR-127 review #7). Case-insensitive, whitespace-trimmed.
@@ -321,6 +334,29 @@ mod tests {
         // A non-loopback IPv4 address is not local.
         assert!(!is_loopback_host("10.0.0.1"));
         assert!(!is_loopback_host("128.0.0.1"));
+    }
+
+    #[test]
+    fn rfc1918_hosts_are_only_dotted_private_ipv4() {
+        for host in ["10.0.0.5", "172.16.0.1", "172.31.255.254", "192.168.1.20"] {
+            assert!(is_rfc1918_ipv4_host(host), "{host}");
+        }
+        for host in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "127.0.0.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.169.0.1",
+            "8.8.8.8",
+            "0xC0A80114",
+            "3232235796",
+            "fd00:ec2::254",
+            "10.0.0.5.evil.example",
+            "lan.example",
+        ] {
+            assert!(!is_rfc1918_ipv4_host(host), "{host}");
+        }
     }
 
     #[test]
