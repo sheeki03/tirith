@@ -3254,6 +3254,44 @@ fn iac_plan_gate_does_not_follow_a_cd_that_may_not_run() {
             fish,
             true,
         ),
+        // The shells read `[[ ... ]]` (and a fish brace expansion) whole, so
+        // the `fi` / `done` / `end` in it is text; bash runs a compound
+        // command after `time -p` or `time --`, zsh after a redirection.
+        (
+            "if false; then [[ x && fi ]]; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "until :; do [[ x || done ]]; pushd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then [[\nfi ]]; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "time -p while false; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "time -- if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "2>/dev/null if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; echo {a && end }; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
         // The second pass of the loop applies infra/ops/tfplan.
         (
             "cd ./infra; for i in 1 2; do :; terraform apply tfplan; cd ./ops; done",
@@ -3301,6 +3339,16 @@ fn iac_plan_gate_does_not_follow_a_cd_that_may_not_run() {
         (
             "if false; :; else if true; :; end; cd ./infra; terraform apply tfplan",
             fish,
+            false,
+        ),
+        (
+            "if [ -d x ]; then :; fi; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "time -p true; cd ./infra; terraform apply tfplan",
+            posix,
             false,
         ),
         ("terraform apply tfplan", posix, true),

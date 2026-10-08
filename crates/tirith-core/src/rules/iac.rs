@@ -453,11 +453,12 @@ const FISH_CLOSERS: &[&str] = &["end", "}"];
 /// quoted one is a plain word), and a closer only as the plain first word
 /// of a segment that is not piped and has no `)` (not a `case` pattern such
 /// as `fi )`), before any heredoc or backquote on the line (the tokenizer
-/// splits their bodies into segments too, `cat <<E` + newline + `fi`) and
-/// before any group the tokenizer may have ended early
-/// (`compound_openers`). A group the tokenizer keeps in one segment opens
-/// nothing that outlasts it. Other shells: all outside (tirith follows no
-/// cd there).
+/// splits their bodies into segments too, `cat <<E` + newline + `fi`),
+/// before any word the tokenizer may have split where the shell does not
+/// (`may_split_inside_a_word`: `[[ x && fi ]]`) and before any group the
+/// tokenizer may have ended early (`compound_openers`). A group the
+/// tokenizer keeps in one segment opens nothing that outlasts it. Other
+/// shells: all outside (tirith follows no cd there).
 fn compound_scopes(segments: &[tokenize::Segment], shell: ShellType) -> Vec<CompoundScope> {
     let mut scopes = vec![CompoundScope::default(); segments.len()];
     if !matches!(shell, ShellType::Posix | ShellType::Fish) {
@@ -489,9 +490,19 @@ fn compound_scopes(segments: &[tokenize::Segment], shell: ShellType) -> Vec<Comp
         if closers_trusted && closers.contains(&first_word) && !pattern_like {
             depth = depth.saturating_sub(1);
         }
-        let (opens, group_may_run_on) = compound_openers(raw, shell);
+        // The tokenizer splits zsh's `>|` (a redirection past `noclobber`)
+        // into a segment ending in `>` piped into this one, which then
+        // starts with its target: `>| f if ...`.
+        let after_clobber = i > 0
+            && seg.preceding_separator.as_deref() == Some("|")
+            && segments[i - 1].raw.trim_end().ends_with('>');
+        let (opens, group_may_run_on) = compound_openers(raw, shell, after_clobber);
         depth = depth.saturating_add(opens);
-        if group_may_run_on || raw.contains("<<") || raw.contains('`') {
+        if group_may_run_on
+            || raw.contains("<<")
+            || raw.contains('`')
+            || may_split_inside_a_word(raw, shell)
+        {
             closers_trusted = false;
         }
         if depth_before == 0 && opens == 0 {
@@ -518,7 +529,8 @@ fn compound_scopes(segments: &[tokenize::Segment], shell: ShellType) -> Vec<Comp
 /// How many compound commands a segment (its text `raw`, trimmed) opens
 /// that its later segments are inside: the openers in the run of
 /// command-position words it starts with (`then if`, `! while`, `do {`,
-/// fish `and begin`; fish `else if` opens nothing), and whether a group the
+/// bash `time -p while`, zsh `2>/dev/null if`, fish `and begin`; fish
+/// `else if` opens nothing), and whether a group the
 /// tokenizer ended in it may in fact run on into later segments. A group
 /// the tokenizer keeps whole (a segment that starts with `{ ` or `(`, a
 /// `coproc` body) opens nothing when it plainly ends the segment: its `}`
@@ -527,8 +539,9 @@ fn compound_scopes(segments: &[tokenize::Segment], shell: ShellType) -> Vec<Comp
 /// shell does not: a `}` that is an argument (`{ echo }; cd x; }`), or the
 /// `)` of a `case` pattern inside parentheses (`( case x in y) ...`,
 /// `$(case ...)`): then the segment opens one, and no later closer is
-/// trusted.
-fn compound_openers(raw: &str, shell: ShellType) -> (usize, bool) {
+/// trusted. `redirected`: the segment starts after a redirection operator
+/// (see `redirected` below).
+fn compound_openers(raw: &str, shell: ShellType, redirected: bool) -> (usize, bool) {
     let fish = shell == ShellType::Fish;
     let (before_command, before_word, prefixes) = if fish {
         (
@@ -568,6 +581,10 @@ fn compound_openers(raw: &str, shell: ShellType) -> (usize, bool) {
     }
     let mut opens = 0;
     let mut previous = String::new();
+    // zsh runs a compound command after a redirection (`2>/dev/null if
+    // ...`, `> "$f" while ...`). Its target may span several of these
+    // words (`> $(echo a b)`), so after one every later opener counts.
+    let mut redirected = redirected;
     for word in text.split_whitespace() {
         let word = normalize_shell_token(word, shell).to_ascii_lowercase();
         // bash `coproc NAME while ...`: a name may sit between them.
@@ -579,12 +596,48 @@ fn compound_openers(raw: &str, shell: ShellType) -> (usize, bool) {
         } else if before_word.contains(&word.as_str()) {
             opens += 1;
             break;
-        } else if !prefixes.contains(&word.as_str()) && !after_coproc {
+        } else if previous == "time" && word.starts_with('-') {
+            // bash `time -p`, `time --`, `time -p --` before the command.
+            continue;
+        } else if is_redirection_word(&word) {
+            redirected = true;
+            continue;
+        } else if !prefixes.contains(&word.as_str()) && !after_coproc && !redirected {
             break;
         }
         previous = word;
     }
     (opens, false)
+}
+
+/// `true` for a word that starts with a redirection operator: `>f`,
+/// `2>&1`, `&>/dev/null`, `<<<x`, or a bare `>` before its target.
+fn is_redirection_word(word: &str) -> bool {
+    word.trim_start_matches(|c: char| c.is_ascii_digit())
+        .starts_with(['<', '>'])
+        || word.starts_with("&>")
+}
+
+/// `true` when the tokenizer may have split the segment `raw` inside a
+/// word the shell reads whole, so the first word of a later segment may be
+/// text in that word rather than a reserved word that closes a compound
+/// command (`compound_scopes`). The tokenizer tracks quotes, parentheses
+/// and `${...}`, not brackets: the shells read `[[ x && fi ]]` whole across
+/// `&&`, `||`, a regex `|` and newlines, and `$[ 1 && fi ]` and a
+/// subscript (`a[1 && fi ]=2`, fish `$x[1 && end ]`) whole too, so any
+/// `[` that does not start a word counts. So does a `$'...'` string, which
+/// the tokenizer reads as plain single quotes (`$'\' && fi '` is one word),
+/// and in fish any `{`: brace expansion reads `{a && end }` as one token.
+fn may_split_inside_a_word(raw: &str, shell: ShellType) -> bool {
+    let text = without_continuations(raw);
+    let mut previous: Option<char> = None;
+    for c in text.chars() {
+        if c == '[' && previous.is_some_and(|p| !p.is_whitespace()) {
+            return true;
+        }
+        previous = Some(c);
+    }
+    text.contains("$'") || (shell == ShellType::Fish && text.contains('{'))
 }
 
 /// `true` when the segment `text` ends with the group closer `closer`
@@ -1869,11 +1922,15 @@ fn check_segment(
                     (&in_segment_dir, plan_env.recorded_by_previous),
                     (Ok(p), Some(recorded)) if p == recorded
                 );
+                // Both the plan word and the joined path: on Windows
+                // `C:/work` joined with `/srv/tfplan` keeps the drive
+                // (`C:/srv/tfplan`), where Git Bash passes its own `/srv`.
                 let resolved = in_segment_dir
                     .ok()
                     .filter(|p| {
                         !matches!(shell, ShellType::Posix | ShellType::Fish)
-                            || joins_like_a_posix_shell(p)
+                            || (joins_like_a_posix_shell(p)
+                                && joins_like_a_posix_shell(Path::new(&path)))
                     })
                     .and_then(|p| plan_env.work_dir.resolve(&p));
                 if recorded_by_previous {
@@ -2708,6 +2765,29 @@ mod tests {
                 WorkDir::Unknown,
             ),
             ("coproc w { echo }; cd infra; }; x", posix, WorkDir::Unknown),
+            // A closer inside a word the tokenizer splits and the shell
+            // reads whole (`[[ ... ]]`), and an opener after `time -p` or a
+            // zsh redirection: `cd_after_a_word_split_or_prefix_is_inside`.
+            (
+                "if false; then [[ x && fi ]]; cd ./infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "time -p while false; do :; cd ./infra; done; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "2>/dev/null if false; then :; cd ./infra; fi; x",
+                posix,
+                WorkDir::Unknown,
+            ),
+            (
+                "if false; echo {a && end }; cd ./infra; end; x",
+                fish,
+                WorkDir::Unknown,
+            ),
             // After a compound command that may move the shell, the
             // directory stays unknown.
             ("if true; then :; cd infra; fi; x", posix, WorkDir::Unknown),
@@ -2800,6 +2880,18 @@ mod tests {
                 known("./infra"),
             ),
             ("echo for; cd ./infra; x", posix, known("./infra")),
+            (
+                "if [ -d x ]; then :; fi; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
+            ("[[ -d x ]]; cd ./infra; x", posix, known("./infra")),
+            ("time -p true; cd ./infra; x", posix, known("./infra")),
+            (
+                "echo a > /dev/null; if :; then :; fi; cd ./infra; x",
+                posix,
+                known("./infra"),
+            ),
             ("if true; :; end; cd ./infra; x", fish, known("./infra")),
             (
                 "if false; :; else if true; :; end; cd ./infra; x",
@@ -2858,6 +2950,120 @@ mod tests {
         .all(|s| *s == CompoundScope::default()));
     }
 
+    /// The scope of the first segment of `input` whose text is `raw`.
+    fn scope_of(input: &str, shell: ShellType, raw: &str) -> CompoundScope {
+        let segments = tokenize::tokenize(input, shell);
+        let scopes = compound_scopes(&segments, shell);
+        let i = segments
+            .iter()
+            .position(|seg| seg.raw.trim() == raw)
+            .unwrap_or_else(|| panic!("no segment {raw:?} in {input:?}"));
+        scopes[i]
+    }
+
+    /// The tokenizer splits `[[ ... ]]`, `$[ ... ]`, a subscript, a
+    /// `$'...'` string and a fish brace expansion at `&&`, `||` or `|`
+    /// where the shell reads one word, so a closer there is text, not the
+    /// end of the compound command. A compound command after bash's
+    /// `time -p` / `time --` or a zsh redirection is one all the same.
+    /// Checked on the scope alone: a `$` on the line would make a bare
+    /// `cd` unknown anyway (`CdHazard`). Before this fix the cd segments
+    /// below were outside, and the tracker followed them.
+    #[test]
+    fn cd_after_a_word_split_or_prefix_is_inside() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let posix = ShellType::Posix;
+        let fish = ShellType::Fish;
+        let mut wrong = Vec::new();
+        for (input, shell) in [
+            ("if false; then [[ x && fi ]]; cd ./infra; fi; x", posix),
+            ("if false; then [[ -z x || fi ]]; cd ./infra; fi; x", posix),
+            ("if false; then [[ x =~ a|fi ]]; cd ./infra; fi; x", posix),
+            ("if false; then [[ x &&\nfi ]]; cd ./infra; fi; x", posix),
+            ("if false; then [[\nfi ]]; cd ./infra; fi; x", posix),
+            ("if false; then [\\\n[ x && fi ]]; cd ./infra; fi; x", posix),
+            (
+                "if false; then [[ x && # ]]\nfi ]]; cd ./infra; fi; x",
+                posix,
+            ),
+            (
+                "if false; then [[ x == a]] && fi ]]; cd ./infra; fi; x",
+                posix,
+            ),
+            (
+                "if false; then [[ x == \"]]\" && fi ]]; cd ./infra; fi; x",
+                posix,
+            ),
+            (
+                "while false; do [[ x && done ]]; cd ./infra; done; x",
+                posix,
+            ),
+            ("case x in y) [[ x && esac ]]; cd ./infra;; esac; x", posix),
+            ("if false; then [[ x && } ]]; cd ./infra; fi; x", posix),
+            ("until :; do [[ x || done ]]; pushd ./infra; done; x", posix),
+            ("if false; then echo $[ 1 && fi ]; cd ./infra; fi; x", posix),
+            ("if false; then a[1 && fi ]=2; cd ./infra; fi; x", posix),
+            (
+                "if false; then echo $'\\' && fi '\\'; cd ./infra; fi; x",
+                posix,
+            ),
+            ("time -p while false; do :; cd ./infra; done; x", posix),
+            ("time -p if false; then :; cd ./infra; fi; x", posix),
+            ("time -- while false; do :; cd ./infra; done; x", posix),
+            ("! time -p -- if false; then :; cd ./infra; fi; x", posix),
+            ("2>/dev/null if false; then :; cd ./infra; fi; x", posix),
+            ("> /dev/null while false; do :; cd ./infra; done; x", posix),
+            ("> \"a b\" if false; then :; cd ./infra; fi; x", posix),
+            ("> $(echo a b) if false; then :; cd ./infra; fi; x", posix),
+            ("</dev/null 2>&1 for i in; do :; cd ./infra; done; x", posix),
+            ("&>/dev/null if false; then :; cd ./infra; fi; x", posix),
+            (">| /tmp/f if false; then :; cd ./infra; fi; x", posix),
+            ("if false; echo $x[1 && end ]; cd ./infra; end; x", fish),
+            ("if false; echo a[1 && end ]; cd ./infra; end; x", fish),
+            ("if false; echo {a && end }; cd ./infra; end; x", fish),
+            ("if false; echo a,{b && end }; cd ./infra; end; x", fish),
+            ("while false; echo { a || end }; cd ./infra; end; x", fish),
+        ] {
+            let cd = if input.contains("pushd") {
+                "pushd ./infra"
+            } else {
+                "cd ./infra"
+            };
+            if !scope_of(input, shell, cd).inside
+                || work_dir_at_last_segment_in(input, shell) != WorkDir::Unknown
+            {
+                wrong.push((input, shell));
+            }
+        }
+        assert!(wrong.is_empty(), "cd followed or outside: {wrong:#?}");
+        // Errs toward inside: after a `[[` (or any `[` inside a word) no
+        // closer on the line is trusted, also when the test plainly ended.
+        assert!(
+            scope_of(
+                "if [[ -d x ]]; then :; fi; cd ./infra; x",
+                posix,
+                "cd ./infra"
+            )
+            .inside
+        );
+        // Controls: a single-bracket test is split by the shells too, a
+        // `[` that starts a word in fish is split by fish, and a
+        // redirection after the command word does not open anything.
+        for (input, shell) in [
+            ("if [ -d x ]; then :; fi; cd ./infra; x", posix),
+            ("[[ -d x ]]; cd ./infra; x", posix),
+            ("time -p true; cd ./infra; x", posix),
+            ("echo a > /dev/null; if :; then :; fi; cd ./infra; x", posix),
+            ("echo a >| f; if :; then :; fi; cd ./infra; x", posix),
+            ("if test x; echo [a; end; cd ./infra; x", fish),
+        ] {
+            assert!(
+                !scope_of(input, shell, "cd ./infra").inside,
+                "{input:?} ({shell:?})"
+            );
+        }
+    }
+
     /// On Windows a POSIX or fish line's rooted path without a drive is not
     /// the current drive's root: Git Bash maps `/` to its install directory,
     /// also in the arguments it passes to a native `terraform.exe`.
@@ -2885,6 +3091,12 @@ mod tests {
             (
                 "terraform apply /tirith-no-such-dir/tfplan",
                 ShellType::Fish,
+            ),
+            // Joined to a drive path on Windows the rooted plan word keeps
+            // the drive (`C:/tirith-no-such-dir/tfplan`): still not located.
+            (
+                "terraform -chdir=C:/tirith-no-such-dir apply /tirith-no-such-dir/tfplan",
+                ShellType::Posix,
             ),
         ] {
             let titles = check_executable_inputs(
