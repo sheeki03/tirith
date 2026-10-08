@@ -28,8 +28,8 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
-# Native npm contract review (cd914781): compare all parsed entries with
-# bd9d5068. 89 entries become 90; only pkg install-npm is added, in the existing
+# Native npm contract review (cd914781, retired below): compare all parsed entries with
+# bd9d5068. 89 entries became 90; only pkg install-npm was added, in the existing
 # Package firewall group. No existing identity, relative order, group, inspected
 # value or policy_complete flag changes. Only pkg install coverage prose changes
 # to distinguish its unchanged disabled backend from the separate local-leaf
@@ -135,7 +135,58 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # Private-input execution qualification refusal: pkg install inspected changes
 # from full to none, and install/approve coverage now describes the refusal.
 # All 89 command identities, order and policy_complete values stay unchanged.
-sha256 = "a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63"
+#
+# Local-leaf npm retirement (simplify/cycle-cleanup): the unreleased
+# `pkg install-npm` entry is removed (90 entries become 89) and the `pkg install`
+# coverage prose drops its pointer to that separate route. `pkg materialize`
+# never had a manifest entry. The resulting file is byte-identical to the
+# reviewed pre-npm freeze 36a81bdd (compared with `git diff bd9d5068`), so no
+# remaining identity, order, group, inspected value or policy_complete flag
+# changes. It replaces digest
+# a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63.
+#
+# Private-input launcher removal (simplify/cycle-cleanup): `pkg approve` now
+# refuses with the pkg install qualification reason right after its native
+# authority check, because approvals existed only for the disabled contained
+# install. Its `inspected` value changes from full to none (the same disclosure
+# `pkg install` received) and its coverage prose describes the refusal. No
+# entry is added, removed, renamed, regrouped or reordered; manifest_version
+# and every policy_complete flag stay unchanged. It replaces digest
+# 36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4.
+#
+# Browser update pipeline removal (simplify/cycle-cleanup): the dashboard no
+# longer prepares or applies binary updates/rollbacks; it shows the exact CLI
+# or package-manager command and keeps one guarded ThreatDB refresh. Only the
+# `dashboard` coverage prose changes (it no longer claims lifecycle changes).
+# No entry is added, removed, renamed, regrouped or reordered; manifest_version,
+# every inspected value and every policy_complete flag stay unchanged. It
+# replaces digest
+# 3f6aa6a786787e6bb734d60b9fd23dc2083cb97cd1ad2649b08a58392ba6046e.
+#
+# Onboarding truthfulness (simplify/cycle-cleanup): only the `onboard` coverage
+# prose changes. It said the wizard "recommends a policy template"; it lists
+# the detected integrations and recommends the personal Balanced protection
+# profile, with a legacy template only for --team or --ai-agent-heavy. No
+# entry is added, removed, renamed, regrouped or reordered; manifest_version,
+# every inspected value and every policy_complete flag stay unchanged. It
+# replaces digest
+# 9bc4e04b0aacc1bd0da755da03ab42bd5d52147ef3a3a14e6ff5f29df131ddd0.
+#
+# Package firewall truthfulness (simplify/cycle-cleanup, R3): parsed and
+# compared the complete previous/current manifest. 89 entries become 91: two
+# rows are ADDED for commands `tirith pkg --help` already listed, in the
+# existing "Package firewall" group: `pkg inspect` (partial, policy_complete
+# false, the same local route as `package inspect`) and `pkg trust-tool`
+# (none, policy_complete true; the pin it records is not yet enforced). Zero
+# entries are removed, renamed, regrouped or reordered; manifest_version stays
+# 1; no existing inspected value or policy_complete flag changes. Only three
+# coverage descriptions change: `pkg diff` (npm tarballs as well as wheels),
+# `pkg attest` (binds to the wheel's SHA-256, not a quarantine) and `pkg
+# receipt` (reads receipts from earlier releases; nothing writes new ones).
+# `capability_manifest_covers_every_pkg_subcommand` now pins the row set. It
+# replaces digest
+# 2c6beaf4148a87f79b86d1ae6503cd4fe44fc6b3dd983cd7e5c82a8255a795a2.
+sha256 = "c516c9e8a6a5eeab433c070d24cd4244e2a5a830ed51f478fb080a3f0ade3f39"
 
 [mcp]
 default_tools = [

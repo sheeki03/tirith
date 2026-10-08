@@ -60,27 +60,49 @@ fn absolute_root(value: Option<PathBuf>, name: &str) -> Result<Option<PathBuf>, 
         .transpose()
 }
 
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn current_platform() -> Platform {
+    if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::Macos
+    } else {
+        Platform::Unix
+    }
+}
+
 impl TargetInputs {
     pub(crate) fn current(home: PathBuf) -> Result<Self, String> {
-        let env_path = |key| {
-            std::env::var_os(key)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        };
         Ok(Self {
-            platform: if cfg!(windows) {
-                Platform::Windows
-            } else if cfg!(target_os = "macos") {
-                Platform::Macos
-            } else {
-                Platform::Unix
-            },
+            platform: current_platform(),
             home,
             xdg_config: absolute_root(env_path("XDG_CONFIG_HOME"), "XDG_CONFIG_HOME")?,
             zdotdir: absolute_root(env_path("ZDOTDIR"), "ZDOTDIR")?,
             appdata: absolute_root(env_path("APPDATA"), "APPDATA")?,
             documents: native_documents(),
         })
+    }
+
+    /// Like [`TargetInputs::current`], but a relative or traversing root is
+    /// ignored instead of being an error, as the XDG Base Directory spec says
+    /// to treat a relative XDG_CONFIG_HOME. For callers that must still reach
+    /// a profile when a variable the detected shell may not even read is
+    /// malformed.
+    pub(crate) fn current_ignoring_invalid(home: PathBuf) -> Self {
+        let valid = |key: &str| absolute_root(env_path(key), key).ok().flatten();
+        Self {
+            platform: current_platform(),
+            home,
+            xdg_config: valid("XDG_CONFIG_HOME"),
+            zdotdir: valid("ZDOTDIR"),
+            appdata: valid("APPDATA"),
+            documents: native_documents(),
+        }
     }
 }
 

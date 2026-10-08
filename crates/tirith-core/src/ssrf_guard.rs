@@ -763,6 +763,7 @@ mod tests {
 
     #[test]
     fn test_server_redirect_rejects_private_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An open redirect bouncing a public request into loopback must be
         // refused even on the first hop (prior_hops = 0).
         let result = super::server_redirect_decision("http://127.0.0.1/x", 0);
@@ -771,6 +772,7 @@ mod tests {
 
     #[test]
     fn test_server_redirect_rejects_over_hop_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A public target is fine on its own, but 5 prior hops trips the cap.
         let result = super::server_redirect_decision("https://8.8.8.8/api", 5);
         assert!(result.is_err(), "hop count at the cap must be rejected");
@@ -779,6 +781,7 @@ mod tests {
 
     #[test]
     fn test_server_redirect_allows_public_under_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // HTTPS public target, hop count under the cap → follow.
         let result = super::server_redirect_decision("https://8.8.8.8/api", 4);
         assert!(

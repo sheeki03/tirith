@@ -3,7 +3,11 @@
 ## Release sequence
 
 Substitute the release version for `<VERSION>` throughout (for example `0.4.2`,
-tagged `v0.4.2`). The changelog and release notes describe the final tree. The
+tagged `v0.4.2`). Choose `<VERSION>` by the `tirith-core` library contract:
+`tirith-core` is published on crates.io, and Cargo treats every `0.x.y` with the
+same `x` as compatible, so if `[Unreleased]` → `Removed` lists any `tirith-core`
+public API removal or other breaking library change, bump the minor version
+(`0.4.x` → `0.5.0`), never only the patch version. The changelog and release notes describe the final tree. The
 workspace version stays on the previous release until the integration tree is
 known, then the release commit performs the version and documentation
 transition below:
@@ -145,11 +149,13 @@ Native aarch64 Linux uses a separate deny-all seccomp policy alongside Landlock;
 the x86_64 extrasafe dependency remains architecture-specific. Each exact GNU
 and musl release archive must pass the native ARM containment job, including
 network/filesystem restrictions, resource limits and interruption cleanup.
+For the GNU target the same job also runs the seccomp, `clone` flag policy
+(including the installed production filter), ACL, breakpoint and parent-lifetime
+contract tests on the native aarch64 kernel.
 Missing required kernel controls still cause a pre-launch refusal. The QEMU
 runtime compatibility checks cannot establish native seccomp enforcement: they
 require an exit-1 refusal naming `network_raw_denied`, and any child output fails
-that gate. Keep both the native containment and emulated compatibility checks;
-see the [ARM capability and evidence record](next-cycle/containment-aarch64.md).
+that gate. Keep both the native containment and emulated compatibility checks.
 The static musl build retains the cleanup walk's exact mount-ID proof through a
 size- and offset-asserted Linux `statx` UAPI buffer because libc hides those
 bindings for its default musl ABI. There is no `st_dev` fallback: an unavailable

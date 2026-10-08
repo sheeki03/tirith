@@ -54,7 +54,7 @@
 //! `tirith-core` and is tested on every platform.
 #![cfg(windows)]
 // The launch entry point is consumed by E5 (which routes `runner.rs` / `temp_run.rs`
-// / the package-firewall install / the gateway upstream spawn through the capsule).
+// / the gateway upstream spawn through the capsule).
 // Until that wiring lands, the public surface here is exercised only by this
 // module's own tests; keep the not-yet-wired API from tripping `-D warnings`.
 #![allow(dead_code)]
@@ -1218,6 +1218,7 @@ mod tests {
 
     #[test]
     fn apply_plan_refuses_allowlisted_via_core_plan() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The pure plan builder refuses an allow-list spec; launch_contained surfaces
         // that as an error WITHOUT touching any Win32 API.
         let mut spec = CapsuleSpec::locked_down();

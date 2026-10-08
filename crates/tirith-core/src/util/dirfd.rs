@@ -386,6 +386,7 @@ impl DirCapability {
     /// Re-open a descendant regular file from this retained root. Every parent
     /// is opened relative to the previously retained directory and the final
     /// component is opened no-follow and size-capped.
+    #[cfg(test)]
     pub(crate) fn open_descendant_file(
         &self,
         relative: &str,

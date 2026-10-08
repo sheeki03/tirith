@@ -594,6 +594,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new("/work/repo");
         let key = normalize_key(Path::new("./install.sh"), Some(cwd));
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
@@ -602,6 +603,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_parent_components() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new("/work/repo/sub");
         let key = normalize_key(Path::new("../install.sh"), Some(cwd));
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
@@ -610,6 +612,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_keeps_absolute_untouched() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = normalize_key(Path::new("/tmp/x/./y"), Some(Path::new("/work")));
         assert_eq!(key, PathBuf::from("/tmp/x/y"));
     }
@@ -620,6 +623,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new(r"C:\work\repo");
         let from_rel = normalize_key(Path::new(r".\install.sh"), Some(cwd));
         let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
@@ -629,6 +633,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_parent_components_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new(r"C:\work\repo\sub");
         let from_rel = normalize_key(Path::new(r"..\install.sh"), Some(cwd));
         let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
@@ -638,6 +643,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_keeps_absolute_untouched_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `.`-component normalization is idempotent: the dotted and clean forms
         // of the same absolute path must produce the same key.
         let dotted = normalize_key(Path::new(r"C:\tmp\x\.\y"), Some(Path::new(r"C:\work")));

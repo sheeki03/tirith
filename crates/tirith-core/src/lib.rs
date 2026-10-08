@@ -62,7 +62,6 @@ pub mod npm_command;
 pub mod osv_correlation;
 pub mod output;
 pub mod output_contract;
-pub mod package_approval;
 pub mod package_risk;
 pub mod parse;
 pub mod path_audit;

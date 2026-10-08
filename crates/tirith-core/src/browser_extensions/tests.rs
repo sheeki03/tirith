@@ -523,6 +523,7 @@ fn a_missing_user_data_directory_is_reported_explicitly() {
 
 #[test]
 fn the_audit_never_opens_a_path_the_shared_catalogue_calls_sensitive() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     seed_private_stores(&profile);
@@ -610,6 +611,7 @@ fn the_audit_never_opens_a_path_the_shared_catalogue_calls_sensitive() {
 
 #[test]
 fn nothing_outside_the_allowed_preferences_fields_reaches_the_output() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -659,6 +661,7 @@ fn nothing_outside_the_allowed_preferences_fields_reaches_the_output() {
 
 #[test]
 fn no_value_from_outside_the_allowed_preferences_fields_appears_anywhere_in_the_report() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -858,6 +861,7 @@ fn every_wire_token_matches_its_own_serde_spelling() {
 
 #[test]
 fn the_report_carries_no_absolute_host_path() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -885,6 +889,7 @@ fn the_report_carries_no_absolute_host_path() {
 
 #[test]
 fn wallet_shaped_ids_are_labelled_and_never_trusted() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     for id in [WALLET_ID, WALLET_ID_TWO] {
@@ -940,6 +945,7 @@ fn wallet_shaped_ids_are_labelled_and_never_trusted() {
 
 #[test]
 fn mv2_and_mv3_both_parse_and_report_their_manifest_version_verbatim() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -980,6 +986,7 @@ fn mv2_and_mv3_both_parse_and_report_their_manifest_version_verbatim() {
 
 #[test]
 fn install_classes_are_classified_and_none_of_them_raises_risk() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let ids = [
@@ -1041,6 +1048,7 @@ fn install_classes_are_classified_and_none_of_them_raises_risk() {
 
 #[test]
 fn an_unreadable_preferences_file_degrades_install_class_to_unknown_and_partial() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1063,6 +1071,7 @@ fn an_unreadable_preferences_file_degrades_install_class_to_unknown_and_partial(
 
 #[test]
 fn provenance_is_read_from_the_presence_of_the_browsers_own_records() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1117,6 +1126,7 @@ fn provenance_is_read_from_the_presence_of_the_browsers_own_records() {
 
 #[test]
 fn several_version_directories_are_recorded_and_the_highest_is_audited() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1161,6 +1171,7 @@ fn several_version_directories_are_recorded_and_the_highest_is_audited() {
 
 #[test]
 fn broad_authority_is_permission_risk_and_never_integrity_drift() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1206,6 +1217,7 @@ fn broad_authority_is_permission_risk_and_never_integrity_drift() {
 
 #[test]
 fn the_tree_digest_is_deterministic_and_sensitive_to_bytes_and_paths() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let first = make_profile(root.path(), "Default");
     write_extension(
@@ -1260,6 +1272,7 @@ fn the_tree_digest_is_deterministic_and_sensitive_to_bytes_and_paths() {
 
 #[test]
 fn a_same_version_byte_change_is_its_own_drift_variant() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1306,6 +1319,7 @@ fn a_same_version_byte_change_is_its_own_drift_variant() {
 #[cfg(unix)]
 #[test]
 fn a_tree_that_could_not_be_fully_hashed_is_not_comparable_rather_than_clean_or_tampered() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::symlink;
 
     let root = temp();
@@ -1343,6 +1357,7 @@ fn a_tree_that_could_not_be_fully_hashed_is_not_comparable_rather_than_clean_or_
 
 #[test]
 fn a_version_move_does_not_also_report_a_byte_change() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1386,6 +1401,7 @@ fn a_version_move_does_not_also_report_a_byte_change() {
 
 #[test]
 fn every_expansion_drift_fires_on_its_own_and_is_never_conflated() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let base = r#"{
   "manifest_version": 2,
   "name": "Synthetic",
@@ -1456,6 +1472,7 @@ fn every_expansion_drift_fires_on_its_own_and_is_never_conflated() {
 
 #[test]
 fn added_content_scripts_and_native_messaging_are_surface_changes() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let base = r#"{
   "manifest_version": 3,
   "name": "Synthetic",
@@ -1505,6 +1522,7 @@ fn added_content_scripts_and_native_messaging_are_surface_changes() {
 
 #[test]
 fn provenance_and_install_class_changes_are_their_own_drift_variants() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1536,6 +1554,7 @@ fn provenance_and_install_class_changes_are_their_own_drift_variants() {
 
 #[test]
 fn new_and_removed_extensions_are_reported_from_the_baseline() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1569,6 +1588,7 @@ fn new_and_removed_extensions_are_reported_from_the_baseline() {
 
 #[test]
 fn a_baseline_round_trips_with_zero_drift_and_a_stable_inventory_hash() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1597,6 +1617,7 @@ fn a_baseline_round_trips_with_zero_drift_and_a_stable_inventory_hash() {
 
 #[test]
 fn an_edited_baseline_fails_its_own_content_address() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1637,6 +1658,7 @@ fn an_edited_baseline_fails_its_own_content_address() {
 
 #[test]
 fn the_signature_binds_the_content_address() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use ed25519_dalek::{Signer as _, SigningKey};
 
     let root = temp();
@@ -1667,6 +1689,7 @@ fn the_signature_binds_the_content_address() {
 
 #[test]
 fn an_older_hashing_format_reports_one_upgrade_rather_than_phantom_drift() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     for id in [PLAIN_ID, WALLET_ID, WALLET_ID_TWO] {
@@ -1702,6 +1725,7 @@ fn an_older_hashing_format_reports_one_upgrade_rather_than_phantom_drift() {
 
 #[test]
 fn a_schema_v1_baseline_parses_only_as_an_upgrade_marker() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -1759,6 +1783,7 @@ fn a_schema_v1_baseline_parses_only_as_an_upgrade_marker() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_version_directory_is_refused_without_opening_its_target() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::symlink;
 
     let root = temp();
@@ -1794,6 +1819,7 @@ fn a_symlinked_version_directory_is_refused_without_opening_its_target() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_file_inside_the_tree_is_refused_and_never_folded_into_the_digest() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::symlink;
 
     let root = temp();
@@ -1847,6 +1873,7 @@ fn the_collision_fold_is_nfkc_plus_lowercase() {
 
 #[test]
 fn sibling_version_directories_that_fold_together_are_refused_on_both_sides() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     // Two version directories whose NFKC + lowercase fold keys collide: the
@@ -1890,6 +1917,7 @@ fn sibling_version_directories_that_fold_together_are_refused_on_both_sides() {
 
 #[test]
 fn colliding_file_names_inside_a_tree_refuse_both_and_never_hash_one() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let version = write_extension(
@@ -1925,6 +1953,7 @@ fn colliding_file_names_inside_a_tree_refuse_both_and_never_hash_one() {
 
 #[test]
 fn a_sibling_that_is_not_an_extension_id_is_a_typed_rejection() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     std::fs::create_dir_all(profile.join("Extensions").join("Temp")).expect("create Temp");
@@ -1949,6 +1978,7 @@ fn a_sibling_that_is_not_an_extension_id_is_a_typed_rejection() {
 
 #[test]
 fn a_file_count_cap_produces_a_gap_and_never_a_complete_digest() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let files: Vec<(String, String)> = (0..10)
@@ -2020,6 +2050,7 @@ fn the_run_wide_budget_bounds_a_multi_browser_walk() {
 
 #[test]
 fn an_oversize_file_becomes_a_coverage_gap_rather_than_an_unbounded_read() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2054,6 +2085,7 @@ fn an_oversize_file_becomes_a_coverage_gap_rather_than_an_unbounded_read() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_subdirectory_is_partial_and_not_a_hard_error() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::PermissionsExt as _;
 
     // SAFETY: geteuid always succeeds and does not mutate memory.
@@ -2093,6 +2125,7 @@ fn an_unreadable_subdirectory_is_partial_and_not_a_hard_error() {
 
 #[test]
 fn malformed_manifests_are_typed_rejections_and_never_panic() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let cases: &[(&str, RejectionReason)] = &[
         ("not json at all", RejectionReason::MalformedManifest),
         ("[1, 2, 3]", RejectionReason::MalformedManifest),
@@ -2128,6 +2161,7 @@ fn malformed_manifests_are_typed_rejections_and_never_panic() {
 
 #[test]
 fn a_manifest_that_is_a_directory_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let version = profile.join("Extensions").join(PLAIN_ID).join("1.0.0_0");
@@ -2151,6 +2185,7 @@ fn a_manifest_that_is_a_directory_is_refused() {
 
 #[test]
 fn an_oversize_manifest_is_refused_before_it_is_parsed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let filler = "x".repeat(MAX_MANIFEST_BYTES as usize + 16);
@@ -2167,6 +2202,7 @@ fn an_oversize_manifest_is_refused_before_it_is_parsed() {
 
 #[test]
 fn an_extension_directory_with_no_version_is_a_typed_rejection() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     std::fs::create_dir_all(profile.join("Extensions").join(PLAIN_ID)).expect("create empty");
@@ -2182,6 +2218,7 @@ fn an_extension_directory_with_no_version_is_a_typed_rejection() {
 
 #[test]
 fn manifest_text_is_display_sanitized_before_it_reaches_a_durable_artifact() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     let hostile = "{\"manifest_version\": 3, \"name\": \"Sy\\u001b[31mnthetic\\u200b\", \
@@ -2289,6 +2326,7 @@ fn host_patterns_are_split_out_of_a_mixed_permission_list() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_extensions_directory_is_refused_and_its_tree_is_never_hashed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::symlink;
 
     let root = temp();
@@ -2418,6 +2456,7 @@ fn the_read_gate_refuses_every_never_read_profile_store_by_name() {
 #[cfg(unix)]
 #[test]
 fn a_hard_linked_file_inside_a_tree_is_refused_and_never_hashed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     std::fs::write(profile.join("Cookies"), "POISON-COOKIE-JAR").expect("write cookie jar");
@@ -2452,6 +2491,7 @@ fn a_hard_linked_file_inside_a_tree_is_refused_and_never_hashed() {
 /// one extra line `"version": "1.0.1"` defeated the byte-change detector.
 #[test]
 fn a_version_bump_inside_an_unchanged_version_directory_is_reported_with_its_digests() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2499,6 +2539,7 @@ fn a_version_bump_inside_an_unchanged_version_directory_is_reported_with_its_dig
 /// there.
 #[test]
 fn a_second_version_tree_beside_the_audited_one_is_drift() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2536,6 +2577,7 @@ fn a_second_version_tree_beside_the_audited_one_is_drift() {
 /// extension holding an unaudited payload still reported `coverage: complete`.
 #[test]
 fn a_stray_entry_under_an_extension_directory_is_recorded_not_dropped() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2571,6 +2613,7 @@ fn a_stray_entry_under_an_extension_directory_is_recorded_not_dropped() {
 /// `<all_urls>` reported exactly one `version_changed` line and nothing else.
 #[test]
 fn optional_permission_and_host_expansions_are_their_own_drift_entries() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let base = r#"{
   "manifest_version": 3,
   "name": "Synthetic",
@@ -2626,6 +2669,7 @@ fn optional_permission_and_host_expansions_are_their_own_drift_entries() {
 /// An MV2-to-MV3 move was captured into the baseline and never compared.
 #[test]
 fn a_manifest_version_move_is_its_own_drift_entry() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2663,6 +2707,7 @@ fn a_manifest_version_move_is_its_own_drift_entry() {
 /// rejection each is one report entry each.
 #[test]
 fn a_hostile_extension_directory_cannot_grow_the_report_without_bound() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = temp();
     let profile = make_profile(root.path(), "Default");
     write_extension(
@@ -2763,6 +2808,7 @@ fn an_exhausted_budget_stops_the_walk_and_bounds_what_is_recorded() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_subdirectory_inside_the_tree_is_refused_and_never_descended_into() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::symlink;
 
     let root = temp();

@@ -293,6 +293,7 @@ mod tests {
 
     #[test]
     fn test_production_client_rejects_connect_time_private_rebind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::error::Error as _;
 
         let url = "http://rebind.example.test/landing";

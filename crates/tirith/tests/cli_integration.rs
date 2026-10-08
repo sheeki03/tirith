@@ -20,10 +20,14 @@ fn fresh_command_environment() -> PathBuf {
     static NEXT_COMMAND: AtomicU64 = AtomicU64::new(0);
 
     let suite = SUITE_ROOT.get_or_init(|| {
-        tempfile::Builder::new()
+        let root = tempfile::Builder::new()
             .prefix("tirith-cli-integration-")
             .tempdir()
-            .expect("create hermetic CLI integration root")
+            .expect("create hermetic CLI integration root");
+        // A static is never dropped, so this TempDir would never delete the
+        // suite tree; remove it when the test process exits instead.
+        tirith_test_support::remove_at_exit(root.path());
+        root
     });
     let id = NEXT_COMMAND.fetch_add(1, Ordering::Relaxed);
     let root = suite.path().join(format!("command-{id}"));
@@ -79,6 +83,61 @@ fn tirith() -> Command {
     cmd
 }
 
+#[cfg(unix)]
+const SUITE_ROOT_MARKER: &str = "TIRITH_CLI_INTEGRATION_SUITE_ROOT_MARKER";
+
+/// Child half of `hermetic_suite_root_is_removed_when_the_suite_exits`: creates
+/// the suite root and records where it is. A no-op in an ordinary run.
+#[cfg(unix)]
+#[test]
+fn hermetic_suite_root_exit_probe() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(marker) = std::env::var_os(SUITE_ROOT_MARKER) else {
+        return;
+    };
+    let command_root = fresh_command_environment();
+    let suite_root = command_root.parent().expect("command dir has a suite root");
+    fs::write(marker, suite_root.as_os_str().as_bytes()).expect("record the suite root");
+}
+
+/// The suite root lives in a static, which Rust never drops: without an exit
+/// hook every run left its whole tree (hundreds of MB) in the temp dir.
+#[cfg(unix)]
+#[test]
+fn hermetic_suite_root_is_removed_when_the_suite_exits() {
+    use std::os::unix::ffi::OsStrExt;
+    let private_tmp = tempfile::tempdir().expect("private temp dir");
+    let marker = private_tmp.path().join("suite-root-marker");
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", "hermetic_suite_root_exit_probe", "--nocapture"])
+        .env("TMPDIR", private_tmp.path())
+        .env(SUITE_ROOT_MARKER, &marker)
+        .output()
+        .expect("run the suite-root probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "probe failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let suite_root = PathBuf::from(OsStr::from_bytes(
+        &fs::read(&marker).expect("the probe recorded its suite root"),
+    ));
+    assert!(
+        suite_root.starts_with(private_tmp.path())
+            && suite_root.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("tirith-cli-integration-")),
+        "unexpected suite root {}",
+        suite_root.display()
+    );
+    assert!(
+        !suite_root.exists(),
+        "the suite root {} must be removed when the test process exits",
+        suite_root.display()
+    );
+}
+
 #[test]
 fn ordinary_cli_tests_cannot_bypass_the_hermetic_command_builder() {
     let source = include_str!("cli_integration.rs");
@@ -88,6 +147,139 @@ fn ordinary_cli_tests_cannot_bypass_the_hermetic_command_builder() {
         2,
         "only tirith() and the documented raw __capsule-child handle-inheritance probe may invoke the binary directly"
     );
+}
+
+/// Run `tirith output wrap <action>` as a zsh user whose HOME is `home`.
+/// `output wrap` picks the shell from the nearest ancestor shell process
+/// before `SHELL`, so Tirith runs as a child of zsh: otherwise a test runner
+/// started from bash (CI, containers) would make it edit `.bashrc`. `None`
+/// when zsh is not installed.
+#[cfg(unix)]
+fn output_wrap_zsh(
+    home: &std::path::Path,
+    zdotdir: Option<&std::path::Path>,
+    xdg_config_home: &std::ffi::OsStr,
+    action: &str,
+) -> Option<std::process::Output> {
+    let mut hermetic = tirith();
+    hermetic
+        .env("HOME", home)
+        .env("SHELL", "/bin/zsh")
+        .env("XDG_CONFIG_HOME", xdg_config_home);
+    match zdotdir {
+        Some(dir) => hermetic.env("ZDOTDIR", dir),
+        None => hermetic.env_remove("ZDOTDIR"),
+    };
+    let mut cmd = Command::new("zsh");
+    for (key, value) in hermetic.get_envs() {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        };
+    }
+    // The trailing `exit` keeps zsh from exec-ing Tirith in its own place.
+    cmd.args(["-dfc", r#""$0" output wrap "$1"; rc=$?; exit $rc"#])
+        .arg(hermetic.get_program())
+        .arg(action);
+    match cmd.output() {
+        Ok(output) => Some(output),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping output wrap check: zsh is not installed");
+            None
+        }
+        Err(error) => panic!("run output wrap {action}: {error}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn output_wrap_status_and_off_ignore_an_invalid_variable_the_shell_does_not_use() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let Some(ok) = output_wrap_zsh(home.path(), None, config.as_os_str(), "on") else {
+        return;
+    };
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let zshrc = home.path().join(".zshrc");
+    assert!(fs::read_to_string(&zshrc)
+        .unwrap()
+        .contains("# BEGIN tirith-output-wrap"));
+
+    // zsh never reads XDG_CONFIG_HOME; a relative value (invalid per the XDG
+    // spec) must not stop status/off from finding the wrapper in ~/.zshrc.
+    let relative = std::ffi::OsStr::new("rel/cfg");
+    let status = output_wrap_zsh(home.path(), None, relative, "status").unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("enabled:   yes"));
+    let off = output_wrap_zsh(home.path(), None, relative, "off").unwrap();
+    assert!(
+        off.status.success(),
+        "off failed: {}",
+        String::from_utf8_lossy(&off.stderr)
+    );
+    assert!(!fs::read_to_string(&zshrc)
+        .unwrap()
+        .contains("# BEGIN tirith-output-wrap"));
+}
+
+#[cfg(unix)]
+#[test]
+fn output_wrap_treats_a_symlinked_old_path_as_the_same_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
+    let zdotdir = home.path().join("dotfiles/zsh");
+    fs::create_dir_all(&zdotdir).unwrap();
+    let real = zdotdir.join(".zshrc");
+    fs::write(&real, "export KEEP_ME=1\n").unwrap();
+    // A common dotfile layout: ~/.zshrc is a symlink to $ZDOTDIR/.zshrc.
+    std::os::unix::fs::symlink(&real, home.path().join(".zshrc")).unwrap();
+
+    // A second layout: ZDOTDIR names HOME through a symlinked directory.
+    let other_home = tempfile::tempdir().unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let home_link = links.path().join("home-link");
+    std::os::unix::fs::symlink(other_home.path(), &home_link).unwrap();
+    let other_real = other_home.path().join(".zshrc");
+    fs::write(&other_real, "export KEEP_ME=1\n").unwrap();
+
+    for (home, zdotdir, real) in [
+        (home.path(), zdotdir.as_path(), real.as_path()),
+        (other_home.path(), home_link.as_path(), other_real.as_path()),
+    ] {
+        let run = |action: &str| output_wrap_zsh(home, Some(zdotdir), config.as_os_str(), action);
+        for action in ["on", "status", "on", "status"] {
+            let Some(out) = run(action) else {
+                return;
+            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{action} failed: {stderr}");
+            assert!(
+                !stdout.contains("older copy") && !stderr.contains("older copy"),
+                "{action} reported the live profile as an older copy:\n{stdout}{stderr}"
+            );
+        }
+        let content = fs::read_to_string(real).unwrap();
+        assert!(content.contains("# BEGIN tirith-output-wrap"));
+        assert!(content.contains("export KEEP_ME=1"));
+        let off = run("off").unwrap();
+        assert!(
+            off.status.success(),
+            "off failed: {}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+        let content = fs::read_to_string(real).unwrap();
+        assert!(!content.contains("# BEGIN tirith-output-wrap"));
+        assert!(content.contains("export KEEP_ME=1"));
+    }
 }
 
 #[cfg(unix)]
@@ -2004,9 +2196,19 @@ fn process_group_disappears(group: u32, timeout: std::time::Duration) -> bool {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// The production capsule refuses `clone(CLONE_PARENT | signal)` on x86_64 and
+/// aarch64 (14f, clone_policy.rs), so a contained target cannot give the guard
+/// a sibling child or choose that child's exit signal. Before 14f, x86_64
+/// allowed the call and this receipt checked that the guard reaped such
+/// siblings. The guard's `__WALL` reaping loop is still covered, without
+/// seccomp, by the capsule_child unit test
+/// `contained_guard_reaps_clone_parent_children_with_wall`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
-fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
+fn capsule_refuses_clone_parent_children_with_untrusted_exit_signals() {
     use std::io::{BufRead as _, BufReader};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -2024,9 +2226,13 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
         .expect("create clone-parent probe directory");
     let helper_source = helper_dir.path().join("clone_parent_probe.c");
     let helper_binary = helper_dir.path().join("clone-parent-probe");
+    // The probe publishes its pid, waits for "g", then asks for a CLONE_PARENT
+    // child with exit signal 0, SIGCHLD and the attack signal. A child that is
+    // created exits at once. Each attempt prints "<signal> <result> <errno>";
+    // then the probe prints "ready" and spins until the group is killed.
     fs::write(
         &helper_source,
-        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int sig = atoi(argv[1]); dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int kind = 0; kind < 2; ++kind) { int child_signal = kind == 0 ? 0 : SIGCHLD; for (int i = 0; i < 16; ++i) { long reaped = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)child_signal, 0, 0, 0, 0); if (reaped < 0) return 22; if (reaped == 0) _exit(0); dprintf(STDOUT_FILENO, \"%ld\\n\", reaped); } } dprintf(STDOUT_FILENO, \"ready\\n\"); if (read(STDIN_FILENO, &go, 1) != 1) return 23; int gate[2]; if (pipe(gate) != 0) return 24; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)sig, 0, 0, 0, 0); if (child < 0) { dprintf(STDERR_FILENO, \"clone-failed-%d\\n\", errno); return 25; } if (child == 0) { close(gate[1]); if (read(gate[0], &go, 1) != 1) _exit(26); _exit(0); } close(gate[0]); dprintf(STDOUT_FILENO, \"%ld\\n\", child); if (write(gate[1], \"x\", 1) != 1) return 27; for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
+        b"#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\n#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (argc != 2) return 20; int requested[3] = {0, SIGCHLD, atoi(argv[1])}; dprintf(STDOUT_FILENO, \"%ld\\n\", (long)getpid()); char go = 0; if (read(STDIN_FILENO, &go, 1) != 1) return 21; for (int i = 0; i < 3; ++i) { errno = 0; long child = syscall(SYS_clone, (unsigned long)CLONE_PARENT | (unsigned long)requested[i], 0, 0, 0, 0); if (child == 0) _exit(0); dprintf(STDOUT_FILENO, \"%d %ld %d\\n\", requested[i], child, child < 0 ? errno : 0); } dprintf(STDOUT_FILENO, \"ready\\n\"); for (;;) { __asm__ __volatile__(\"\" ::: \"memory\"); } }\n",
     )
     .expect("write clone-parent probe source");
     let compile = Command::new("cc")
@@ -2153,120 +2359,52 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
         let mut guard_stdin = guard.stdin.take().expect("guard stdin");
         guard_stdin
             .write_all(b"g")
-            .expect("trigger reaped clone-parent children");
-        let mut reaped_clone_pids = Vec::new();
-        for _ in 0..32 {
-            let mut reaped_line = String::new();
-            let bytes = target_output
-                .read_line(&mut reaped_line)
-                .expect("read reaped clone child pid");
-            assert_ne!(bytes, 0, "target stopped publishing clone child pids");
-            reaped_clone_pids.push(
-                reaped_line
-                    .trim()
-                    .parse::<libc::pid_t>()
-                    .expect("numeric reaped clone child pid"),
-            );
-        }
-        let mut ready_line = String::new();
-        target_output
-            .read_line(&mut ready_line)
-            .expect("read clone-reap ready marker");
-        assert_eq!(ready_line.trim(), "ready");
+            .expect("trigger the clone-parent attempts");
 
-        // The target remains alive while the guard reaps both ordinary SIGCHLD
-        // children and exit-signal-0 clone children (the latter require __WALL).
-        // `/proc/.../children` includes zombies, so converging to only the primary
-        // target is a direct no-zombie receipt before group teardown begins.
-        let guard_children = PathBuf::from(format!("/proc/{group}/task/{group}/children"));
-        let reaped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Collect every report before asserting, so a failed assertion below
+        // never leaks the spinning target or its guard into the suite.
+        let mut attempts = Vec::new();
+        let mut ready = false;
         loop {
-            let children = fs::read_to_string(&guard_children)
-                .expect("inspect contained guard direct children")
-                .split_whitespace()
-                .map(str::parse::<libc::pid_t>)
-                .collect::<Result<Vec<_>, _>>()
-                .expect("numeric guard child list");
-            if children == [target_pid] {
+            let mut line = String::new();
+            let bytes = target_output
+                .read_line(&mut line)
+                .expect("read a clone-parent attempt report");
+            if bytes == 0 {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < reaped_deadline,
-                "guard retained clone children or zombies while target stayed alive: {children:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if line.trim() == "ready" {
+                ready = true;
+                break;
+            }
+            attempts.push(line.trim().to_string());
         }
-        assert!(
-            reaped_clone_pids
-                .iter()
-                .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists()),
-            "a recorded CLONE_PARENT child remained present after the guard's __WALL reap"
-        );
 
-        guard_stdin
-            .write_all(b"g")
-            .expect("trigger fatal clone-parent adversary");
-        drop(guard_stdin);
-        let mut clone_line = String::new();
-        let clone_line_bytes = target_output
-            .read_line(&mut clone_line)
-            .expect("read hostile clone child pid");
-        assert_ne!(
-            clone_line_bytes, 0,
-            "target did not publish its clone child pid"
-        );
-        let clone_pid: libc::pid_t = clone_line
-            .trim()
-            .parse()
-            .expect("numeric hostile clone child pid");
-
-        // CLONE_PARENT makes the clone a direct child of the guard, but Linux
-        // deliberately does not let the cloner choose that sibling's
-        // termination signal. For legacy clone(2), the kernel replaces the low
-        // byte with the cloner's inherited exit signal; clone3(2) rejects
-        // CLONE_PARENT plus a nonzero exit signal outright. The security
-        // receipt is therefore that even a requested SIGKILL or SIGSTOP is
-        // reaped as an ordinary guard child without killing or stopping the
-        // guard.
-        let receipt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let receipt = loop {
-            let children = fs::read_to_string(&guard_children)
-                .map_err(|error| format!("inspect guard after hostile clone: {error}"))
-                .and_then(|children| {
-                    children
-                        .split_whitespace()
-                        .map(str::parse::<libc::pid_t>)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| format!("parse guard child list: {error}"))
-                });
-            let clone_present = PathBuf::from(format!("/proc/{clone_pid}")).exists();
-            if matches!(&children, Ok(children) if children == &[target_pid]) && !clone_present {
-                let guard_state = fs::read_to_string(format!("/proc/{group}/stat"))
-                    .ok()
-                    .and_then(|line| {
-                        line.rsplit_once(')').and_then(|(_, rest)| {
-                            rest.split_whitespace().next().map(str::to_string)
-                        })
-                    });
-                break Ok(guard_state);
-            }
-            if std::time::Instant::now() >= receipt_deadline {
-                break Err(format!(
-                    "guard did not reap CLONE_PARENT child {clone_pid} requested with signal \
-                     {attack_signal}: children={children:?} clone-present={clone_present}"
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+        // The target is alive (spinning) once it printed "ready". The guard
+        // must still be running, not stopped, with the target as its only
+        // child: no CLONE_PARENT sibling and no zombie.
+        let guard_children = fs::read_to_string(format!("/proc/{group}/task/{group}/children"))
+            .map_err(|error| format!("inspect guard children: {error}"))
+            .and_then(|children| {
+                children
+                    .split_whitespace()
+                    .map(str::parse::<libc::pid_t>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("parse guard child list: {error}"))
+            });
+        let guard_state = fs::read_to_string(format!("/proc/{group}/stat"))
+            .ok()
+            .and_then(|line| {
+                line.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            });
         let direct_exit = observe_test_child_without_reaping(group as libc::pid_t);
         let direct_exit_observed = matches!(&direct_exit, Ok(true));
+        drop(guard_stdin);
 
-        // This is the same safety ordering as the production supervisor: signal
-        // the complete group while its direct guard is still unreaped, then reap
-        // that leader and require ESRCH before releasing its temporary HOME.
-        // Cleanup is attempted before validating the receipt so a failed
-        // assertion cannot leak a stopped guard or its spinning target into the
-        // rest of the suite.
+        // Same safety ordering as the production supervisor: signal the whole
+        // group while its direct guard is still unreaped, then reap that leader
+        // and require ESRCH before releasing its temporary HOME.
         let cleanup = finish_test_process_group(
             &mut guard,
             group as libc::pid_t,
@@ -2289,28 +2427,32 @@ fn capsule_guard_reaps_clone_parent_children_with_untrusted_exit_signals() {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        assert_ne!(
-            unsafe { libc::kill(clone_pid, 0) },
-            0,
-            "hostile clone child {clone_pid} remained runnable or zombie"
-        );
+
+        let expected: Vec<String> = [0, libc::SIGCHLD, attack_signal]
+            .iter()
+            .map(|signal| format!("{signal} -1 {}", libc::EPERM))
+            .collect();
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            attempts, expected,
+            "the capsule must refuse CLONE_PARENT with EPERM whatever exit signal is requested \
+             (attack signal {attack_signal}); ready={ready}"
         );
-        let guard_state = receipt.unwrap_or_else(|error| {
-            panic!("verify untrusted clone exit signal containment: {error}")
-        });
+        assert!(ready, "target did not finish its clone-parent attempts");
+        assert_eq!(
+            guard_children,
+            Ok(vec![target_pid]),
+            "the guard must have only the contained target as a child"
+        );
         assert!(
             !direct_exit.unwrap_or_else(|error| panic!("observe guarded capsule leader: {error}")),
-            "untrusted clone exit signal terminated the guard before anchored cleanup"
+            "the guard exited before anchored cleanup"
         );
         assert!(
             !matches!(
                 guard_state.as_deref(),
                 Some("T" | "t" | "Z" | "X" | "x") | None
             ),
-            "untrusted clone exit signal stopped or terminated the guard: state={guard_state:?}"
+            "the guard was stopped or terminated: state={guard_state:?}"
         );
         assert_eq!(
             status.signal(),
@@ -3447,7 +3589,7 @@ fn sourced_bash_hook_keeps_using_pinned_or_builtin_helpers_after_path_changes() 
 export PATH='{}:/usr/bin:/bin'
 _TIRITH_RECEIPT_PROTOCOL=1
 _TIRITH_RECEIPT_INSTANCE={}
-_tirith_receipt_discard bash-enter {} >/dev/null 2>&1 || :
+_tirith_receipt_call discard bash-enter {} >/dev/null 2>&1 || :
 _TIRITH_ENTER_CAP_FILE="$HOME/helper-capability"
 builtin printf 'x' >"$_TIRITH_ENTER_CAP_FILE"
 _tirith_enter_capability_proven >/dev/null 2>&1 || :
@@ -3522,9 +3664,9 @@ fn root_zsh_and_fish_hook_helpers_ignore_path_shadow_after_source() {
         real_dir.display(),
         fake_bin.display()
     );
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let zsh_hook = root.join("shell/lib/zsh-hook.zsh");
-    let fish_hook = root.join("shell/lib/fish-hook.fish");
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib");
+    let zsh_hook = hooks.join("zsh-hook.zsh");
+    let fish_hook = hooks.join("fish-hook.fish");
 
     let zsh_script = format!(
         r#"source '{}'
@@ -3532,11 +3674,11 @@ PATH='{}'
 export PATH
 capture="$(_tirith_v3_new_capture_file)" || exit 61
 command "$_TIRITH_WC_BIN" -c <"$capture" >/dev/null || exit 62
-command "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN" -c ':' || exit 63
+command "$_TIRITH_ENV_BIN" "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 63
 _tirith_v3_cleanup_registration_files "" "$capture" || exit 64
 [[ ! -e "$capture" ]] || exit 66
 command "$_TIRITH_BIN" __execution-receipt capability >/dev/null || exit 65
-print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN|$_TIRITH_SH_BIN"
+print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BIN"
 "#,
         zsh_hook.display(),
         fake_bin.display(),
@@ -3608,7 +3750,7 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
     );
 
     for hook in [zsh_hook, fish_hook] {
-        let source = fs::read_to_string(&hook).expect("read root receipt hook");
+        let source = fs::read_to_string(&hook).expect("read receipt hook");
         let forbidden: &[&str] = if hook.ends_with("zsh-hook.zsh") {
             &[
                 "$(date +%s)",
@@ -3638,11 +3780,21 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
         }
         assert!(
             source.contains("command \"$_TIRITH_ENV_BIN\"")
-                && source.contains("\"$_TIRITH_SH_BIN\" -c")
                 && source.contains("_tirith_v3_new_capture_file")
                 && source.contains("_tirith_v3_remove_capture_files")
                 && source.contains("_tirith_v3_cleanup_registration_files"),
             "v3 transport must route through pinned helpers: {}",
+            hook.display()
+        );
+        // Receipt operations pass the bound directory to Tirith itself: no
+        // `sh -c cd` hop between the shell and Tirith, and no separate
+        // acknowledgement process after a successful operation.
+        assert!(
+            source.contains("__execution-receipt \"$action\" --cwd \"$original_cwd\"")
+                && source.contains("__execution-receipt consume --cwd \"$original_cwd\"")
+                && !source.contains("_TIRITH_RECEIPT_CWD")
+                && !source.contains("__execution-receipt acknowledge"),
+            "v3 receipt calls must be single direct-child launches: {}",
             hook.display()
         );
         assert!(
@@ -3671,7 +3823,7 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
             .find("command changed before receipt commit")
             .expect("pre-commit drift guard");
         let consume = v3
-            .find("_tirith_receipt_consume_at")
+            .find("_tirith_receipt_call consume")
             .expect("synchronous receipt consume");
         let native_handoff = if hook.ends_with("zsh-hook.zsh") {
             v3.rfind("zle .accept-line").expect("zsh native handoff")
@@ -3749,18 +3901,30 @@ fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
     );
 }
 
+/// The hooks have one source of truth: `crates/tirith/assets/shell`, which the
+/// binary embeds and every package installs. The top-level `shell` path is only
+/// a compatibility symlink to it, so a second, drifting copy cannot reappear.
+#[cfg(unix)]
 #[test]
-fn embedded_shell_hooks_match_repo_hooks() {
+fn repo_shell_path_is_the_embedded_hook_directory() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let embedded_dir = manifest_dir.join("assets/shell/lib");
-    let repo_dir = manifest_dir.join("../../shell/lib");
-
-    if !repo_dir.exists() {
-        // Skip when running outside the workspace (e.g. a crate-only
-        // package test where shell/lib is not present).
+    let repo_shell = manifest_dir.join("../../shell");
+    let Ok(metadata) = fs::symlink_metadata(&repo_shell) else {
+        // Skip when running outside the workspace (e.g. a crate-only package test).
         return;
-    }
-
+    };
+    assert!(
+        metadata.file_type().is_symlink(),
+        "top-level shell/ must stay a symlink to crates/tirith/assets/shell, not a copy"
+    );
+    assert_eq!(
+        fs::read_link(&repo_shell).expect("read shell symlink"),
+        PathBuf::from("crates/tirith/assets/shell")
+    );
+    assert_eq!(
+        fs::canonicalize(&repo_shell).expect("resolve shell symlink"),
+        fs::canonicalize(manifest_dir.join("assets/shell")).expect("resolve embedded hooks")
+    );
     for hook in [
         "zsh-hook.zsh",
         "bash-hook.bash",
@@ -3768,15 +3932,133 @@ fn embedded_shell_hooks_match_repo_hooks() {
         "powershell-hook.ps1",
         "nushell-hook.nu",
     ] {
-        let embedded = fs::read_to_string(embedded_dir.join(hook))
-            .unwrap_or_else(|e| panic!("failed reading embedded hook {hook}: {e}"));
-        let repo = fs::read_to_string(repo_dir.join(hook))
-            .unwrap_or_else(|e| panic!("failed reading repo hook {hook}: {e}"));
-        assert_eq!(
-            embedded, repo,
-            "embedded hook {hook} must stay in sync with shell/lib/{hook}"
+        assert!(
+            repo_shell.join("lib").join(hook).is_file(),
+            "compatibility path must expose {hook}"
         );
     }
+}
+
+/// PowerShell and Nushell hooks record their load with `tirith __hook-presence`
+/// (as the shipped hooks do), so `status` reports this terminal's hook as
+/// unregistered, then current, instead of the inherited, unverified hint.
+/// Caller detection reads the parent process's executable name, so a copy of
+/// this test binary named `pwsh` or `nu` stands in for the shell and runs
+/// [`hook_presence_shell_stand_in`] (system shells cannot be copied on macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn powershell_and_nushell_hook_load_records_drive_status_hook_freshness() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().expect("shell stand-in fixture");
+    for (name, family, shell, other) in [
+        ("pwsh", "powershell", "pwsh", "nushell"),
+        ("nu", "nushell", "nushell", "powershell"),
+    ] {
+        let stand_in = fixture.path().join(name);
+        fs::copy(std::env::current_exe().unwrap(), &stand_in)
+            .expect("copy the test binary as the shell stand-in");
+        fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let mut hermetic = tirith();
+        hermetic.env("TIRITH_OFFLINE", "1");
+        let mut cmd = Command::new(&stand_in);
+        for (key, value) in hermetic.get_envs() {
+            match value {
+                Some(value) => cmd.env(key, value),
+                None => cmd.env_remove(key),
+            };
+        }
+        cmd.env("TIRITH_STAND_IN_TIRITH", hermetic.get_program())
+            .env("TIRITH_STAND_IN_FAMILY", family)
+            .env("TIRITH_STAND_IN_OTHER_FAMILY", other)
+            .env("TIRITH_STAND_IN_SHELL", shell)
+            .args([
+                "--exact",
+                "hook_presence_shell_stand_in",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        let run = cmd.output().expect("run the shell stand-in");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.contains("1 passed"),
+            "{name}: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+/// The stand-in shell's side of the test above; a no-op in a normal test run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn hook_presence_shell_stand_in() {
+    let Some(tirith) = std::env::var_os("TIRITH_STAND_IN_TIRITH") else {
+        return;
+    };
+    let var = |key: &str| std::env::var(key).expect(key);
+    let (family, other, shell) = (
+        var("TIRITH_STAND_IN_FAMILY"),
+        var("TIRITH_STAND_IN_OTHER_FAMILY"),
+        var("TIRITH_STAND_IN_SHELL"),
+    );
+    let pid = std::process::id().to_string();
+    let run = |args: &[&str]| {
+        Command::new(&tirith)
+            .args(args)
+            .output()
+            .expect("run tirith from the stand-in shell")
+    };
+    let freshness = || -> serde_json::Value {
+        let out = run(&["status", "--json"]);
+        let value: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "status --json: {error}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        value["hook_freshness"].clone()
+    };
+
+    let before = freshness();
+    assert_eq!(before["shell"], shell.as_str(), "{before}");
+    assert_eq!(before["evidence"], "registered_hook_presence", "{before}");
+    assert_eq!(before["this_shell"], "unregistered", "{before}");
+    assert_eq!(before["blocking_proof"], false);
+
+    // Only the calling shell, under its own family, can be recorded.
+    for (record_family, shell_pid) in [(other.as_str(), pid.as_str()), (family.as_str(), "1")] {
+        let refused = run(&[
+            "__hook-presence",
+            "--family",
+            record_family,
+            "--shell-pid",
+            shell_pid,
+        ]);
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{record_family} {shell_pid}"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("hook load record refused"), "{stderr}");
+    }
+    assert_eq!(freshness()["this_shell"], "unregistered");
+
+    let registered = run(&["__hook-presence", "--family", &family, "--shell-pid", &pid]);
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    assert!(registered.stdout.is_empty());
+    let after = freshness();
+    assert_eq!(after["this_shell"], "current", "{after}");
+    assert_eq!(after["evidence"], "registered_hook_presence");
+    assert_eq!(after["other_live_current"], 0);
+    assert_eq!(after["blocking_proof"], false);
+    assert!(after.get("inherited_integration_version").is_none());
 }
 
 /// Render `docs/capability-matrix.md` deterministically from a parsed
@@ -3925,6 +4207,51 @@ fn capability_matrix_is_in_sync() {
         "docs/capability-matrix.md is out of sync with docs/capability-manifest.toml. \
 Regenerate it with: TIRITH_BLESS_CAPABILITY_MATRIX=1 cargo test -p tirith capability_matrix_is_in_sync"
     );
+}
+
+/// Every `tirith pkg` subcommand the CLI lists must have its own row in the
+/// capability manifest, so the matrix cannot silently omit a package command
+/// (it once lacked `pkg inspect` and `pkg trust-tool`).
+#[test]
+fn capability_manifest_covers_every_pkg_subcommand() {
+    let manifest_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/capability-manifest.toml");
+    if !manifest_path.exists() {
+        return;
+    }
+    let manifest: toml::Value = fs::read_to_string(&manifest_path)
+        .expect("read capability-manifest.toml")
+        .parse()
+        .expect("capability-manifest.toml is valid TOML");
+    let names: Vec<&str> = manifest["command"]
+        .as_array()
+        .expect("[[command]] array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+
+    let out = tirith()
+        .args(["pkg", "--help"])
+        .output()
+        .expect("run pkg --help");
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    let subcommands: Vec<&str> = help
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| *name != "help")
+        .collect();
+    assert!(subcommands.len() >= 5, "parsed {subcommands:?} from {help}");
+    for subcommand in subcommands {
+        let name = format!("pkg {subcommand}");
+        assert!(
+            names.contains(&name.as_str()),
+            "docs/capability-manifest.toml has no [[command]] row for `{name}`"
+        );
+    }
 }
 
 #[test]
@@ -5101,6 +5428,360 @@ fn shell_execution_receipt_capability_reports_protocol_v3() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
+
+    // zsh/fish hooks probe with `--require-cwd` because they send `--cwd` on
+    // every receipt operation; this binary must answer it identically.
+    let out = tirith()
+        .args(["__execution-receipt", "capability", "--require-cwd"])
+        .output()
+        .expect("run --require-cwd capability probe");
+    assert!(
+        out.status.success(),
+        "--require-cwd capability probe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"TIRITH_EXECUTION_RECEIPT_PROTOCOL=3\n");
+}
+
+/// A packaged hook directory can be newer than the binary it is pinned to
+/// (`tirith init` prefers /usr/share/tirith/shell or TIRITH_SHELL_DIR). A
+/// binary that speaks protocol 3 but predates `--cwd` on consume/discard/
+/// reconcile would reject every receipt operation from these hooks and block
+/// every command, so zsh and fish must stay in the legacy flow against it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_and_fish_hooks_stay_legacy_with_a_binary_without_receipt_cwd() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("old-binary hook test home");
+    let calls = home.path().join("receipt-calls");
+    let old_bin = home.path().join("old-tirith");
+    // Behaves like a protocol-3 binary from before `--cwd`: the bare probe
+    // and registration succeed, and clap rejects any argument it does not know.
+    fs::write(
+        &old_bin,
+        format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+  '__execution-receipt capability')
+    if [ "$#" -eq 2 ]; then echo TIRITH_EXECUTION_RECEIPT_PROTOCOL=3; exit 0; fi
+    echo "error: unexpected argument '$3' found" >&2; exit 2 ;;
+  '__execution-receipt register')
+    echo 45bcb43f30d36c8e1b50d2ecfc3c3ffb8fce9bced081bd331e572e49232402fa; exit 0 ;;
+  '__execution-receipt '*)
+    echo "$2" >> '{calls}'
+    for arg in "$@"; do
+      if [ "$arg" = --cwd ]; then echo "error: unexpected argument '--cwd' found" >&2; exit 2; fi
+    done
+    exit 0 ;;
+  '__session-id '*)
+    echo "error: unrecognized subcommand '__session-id'" >&2; exit 2 ;;
+esac
+exit 0
+"#,
+            calls = calls.display()
+        ),
+    )
+    .expect("write old tirith stub");
+    fs::set_permissions(&old_bin, fs::Permissions::from_mode(0o700))
+        .expect("make old tirith stub executable");
+
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib");
+    let path = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin";
+
+    let zsh_script = format!(
+        r#"source '{}' --tirith-executable '{}'
+builtin print -r -- "protocol=$_TIRITH_RECEIPT_PROTOCOL status=$TIRITH_STATUS"
+"#,
+        hooks.join("zsh-hook.zsh").display(),
+        old_bin.display()
+    );
+    match Command::new("zsh")
+        .args(["-d", "-f", "-i", "-c", &zsh_script])
+        .env("PATH", path)
+        .env("HOME", home.path())
+        .env("ZDOTDIR", home.path())
+        .env("TERM", "xterm")
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_ZSH_LOADED")
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("protocol=0 status=degraded"),
+                "zsh hook entered protocol 3 against a binary without --cwd: \
+                 stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("legacy mode"),
+                "zsh hook must say it is running in legacy mode: {stderr:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping zsh old-binary probe: zsh not available"),
+    }
+
+    let fish_script = format!(
+        r#"source '{}' --tirith-executable '{}'
+builtin printf 'protocol=%s status=%s\n' "$_TIRITH_RECEIPT_PROTOCOL" "$TIRITH_STATUS"
+"#,
+        hooks.join("fish-hook.fish").display(),
+        old_bin.display()
+    );
+    match Command::new("fish")
+        .args(["--no-config", "-i", "-c", &fish_script])
+        .env("PATH", path)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("TERM", "xterm")
+        .env_remove("TIRITH_SESSION_ID")
+        .env_remove("_TIRITH_FISH_LOADED")
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stdout.contains("protocol=0 status=degraded"),
+                "fish hook entered protocol 3 against a binary without --cwd: \
+                 stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("legacy mode"),
+                "fish hook must say it is running in legacy mode: {stderr:?}"
+            );
+        }
+        Err(_) => eprintln!("skipping fish old-binary probe: fish not available"),
+    }
+
+    // Legacy mode never sends a receipt operation the old binary would reject.
+    let sent = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        sent.is_empty(),
+        "legacy-mode hooks sent receipt operations: {sent:?}"
+    );
+}
+
+/// Hooks loaded before consume/discard/reconcile retired receipts themselves
+/// still send `acknowledge` after each success. It must keep succeeding, as a
+/// no-op that trusts nothing it is given, so such a shell keeps working.
+#[test]
+fn shell_execution_receipt_acknowledge_is_a_compatibility_no_op() {
+    use std::io::Write as _;
+    for frame in [
+        "a".repeat(64),
+        "not a receipt token".to_string(),
+        String::new(),
+    ] {
+        let mut child = tirith()
+            .args(["__execution-receipt", "acknowledge", "--channel", "zsh"])
+            .env_remove("_TIRITH_RECEIPT_INSTANCE")
+            .env_remove("_TIRITH_RECEIPT_SHELL_PID")
+            .env_remove("_TIRITH_RECEIPT_FAMILY")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run compatibility acknowledge");
+        child
+            .stdin
+            .take()
+            .expect("acknowledge stdin")
+            .write_all(frame.as_bytes())
+            .expect("write acknowledge frame");
+        let out = child.wait_with_output().expect("wait for acknowledge");
+        assert_eq!(out.status.code(), Some(0), "frame {frame:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "frame {frame:?}"
+        );
+    }
+}
+
+/// `--cwd` replaces the hooks' `sh -c 'cd …; exec tirith …'` hop. A directory
+/// that cannot be entered fails like that silenced `cd`: exit 1, no output, and
+/// nothing is read or authorized.
+#[test]
+fn shell_execution_receipt_operations_accept_cwd_and_fail_closed_when_missing() {
+    let missing = tempfile::tempdir().expect("tempdir");
+    let gone = missing.path().join("removed");
+    for action in ["consume", "discard", "reconcile"] {
+        let out = tirith()
+            .args(["__execution-receipt", action, "--cwd"])
+            .arg(&gone)
+            .args(["--channel", "zsh"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run receipt operation with --cwd");
+        assert_eq!(out.status.code(), Some(1), "{action}");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{action}");
+    }
+    // An enterable directory proceeds to the ordinary receipt checks, which
+    // refuse a caller that is not a registered hook.
+    let out = tirith()
+        .args(["__execution-receipt", "discard", "--cwd"])
+        .arg(missing.path())
+        .args(["--channel", "zsh"])
+        .env_remove("_TIRITH_RECEIPT_INSTANCE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run receipt discard in an existing directory");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("receipt"));
+}
+
+/// The receipt binds the working directory the hook checked the command in.
+/// zsh/fish run consume/discard/reconcile from wherever the shell is now and
+/// pass the original directory with `--cwd`, so the operation must use
+/// `--cwd`, not the process's own working directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_operations_use_cwd_over_the_process_directory() {
+    let isolated = tempfile::tempdir().expect("isolated receipt state");
+    let state_dir = isolated.path().join("state");
+    let bound = isolated.path().join("bound");
+    let elsewhere = isolated.path().join("elsewhere");
+    fs::create_dir(&bound).expect("create receipt directory");
+    fs::create_dir(&elsewhere).expect("create other directory");
+    let session_id = "cli-receipt-cwd-differs";
+    let shell_pid = std::process::id().to_string();
+    let isolated_cmd = |cwd: &std::path::Path| {
+        let mut cmd = tirith_isolated(session_id, &state_dir, cwd);
+        cmd.env("HOME", isolated.path());
+        cmd
+    };
+    let register = isolated_cmd(&bound)
+        .args(["__execution-receipt", "register", "--family", "zsh"])
+        .args(["--shell-pid", shell_pid.as_str()])
+        .output()
+        .expect("register zsh receipt capability");
+    assert!(
+        register.status.success(),
+        "registration failed: {}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let bearer = String::from_utf8(register.stdout)
+        .expect("bearer is UTF-8")
+        .trim()
+        .to_string();
+    let command = "printf receipt-cwd-ok";
+    let hook_env = |cmd: &mut Command| {
+        cmd.env("_TIRITH_RECEIPT_INSTANCE", &bearer)
+            .env("_TIRITH_RECEIPT_SHELL_PID", &shell_pid)
+            .env("_TIRITH_RECEIPT_FAMILY", "zsh");
+    };
+    // Mint a receipt the way the zsh hook does, in `bound`.
+    let mint = || {
+        let mut cmd = isolated_cmd(&bound);
+        hook_env(&mut cmd);
+        let out = cmd
+            .env("_TIRITH_HOOK", "1")
+            .args([
+                "check",
+                "--approval-check",
+                "--non-interactive",
+                "--interactive",
+            ])
+            .args([
+                "--shell",
+                "posix",
+                "--execution-receipt",
+                "zsh",
+                "--",
+                command,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("mint shell execution receipt");
+        let stdout = String::from_utf8(out.stdout).expect("receipt frame is UTF-8");
+        stdout
+            .strip_prefix("TIRITH_EXECUTION_RECEIPT=")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .filter(|token| token.len() == 64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no receipt (code {:?}): {stdout:?} {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .to_string()
+    };
+    let consume = |token: &str, process_cwd: &std::path::Path, flag_cwd: &std::path::Path| {
+        use std::io::Write as _;
+        let mut cmd = isolated_cmd(process_cwd);
+        hook_env(&mut cmd);
+        let mut child = cmd
+            .args(["__execution-receipt", "consume", "--cwd"])
+            .arg(flag_cwd)
+            .args(["--channel", "zsh"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn receipt consume");
+        child
+            .stdin
+            .take()
+            .expect("consume stdin")
+            .write_all(format!("{token}\n{command}").as_bytes())
+            .expect("send consume frame");
+        child.wait_with_output().expect("wait for consume")
+    };
+
+    // The shell has moved on to `elsewhere`; `--cwd` names the bound directory.
+    let token = mint();
+    let out = consume(&token, &elsewhere, &bound);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "consume with --cwd of the bound directory must succeed from another directory: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Run from the bound directory, but `--cwd` names another one: the receipt
+    // is checked against the directory `--cwd` entered and refused.
+    let token = mint();
+    let out = consume(&token, &bound, &elsewhere);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("different working directory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Shell hooks take their per-shell session ID from `tirith __session-id`: a
+/// fresh, unpredictable UUID on every call (PowerShell and Nushell hooks had no
+/// random source of their own).
+#[test]
+fn session_id_helper_prints_a_fresh_uuid_each_call() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let out = tirith()
+            .arg("__session-id")
+            .env("TIRITH_SESSION_ID", "inherited-parent-session")
+            .output()
+            .expect("run __session-id");
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8(out.stdout).expect("UTF-8 session ID");
+        let id = text
+            .strip_suffix('\n')
+            .expect("one newline-terminated line");
+        assert_eq!(id.len(), 36, "{id:?}");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'),
+            "{id:?}"
+        );
+        assert_eq!(id.matches('-').count(), 4, "{id:?}");
+        assert!(seen.insert(id.to_owned()), "session IDs must not repeat");
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5355,8 +6036,8 @@ fn root_bash_hook_protocol_v3_response_parser_is_fail_closed() {
     fs::write(&trailing_nul, trailing_nul_bytes)
         .expect("write valid line plus trailing NUL byte response");
 
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
-    let hook_source = fs::read_to_string(&hook).expect("read root Bash hook");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
+    let hook_source = fs::read_to_string(&hook).expect("read Bash hook");
     assert!(
         !hook_source.contains("__execution-receipt arm")
             && !hook_source.contains("_tirith_receipt_arm"),
@@ -5457,7 +6138,7 @@ fn root_bash_hook_repeated_complex_delivery_and_exact_pipe_are_bash32_safe() {
     fs::create_dir(&capture_dir).expect("create private capture directory");
     let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
     let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
     let script = format!(
         r#"_TIRITH_BASH_INTERNAL=1
 _TIRITH_TEST_SKIP_HEALTH=1
@@ -5514,8 +6195,13 @@ IFS= builtin read -r second <&"$frame_fd" || second_rc=$?
 IFS= builtin read -r third <&"$frame_fd" || third_rc=$?
 _tirith_close_pending_fd "$frame_fd" || exit 73
 
-_tirith_receipt_consume() {{ TIRITH_CONSUMED_TOKEN="$2"; return 0; }}
-_tirith_receipt_discard() {{ TIRITH_DISCARDED_TOKEN="$2"; return 0; }}
+_tirith_receipt_call() {{
+  case "$1" in
+    consume) TIRITH_CONSUMED_TOKEN="$3" ;;
+    discard) TIRITH_DISCARDED_TOKEN="$3" ;;
+    *) return 1 ;;
+  esac
+}}
 _tirith_degrade_to_preexec() {{ TIRITH_DEGRADE_REASON="$1"; return 0; }}
 
 TIRITH_PARTIAL_EXECUTED=0
@@ -5643,7 +6329,7 @@ fn root_bash_hook_protocol_v3_runs_receipt_commands_as_direct_children() {
         .expect("make PATH-shadow Tirith executable");
     let real = fs::canonicalize(env!("CARGO_BIN_EXE_tirith")).expect("canonical Tirith binary");
     let real_dir = real.parent().expect("Tirith binary parent");
-    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../shell/lib/bash-hook.bash");
+    let hook = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/bash-hook.bash");
     let script = format!(
         "_TIRITH_BASH_INTERNAL=1; \
          source '{}'; \
@@ -6432,6 +7118,203 @@ fn warn_only_json_output_matches_plain_when_timings_stripped() {
         without_flag.status.code(),
         "exit codes must match"
     );
+}
+
+// R4.8: the MCP server and the gateway start the same detached, rate-limited
+// team policy refresh as `tirith check`. The claim file is the observable proof
+// that the refresh was started (the detached `enrollment sync --background`
+// child finds no connection file here and exits without any network contact).
+
+/// An isolated home whose enrolled team cache is two hours old, so a refresh is
+/// due. A refresh target needs only a well-formed enrollment record.
+#[cfg(unix)]
+fn stale_team_enrollment_root() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    use tirith_core::policy_team::Id;
+    let root = tempfile::tempdir().expect("team refresh root");
+    let team = root
+        .path()
+        .join("config")
+        .join("tirith")
+        .join("team-policy");
+    fs::create_dir_all(&team).expect("create team-policy dir");
+    for dir in [
+        root.path().join("config"),
+        root.path().join("config").join("tirith"),
+        team.clone(),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod dir");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "connection_id": Id::new(),
+        "authority_id": Id::new(),
+        "policy_id": Id::new(),
+        "activation_id": Id::new(),
+        "client_id": Id::new(),
+        "selection_commitment": "a".repeat(64),
+        "fetched_unix_ms": now - 2 * 3_600_000,
+        "cached_policy": null,
+    });
+    let path = team.join("enrollment.json");
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).expect("write enrollment");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod enrollment");
+    root
+}
+
+#[cfg(unix)]
+fn team_refresh_env(cmd: &mut Command, root: &Path) {
+    cmd.env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env_remove("TIRITH_OFFLINE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+}
+
+#[cfg(unix)]
+fn team_refresh_claimed(root: &Path) -> bool {
+    root.join("state")
+        .join("tirith")
+        .join("team-policy-refresh-claimed-at")
+        .is_file()
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_server_starts_the_team_policy_background_refresh() {
+    let root = stale_team_enrollment_root();
+    let mut cmd = tirith();
+    cmd.arg("mcp-server");
+    team_refresh_env(&mut cmd, root.path());
+    let out = cmd.output().expect("run tirith mcp-server");
+    assert!(
+        team_refresh_claimed(root.path()),
+        "the MCP server must start the team policy refresh; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let offline = stale_team_enrollment_root();
+    let mut cmd = tirith();
+    cmd.arg("mcp-server");
+    team_refresh_env(&mut cmd, offline.path());
+    cmd.env("TIRITH_OFFLINE", "1");
+    cmd.output().expect("run offline tirith mcp-server");
+    assert!(
+        !team_refresh_claimed(offline.path()),
+        "TIRITH_OFFLINE=1 must keep the MCP server from starting a refresh"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_starts_the_team_policy_background_refresh() {
+    let run = |offline: bool| {
+        let root = stale_team_enrollment_root();
+        let config = root.path().join("gateway.yaml");
+        fs::write(&config, "guarded_tools: []\n").expect("write gateway config");
+        let mut cmd = tirith();
+        cmd.current_dir(root.path()).args([
+            "gateway",
+            "run",
+            "--upstream-bin",
+            "/bin/cat",
+            "--config",
+            config.to_str().expect("utf-8 config path"),
+        ]);
+        team_refresh_env(&mut cmd, root.path());
+        if offline {
+            cmd.env("TIRITH_OFFLINE", "1");
+        }
+        let out = cmd.output().expect("run tirith gateway");
+        (team_refresh_claimed(root.path()), out)
+    };
+    let (claimed, out) = run(false);
+    assert!(
+        claimed,
+        "the gateway must start the team policy refresh; status={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (claimed, _) = run(true);
+    assert!(
+        !claimed,
+        "TIRITH_OFFLINE=1 must keep the gateway from starting a refresh"
+    );
+}
+
+/// `tirith check` is the main trigger: hooks run it for every command. It
+/// starts the refresh before any analysis-dependent early return, so the
+/// `TIRITH=0` bypass and the hooks' `--approval-check` calls start it too;
+/// `--offline` and `TIRITH_OFFLINE=1` never do.
+#[cfg(unix)]
+#[test]
+fn check_starts_the_team_policy_background_refresh_unless_offline() {
+    use std::os::unix::fs::PermissionsExt;
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let root = stale_team_enrollment_root();
+        // `tirith check` also starts the ThreatDB auto-update; mark it as not
+        // due so this test never downloads the real database.
+        let state = root.path().join("state");
+        let tirith_state = state.join("tirith");
+        fs::create_dir_all(&tirith_state).expect("create state dir");
+        for dir in [&state, &tirith_state] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod state dir");
+        }
+        fs::write(tirith_state.join("threatdb-next-check-at"), "99999999999")
+            .expect("write threatdb next-check");
+        let mut cmd = tirith();
+        cmd.current_dir(root.path())
+            .arg("check")
+            .args(args)
+            .args(["--", "echo hi"]);
+        team_refresh_env(&mut cmd, root.path());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("run tirith check");
+        let threatdb_spawned = tirith_state.join("threatdb-spawned-at").exists();
+        assert!(!threatdb_spawned, "the ThreatDB auto-update must stay off");
+        (team_refresh_claimed(root.path()), out)
+    };
+    let check = ["--non-interactive", "--shell", "posix", "--format", "json"];
+    let approval = ["--approval-check", "--non-interactive", "--shell", "posix"];
+    let offline = [
+        "--offline",
+        "--non-interactive",
+        "--shell",
+        "posix",
+        "--format",
+        "json",
+    ];
+    for (case, args, env, expected) in [
+        ("tirith check", &check[..], &[][..], true),
+        ("TIRITH=0 bypass", &check[..], &[("TIRITH", "0")][..], true),
+        ("--approval-check", &approval[..], &[][..], true),
+        ("--offline", &offline[..], &[][..], false),
+        (
+            "TIRITH_OFFLINE=1",
+            &check[..],
+            &[("TIRITH_OFFLINE", "1")][..],
+            false,
+        ),
+    ] {
+        let (claimed, out) = run(args, env);
+        assert_eq!(
+            claimed,
+            expected,
+            "{case}: team policy refresh claimed={claimed}, expected {expected}; status={:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 // `--offline` / `TIRITH_OFFLINE` (roadmap M0.3). The offline switch suppresses the periodic
@@ -18442,6 +19325,88 @@ fn rule_test_allowlisted_domain_does_not_fire() {
     );
 }
 
+/// Issue #264: `tirith rule test` must agree with `tirith check` on an input
+/// whose variable command word resolves (`N=npm; "$N" install ...`), for both
+/// a DSL `when:` rule and a regex rule keyed on the literal spelling.
+#[test]
+fn rule_test_agrees_with_check_on_a_resolved_variable_command() {
+    let (tmp, proj) = rule_project(
+        "custom_rules:\n  \
+         - id: pkg-npm\n    \
+         when:\n      \
+         package.ecosystem: npm\n    \
+         severity: medium\n    \
+         title: \"npm install\"\n    \
+         context: [exec]\n  \
+         - id: lit-npm\n    \
+         pattern: 'npm install'\n    \
+         severity: medium\n    \
+         title: \"npm install literal\"\n    \
+         context: [exec]\n",
+    );
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let isolated = |c: &mut Command| {
+        c.env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".state"))
+            .env("XDG_DATA_HOME", home.join(".data"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("TIRITH_LOG", "0");
+    };
+    for input in [
+        r#"N=npm; "$N" install left-pad"#,
+        "N=npm; npm install left-pad",
+    ] {
+        let mut check = tirith_in_proj(&proj);
+        isolated(&mut check);
+        let out = check
+            .args([
+                "check",
+                "--json",
+                "--non-interactive",
+                "--shell",
+                "posix",
+                "--",
+                input,
+            ])
+            .output()
+            .expect("run tirith check");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "check json for {input:?}: {e}; stdout {} stderr {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        let fired: Vec<&str> = v["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f["custom_rule_id"].as_str())
+            .collect();
+        for rule in ["pkg-npm", "lit-npm"] {
+            assert!(
+                fired.contains(&rule),
+                "check must fire {rule} on {input:?}: {fired:?}"
+            );
+            let mut test = tirith_in_proj(&proj);
+            isolated(&mut test);
+            let out = test
+                .args(["rule", "test", "--rule", rule, "--input", input, "--json"])
+                .output()
+                .expect("run tirith rule test");
+            assert_eq!(out.status.code(), Some(0));
+            let t: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(
+                t["fires"],
+                serde_json::json!(true),
+                "rule test must agree with check for {rule} on {input:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn rule_test_unknown_rule_exits_one() {
     let (_tmp, proj) = rule_project(RULE_DSL_POLICY);
@@ -22024,9 +22989,9 @@ fn scan_directory_with_wheel_inspects_member() {
 // resolver and the OS containment backend, so it stays integration-only off-CI;
 // these tests pin the parts that refuse deterministically with no network / index.
 
-/// An empty PATH (no `uv`/`python` resolver) for the enforcing install: forces
-/// `ResolverTools::discover` to fail, so `tirith pkg install` cannot reach a real
-/// index or spawn anything. The dir is created so PATH resolution finds nothing
+/// An empty PATH (no `uv`/`python` resolver) for the refusing install/approve
+/// commands, so they could not reach a real index or spawn anything even if they
+/// did not refuse first. The dir is created so PATH resolution finds nothing
 /// there rather than reading the host's tools.
 fn empty_path_dir(home: &std::path::Path) -> std::path::PathBuf {
     let empty_bin = home.join("empty-bin");
@@ -22095,16 +23060,12 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"
             );
-        } else if action == "install" {
+        } else {
+            // Both commands refuse contained package execution before resolver
+            // discovery; approve records nothing that install could redeem.
             assert!(
                 stderr.contains("private_input_execution_unqualified:"),
-                "pkg install must refuse before resolver discovery: {stderr}"
-            );
-        } else {
-            assert!(
-                stderr.contains("resolve failed")
-                    && stderr.contains("explicit `tirith pkg trust-tool"),
-                "pkg {action} must report the resolver trust boundary: {stderr}"
+                "pkg {action} must refuse before resolver discovery: {stderr}"
             );
         }
     }
@@ -22311,9 +23272,86 @@ fn pkg_install_private_input_qualification_refuses_before_package_side_effects()
     }
 }
 
-/// A complete private-input argv and valid spec must hit qualification before
-/// platform setup or descriptor validation. The target is a harmless shell that
-/// would create a marker if reached; no package or namespace attack is attempted.
+/// The exact bytes `tirith pkg install` prints when it refuses. Captured from the
+/// pre-cleanup implementation so deleting the unreachable execution path cannot
+/// change a single byte of the human diagnostic, the JSON document, or the exit
+/// code. Both the qualification refusal and the earlier request-validation
+/// refusal are pinned, with every historical flag combination.
+#[test]
+fn pkg_install_refusal_output_is_byte_identical() {
+    const REASON: &str = "private_input_execution_unqualified: contained package execution is \
+disabled; the private-input backend cannot guarantee unchanged package inputs throughout \
+execution against another process owned by the same user. Sudo or administrator access does \
+not qualify this backend. Package inspection and ordinary command protection remain available.";
+    const DIRECT_URL: &str = "examplepkg@https://unapproved.example/pkg-1.0-py3-none-any.whl";
+    let direct_url_reason = format!(
+        "resolve failed: refusing requirement \"{DIRECT_URL}\": direct-URL requirements \
+(name @ url / bare url) are not permitted"
+    );
+    let json_document = |phase: &str, reason: &str| {
+        format!(
+            "{{\n  \"error_phase\": \"{phase}\",\n  \"reason\": {},\n  \"success\": false,\n  \
+\"target_executed\": false,\n  \"target_published\": false\n}}\n",
+            serde_json::to_string(reason).unwrap()
+        )
+    };
+    let cases: [(&str, &str, String); 2] = [
+        (
+            "examplepkg==1.0.0",
+            "refused_before_exec",
+            REASON.to_string(),
+        ),
+        (DIRECT_URL, "plan_preparation", direct_url_reason),
+    ];
+    for (requirement, phase, reason) in &cases {
+        for flags in [
+            Vec::<&str>::new(),
+            vec!["--yes"],
+            vec!["--allow-degraded", "--yes"],
+        ] {
+            for json in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let mut command = tirith();
+                command
+                    .current_dir(fixture.path())
+                    .env("HOME", fixture.path())
+                    .env("USERPROFILE", fixture.path())
+                    .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+                    .env("XDG_DATA_HOME", fixture.path().join("data"))
+                    .env("APPDATA", fixture.path().join("data"))
+                    .env("LOCALAPPDATA", fixture.path().join("data"))
+                    .env("TIRITH_LOG", "0")
+                    .args(["pkg", "install", "pip", requirement, "--target"])
+                    .arg(fixture.path().join("target"))
+                    .args(&flags);
+                if json {
+                    command.arg("--json");
+                }
+                let output = command.output().expect("run pkg install refusal");
+                assert_eq!(output.status.code(), Some(1), "flags={flags:?} json={json}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                if json {
+                    assert_eq!(stdout, json_document(phase, reason), "flags={flags:?}");
+                    assert_eq!(stderr, "", "flags={flags:?}");
+                } else {
+                    assert_eq!(stdout, "", "flags={flags:?}");
+                    assert_eq!(
+                        stderr,
+                        format!("tirith pkg install: {phase}: {reason}\n"),
+                        "flags={flags:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The private-input launcher was removed, so its operands are unknown to the
+/// hidden launcher grammar: a complete former private-input argv with a valid
+/// spec is refused as a usage error (exit 2) before platform setup, descriptor
+/// use, or target execution. The target is a harmless shell that would create a
+/// marker if reached; no package or namespace attack is attempted.
 #[cfg(unix)]
 #[test]
 fn hidden_capsule_private_inputs_refuse_before_target_execution() {
@@ -22350,43 +23388,54 @@ fn hidden_capsule_private_inputs_refuse_before_target_execution() {
         .expect("run hidden private-input refusal");
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("private_input_execution_unqualified:"),
-        "{stderr}"
+    assert_eq!(
+        stderr,
+        "tirith __capsule-child: unknown internal launcher option \"--staging-root\"\n"
     );
-    assert!(!stderr.contains("invalid capsule spec"));
     assert!(output.stdout.is_empty());
     assert!(!marker.exists(), "refused target must never execute");
     assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
 }
 
-/// `tirith pkg install` only enforces `pip` in v1; a non-pip ecosystem must be a
-/// hard usage refusal (exit 2) that points at the analysis-only path, never an
-/// attempt to install. Refused at the `precheck` gate before any resolve, so this
-/// is host-independent.
+/// `tirith pkg install` accepts only `pip` requirements (and then refuses, since
+/// contained installation is disabled); a non-pip ecosystem must be a hard usage
+/// refusal (exit 2) that points at the analysis-only path, never an attempt to
+/// install. Refused at the `precheck` gate before any resolve, so this is
+/// host-independent.
 #[test]
 fn pkg_install_non_pip_ecosystem_is_refused() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let out = tirith()
-        .env("PATH", empty_path_dir(home.path()))
-        .env("XDG_DATA_HOME", home.path())
-        .env("APPDATA", home.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .args(["pkg", "install", "npm", "lodash"])
-        .output()
-        .expect("failed to run tirith pkg install npm");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "a non-pip ecosystem must be a usage refusal (exit 2); stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("only `pip` is enforced"),
-        "the refusal must explain only pip is enforced: {stderr}"
-    );
+    for (ecosystem, package) in [("npm", "lodash"), ("cargo", "serde")] {
+        let home = tempfile::tempdir().expect("tempdir");
+        let out = tirith()
+            .env("PATH", empty_path_dir(home.path()))
+            .env("XDG_DATA_HOME", home.path())
+            .env("APPDATA", home.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .args(["pkg", "install", ecosystem, package])
+            .output()
+            .expect("failed to run tirith pkg install");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "a non-pip ecosystem must be a usage refusal (exit 2); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("accept only `pip` requirements")
+                && stderr.contains("disabled for every ecosystem"),
+            "the refusal must explain only pip requirements are accepted: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("tirith install --no-exec {ecosystem} <package>")),
+            "the refusal must name the analysis-only path: {stderr}"
+        );
+        assert!(
+            !stderr.contains("hidden experimental flags") && !stderr.contains("is enforced"),
+            "the refusal must not describe removed or nonexistent paths: {stderr}"
+        );
+    }
 }
 
 /// `tirith pkg install pip` with no requirements is a usage error (exit 2), not a
@@ -22411,6 +23460,57 @@ fn pkg_install_empty_requirements_is_usage_error() {
     );
 }
 
+/// `pkg trust-tool` records a resolver pin that nothing in this release reads
+/// (contained package installation is disabled). Its help must say so instead
+/// of reading as if enrollment changed what tirith enforces.
+#[test]
+fn pkg_trust_tool_help_says_the_pin_is_not_enforced() {
+    for args in [vec!["pkg", "trust-tool", "--help"], vec!["pkg", "--help"]] {
+        let out = tirith().args(&args).output().expect("run tirith help");
+        assert!(out.status.success(), "{args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.contains("uv executable"))
+            .unwrap_or_else(|| panic!("{args:?}: no trust-tool summary in {stdout}"));
+        assert!(
+            line.contains("not yet enforced"),
+            "{args:?}: trust-tool help must say the pin is not enforced: {line}"
+        );
+    }
+}
+
+/// A schema-v2 `private_verified` artifact-scan receipt as the removed package
+/// install wrote it: `fields` plus the stamped schema, engine build, timestamp
+/// and content-addressed id. Artifact hashes are sorted like the old writer did.
+fn artifact_receipt_fixture(
+    mut fields: serde_json::Value,
+) -> tirith_core::receipt::ArtifactScanReceipt {
+    let object = fields.as_object_mut().expect("receipt fixture fields");
+    object.insert("schema".into(), serde_json::json!(2));
+    object.insert("receipt_id".into(), serde_json::json!(""));
+    object.insert(
+        "engine_build_sha".into(),
+        serde_json::json!(tirith_core::receipt::engine_build_sha()),
+    );
+    object.insert(
+        "publication_state".into(),
+        serde_json::json!("private_verified"),
+    );
+    object.insert(
+        "timestamp".into(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
+    if let Some(serde_json::Value::Array(hashes)) = object.get_mut("artifact_sha256") {
+        hashes.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        hashes.dedup();
+    }
+    let mut receipt: tirith_core::receipt::ArtifactScanReceipt =
+        serde_json::from_value(fields).expect("receipt fixture deserializes");
+    receipt.receipt_id = receipt.compute_content_hash();
+    receipt
+}
+
 /// `tirith pkg receipt show` on a TAMPERED receipt must detect the edit and exit
 /// non-zero with a warning, never report it as a clean receipt. We build a real,
 /// content-addressed `ArtifactScanReceipt`, save it under an isolated data dir,
@@ -22420,7 +23520,7 @@ fn pkg_install_empty_requirements_is_usage_error() {
 #[test]
 fn pkg_receipt_show_detects_a_tampered_receipt() {
     use tirith_core::capsule::CapsuleCoverage;
-    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+    use tirith_core::receipt::{CapsuleReceipt, VerdictSummary};
 
     let home = tempfile::tempdir().expect("tempdir");
     // `data_dir()` honors XDG_DATA_HOME on Unix and %APPDATA% on Windows; receipts
@@ -22429,25 +23529,25 @@ fn pkg_receipt_show_detects_a_tampered_receipt() {
     fs::create_dir_all(&receipts_dir).expect("create receipts dir");
 
     // A valid receipt whose `receipt_id` is the content hash of its own bytes.
-    let receipt = ArtifactScanReceipt::new(
-        "0.0.0-test".to_string(),
-        "deadbeef".repeat(8),
-        7,
-        "uv pip compile --generate-hashes --no-build".to_string(),
-        String::new(),
-        String::new(),
-        CapsuleReceipt {
+    let receipt = artifact_receipt_fixture(serde_json::json!({
+        "tirith_version": "0.0.0-test".to_string(),
+        "policy_hash": "deadbeef".repeat(8),
+        "threat_db_sequence": 7,
+        "resolver_command": "uv pip compile --generate-hashes --no-build".to_string(),
+        "resolver_version": String::new(),
+        "package_manager_version": String::new(),
+        "capsule": CapsuleReceipt {
             backend_id: "noop".to_string(),
             coverage: CapsuleCoverage::NONE,
         },
-        vec!["a".repeat(64)],
-        None,
-        VerdictSummary {
+        "artifact_sha256": vec!["a".repeat(64)],
+        "post_install_record": null,
+        "verdict": VerdictSummary {
             action: "Allow".to_string(),
             rule_ids: vec![],
             finding_count: 0,
         },
-    );
+    }));
     assert!(
         receipt.content_hash_matches(),
         "freshly built receipt must be self-consistent before tampering"
@@ -22490,31 +23590,31 @@ fn pkg_receipt_show_detects_a_tampered_receipt() {
 #[test]
 fn pkg_receipt_show_accepts_an_untampered_receipt() {
     use tirith_core::capsule::CapsuleCoverage;
-    use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
+    use tirith_core::receipt::{CapsuleReceipt, VerdictSummary};
 
     let home = tempfile::tempdir().expect("tempdir");
     let receipts_dir = home.path().join("tirith").join("receipts");
     fs::create_dir_all(&receipts_dir).expect("create receipts dir");
 
-    let receipt = ArtifactScanReceipt::new(
-        "0.0.0-test".to_string(),
-        "deadbeef".repeat(8),
-        7,
-        "uv pip compile --generate-hashes --no-build".to_string(),
-        String::new(),
-        String::new(),
-        CapsuleReceipt {
+    let receipt = artifact_receipt_fixture(serde_json::json!({
+        "tirith_version": "0.0.0-test".to_string(),
+        "policy_hash": "deadbeef".repeat(8),
+        "threat_db_sequence": 7,
+        "resolver_command": "uv pip compile --generate-hashes --no-build".to_string(),
+        "resolver_version": String::new(),
+        "package_manager_version": String::new(),
+        "capsule": CapsuleReceipt {
             backend_id: "noop".to_string(),
             coverage: CapsuleCoverage::NONE,
         },
-        vec!["a".repeat(64)],
-        None,
-        VerdictSummary {
+        "artifact_sha256": vec!["a".repeat(64)],
+        "post_install_record": null,
+        "verdict": VerdictSummary {
             action: "Allow".to_string(),
             rule_ids: vec![],
             finding_count: 0,
         },
-    );
+    }));
     let id = receipt.receipt_id.clone();
     // Write the receipt verbatim (no edit), keyed by its content-hash id.
     let json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
@@ -22845,4 +23945,409 @@ fn ecosystem_scan_human_output_neutralizes_attacker_scan_root() {
         .expect("failed to run tirith ecosystem scan");
 
     assert_attack_codepoints_stripped(&out.stderr);
+}
+
+/// Bug 4: an inherited, exported PYTHONINSPECT makes `python3 -c <literal>`
+/// run the rest of the piped stdin as code once the fixed program exits, so the
+/// issue #136 data-pipeline exemption must not apply when the caller's
+/// environment carries it.
+#[test]
+fn inherited_python_inspect_keeps_pipe_to_interpreter() {
+    let input = "echo payload | python3 -c 'print(1)'";
+    let rule_ids = |inspect: Option<&str>| -> Vec<String> {
+        let mut cmd = tirith();
+        cmd.env_remove("PYTHONINSPECT");
+        if let Some(value) = inspect {
+            cmd.env("PYTHONINSPECT", value);
+        }
+        let out = cmd
+            .args(["check", "--json", "--shell", "posix", "--", input])
+            .output()
+            .expect("tirith check");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse JSON");
+        v["findings"]
+            .as_array()
+            .map(|findings| {
+                findings
+                    .iter()
+                    .filter_map(|f| f["rule_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let has_pipe = |ids: &[String]| ids.iter().any(|id| id == "pipe_to_interpreter");
+    assert!(
+        !has_pipe(&rule_ids(None)),
+        "#136 exemption must still apply"
+    );
+    assert!(!has_pipe(&rule_ids(Some(""))), "empty PYTHONINSPECT is off");
+    assert!(
+        has_pipe(&rule_ids(Some("1"))),
+        "inherited PYTHONINSPECT must refuse the exemption"
+    );
+}
+
+/// Bug 4 follow-up: `tirith check` answers through the persistent daemon by
+/// default, and the daemon analyzes for other shells. The inherited
+/// PYTHONINSPECT decision must come from the CLIENT's environment (it rides
+/// the request), never from the environment the daemon was started with.
+#[cfg(unix)]
+#[test]
+fn daemon_check_uses_the_clients_python_inspect_not_the_daemons() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The daemon socket lives in the state dir; client and daemon share it.
+    // A short path keeps the socket under the platform's sun_path limit.
+    let state = tmp.path().join("s");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    // A daemon-only policy root: `policy_path_used` naming it proves that the
+    // daemon, not a local fallback, produced the verdict.
+    let org = tmp.path().join("org");
+    fs::create_dir_all(org.join(".tirith")).expect("org policy dir");
+    fs::write(org.join(".tirith/policy.yaml"), "fail_mode: open\n").expect("org policy");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("git marker");
+
+    let mut daemon_cmd = tirith();
+    daemon_cmd
+        .env("XDG_STATE_HOME", &state)
+        .env("TIRITH_POLICY_ROOT", &org)
+        .env("PYTHONINSPECT", "1")
+        .args(["daemon", "start"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = KillOnDrop(daemon_cmd.spawn().expect("spawn daemon"));
+    let socket = state.join("tirith").join("daemon.sock");
+    let started = std::time::Instant::now();
+    while !socket.exists() {
+        assert!(
+            daemon.0.try_wait().expect("poll daemon").is_none(),
+            "daemon exited before binding its socket"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "daemon did not bind {}",
+            socket.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let answered_by_daemon = |json: &serde_json::Value| {
+        json["policy_path_used"]
+            .as_str()
+            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
+    };
+    let has_pipe = |json: &serde_json::Value| {
+        json["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|f| f["rule_id"].as_str() == Some("pipe_to_interpreter"))
+        })
+    };
+
+    // `tirith check` waits at most 5 s for the daemon's answer, then falls
+    // back to local analysis. The first requests a fresh daemon serves also
+    // pay its one-time start-up work, and under the parallel workspace run
+    // that took longer than 5 s, so the asserted checks got a local verdict
+    // (the cold local fallback in those runs took another 2.8 s and 7.4 s).
+    // Warm the daemon first: send the exact request the client sends, for
+    // both inspect values, over the daemon socket with no 5 s deadline.
+    // These answers also show the daemon's own decision, with no client in
+    // between.
+    let project_cwd = fs::canonicalize(&project).expect("canonical project dir");
+    let ask_daemon = |python_inspect_inherited: bool| -> serde_json::Value {
+        use std::io::{BufRead as _, Write as _};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket).expect("connect to the daemon");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+            .expect("bounded warm-up read");
+        let request = serde_json::json!({
+            "command": "check",
+            "input": "echo payload | python3 -c 'print(1)'",
+            "context": "exec",
+            "cwd": project_cwd.display().to_string(),
+            "shell": "posix",
+            "interactive": false,
+            "bypass_requested": false,
+            "offline": true,
+            "python_inspect_inherited": python_inspect_inherited,
+        });
+        writeln!(stream, "{request}").expect("send the request");
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("daemon answer");
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("daemon answer must be JSON: {error}: {line}"))
+    };
+    let direct_without = ask_daemon(false);
+    assert!(
+        answered_by_daemon(&direct_without),
+        "warm-up answer did not come from the daemon's policy: {direct_without}"
+    );
+    assert!(
+        !has_pipe(&direct_without),
+        "the daemon's own PYTHONINSPECT must not refuse the exemption: {direct_without}"
+    );
+    let direct_with = ask_daemon(true);
+    assert!(
+        answered_by_daemon(&direct_with),
+        "warm-up answer did not come from the daemon's policy: {direct_with}"
+    );
+    assert!(
+        has_pipe(&direct_with),
+        "an inherited PYTHONINSPECT in the request must refuse the exemption: {direct_with}"
+    );
+
+    let check = |client_inspect: Option<&str>| -> serde_json::Value {
+        let mut cmd = tirith_in_proj(&project);
+        cmd.env("XDG_STATE_HOME", &state)
+            .env_remove("PYTHONINSPECT");
+        if let Some(value) = client_inspect {
+            cmd.env("PYTHONINSPECT", value);
+        }
+        let out = cmd
+            .args([
+                "check",
+                "--json",
+                "--offline",
+                "--shell",
+                "posix",
+                "--non-interactive",
+                "--",
+                "echo payload | python3 -c 'print(1)'",
+            ])
+            .output()
+            .expect("tirith check");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "check output must be JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    let without = check(None);
+    assert!(
+        answered_by_daemon(&without),
+        "daemon did not answer: {without}"
+    );
+    assert!(
+        !has_pipe(&without),
+        "the daemon's own PYTHONINSPECT must not refuse the exemption: {without}"
+    );
+    let with = check(Some("1"));
+    assert!(answered_by_daemon(&with), "daemon did not answer: {with}");
+    assert!(
+        has_pipe(&with),
+        "the client's PYTHONINSPECT must refuse the exemption: {with}"
+    );
+}
+
+/// Review of PR #274: the daemon reads a relative plan from the client's
+/// directory, so whether the IaC plan gate follows a `cd` to a bare name
+/// must come from the client's environment too. With `CDPATH` exported
+/// there, the client's shell changes to `$CDPATH/infra`, not to the
+/// `infra` tirith reads. A daemon started without `CDPATH` used to follow
+/// `cd infra` into the recorded plan and allow the apply, while the same
+/// check without the daemon blocked.
+#[cfg(unix)]
+#[test]
+fn daemon_check_uses_the_clients_cdpath_not_the_daemons() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The daemon socket and the recorded plan hashes live in the state dir;
+    // client and daemon share it. A short path keeps the socket under the
+    // platform's sun_path limit.
+    let state = tmp.path().join("s");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    // A daemon-only policy root that turns the plan gate on:
+    // `policy_path_used` naming it proves that the daemon, not a local
+    // fallback, produced the verdict.
+    let org = tmp.path().join("org");
+    fs::create_dir_all(org.join(".tirith")).expect("org policy dir");
+    fs::write(
+        org.join(".tirith/policy.yaml"),
+        "fail_mode: open\niac_require_plan_before_apply: true\n",
+    )
+    .expect("org policy");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("git marker");
+    fs::create_dir_all(project.join("infra")).expect("project infra dir");
+    // The client's CDPATH, where its shell's `cd infra` leads.
+    let cdpath = tmp.path().join("cdpath");
+    fs::create_dir_all(cdpath.join("infra")).expect("CDPATH infra dir");
+    let plan = |marker: &str| {
+        serde_json::json!({"format_version": "1.2", "resource_changes": [], "marker": marker})
+            .to_string()
+    };
+    fs::write(project.join("infra/tfplan"), plan("recorded")).expect("recorded plan");
+    fs::write(cdpath.join("infra/tfplan"), plan("not recorded")).expect("unrecorded plan");
+    let recorded = tirith_in_proj(&project)
+        .env("XDG_STATE_HOME", &state)
+        .args(["iac", "check-plan", "infra/tfplan"])
+        .output()
+        .expect("tirith iac check-plan");
+    assert!(
+        recorded.status.success(),
+        "check-plan failed: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+
+    let mut daemon_cmd = tirith();
+    daemon_cmd
+        .env("XDG_STATE_HOME", &state)
+        .env("TIRITH_POLICY_ROOT", &org)
+        .env_remove("CDPATH")
+        .args(["daemon", "start"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = KillOnDrop(daemon_cmd.spawn().expect("spawn daemon"));
+    let socket = state.join("tirith").join("daemon.sock");
+    let started = std::time::Instant::now();
+    while !socket.exists() {
+        assert!(
+            daemon.0.try_wait().expect("poll daemon").is_none(),
+            "daemon exited before binding its socket"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "daemon did not bind {}",
+            socket.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let answered_by_daemon = |json: &serde_json::Value| {
+        json["policy_path_used"]
+            .as_str()
+            .is_some_and(|path| path.contains("org") && path.ends_with("policy.yaml"))
+    };
+    let blocks_plan = |json: &serde_json::Value| {
+        json["findings"].as_array().is_some_and(|findings| {
+            findings
+                .iter()
+                .any(|f| f["rule_id"].as_str() == Some("iac_plan_hash_mismatch"))
+        })
+    };
+    let command = "cd infra; terraform apply tfplan";
+
+    // Warm the daemon with the requests a client sends (see
+    // `daemon_check_uses_the_clients_python_inspect_not_the_daemons`); they
+    // also show the daemon's own decision, including for an older client
+    // that does not send the field.
+    let project_cwd = fs::canonicalize(&project).expect("canonical project dir");
+    let ask_daemon = |cdpath_inherited: Option<bool>| -> serde_json::Value {
+        use std::io::{BufRead as _, Write as _};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&socket).expect("connect to the daemon");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+            .expect("bounded warm-up read");
+        let mut request = serde_json::json!({
+            "command": "check",
+            "input": command,
+            "context": "exec",
+            "cwd": project_cwd.display().to_string(),
+            "shell": "posix",
+            "interactive": false,
+            "bypass_requested": false,
+            "offline": true,
+            "python_inspect_inherited": false,
+        });
+        if let Some(value) = cdpath_inherited {
+            request["cdpath_inherited"] = value.into();
+        }
+        writeln!(stream, "{request}").expect("send the request");
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("daemon answer");
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("daemon answer must be JSON: {error}: {line}"))
+    };
+    for (cdpath_inherited, expect_block, why) in [
+        (
+            Some(false),
+            false,
+            "a client without CDPATH: `cd infra` reaches the recorded plan",
+        ),
+        (
+            Some(true),
+            true,
+            "a client with CDPATH: `cd infra` may lead elsewhere",
+        ),
+        (None, true, "an older client counts as having CDPATH"),
+    ] {
+        let answer = ask_daemon(cdpath_inherited);
+        assert!(
+            answered_by_daemon(&answer),
+            "warm-up answer did not come from the daemon's policy: {answer}"
+        );
+        assert_eq!(blocks_plan(&answer), expect_block, "{why}: {answer}");
+    }
+
+    let check = |client_cdpath: Option<&std::path::Path>| -> serde_json::Value {
+        let mut cmd = tirith_in_proj(&project);
+        cmd.env("XDG_STATE_HOME", &state).env_remove("CDPATH");
+        if let Some(value) = client_cdpath {
+            cmd.env("CDPATH", value);
+        }
+        let out = cmd
+            .args([
+                "check",
+                "--json",
+                "--offline",
+                "--shell",
+                "posix",
+                "--non-interactive",
+                "--",
+                command,
+            ])
+            .output()
+            .expect("tirith check");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "check output must be JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+
+    let without = check(None);
+    assert!(
+        answered_by_daemon(&without),
+        "daemon did not answer: {without}"
+    );
+    assert!(
+        !blocks_plan(&without),
+        "without CDPATH the daemon follows `cd infra` to the recorded plan: {without}"
+    );
+    let with = check(Some(&cdpath));
+    assert!(answered_by_daemon(&with), "daemon did not answer: {with}");
+    assert!(
+        blocks_plan(&with),
+        "the client's CDPATH must stop the daemon following `cd infra`: {with}"
+    );
 }

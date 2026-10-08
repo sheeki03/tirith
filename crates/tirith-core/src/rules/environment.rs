@@ -85,6 +85,7 @@ mod tests {
 
     #[test]
     fn test_no_proxy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let env = TestEnv {
             vars: std::collections::HashMap::new(),
         };
@@ -94,6 +95,7 @@ mod tests {
 
     #[test]
     fn test_http_proxy_set() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut vars = std::collections::HashMap::new();
         vars.insert(
             "HTTP_PROXY".to_string(),

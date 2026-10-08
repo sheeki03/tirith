@@ -1,6 +1,8 @@
 //! Explicit operator annotations. These records never participate in policy,
 //! trust, reputation scoring, or execution authorization.
-use super::setup::change_plan::{Edit, MutationService, OperationKind, RequestedChange};
+use super::setup::change_plan::{
+    Edit, MutationService, OperationKind, PlanRequest, RequestedChange,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -42,7 +44,7 @@ struct Intent<'a> {
 }
 
 fn intent<'a>(change: &'a FeedbackRequest, cwd: Option<&str>) -> Result<Intent<'a>, String> {
-    if !uuid::Uuid::parse_str(&change.event_id).is_ok_and(|id| id.to_string() == change.event_id) {
+    if !tirith_core::util::is_uuid(&change.event_id) {
         return Err("feedback requires a canonical incident event UUID".into());
     }
     Ok(Intent {
@@ -60,7 +62,7 @@ fn observed_incident(id: &str) -> Result<String, String> {
     let report = tirith_core::history::HistoryReader::new(path).recent(
         Default::default(),
         500,
-        std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+        tirith_core::audit::logging_enabled(),
     )?;
     let matches: Vec<_> = report
         .events
@@ -156,11 +158,10 @@ pub(crate) fn prepare(
     if dry_run {
         return Ok(preview);
     }
-    let status = if previous.as_deref() == Some(text.as_str()) {
-        service.complete_noop_with_intent(id, OperationKind::RecordFeedback, &snapshot, &intent)?
+    let request = if previous.as_deref() == Some(text.as_str()) {
+        PlanRequest::no_op(OperationKind::RecordFeedback)
     } else {
-        service.plan_with_preimages_and_intent(
-            id,
+        PlanRequest::change(
             OperationKind::RecordFeedback,
             vec![RequestedChange {
                 target: path.clone(),
@@ -173,14 +174,27 @@ pub(crate) fn prepare(
                     change.expectation.token()
                 ),
             }],
-            &snapshot,
-            &BTreeMap::from([(path, previous)]),
-            &intent,
-        )?
+        )
+        .preimages(BTreeMap::from([(path, previous)]))
     };
+    let status = service.submit(id, &snapshot, request.intent(&intent)?)?;
     Ok(
         json!({"schema_version":1,"kind":"feedback_plan","applied":false,"preview":preview,"operation":super::profile::status_projection(&status,&compiled)?,"policy_changed":false}),
     )
+}
+
+/// Human text for `tirith audit feedback` without `--json`.
+fn human_text(value: &Value) -> String {
+    if value["kind"] == "feedback_preview" {
+        let record = &value["record"];
+        return format!(
+            "Feedback preview (not applied): incident {} marked {}\n  {}\n",
+            super::profile::human_value(&record["event_id"]),
+            super::profile::human_value(&record["expectation"]),
+            super::profile::human_value(&value["notice"]),
+        );
+    }
+    super::profile::operation_human_text(value)
 }
 
 pub(crate) fn run(
@@ -190,63 +204,37 @@ pub(crate) fn run(
     dry_run: bool,
     json_output: bool,
 ) -> i32 {
-    let result = (|| -> Result<Value, String> {
-        let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
-        let id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string());
-        let preview = prepare(
-            &id,
-            FeedbackRequest {
-                event_id,
-                expectation,
-            },
-            cwd.as_deref(),
-            dry_run,
-        )?;
-        if dry_run {
-            return Ok(preview);
-        }
-        let snapshot = EffectivePolicySnapshot::resolve(cwd.as_deref(), ResolutionMode::Runtime);
-        let status = MutationService::current()?.apply(&id, &snapshot)?;
-        let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(
-            &tirith_core::policy::captured_policy_dlp_patterns_or(
-                &snapshot.policy.dlp_custom_patterns,
-            ),
-        );
-        super::profile::status_projection(&status, &compiled)
-    })();
-    match result {
-        Ok(value) => {
-            if json_output {
-                if !super::write_json_stdout(&value, "tirith audit feedback: cannot write result") {
-                    return 1;
-                }
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
+    super::profile::run_operation_cli(
+        "tirith audit feedback",
+        "tirith audit feedback: cannot write result",
+        json_output,
+        || {
+            let id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string());
+            let preview = prepare(
+                &id,
+                FeedbackRequest {
+                    event_id,
+                    expectation,
+                },
+                cwd.as_deref(),
+                dry_run,
+            )?;
+            if dry_run {
+                return Ok(preview);
             }
-            if value
-                .get("state")
-                .is_some_and(|state| state != "completed" && state != "completed-with-recovery")
-            {
-                1
-            } else {
-                0
-            }
-        }
-        Err(error) => {
-            eprintln!(
-                "tirith audit feedback: {}",
-                tirith_core::redact::redact_sanitize_redact(
-                    &error,
-                    &tirith_core::policy::captured_policy_dlp_patterns_or(&[])
-                )
+            let snapshot =
+                EffectivePolicySnapshot::resolve(cwd.as_deref(), ResolutionMode::Runtime);
+            let status = MutationService::current()?.apply(&id, &snapshot)?;
+            let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(
+                &tirith_core::policy::captured_policy_dlp_patterns_or(
+                    &snapshot.policy.dlp_custom_patterns,
+                ),
             );
-            1
-        }
-    }
+            super::profile::status_projection(&status, &compiled)
+        },
+        human_text,
+    )
 }

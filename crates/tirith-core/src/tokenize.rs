@@ -61,11 +61,49 @@ pub(crate) fn tokenize_bounded(
         max_word_bytes,
     };
     match shell {
-        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits),
+        ShellType::Posix => tokenize_posix(input, true, SingleQuoteStyle::Posix, limits, None),
         ShellType::Fish => tokenize_fish(input, limits),
         ShellType::PowerShell => tokenize_powershell(input, limits),
         ShellType::Cmd => tokenize_cmd(input, limits),
     }
+}
+
+/// Where POSIX text reads differently in different shells, as the tokenizer
+/// sees it outside single quotes and comments ([`posix_readings`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PosixReadings {
+    /// Byte offsets of each `'` that a backslash escapes inside a `$'...'`
+    /// string. bash, zsh and ksh read one ANSI-C string there, where a
+    /// backslash escapes the next character; dash reads a `$` and a plain
+    /// single-quoted string, which that `'` closes, so the two read the text
+    /// after it differently. In a backtick body this is the body as the
+    /// shells unescape it (`\\'` there is `\'`). With these quotes replaced
+    /// by a plain character, the tokenizer reads the text the way bash does.
+    pub ansi_c_escaped_quotes: Vec<usize>,
+    /// A run of two or more `$` before `{` or `(`, or a backslash-newline
+    /// between `$`, `<` or `>` and `(` (or `$` and `{`). The shells disagree
+    /// about where such a `${...}` or `$(...)` starts or ends.
+    pub dollars_differ: bool,
+}
+
+/// [`PosixReadings`] for `input`. The text is read the way bash reads its
+/// `$'...'` strings; up to the first `$'...'` that holds an escaped quote,
+/// dash reads it the same way.
+pub(crate) fn posix_readings(input: &str) -> PosixReadings {
+    let mut readings = PosixReadings::default();
+    let limits = TokenizeLimits {
+        max_segments: 0,
+        max_words_per_segment: 0,
+        max_word_bytes: 0,
+    };
+    tokenize_posix(
+        input,
+        true,
+        SingleQuoteStyle::Posix,
+        limits,
+        Some(&mut readings),
+    );
+    readings
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,11 +172,14 @@ enum SingleQuoteStyle {
     Fish,
 }
 
+/// With `readings` (POSIX only), `$'...'` strings are read the way bash reads
+/// them and the spots the shells read differently are noted there.
 fn tokenize_posix(
     input: &str,
     bash_function_names: bool,
     single_quote_style: SingleQuoteStyle,
     limits: TokenizeLimits,
+    mut readings: Option<&mut PosixReadings>,
 ) -> (Vec<Segment>, TokenizeBudget) {
     let mut segments = SegmentAccumulator::new(limits, false, single_quote_style);
     let mut current = String::new();
@@ -146,6 +187,12 @@ fn tokenize_posix(
     let mut search_cursor: usize = 0;
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
+    // Byte offset of each character, for `readings` only.
+    let byte_offsets: Vec<usize> = if readings.is_some() {
+        input.char_indices().map(|(offset, _)| offset).collect()
+    } else {
+        Vec::new()
+    };
     let mut i = 0;
     // A POSIX `#` begins a comment only at the start of a shell word. Keep
     // that lexical state explicitly: looking at the preceding source
@@ -161,9 +208,118 @@ fn tokenize_posix(
     // group. The distinction matters because parameter braces stay within the
     // current word while grouping braces start/end shell words.
     let mut brace_scopes: Vec<bool> = Vec::new();
+    // POSIX only (fish has neither `${...}` nor backticks): which scope is
+    // innermost decides what `#`, `(`, `)`, `{` and `}` are.
+    // `brace_paren_depth[n]` is `paren_depth` when `brace_scopes[n]` opened,
+    // so a `(` opened after a brace (still open) makes that paren the inner
+    // scope. `backtick` holds `paren_depth`, the brace count and whether the
+    // body sits in double quotes when a backtick body opened. The shells cut
+    // a backtick body out at its first unescaped backtick before they parse
+    // it, so nothing in the body (a quote included) runs past that backtick
+    // or closes a scope opened before it, and a scope it leaves open ends
+    // with it. Backticks do not change where segments split.
+    let posix = single_quote_style == SingleQuoteStyle::Posix;
+    let mut brace_paren_depth: Vec<usize> = Vec::new();
+    let mut backtick: Option<(usize, usize, bool)> = None;
+    // Reading double-quoted text. In POSIX double quotes a `$(` and a
+    // backtick open a body the shells read as code, with its own quotes
+    // (`"$(echo '"')"` is one word); the double-quoted text resumes after
+    // its closer. `double_quoted_parens` holds, for each `$(` opened in
+    // double quotes, `paren_depth` from before it opened.
+    let mut in_double = false;
+    let mut double_quoted_parens: Vec<usize> = Vec::new();
+    // The last unescaped character read at a token position, with the index
+    // just past it, and the run of unescaped `$` that ends with it. The
+    // shells remove a backslash-newline before they read tokens, so one in
+    // between leaves both in place (`$\` + newline + `(cmd)` is `$(cmd)`).
+    let mut previous: Option<(char, usize)> = None;
+    let mut dollar_run = 0usize;
 
     while i < len {
         let ch = chars[i];
+        let before = previous
+            .filter(|(_, end)| *end == i)
+            .map(|(previous, _)| previous);
+        let dollars_before = if before == Some('$') { dollar_run } else { 0 };
+        if posix {
+            if ch == '\\' && chars.get(i + 1) == Some(&'\n') {
+                if let Some((_, end)) = previous.as_mut().filter(|(_, end)| *end == i) {
+                    *end = i + 2;
+                }
+            } else {
+                dollar_run = if ch == '$' { dollars_before + 1 } else { 0 };
+                previous = Some((ch, i + 1));
+            }
+            // Outside single quotes and comments (their text never comes
+            // back to the top of this loop): a `$$` before `{` or `(`, or a
+            // `$`, `<` or `>` split from its `(` (or `$` from its `{`) by a
+            // backslash-newline.
+            if let Some(readings) = readings.as_deref_mut() {
+                let split = i >= 2 && chars[i - 1] == '\n' && chars[i - 2] == '\\';
+                readings.dollars_differ |= match (ch, before) {
+                    ('{' | '(', Some('$')) => dollars_before >= 2 || split,
+                    ('(', Some('<' | '>')) => split,
+                    _ => false,
+                };
+            }
+        }
+        if in_double {
+            match ch {
+                '"' => {
+                    in_double = false;
+                    current.push(ch);
+                    at_word_start = false;
+                    i += 1;
+                    continue;
+                }
+                '\\' if i + 1 < len => {
+                    current.push(chars[i]);
+                    current.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                // The closing backtick of the body this text sits in: the
+                // backtick arm below closes the body.
+                '`' if posix && backtick.is_some() => in_double = false,
+                '`' if posix => {
+                    in_double = false;
+                    backtick = Some((paren_depth, brace_scopes.len(), true));
+                    current.push(ch);
+                    at_word_start = true;
+                    i += 1;
+                    continue;
+                }
+                // `$(` after an odd run of `$` (`$$(` is the PID and a plain
+                // `(` in every shell).
+                '(' if posix && before == Some('$') && dollars_before % 2 == 1 => {
+                    in_double = false;
+                    double_quoted_parens.push(paren_depth);
+                    paren_depth = paren_depth.saturating_add(1);
+                    current.push(ch);
+                    at_word_start = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    current.push(ch);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        let parameter_innermost = posix
+            && posix_parameter_is_innermost(
+                paren_depth,
+                &brace_scopes,
+                &brace_paren_depth,
+                backtick.map(|(_, braces, _)| braces),
+            );
+        // Control operators split segments only at the top level. A backtick
+        // body opened in double quotes stays inside that one word, as it did
+        // when the double-quoted text was read in one piece.
+        let top_level = paren_depth == 0
+            && brace_scopes.is_empty()
+            && !backtick.is_some_and(|(_, _, double_quoted)| double_quoted);
 
         match ch {
             '\\' if i + 1 < len => {
@@ -175,11 +331,60 @@ fn tokenize_posix(
                 i += 2;
                 continue;
             }
-            // Single quotes: everything literal until the closing quote.
+            // Single quotes: everything literal until the closing quote. In a
+            // backtick body they also end at its first unescaped backtick
+            // (the shells cut the body out there before they read its
+            // quotes); `\\` and `` \` `` are escapes there.
             '\'' => {
                 current.push(ch);
                 i += 1;
+                let in_backtick = posix && backtick.is_some();
+                // With `readings`, a `'` after an odd run of `$` opens an
+                // ANSI-C string, where a backslash escapes the next character
+                // (`$'it\'s'` is one string). It also ends at the first
+                // unescaped backtick of a backtick body.
+                let ansi_c =
+                    posix && readings.is_some() && before == Some('$') && dollars_before % 2 == 1;
                 while i < len && chars[i] != '\'' {
+                    if ansi_c && chars[i] == '\\' && i + 1 < len {
+                        // The shells unescape a backtick body (`\\` to `\`)
+                        // before they read it, so there a run of `n`
+                        // backslashes leaves `n / 2` rounded up before a `'`,
+                        // and an even run leaves a backtick unescaped.
+                        let run = if in_backtick {
+                            chars[i..].iter().take_while(|ch| **ch == '\\').count()
+                        } else {
+                            1
+                        };
+                        let escaped = match chars.get(i + run) {
+                            Some('\'') => run.div_ceil(2) % 2 == 1,
+                            Some('`') if in_backtick => run % 2 == 1,
+                            Some(_) => !in_backtick,
+                            None => false,
+                        };
+                        let take = if escaped { run + 1 } else { run };
+                        if escaped && chars.get(i + run) == Some(&'\'') {
+                            if let Some((readings, offset)) =
+                                readings.as_deref_mut().zip(byte_offsets.get(i + run))
+                            {
+                                readings.ansi_c_escaped_quotes.push(*offset);
+                            }
+                        }
+                        current.extend(&chars[i..i + take]);
+                        i += take;
+                        continue;
+                    }
+                    if in_backtick {
+                        if chars[i] == '`' {
+                            break;
+                        }
+                        if chars[i] == '\\' && matches!(chars.get(i + 1), Some('\\' | '`')) {
+                            current.push(chars[i]);
+                            current.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                    }
                     if single_quote_style == SingleQuoteStyle::Fish
                         && chars[i] == '\\'
                         && i + 1 < len
@@ -196,41 +401,91 @@ fn tokenize_posix(
                     current.push(chars[i]);
                     i += 1;
                 }
-                if i < len {
+                if i < len && chars[i] == '\'' {
                     current.push(chars[i]);
                     i += 1;
                 }
                 at_word_start = false;
                 continue;
             }
-            // Double quotes: backslash escaping allowed inside.
+            // Double quotes: backslash escaping allowed inside. The text is
+            // read at the top of the loop (`in_double`).
             '"' => {
                 current.push(ch);
-                i += 1;
-                while i < len && chars[i] != '"' {
-                    if chars[i] == '\\' && i + 1 < len {
-                        current.push(chars[i]);
-                        current.push(chars[i + 1]);
-                        i += 2;
-                    } else {
-                        current.push(chars[i]);
-                        i += 1;
-                    }
-                }
-                if i < len {
-                    current.push(chars[i]);
-                    i += 1;
-                }
+                in_double = true;
                 at_word_start = false;
+                i += 1;
                 continue;
             }
             '#' if at_word_start => {
+                let scope = if posix {
+                    posix_hash_scope(parameter_innermost, backtick.is_some())
+                } else {
+                    HashScope::Comment
+                };
+                if scope == HashScope::Parameter {
+                    // Inside `${...}` a `#` is part of the parameter word
+                    // (`${x:- #}`), never a comment.
+                    current.push(ch);
+                    at_word_start = false;
+                    i += 1;
+                    continue;
+                }
                 // Comments are not argv and syntax inside them cannot affect
                 // delimiter depth. Leave the newline for the normal segment
                 // boundary arm so the following command is still analyzed.
+                // A comment in a backtick body also ends at the closing
+                // backtick, which the backtick arm then reads; an escaped
+                // backtick does not close the body.
                 while i < len && chars[i] != '\n' {
+                    if scope == HashScope::CommentToBacktick {
+                        if chars[i] == '`' {
+                            break;
+                        }
+                        if chars[i] == '\\' && i + 1 < len && chars[i + 1] != '\n' {
+                            i += 2;
+                            continue;
+                        }
+                    }
                     i += 1;
                 }
+                continue;
+            }
+            // A backtick opens a command substitution, or closes the open one
+            // (a nested backtick must be escaped, and the escape arm above
+            // keeps `\`` together). The body starts a command, so a `#` first
+            // in it is a comment. Closing the body drops every scope opened
+            // inside it, and resumes the double-quoted text it sat in.
+            '`' if posix => {
+                match backtick.take() {
+                    Some((parens, braces, double_quoted)) => {
+                        paren_depth = parens;
+                        brace_scopes.truncate(braces);
+                        brace_paren_depth.truncate(braces);
+                        while double_quoted_parens
+                            .last()
+                            .is_some_and(|depth| *depth >= parens)
+                        {
+                            double_quoted_parens.pop();
+                        }
+                        in_double = double_quoted;
+                        at_word_start = false;
+                    }
+                    None => {
+                        backtick = Some((paren_depth, brace_scopes.len(), false));
+                        at_word_start = true;
+                    }
+                }
+                current.push(ch);
+                i += 1;
+                continue;
+            }
+            // Inside `${...}` a `(` is a plain byte (`${x//(/_}`, `${x:-(}`)
+            // unless it opens a `$(`, `$((`, `<(` or `>(`.
+            '(' if parameter_innermost && !matches!(before, Some('$' | '<' | '>')) => {
+                current.push(ch);
+                at_word_start = false;
+                i += 1;
                 continue;
             }
             '(' => {
@@ -240,42 +495,69 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
-            ')' if paren_depth > 0 => {
+            // A `)` closes a paren only when a paren is the innermost scope:
+            // inside `${...}` it is a plain byte, and a backtick body cannot
+            // close a paren opened before it. Closing a `$(` opened in double
+            // quotes resumes the double-quoted text.
+            ')' if paren_depth > 0
+                && !parameter_innermost
+                && backtick.is_none_or(|(parens, _, _)| paren_depth > parens) =>
+            {
                 paren_depth -= 1;
+                if double_quoted_parens.last() == Some(&paren_depth) {
+                    double_quoted_parens.pop();
+                    in_double = true;
+                }
                 current.push(ch);
                 at_word_start = true;
                 i += 1;
                 continue;
             }
-            '{' if ends_with_unescaped_char(&current, '$', '\\')
-                || (posix_reserved_word_boundary_after(&chars, i)
-                    && ((!brace_scopes.is_empty() && at_word_start)
-                        || opens_posix_brace_scope(
-                            &current,
-                            paren_depth,
-                            bash_function_names,
-                            single_quote_style,
-                        ))) =>
+            '{' if (if posix {
+                posix_dollars_open_parameter(dollars_before, parameter_innermost)
+            } else {
+                ends_with_unescaped_char(&current, '$', '\\')
+            }) || (!parameter_innermost
+                && posix_reserved_word_boundary_after(&chars, i)
+                && ((!brace_scopes.is_empty() && at_word_start)
+                    || opens_posix_brace_scope(
+                        &current,
+                        paren_depth,
+                        bash_function_names,
+                        single_quote_style,
+                    ))) =>
             {
-                let embedded_in_word = ends_with_unescaped_char(&current, '$', '\\');
+                let embedded_in_word = if posix {
+                    posix_dollars_open_parameter(dollars_before, parameter_innermost)
+                } else {
+                    ends_with_unescaped_char(&current, '$', '\\')
+                };
                 brace_scopes.push(embedded_in_word);
+                brace_paren_depth.push(paren_depth);
                 current.push(ch);
                 at_word_start = !embedded_in_word;
                 i += 1;
                 continue;
             }
+            // A `}` closes `${...}` only when it is the innermost scope (a `}`
+            // inside `${x:-$(echo })}` is a word of the `$(...)`), and no
+            // brace scope opened before an open backtick body.
             '}' if brace_scopes.last().is_some_and(|embedded_in_word| {
-                *embedded_in_word
-                    || (at_word_start && posix_reserved_word_boundary_after(&chars, i))
-            }) =>
+                if *embedded_in_word {
+                    !posix || parameter_innermost
+                } else {
+                    at_word_start && posix_reserved_word_boundary_after(&chars, i)
+                }
+            }) && backtick.is_none_or(|(_, braces, _)| braces < brace_scopes.len()) =>
             {
                 let embedded_in_word = brace_scopes.pop().unwrap_or(false);
+                brace_paren_depth.pop();
                 current.push(ch);
                 at_word_start = !embedded_in_word;
                 i += 1;
                 continue;
             }
-            '|' if paren_depth == 0 && brace_scopes.is_empty() => {
+            '|' if top_level => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     push_posix_segment(
                         &mut segments,
@@ -318,11 +600,7 @@ fn tokenize_posix(
                     continue;
                 }
             }
-            '&' if paren_depth == 0
-                && brace_scopes.is_empty()
-                && i + 1 < len
-                && chars[i + 1] == '&' =>
-            {
+            '&' if top_level && i + 1 < len && chars[i + 1] == '&' => {
                 push_posix_segment(
                     &mut segments,
                     &current,
@@ -339,8 +617,7 @@ fn tokenize_posix(
             // POSIX/Fish single `&` terminates an asynchronous command. Keep
             // fd-duplication and combined-redirection forms (`2>&1`, `0<&1`,
             // `&>file`) inside the current segment.
-            '&' if paren_depth == 0
-                && brace_scopes.is_empty()
+            '&' if top_level
                 && !ends_with_unescaped_redirection(&current, '\\')
                 && !(i + 1 < len && chars[i + 1] == '>') =>
             {
@@ -357,7 +634,7 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
-            ';' if paren_depth == 0 && brace_scopes.is_empty() => {
+            ';' if top_level => {
                 push_posix_segment(
                     &mut segments,
                     &current,
@@ -371,7 +648,7 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
-            '\n' if paren_depth == 0 && brace_scopes.is_empty() => {
+            '\n' if top_level => {
                 push_posix_segment(
                     &mut segments,
                     &current,
@@ -407,6 +684,59 @@ fn tokenize_posix(
         &mut search_cursor,
     );
     segments.finish()
+}
+
+/// What a word-start `#` is in [`tokenize_posix`], by its innermost scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HashScope {
+    /// A comment to the end of the line: top level, a `(`/`$(` body or a
+    /// brace group.
+    Comment,
+    /// A comment in a backtick body: it ends at the end of the line or at
+    /// the closing backtick, whichever comes first (`` `echo a #x` ; cmd ``
+    /// runs `cmd`). The shells cut the body out at that backtick before they
+    /// parse it, so this holds in a `(...)` inside the body too.
+    CommentToBacktick,
+    /// Part of a `${...}` word: no comment (`${x:- #} ; cmd` runs `cmd`).
+    Parameter,
+}
+
+fn posix_hash_scope(parameter_innermost: bool, backtick_open: bool) -> HashScope {
+    if parameter_innermost {
+        HashScope::Parameter
+    } else if backtick_open {
+        HashScope::CommentToBacktick
+    } else {
+        HashScope::Comment
+    }
+}
+
+/// Whether an open `${...}` is the innermost scope of [`tokenize_posix`]: no
+/// paren opened after it, and no backtick body opened after it.
+/// `brace_paren_depth[n]` is the paren depth when `brace_scopes[n]` opened;
+/// `backtick_braces` is the brace count when the open backtick body started.
+fn posix_parameter_is_innermost(
+    paren_depth: usize,
+    brace_scopes: &[bool],
+    brace_paren_depth: &[usize],
+    backtick_braces: Option<usize>,
+) -> bool {
+    brace_scopes.last() == Some(&true)
+        && brace_paren_depth
+            .last()
+            .is_some_and(|parens| paren_depth <= *parens)
+        && backtick_braces.is_none_or(|braces| braces < brace_scopes.len())
+}
+
+/// Whether a `{` after `dollars` unescaped `$` opens a `${...}`. Outside
+/// `${...}`, bash, dash and ksh read `$$` as one parameter (the PID), so
+/// `$${x` is `$$` and a plain `{x`; an odd run ends in `${`. zsh reads `$${x`
+/// as `$` and `${x`, and inside `${...}` bash 3.2 and ksh do too, while bash
+/// 5 and dash do not, so inside `${...}` any run opens one. The exec gate
+/// fails closed on the even runs where the shells disagree
+/// (`extract::lexical_executable_substitutions_bounded`).
+fn posix_dollars_open_parameter(dollars: usize, parameter_innermost: bool) -> bool {
+    dollars > 0 && (parameter_innermost || dollars % 2 == 1)
 }
 
 /// Whether the current token really ends in a redirection operator.  Looking
@@ -557,7 +887,7 @@ fn looks_like_posix_function_header(raw: &str, bash_function_names: bool) -> boo
 fn tokenize_fish(input: &str, limits: TokenizeLimits) -> (Vec<Segment>, TokenizeBudget) {
     // Fish shares the control-operator grammar used by this bounded scanner,
     // but unlike POSIX it accepts `\'` and `\\` within single-quoted words.
-    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits)
+    tokenize_posix(input, false, SingleQuoteStyle::Fish, limits, None)
 }
 
 /// Distinguish PowerShell's unary call operator from its postfix background
@@ -1610,6 +1940,9 @@ fn push_segment_impl(
         segments.note_word_budget(budget);
         if words_truncated || word_bytes_truncated {
             (None, Vec::new())
+        } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Posix
+        {
+            posix_command_and_args(words)
         } else {
             // Skip leading `VAR=VALUE` assignments.
             let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
@@ -1638,6 +1971,69 @@ fn push_segment_impl(
         preceding_separator: preceding_sep,
         byte_range,
     });
+}
+
+/// The command word and arguments of a POSIX simple command, read the way the
+/// shell builds argv. The shell takes redirections out of a simple
+/// command wherever they stand: before the command word (`>/dev/null sh`),
+/// joined to a word (`sh>/dev/null`, `rm>/dev/null -rf /`) or between the
+/// command word and its operands (`sudo >/dev/null sh`). So an unquoted
+/// operator is split off the end of a word (a word made only of a redirection,
+/// such as `2>/dev/null`, stays whole, and `sh2>/dev/null` runs `sh2`), leading
+/// assignments and redirections (with the separate target of a bare operator)
+/// are skipped to find the command word, and every redirection is kept, in
+/// order, after the argv words. Rules that look for a redirection in the
+/// arguments still see it; rules that read argv by position see the shell's
+/// argv, as for a trailing redirection. Inside `[[ ... ]]` and `(( ... ))`
+/// `<` and `>` compare, so those words are left as they are.
+fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+    use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
+
+    let Some(first) = words.iter().position(|word| !is_env_assignment(word)) else {
+        // All words are assignments — no command.
+        return (None, Vec::new());
+    };
+    if words[first] == "[[" || words[first].starts_with("((") {
+        let args = words[first + 1..].to_vec();
+        return (Some(words[first].clone()), args);
+    }
+
+    let mut split = Vec::with_capacity(words.len());
+    for word in words {
+        if shell_redirection_token(&word).is_none() {
+            if let Some((prefix, _)) = shell_redirection_suffix(&word) {
+                let at = prefix.len();
+                split.push(word[..at].to_owned());
+                split.push(word[at..].to_owned());
+                continue;
+            }
+        }
+        split.push(word);
+    }
+
+    let mut command = None;
+    let mut args = Vec::new();
+    let mut redirections = Vec::new();
+    let mut words = split.into_iter();
+    while let Some(word) = words.next() {
+        if let Some(target_is_separate) = shell_redirection_token(&word) {
+            redirections.push(word);
+            if target_is_separate {
+                redirections.extend(words.next());
+            }
+            continue;
+        }
+        if command.is_some() {
+            args.push(word);
+        } else if !is_env_assignment(&word) {
+            command = Some(word);
+        }
+    }
+    if command.is_none() {
+        return (None, Vec::new());
+    }
+    args.extend(redirections);
+    (command, args)
 }
 
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
@@ -1673,15 +2069,33 @@ pub(crate) fn leading_env_assignments_bounded(
     max_words: usize,
     max_word_bytes: usize,
 ) -> (Vec<(String, String)>, bool, bool) {
+    use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
+
     let mut assignments = Vec::new();
     let (words, words_truncated, word_bytes_truncated) =
         split_words_bounded(segment_raw.trim(), max_words, max_word_bytes);
-    for word in words {
-        if !is_env_assignment(&word) {
+    // Redirections may stand among the prefix assignments
+    // (`>/dev/null FOO=1 cmd`); they are not assignments and do not end them.
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        if let Some(target_is_separate) = shell_redirection_token(&word) {
+            if target_is_separate {
+                words.next();
+            }
+            continue;
+        }
+        let (word, suffix) = match shell_redirection_suffix(&word) {
+            Some((prefix, target_is_separate)) => (prefix, Some(target_is_separate)),
+            None => (word.as_str(), None),
+        };
+        if !is_env_assignment(word) {
             break;
         }
         if let Some((name, value)) = word.split_once('=') {
             assignments.push((name.to_string(), value.to_string()));
+        }
+        if suffix == Some(true) {
+            words.next();
         }
     }
     (assignments, words_truncated, word_bytes_truncated)
@@ -2528,6 +2942,338 @@ mod tests {
         }
     }
 
+    /// A `#` inside `${...}` is part of the parameter word, and a comment in
+    /// a backtick body ends at the closing backtick. Reading either as a
+    /// comment to the end of the line hid every command after it (bash,
+    /// dash, zsh and ksh run `sink` in each input below).
+    #[test]
+    fn hash_in_parameter_or_backtick_body_hides_no_later_command() {
+        let parameter = [
+            "echo ${x:- #} ; printf ready | sink",
+            "echo ${x:- #}\nprintf ready | sink",
+            "echo ${x:- #}\n\nprintf ready | sink",
+            "echo ${x:- #} && printf ready | sink",
+            "echo ${x:- #'}'} ; printf ready | sink",
+            "echo ${x:-${y:- #}} ; printf ready | sink",
+            // A comment in a `$(...)` inside `${...}` is still a comment.
+            "echo ${x:-$(true # it's\n)} ; printf ready | sink",
+        ];
+        for input in parameter {
+            let segs = tokenize(input, ShellType::Posix);
+            let commands: Vec<_> = segs.iter().map(|seg| seg.command.as_deref()).collect();
+            assert!(
+                commands.ends_with(&[Some("printf"), Some("sink")]),
+                "{input:?} -> {segs:?}"
+            );
+            assert_eq!(segs[0].command.as_deref(), Some("echo"), "{input:?}");
+        }
+        for input in &parameter[..6] {
+            assert_byte_ranges_match_raw(input, &tokenize(input, ShellType::Posix));
+        }
+        for input in [
+            "echo `echo a #x` ; printf ready | sink",
+            "x=`echo a #x` ; printf ready | sink",
+            "echo ${x:-`echo #it's`} ; printf ready | sink",
+            "echo `echo a #x \\` y` ; printf ready | sink",
+            "x=`echo a\necho b #x` ; printf ready | sink",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            let commands: Vec<_> = segs.iter().map(|seg| seg.command.as_deref()).collect();
+            assert!(
+                commands.ends_with(&[Some("printf"), Some("sink")]),
+                "{input:?} -> {segs:?}"
+            );
+        }
+
+        // Comments that stay comments: at the top level, in a backtick body
+        // up to its closing backtick, in a `$(...)` to the end of the line
+        // (a backtick there is comment text), and in a `$(...)` inside
+        // `${...}`.
+        for input in [
+            "echo hi # ${x:- ; printf ready | sink",
+            "echo `echo a # printf ready | sink`",
+            "echo $(echo a # ` ; printf ready | sink\n)",
+            "echo ${x:-$(true # } ; printf ready | sink\n)}",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert!(
+                !segs
+                    .iter()
+                    .any(|seg| seg.command.as_deref() == Some("sink")),
+                "{input:?} -> {segs:?}"
+            );
+        }
+
+        // Fish has neither `${...}` nor backtick substitutions: unchanged.
+        for input in ["echo ${x:- #} ; sink", "echo `a #b` ; sink"] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+        }
+    }
+
+    /// Only the innermost scope closes: inside `${...}` a `(`, `)` or `{` is
+    /// a plain byte, a `}` in a `$(...)` or backtick body does not close the
+    /// `${...}` around it, and a backtick body cannot leave a scope open. A
+    /// `{` opens `${...}` after an odd run of `$` outside `${...}` (`$$` is
+    /// one parameter), backslash-newlines removed. A `#` first in a backtick
+    /// body is a comment that ends at the closing backtick. Each misreading
+    /// hid every later command; bash or dash (most also zsh or ksh) run
+    /// `sink` in every input below.
+    #[test]
+    fn scopes_close_innermost_first_and_hide_no_later_command() {
+        let runs_sink = |input: &str| {
+            tokenize(input, ShellType::Posix)
+                .iter()
+                .map(|seg| seg.command.as_deref())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == [Some("printf"), Some("sink")])
+        };
+        let plain_bytes = [
+            "echo ${x:-(}\necho }\nprintf ready | sink",
+            "echo ${x:- #(} && printf ready | sink",
+            "echo ${x:- #(} ; printf ready | sink",
+            "echo ${x//(/_}\nprintf ready | sink",
+            "echo ${x:-${y:-(}}\nprintf ready | sink",
+            "echo ${x:- { } ; printf ready | sink",
+            "echo ${x:-$(echo }) #} ; printf ready | sink",
+        ];
+        let mut missed: Vec<_> = plain_bytes
+            .into_iter()
+            .filter(|input| !runs_sink(input))
+            .collect();
+        for input in [
+            "echo ${x:- #(}\necho }\nprintf ready | sink",
+            "echo ${x:- #(}\n: } ; printf ready | sink",
+            "echo ${x:- #((}\necho }\nprintf ready | sink",
+            "echo ${x:-`true #`(}\necho }\nprintf ready | sink",
+            "echo ${x:-`echo }` #} ; printf ready | sink",
+            "echo `echo ${x:-`\nprintf ready | sink",
+            "echo ${x:-`echo (`}\nprintf ready | sink",
+            "echo `echo (`\nprintf ready | sink",
+            // `(` still opens `$(`, `$((`, `<(` and `>(` inside `${...}`.
+            "echo ${x:-$(echo a)} ; printf ready | sink",
+            "echo ${x:-$((1+2))} ; printf ready | sink",
+            "echo ${x:-<(true)} ; printf ready | sink",
+            "echo ${x:-a(b)c} ; printf ready | sink",
+            // `$$` and then a plain `{`.
+            "echo $${x # it's\necho a}b\nprintf ready | sink\n# '}",
+            "x=$${ #it's\necho }\nprintf ready | sink\n#'}",
+            "echo $$$${x # it's\necho a}b\nprintf ready | sink\n# '}",
+            "x=$${ #(\n: } && printf ready | sink",
+            "echo $${x ; printf ready | sink",
+            "echo $${x\nprintf ready | sink",
+            "echo $\\\n$\\\n{x # it's\necho a}b\nprintf ready | sink\n# '}",
+            // An odd run, an escaped `$`, or a backslash-newline: `${`.
+            "echo $$${x:- #} ; printf ready | sink",
+            "echo \\$${x:- #} ; printf ready | sink",
+            "echo $\\\n{x:- #} ; printf ready | sink",
+            // A `#` first in a backtick body.
+            "echo `#it's` ; printf ready | sink",
+            "x=`#it's`; printf ready | sink",
+            "x=`#it's` ; printf ready | sink",
+            "echo `#it's` && printf ready | sink",
+            "echo `#'` ; printf ready | sink",
+            "echo ${x:-`#it's`} ; printf ready | sink",
+            "echo `#it's`\nprintf ready | sink",
+            "x=`(echo a #x` ; printf ready | sink",
+        ] {
+            if !runs_sink(input) {
+                missed.push(input);
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        for input in plain_bytes {
+            assert_byte_ranges_match_raw(input, &tokenize(input, ShellType::Posix));
+        }
+
+        // Comments that stay comments.
+        for input in [
+            "echo `#printf ready | sink`",
+            "echo $${x} # ; printf ready | sink",
+            "echo ${x:-(} # ; printf ready | sink",
+            "echo `echo ${x:-` # ; printf ready | sink",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert!(
+                !segs
+                    .iter()
+                    .any(|seg| seg.command.as_deref() == Some("sink")),
+                "{input:?} -> {segs:?}"
+            );
+        }
+
+        // Fish keeps counting every `(` and `$`-brace.
+        for input in ["echo ${x:-(} ; sink", "echo $${x ; sink"] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+        }
+    }
+
+    /// The shells cut a backtick body out at its first unescaped backtick
+    /// before they read the quotes in it, so a quote in the body never runs
+    /// past that backtick (`` echo `echo it's` `` ends there). In double
+    /// quotes a `$(...)` or backtick body is read as code with its own
+    /// quotes (`"$(echo '"')"` is one word) and the double-quoted text
+    /// resumes after it. Reading such a quote as running on hid every later
+    /// command, and once a backtick body was isolated (closing it restores
+    /// the paren and brace scopes) it also kept a later `)` or `}` from
+    /// closing. bash and ksh (most also dash and zsh) run `sink` in every
+    /// input below.
+    #[test]
+    fn quotes_end_at_the_backtick_and_double_quoted_bodies_are_code() {
+        let runs_sink = |input: &str| {
+            tokenize(input, ShellType::Posix)
+                .iter()
+                .map(|seg| seg.command.as_deref())
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == [Some("printf"), Some("sink")])
+        };
+        let inputs = [
+            "echo `echo it's`\nprintf ready | sink",
+            "x=`printf it's`\nprintf ready | sink",
+            "echo `echo say \"hi`\nprintf ready | sink",
+            "echo `echo it's` ; printf ready | sink",
+            "echo `echo it's` `echo it's`\nprintf ready | sink",
+            "echo `echo 'a\\\\`\nprintf ready | sink",
+            "(\n  echo `echo it's`\n  # it's\n)\nprintf ready | sink",
+            "{\n  echo `echo it's`\n  # it's\n}\nprintf ready | sink",
+            "x=$(\n  echo `echo it's`\n  # it's\n)\nprintf ready | sink",
+            "f() {\n  echo `echo it's`\n  # it's\n}\nprintf ready | sink",
+            "(\n  echo `echo say \"hi`\n  # \"\n)\nprintf ready | sink",
+            "echo `echo it's`\n# it's\n# run `npm i` then 'x\nprintf ready | sink",
+            // A backtick body in double quotes.
+            "echo \"`echo \"`\"\nprintf ready | sink",
+            "x=\"`printf \"`\"\nprintf ready | sink",
+            "(\n  echo \"`echo \"`\"\n)\nprintf ready | sink",
+            "( echo \"`echo \"`\" )\nprintf ready | sink",
+            "echo \"`#it's`\"\nprintf ready | sink",
+            // A `$(...)` in double quotes.
+            "echo \"$(echo '\"')\"\nprintf ready | sink",
+            "echo \"$(echo '\"')\" ; printf ready | sink",
+            "x=\"$(printf '\"')\"\nprintf ready | sink",
+            "echo \"$(echo a # \"\n)\"\nprintf ready | sink",
+            "echo \"${x:-$(echo \")\")}\"\nprintf ready | sink",
+            "echo \"$$$(echo ')')\"\nprintf ready | sink",
+            "echo \"$(echo \"$(echo ')')\")\"\nprintf ready | sink",
+            "echo \"$(echo `echo '\"'`)\"\nprintf ready | sink",
+        ];
+        let missed: Vec<_> = inputs
+            .into_iter()
+            .filter(|input| !runs_sink(input))
+            .collect();
+        assert!(missed.is_empty(), "{missed:#?}");
+        // A comment skipped inside a scope leaves the segment's raw text
+        // shorter than the input, as before; the rest map back exactly.
+        for input in inputs.into_iter().filter(|input| !input.contains('#')) {
+            assert_byte_ranges_match_raw(input, &tokenize(input, ShellType::Posix));
+        }
+
+        // Text that stays quoted, or a comment.
+        for input in [
+            // `$$(` is the PID and a plain `(` in every shell.
+            "echo \"$$(printf ready | sink)\"",
+            "echo \"$(echo ')')\" # printf ready | sink",
+            "echo `echo 'a\\`b'` # ; printf ready | sink",
+            "echo \"`echo \"`\" # printf ready | sink",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert!(
+                !segs
+                    .iter()
+                    .any(|seg| seg.command.as_deref() == Some("sink")),
+                "{input:?} -> {segs:?}"
+            );
+        }
+
+        // A body in double quotes splits no segment, as before.
+        for input in [
+            "echo \"`printf ready | sink`\"",
+            "echo \"$(printf ready | sink)\"",
+        ] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+        }
+
+        // Fish reads double and single quotes as before.
+        for input in ["echo \"$(echo '\"')\"\nsink", "echo `echo it's`\nsink"] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+        }
+    }
+
+    /// `posix_readings` notes only the spots the shells read differently:
+    /// a `$'...'` string holding a `\'` (in a backtick body, as the shells
+    /// unescape it), and a `$$` before `{`/`(` or a split `$(`, outside
+    /// single quotes and comments. `$'\n'` reads the same in bash and dash.
+    #[test]
+    fn posix_readings_note_only_text_the_shells_read_differently() {
+        let readings = posix_readings;
+        // The offset of each escaped quote.
+        for (input, quotes) in [
+            ("echo $'a\\'' ; sink # '", vec![9]),
+            ("echo $'it\\'s'", vec![10]),
+            ("echo $'a\\'b\\'c'", vec![9, 12]),
+            ("echo $'a\\\\\\'b'", vec![11]),
+            ("x=$(printf $'it\\'s'); sink", vec![16]),
+            ("x=\"$(printf $'it\\'s')\"; sink", vec![17]),
+            ("echo ${x:-$'a\\''} ; sink # '", vec![14]),
+            ("é=1; echo $'a\\''", vec![15]),
+            // A backtick body as the shells unescape it: `\\'` is `\'`.
+            ("x=`printf $'it\\'s'`", vec![15]),
+            ("x=`printf $'it\\\\'s'`", vec![16]),
+            ("echo \"`echo $'a\\\\''`\"", vec![17]),
+        ] {
+            let found = readings(input);
+            assert_eq!(found.ansi_c_escaped_quotes, quotes, "{input:?}");
+            assert!(!found.dollars_differ, "{input:?}");
+            for offset in quotes {
+                assert_eq!(input.as_bytes()[offset], b'\'', "{input:?}");
+            }
+        }
+        // Read the same way by every shell.
+        for input in [
+            "IFS=$'\\n\\t'",
+            "printf $'done\\t%s\\n' ok",
+            "sep=$'\\\\'",
+            "echo $''",
+            "echo $$'a\\'' # $$ is the PID, then a plain quote",
+            "echo 'cost: $'\\''5'",
+            "echo \"$'a\\'\"",
+            "# Makefile uses $${HOME}",
+            "echo 'pid $$(x) $${y}'",
+            "echo \\$${HOME:-x} \\$$(x)",
+            "echo $$ $( x ) ${y}",
+            "echo `echo it's` # $${x}",
+            // `\\\'` in a backtick body is `\\'`: a closing quote.
+            "x=`printf $'it\\\\\\'s'`",
+            "x=`printf $'a\\`b'`",
+        ] {
+            assert_eq!(
+                readings(input),
+                PosixReadings::default(),
+                "{input:?} reads the same in every shell"
+            );
+        }
+        for input in [
+            "echo $${HOME}",
+            "echo $$(x)",
+            "echo \"$$(x)\"",
+            "echo ${x:-$${y}}",
+            "echo $\\\n(sink)",
+            "echo $\\\n{x}",
+            "cat <\\\n(sink)",
+        ] {
+            let found = readings(input);
+            assert!(found.dollars_differ, "{input:?}");
+            assert!(found.ansi_c_escaped_quotes.is_empty(), "{input:?}");
+        }
+        // The tokenizer itself still reads `$'...'` the dash way.
+        let segs = tokenize("echo $'a\\'' ; sink # '", ShellType::Posix);
+        assert_eq!(segs.len(), 1, "{segs:?}");
+    }
+
     #[test]
     fn line_comments_cannot_emit_commands_or_corrupt_nesting() {
         for shell in [ShellType::Posix, ShellType::Fish] {
@@ -2944,5 +3690,100 @@ mod tests {
         assert_byte_ranges_match_raw(input, &segs);
         assert_eq!(segs[0].byte_range, 0..2); // "ls"
         assert_eq!(segs[1].byte_range, 6..15); // "echo done"
+    }
+
+    /// The shell takes redirections out of argv wherever they stand, so the
+    /// command word and the argv positions are read past them: before the
+    /// command word, joined to a word, or between the command word and its
+    /// operands. Redirections stay in the arguments, after the argv words.
+    #[test]
+    fn redirections_are_never_the_command_word_and_follow_the_argv() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("sh>/dev/null", "sh", &[">/dev/null"]),
+            ("bash&>/dev/null", "bash", &["&>/dev/null"]),
+            ("sh>&2", "sh", &[">&2"]),
+            ("sh<&0", "sh", &["<&0"]),
+            ("sh&>>log", "sh", &["&>>log"]),
+            ("sh<>f", "sh", &["<>f"]),
+            ("/bin/sh>/dev/null", "/bin/sh", &[">/dev/null"]),
+            ("python3>/dev/null -", "python3", &["-", ">/dev/null"]),
+            (">/dev/null sh", "sh", &[">/dev/null"]),
+            ("2>/dev/null sh", "sh", &["2>/dev/null"]),
+            ("> /dev/null sh -s", "sh", &["-s", ">", "/dev/null"]),
+            ("2> /dev/null bash", "bash", &["2>", "/dev/null"]),
+            (">/dev/null FOO=1 sh", "sh", &[">/dev/null"]),
+            ("FOO=1 >/dev/null sh", "sh", &[">/dev/null"]),
+            (
+                "</dev/null >/dev/null sh",
+                "sh",
+                &["</dev/null", ">/dev/null"],
+            ),
+            ("sudo >/dev/null sh", "sudo", &["sh", ">/dev/null"]),
+            ("sudo sh&>/dev/null", "sudo", &["sh", "&>/dev/null"]),
+            ("env >/dev/null sh", "env", &["sh", ">/dev/null"]),
+            ("rm>/dev/null -rf /", "rm", &["-rf", "/", ">/dev/null"]),
+            (">/dev/null rm -rf /", "rm", &["-rf", "/", ">/dev/null"]),
+            ("sh >/dev/null -c 'x'", "sh", &["-c", "'x'", ">/dev/null"]),
+            ("cp a >/dev/null .env", "cp", &["a", ".env", ">/dev/null"]),
+            (
+                "echo 2>&1 >/dev/null x",
+                "echo",
+                &["x", "2>&1", ">/dev/null"],
+            ),
+            ("sh 2>/dev/null", "sh", &["2>/dev/null"]),
+            ("cat<<EOF", "cat", &["<<EOF"]),
+            // `sh2>/dev/null` runs `sh2`: digits joined to a word are not a
+            // descriptor number.
+            ("sh2>/dev/null", "sh2", &[">/dev/null"]),
+            ("a2>b", "a2", &[">b"]),
+        ];
+        for (input, command, args) in cases {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+            assert_eq!(segs[0].raw, *input);
+        }
+        // Only redirections and assignments: no command word.
+        for input in [">/dev/null", "2> /dev/null", "FOO=1 >/dev/null"] {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs[0].command, None, "{input:?}");
+            assert!(segs[0].args.is_empty(), "{input:?}");
+        }
+        // Quoted or escaped operators, process substitutions, operators inside
+        // expansions and `[[ ]]` comparisons are words, unchanged.
+        let words: &[(&str, &str, &[&str])] = &[
+            ("'sh>/dev/null'", "'sh>/dev/null'", &[]),
+            ("sh'>'/dev/null", "sh'>'/dev/null", &[]),
+            ("sh\\>/dev/null", "sh\\>/dev/null", &[]),
+            ("tee >(sh)", "tee", &[">(sh)"]),
+            ("echo ${x:->y}", "echo", &["${x:->y}"]),
+            ("echo $((1>2))", "echo", &["$((1>2))"]),
+            ("[[ a > b ]]", "[[", &["a", ">", "b", "]]"]),
+        ];
+        for (input, command, args) in words {
+            let segs = tokenize(input, ShellType::Posix);
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+        }
+        // Fish keeps its word reading.
+        let fish = tokenize("sh>/dev/null", ShellType::Fish);
+        assert_eq!(fish[0].command.as_deref(), Some("sh>/dev/null"));
+    }
+
+    #[test]
+    fn leading_assignments_are_read_past_redirections() {
+        assert_eq!(
+            leading_env_assignments(">/dev/null FOO=1 2> err BAR=2 cmd"),
+            vec![
+                ("FOO".to_string(), "1".to_string()),
+                ("BAR".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(
+            leading_env_assignments("PYTHONINSPECT=1>/dev/null python3"),
+            vec![("PYTHONINSPECT".to_string(), "1".to_string())]
+        );
+        assert!(leading_env_assignments("'>x' FOO=1 cmd").is_empty());
     }
 }

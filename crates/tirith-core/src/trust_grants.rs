@@ -387,6 +387,18 @@ impl TrustGrantStore {
         Ok(())
     }
 
+    /// True when any raw record (valid or not) is declared project-scoped.
+    /// Only such records can depend on the current checkout identity.
+    pub fn has_project_records(&self) -> bool {
+        self.grants.iter().any(|value| {
+            value
+                .get("scope")
+                .and_then(|scope| scope.get("kind"))
+                .and_then(Value::as_str)
+                == Some("project")
+        })
+    }
+
     pub fn applicable(
         &self,
         project: Option<&ProjectIdentity>,
@@ -562,5 +574,59 @@ mod tests {
             broad.status(None, Some(&policy), Utc::now()).state,
             GrantState::Overridden
         );
+    }
+
+    #[test]
+    fn checkout_identity_is_captured_only_when_the_store_has_project_records() {
+        use crate::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let cwd = state.roots().cwd.clone();
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let resolve = || EffectivePolicySnapshot::resolve(cwd.to_str(), ResolutionMode::Runtime);
+        let observed = |snapshot: &EffectivePolicySnapshot| {
+            snapshot
+                .input_revisions
+                .iter()
+                .any(|input| input.source.kind == "project_identity")
+        };
+        assert!(!observed(&resolve()), "no grant store: nothing to bind");
+        let config = crate::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let write = |store: &TrustGrantStore| {
+            std::fs::write(config.join(STORE_FILE), serde_json::to_vec(store).unwrap()).unwrap()
+        };
+        let mut store = TrustGrantStore::default();
+        write(&store);
+        assert!(!observed(&resolve()), "empty grant store");
+        let user = grant();
+        store.insert(&user).unwrap();
+        write(&store);
+        let snapshot = resolve();
+        assert!(!observed(&snapshot), "user grants never need the checkout");
+        assert!(snapshot
+            .policy
+            .is_allowlisted_for_rule("pipe_to_interpreter", &user.pattern));
+
+        let project = TrustGrant {
+            pattern: "https://mirror.example/project.sh".into(),
+            scope: GrantScope::Project {
+                project: ProjectIdentity::capture(cwd.to_str()).unwrap(),
+            },
+            ..grant()
+        };
+        store.insert(&project).unwrap();
+        write(&store);
+        let snapshot = resolve();
+        assert!(observed(&snapshot), "a project grant binds the checkout");
+        assert!(snapshot
+            .policy
+            .is_allowlisted_for_rule("pipe_to_interpreter", &project.pattern));
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(elsewhere.path().join(".git")).unwrap();
+        let outside =
+            EffectivePolicySnapshot::resolve(elsewhere.path().to_str(), ResolutionMode::Runtime);
+        assert!(!outside
+            .policy
+            .is_allowlisted_for_rule("pipe_to_interpreter", &project.pattern));
     }
 }

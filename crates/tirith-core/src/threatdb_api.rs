@@ -532,6 +532,10 @@ fn enrich_command_with_cache(
         return Vec::new();
     }
 
+    // Issue #264: `N=npm; "$N" install pkg` is enriched exactly like the literal
+    // `npm install pkg` it is proven to run.
+    let literal_view = crate::extract::posix_variable_command_literal_view(input, shell);
+    let input = literal_view.as_deref().unwrap_or(input);
     let segments = crate::tokenize::tokenize(input, shell);
     // `extract_packages_detail_for_shell`, not the bare variant: the detail form
     // exists precisely so a consumer whose output is a security decision can see
@@ -1945,6 +1949,8 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
             context,
@@ -2389,6 +2395,7 @@ mod tests {
 
     #[test]
     fn enrich_command_returns_empty_when_all_apis_disabled() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = ThreatIntelConfig {
             osv_enabled: false,
             deps_dev_enabled: false,
@@ -2616,6 +2623,57 @@ mod tests {
                     .description
                     .contains("offline mode forbids DNS and HTTP")
         }));
+    }
+
+    /// Issue #264: a package manager named through a proven literal variable is
+    /// enriched exactly like the literal command, so indirection cannot skip
+    /// runtime package intelligence.
+    #[test]
+    fn variable_named_package_manager_is_enriched_like_the_literal() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            ..ThreatIntelConfig::default()
+        };
+        let enrich = |input: &str| {
+            enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        for (literal, indirect) in [
+            (
+                "P=pip; pip install tirith-offline-command-fixture==9.9.9",
+                r#"P=pip; "$P" install tirith-offline-command-fixture==9.9.9"#,
+            ),
+            (
+                "N=npm; npm install tirith-offline-npm-fixture@9.9.9",
+                r#"N=npm; "${N}" install tirith-offline-npm-fixture@9.9.9"#,
+            ),
+        ] {
+            let literal_findings = enrich(literal);
+            assert!(
+                literal_findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "{literal}: {literal_findings:?}"
+            );
+            let describe = |findings: &[Finding]| {
+                findings
+                    .iter()
+                    .map(|finding| (finding.rule_id, finding.description.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                describe(&enrich(indirect)),
+                describe(&literal_findings),
+                "{indirect}"
+            );
+        }
     }
 
     /// Runtime enrichment has three independent caps and every one of them used

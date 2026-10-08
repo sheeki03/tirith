@@ -116,6 +116,8 @@ unset _tirith_inherited_state
 # shell or terminal multiplexer must not join independent receipt ledgers.
 # The double-source guard above preserves this ID in the same live shell;
 # ordinary child commands still inherit it for that shell's correlation.
+# This shell-built value is the fallback; once the executable is pinned below,
+# `tirith __session-id` replaces its random part with an unpredictable one.
 builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
   "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
 export TIRITH_SESSION_ID
@@ -154,6 +156,14 @@ if [[ $- == *i* && ( -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ) ]]; then
   TIRITH_STATUS=off
   _tirith_restore_init_allexport
   return
+fi
+if [[ -n "$_TIRITH_BIN" && -x "$_TIRITH_BIN" ]]; then
+  _tirith_session_suffix="$(builtin command "$_TIRITH_BIN" __session-id 2>/dev/null)" \
+    || _tirith_session_suffix=""
+  if [[ ${#_tirith_session_suffix} -eq 36 && "$_tirith_session_suffix" != *[^0-9a-f-]* ]]; then
+    builtin printf -v TIRITH_SESSION_ID '%x-%s' "$$" "$_tirith_session_suffix"
+  fi
+  unset _tirith_session_suffix
 fi
 
 # Stock macOS Bash 3.2 runs an external command inside `$(...)` from a subshell.
@@ -438,58 +448,29 @@ _tirith_escape_preview() {
 # Restore an entry status without touching any secret-bearing argument.
 _tirith_trace_preserve_status() { return "$1"; }
 
-# Receipt retirement is separate from authorization. Call only after observing
-# successful consume/discard/reconcile; old binaries may not implement it.
-_tirith_receipt_acknowledge_untraced() {
-  local channel="$1" token="$2" input_fd
-  builtin export -n token
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0
-  _tirith_receipt_parent_context_is_valid || return 0
-  _tirith_open_exact_input_pipe "$token" || return 0
-  input_fd="$_TIRITH_OPENED_FD"
-  unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt acknowledge \
-    --channel "$channel" <&"$input_fd" >/dev/null 2>&1 || true
-  _tirith_close_pending_fd "$input_fd" 2>/dev/null || true
-  return 0
-}
-
-_tirith_receipt_discard_untraced() {
-  local channel="$1" token="$2"
-  builtin export -n token
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0
-  _tirith_receipt_parent_context_is_valid || return 1
-  local input_fd rc
-  _tirith_open_exact_input_pipe "$token" || return 1
-  input_fd="$_TIRITH_OPENED_FD"
-  unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt discard \
-    --channel "$channel" <&"$input_fd" >/dev/null 2>&1
-  rc=$?
-  _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
-  if [[ $rc -eq 0 ]]; then
-    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
-  fi
-  return "$rc"
-}
-
-_tirith_receipt_discard() {
-  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+# Every hook entry point that can handle a secret runs its body untraced:
+#   name() {
+#     local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+#     _tirith_untraced_begin
+#     _tirith_untraced_run name_untraced "$@"
+#   }
+# The two helpers read and set those caller locals (Bash scoping is dynamic).
+# _tirith_untraced_begin takes no arguments, so xtrace is already off before
+# any argument is expanded on a traced line. _tirith_untraced_run hands the
+# body the caller's entry status, then restores xtrace and allexport.
+_tirith_untraced_begin() {
   if [[ $- == *x* ]]; then
     builtin set +x
     _tirith_trace_was_on=1
   fi
   if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
+}
+
+_tirith_untraced_run() {
   if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_receipt_discard_untraced "$@"
+    "$@"
   else
-    _tirith_receipt_discard_untraced "$@"
+    "$@"
   fi
   _tirith_result=$?
   [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
@@ -497,84 +478,51 @@ _tirith_receipt_discard() {
   return "$_tirith_result"
 }
 
-_tirith_receipt_consume_untraced() {
-  local channel="$1" token="$2" command_text="$3"
+# One protocol-v3 receipt operation (consume, discard or reconcile):
+#   _tirith_receipt_call <action> <channel> <token> [<exact command>]
+# The token, and consume's exact command, travel on an exact stdin pipe and
+# never in argv or the environment. A successful operation also retires the
+# receipt inside the same Tirith call, so no separate acknowledgement runs.
+_tirith_receipt_call_untraced() {
+  local action="$1" channel="$2" token="$3" command_text="${4:-}"
   builtin export -n token command_text
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" && -n "$command_text" ]] || return 1
+  case "$action" in
+    discard) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0 ;;
+    reconcile) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 1 ;;
+    consume) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" && -n "$command_text" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
   _tirith_receipt_parent_context_is_valid || return 1
   local input_fd rc
-  _tirith_open_exact_input_pipe "$token"$'\n'"$command_text" || return 1
+  if [[ "$action" == consume ]]; then
+    _tirith_open_exact_input_pipe "$token"$'\n'"$command_text" || return 1
+  else
+    _tirith_open_exact_input_pipe "$token" || return 1
+  fi
   input_fd="$_TIRITH_OPENED_FD"
   unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt consume \
-    --channel "$channel" <&"$input_fd" >/dev/null
+  if [[ "$action" == consume ]]; then
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+      _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+      _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt consume \
+      --channel "$channel" <&"$input_fd" >/dev/null
+  else
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+      _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+      _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt "$action" \
+      --channel "$channel" <&"$input_fd" >/dev/null 2>&1
+  fi
   rc=$?
   _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
-  if [[ $rc -eq 0 ]]; then
-    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
-  fi
   return "$rc"
 }
 
-_tirith_receipt_consume() {
+_tirith_receipt_call() {
   local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_receipt_consume_untraced "$@"
-  else
-    _tirith_receipt_consume_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
-}
-
-_tirith_receipt_reconcile_untraced() {
-  local channel="$1" token="$2"
-  builtin export -n token
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 1
-  _tirith_receipt_parent_context_is_valid || return 1
-  local input_fd rc
-  _tirith_open_exact_input_pipe "$token" || return 1
-  input_fd="$_TIRITH_OPENED_FD"
-  unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt reconcile \
-    --channel "$channel" <&"$input_fd" >/dev/null 2>&1
-  rc=$?
-  _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
-  if [[ $rc -eq 0 ]]; then
-    _tirith_receipt_acknowledge_untraced "$channel" "$token" || true
-  fi
-  return "$rc"
-}
-
-_tirith_receipt_reconcile() {
-  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_receipt_reconcile_untraced "$@"
-  else
-    _tirith_receipt_reconcile_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_receipt_call_untraced "$@"
 }
 
 
@@ -1465,32 +1413,20 @@ _tirith_preexec_receipt_check_untraced() {
     0) ;;
     1) return 1 ;;
     *)
-      _tirith_receipt_discard bash-preexec "$token"
+      _tirith_receipt_call discard bash-preexec "$token"
       return 1
       ;;
   esac
-  if ! _tirith_receipt_consume bash-preexec "$token" "$scan_target"; then
-    _tirith_receipt_reconcile bash-preexec "$token" || return 1
+  if ! _tirith_receipt_call consume bash-preexec "$token" "$scan_target"; then
+    _tirith_receipt_call reconcile bash-preexec "$token" || return 1
   fi
   return 0
 }
 
 _tirith_preexec_receipt_check() {
   local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_preexec_receipt_check_untraced "$@"
-  else
-    _tirith_preexec_receipt_check_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_preexec_receipt_check_untraced "$@"
 }
 
 
@@ -2035,7 +1971,7 @@ _tirith_prompt_hook_untraced() {
       unset _TIRITH_PENDING_EVAL
       unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
       if [[ -n "$failed_pending_receipt" ]]; then
-        _tirith_receipt_discard bash-enter "$failed_pending_receipt" || true
+        _tirith_receipt_call discard bash-enter "$failed_pending_receipt" || true
       fi
       _tirith_degrade_to_preexec "could not disarm guarded accept-line" || true
       return
@@ -2055,12 +1991,12 @@ _tirith_prompt_hook_untraced() {
           || -z "$pending_eval" \
           || -z "$pending_command" \
           || "$pending_eval" != "$pending_command" ]]; then
-      _tirith_receipt_discard bash-enter "$pending_receipt" || true
+      _tirith_receipt_call discard bash-enter "$pending_receipt" || true
       _tirith_degrade_to_preexec "deferred command state did not match its receipt"
       return 1
     fi
-    if ! _tirith_receipt_consume bash-enter "$pending_receipt" "$pending_command"; then
-      if ! _tirith_receipt_reconcile bash-enter "$pending_receipt"; then
+    if ! _tirith_receipt_call consume bash-enter "$pending_receipt" "$pending_command"; then
+      if ! _tirith_receipt_call reconcile bash-enter "$pending_receipt"; then
         _tirith_degrade_to_preexec "execution receipt could not be committed before delivery"
         return 1
       fi
@@ -2086,20 +2022,8 @@ _tirith_prompt_hook_untraced() {
 
 _tirith_prompt_hook() {
   local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_prompt_hook_untraced "$@"
-  else
-    _tirith_prompt_hook_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_prompt_hook_untraced "$@"
 }
 
 _tirith_is_prompt_hook_attached() {
@@ -2403,7 +2327,7 @@ _tirith_queue_enter_delivery() {
   # command can still be put visibly into Readline for a safe retry.
   if ! _tirith_enter_arm_accept; then
     unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_COMMAND _TIRITH_PENDING_RECEIPT
-    _tirith_receipt_discard bash-enter "$receipt_token" || true
+    _tirith_receipt_call discard bash-enter "$receipt_token" || true
     READLINE_LINE="$cmd"
     READLINE_POINT=${#cmd}
     _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
@@ -2478,7 +2402,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -n "${_TIRITH_PENDING_EVAL:-}" \
             || -n "${_TIRITH_PENDING_COMMAND:-}" \
             || -n "${_TIRITH_PENDING_RECEIPT:-}" ]]; then
-        _tirith_receipt_discard bash-enter "${_TIRITH_PENDING_RECEIPT:-}"
+        _tirith_receipt_call discard bash-enter "${_TIRITH_PENDING_RECEIPT:-}"
         unset _TIRITH_PENDING_EVAL
         unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
         _tirith_degrade_to_preexec "previous command not delivered (check shell history)"
@@ -2586,7 +2510,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
             _tirith_output ""
             _tirith_output "command> $escaped_line"
             [[ -n "$output" ]] && _tirith_output "$output"
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             _tirith_degrade_to_preexec "invalid protocol-v3 execution-receipt response (exit $rc)"
             return
             ;;
@@ -2644,7 +2568,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           [[ -n "$output" ]] && _tirith_output "$output"
           [[ -n "$approval_path" ]] && _tirith_remove_capture_file "$approval_path" >/dev/null 2>&1
           [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-          _tirith_receipt_discard bash-enter "$receipt_token"
+          _tirith_receipt_call discard bash-enter "$receipt_token"
           _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
           return  # READLINE_LINE preserved for re-execution via preexec
         fi
@@ -2681,7 +2605,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
                 *)
                   _tirith_output "tirith: approval not granted — fallback: block"
                   [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-                  _tirith_receipt_discard bash-enter "$receipt_token"
+                  _tirith_receipt_call discard bash-enter "$receipt_token"
                   READLINE_LINE=""
                   READLINE_POINT=0
                   return
@@ -2691,14 +2615,14 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           elif [[ $rc -eq 1 ]]; then
             # Approval not required but command was blocked: honor block
             [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             READLINE_LINE=""
             READLINE_POINT=0
             return
           fi
         elif [[ $rc -eq 1 ]]; then
           # No approval file: honor block
-          _tirith_receipt_discard bash-enter "$receipt_token"
+          _tirith_receipt_call discard bash-enter "$receipt_token"
           READLINE_LINE=""
           READLINE_POINT=0
           return
@@ -2707,7 +2631,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
         if [[ $rc -eq 3 && -n "$warn_ack_path" ]]; then
           if ! _tirith_parse_warn_ack "$warn_ack_path"; then
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             _tirith_output "tirith: warning acknowledgement metadata is invalid; command blocked"
             READLINE_LINE=""
             READLINE_POINT=0
@@ -2719,7 +2643,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
             warn_acknowledged="yes"
           else
             _tirith_output "tirith: warnings not acknowledged — command blocked"
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             READLINE_LINE=""
             READLINE_POINT=0
             return
@@ -2747,20 +2671,8 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
 
     _tirith_enter() {
       local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-      if [[ $- == *x* ]]; then
-        builtin set +x
-        _tirith_trace_was_on=1
-      fi
-      if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-      if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-        _tirith_enter_untraced "$@"
-      else
-        _tirith_enter_untraced "$@"
-      fi
-      _tirith_result=$?
-      [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-      [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-      return "$_tirith_result"
+      _tirith_untraced_begin
+      _tirith_untraced_run _tirith_enter_untraced "$@"
     }
 
     # Bracketed paste interception
@@ -2900,7 +2812,7 @@ _tirith_exit_summary_untraced() {
   builtin export -n pending_receipt
   unset _TIRITH_PENDING_EVAL
   unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
-  [[ -n "$pending_receipt" ]] && _tirith_receipt_discard bash-enter "$pending_receipt"
+  [[ -n "$pending_receipt" ]] && _tirith_receipt_call discard bash-enter "$pending_receipt"
   [[ -n "${TIRITH_SESSION_ID:-}" ]] || return
   local _sd="${XDG_STATE_HOME:-$HOME/.local/state}/tirith"
   [[ -f "$_sd/sessions/$TIRITH_SESSION_ID.json" ]] || return
@@ -2909,20 +2821,8 @@ _tirith_exit_summary_untraced() {
 
 _tirith_exit_summary() {
   local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_exit_summary_untraced "$@"
-  else
-    _tirith_exit_summary_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_exit_summary_untraced "$@"
 }
 
 _tirith_exit_trampoline() {
@@ -3009,20 +2909,8 @@ _tirith_verification_probe_untraced() {
 
 _tirith_verification_probe() {
   local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
-  if [[ $- == *x* ]]; then
-    builtin set +x
-    _tirith_trace_was_on=1
-  fi
-  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
-  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
-    _tirith_verification_probe_untraced "$@"
-  else
-    _tirith_verification_probe_untraced "$@"
-  fi
-  _tirith_result=$?
-  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
-  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
-  return "$_tirith_result"
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_verification_probe_untraced "$@"
 }
 
 # Report loaded code only after this fresh initialization reaches installation.

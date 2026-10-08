@@ -381,6 +381,7 @@ mod tests {
 
     #[test]
     fn valid_zsh_syntax() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let snippet = "if [[ -n \"${ZSH_EXECUTION_STRING:-}\" ]]; then\n  echo hello\nfi\n";
         if trusted_zsh_executable().is_err() {
             eprintln!("skipping validate_zsh_syntax test: trusted system zsh not found");
@@ -391,6 +392,7 @@ mod tests {
 
     #[test]
     fn invalid_zsh_syntax() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let snippet = "if [[ -n \"${FOO}\" ]]; then\n  # missing fi\n";
         if trusted_zsh_executable().is_err() {
             eprintln!("skipping validate_zsh_syntax test: trusted system zsh not found");

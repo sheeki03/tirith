@@ -662,6 +662,7 @@ mod tests {
 
     #[test]
     fn excl_write_failure_leaves_no_flag_so_incident_reads_inactive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R6 #3: a write failure must leave NO partial flag (else
         // incident mode turns ON while `start` reports Err). Force the failure
         // with a read-only handle and assert no flag remains.
@@ -774,6 +775,7 @@ mod tests {
 
     #[test]
     fn stop_clears_a_directory_sentinel_no_lockout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // LOCKOUT SAFETY (finding E): a directory at the flag path reads as active
         // (EISDIR → Corrupt), and a plain `remove_file` errors on it. `stop` must
         // still clear it. Use a NON-EMPTY directory (so `remove_dir` would fail too).

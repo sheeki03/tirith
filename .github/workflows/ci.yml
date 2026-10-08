@@ -44,10 +44,10 @@ jobs:
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
       - name: Validate signed release compatibility payload generation
         run: python3 .github/scripts/test-release-compatibility.py
-      - name: Verify sealed npm bootstrap generation
-        run: |
-          python3 tools/npm-bootstrap/build-bootstrap.py --check
-          python3 tools/npm-bootstrap/test-build-bootstrap.py
+      - name: Validate workflow hygiene
+        run: python3 .github/scripts/test-workflow-hygiene.py
+      - name: Validate documentation links
+        run: python3 .github/scripts/test-check-doc-links.py
       - name: Validate native host certification bounds
         run: |
           python3 scripts/test-certify-claude-host.py
@@ -56,15 +56,8 @@ jobs:
           python3 scripts/test-certify-powershell-hook.py
           python3 scripts/test-certify-powershell-target.py
           python3 scripts/test-control-browser-fixtures.py
-          python3 scripts/test-collect-native-resource-reference.py
-          python3 scripts/test-measure-daemon-workloads.py
-          python3 scripts/test-measure-claude-adapter.py
-          python3 scripts/test-qualify-daemon-trust-expiry.py
           python3 tools/qualification/test_mixed_audit_native.py
-          python3 tools/qualification/test_compatibility_capture.py
-          python3 tools/qualification/test_durable_boundaries_native.py
           python3 tools/qualification/test_service_coordination_native.py
-          python3 tools/qualification/test_signed_numeric_inputs.py
       - name: Validate managed browser qualification predicates
         run: |
           set -euo pipefail
@@ -160,12 +153,6 @@ jobs:
         run: node tests/ipython-vector-extraction.mjs
       - name: npm launcher exit and signal contract
         run: node tests/npm-launcher.mjs
-      - name: Sealed npm bootstrap source contracts
-        if: matrix.name != 'Windows'
-        run: |
-          node tools/npm-bootstrap/bootstrap-controls.cjs
-          node tools/npm-bootstrap/descriptor-source-controls.cjs
-          node tools/npm-bootstrap/resolver-controls.cjs
       - name: Windows user installer release contract
         if: matrix.name == 'Windows'
         shell: pwsh
@@ -179,7 +166,7 @@ jobs:
       - name: Native shell private state stays out of child environments
         if: matrix.name == 'Linux'
         run: python3 tests/shell-private-environment.py --require-shell bash --require-shell zsh --require-shell fish --report "$RUNNER_TEMP/tirith-shell-private-environment.json"
-      - name: Receipt acknowledgment preserves observed outcomes
+      - name: Receipt calls are single launches that preserve observed outcomes
         if: matrix.name == 'Linux'
         run: python3 scripts/test-shell-receipt-ack.py --report "$RUNNER_TEMP/tirith-shell-receipt-ack.json"
       - name: Retain shell privacy and acknowledgment evidence
@@ -203,20 +190,6 @@ jobs:
       - name: Workspace tests
         if: matrix.name != 'Windows'
         run: cargo test --workspace --locked --no-fail-fast
-      - name: Record native CLI test binary sizes
-        if: always() && matrix.name != 'Windows'
-        run: |
-          python3 - <<'PY'
-          import json, pathlib, re
-          root = pathlib.Path('target/debug/deps')
-          records = []
-          if root.is_dir():
-              for path in sorted(root.iterdir()):
-                  if re.fullmatch(r'tirith-[0-9a-f]{16}', path.name) and path.is_file():
-                      records.append({'file': path.name, 'bytes': path.stat().st_size})
-          print(json.dumps({'binary_identity_limit_bytes': 512 * 1024 * 1024,
-                            'cli_test_images': records}, indent=2))
-          PY
       - name: Windows workspace and standard-account dashboard tests
         if: matrix.name == 'Windows'
         shell: pwsh
@@ -229,28 +202,7 @@ jobs:
           mkdir "$evidence"
           cargo test --locked -p tirith --bin tirith --no-run --message-format=json \
             > "$evidence/cargo.jsonl" 2> "$evidence/build.stderr"
-          python3 - "$evidence" <<'PY'
-          import hashlib, json, pathlib, subprocess, sys
-          output = pathlib.Path(sys.argv[1])
-          source = pathlib.Path.cwd().resolve()
-          records = [json.loads(line) for line in (output / 'cargo.jsonl').read_text().splitlines()]
-          selected = [r for r in records if r.get('reason') == 'compiler-artifact'
-                      and r.get('executable') and r.get('profile', {}).get('test') is True
-                      and r.get('target', {}).get('name') == 'tirith'
-                      and pathlib.Path(r['manifest_path']).resolve() == source / 'crates/tirith/Cargo.toml']
-          if len(selected) != 1:
-              raise SystemExit('expected one current Tirith CLI test executable')
-          binary = pathlib.Path(selected[0]['executable']).resolve(strict=True)
-          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-          (output / 'selected-test.json').write_text(json.dumps({
-              'cargo_artifact': selected[0], 'sha256': digest,
-              'source_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-              'scope': 'instrumented test fixture, not signed replacement or release qualification'
-          }, indent=2) + '\n')
-          subprocess.run([sys.executable, '-B', 'tools/qualification/service_coordination_native.py',
-                          '--test-executable', str(binary), '--sha256', digest,
-                          '--output', str(output / 'native')], check=True)
-          PY
+          python3 -B .github/scripts/run-service-coordination.py "$evidence"
       - name: Retain native update coordination evidence
         if: always() && matrix.name != 'Windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -295,7 +247,7 @@ jobs:
             'scripts/certify-powershell-hook.py',
             '--binary', (Join-Path $PWD 'target/debug/tirith'),
             '--powershell', (Get-Process -Id $PID).Path,
-            '--hook', (Join-Path $PWD 'shell/lib/powershell-hook.ps1'),
+            '--hook', (Join-Path $PWD 'crates/tirith/assets/shell/lib/powershell-hook.ps1'),
             '--output', (Join-Path $env:RUNNER_TEMP 'tirith-powershell-native')
           )
           if ($IsWindows) {
@@ -416,6 +368,50 @@ jobs:
           toolchain: "1.83"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked --no-fail-fast
+
+  android:
+    # Issue #261: Android/Termux support lives behind cfg(target_os = "android")
+    # (no arboard there, the Bionic `__errno` accessor, the clipboard NoBackend
+    # test), so no other job compiles it. Build both crates and link the
+    # tirith-core test binary for aarch64 Android with the runner's NDK so a
+    # regression in that code fails CI. Compile only: nothing runs on Android.
+    name: Android (aarch64, compile only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_API: "24"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Point Cargo and cc at the NDK toolchain
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          clang="$bin/aarch64-linux-android${ANDROID_API}-clang"
+          if [ ! -x "$clang" ] || [ ! -x "$bin/llvm-ar" ]; then
+            echo "::error::Android NDK toolchain not found under '$ndk'"
+            exit 1
+          fi
+          {
+            echo "CC_aarch64_linux_android=$clang"
+            echo "AR_aarch64_linux_android=$bin/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$clang"
+          } >> "$GITHUB_ENV"
+      - name: Check both crates for Android
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --locked -p tirith-core -p tirith --target aarch64-linux-android
+      - name: Build the tirith-core tests for Android
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --no-run --locked -p tirith-core --target aarch64-linux-android
 
   deny:
     name: Cargo Deny
@@ -552,7 +548,7 @@ jobs:
           mkdir -p docker-ci-smoke/bin docker-ci-smoke/shell
           printf '#!/bin/sh\nprintf "tirith-ci-smoke\\n"\n' > docker-ci-smoke/bin/tirith
           chmod +x docker-ci-smoke/bin/tirith
-          cp -R shell/. docker-ci-smoke/shell/
+          cp -R crates/tirith/assets/shell/. docker-ci-smoke/shell/
           cp Dockerfile docker-ci-smoke/
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0

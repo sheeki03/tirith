@@ -61,23 +61,69 @@ fn launch(state: &GlobalStateGuard) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// The single-use code from a launch URL.
+fn launch_code(launch: &Value) -> (u16, String) {
+    let url = url::Url::parse(launch["url"].as_str().unwrap()).unwrap();
+    let code = url
+        .fragment()
+        .and_then(|fragment| fragment.strip_prefix("code="))
+        .unwrap_or_else(|| panic!("launch URL must carry a sign-in code: {url}"));
+    (url.port().unwrap(), code.into())
+}
+
+/// Sign in the way the page does: exchange the code once, same origin.
+fn exchange(port: u16, code: &str, origin: Option<&str>) -> (u16, Value) {
+    let body = json!({ "code": code }).to_string();
+    let origin = origin
+        .map(|origin| format!("Origin: {origin}\r\n"))
+        .unwrap_or_default();
+    let probe = Service {
+        port,
+        token: String::new(),
+        csrf: String::new(),
+    };
+    let response = probe.raw(&format!("POST /api/session/exchange HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+    std::mem::forget(probe);
+    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    (
+        status,
+        serde_json::from_str(body).unwrap_or_else(|_| json!({"text":body})),
+    )
+}
+
 fn service(state: &GlobalStateGuard) -> (Service, Value) {
     let launch = launch(state);
-    let url = url::Url::parse(launch["url"].as_str().unwrap()).unwrap();
+    let (port, code) = launch_code(&launch);
+    let (status, session) = exchange(port, &code, Some(&format!("http://127.0.0.1:{port}")));
+    assert_eq!(status, 200, "{session}");
+    let service = Service {
+        port,
+        token: session["token"].as_str().unwrap().into(),
+        csrf: session["csrf"].as_str().unwrap().into(),
+    };
+    let (status, current) = service.request("GET", "/api/session", None);
+    assert_eq!(status, 200);
+    assert_eq!(current["csrf"], session["csrf"]);
+    (service, launch)
+}
+
+/// The private-record service credential (owner-only file), as the CLI uses it.
+fn service_credential(state: &GlobalStateGuard) -> Service {
+    launch(state);
+    let path = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("control/v1/service.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let mut service = Service {
-        port: url.port().unwrap(),
-        token: url
-            .fragment()
-            .unwrap()
-            .strip_prefix("token=")
-            .unwrap()
-            .into(),
+        port: record["port"].as_u64().unwrap() as u16,
+        token: record["token"].as_str().unwrap().into(),
         csrf: String::new(),
     };
     let (status, session) = service.request("GET", "/api/session", None);
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{session}");
     service.csrf = session["csrf"].as_str().unwrap().into();
-    (service, launch)
+    service
 }
 
 fn state() -> GlobalStateGuard {
@@ -143,6 +189,160 @@ fn activity_starts_with_newest_checks_and_pages_older_without_shifting_on_append
         std::fs::read_to_string(path).unwrap(),
         format!("{original}{}", record(600))
     );
+}
+
+#[test]
+fn launch_url_carries_only_a_single_use_code_and_each_reopen_gets_a_fresh_session() {
+    let state = state();
+    let first = launch(&state);
+    let (port, code) = launch_code(&first);
+    assert!(code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first["single_use_code"], true);
+    let record_path = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("control/v1/service.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+    let service_token = record["token"].as_str().unwrap();
+    // The reusable credential never appears in the URL given to a browser launcher.
+    assert!(!first["url"].as_str().unwrap().contains(service_token));
+    assert_ne!(code, service_token);
+    let origin = format!("http://127.0.0.1:{port}");
+    // A code is not a bearer credential.
+    let as_bearer = Service {
+        port,
+        token: code.clone(),
+        csrf: String::new(),
+    };
+    assert_eq!(as_bearer.request("GET", "/api/state", None).0, 401);
+    std::mem::forget(as_bearer);
+    // The exchange is a same-origin write.
+    assert_eq!(exchange(port, &code, None).0, 403);
+    assert_eq!(
+        exchange(port, &code, Some("http://attacker.example")).0,
+        403
+    );
+    let (status, session) = exchange(port, &code, Some(&origin));
+    assert_eq!(status, 200, "{session}");
+    assert_ne!(session["token"], service_token);
+    assert!(session["expires_in_seconds"].as_u64().unwrap() > 3500);
+    // Used once.
+    assert_eq!(exchange(port, &code, Some(&origin)).0, 401);
+    let browser = Service {
+        port,
+        token: session["token"].as_str().unwrap().into(),
+        csrf: session["csrf"].as_str().unwrap().into(),
+    };
+    assert_eq!(browser.request("GET", "/api/state", None).0, 200);
+    // Only the private launcher credential can mint codes.
+    assert_eq!(
+        browser
+            .request("POST", "/api/session/code", Some(json!({})))
+            .0,
+        403
+    );
+    // Reopening reuses the service but issues a new code and a new session.
+    let second = launch(&state);
+    assert_eq!(first["service_id"], second["service_id"]);
+    let (_, second_code) = launch_code(&second);
+    assert_ne!(code, second_code);
+    let (status, reopened) = exchange(port, &second_code, Some(&origin));
+    assert_eq!(status, 200, "{reopened}");
+    assert_ne!(reopened["token"], session["token"]);
+    assert_ne!(reopened["csrf"], session["csrf"]);
+    assert!(reopened["expires_in_seconds"].as_u64().unwrap() > 3500);
+    assert_eq!(browser.request("GET", "/api/state", None).0, 200);
+}
+
+#[test]
+fn read_only_routes_never_resolve_the_remote_policy() {
+    // Every remote fetch attempt reports itself in the route's diagnostics.
+    // A loopback policy server is refused before any connection, so this
+    // fixture observes attempts without network access.
+    let mut state = state();
+    state.set_env("TIRITH_SERVER_URL", "https://127.0.0.1:1");
+    state.set_env("TIRITH_API_KEY", "fixture-remote-policy-key");
+    let server = service_credential(&state);
+    // Routes that nest their own diagnostic capture report it in a
+    // route-specific field (`policy_diagnostics` for the tuning review), so
+    // look at the whole response.
+    let attempted = |value: &Value| value.to_string().contains("remote policy fetch");
+    let mut resolved_remote = Vec::new();
+    for (method, path, body) in [
+        ("GET", "/api/jobs", None),
+        ("GET", "/api/state", None),
+        ("GET", "/api/integrations", None),
+        ("GET", "/api/activity/summary", None),
+        ("GET", "/api/freshness", None),
+        ("GET", "/api/policy/tuning", None),
+        ("GET", "/api/exceptions", None),
+        (
+            "POST",
+            "/api/exceptions/explain",
+            Some(json!({"target": "example-cli.dev", "scope": "user"})),
+        ),
+        ("POST", "/api/history", Some(json!({"limit": 10}))),
+        (
+            "POST",
+            "/api/operations",
+            Some(json!({"operation_id": uuid::Uuid::new_v4().to_string(), "action": "status"})),
+        ),
+    ] {
+        let (status, value) = server.request(method, path, body);
+        assert!(
+            status == 200 || path == "/api/operations",
+            "{path}: {value}"
+        );
+        if attempted(&value) {
+            resolved_remote.push(format!("{path}: {value}"));
+        }
+    }
+    assert!(
+        resolved_remote.is_empty(),
+        "read-only routes resolved the remote policy:\n{}",
+        resolved_remote.join("\n")
+    );
+    // The effective-policy view still resolves Runtime, which also shows the
+    // fixture would have seen an attempt.
+    let (status, policy) = server.request("GET", "/api/policy", None);
+    assert_eq!(status, 200, "{policy}");
+    assert!(attempted(&policy), "{policy}");
+}
+
+/// With a legacy remote policy server configured, the exception views use
+/// the service's latest full Runtime resolution. Once a local input changed
+/// (here the user policy), that snapshot no longer revalidates, and every
+/// list/explain answered 409 "refresh the list" until something called
+/// GET /api/policy. They now resolve again and show the current rows.
+#[test]
+fn exception_views_follow_local_policy_edits_with_a_legacy_remote_server() {
+    let mut state = state();
+    state.set_env("TIRITH_SERVER_URL", "https://127.0.0.1:1");
+    state.set_env("TIRITH_API_KEY", "fixture-remote-policy-key");
+    let server = service_credential(&state);
+    let (status, before) = server.request("GET", "/api/exceptions", None);
+    assert_eq!(status, 200, "{before}");
+    assert!(!before.to_string().contains("example-cli.dev"), "{before}");
+    let config = tirith_core::policy::config_dir().unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.yaml"),
+        "allowlist:\n  - example-cli.dev\n",
+    )
+    .unwrap();
+    for attempt in 0..2 {
+        let (status, after) = server.request("GET", "/api/exceptions", None);
+        assert_eq!(status, 200, "attempt {attempt}: {after}");
+        assert!(
+            after.to_string().contains("example-cli.dev"),
+            "attempt {attempt}: {after}"
+        );
+    }
+    let (status, explain) = server.request(
+        "POST",
+        "/api/exceptions/explain",
+        Some(json!({"target": "example-cli.dev", "scope": "user"})),
+    );
+    assert_eq!(status, 200, "{explain}");
 }
 
 #[test]
@@ -222,6 +422,20 @@ fn browser_profile_plan_is_read_only_until_apply_and_retries_keep_identity() {
         policy["protection_profile"]["name"].as_str(),
         Some("balanced")
     );
+    // The inventory row carries the recovery flag next to the stored state so
+    // a reopened dashboard can still label retained recovery material.
+    let (status, jobs) = server.request("GET", "/api/jobs", None);
+    assert_eq!(status, 200, "{jobs}");
+    let row = jobs["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["operation_id"] == id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["state"], "completed", "{row}");
+    // The edit created policy.yaml, so no displaced original was retained.
+    assert_eq!(row["recovery"], false, "{row}");
     let (status, changed_intent) = server.request(
         "POST",
         "/api/plans",
@@ -392,48 +606,77 @@ fn explicit_project_review_is_inert_and_revalidates_retained_files() {
 }
 
 #[test]
-fn failed_lifecycle_apply_retry_returns_saved_state_without_starting_work() {
+fn threatdb_refresh_is_a_guarded_write_and_lifecycle_writes_are_gone() {
     let state = state();
     let (server, _) = service(&state);
-    let id = uuid::Uuid::new_v4().to_string();
-    let (status, prepared) = server.request(
+    // The isolated fixture redirects both ThreatDB paths, so the guarded
+    // refresh must refuse before any network access or database write.
+    let (status, refused) = server.request("POST", "/api/threatdb/refresh", Some(json!({})));
+    assert_eq!(status, 409, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("redirected"),
+        "{refused}"
+    );
+    assert!(!state.roots().threatdb.exists());
+    // The browser cannot request force or any other mode.
+    let (status, refused) = server.request(
         "POST",
+        "/api/threatdb/refresh",
+        Some(json!({"force": true})),
+    );
+    assert_eq!(status, 409, "{refused}");
+    // Same origin and CSRF checks as every other write; both are refused
+    // before the body is read, so none is sent.
+    let response = server.raw(&format!("POST /api/threatdb/refresh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n", server.port, server.token, server.port));
+    assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = server.raw(&format!("POST /api/threatdb/refresh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: http://attacker.example\r\nX-Tirith-CSRF: {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n", server.port, server.token, server.csrf));
+    assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+    // Browser binary update/rollback is removed; the read-only views remain.
+    for (path, body) in [
+        (
+            "/api/lifecycle/prepare",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"action":"update"}),
+        ),
+        (
+            "/api/lifecycle/operation",
+            json!({"operation_id":uuid::Uuid::new_v4().to_string(),"action":"apply"}),
+        ),
+    ] {
+        let (status, value) = server.request("POST", path, Some(body));
+        assert_eq!(status, 409, "{value}");
+        assert_eq!(value["error"], "unknown local control endpoint");
+    }
+    let (status, lifecycle) = server.request("GET", "/api/lifecycle", None);
+    assert_eq!(status, 200, "{lifecycle}");
+    let (status, freshness) = server.request("GET", "/api/freshness", None);
+    assert_eq!(status, 200, "{freshness}");
+    assert!(freshness["refresh_interval_hours"].is_u64(), "{freshness}");
+    // The Settings view shows copyable commands and one refresh button, and
+    // offers no browser update or rollback.
+    let asset = server.raw(&format!(
+        "GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        server.port
+    ));
+    assert!(asset.starts_with("HTTP/1.1 200"));
+    for present in [
+        "Refresh threat DB now",
+        "/api/threatdb/refresh",
+        "tirith threat-db update",
+        "'tirith update'",
+        "'tirith update --rollback'",
+        "Copy command",
+    ] {
+        assert!(asset.contains(present), "{present}");
+    }
+    for absent in [
         "/api/lifecycle/prepare",
-        Some(json!({"operation_id":id,"action":"rollback"})),
-    );
-    // This fixture has no saved compatible rollback. Preparation is local and
-    // leaves a durable failed request; retrying apply must not start a worker.
-    assert_eq!(status, 409, "{prepared}");
-    let (status, saved) = server.request(
-        "POST",
         "/api/lifecycle/operation",
-        Some(json!({"operation_id":id,"action":"status"})),
-    );
-    assert_eq!(status, 200, "prepared={prepared}; saved={saved}");
-    assert_eq!(saved["phase"], "refresh_required");
-    let (status, retry) = server.request(
-        "POST",
-        "/api/lifecycle/operation",
-        Some(json!({"operation_id":id,"action":"apply"})),
-    );
-    assert_eq!(status, 200, "{retry}");
-    assert_eq!(retry["phase"], saved["phase"]);
-    assert_eq!(retry["published"], false);
-    let (status, support) = server.request(
-        "POST",
-        "/api/support/preview",
-        Some(json!({"operation_ids":[id],"incident_ids":[]})),
-    );
-    assert_eq!(status, 200, "{support}");
-    assert_eq!(support["operations"][0]["availability"], "available");
-    assert_eq!(
-        support["operations"][0]["content"]["operation"]["operation_id"],
-        id
-    );
-    assert_eq!(
-        support["operations"][0]["content"]["operation"]["phase"],
-        retry["phase"]
-    );
+        "Check and review update",
+        "Review saved rollback",
+        "Apply reviewed lifecycle change",
+    ] {
+        assert!(!asset.contains(absent), "{absent}");
+    }
 }
 
 #[test]

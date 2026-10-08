@@ -53,9 +53,18 @@ tirith init --shell fish | source
 > [!TIP]
 > `eval "$(tirith init)"` auto-detects your current shell (it inspects the parent process and falls back to `$SHELL` if needed). The explicit `--shell` flag is only required when you want to override the detection.
 
+Or let Tirith write the startup file for you, as one reviewed plan you can undo:
+
+```bash
+tirith setup recommended --scope user --shell zsh --dry-run   # preview
+tirith setup recommended --scope user --shell zsh             # apply
+```
+
 That's it for interactive-shell coverage. Commands accepted by that shell are
 checked while the hook is loaded and healthy; exact blocking behavior depends
-on the shell and mode. Run `tirith doctor` after installation and upgrades, and
+on the shell and mode. Run `tirith status` after installation and upgrades: it
+says whether this terminal's loaded hook is current. Run
+`tirith doctor --verify-shell` to observe blocking in the shell itself, and
 read [enforcement by shell](#enforcement-by-shell) before treating the hook as
 an authorization boundary. Clean commands stay silent and normally take the
 fast path.
@@ -283,9 +292,12 @@ contains, and attests.
 - **Task-gate coverage:** task effect inference models the Web3 shell grammar
   and nothing else, so nearly every ordinary SHELL command is reported
   INCOMPLETE. `task_gate.mode: enforce` with `action_incomplete_analysis: block`
-  refuses those at the five boundaries that submit a shell envelope, and changes
-  nothing at the four package and config-write boundaries, which always assess
-  as complete. `warn` is the default. The alternative,
+  refuses those at the five boundaries that submit a shell envelope. It also
+  refuses the narrative actions that MCP tool calls the gateway cannot model,
+  `tirith verify-self`, `tirith update --dry-run` and the dashboard's ThreatDB
+  refresh submit. It changes nothing at config writes, `tirith fetch`, or a real
+  `tirith update` or rollback, which always assess as complete. `warn` is the
+  default. The alternative,
   `effects_denied_for_untrusted_sources`, denies the named effect on every call
   at every owned boundary, including commands you typed yourself, because no
   source at those boundaries is ever treated as trusted.
@@ -394,7 +406,7 @@ tirith ecosystem scan --format json ./      # full machine-readable report
 
 This helps catch known-malicious packages, confirmed typosquats, slopsquatted package names, malicious download infrastructure, and packages with live OSV / CISA KEV advisory data.
 
-### Python artifact inspection and enforcing installs
+### Python artifact inspection and environment verification
 
 Package-name risk is only one layer. Tirith can inspect the exact Python bytes
 you already have and verify an existing installed environment:
@@ -605,13 +617,11 @@ sudo dnf install ./tirith-*.rpm
 
 Package installation requires administrator privileges; in an existing root
 session, run the commands without `sudo`. Tirith packages neither depend on nor
-suggest installing sudo. On x86_64 Linux, only the explicitly requested
-`tirith pkg approve` operation requires a trusted
-`/usr/bin/sudo` and the root-owned approval helper for fresh administrator
-confirmation. The packaged helper is inert: installation creates no sudoers
-rule, elevated service, or signing key. If that authority is unavailable,
-approval remains blocked; ordinary command checks and shell protection
-continue to work.
+suggest installing sudo. The optional root-owned approval helper belongs to
+`tirith pkg approve`, which currently refuses (contained package execution, its
+only consumer, is disabled). The packaged helper is inert: installation creates
+no sudoers rule, elevated service, or signing key. Ordinary command checks and
+shell protection never need it.
 The [installation privileges guide](docs/install-privileges.md) covers all
 package formats, manual installs, updates, and removal.
 
@@ -934,6 +944,41 @@ tirith daemon stop
 
 ---
 
+## Profiles, dashboard and team policy
+
+Personal changes are previewed first and saved as operations you can inspect,
+apply, cancel or undo (`tirith policy operation ID`). They edit only the lines
+they own in your policy file and keep its comments and layout.
+
+- **Protection profiles:** `tirith policy profile balanced --dry-run` previews
+  Comfortable, Balanced (the default) or Strict; `tirith policy setting` changes
+  one field. `tirith policy rollout prepare` measures a profile against your own
+  commands before you activate it. See
+  [profiles and settings](docs/profiles-and-settings.md).
+- **Is this terminal protected?** `tirith status` and `tirith doctor` report
+  whether the loaded Bash, Zsh or Fish hook is current, stale (for example from
+  before an upgrade) or unregistered. `tirith doctor --verify-shell` observes
+  blocking in the calling shell; see
+  [caller-shell verification](docs/caller-shell-verification.md).
+- **Local dashboard:** `tirith dashboard` opens a loopback-only page with a
+  single-use sign-in code for settings, history, project review, trust grants,
+  team policy, saved changes, support reports, audit retention and a
+  "Refresh threat DB now" button. Binary updates stay in the terminal. See
+  [dashboard](docs/dashboard.md).
+- **Team policy (optional, self-hosted):** run `tirith-policy-server`, publish a
+  reviewed policy, and enroll each device explicitly. Enrolled devices refresh
+  the policy in the background; when offline they keep enforcing the last good
+  team policy, with a warning, for a grace period (72 hours by default) before
+  failing closed. See [team policy](docs/team-policy.md).
+- **Review before you trust:** `tirith review` statically reviews a project's
+  dependency, hook, AI-instruction and MCP files, and `tirith pkg inspect` /
+  `tirith pkg diff` inspect npm tarballs without extracting or running them. See
+  [project review](docs/project-review.md) and
+  [npm inspection](docs/npm-inspection.md).
+
+[Everyday workflows](docs/user-journeys.md) walks through setup, interruptions,
+upgrade and removal.
+
 ## Commands
 
 The everyday commands:
@@ -947,17 +992,20 @@ The everyday commands:
 | `tirith fix -- <cmd>` | Interactively apply a verified fail-closed pipe-runner rewrite when available; otherwise show guidance |
 | `tirith score <url>` / `diff <url>` | Break down a URL's trust signals, or show where suspicious characters hide |
 | `tirith explain --rule <id>` / `why` | Rule docs and remediation, or explain the last trigger |
-| `tirith status` / `doctor` | Are you protected? Diagnose install, hooks, and policy (`--fix`, `--quick`) |
-| `tirith setup <tool>` / `init` | One-command AI-tool setup, or print the shell hook |
+| `tirith status` / `doctor` | Are you protected? Loaded-hook freshness, install, hooks, and policy (`--verify-shell`, `--fix`, `--quick`) |
+| `tirith setup <tool>` / `init` | Reviewed shell/profile setup (`setup recommended`), one-command AI-tool setup, or print the shell hook |
 | `tirith policy {init,validate,test}` | Scaffold, validate, and dry-run your policy |
-| `tirith trust {add,list,remove}` | Manage trusted patterns (narrow scope, 30-day TTL by default) |
+| `tirith policy {profile,setting,operation,rollout}` | Preview and apply personal profiles and settings; inspect, apply, cancel or undo saved operations |
+| `tirith policy team` | Connect to and enroll in an optional self-hosted team policy |
+| `tirith trust {add,list,explain,revoke,remove}` | Manage trust grants (narrow scope, 30-day TTL by default) |
+| `tirith dashboard` | Local loopback dashboard for settings, history, review, trust and team policy |
+| `tirith review` | Read-only review of a project's dependency, hook, AI and MCP files |
 | `tirith threat-db update` | Download and verify the signed threat database |
 | `tirith package risk <eco> <name>` | Score a package's supply-chain risk |
 | `tirith ecosystem scan [path]` | Score every declared dependency in a project |
 | `tirith package inspect --artifact <wheel>` | Inspect exact Python artifact bytes, startup hooks, native code, RECORD integrity, and cross-wheel execution chains |
-| `tirith pkg approve` | Create a non-installing Python package approval under its native authority and platform requirements |
+| `tirith pkg approve` | Currently disabled: after its native-authority check it refuses with `private_input_execution_unqualified` and records no approval |
 | `tirith pkg install` | Currently disabled on every host: refuses with `private_input_execution_unqualified` before resolver or package execution |
-| `tirith pkg install-npm` | Review, apply, inspect history and reconfirm a bounded local leaf installation. GNU Linux AArch64 only, with exact pinned tools, disabled scripts, full native confinement and a current production-signed v2 threat feed. The published v1 feed is insufficient; unsupported or incomplete requests refuse. See the [installation contract](docs/npm-install-contract.md) |
 | `tirith pkg verify-env` | Verify an existing Python environment without installing packages |
 | `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |
 | `tirith gateway run` | Proxy an upstream MCP server and enforce configured request/output boundaries |
@@ -1108,18 +1156,22 @@ works, and entries expire after 30 days unless you opt out.
 ```bash
 # Narrowest scope, a specific URL or path is accepted as-is, 30-day TTL.
 # A schemeless host/path is normalized as HTTPS for exact matching.
-tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
 
 # A whole domain / wildcard / bare TLD is broad, it must be opted into.
-tirith trust add get.docker.com --broad --rule curl_pipe_shell
+tirith trust add example-cli.dev --broad --rule shortened_url --ttl 7d
 
-# Opt out of the default TTL, and record why the entry exists.
-tirith trust add example.com --broad --permanent --reason "internal mirror, OPS-42"
+# Every rule needs an explicit --all-rules; opt out of the TTL and record why.
+tirith trust add example.com --broad --all-rules --permanent --reason "internal mirror, OPS-42"
+
+# Only for this checkout (bound to its root and filesystem identity).
+tirith trust add example-tool.sh/install.sh --rule pipe_to_interpreter --scope project
 
 tirith trust list                 # scope class per entry; '!' marks broad ones
 tirith trust explain example.com  # what it covers, when it expires, why added
+tirith trust revoke GRANT_ID      # revoke one grant; reports broader ones that remain
 tirith trust diff                 # what changed in the trust set
-tirith trust gc --expired         # drop expired entries
+tirith trust gc --expired         # drop expired grants and old revocations
 ```
 
 Each entry's **scope** is classified as `exact`, `substring`, `domain`,
@@ -1127,8 +1179,10 @@ Each entry's **scope** is classified as `exact`, `substring`, `domain`,
 `wildcard` / `bare-TLD`) requires `--broad`, so a sweeping allow is always a
 deliberate choice. Exact URLs use normalized URL equality (including scheme,
 host, effective port, path, query, and fragment), never substring matching. All
-subcommands support `--format json`. Trust stores written by older versions of
-tirith keep working unchanged, an entry with no TTL is treated as permanent.
+subcommands support `--format json`. New entries are stable, expiring grants in
+`trust-grants.json`; `trust.json` entries written by older versions keep
+working unchanged (an entry with no TTL is treated as permanent) until you run
+`tirith trust migrate --scope user`. See [trust grants](docs/trust-grants.md).
 
 ### Escalation and action overrides
 
@@ -1252,9 +1306,19 @@ Disable: `export TIRITH_LOG=0`
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager
+- [Internals](docs/internals.md), contracts behind the features below, for maintainers
 
 Feature guides:
 
+- [Everyday workflows](docs/user-journeys.md) (setup, interruptions, upgrade and removal)
+- [Profiles and settings](docs/profiles-and-settings.md) and [reviewed rollouts](docs/policy-rollouts.md)
+- [Trust grants](docs/trust-grants.md) (scoped, expiring exceptions)
+- [Local dashboard](docs/dashboard.md)
+- [Team policy](docs/team-policy.md) (self-hosted server, enrollment, background refresh and offline grace)
+- [Caller-shell verification](docs/caller-shell-verification.md) (hook freshness and observed blocking)
+- [Project review](docs/project-review.md) and [npm tarball inspection](docs/npm-inspection.md)
+- [ThreatDB freshness](docs/threatdb-freshness.md)
+- [Installation privileges](docs/install-privileges.md) and [Android/Termux](docs/android-termux.md)
 - [Web3 command guard](docs/security/web3-command-guard.md) (the `web3_guard` policy, the three Web3 rules, and command-card v2 bindings)
 - [Task envelope](docs/task-envelope.md) (untrusted task provenance, the `task_gate` policy, and the preview MCP tool)
 - [Untrusted projects](docs/untrusted-projects.md) (the "somebody sent me a repo" workflow)

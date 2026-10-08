@@ -3,6 +3,35 @@ use std::process::{Command, Output};
 use tirith_core::receipt::{ArtifactScanReceipt, CapsuleReceipt, VerdictSummary};
 use tirith_test_support::GlobalStateGuard;
 
+/// A schema-v2 `private_verified` artifact-scan receipt as the removed package
+/// install wrote it: `fields` plus the stamped schema, engine build, timestamp
+/// and content-addressed id. Artifact hashes are sorted like the old writer did.
+fn artifact_receipt_fixture(mut fields: serde_json::Value) -> ArtifactScanReceipt {
+    let object = fields.as_object_mut().expect("receipt fixture fields");
+    object.insert("schema".into(), serde_json::json!(2));
+    object.insert("receipt_id".into(), serde_json::json!(""));
+    object.insert(
+        "engine_build_sha".into(),
+        serde_json::json!(tirith_core::receipt::engine_build_sha()),
+    );
+    object.insert(
+        "publication_state".into(),
+        serde_json::json!("private_verified"),
+    );
+    object.insert(
+        "timestamp".into(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
+    if let Some(serde_json::Value::Array(hashes)) = object.get_mut("artifact_sha256") {
+        hashes.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        hashes.dedup();
+    }
+    let mut receipt: ArtifactScanReceipt =
+        serde_json::from_value(fields).expect("receipt fixture deserializes");
+    receipt.receipt_id = receipt.compute_content_hash();
+    receipt
+}
+
 fn run(state: &GlobalStateGuard, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
     state.apply_to_command(&mut command);
@@ -87,25 +116,25 @@ fn saved_download_receipt_routes_use_current_privacy_without_changing_storage() 
 #[test]
 fn canonical_artifact_json_is_unchanged_or_explicitly_refused_under_tighter_privacy() {
     let state = GlobalStateGuard::new().unwrap();
-    let receipt = ArtifactScanReceipt::new(
-        "0.4.2".into(),
-        "a".repeat(64),
-        5,
-        "uv receipt-private-index".into(),
-        "0.8.22".into(),
-        "25.1".into(),
-        CapsuleReceipt {
+    let receipt = artifact_receipt_fixture(serde_json::json!({
+        "tirith_version": "0.4.2",
+        "policy_hash": "a".repeat(64),
+        "threat_db_sequence": 5,
+        "resolver_command": "uv receipt-private-index",
+        "resolver_version": "0.8.22",
+        "package_manager_version": "25.1",
+        "capsule": CapsuleReceipt {
             backend_id: "noop".into(),
             coverage: tirith_core::capsule::CapsuleCoverage::NONE,
         },
-        vec!["b".repeat(64)],
-        None,
-        VerdictSummary {
+        "artifact_sha256": vec!["b".repeat(64)],
+        "post_install_record": null,
+        "verdict": VerdictSummary {
             action: "Allow".into(),
             rule_ids: vec![],
             finding_count: 0,
         },
-    );
+    }));
     let id = &receipt.receipt_id;
     let canonical = serde_json::to_value(&receipt).unwrap();
     let (path, original) = save(&canonical, id);

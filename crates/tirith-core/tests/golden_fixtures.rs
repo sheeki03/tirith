@@ -361,6 +361,8 @@ fn run_fixture(fixture: &Fixture) {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -1469,14 +1471,13 @@ const EXTERNALLY_TRIGGERED_RULES: &[&str] = &[
     // duplicate-path collision). It is triggered by artifact inspection at the CLI, not by
     // the engine over a fixture string, so it has no PATTERN_TABLE entry and no fixture.
     "wheel_structurally_rejected",
-    // D3: `artifact_download_integrity_mismatch` is produced by the package
-    // firewall (`crate::artifact::firewall`) when a content-addressed quarantine
-    // blob no longer hashes to the resolver-pinned digest at firewall time, never
-    // from a command/paste fixture, so it has no PATTERN_TABLE entry. Covered by
-    // unit tests in `artifact/firewall.rs`.
+    // D3: `artifact_download_integrity_mismatch` was produced only by the removed
+    // pip package firewall when a quarantine blob no longer matched its pinned
+    // digest, never from a command/paste fixture, so it has no PATTERN_TABLE
+    // entry. The rule id stays for policy and audit-reader compatibility.
     "artifact_download_integrity_mismatch",
-    // F2: `artifact_release_anomaly` is produced by the package-firewall release
-    // differential (`crate::artifact::release_diff`) comparing two on-disk wheels
+    // F2: `artifact_release_anomaly` is produced by the release differential behind
+    // `tirith pkg diff` (`crate::artifact::release_diff`) comparing two on-disk wheels
     // of the same distribution, never from a command/paste fixture, so it has no
     // PATTERN_TABLE entry. Covered by unit tests in `artifact/release_diff.rs`.
     "artifact_release_anomaly",
@@ -2027,6 +2028,8 @@ fn test_tier1_does_not_gate_findings() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2080,6 +2083,8 @@ fn test_non_ascii_paste_not_sole_warn() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -2250,6 +2255,8 @@ fn test_lab_corpus_reaches_tier3() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2352,6 +2359,8 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2417,6 +2426,8 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2477,6 +2488,8 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2527,6 +2540,8 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2579,6 +2594,8 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2636,6 +2653,8 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2692,6 +2711,8 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2756,6 +2777,8 @@ fn iac_rule_detects_plan_modification_after_record() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -2794,6 +2817,1023 @@ fn iac_rule_detects_plan_modification_after_record() {
             .iter()
             .map(|f| format!("{}: {}", f.rule_id, f.title))
             .collect::<Vec<_>>(),
+    );
+}
+
+/// R4 fix round 1: with the plan gate on, the IaC rule sees every segment, so
+/// the plan file it hashes must be the one the apply segment will actually
+/// read. A literal `cd` / `-chdir=` earlier in the line moves the base
+/// directory; an unresolvable directory change fails closed. A plan file that
+/// the immediately preceding `&&` segment records with `tirith iac
+/// check-plan` (the workflow the rule's own message recommends) is not read at
+/// preexec time, because it may not exist yet.
+#[test]
+fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_cwd(&root).unwrap();
+
+    // ./tfplan is recorded; infra/tfplan is a different, unrecorded plan.
+    // rec/tfplan2 is recorded and there is no ./tfplan2.
+    let summary = PlanSummary::default();
+    fs::write(root.join("tfplan"), b"RECORDED ROOT PLAN").unwrap();
+    iac_plan::record_plan_hash(b"RECORDED ROOT PLAN", &root.join("tfplan"), &summary).unwrap();
+    fs::create_dir_all(root.join("infra")).unwrap();
+    fs::write(root.join("infra/tfplan"), b"UNRECORDED INFRA PLAN").unwrap();
+    fs::create_dir_all(root.join("rec")).unwrap();
+    fs::write(root.join("rec/tfplan2"), b"RECORDED REC PLAN").unwrap();
+    iac_plan::record_plan_hash(b"RECORDED REC PLAN", &root.join("rec/tfplan2"), &summary).unwrap();
+    // R4 fix round 2: ./tfplan2 exists but is NOT recorded, so a `cd rec`
+    // that may not run (or may run in a subshell) must not let it through.
+    fs::write(root.join("tfplan2"), b"UNRECORDED ROOT PLAN2").unwrap();
+
+    let mismatch = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(root.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+
+    // The lines are POSIX shell text. On Windows spell the absolute
+    // directory as a POSIX shell (Git Bash) reads it: drive letter and
+    // forward slashes, without the `\\?\` verbatim prefix, whose
+    // backslashes the shell would read as escapes.
+    let shell_path = |path: &std::path::Path| {
+        let text = path.display().to_string();
+        if cfg!(windows) {
+            text.trim_start_matches(r"\\?\").replace('\\', "/")
+        } else {
+            text
+        }
+    };
+    let infra_abs = format!(
+        "cd {} && terraform apply tfplan",
+        shell_path(&root.join("infra"))
+    );
+    let rec_abs = format!(
+        "cd {}; terraform apply tfplan2",
+        shell_path(&root.join("rec"))
+    );
+    let wrong = [
+        // Baseline: the recorded plan in the cwd passes, the unrecorded one blocks.
+        ("terraform apply tfplan", false),
+        ("terraform apply infra/tfplan", true),
+        // A directory change before the apply moves the plan file it reads.
+        ("cd infra; terraform apply tfplan", true),
+        ("cd infra && terraform apply tfplan", true),
+        ("cd ./infra || exit 1; terraform apply tfplan", true),
+        (infra_abs.as_str(), true),
+        ("terraform -chdir=infra apply tfplan", true),
+        ("cd rec && terraform apply tfplan2", false),
+        (rec_abs.as_str(), false),
+        ("terraform -chdir=rec apply tfplan2", false),
+        // A `..` component is resolved against the shell's logical
+        // directory, which tirith cannot see: it fails closed.
+        ("cd rec; cd ..; terraform apply tfplan", true),
+        // A directory change tirith cannot resolve fails closed.
+        ("cd \"$D\" && terraform apply tfplan", true),
+        ("pushd infra >/dev/null; popd; terraform apply tfplan", true),
+        ("{ cd infra; }; terraform apply tfplan", true),
+        // The recommended chain records the plan right before the apply.
+        (
+            "terraform plan -out tfplan3 && tirith iac check-plan tfplan3 && terraform apply tfplan3",
+            false,
+        ),
+        ("tirith iac check-plan --json tfplan3 && terraform apply tfplan3", false),
+        ("cd infra && tirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        // Anything short of that still checks the (missing) file and blocks.
+        ("terraform plan -out tfplan3 && terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3; terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3 || terraform apply tfplan3", true),
+        (
+            "tirith iac check-plan tfplan3 && cp other tfplan3 && terraform apply tfplan3",
+            true,
+        ),
+        ("tirith iac check-plan other && terraform apply tfplan3", true),
+        ("tirith iac check-plan tfplan3 && terraform -chdir=infra apply tfplan3", true),
+        ("XDG_STATE_HOME=/tmp/x tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        // R4 fix round 2: a `cd` that may not run (conditional, or in the
+        // `||` branch that only runs when it failed, or backgrounded into a
+        // subshell) does not move the directory the plan is read from.
+        ("false && cd rec; terraform apply tfplan2", true),
+        ("true || cd rec; terraform apply tfplan2", true),
+        ("[ -d nope ] && cd rec; terraform apply tfplan2", true),
+        ("false && cd rec || terraform apply tfplan2", true),
+        ("cd rec || terraform apply tfplan2", true),
+        ("cd rec && false || terraform apply tfplan2", true),
+        ("cd rec || true & terraform apply tfplan2", true),
+        ("cd rec && true & terraform apply tfplan2", true),
+        ("alias cd=true\ncd rec\nterraform apply tfplan2", true),
+        // R4 fix round 3: a quoted or escaped `cd` is still `cd` to the
+        // shell, so after it the directory is unknown.
+        ("cd rec; \\cd ..; terraform apply tfplan2", true),
+        ("cd rec; c''d ..; terraform apply tfplan2", true),
+        ("cd rec; c\"d\" ..; terraform apply tfplan2", true),
+        ("cd rec; 'c'd ..; terraform apply tfplan2", true),
+        ("cd rec; c\\d ..; terraform apply tfplan2", true),
+        ("cd rec; pu''shd ..; terraform apply tfplan2", true),
+        ("cd rec; time c''d ..; terraform apply tfplan2", true),
+        ("cd rec; { c''d ..; }; terraform apply tfplan2", true),
+        ("cd rec; so''urce x; terraform apply tfplan2", true),
+        // Controls: an unconditional cd still moves it.
+        ("cd rec || exit 1; terraform apply tfplan2", false),
+        ("cd rec && echo ok; terraform apply tfplan2", false),
+        ("cd rec\nterraform apply tfplan2", false),
+        // R4 fix round 2: the check-plan shortcut needs a check-plan that
+        // runs whenever the apply runs, and the real (bare-name) tirith.
+        ("true || tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("false && true || tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("echo x | tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("tirith() { :; }; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("alias tirith=true; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("/tmp/x/tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("PATH=/tmp/x:$PATH; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("export PATH=/tmp/x:$PATH; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        ("eval 'tirith() { :; }'; tirith iac check-plan tfplan3 && terraform apply tfplan3", true),
+        // Controls: an unconditional check-plan still records it.
+        ("true; tirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        ("true\ntirith iac check-plan tfplan3 && terraform apply tfplan3", false),
+        (
+            "tirith iac check-plan tfplan3 && terraform apply tfplan3 && tirith iac check-plan tfplan4 && terraform apply tfplan4",
+            false,
+        ),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
+/// The plan gate reads a relative plan from the directory the command runs
+/// in (`AnalysisContext.cwd`), not from tirith's own working directory: the
+/// daemon analyses commands for clients in other directories (review of
+/// PR #274).
+#[test]
+fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+
+    // The caller's directory and tirith's own hold plans of the same
+    // names with opposite recorded states.
+    let caller = root.join("caller");
+    let own = root.join("own");
+    fs::create_dir_all(caller.join("infra")).unwrap();
+    fs::create_dir_all(own.join("infra")).unwrap();
+    let summary = PlanSummary::default();
+    let write = |path: PathBuf, bytes: &[u8], recorded: bool| {
+        fs::write(&path, bytes).unwrap();
+        if recorded {
+            iac_plan::record_plan_hash(bytes, &path, &summary).unwrap();
+        }
+    };
+    write(caller.join("tfplan"), b"CALLER ROOT PLAN", true);
+    write(own.join("tfplan"), b"OWN ROOT PLAN", false);
+    write(caller.join("infra/tfplan"), b"CALLER INFRA PLAN", false);
+    write(own.join("infra/tfplan"), b"OWN INFRA PLAN", true);
+    global.set_cwd(&own).unwrap();
+
+    let mismatch = |input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(caller.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    let wrong = [
+        ("terraform apply tfplan", false),
+        ("terraform apply ./tfplan", false),
+        ("terraform apply infra/tfplan", true),
+        ("terraform -chdir=infra apply tfplan", true),
+        ("cd infra && terraform apply tfplan", true),
+        ("cd infra; cd ..; terraform apply tfplan", true),
+        ("bash -c 'terraform apply tfplan'", false),
+        ("bash -c 'terraform apply infra/tfplan'", true),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+}
+
+/// Review of PR #274: the plan gate follows a literal `cd` only where it
+/// runs whenever the line runs. A `cd` inside a compound command (an `if`,
+/// a loop, a `case`, a brace group, a fish block) may not run, and a loop
+/// runs its earlier commands again after it, so the plan file it leads to
+/// is not the one the apply reads. Before this fix the tracker followed
+/// such a `cd` into the recorded `infra/tfplan` while the shell, which
+/// never ran it, applied the unrecorded `./tfplan`. Also here: a `cd`
+/// through a symlink and back with `..` (bash resolves `..` logically), and
+/// a caller directory whose name was not valid UTF-8.
+#[test]
+fn iac_plan_gate_does_not_follow_a_cd_that_may_not_run() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.set_cwd(&root).unwrap();
+
+    // infra/tfplan is recorded; ./tfplan, where the shell stays when the
+    // cd does not run, is not.
+    let summary = PlanSummary::default();
+    let write = |path: PathBuf, bytes: &[u8], recorded: bool| {
+        fs::write(&path, bytes).unwrap();
+        if recorded {
+            iac_plan::record_plan_hash(bytes, &path, &summary).unwrap();
+        }
+    };
+    fs::create_dir_all(root.join("infra/ops")).unwrap();
+    write(root.join("tfplan"), b"UNRECORDED ROOT PLAN", false);
+    write(root.join("infra/tfplan"), b"RECORDED INFRA PLAN", true);
+    write(root.join("infra/ops/tfplan"), b"UNRECORDED OPS PLAN", false);
+
+    let mismatch = |input: &str, shell: ShellType, cwd: &std::path::Path| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(cwd.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    let posix = ShellType::Posix;
+    let fish = ShellType::Fish;
+    // (input, shell, expected): `true` = the plan gate blocks.
+    let rows = [
+        // The body does not run: the shell applies the unrecorded ./tfplan.
+        (
+            "if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then\ncd ./infra\nfi\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if true; then :; else :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then :; elif false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "while false; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "until true; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "for d in; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "case x in y) :; cd ./infra;; esac; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "case x in\ny)\ncd ./infra\n;;\nesac\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then { :; cd ./infra; }; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "false && if true; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then cat <<E\nfi\nE\ncd ./infra\nfi\nterraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "bash -c 'if false; then :; cd ./infra; fi; terraform apply tfplan'",
+            posix,
+            true,
+        ),
+        (
+            "if false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "if false\ncd ./infra\nend\nterraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "while false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "switch x; case y; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "false; and begin; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        (
+            "if false; :; else if false; :; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        // The shells read `[[ ... ]]` (and a fish brace expansion) whole, so
+        // the `fi` / `done` / `end` in it is text; bash runs a compound
+        // command after `time -p` or `time --`, zsh after a redirection.
+        (
+            "if false; then [[ x && fi ]]; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "until :; do [[ x || done ]]; pushd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; then [[\nfi ]]; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "time -p while false; do :; cd ./infra; done; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "time -- if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "2>/dev/null if false; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        (
+            "if false; echo {a && end }; cd ./infra; end; terraform apply tfplan",
+            fish,
+            true,
+        ),
+        // The second pass of the loop applies infra/ops/tfplan.
+        (
+            "cd ./infra; for i in 1 2; do :; terraform apply tfplan; cd ./ops; done",
+            posix,
+            true,
+        ),
+        (
+            "cd ./infra; for i in 1 2; :; terraform apply tfplan; cd ./ops; end",
+            fish,
+            true,
+        ),
+        // The body runs, but tirith cannot prove it: fails closed.
+        (
+            "if true; then :; cd ./infra; fi; terraform apply tfplan",
+            posix,
+            true,
+        ),
+        // Controls: a cd outside any compound command still moves it.
+        ("cd ./infra; terraform apply tfplan", posix, false),
+        (
+            "if true; then :; fi; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "for d in a; do :; done; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "case x in y) :;; esac; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "cd ./infra; for i in 1 2; do :; terraform apply tfplan; done",
+            posix,
+            false,
+        ),
+        (
+            "if true; :; end; cd ./infra; terraform apply tfplan",
+            fish,
+            false,
+        ),
+        (
+            "if false; :; else if true; :; end; cd ./infra; terraform apply tfplan",
+            fish,
+            false,
+        ),
+        (
+            "if [ -d x ]; then :; fi; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        (
+            "time -p true; cd ./infra; terraform apply tfplan",
+            posix,
+            false,
+        ),
+        ("terraform apply tfplan", posix, true),
+        ("terraform apply infra/tfplan", posix, false),
+    ];
+    let mut wrong = rows
+        .into_iter()
+        .filter(|(input, shell, expected)| mismatch(input, *shell, &root) != *expected)
+        .map(|(input, shell, expected)| (input.to_string(), shell, expected))
+        .collect::<Vec<_>>();
+
+    // `cd link; cd ..`: bash returns to the directory holding `link`
+    // (./tfplan, unrecorded); the physical parent of its target holds a
+    // recorded plan.
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(root.join("deep/target")).unwrap();
+        write(root.join("deep/tfplan"), b"RECORDED DEEP PLAN", true);
+        std::os::unix::fs::symlink(root.join("deep/target"), root.join("link")).unwrap();
+        for input in [
+            "cd ./link; cd ..; terraform apply tfplan",
+            "cd ./link/..; terraform apply tfplan",
+        ] {
+            if !mismatch(input, posix, &root) {
+                wrong.push((input.to_string(), posix, true));
+            }
+        }
+    }
+
+    // A caller directory that was not valid UTF-8 reaches tirith with
+    // U+FFFD in place of its bad bytes; the directory of that name (here
+    // one with a recorded plan) is not where the shell runs.
+    let lossy = root.join("caf\u{FFFD}-infra");
+    fs::create_dir_all(&lossy).unwrap();
+    write(lossy.join("tfplan"), b"RECORDED LOSSY PLAN", true);
+    if !mismatch("terraform apply tfplan", posix, &lossy) {
+        wrong.push((
+            "terraform apply tfplan (lossy cwd)".to_string(),
+            posix,
+            true,
+        ));
+    }
+    if mismatch(
+        &format!("terraform apply {}", lossy.join("tfplan").display()),
+        posix,
+        &lossy,
+    ) && !cfg!(windows)
+    {
+        wrong.push((
+            "terraform apply <absolute> (lossy cwd)".to_string(),
+            posix,
+            false,
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, shell, expected): {wrong:#?}"
+    );
+}
+
+/// The plan gate follows a `cd` to a bare name only while the shell that
+/// runs the line has no `CDPATH`, and that is the caller's environment
+/// (`AnalysisContext.cdpath_inherited`), not tirith's own: the daemon
+/// analyses commands for clients whose environment it does not share
+/// (review of PR #274). Before this fix a daemon started without `CDPATH`
+/// followed `cd infra` into the caller's recorded plan while the client's
+/// shell, with `CDPATH` exported, applied the unrecorded one it leads to.
+#[test]
+fn iac_plan_gate_takes_cdpath_from_the_caller_not_from_tirith() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+
+    // The caller's infra/tfplan is recorded; the infra/tfplan under its
+    // CDPATH, where the shell's `cd infra` leads, is not.
+    let caller = root.join("caller");
+    let cdpath = root.join("cdpath");
+    fs::create_dir_all(caller.join("infra")).unwrap();
+    fs::create_dir_all(cdpath.join("infra")).unwrap();
+    let recorded = b"CALLER INFRA PLAN";
+    fs::write(caller.join("infra/tfplan"), recorded).unwrap();
+    iac_plan::record_plan_hash(
+        recorded,
+        &caller.join("infra/tfplan"),
+        &PlanSummary::default(),
+    )
+    .unwrap();
+    fs::write(cdpath.join("infra/tfplan"), b"CDPATH INFRA PLAN").unwrap();
+    global.set_cwd(&root).unwrap();
+
+    let mismatch = |input: &str, cdpath_inherited: bool| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell: ShellType::Posix,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(caller.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    // (tirith's own CDPATH set, the caller's CDPATH set, input, expected).
+    let rows = [
+        // The caller's CDPATH decides, also for a nested shell, which
+        // inherits it ...
+        (false, true, "cd infra; terraform apply tfplan", true),
+        (false, true, "cd infra && terraform apply tfplan", true),
+        (
+            false,
+            true,
+            "bash -c 'cd infra && terraform apply tfplan'",
+            true,
+        ),
+        // ... and tirith's own does not.
+        (true, false, "cd infra; terraform apply tfplan", false),
+        (
+            true,
+            false,
+            "bash -c 'cd infra && terraform apply tfplan'",
+            false,
+        ),
+        // Controls: no CDPATH anywhere, a cd CDPATH does not search, and
+        // CDPATH in both.
+        (false, false, "cd infra; terraform apply tfplan", false),
+        (false, true, "cd ./infra; terraform apply tfplan", false),
+        (true, true, "cd infra; terraform apply tfplan", true),
+    ];
+    let mut wrong = Vec::new();
+    for (own, inherited, input, expected) in rows {
+        if own {
+            global.set_env("CDPATH", &cdpath);
+        } else {
+            global.remove_env("CDPATH");
+        }
+        if mismatch(input, inherited) != expected {
+            wrong.push((own, inherited, input, expected));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (tirith's CDPATH, caller's CDPATH, input, expected): {wrong:#?}"
+    );
+}
+
+/// Fix round 1 of the CodeRabbit review (CDPATH, core-detect-2): a `cd` to a
+/// bare name may follow `CDPATH`, which the line can set in a spelling the
+/// shell decodes, through an expansion (also one bash evaluates later from
+/// single quotes), or around a nested shell body; a nested body also starts
+/// in the directory, and with the startup files, the commands around it
+/// leave; and code that runs later, or the apply's own expansion, can move
+/// the apply. Each `true` row applied (or could apply) an unrecorded plan
+/// while tirith hashed the recorded one before this fix. Fix round 2 adds
+/// arithmetic over data, a `${ cmd; }` whose command word is built from a
+/// variable, a fish command substitution and code that may redefine
+/// `tirith` before a check-plan chain, and the PowerShell and cmd rows. Fix
+/// round 3 adds the check-plan chain on PowerShell and cmd lines.
+#[test]
+fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
+    use tirith_core::iac_plan::{self, PlanSummary};
+    use tirith_core::verdict::RuleId;
+
+    let mut global = isolate_fixture_state();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let tirith_dir = root.join(".tirith");
+    fs::create_dir_all(&tirith_dir).unwrap();
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "iac_require_plan_before_apply: true\n",
+    )
+    .unwrap();
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    global.set_env("TIRITH_POLICY_ROOT", &root);
+    global.set_env("XDG_STATE_HOME", &state_dir);
+    global.remove_env("CDPATH");
+    global.set_cwd(&root).unwrap();
+
+    // ./tfplan and ./infra/tfplan are recorded; other/tfplan and
+    // other/infra/tfplan (where CDPATH=other or `cd other` leads) are not.
+    let summary = PlanSummary::default();
+    fs::create_dir_all(root.join("infra")).unwrap();
+    fs::create_dir_all(root.join("other/infra")).unwrap();
+    for (path, bytes) in [
+        ("tfplan", &b"RECORDED ROOT PLAN"[..]),
+        ("infra/tfplan", &b"RECORDED INFRA PLAN"[..]),
+    ] {
+        fs::write(root.join(path), bytes).unwrap();
+        iac_plan::record_plan_hash(bytes, &root.join(path), &summary).unwrap();
+    }
+    fs::write(root.join("other/tfplan"), b"UNRECORDED OTHER PLAN").unwrap();
+    fs::write(root.join("other/infra/tfplan"), b"UNRECORDED OTHER INFRA").unwrap();
+    // Fix round 2: where an arithmetic `CDPATH=5` leads, and an unrecorded
+    // plan in the root that only a trusted check-plan chain may skip.
+    fs::create_dir_all(root.join("5/infra")).unwrap();
+    fs::write(root.join("5/infra/tfplan"), b"UNRECORDED 5 INFRA").unwrap();
+    fs::write(root.join("tfplan2"), b"UNRECORDED ROOT PLAN2").unwrap();
+
+    let mismatch_in = |shell: ShellType, input: &str| {
+        let ctx = AnalysisContext {
+            input: input.to_string(),
+            shell,
+            scan_context: ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(root.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        };
+        engine::analyze(&ctx)
+            .findings
+            .iter()
+            .any(|f| matches!(f.rule_id, RuleId::IacPlanHashMismatch))
+    };
+    let mismatch = |input: &str| mismatch_in(ShellType::Posix, input);
+
+    // `$n` may be BASH_ENV (a startup file that redefines `cd`).
+    let dynamic_env = format!(
+        "export \"$n=$v\"; bash -c 'cd {} && terraform apply tfplan'",
+        root.join("infra").display()
+    );
+    let wrong = [
+        // CDPATH in spellings the shell decodes, or built by an expansion.
+        (
+            "export CD''PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // ... also inside single quotes that bash evaluates later.
+        (
+            "y=CD; z=PATH; PS4='$(($y$z=5))'; set -x; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "y=CD; z=PATH; declare -a 'a=($(($y$z=5)))'; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // Code that may run before the apply, or the apply's own expansion.
+        ("trap \"$x\" DEBUG; terraform apply tfplan", true),
+        ("terraform apply tfplan \"${ cd other; }\"", true),
+        // A nested shell whose startup files or functions the line picks.
+        (
+            "HOME=other fish -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (dynamic_env.as_str(), true),
+        (
+            "export CD\\PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "declare -x \"CD\"\"PATH=other\"; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "v=CD; export \"${v}PATH=other\"; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "export $'\\x43DPATH'=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "printf -v C''DPATH other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "export C{D,}PATH=other; cd infra; terraform apply tfplan",
+            true,
+        ),
+        // Around a nested shell body.
+        (
+            "CDPATH=other bash -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (
+            "export CDPATH=other; bash -c 'cd infra; terraform apply tfplan'",
+            true,
+        ),
+        (
+            "env CDPATH=other sh -c 'cd infra && terraform apply tfplan'",
+            true,
+        ),
+        ("cd other; bash -c 'terraform apply tfplan'", true),
+        ("env -C other sh -c 'terraform apply tfplan'", true),
+        // In a heredoc body a builtin reads (blanked out of the view).
+        (
+            ": <<EOF\n${CDPATH:=other}\nEOF\ncd infra\nterraform apply tfplan",
+            true,
+        ),
+        // Fix round 2: arithmetic assigns CDPATH from data that never spells
+        // it (`z=CDPATH=5`, built with `+=`).
+        (
+            "z=CD; z+=PATH=5; (( z )); cd infra; terraform apply tfplan",
+            true,
+        ),
+        ("z=CD; z+=PATH=5; let z; cd infra; terraform apply tfplan", true),
+        (
+            "z=CD; z+=PATH=5; [[ z -eq 5 ]]; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "declare -i n; z=CD; z+=PATH=5; n=z; cd infra; terraform apply tfplan",
+            true,
+        ),
+        (
+            "bash -c 'z=CD; z+=PATH=5; let z; cd infra; terraform apply tfplan'",
+            true,
+        ),
+        // ... and runs a bash 5.3 `${ ...; }` held in data, in the shell.
+        (
+            "z='a[$'; z+='{ c'; z+='d other; }]'; (( z )); terraform apply tfplan",
+            true,
+        ),
+        (
+            "z='$'; z+='{ c'; z+='d other; }'; : ${z@P}; terraform apply tfplan",
+            true,
+        ),
+        // A `${ cmd; }` whose command word is built from a variable, in the
+        // apply's own words or before it.
+        ("f=c; f+=d; terraform apply tfplan ${ $f other; }", true),
+        ("f=c; f+=d; : ${ $f other; }; terraform apply tfplan", true),
+        (
+            "f=c; f+=d; [[ -v a[${ $f other; }] ]]; terraform apply tfplan",
+            true,
+        ),
+        // A zsh glob qualifier that runs code for each match, and bash
+        // `autocd` (a directory name runs as cd) switched on by the line.
+        ("c=c; c+=d; : *(e:'$c other':); terraform apply tfplan", true),
+        ("shopt -s autocd; other; terraform apply tfplan", true),
+        // Code tirith cannot read may define `tirith`, so the chain no longer
+        // skips reading the (unrecorded) plan.
+        (
+            "e=ev; e+=al; p='('; p+=')'; : ${ $e \"tirith$p { :; }\"; }; tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            "BASH_ENV=./x.sh bash -c 'tirith iac check-plan tfplan2 && terraform apply tfplan2'",
+            true,
+        ),
+        ("tirith iac check-plan tfplan2 && terraform apply tfplan2", false),
+        (
+            "bash -c 'tirith iac check-plan tfplan2 && terraform apply tfplan2'",
+            false,
+        ),
+        // A plain apply's own words move nothing.
+        ("ENV=staging terraform apply tfplan", false),
+        ("n=1; echo \"$n\"; cd ./infra; terraform apply tfplan", false),
+        // Controls: nothing reaches CDPATH or the nested body's directory.
+        ("cd infra; terraform apply tfplan", false),
+        ("export TF_LOG=1; cd infra; terraform apply tfplan", false),
+        (
+            "export TF_VAR_region=$REGION; cd ./infra; terraform apply tfplan",
+            false,
+        ),
+        ("grep r notes.txt; cd infra; terraform apply tfplan", false),
+        (
+            "export CD''PATH=other; cd ./infra; terraform apply tfplan",
+            false,
+        ),
+        ("bash -c 'cd infra && terraform apply tfplan'", false),
+        (
+            "CDPATH=other bash -c 'cd ./infra && terraform apply tfplan'",
+            false,
+        ),
+        (
+            "sh -c 'cd infra && terraform apply tfplan'; echo \"exit=$?\"",
+            false,
+        ),
+        ("bash -c 'terraform apply tfplan'", false),
+    ]
+    .into_iter()
+    .filter(|(input, expect_mismatch)| mismatch(input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (input, expected): {wrong:#?}"
+    );
+
+    // Fix round 2: a PowerShell or cmd apply of the recorded plan in the
+    // current directory is allowed again; code in its own words, anything
+    // before it on the line (`cd..` is a PowerShell function and a cmd
+    // command), and a fish command substitution (it runs in the shell
+    // itself) make the plan unlocatable.
+    let wrong = [
+        (ShellType::PowerShell, "terraform apply tfplan", false),
+        (ShellType::PowerShell, "terraform apply ./tfplan", false),
+        (ShellType::Cmd, "terraform apply tfplan", false),
+        (
+            ShellType::PowerShell,
+            "tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            false,
+        ),
+        (ShellType::PowerShell, "terraform apply tfplan2", true),
+        (ShellType::Cmd, "terraform apply tfplan2", true),
+        (
+            ShellType::PowerShell,
+            "terraform apply tfplan $(Set-Location other)",
+            true,
+        ),
+        (ShellType::PowerShell, "cd..; terraform apply tfplan", true),
+        (ShellType::Cmd, "cd.. & terraform apply tfplan", true),
+        // Fix round 3: a PowerShell line trusts the check-plan chain only
+        // when nothing but IaC commands share it (`InvokeScript` can define a
+        // `tirith` function from string pieces), and cmd never trusts it
+        // (it runs a `tirith.bat` / `tirith.cmd` in the current directory
+        // before it searches `PATH`; `P^ATH` is `PATH`), so the unrecorded
+        // plan is read before the line runs.
+        (
+            ShellType::PowerShell,
+            "$ExecutionContext.InvokeCommand.InvokeScript('func'+'tion global:tir'+'ith { }'); tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::PowerShell,
+            "Write-Host hi; tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::PowerShell,
+            "terraform plan -out tfplan2 && tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            false,
+        ),
+        (
+            ShellType::Cmd,
+            "set P^ATH=C:\\x & tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (
+            ShellType::Cmd,
+            "tirith iac check-plan tfplan2 && terraform apply tfplan2",
+            true,
+        ),
+        (ShellType::Fish, "terraform apply tfplan", false),
+        (
+            ShellType::Fish,
+            "set c (string join '' c d); terraform apply tfplan ($c other)",
+            true,
+        ),
+        (
+            ShellType::Fish,
+            "set c (string join '' c d); echo ($c other); terraform apply tfplan",
+            true,
+        ),
+    ]
+    .into_iter()
+    .filter(|(shell, input, expect_mismatch)| mismatch_in(*shell, input) != *expect_mismatch)
+    .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "IacPlanHashMismatch presence differs from (shell, input, expected): {wrong:#?}"
     );
 }
 
@@ -2851,6 +3891,8 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -2952,6 +3994,8 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };
@@ -3043,6 +4087,8 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: state,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         engine::analyze(&ctx)
     };

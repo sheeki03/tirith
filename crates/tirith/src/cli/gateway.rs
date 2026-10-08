@@ -2875,6 +2875,11 @@ pub fn run_gateway_with_options(
         }
     };
 
+    // The configuration is valid, so the gateway is going to serve: refresh
+    // an enrolled team policy cache in the background, as `tirith check`
+    // does, for as long as it runs.
+    crate::cli::team_enrollment::start_server_background_refresh();
+
     // IM2, load the committed descriptor-lock baseline and make the fail-closed
     // decision on a present-but-unloadable lock BEFORE spawning the upstream, so a
     // refusal under `fail_mode: closed` never first launches the very MCP server it
@@ -4529,6 +4534,8 @@ fn gateway_analysis_context(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     }
 }
 
@@ -8584,6 +8591,7 @@ mod tests {
 
     #[test]
     fn malformed_task_authorization_notification_is_dropped_without_a_response() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
@@ -8619,6 +8627,7 @@ mod tests {
 
     #[test]
     fn locally_derived_task_identity_ignores_only_jsonrpc_correlation_id() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let permit = test_tool_contract("Bash", None);
         let request = |id, command: &str| {
             serde_json::json!({
@@ -8688,6 +8697,7 @@ mod tests {
 
     #[test]
     fn tool_permit_binds_server_launch_descriptor_and_both_schemas() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let runtime = gateway_tool_runtime_binding(
             Some("server@config"),
             "server",
@@ -8717,6 +8727,7 @@ mod tests {
 
     #[test]
     fn missing_receipts_return_only_safe_exact_challenge_projections() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let runtime = gateway_tool_runtime_binding(
             Some("server@config"),
             "server",
@@ -8837,6 +8848,7 @@ mod tests {
 
     #[test]
     fn guarded_policy_denial_and_receipt_failures_keep_distinct_wire_contracts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "Bash", "arguments": {"command": "echo safe"}}
@@ -8916,6 +8928,7 @@ mod tests {
 
     #[test]
     fn guarded_forward_consumes_an_exact_boundary_typed_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "Bash", "arguments": {"command": "echo safe"}}
@@ -8959,6 +8972,7 @@ mod tests {
 
     #[test]
     fn unmatched_tools_call_is_incomplete_and_protocol_messages_remain_exempt() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let mut policy = tirith_core::policy::Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
@@ -9033,6 +9047,7 @@ mod tests {
 
     #[test]
     fn unmatched_tools_call_off_mode_uses_a_typed_gateway_forward() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let policy = tirith_core::policy::Policy::default();
         let pending = Mutex::new(PendingRequests::new());
@@ -9232,6 +9247,7 @@ mod tests {
 
     #[test]
     fn custom_interpreter_classification_does_not_depend_on_path_existence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let entrypoint = static_interpreted_entrypoint(
             Path::new("/usr/local/bin/custom-runtime"),
@@ -9255,6 +9271,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn interpreted_snapshot_excludes_self_referential_descriptor_lock() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("server.py"), b"pass\n").unwrap();
         std::fs::create_dir(repo.path().join(".tirith")).unwrap();
@@ -9272,6 +9289,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn interpreted_snapshot_refuses_symlinked_dependencies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let repo = tempfile::tempdir().unwrap();
@@ -9498,6 +9516,7 @@ guarded_tools:
 
     #[test]
     fn test_config_rejects_zero_pending_timeout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = "guarded_tools: []\npolicy:\n  pending_timeout_ms: 0\n";
         let config: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
         let err = CompiledConfig::from_config(config).unwrap_err();
@@ -9646,6 +9665,7 @@ policy:
     // does not inherit the parent environment and strips sensitive variables.
     #[test]
     fn mcp_capsule_spec_scrubs_env_but_keeps_recursion_var() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = mcp_server_capsule_spec(Path::new("."));
         assert!(!spec.environment.inherit, "must not inherit parent env");
         assert!(
@@ -9880,6 +9900,7 @@ guarded_tools:
 
     #[test]
     fn gateway_analysis_context_is_noninteractive_and_cannot_honor_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let ctx = gateway_analysis_context(
             "TIRITH=0 echo should-not-bypass".to_string(),
             ShellType::Posix,
@@ -10547,6 +10568,7 @@ policy:
 
     #[test]
     fn test_not_guarded_duplicate_id_is_denied_before_second_forward() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let pending = Mutex::new(PendingRequests::new());
@@ -10621,6 +10643,7 @@ policy:
 
     #[test]
     fn test_client_jsonrpc_boundary_blocks_invalid_unguarded_messages_before_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
 
         for (invalid, expected_reply_id) in [
@@ -10694,6 +10717,7 @@ policy:
 
     #[test]
     fn test_client_jsonrpc_boundary_allows_valid_request_and_notification() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         for valid in [
             serde_json::json!({
@@ -10740,6 +10764,7 @@ policy:
 
     #[test]
     fn test_invalid_guarded_id_returns_local_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let obj: Value = serde_json::json!({
@@ -11288,6 +11313,7 @@ policy:
 
     #[test]
     fn proxy_ids_restore_exact_string_number_and_null_ids_once() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for original_id in [Value::from("request-1"), Value::from(17), Value::Null] {
             let pending = Mutex::new(PendingRequests::new());
             let request = serde_json::json!({
@@ -11359,6 +11385,7 @@ policy:
 
     #[test]
     fn guarded_notifications_are_denied_even_when_fail_mode_is_open() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
@@ -11394,6 +11421,7 @@ policy:
 
     #[test]
     fn poisoned_pending_table_always_drops_unverifiable_responses() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = pending.lock().unwrap();
@@ -11441,6 +11469,7 @@ policy:
 
     #[test]
     fn test_passthrough_request_non_listing_has_no_kind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-listing passthrough request (e.g. `ping`) carries no inspect kind.
         let pending = Mutex::new(PendingRequests::new());
         let req = serde_json::json!({
@@ -11456,6 +11485,7 @@ policy:
 
     #[test]
     fn test_listing_injection_blocks_via_jsonrpc_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An injection seed in a tools/list description blocks; the blocked
         // response is a JSON-RPC error keyed to the same id (list calls expect a
         // result, so a policy block surfaces as a transport-shaped error).
@@ -11495,6 +11525,7 @@ policy:
 
     #[test]
     fn test_tools_list_rejects_missing_empty_and_duplicate_names() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cases = [
             (
                 serde_json::json!({"tools": [{"description": "missing"}]}),
@@ -11528,6 +11559,7 @@ policy:
 
     #[test]
     fn test_tools_list_rejects_names_that_collide_after_sanitization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         register_inspect(&pending, Value::from(29), ResponseKind::ToolsList);
         let upstream = serde_json::json!({
@@ -11549,6 +11581,7 @@ policy:
 
     #[test]
     fn test_descriptor_enforcement_rejects_paginated_tools_list_capture() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let baseline =
             baseline_from_tools("s", &serde_json::json!({"tools": [{"name": "approved"}]}));
         let pending = Mutex::new(PendingRequests::new());
@@ -11595,6 +11628,7 @@ policy:
 
     #[test]
     fn test_descriptor_approval_persists_exact_live_baseline_atomically() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(
             repo.path().join(".mcp.json"),
@@ -11641,6 +11675,7 @@ policy:
 
     #[test]
     fn test_descriptor_approval_failure_does_not_rewrite_lock() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(
             repo.path().join(".mcp.json"),
@@ -11676,6 +11711,7 @@ policy:
 
     #[test]
     fn test_descriptor_approval_policy_deny_creates_no_lock_or_baseline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
         let config = repo.path().join(".tirith");
@@ -11734,6 +11770,7 @@ policy:
 
     #[test]
     fn test_descriptor_drift_suspends_added_and_changed_tools() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The approved lock baselines a single tool `safe` with a fixed
         // description. The live tools/list (a) CHANGES `safe`'s description (a
         // rug-pull) and (b) ADDS an unapproved `evil` tool. Both must be SUSPENDED
@@ -11789,6 +11826,7 @@ policy:
 
     #[test]
     fn test_descriptor_drift_keeps_unchanged_tools() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A tool whose descriptor is byte-identical to the lock is forwarded
         // untouched; only the drifted siblings are suspended.
         let approved = serde_json::json!({
@@ -11827,6 +11865,7 @@ policy:
 
     #[test]
     fn test_descriptor_drift_no_drift_forwards_all() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // When the live list matches the lock exactly, nothing is suspended.
         let approved = serde_json::json!({
             "tools": [
@@ -11859,6 +11898,7 @@ policy:
 
     #[test]
     fn test_descriptor_drift_no_baseline_forwards_unchanged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // With no descriptor-lock baseline (no lockfile), drift detection is off and
         // even an all-new tools/list forwards verbatim.
         let pending = Mutex::new(PendingRequests::new());
@@ -11882,6 +11922,7 @@ policy:
 
     #[test]
     fn test_drift_suspended_tool_is_also_blocked_on_tools_call() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CR4, a rug-pull: the lock approved `safe` with a benign description; the
         // live tools/list CHANGES `safe`'s description (its inputSchema still
         // compiles). Drift holds `safe` out of the forwarded tools/list, AND must
@@ -12008,6 +12049,7 @@ policy:
 
     #[test]
     fn test_listing_resource_link_ssrf_blocks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A prompts/get response carrying a resource_link to the cloud-metadata
         // endpoint is blocked even though the text is clean.
         let pending = Mutex::new(PendingRequests::new());
@@ -12040,6 +12082,7 @@ policy:
 
     #[test]
     fn test_listing_benign_forwards_and_sanitizes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A benign resources/list response forwards; any ANSI/zero-width display
         // bytes in a descriptor are scrubbed on the way through.
         let pending = Mutex::new(PendingRequests::new());
@@ -12073,6 +12116,7 @@ policy:
 
     #[test]
     fn test_listing_injection_created_by_sanitization_is_blocked() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         register_inspect(&pending, Value::from(31), ResponseKind::ToolsList);
 
@@ -12100,6 +12144,7 @@ policy:
 
     #[test]
     fn test_listing_not_inspected_without_filter_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C4 inspection is gated behind --filter-output, like the C2 tool-call
         // filter: with filter_output=false a malicious listing forwards verbatim
         // (the operator opted out of MCP output filtering entirely).
@@ -12126,6 +12171,7 @@ policy:
 
     #[test]
     fn test_listing_error_envelope_is_sanitized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An error response to a listing request still has OSC52 scrubbed from
         // error.message (an upstream must not smuggle a terminal payload there).
         let pending = Mutex::new(PendingRequests::new());
@@ -12148,6 +12194,7 @@ policy:
 
     #[test]
     fn test_live_response_augments_and_retires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::verdict::{RuleId, Severity};
         let pending = Mutex::new(PendingRequests::new());
         register_warn(
@@ -12184,6 +12231,7 @@ policy:
 
     #[test]
     fn test_live_response_string_id_augments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::verdict::{RuleId, Severity};
         let pending = Mutex::new(PendingRequests::new());
         register_warn(
@@ -12214,6 +12262,7 @@ policy:
 
     #[test]
     fn test_filter_blocks_osc52_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         register_filter(&pending, Value::from(42));
 
@@ -12258,6 +12307,7 @@ policy:
 
     #[test]
     fn test_filter_passes_through_benign_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         register_filter(&pending, Value::from(7));
 
@@ -12288,6 +12338,7 @@ policy:
 
     #[test]
     fn test_unguarded_tools_call_response_still_crosses_output_filter() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -12353,6 +12404,7 @@ policy:
 
     #[test]
     fn test_hardened_error_validation_precedes_pending_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for malformed_error in [
             serde_json::json!("not-an-object"),
             serde_json::json!({"code": "-32603", "message": "bad"}),
@@ -12393,6 +12445,7 @@ policy:
 
     #[test]
     fn test_hardened_unsafe_error_consumes_one_pending_contract_and_clean_error_forwards() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 703, "method": "ping", "params": {}
@@ -12469,6 +12522,7 @@ policy:
 
     #[test]
     fn test_unknown_hardened_errors_never_create_client_responses() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         for response in [
             serde_json::json!({
@@ -12498,6 +12552,7 @@ policy:
 
     #[test]
     fn test_generic_initialize_result_text_is_filtered_and_sanitized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 704, "method": "initialize", "params": {}
@@ -12533,6 +12588,7 @@ policy:
 
     #[test]
     fn test_filter_blocks_osc52_in_error_message() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // OSC52 is a blocking output rule. Error envelopes must receive the
         // same verdict as tool results, and the attacker-controlled message
         // must not survive inside a merely sanitized upstream envelope.
@@ -12566,6 +12622,7 @@ policy:
 
     #[test]
     fn test_error_sanitizer_failure_retains_analysis_incomplete_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut error = serde_json::json!({
             "code": -32603,
             "message": "safe",
@@ -12595,6 +12652,7 @@ policy:
 
     #[test]
     fn test_generic_result_block_envelope_retains_rule_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 13,
@@ -12617,6 +12675,7 @@ policy:
 
     #[test]
     fn test_generic_result_sanitizer_failure_retains_analysis_incomplete_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 14,
@@ -12643,6 +12702,7 @@ policy:
 
     #[test]
     fn test_filter_blocks_malformed_result_in_every_fail_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for fail_mode_closed in [false, true] {
             let pending = Mutex::new(PendingRequests::new());
             register_filter(&pending, Value::from(21));
@@ -12673,6 +12733,7 @@ policy:
 
     #[test]
     fn test_filter_handles_missing_is_error_field() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         register_filter(&pending, Value::from(5));
 
@@ -12692,6 +12753,7 @@ policy:
 
     #[test]
     fn test_filter_preserves_image_block_losslessly_on_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2: an image content block (no `text` field) must survive the typed
         // filter byte-for-byte on Allow. The pre-C2 `reshape_for_deserialize`
         // would have stringified/dropped it.
@@ -12728,6 +12790,7 @@ policy:
 
     #[test]
     fn test_filter_preserves_unknown_block_losslessly_on_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2 compat mode: a content block this build does not model is forwarded
         // unchanged, not coerced or dropped.
         let pending = Mutex::new(PendingRequests::new());
@@ -12758,6 +12821,7 @@ policy:
 
     #[test]
     fn test_filter_catches_taint_hidden_in_image_data() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2: taint living only in a non-text block's string leaf (here an OSC52
         // payload smuggled into an image `data` field) must still be scanned and
         // blocked; it must not ride through because the block is not `text`.
@@ -12797,6 +12861,7 @@ policy:
 
     #[test]
     fn test_filter_catches_osc52_split_across_content_items() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2 boundary-split: an OSC52 sequence split across two separate text
         // content items must be reassembled by the streaming scanner and blocked.
         let pending = Mutex::new(PendingRequests::new());
@@ -12825,6 +12890,7 @@ policy:
 
     #[test]
     fn test_filter_catches_injection_split_across_content_items() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2 boundary-split: a prompt-injection seed split across two text items
         // must be detected by the streaming scanner's cross-boundary join.
         let pending = Mutex::new(PendingRequests::new());
@@ -12854,6 +12920,7 @@ policy:
 
     #[test]
     fn test_filter_final_scan_covers_exact_reconstructed_result() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The synthetic cross-leaf sanitizer can legitimately consume a
         // structured leaf as payload of an unterminated control opened in a text
         // block. The lossless re-emitter sanitizes that structured value in its
@@ -12885,6 +12952,7 @@ policy:
 
     #[test]
     fn test_filter_preserves_text_block_metadata_on_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2: a text block's sibling fields (annotations, _meta) must survive the
         // re-stitch; only the scanned `text` is replaced (here unchanged on Allow).
         let pending = Mutex::new(PendingRequests::new());
@@ -12918,6 +12986,7 @@ policy:
 
     #[test]
     fn test_filter_scrubs_structured_content_on_allow_lossless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C2: structured content survives the typed re-emit, with ANSI/zero-width
         // scrubbed (the data is re-attached from the original, not the synthetic
         // scan view), while a sibling image block is preserved verbatim.
@@ -12961,6 +13030,7 @@ policy:
 
     #[test]
     fn test_schema_cache_suspends_tool_with_uncompilable_schema() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A tools/list whose tool declares a malformed inputSchema (`type: 123`)
         // must SUSPEND that tool: it is removed from the forwarded list and cached
         // as suspended (fail-closed: never "validate nothing").
@@ -13161,6 +13231,7 @@ policy:
 
     #[test]
     fn test_no_id_tools_call_to_suspended_tool_is_dropped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // IM3, a notification-shaped tools/call (no `id`) to a SUSPENDED tool must
         // be DROPPED (not forwarded raw): before the fix it returned "forward" and
         // the suspended tool was invoked via a no-id call, bypassing the C2 gate.
@@ -13389,6 +13460,7 @@ policy:
 
     #[test]
     fn test_tools_list_poisoned_cache_fails_closed_whole_list() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // MN4, a poisoned schema cache means NO tool can be schema-validated; the
         // whole `tools/list` must be held out (every tool suspended) rather than
         // forwarded unvalidated, for parity with the request path. Poison the cache
@@ -13440,6 +13512,7 @@ policy:
 
     #[test]
     fn test_response_structured_content_violating_output_schema_blocked() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // End to end: a tools/list declares an outputSchema; the matching tools/call
         // response returns structuredContent that violates it -> blocked.
         let pending = Mutex::new(PendingRequests::new());
@@ -13514,6 +13587,7 @@ policy:
 
     #[test]
     fn test_response_structured_content_valid_against_output_schema_forwards() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A structuredContent that satisfies the outputSchema forwards (filtered).
         let pending = Mutex::new(PendingRequests::new());
         let cache = Mutex::new(ToolSchemaCache::new());
@@ -13571,6 +13645,7 @@ policy:
 
     #[test]
     fn test_sanitized_structured_key_collision_blocks_end_to_end() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let cache = Mutex::new(ToolSchemaCache::new());
         cache.lock().unwrap().tools.insert(
@@ -13632,6 +13707,7 @@ policy:
 
     #[test]
     fn test_exact_sanitized_structured_content_is_schema_validated_again() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let cache = Mutex::new(ToolSchemaCache::new());
         let raw_label = "\x1B[31mred\x1B[0m";
@@ -14036,6 +14112,7 @@ policy:
 
     #[test]
     fn logical_pending_deadlines_do_not_depend_on_sweep_cadence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending_timeout = Duration::from_secs(5);
         let retention = Duration::from_secs(7);
         let payload = || PendingPayload {
@@ -14139,6 +14216,7 @@ policy:
 
     #[test]
     fn client_cancellation_rewrites_exact_owner_and_retains_tombstone() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let pending = Mutex::new(PendingRequests::new());
         let schema_cache = Mutex::new(ToolSchemaCache::new());
@@ -14226,6 +14304,7 @@ policy:
 
     #[test]
     fn malformed_or_unknown_client_cancellation_is_dropped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = test_config();
         let pending = Mutex::new(PendingRequests::new());
         let schema_cache = Mutex::new(ToolSchemaCache::new());
@@ -14262,6 +14341,7 @@ policy:
 
     #[test]
     fn test_late_response_after_timeout_blocks_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A response arriving after the TimedOut tombstone must be blocked under
         // fail-closed (never delete-then-allow): the raw upstream bytes are
         // replaced with a deny envelope keyed to the same id.
@@ -14295,6 +14375,7 @@ policy:
 
     #[test]
     fn test_late_response_after_timeout_dropped_fail_open() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Under fail-open the late response is dropped (None) rather than forwarded
         // unfiltered.
         let pending = Mutex::new(PendingRequests::new());
@@ -14319,6 +14400,7 @@ policy:
 
     #[test]
     fn test_unknown_response_id_is_dropped_without_forging_a_client_envelope() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The unknown id is attacker-controlled. Neither the raw response nor a
         // synthetic keyed denial may create a client-visible message for it.
         let pending = Mutex::new(PendingRequests::new());
@@ -14333,6 +14415,7 @@ policy:
 
     #[test]
     fn test_unknown_response_id_dropped_when_output_filter_is_active() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
@@ -14348,6 +14431,7 @@ policy:
 
     #[test]
     fn test_unknown_response_id_is_dropped_in_legacy_unhardened_mode_too() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let upstream = serde_json::json!({
             "jsonrpc": "2.0",
@@ -14520,6 +14604,7 @@ policy:
 
     #[test]
     fn test_notification_is_inspected_and_forwarded_when_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A clean upstream notification is inspected independently of the
         // response pending table and remains protocol-compatible.
         let pending = Mutex::new(PendingRequests::new());
@@ -14536,6 +14621,7 @@ policy:
 
     #[test]
     fn test_server_initiated_request_denied_without_negotiated_capability() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The gateway does not yet observe negotiated sampling/elicitation
         // capabilities, so hardened mode must deny active server requests.
         let pending = Mutex::new(PendingRequests::new());
@@ -14552,6 +14638,7 @@ policy:
 
     #[test]
     fn test_request_only_and_unknown_server_methods_do_not_bypass_without_id() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         for method in [
             "sampling/createMessage",
@@ -14574,6 +14661,7 @@ policy:
 
     #[test]
     fn test_tools_list_changed_invalidates_live_descriptor_snapshot_before_compat_passthrough() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let baseline =
             baseline_from_tools("s", &serde_json::json!({"tools": [{"name": "approved"}]}));
@@ -14618,6 +14706,7 @@ policy:
 
     #[test]
     fn test_server_initiated_request_is_denied_even_when_unhardened() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let req = serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "sampling/createMessage", "params": {}
@@ -14635,6 +14724,7 @@ policy:
 
     #[test]
     fn test_server_notification_injection_is_dropped_and_controls_are_scrubbed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let injection = serde_json::json!({
             "jsonrpc": "2.0",
@@ -14660,6 +14750,7 @@ policy:
 
     #[test]
     fn test_hardened_server_shape_validation_precedes_cache_and_pending_mutation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cache = Mutex::new(ToolSchemaCache::new());
         cache
             .lock()
@@ -14728,6 +14819,7 @@ policy:
 
     #[test]
     fn test_hardened_server_output_drops_unparseable_and_malformed_messages() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         assert!(
             run_upstream(b"not json", &pending, true, true).is_none(),
@@ -14783,6 +14875,7 @@ policy:
 
     #[test]
     fn test_unhardened_server_output_still_drops_malformed_protocol_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pending = Mutex::new(PendingRequests::new());
         let raw = b"not json";
         assert!(run_upstream(raw, &pending, false, false).is_none());
@@ -14809,6 +14902,7 @@ policy:
 
     #[test]
     fn test_register_passthrough_request_tracks_non_guarded_id() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-guarded id-bearing request is registered so its response is known.
         let pending = Mutex::new(PendingRequests::new());
         let req = serde_json::json!({

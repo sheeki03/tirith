@@ -717,6 +717,9 @@ fn finish_route(
     // Claim the budget BEFORE reading, so two workers cannot both read against
     // the same remaining bytes.
     let claim = settings.max_response_bytes;
+    // Rust 1.99 deprecates `fetch_update` as a rename to `try_update`, which
+    // the 1.83 MSRV does not have.
+    #[allow(deprecated)]
     let granted = remaining
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             (left >= claim).then(|| left - claim)

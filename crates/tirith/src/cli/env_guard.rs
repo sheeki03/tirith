@@ -601,6 +601,7 @@ mod tests {
 
     #[test]
     fn an_indented_lookalike_key_is_not_rewritten_and_does_not_suppress_the_append() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `env_guard_enabled:` nested under another key means nothing. Matching
         // it with `trim_start()` rewrote it at column zero, which corrupted the
         // document and marked the key as already replaced, so the real
@@ -638,6 +639,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_appends_and_replaces() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(&path, "paranoia: 2\nfail_mode: open\n").unwrap();
@@ -661,6 +663,7 @@ mod tests {
 
     #[test]
     fn guard_unknown_action_returns_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(guard("bogus", false), 2);
     }
 
@@ -696,6 +699,7 @@ mod tests {
 
     #[test]
     fn normal_diff_loader_fails_safely_without_overwriting_invalid_snapshot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env_snapshot.json");
         let invalid = "{not valid snapshot json";
@@ -710,6 +714,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_refuses_symlinked_containing_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
@@ -730,6 +735,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_refuses_symlinked_final_component() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");
@@ -753,6 +759,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_aborts_on_non_regular_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("repo").join(".tirith");
         let path = dir.join("policy.yaml");

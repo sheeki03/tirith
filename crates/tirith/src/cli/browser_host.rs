@@ -323,6 +323,7 @@ mod tests {
     /// short body whose declared length we vary.
     #[test]
     fn cap_boundary_is_inclusive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Exactly MAX is permitted as a length — we don't supply the full body,
         // so it then reports Truncated (not TooLarge), proving the cap check
         // passed at the boundary.
@@ -466,6 +467,7 @@ mod tests {
     /// expected JSON.
     #[test]
     fn ack_frame_is_well_formed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut buf: Vec<u8> = Vec::new();
         write_ack(&mut buf, true).unwrap();
         let mut cursor = std::io::Cursor::new(buf);

@@ -91,16 +91,19 @@ class OwnerControls(unittest.TestCase):
         with self.assertRaises(AssertionError): self.discovery()
     def test_public_launcher_must_reuse_exact_owned_service(self):
         launch = {"kind": "dashboard_launch", "service_id": self.record["service_id"],
-                  "url": f"http://127.0.0.1:12345/#token={self.record['token']}",
+                  "url": f"http://127.0.0.1:12345/#code={'e' * 64}",
                   "browser_opened": False, "protection_changed": False}
         HARNESS.verify_launch(launch, self.record)
         for key, bad in (("service_id", str(uuid.uuid4())), ("url", "http://other.example/"),
+                         ("url", f"http://127.0.0.1:12345/#token={self.record['token']}"),
+                         ("url", f"http://127.0.0.1:12345/#code={self.record['token']}"),
+                         ("url", "http://127.0.0.1:12345/#code=short"),
                          ("browser_opened", True), ("protection_changed", True)):
             with self.subTest(key=key), self.assertRaises(AssertionError):
                 HARNESS.verify_launch({**launch, key: bad}, self.record)
     def test_launcher_probe_explicitly_forbids_detached_replacement(self):
         launch = {"kind": "dashboard_launch", "service_id": self.record["service_id"],
-                  "url": f"http://127.0.0.1:12345/#token={self.record['token']}",
+                  "url": f"http://127.0.0.1:12345/#code={'e' * 64}",
                   "browser_opened": False, "protection_changed": False}
         seen = []
         def cli(*args):

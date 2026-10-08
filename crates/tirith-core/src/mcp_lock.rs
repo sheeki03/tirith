@@ -1713,15 +1713,7 @@ fn compute_inventory_hash(servers: &[McpLockServer]) -> String {
     hex_lower(&hasher.finalize())
 }
 
-/// Lowercase hex encoding of a byte slice (local — avoids the `hex` crate).
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
+use crate::util::hex as hex_lower;
 
 // ---------------------------------------------------------------------------
 // Discovery

@@ -10,28 +10,20 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+#[path = "hook_presence.rs"]
+mod hook_presence;
 #[cfg(unix)]
-#[path = "activation_transport.rs"]
-mod activation_transport;
-#[cfg(unix)]
-pub use activation_transport::{
-    activation_client_exchange, activation_server_receive, ActivationExchangeId,
-    ActivationReplyOwner, ActivationTransportError, ACTIVATION_REPLY_CAP, ACTIVATION_REQUEST_CAP,
-};
+use hook_presence::{hook_presence_key, presence_key, registered_presence};
+pub use hook_presence::{register_hook_presence, HookPresenceFamily};
 
 #[path = "shell_verification.rs"]
 mod shell_verification;
 pub use shell_verification::{
-    execute_automatic_shell_verification_probe, execute_shell_verification_probe,
-    finish_automatic_shell_verification_status, finish_shell_verification,
+    execute_shell_verification_probe, finish_shell_verification,
     finish_shell_verification_authenticated, observe_shell_verification_hook,
     start_shell_verification, ShellVerificationChallenge, ShellVerificationHookDecision,
     ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
     ShellVerificationStatus,
-};
-#[cfg(unix)]
-pub use shell_verification::{
-    start_automatic_shell_verification, AutomaticShellVerification, AutomaticVerificationStage,
 };
 
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
@@ -428,15 +420,8 @@ fn token_sha256(token: &str) -> String {
     sha256_hex(token.as_bytes())
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
+#[cfg(unix)]
+use crate::util::hex as hex_lower;
 
 fn current_hook_instance(
     expected_channel: ShellReceiptChannel,
@@ -459,176 +444,6 @@ fn current_hook_instance(
     }
     validate_shell_hook_instance(&instance, shell_pid, family, expected_session_id)?;
     Ok(instance)
-}
-
-/// Live authentication of this process's registered parent shell. This is not
-/// interception evidence or authority to signal that process. The context is
-/// neither serializable nor clonable and must remain in its creating process.
-pub struct AuthenticatedShellContext {
-    shell_pid: u32,
-    #[cfg(unix)]
-    issuer_pid: u32,
-    #[cfg(unix)]
-    family: ShellHookFamily,
-    #[cfg(unix)]
-    session_id: String,
-    #[cfg(unix)]
-    session_environment: Option<std::ffi::OsString>,
-    #[cfg(unix)]
-    secret: String,
-    #[cfg(unix)]
-    identity: ShellProcessIdentity,
-    #[cfg(unix)]
-    executable: TirithExecutableIdentity,
-    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl AuthenticatedShellContext {
-    /// A read-only native observation coordinate, never a process handle.
-    pub fn shell_pid(&self) -> u32 {
-        self.shell_pid
-    }
-
-    /// Private correlation for one explicit automatic-activation operation.
-    /// This is not a capability, record signature, or shell execution proof;
-    /// callers must retain this context and independently revalidate it. Never
-    /// expose the value in argv, output, public DTOs, or the setup journal.
-    pub fn automatic_claim_binding(&self, operation_id: &str) -> Result<String, String> {
-        if !uuid::Uuid::parse_str(operation_id)
-            .is_ok_and(|id| !id.is_nil() && id.to_string() == operation_id)
-        {
-            return Err("automatic claim requires a canonical non-nil operation ID".into());
-        }
-        self.revalidate()?;
-        #[cfg(unix)]
-        {
-            if self.family != ShellHookFamily::Zsh {
-                return Err("automatic claim requires the authenticated Zsh channel".into());
-            }
-            let binding = secret_seal(
-                &self.secret,
-                "tirith-automatic-claim-shell-v1",
-                &serde_json::json!({
-                    "operation_id": operation_id,
-                    "shell_pid": self.shell_pid,
-                    "shell_identity": self.identity,
-                    "family": self.family,
-                    "session": self.session_id,
-                    "executable": self.executable,
-                }),
-            );
-            self.revalidate()?;
-            Ok(binding)
-        }
-        #[cfg(not(unix))]
-        {
-            Err("automatic claim binding is unsupported on this platform".into())
-        }
-    }
-
-    pub fn revalidate(&self) -> Result<(), String> {
-        #[cfg(not(unix))]
-        {
-            Err("authenticated shell context is unsupported on this platform".into())
-        }
-        #[cfg(unix)]
-        {
-            if std::process::id() != self.issuer_pid {
-                return Err("authenticated shell context left its creating process".into());
-            }
-            if capture_context_session_environment(&self.session_id)? != self.session_environment {
-                return Err("authenticated shell context session environment changed".into());
-            }
-            validate_shell_hook_instance_inner(
-                &self.secret,
-                self.shell_pid,
-                self.family,
-                &self.session_id,
-                false,
-            )?;
-            let identity = shell_process_identity(self.shell_pid)
-                .map_err(|_| "authenticated shell process is no longer available")?;
-            if identity != self.identity || current_tirith_executable_identity()? != self.executable
-            {
-                return Err("authenticated shell context identity changed".into());
-            }
-            // Bracket the native identity observations with complete capability
-            // validation; no capability/global writer lock is held while idle.
-            validate_shell_hook_instance_inner(
-                &self.secret,
-                self.shell_pid,
-                self.family,
-                &self.session_id,
-                false,
-            )?;
-            if capture_context_session_environment(&self.session_id)? != self.session_environment {
-                return Err("authenticated shell context session environment changed".into());
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Authenticate the protocol-v3 capability delivered privately to the current
-/// direct child. Caller supplied PIDs or inherited status markers cannot
-/// construct a context, and the result establishes no protection observation.
-pub fn authenticate_shell_context(
-    channel: ShellReceiptChannel,
-    session_id: &str,
-) -> Result<AuthenticatedShellContext, String> {
-    #[cfg(not(unix))]
-    {
-        let _ = (channel, session_id);
-        Err("authenticated shell context is unsupported on this platform".into())
-    }
-    #[cfg(unix)]
-    {
-        let session_environment = capture_context_session_environment(session_id)?;
-        let secret = current_hook_instance(channel, session_id)?;
-        let parent = unsafe { libc::getppid() };
-        if parent <= 1 {
-            return Err("authenticated shell context has no live direct parent".into());
-        }
-        let shell_pid = parent as u32;
-        let context = AuthenticatedShellContext {
-            shell_pid,
-            issuer_pid: std::process::id(),
-            family: channel.hook_family()?,
-            session_id: session_id.into(),
-            session_environment,
-            secret,
-            identity: shell_process_identity(shell_pid)
-                .map_err(|_| "authenticated shell process is no longer available")?,
-            executable: current_tirith_executable_identity()?,
-            _same_thread: std::marker::PhantomData,
-        };
-        context.revalidate()?;
-        Ok(context)
-    }
-}
-
-// Unlike env_session_id(), this reads the actual environment on every call.
-// Its bounded, private snapshot also preserves existing fallback authentication
-// when the original variable is absent or invalid; no fallback file is reread.
-#[cfg(unix)]
-fn capture_context_session_environment(
-    session_id: &str,
-) -> Result<Option<std::ffi::OsString>, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let observed = std::env::var_os("TIRITH_SESSION_ID");
-    if let Some(value) = &observed {
-        if value.as_os_str().as_bytes().len() > 256 {
-            return Err("authenticated shell context session environment exceeds its bound".into());
-        }
-        if value
-            .to_str()
-            .is_some_and(|value| crate::session::is_valid_session_id(value) && value != session_id)
-        {
-            return Err("authenticated shell context has a different explicit session".into());
-        }
-    }
-    Ok(observed)
 }
 
 #[cfg(unix)]
@@ -711,11 +526,14 @@ fn secret_seal(token: &str, domain: &str, value: &serde_json::Value) -> String {
 #[cfg(unix)]
 #[derive(Debug)]
 enum ShellProcessLookupError {
+    // Only the Linux and macOS identity readers can report a vanished shell;
+    // other Unix targets (Android, the BSDs) refuse registration outright.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Missing,
     Rejected(String),
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_shell_pid(shell_pid: u32) -> Result<libc::pid_t, String> {
     if shell_pid <= 1 || shell_pid > libc::pid_t::MAX as u32 {
         return Err("shell receipt registration has an invalid shell PID".to_string());
@@ -1116,6 +934,19 @@ fn existing_capability_paths(
     shell_pid: u32,
     shell_start_fingerprint: &str,
 ) -> Result<(PathBuf, PathBuf), String> {
+    let receipts = existing_receipt_directory(effective_uid)?
+        .ok_or_else(|| "existing shell capability directory is unavailable".to_string())?;
+    let key = capability_key(effective_uid, shell_pid, shell_start_fingerprint);
+    Ok((
+        receipts.join(format!(".hook-{key}.capability")),
+        receipts.join(format!(".hook-{key}.capability.lock")),
+    ))
+}
+
+/// The private receipt directory, or `None` when it (or its parent) was never
+/// provisioned. Never creates or repairs anything.
+#[cfg(unix)]
+fn existing_receipt_directory(effective_uid: u32) -> Result<Option<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let root = crate::policy::state_dir()
@@ -1123,8 +954,11 @@ fn existing_capability_paths(
     let sessions = root.join("sessions");
     let receipts = sessions.join("execution-receipts");
     for (directory, receipt_directory) in [(&sessions, false), (&receipts, true)] {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|_| "existing shell capability directory is unavailable".to_string())?;
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("existing shell capability directory is unavailable".to_string()),
+        };
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
             || metadata.uid() != effective_uid
@@ -1134,11 +968,7 @@ fn existing_capability_paths(
             return Err("existing shell capability directory is not private".to_string());
         }
     }
-    let key = capability_key(effective_uid, shell_pid, shell_start_fingerprint);
-    Ok((
-        receipts.join(format!(".hook-{key}.capability")),
-        receipts.join(format!(".hook-{key}.capability.lock")),
-    ))
+    Ok(Some(receipts))
 }
 
 #[cfg(unix)]
@@ -2024,6 +1854,250 @@ where
         }
         Ok(delivered)
     }
+}
+
+/// Whether a live shell runs a hook registered by this Tirith executable.
+/// Loaded-hook evidence only: never interception or blocking proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFreshnessState {
+    /// Registered by this exact executable.
+    Current,
+    /// Registered by a different or since-replaced executable.
+    Stale,
+    /// No completed protocol-v3 registration (Bash, Zsh, Fish) or hook load
+    /// record (PowerShell, Nushell) for this shell.
+    Unregistered,
+    /// Not determinable (no shell identified, unsupported platform, or
+    /// unreadable state).
+    Unknown,
+}
+
+/// Which record a shell's hook writes when it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRegistration {
+    /// Bash, Zsh and Fish: the protocol-v3 receipt capability.
+    Capability,
+    /// PowerShell and Nushell: a hook load record, which carries no bearer.
+    Presence(HookPresenceFamily),
+}
+
+/// Read-only projection over the private hook capability and hook load
+/// records. Secrets and seals are neither needed nor read; records of dead or
+/// reused processes are ignored with the registry's own liveness test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HookFreshness {
+    pub this_shell: HookFreshnessState,
+    pub other_live_current: u32,
+    pub other_live_stale: u32,
+    pub scan_limited: bool,
+}
+
+impl HookFreshness {
+    fn unknown() -> Self {
+        Self {
+            this_shell: HookFreshnessState::Unknown,
+            other_live_current: 0,
+            other_live_stale: 0,
+            scan_limited: false,
+        }
+    }
+}
+
+/// `shell` is the caller's shell PID and the record its hook writes, when
+/// known. A capability lookup never accepts a load record, and a load-record
+/// lookup accepts only a record of the same family. Other live registered
+/// shells of this user (either kind) are counted separately. Never creates,
+/// repairs or locks state.
+pub fn hook_freshness(shell: Option<(u32, HookRegistration)>) -> HookFreshness {
+    #[cfg(not(unix))]
+    {
+        let _ = shell;
+        HookFreshness::unknown()
+    }
+    #[cfg(unix)]
+    {
+        match current_tirith_executable_identity() {
+            Ok(executable) => hook_freshness_for(shell, &executable),
+            Err(_) => HookFreshness::unknown(),
+        }
+    }
+}
+
+#[cfg(unix)]
+enum RegisteredHook {
+    Absent,
+    Invalid,
+    Live { current: bool },
+}
+
+#[cfg(unix)]
+fn registered_hook(
+    directory: &Path,
+    key: &str,
+    effective_uid: u32,
+    executable: &TirithExecutableIdentity,
+) -> RegisteredHook {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let capability_path = directory.join(format!(".hook-{key}.capability"));
+    let anchor_path = directory.join(format!(".hook-{key}.capability.lock"));
+    let capability = match fs::symlink_metadata(&capability_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+        Ok(_) => match read_capability(&capability_path) {
+            Ok((capability, _)) => capability,
+            Err(_) => return RegisteredHook::Invalid,
+        },
+    };
+    let live = matches!(
+        shell_process_identity(capability.shell_pid),
+        Ok(identity) if identity.effective_uid == capability.effective_uid
+            && identity.start_fingerprint == capability.shell_start_fingerprint
+    );
+    if !capability_key_matches_record(key, &capability)
+        || capability.effective_uid != effective_uid
+        || !live
+    {
+        return RegisteredHook::Invalid;
+    }
+    // A Prepared anchor is a registration that never delivered its bearer, so
+    // the shell runs without a protocol-v3 hook instance.
+    let anchor = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&anchor_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+    };
+    if secure_regular_identity(&anchor, "shell hook capability anchor").is_err() {
+        return RegisteredHook::Invalid;
+    }
+    match read_capability_anchor(&anchor) {
+        Ok(anchor)
+            if matches!(anchor.state, ShellHookCapabilityAnchorState::Issued { .. })
+                && validate_capability_anchor_process(
+                    &anchor,
+                    capability.effective_uid,
+                    capability.shell_pid,
+                    &capability.shell_start_fingerprint,
+                )
+                .is_ok() => {}
+        Ok(_) => return RegisteredHook::Absent,
+        Err(_) => return RegisteredHook::Invalid,
+    }
+    RegisteredHook::Live {
+        current: capability.tirith_executable == *executable,
+    }
+}
+
+#[cfg(unix)]
+fn hook_freshness_for(
+    shell: Option<(u32, HookRegistration)>,
+    executable: &TirithExecutableIdentity,
+) -> HookFreshness {
+    let effective_uid = unsafe { libc::geteuid() };
+    let mut result = HookFreshness::unknown();
+    let this_key = shell.and_then(|(pid, registration)| match shell_process_identity(pid) {
+        Ok(identity) if identity.effective_uid == effective_uid => Some((
+            match registration {
+                HookRegistration::Capability => {
+                    capability_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+                HookRegistration::Presence(_) => {
+                    presence_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+            },
+            registration,
+        )),
+        _ => None,
+    });
+    // Never-provisioned receipt state means no hook ever registered here, even
+    // when an unrelated session fallback created the parent directory.
+    let directory = match existing_receipt_directory(effective_uid) {
+        Ok(Some(directory)) => directory,
+        outcome => {
+            let never_provisioned = crate::policy::state_dir().is_some_and(|root| {
+                fs::symlink_metadata(root.join("sessions").join("execution-receipts"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            });
+            if this_key.is_some() && (outcome.is_ok() || never_provisioned) {
+                result.this_shell = HookFreshnessState::Unregistered;
+            }
+            return result;
+        }
+    };
+    if let Some((key, registration)) = &this_key {
+        let registered = match registration {
+            HookRegistration::Capability => {
+                registered_hook(&directory, key, effective_uid, executable)
+            }
+            HookRegistration::Presence(family) => {
+                registered_presence(&directory, key, effective_uid, executable, Some(*family))
+            }
+        };
+        result.this_shell = match registered {
+            RegisteredHook::Absent => HookFreshnessState::Unregistered,
+            RegisteredHook::Invalid => HookFreshnessState::Unknown,
+            RegisteredHook::Live { current: true } => HookFreshnessState::Current,
+            RegisteredHook::Live { current: false } => HookFreshnessState::Stale,
+        };
+    }
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return result;
+    };
+    // Each kind is bounded like its registry.
+    let (mut capabilities, mut load_records) = (0usize, 0usize);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let (key, presence) = if let Some(key) = hook_capability_key(name) {
+            (key, false)
+        } else if let Some(key) = hook_presence_key(name) {
+            (key, true)
+        } else {
+            continue;
+        };
+        if this_key.as_ref().is_some_and(|(this, registration)| {
+            this == key && matches!(registration, HookRegistration::Presence(_)) == presence
+        }) {
+            continue;
+        }
+        let examined = if presence {
+            &mut load_records
+        } else {
+            &mut capabilities
+        };
+        *examined += 1;
+        if *examined > MAX_HOOK_CAPABILITIES {
+            result.scan_limited = true;
+            break;
+        }
+        let registered = if presence {
+            registered_presence(&directory, key, effective_uid, executable, None)
+        } else {
+            registered_hook(&directory, key, effective_uid, executable)
+        };
+        if let RegisteredHook::Live { current } = registered {
+            if current {
+                result.other_live_current = result.other_live_current.saturating_add(1);
+            } else {
+                result.other_live_stale = result.other_live_stale.saturating_add(1);
+            }
+        }
+    }
+    result
 }
 
 /// Validate a protocol-v3 bearer against its live shell and executable
@@ -4052,195 +4126,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn authenticated_context_does_not_recreate_removed_directory_generation() {
-        isolated_state(|_, session| {
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let sessions = crate::policy::state_dir().unwrap().join("sessions");
-            let moved = sessions.with_file_name("retained-sessions");
-            let (capability, _) = active_capability_paths();
-            let expected = fs::read(&capability).unwrap();
-            let relative = capability.strip_prefix(&sessions).unwrap().to_path_buf();
-            fs::rename(&sessions, &moved).unwrap();
-            assert!(context.revalidate().is_err());
-            assert!(!sessions.exists());
-            assert_eq!(fs::read(moved.join(relative)).unwrap(), expected);
-        });
-    }
-
-    #[test]
-    fn authenticated_context_refuses_permissions_without_repairing_them() {
-        use std::os::unix::fs::MetadataExt as _;
-        isolated_state(|_, session| {
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let sessions = crate::policy::state_dir().unwrap().join("sessions");
-            let (capability, _) = active_capability_paths();
-            let expected = fs::read(&capability).unwrap();
-            for directory in [&sessions, &sessions.join("execution-receipts")] {
-                fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
-                let before = fs::symlink_metadata(directory).unwrap();
-                assert!(context.revalidate().is_err());
-                let after = fs::symlink_metadata(directory).unwrap();
-                assert_eq!(
-                    (before.dev(), before.ino(), before.mode()),
-                    (after.dev(), after.ino(), after.mode())
-                );
-                assert_eq!(fs::read(&capability).unwrap(), expected);
-                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            context.revalidate().unwrap();
-        });
-    }
-
-    #[test]
-    fn authenticated_context_refuses_directory_symlink_without_replacing_it() {
-        isolated_state(|_, session| {
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let sessions = crate::policy::state_dir().unwrap().join("sessions");
-            let moved = sessions.with_file_name("retained-sessions");
-            fs::rename(&sessions, &moved).unwrap();
-            symlink(&moved, &sessions).unwrap();
-            assert!(context.revalidate().is_err());
-            assert!(fs::symlink_metadata(&sessions)
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert_eq!(fs::read_link(&sessions).unwrap(), moved);
-        });
-    }
-
-    #[test]
-    fn authenticated_context_checks_actual_session_environment_not_cached_selection() {
-        isolated_state_with_guard(|_, session, environment| {
-            environment.set_env("TIRITH_SESSION_ID", session);
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            environment.set_env("TIRITH_SESSION_ID", "different-valid-session");
-            assert!(context.revalidate().is_err());
-            environment.remove_env("TIRITH_SESSION_ID");
-            assert!(context.revalidate().is_err());
-            environment.set_env("TIRITH_SESSION_ID", session);
-            context.revalidate().unwrap();
-        });
-    }
-
-    #[test]
-    fn authenticated_fallback_context_revalidates_without_recreating_fallback_state() {
-        isolated_state_with_guard(|_, session, environment| {
-            environment.remove_env("TIRITH_SESSION_ID");
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let sessions = crate::policy::state_dir().unwrap().join("sessions");
-            // Delete only session fallback IDs, leaving the registered capability.
-            for entry in fs::read_dir(&sessions).unwrap() {
-                let path = entry.unwrap().path();
-                if path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("fallback-") && name.ends_with(".id"))
-                {
-                    fs::remove_file(path).unwrap();
-                }
-            }
-            let count = fs::read_dir(&sessions).unwrap().count();
-            context.revalidate().unwrap();
-            assert_eq!(fs::read_dir(&sessions).unwrap().count(), count);
-            environment.set_env("TIRITH_SESSION_ID", session);
-            assert!(
-                context.revalidate().is_err(),
-                "fallback-to-explicit drift must refuse"
-            );
-        });
-    }
-
-    #[test]
-    fn authenticated_context_keeps_live_native_identity_without_receipt_lock() {
-        isolated_state(|_, session| {
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            assert_eq!(context.shell_pid(), unsafe { libc::getppid() } as u32);
-            context.revalidate().unwrap();
-            // A second full validation must acquire the same short-lived lock.
-            current_hook_instance(ShellReceiptChannel::Zsh, session).unwrap();
-            assert!(authenticate_shell_context(ShellReceiptChannel::Fish, session).is_err());
-            assert!(authenticate_shell_context(ShellReceiptChannel::Zsh, "wrong-session").is_err());
-        });
-    }
-
-    #[test]
-    fn automatic_claim_correlation_is_operation_bound_and_requires_live_context() {
-        isolated_state(|_, session| {
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let operation = "12345678-9abc-4def-8123-456789abcdef";
-            let binding = context.automatic_claim_binding(operation).unwrap();
-            assert_eq!(binding.len(), 64);
-            assert_eq!(binding, context.automatic_claim_binding(operation).unwrap());
-            assert_ne!(
-                binding,
-                context
-                    .automatic_claim_binding("12345678-9abc-4def-8123-456789abcdee")
-                    .unwrap()
-            );
-            for invalid in [
-                "",
-                "00000000-0000-0000-0000-000000000000",
-                "12345678-9ABC-4DEF-8123-456789ABCDEF",
-                "../operation",
-            ] {
-                assert!(context.automatic_claim_binding(invalid).is_err());
-            }
-            let (capability, _) = active_capability_paths();
-            fs::remove_file(capability).unwrap();
-            assert!(context.automatic_claim_binding(operation).is_err());
-        });
-    }
-
-    #[test]
-    fn automatic_claim_correlation_cannot_rebind_changed_native_identity() {
-        isolated_state(|_, session| {
-            let mut context =
-                authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let operation = "12345678-9abc-4def-8123-456789abcdef";
-            context.identity.start_fingerprint.push('x');
-            assert!(context.automatic_claim_binding(operation).is_err());
-            let mut context =
-                authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            context.executable.size = context.executable.size.saturating_add(1);
-            assert!(context.automatic_claim_binding(operation).is_err());
-            let mut context =
-                authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            context.issuer_pid = context.issuer_pid.saturating_add(1);
-            assert!(context.automatic_claim_binding(operation).is_err());
-        });
-    }
-
-    #[test]
-    fn authenticated_context_refuses_revoked_capability_and_changed_identity() {
-        isolated_state(|_, session| {
-            let mut context =
-                authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            context.issuer_pid = context.issuer_pid.saturating_add(1);
-            assert!(context.revalidate().is_err());
-            context.issuer_pid = std::process::id();
-            context.identity.start_fingerprint.push('x');
-            assert!(context.revalidate().is_err());
-            let context = authenticate_shell_context(ShellReceiptChannel::Zsh, session).unwrap();
-            let (capability, _) = active_capability_paths();
-            fs::remove_file(capability).unwrap();
-            assert!(context.revalidate().is_err());
-        });
-    }
-
-    #[test]
-    fn authenticated_context_cannot_be_constructed_from_unregistered_markers() {
-        isolated_unregistered_state_with_guard(|_, session, environment| {
-            environment.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
-            environment.set_env(
-                "_TIRITH_RECEIPT_SHELL_PID",
-                (unsafe { libc::getppid() }).to_string(),
-            );
-            environment.set_env("_TIRITH_RECEIPT_FAMILY", "zsh");
-            assert!(authenticate_shell_context(ShellReceiptChannel::Zsh, session).is_err());
-        });
-    }
-
     fn allow_verdict() -> Verdict {
         Verdict::allow_fast(3, Timings::default())
     }
@@ -5930,6 +5815,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for process-scoped capability tests"]
     fn protocol_v3_capability_process_helper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         match std::env::var("TIRITH_CAPABILITY_PROCESS_HELPER").as_deref() {
             Ok("register") => {
                 let session_id = crate::session::resolve_session_id();
@@ -5967,6 +5853,191 @@ mod tests {
             }
             mode => panic!("unexpected subprocess-helper mode: {mode:?}"),
         }
+    }
+
+    #[test]
+    fn hook_freshness_reports_current_stale_and_unregistered_hooks() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        isolated_unregistered_state(|_, _| {
+            let freshness = hook_freshness(Some((shell_pid, HookRegistration::Capability)));
+            assert_eq!(freshness.this_shell, HookFreshnessState::Unregistered);
+            assert_eq!(
+                (freshness.other_live_current, freshness.other_live_stale),
+                (0, 0)
+            );
+            assert_eq!(hook_freshness(None).this_shell, HookFreshnessState::Unknown);
+        });
+        isolated_state(|temporary, _| {
+            // The hook registered by this executable is current.
+            assert_eq!(
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
+                HookFreshnessState::Current
+            );
+            // Seen from another shell, it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // After the binary is replaced (a different executable identity),
+            // the same record is a stale loaded hook, for this and other shells.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some((shell_pid, HookRegistration::Capability)), &upgraded)
+                    .this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+            // A record whose shell process has exited is never counted.
+            let (mut capability, _) = read_capability(&active_capability_path()).unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            capability.shell_pid = dead_pid;
+            let key = capability_key(
+                capability.effective_uid,
+                dead_pid,
+                &capability.shell_start_fingerprint,
+            );
+            let directory = active_capability_path().parent().unwrap().to_path_buf();
+            let dead_path = directory.join(format!(".hook-{key}.capability"));
+            fs::write(&dead_path, serde_json::to_vec(&capability).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+        });
+    }
+
+    fn hook_load_record_paths() -> Vec<PathBuf> {
+        let directory = existing_receipt_directory(unsafe { libc::geteuid() })
+            .expect("private receipt directory")
+            .expect("provisioned receipt directory");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(hook_presence_key)
+                    .is_some()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn hook_load_records_report_freshness_without_acting_as_capabilities() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        let nushell = HookRegistration::Presence(HookPresenceFamily::Nushell);
+        let powershell = HookRegistration::Presence(HookPresenceFamily::PowerShell);
+        isolated_unregistered_state(|temporary, _| {
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load");
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // Loading the hook again in the same live shell replaces its record.
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load again");
+            assert_eq!(hook_load_record_paths().len(), 1);
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // A load record never stands in for a protocol-v3 capability, and
+            // it names one shell family.
+            assert_eq!(
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            assert_eq!(
+                hook_freshness(Some((shell_pid, powershell))).this_shell,
+                HookFreshnessState::Unknown
+            );
+            assert!(validate_shell_hook_instance_inner(
+                OTHER_HOOK_INSTANCE,
+                shell_pid,
+                ShellHookFamily::Zsh,
+                &crate::session::resolve_session_id(),
+                false,
+            )
+            .is_err());
+            // Seen from another shell it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // A replaced executable makes the loaded hook stale.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some((shell_pid, nushell)), &upgraded).this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+
+            // The record is private, is not a receipt (`*.json`) or capability
+            // name, and holds no secret.
+            let paths = hook_load_record_paths();
+            let record_path = &paths[0];
+            let name = record_path.file_name().unwrap().to_str().unwrap();
+            assert!(!name.ends_with(".json") && hook_capability_key(name).is_none());
+            assert_eq!(
+                fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
+            assert_eq!(record["family"], "nushell");
+            assert!(record.get("secret_sha256").is_none());
+            assert!(record.get("session_id").is_none());
+
+            // A record whose shell exited is never counted and is removed by
+            // the next registration; an exited shell cannot be registered.
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            record["shell_pid"] = serde_json::json!(dead_pid);
+            let key = presence_key(
+                unsafe { libc::geteuid() },
+                dead_pid,
+                record["shell_start_fingerprint"].as_str().unwrap(),
+            );
+            let directory = record_path.parent().unwrap();
+            let dead_path = hook_presence::presence_path(directory, &key);
+            fs::write(&dead_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(hook_load_record_paths().len(), 2);
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+            let error = register_hook_presence(dead_pid, HookPresenceFamily::PowerShell)
+                .expect_err("an exited shell cannot record a hook load");
+            assert!(error.contains("not a live process"), "{error}");
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell).unwrap();
+            assert_eq!(hook_load_record_paths(), vec![record_path.clone()]);
+        });
     }
 
     #[test]

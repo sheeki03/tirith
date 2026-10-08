@@ -426,6 +426,8 @@ fn plan_install_inner(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
     };
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;
@@ -4750,6 +4752,7 @@ mod tests {
 
     #[test]
     fn lacks_registry_adapter_matches_registry_api_dispatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Pins this in agreement with `registry_api`'s `fetch` dispatch (the
         // source of truth); wiring a new adapter must flip the method here.
         assert!(!PackageManager::Npm.lacks_registry_adapter());

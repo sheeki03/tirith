@@ -47,8 +47,13 @@ fn reviewed_rollout_is_read_only_until_activation_and_undo_preserves_unrelated_f
     assert_eq!(prepared["operation"]["state"], "planned");
     assert_eq!(prepared["impact"]["scope"], "personal_user");
     assert_eq!(prepared["impact"]["candidate_profile"], "balanced");
-    assert_eq!(prepared["impact"]["execution_permitted"], false);
-    assert_eq!(prepared["impact"]["fleet_adoption_verified"], false);
+    // The impact report carries no authority or adoption flags at all.
+    assert!(prepared["impact"].get("execution_permitted").is_none());
+    assert!(prepared["impact"].get("fleet_adoption_verified").is_none());
+    assert!(prepared["impact"]["gaps"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("fleet_adoption_unavailable")));
     assert!(!state.roots().cwd.join("SHOULD_NOT_EXIST").exists());
     assert!(!path.exists());
     let shown = success(run(&state, &["policy", "rollout", "show", &id, "--json"]));
@@ -65,7 +70,7 @@ fn reviewed_rollout_is_read_only_until_activation_and_undo_preserves_unrelated_f
     let undone = success(run(&state, &["policy", "rollout", "undo", &id, "--json"]));
     assert!(matches!(
         undone["operation"]["state"].as_str(),
-        Some("undone" | "undone-with-recovery")
+        Some("undone")
     ));
     let current: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -211,7 +216,7 @@ mod managed {
         assert_eq!(first["impact"]["scope"], "local_managed");
         assert_eq!(first["impact"]["exception_inventory_complete"], false);
         assert_eq!(first["impact"]["remote_publication_available"], false);
-        assert_eq!(first["impact"]["fleet_adoption_verified"], false);
+        assert!(first["impact"].get("fleet_adoption_verified").is_none());
         assert_eq!(first["live"]["organization_target_effective"], true);
         assert_eq!(first["live"]["personal_target_effective"], false);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
@@ -242,7 +247,7 @@ mod managed {
         let undone = success(run(&state, &["policy", "rollout", "undo", &id, "--json"]));
         assert!(matches!(
             undone["operation"]["state"].as_str(),
-            Some("undone" | "undone-with-recovery")
+            Some("undone")
         ));
         let document: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();

@@ -5623,6 +5623,7 @@ gem 'toplevelgem'
 
     #[test]
     fn scan_discovers_and_scores_a_temp_project() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
@@ -5687,6 +5688,7 @@ gem 'toplevelgem'
 
     #[test]
     fn scan_handles_empty_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let never_allowlisted = |_eco: Ecosystem, _name: &str| false;
         let request = ScanRequest {
@@ -5709,6 +5711,7 @@ gem 'toplevelgem'
 
     #[test]
     fn scan_allowlist_suppresses_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A near-popular dependency would normally yield a finding; an
         // allowlist predicate matching it suppresses the finding but the
         // assessment is still reported.
@@ -5735,6 +5738,7 @@ gem 'toplevelgem'
 
     #[test]
     fn scan_online_resolver_is_memoized_per_package() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::cell::RefCell;
         // The same package declared in two manifests must trigger the
         // resolver at most once.
@@ -5787,6 +5791,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_positive_node_modules_surfaces_assessment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Without a threat DB no name-based finding fires, but the package must
         // still surface as a DeclaredDependency with mode "installed". The
         // BLOCK side is in cli_integration.rs (signed threat-DB fixture).
@@ -5855,6 +5860,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_known_malicious_metadata_blocks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An installed distribution whose concrete version is in the malicious
         // record is an EXACT match: it blocks via ThreatMaliciousPackage, not
         // the unresolved warn.
@@ -5892,6 +5898,7 @@ gem 'toplevelgem'
 
     #[test]
     fn package_json_npm_alias_target_is_assessed_end_to_end() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
 
@@ -5944,6 +5951,7 @@ gem 'toplevelgem'
 
     #[test]
     fn package_lock_npm_alias_without_leaf_name_is_assessed_end_to_end() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use ed25519_dalek::SigningKey;
         use rand_core::OsRng;
 
@@ -6003,6 +6011,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_non_affected_metadata_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The installed version is NOT in the malicious record, so there is no
         // finding at all (NoRecord for this exact version).
         let dir = tempfile::tempdir().unwrap();
@@ -6026,6 +6035,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_clean_node_modules_allows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Three benign packages in node_modules — none known-malicious, none
         // slopsquat-shaped → verdict ALLOW. The wider integration suite uses
         // the signed test threat DB to verify the BLOCK side of this case.
@@ -6066,6 +6076,7 @@ gem 'toplevelgem'
 
     #[test]
     fn specific_lockfile_with_named_dep_surfaces_assessment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A package-lock.json that pins a package by name is parsed via
         // SpecificLockfile mode and surfaces one DeclaredDependency per
         // resolved package. mode field reads "specific_lockfile".
@@ -6101,6 +6112,7 @@ gem 'toplevelgem'
 
     #[test]
     fn specific_lockfile_clean_allows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Same shape as above but with clean dependencies → ALLOW.
         let dir = tempfile::tempdir().unwrap();
         let lockfile = dir.path().join("package-lock.json");
@@ -6140,6 +6152,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_respects_max_entries_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Five packages under node_modules, cap at 2 → only 2 scored, and a
         // truncation note recorded.
         let dir = tempfile::tempdir().unwrap();
@@ -6191,6 +6204,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_reads_dist_info_metadata() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A synthetic site-packages with one `.dist-info/METADATA` entry must
         // be discovered as a PyPI dependency.
         let dir = tempfile::tempdir().unwrap();
@@ -6222,6 +6236,7 @@ gem 'toplevelgem'
 
     #[test]
     fn installed_mode_parses_cargo_lock_at_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A workspace Cargo.lock at the scan root must be picked up in
         // installed mode and emit one DeclaredDependency per `[[package]]`.
         let dir = tempfile::tempdir().unwrap();
@@ -6261,6 +6276,7 @@ version = "1.0.61"
 
     #[test]
     fn specific_lockfile_with_unrecognized_file_records_note() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A bogus path passed via SpecificLockfile must surface a note rather
         // than crash. A piped consumer sees mode=specific_lockfile and
         // dependency_count=0, plus an explanatory note.
@@ -6383,6 +6399,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_tampered_file_fires_violation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // hash_matches: false plants a RECORD hash that disagrees with the bytes.
         plant_installed_dist(
@@ -6408,6 +6425,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_unowned_sitecustomize_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let site = plant_installed_dist(
             dir.path(),
@@ -6442,6 +6460,7 @@ version = "1.0.61"
     /// SitecustomizeUnowned (which would Block a clean environment).
     #[test]
     fn sitecustomize_owned_via_absolute_record_path_is_not_unowned() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let site = dir.path().join("site-packages");
         std::fs::create_dir_all(&site).unwrap();
@@ -6486,6 +6505,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_duplicate_owned_path_fires_violation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let site = dir.path().join("site-packages");
         // Two distributions whose RECORD both list the SAME module path.
@@ -6517,6 +6537,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_benign_numpy_shaped_so_no_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A NumPy-shaped distribution: a compiled .so LISTED in RECORD with a
         // matching hash must not block.
         let dir = tempfile::tempdir().unwrap();
@@ -6691,6 +6712,7 @@ version = "1.0.61"
 
     #[test]
     fn native_import_execution_chain_fires_on_installed_so() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // B7 LIVE PATH: `ecosystem scan --installed` over a site-packages tree
         // containing a malicious native module produces NativeImportExecutionChain.
         let dir = tempfile::tempdir().unwrap();
@@ -6735,6 +6757,7 @@ version = "1.0.61"
 
     #[test]
     fn native_benign_so_no_chain_on_installed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A NumPy-shaped .so (PyInit + constructor, only numerical strings) LISTED
         // in RECORD must NOT fire the chain on the live installed path.
         let dir = tempfile::tempdir().unwrap();
@@ -6764,6 +6787,7 @@ version = "1.0.61"
 
     #[test]
     fn native_unowned_so_corroborates_chain_on_installed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An UNOWNED native module (not listed in any RECORD) with an execution
         // entry + a danger capability fires the chain even WITHOUT a runtime/sibling
         // string, because being unowned is itself the corroborator.
@@ -6814,6 +6838,7 @@ version = "1.0.61"
 
     #[test]
     fn oversized_native_module_emits_partial_coverage_signal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A native module larger than the native-parse cap (64 MiB) cannot be
         // triaged on the installed walk (which does not stream above-cap members).
         // Before the fix it was skipped silently with no gap/signal. It must now
@@ -6885,6 +6910,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_benign_editable_install_no_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An editable install: a sparse RECORD (listing only the dist-info and a
         // .pth-style pointer) and absent project files must not block.
         let dir = tempfile::tempdir().unwrap();
@@ -6927,6 +6953,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_benign_distro_managed_no_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A distro/conda-style install: an INSTALLER naming a non-pip installer,
         // and unverifiable (empty-hash) RECORD rows. Divergence is legitimate; no
         // block.
@@ -6951,6 +6978,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_externally_managed_mismatch_does_not_violate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A conda/distro package whose installed bytes DIVERGE from its RECORD (the real
         // post-install-patching case, not just empty/unverifiable hashes) must NOT fire
         // the integrity violation: its integrity is owned by that package manager, per
@@ -6975,6 +7003,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_non_utf8_installer_is_not_externally_managed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-UTF-8 INSTALLER must NOT count as "externally managed" (which would skip
         // the integrity check): an attacker could otherwise write one junk byte to
         // INSTALLER to bypass RECORD verification. With a divergent (tampered) RECORD, the
@@ -6998,6 +7027,7 @@ version = "1.0.61"
 
     #[test]
     fn integrity_absent_in_manifests_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The integrity report is only computed in `--installed` mode, so a
         // manifest-mode scan must leave it None (byte-identical JSON invariant).
         let dir = tempfile::tempdir().unwrap();
@@ -7037,6 +7067,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_pth_os_system_fires_suspicious() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A `.pth` whose import line runs a shell at interpreter start.
         plant_startup_hook(
@@ -7061,6 +7092,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_pth_cross_runtime_fires_critical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A `.pth` that launches Bun against a sibling JS payload (the campaign's
         // cross-distribution split). Renaming the script must not evade, so the
@@ -7093,6 +7125,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_pth_base64_obfuscated_fires_suspicious() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use base64::Engine as _;
         let dir = tempfile::tempdir().unwrap();
         let inner = "os.system('id')";
@@ -7109,6 +7142,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_pth_tmp_path_addition_alone_does_not_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A NON-executing path-add line pointing at /tmp: a signal, but on its own
         // (no executing line) it does not promote to a Block.
@@ -7134,6 +7168,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_benign_namespace_pth_stays_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A canonical setuptools namespace bootstrap: it begins with `import` and
         // executes, but is a recognized benign template -> no startup finding.
@@ -7152,6 +7187,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_benign_editable_pth_stays_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // A setuptools editable finder bootstrap: a known template -> clean.
         let body = b"import __editable___base_1_0_finder; __editable___base_1_0_finder.install()\n";
@@ -7166,6 +7202,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_tampered_editable_pth_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // The editable template PLUS an appended malicious call: the complete line
         // no longer matches the template, so it is analyzed and fires.
@@ -7181,6 +7218,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_sitecustomize_body_fires_and_unowned_corroborates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // An unowned sitecustomize.py whose MODULE body spawns a shell: B5's
         // unowned-hook integrity violation AND B6's startup-suspicious both fire.
@@ -7204,6 +7242,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_clean_env_no_startup_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A realistic clean env with an editable `.pth` pointer and a numpy-shaped
         // dist must produce NO startup finding (negative control).
         let dir = tempfile::tempdir().unwrap();
@@ -7235,6 +7274,7 @@ version = "1.0.61"
 
     #[test]
     fn sitecustomize_with_only_sys_path_insert_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A legitimate sitecustomize whose ONLY action is a sys.path insert. It
         // executes (module body) and records a `PthSysPathSearch` signal, but
         // sys.path manipulation alone is NOT a danger leg (T3.16/T2.11), so it must
@@ -7265,6 +7305,7 @@ version = "1.0.61"
 
     #[test]
     fn startup_correlation_uses_single_danger_definition() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use crate::artifact::{ArtifactSignal, ArtifactSignalKind as K, EdgeConfidence};
         use crate::location::SubjectLocation;
 
@@ -7366,6 +7407,7 @@ version = "1.0.61"
     #[cfg(unix)]
     #[test]
     fn unreadable_startup_hook_emits_signal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         // A `.pth` planted as a SYMLINK at the final component. The no-follow read

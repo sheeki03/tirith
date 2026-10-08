@@ -112,6 +112,43 @@ pub fn operation(id: &str, action: &str, json: bool) -> i32 {
     })
 }
 
+/// Shared shell of the journaled-operation CLIs (`audit feedback`, `policy
+/// setting`): one policy-diagnostic capture held through error reporting, JSON
+/// or human output, and exit 1 when the operation reports an unfinished state.
+pub(crate) fn run_operation_cli(
+    command: &str,
+    write_failure: &str,
+    json: bool,
+    run: impl FnOnce() -> Result<serde_json::Value, String>,
+    human: impl FnOnce(&serde_json::Value) -> String,
+) -> i32 {
+    let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
+    match run() {
+        Ok(output) => {
+            if json {
+                if !super::write_json_stdout(&output, write_failure) {
+                    return 1;
+                }
+            } else {
+                print!("{}", human(&output));
+            }
+            i32::from(
+                output["state"]
+                    .as_str()
+                    .is_some_and(|state| !matches!(state, "unchanged" | "completed")),
+            )
+        }
+        Err(error) => {
+            let patterns = tirith_core::policy::captured_policy_dlp_patterns_or(&[]);
+            eprintln!(
+                "{command}: {}",
+                tirith_core::redact::redact_sanitize_redact(&error, &patterns)
+            );
+            1
+        }
+    }
+}
+
 pub(crate) fn status_projection(
     status: &OperationStatus,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
@@ -147,6 +184,49 @@ pub(crate) fn status_projection(
     Ok(output)
 }
 
+/// The human state label: a finished apply or undo that retained platform
+/// recovery material reads `<state>-with-recovery`.
+pub(crate) fn human_state(output: &serde_json::Value) -> String {
+    let state = output["state"].as_str().unwrap_or("unknown");
+    let label = if output["recovery"] == true {
+        format!("{state}-with-recovery")
+    } else {
+        state.to_owned()
+    };
+    tirith_core::output::sanitize_human_field(&label, &[])
+}
+
+/// Human text for a projected operation status (the `status_projection` JSON).
+/// Used by commands whose `--json` mode prints that projection, so the
+/// default mode reads as prose instead of the same JSON.
+pub(crate) fn operation_human_text(output: &serde_json::Value) -> String {
+    let id = tirith_core::output::sanitize_human_field(
+        output["operation_id"].as_str().unwrap_or("unknown"),
+        &[],
+    );
+    let mut text = format!(
+        "Operation {id}: {}\n  Inspect: tirith policy operation {id}\n",
+        human_state(output)
+    );
+    if let Some(detail) = output["detail"].as_str() {
+        text.push_str(&format!(
+            "  {}\n",
+            tirith_core::output::sanitize_human_field(detail, &[])
+        ));
+    }
+    text
+}
+
+/// Compact one-line rendering of a JSON value for human output.
+pub(crate) fn human_value(value: &serde_json::Value) -> String {
+    let text = match value {
+        serde_json::Value::Null => "(unset)".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    tirith_core::output::sanitize_human_field(&text, &[])
+}
+
 fn show_status(
     status: &OperationStatus,
     compiled: &tirith_core::redact::CompiledCustomPatterns,
@@ -158,7 +238,12 @@ fn show_status(
             return Ok(1);
         }
     } else {
-        eprintln!("Operation {}: {:?}", status.operation_id, status.state);
+        eprintln!(
+            "Operation {}: {:?}{}",
+            status.operation_id,
+            status.state,
+            if status.recovery { "WithRecovery" } else { "" }
+        );
         eprintln!("  Inspect: tirith policy operation {}", status.operation_id);
         if let Some(detail) = output["detail"].as_str() {
             eprintln!(
@@ -170,12 +255,7 @@ fn show_status(
     Ok(
         if matches!(
             status.state,
-            JobState::Completed
-                | JobState::CompletedWithRecovery
-                | JobState::Undone
-                | JobState::UndoneWithRecovery
-                | JobState::Planned
-                | JobState::Cancelled
+            JobState::Completed | JobState::Undone | JobState::Planned | JobState::Cancelled
         ) {
             0
         } else {
@@ -190,15 +270,34 @@ mod presentation_tests {
     use crate::cli::setup::change_plan::{OperationKind, StepState, StepStatus};
 
     #[test]
+    fn human_state_keeps_the_recovery_label_of_finished_operations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let label = |state: &str, recovery: bool| {
+            human_state(&serde_json::json!({"state": state, "recovery": recovery}))
+        };
+        assert_eq!(label("completed", true), "completed-with-recovery");
+        assert_eq!(label("undone", true), "undone-with-recovery");
+        assert_eq!(label("completed", false), "completed");
+        assert_eq!(
+            human_state(&serde_json::json!({"state": "planned"})),
+            "planned"
+        );
+        assert!(operation_human_text(
+            &serde_json::json!({"operation_id": "x", "state": "undone", "recovery": true})
+        )
+        .starts_with("Operation x: undone-with-recovery\n"));
+    }
+
+    #[test]
     fn oversized_job_display_keeps_control_identity_and_marks_missing_destinations() {
         let status = OperationStatus {
-            setup_activation: None,
             schema_version: 1,
             operation_id: uuid::Uuid::new_v4().to_string(),
             kind: OperationKind::SetProfile,
             client_version: env!("CARGO_PKG_VERSION").into(),
             policy_identity: uuid::Uuid::new_v4().to_string(),
             state: JobState::Planned,
+            recovery: false,
             no_op: false,
             irreversible: false,
             active_action: None,
@@ -211,6 +310,7 @@ mod presentation_tests {
                     description: "Owned setting".repeat(100),
                     activation: false,
                     state: StepState::Pending,
+                    recovery: false,
                 })
                 .collect(),
         };

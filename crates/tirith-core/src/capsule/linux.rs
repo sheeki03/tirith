@@ -84,9 +84,8 @@ const RESOURCE_LIMIT_SUPPORT: ResourceLimitSupport = ResourceLimitSupport {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_seccomp;
-
-#[cfg(any(target_arch = "aarch64", all(test, target_arch = "x86_64")))]
-mod npm_landlock;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod clone_policy;
 
 /// Report only an architecture with an implemented filter and, on AArch64,
 /// observed kernel seccomp support. User-mode emulators that cannot install a
@@ -314,56 +313,6 @@ pub fn apply_containment(
     apply_containment_inner(spec, temp_home, &[], &[])
 }
 
-/// Apply containment while attaching one read-only filesystem grant to an
-/// already-open directory descriptor instead of reopening its pathname. The
-/// caller must keep `bound_read_root_fd` in `HandlePolicy::extra_unix_fds`, must
-/// have entered that same directory with `fchdir`, and must supply its observed
-/// canonical path as `bound_read_root`. This closes the final pathname swap
-/// window for quarantine-backed package installs.
-pub fn apply_containment_with_bound_read_root(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: &Path,
-    bound_read_root_fd: i32,
-) -> Result<CapsuleCoverage, ContainError> {
-    if !spec.handles.extra_unix_fds.contains(&bound_read_root_fd) {
-        return Err(ContainError::Handles(format!(
-            "bound read-root descriptor {bound_read_root_fd} is absent from the handle allow-list"
-        )));
-    }
-    apply_containment_inner(
-        spec,
-        temp_home,
-        &[(bound_read_root, bound_read_root_fd)],
-        &[],
-    )
-}
-
-/// Apply containment with independently held read and write directory
-/// capabilities. The write grant is installed from `bound_write_root_fd`
-/// directly; the diagnostic pathname is never reopened to determine authority.
-/// This is the capability seam used by package installation: a same-UID rename
-/// or replacement of the public target path cannot redirect the Landlock grant.
-pub fn apply_containment_with_bound_roots(
-    spec: &CapsuleSpec,
-    temp_home: Option<&Path>,
-    bound_read_root: Option<(&Path, i32)>,
-    bound_write_root: Option<(&Path, i32)>,
-) -> Result<CapsuleCoverage, ContainError> {
-    for (kind, bound) in [("read", bound_read_root), ("write", bound_write_root)] {
-        if let Some((_, fd)) = bound {
-            if !spec.handles.extra_unix_fds.contains(&fd) {
-                return Err(ContainError::Handles(format!(
-                    "bound {kind}-root descriptor {fd} is absent from the handle allow-list"
-                )));
-            }
-        }
-    }
-    let bound_read_roots = bound_read_root.into_iter().collect::<Vec<_>>();
-    let bound_write_roots = bound_write_root.into_iter().collect::<Vec<_>>();
-    apply_containment_inner(spec, temp_home, &bound_read_roots, &bound_write_roots)
-}
-
 /// Apply containment with any number of independently held directory grants.
 /// Every diagnostic path must be one exact canonical policy root and every
 /// descriptor must be explicitly retained by `HandlePolicy`. Landlock rules are
@@ -548,80 +497,6 @@ fn apply_containment_inner(
         fs_write_enforced: fs_outcome.fs_confined(),
         exec_limited: true,
         network_raw_denied: seccomp_applied,
-        domain_proxy_enforced: false,
-        resource_limits_enforced: spec
-            .resources
-            .all_requested_enforced_by(RESOURCE_LIMIT_SUPPORT),
-        env_isolated: true,
-        handles_isolated: true,
-    })
-}
-
-/// Closed ARM64 npm launch. All filesystem capabilities were retained and
-/// validated by the single-threaded hidden launcher. No containing directory is
-/// granted for a runtime file, and no writable root grants executable access.
-/// This entry does not admit the generic private-input or Python route.
-#[cfg(target_arch = "aarch64")]
-pub fn apply_npm_descriptor_containment(
-    spec: &CapsuleSpec,
-    temp_home: &Path,
-    node_fd: i32,
-    read_files: &[(i32, bool)],
-    write_directories: &[i32],
-) -> Result<CapsuleCoverage, ContainError> {
-    if !(3..256).contains(&node_fd)
-        || read_files.len() != 9
-        || read_files
-            .iter()
-            .filter(|(_, executable)| *executable)
-            .count()
-            != 1
-        || write_directories.len() != 2
-    {
-        return Err(ContainError::Unsupported(
-            "invalid closed npm capability set".into(),
-        ));
-    }
-    let mut used = std::collections::BTreeSet::new();
-    for (fd, directory) in read_files
-        .iter()
-        .map(|(fd, _)| (*fd, false))
-        .chain(write_directories.iter().map(|fd| (*fd, true)))
-    {
-        if !(3..256).contains(&fd)
-            || fd == node_fd
-            || !used.insert(fd)
-            || !spec.handles.extra_unix_fds.contains(&fd)
-        {
-            return Err(ContainError::Unsupported(
-                "overlapping npm capability descriptor".into(),
-            ));
-        }
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } != 0
-            || (stat.st_mode & libc::S_IFMT)
-                != if directory {
-                    libc::S_IFDIR
-                } else {
-                    libc::S_IFREG
-                }
-        {
-            return Err(ContainError::Unsupported(
-                "npm capability type changed".into(),
-            ));
-        }
-    }
-    close_unexpected_fds(&spec.handles)?;
-    apply_rlimits(&spec.resources)?;
-    set_no_new_privs()?;
-    npm_landlock::apply(read_files, write_directories)?;
-    aarch64_seccomp::apply_npm(node_fd).map_err(ContainError::Seccomp)?;
-    apply_env(&spec.environment, Some(temp_home));
-    Ok(CapsuleCoverage {
-        fs_read_enforced: true,
-        fs_write_enforced: true,
-        exec_limited: true,
-        network_raw_denied: true,
         domain_proxy_enforced: false,
         resource_limits_enforced: spec
             .resources
@@ -1174,6 +1049,60 @@ impl extrasafe::RuleSet for PostExecRuntime {
     }
 }
 
+/// Process and thread creation. Replaces extrasafe's `ForkAndExec` and
+/// `Threads::allow_create`, which allow `clone` and `clone3` with ANY flags
+/// (extrasafe 0.5.1 leaves its flag filters commented out). `clone` is limited
+/// to the reviewed fork/vfork/thread flags shared with aarch64; `clone3` is
+/// allowed here only so the ENOSYS answer of the filter installed before this
+/// one reaches libc, which then falls back to the inspectable `clone`.
+#[cfg(target_arch = "x86_64")]
+struct ProcessCreation;
+
+#[cfg(target_arch = "x86_64")]
+impl extrasafe::RuleSet for ProcessCreation {
+    fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
+        use extrasafe::syscalls::Sysno;
+
+        vec![
+            Sysno::fork,
+            Sysno::vfork,
+            Sysno::execve,
+            Sysno::execveat,
+            Sysno::wait4,
+            Sysno::waitid,
+            Sysno::clone3,
+        ]
+    }
+
+    fn conditional_rules(
+        &self,
+    ) -> std::collections::HashMap<extrasafe::syscalls::Sysno, Vec<extrasafe::SeccompRule>> {
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::{SeccompArgumentFilter, SeccompRule, SeccompilerComparator};
+
+        let clone = clone_policy::clone_allow_rules()
+            .into_iter()
+            .map(|conditions| {
+                conditions.into_iter().fold(
+                    SeccompRule::new(Sysno::clone),
+                    |rule, (mask, value)| {
+                        rule.and_condition(SeccompArgumentFilter::new64(
+                            0,
+                            SeccompilerComparator::MaskedEq(mask),
+                            value,
+                        ))
+                    },
+                )
+            })
+            .collect();
+        [(Sysno::clone, clone)].into_iter().collect()
+    }
+
+    fn name(&self) -> &'static str {
+        "ProcessCreation"
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl extrasafe::RuleSet for SafeDescriptorControls {
     fn simple_rules(&self) -> Vec<extrasafe::syscalls::Sysno> {
@@ -1280,9 +1209,16 @@ impl extrasafe::RuleSet for SafeDescriptorControls {
 
 #[cfg(target_arch = "x86_64")]
 fn apply_seccomp() -> Result<bool, ContainError> {
-    use extrasafe::builtins::danger_zone::{ForkAndExec, Threads};
     use extrasafe::builtins::{BasicCapabilities, SystemIO};
     use extrasafe::SafetyContext;
+
+    // First filter: clone3 -> ENOSYS, so libc falls back to the flag-checked
+    // clone of `ProcessCreation` (same order as aarch64).
+    let clone3_fallback =
+        clone_policy::clone3_enosys_filter(seccompiler::TargetArch::x86_64, libc::SYS_clone3)
+            .map_err(ContainError::Seccomp)?;
+    seccompiler::apply_filter(&clone3_fallback)
+        .map_err(|error| ContainError::Seccomp(error.to_string()))?;
 
     SafetyContext::new()
         .enable(BasicCapabilities)
@@ -1305,8 +1241,7 @@ fn apply_seccomp() -> Result<bool, ContainError> {
         // EPERM by the default action.
         .and_then(|ctx| ctx.enable(SafeDescriptorControls))
         .and_then(|ctx| ctx.enable(PostExecRuntime))
-        .and_then(|ctx| ctx.enable(Threads::nothing().allow_create()))
-        .and_then(|ctx| ctx.enable(ForkAndExec))
+        .and_then(|ctx| ctx.enable(ProcessCreation))
         .map_err(|e| ContainError::Seccomp(e.to_string()))?
         .apply_to_current_thread()
         .map_err(|e| ContainError::Seccomp(e.to_string()))?;
@@ -1458,6 +1393,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_full_backend() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Landlock usable + seccomp supported + a locked-down spec -> FS
         // enforced, raw-net denied, NEVER egress, and env + handles set. The
         // aggregate resource bit stays false because locked_down also requests
@@ -1484,6 +1420,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_landlock_does_not_claim_fs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No Landlock on the kernel -> FS not enforced, even though seccomp is.
         let spec = CapsuleSpec::locked_down();
         let fs = LandlockProbe::default(); // usable = false
@@ -1495,6 +1432,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join(".ssh");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -1514,6 +1452,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_unresolved_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = CapsuleSpec::locked_down();
         spec.filesystem.deny_roots = vec![PathBuf::new()];
         let fs = LandlockProbe {
@@ -1528,6 +1467,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_seccomp_does_not_claim_raw_net_deny() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-x86_64 Linux arch can apply Landlock but not seccomp -> raw sockets
         // are NOT denied, so a DenyAll spec is degraded against its requirement.
         let spec = CapsuleSpec::locked_down();
@@ -1543,6 +1483,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_resource_flag_tracks_rlimitable_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A spec with NO rlimit-able dimension does not claim resource limits.
         let mut spec = CapsuleSpec::locked_down();
         spec.resources = ResourceLimits::default(); // nothing set
@@ -1573,6 +1514,7 @@ mod tests {
 
     #[test]
     fn mixed_cpu_and_wall_clock_does_not_claim_all_resource_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let fs = LandlockProbe {
             usable: true,
             abi: Some(4),
@@ -1594,6 +1536,7 @@ mod tests {
 
     #[test]
     fn linux_supported_only_resource_limits_are_reported_enforced() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let fs = LandlockProbe {
             usable: true,
             abi: Some(4),
@@ -2151,6 +2094,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn runtime_file_topology_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(root) = std::env::var_os("TIRITH_RUNTIME_FILE_TOPOLOGY_FIXTURE") else {
             return;
         };
@@ -2270,6 +2214,7 @@ mod tests {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn runtime_readiness_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         if std::env::var_os("TIRITH_RUNTIME_READINESS_FIXTURE").is_none() {
             return;
         }
@@ -2440,8 +2385,129 @@ mod tests {
         );
     }
 
+    /// 14f: the installed production policy limits `clone` flags and answers
+    /// `clone3` with ENOSYS on BOTH architectures. x86_64 previously used
+    /// extrasafe's `ForkAndExec`/`Threads`, which allow `clone`/`clone3` with any
+    /// flags (CLONE_PARENT, CLONE_UNTRACED, namespace flags).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_clone_policy_subprocess() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        if std::env::var_os("TIRITH_CLONE_POLICY_FIXTURE").is_none() {
+            return;
+        }
+        assert!(apply_seccomp().expect("apply production syscall policy"));
+        for flags in [
+            libc::CLONE_PARENT | libc::SIGCHLD,
+            libc::CLONE_UNTRACED | libc::SIGCHLD,
+            libc::CLONE_NEWUSER | libc::SIGCHLD,
+            libc::SIGKILL,
+        ] {
+            // SAFETY: a fork-style clone (no new stack). If the policy wrongly
+            // allows it, the child exits at once without running test code.
+            let result =
+                unsafe { libc::syscall(libc::SYS_clone, flags as libc::c_long, 0, 0, 0, 0) };
+            if result == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if result > 0 {
+                unsafe { libc::waitpid(result as libc::pid_t, std::ptr::null_mut(), 0) };
+            }
+            assert_eq!((result, error), (-1, Some(libc::EPERM)), "clone {flags:#x}");
+        }
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOSYS)
+        );
+        // Ordinary process and thread creation still work through libc's
+        // clone fallback.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .expect("spawn a shell under the production policy");
+        assert!(status.success(), "{status:?}");
+        assert_eq!(std::thread::spawn(|| 7).join().unwrap(), 7);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn production_policy_restricts_clone_flags_on_every_architecture() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "capsule::linux::tests::production_clone_policy_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TIRITH_CLONE_POLICY_FIXTURE", "1")
+            .output()
+            .expect("run isolated production clone policy fixture");
+        assert!(
+            output.status.success(),
+            "clone policy fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// No x86_64 ruleset may grant `clone` or `clone3` unconditionally again
+    /// (extrasafe would then reject the conditional clone rules, or, if the
+    /// conditional rules were dropped, allow every flag).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_process_creation_is_the_only_clone_grant() {
+        use extrasafe::builtins::{BasicCapabilities, SystemIO};
+        use extrasafe::syscalls::Sysno;
+        use extrasafe::RuleSet as _;
+        use extrasafe::{SeccompArgumentFilter, SeccompilerComparator};
+
+        let simple = ProcessCreation.simple_rules();
+        assert!(simple.contains(&Sysno::clone3));
+        assert!(!simple.contains(&Sysno::clone));
+        let conditional = ProcessCreation.conditional_rules();
+        let clone = conditional.get(&Sysno::clone).expect("conditional clone");
+        let table = clone_policy::clone_allow_rules();
+        assert_eq!(clone.len(), table.len());
+        for (rule, conditions) in clone.iter().zip(table) {
+            assert_eq!(rule.argument_filters.len(), conditions.len());
+            for (filter, (mask, value)) in rule.argument_filters.iter().zip(conditions) {
+                assert_eq!(filter.arg_idx, 0);
+                assert!(filter.is_64bit);
+                assert_eq!(filter.value, value);
+                // The comparator is private; equality pins it (and its mask)
+                // to the reviewed `flags & mask == value` condition.
+                assert_eq!(
+                    *filter,
+                    SeccompArgumentFilter::new64(0, SeccompilerComparator::MaskedEq(mask), value)
+                );
+            }
+        }
+        let others: [Vec<Sysno>; 4] = [
+            BasicCapabilities.simple_rules(),
+            SystemIO::nothing()
+                .allow_read()
+                .allow_write()
+                .allow_open()
+                .yes_really()
+                .allow_metadata()
+                .allow_close()
+                .simple_rules(),
+            SafeDescriptorControls.simple_rules(),
+            PostExecRuntime.simple_rules(),
+        ];
+        for rules in others {
+            assert!(!rules.contains(&Sysno::clone) && !rules.contains(&Sysno::clone3));
+        }
+    }
+
     #[test]
     fn apply_containment_refuses_allowlisted_domains() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // E2 has no verified raw-socket-blocking egress backend, so an allow-list
         // spec must be refused BEFORE any process state is changed (it is the
         // first thing apply_containment checks).
@@ -2459,6 +2525,7 @@ mod tests {
 
     #[test]
     fn apply_containment_refuses_missing_parent_temp_home_before_mutation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let err = apply_containment(&spec, None).expect_err("missing temp HOME must fail closed");
         match err {
@@ -2471,6 +2538,7 @@ mod tests {
 
     #[test]
     fn env_survivors_strip_sensitive_and_keep_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = EnvironmentPolicy {
             inherit: false,
             allow: vec![

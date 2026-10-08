@@ -875,19 +875,19 @@ pub enum RuleId {
     /// path-traversal wheel). Triggered by artifact inspection, not a PATTERN_TABLE string,
     /// so it lives in `EXTERNALLY_TRIGGERED_RULES` with no fixture. High severity.
     WheelStructurallyRejected,
-    /// D3: the bytes the package firewall is about to inspect/install do NOT hash
-    /// to the digest the resolver pinned and the quarantine recorded (MITRE T1565
-    /// data manipulation). The firewall operates only on content-addressed
-    /// quarantine blobs and RE-HASHES each one immediately before evaluation
-    /// (cross-cutting invariant 4, the TOCTOU re-bind); if the on-disk blob is
-    /// absent, unreadable, or hashes to anything other than the approved digest,
-    /// the approved bytes are gone and installing would run unapproved content, so
-    /// this fires and the enforcing surface fails closed. DISTINCT from
+    /// D3: fired when the bytes the removed pip package firewall was about to
+    /// inspect/install did NOT hash to the digest the resolver pinned and the
+    /// quarantine recorded (MITRE T1565 data manipulation). That firewall
+    /// operated only on content-addressed quarantine blobs and RE-HASHED each one
+    /// immediately before evaluation (cross-cutting invariant 4, the TOCTOU
+    /// re-bind); if the on-disk blob was absent, unreadable, or hashed to anything
+    /// other than the approved digest, this fired and the install failed closed. DISTINCT from
     /// [`Self::ArtifactKnownMalicious`], which is a POSITIVE threat-DB match on a
     /// known-malicious hash: this is an integrity failure (the bytes are not the
-    /// approved bytes), not a reputation hit. Produced by
-    /// `crate::artifact::firewall`, not from a command/paste fixture, so it has no
-    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
+    /// approved bytes), not a reputation hit. It was produced only by the removed
+    /// pip package firewall, never from a command/paste fixture, so it has no
+    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`; the id stays
+    /// so policies and audit readers that name it keep parsing. Critical
     /// severity (whence the action is Block).
     ArtifactDownloadIntegrityMismatch,
     /// F2: a local release differential between two versions of the SAME

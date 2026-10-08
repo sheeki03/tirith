@@ -44,7 +44,7 @@
 //! private helpers are exercised only by this module's own tests in this unit.
 //! `#![allow(dead_code)]` keeps the not-yet-wired surface from tripping the
 //! `-D warnings` gate; E5 removes the need for it by routing the gateway upstream
-//! spawn, `runner.rs`, `temp_run.rs`, and the package-firewall install through it.
+//! spawn, `runner.rs` and `temp_run.rs` through it.
 #![allow(dead_code)]
 
 use std::net::{IpAddr, SocketAddr};
@@ -1095,18 +1095,21 @@ mod tests {
 
     #[test]
     fn extract_sni_parses_hostname() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let hello = client_hello_with_sni("pypi.org");
         assert_eq!(extract_sni(&hello).as_deref(), Some("pypi.org"));
     }
 
     #[test]
     fn extract_sni_lowercases_and_strips_dot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let hello = client_hello_with_sni("PyPI.ORG.");
         assert_eq!(extract_sni(&hello).as_deref(), Some("pypi.org"));
     }
 
     #[test]
     fn extract_sni_rejects_non_tls() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Plain HTTP bytes are not a Handshake record.
         let http = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(extract_sni(http).is_none());
@@ -1114,6 +1117,7 @@ mod tests {
 
     #[test]
     fn extract_sni_handles_truncation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut hello = client_hello_with_sni("pypi.org");
         hello.truncate(hello.len() / 2);
         // Truncated -> None, never a panic or a partial host.

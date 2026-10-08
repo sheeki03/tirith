@@ -122,6 +122,37 @@ fn parse_expected_action(s: &str) -> Result<Action, String> {
 /// failed mid-loop (distinct so callers can tell a TTY break from a corpus
 /// failure). `score`: add a deterministic 0-100 risk score (see
 /// [`scenario_score`]) per entry / a `Score` column.
+/// The analysis context of one scenario. `tirith lab` is deterministic: it
+/// reads no ambient state, so the result of a scenario is the same on every
+/// machine and in every shell.
+fn scenario_context(
+    scenario: &LabScenario,
+    shell: ShellType,
+    scan_context: ScanContext,
+    raw_bytes: Option<Vec<u8>>,
+) -> AnalysisContext {
+    AnalysisContext {
+        input: scenario.input.clone(),
+        shell,
+        scan_context,
+        raw_bytes,
+        interactive: true,
+        cwd: None,
+        file_path: None,
+        repo_root: None,
+        is_config_override: false,
+        clipboard_html: None,
+        card_ref: None,
+        // AbsentOrInvalid, not Unread (CodeRabbit R6): skip the ambient
+        // `clipboard_source.json` disk read.
+        clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        // Not the caller's PYTHONINSPECT or CDPATH: a scenario never
+        // inherits them.
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
+    }
+}
+
 pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> i32 {
     let corpus: LabCorpus = match toml::from_str(LAB_CORPUS) {
         Ok(c) => c,
@@ -208,23 +239,7 @@ pub fn run(interactive: bool, filter: Option<&str>, json: bool, score: bool) -> 
             (bytes, _) => Some(bytes.to_vec()),
         };
 
-        let ctx = AnalysisContext {
-            input: scenario.input.clone(),
-            shell,
-            scan_context,
-            raw_bytes,
-            interactive: true,
-            cwd: None,
-            file_path: None,
-            repo_root: None,
-            is_config_override: false,
-            clipboard_html: None,
-            card_ref: None,
-            // AbsentOrInvalid, not Unread (CodeRabbit R6): `tirith lab` is
-            // deterministic, so it must skip the ambient `clipboard_source.json`
-            // disk read.
-            clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
-        };
+        let ctx = scenario_context(scenario, shell, scan_context, raw_bytes);
 
         // Interactive prelude — prompt before revealing the verdict; `q` aborts.
         if interactive {
@@ -391,8 +406,8 @@ fn inspect_artifact_paths(paths: &[std::path::PathBuf]) -> tirith_core::verdict:
 
     let set = inspect_artifact_set(paths);
     let findings = set.all_findings(None);
-    // Tier 3 by construction (no tier-1 command gate on this seam), mirroring
-    // `crate::artifact::firewall::firewall_resolved_set`.
+    // Tier 3 by construction (no tier-1 command gate on this seam), as the
+    // removed pip package firewall did.
     let policy = Policy::default();
     let mut verdict = finalize_static_verdict(findings, &policy, 3, Timings::default());
     tirith_core::artifact::enforce_artifact_coverage_floor(
@@ -620,6 +635,7 @@ mod tests {
 
     #[test]
     fn artifact_scenarios_produce_expected_action() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Drive each artifact scenario through the real pipeline (materialize ->
         // inspect_artifact_set -> finalize_static_verdict) and assert the action
         // matches expected_action, bucketing Warn/WarnAck like the runner.
@@ -679,7 +695,17 @@ mod tests {
     }
 
     #[test]
+    fn scenario_context_ignores_the_callers_python_inspect() {
+        let mut global = tirith_test_support::GlobalStateGuard::new().unwrap();
+        global.set_env("PYTHONINSPECT", "1");
+        let scenario = corpus().scenarios.into_iter().next().unwrap();
+        let ctx = scenario_context(&scenario, ShellType::Posix, ScanContext::Exec, None);
+        assert!(!ctx.python_inspect_inherited);
+    }
+
+    #[test]
     fn evaluate_scenario_rejects_both_fixture_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = corpus()
             .scenarios
             .into_iter()
@@ -699,6 +725,8 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         assert!(evaluate_scenario(&s, &ctx).is_err());
     }

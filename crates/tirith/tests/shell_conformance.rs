@@ -74,6 +74,44 @@ const VERDICT_IDLE: Duration = Duration::from_secs(60);
 /// reset against.
 const MARKER_MAX: Duration = Duration::from_secs(90);
 
+/// `status` of every shell execution receipt left in the isolated store.
+/// Hooks no longer send a separate `acknowledge` call: a successful consume
+/// retires its receipt in the same Tirith process, so no receipt may be left
+/// in the `committed` state once its command has run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receipt_statuses(env: &IsolatedEnv) -> Vec<String> {
+    let directory = env.state_home.join("tirith/sessions/execution-receipts");
+    let mut statuses = Vec::new();
+    for entry in std::fs::read_dir(directory).expect("receipt directory") {
+        let path = entry.expect("receipt directory entry").path();
+        if path.extension().and_then(|part| part.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read receipt");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt JSON");
+        statuses.push(
+            value["state"]["status"]
+                .as_str()
+                .expect("receipt state status")
+                .to_owned(),
+        );
+    }
+    statuses
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_consumed_receipts_are_retired(env: &IsolatedEnv, shell: &str) {
+    let statuses = receipt_statuses(env);
+    assert!(
+        statuses.iter().any(|status| status == "acknowledged"),
+        "{shell}: the executed line's receipt must be retired by consume itself: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "committed"),
+        "{shell}: no consumed receipt may be left unretired: {statuses:?}"
+    );
+}
+
 /// Return `(confirmed, unresolved)` from the newest valid fixed-slot ledger.
 /// This independently verifies that a PTY command crossed the durable receipt
 /// boundary instead of merely exercising the hook's legacy fallback.
@@ -760,6 +798,9 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "bash");
     sess.close();
 
     assert_eq!(
@@ -1262,6 +1303,9 @@ fn fish_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "fish");
     sess.close();
 
     assert_eq!(
@@ -1757,6 +1801,7 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         1,
         "zsh warned command must execute exactly once"
     );
+    assert_consumed_receipts_are_retired(&env, "zsh");
 
     sess.send_line(&format!(
         "printf 'true' | sh; touch '{}'",

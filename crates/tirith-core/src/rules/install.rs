@@ -1849,6 +1849,8 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
         };
         crate::engine::analyze_with_policy_without_bypass(
             &context,
@@ -2373,6 +2375,7 @@ mod tests {
 
     #[test]
     fn test_remediation_shapes_reach_the_rule_through_the_engine_gate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, rule) in [
             (
                 "apt-get -o APT::Get::AllowUnauthenticated=true install pkg",

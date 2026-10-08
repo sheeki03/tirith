@@ -278,14 +278,16 @@ allowlist:
 ### CLI: manage trust without editing YAML
 
 `tirith trust` does the same thing from the command line, and steers you
-toward the narrowest scope that works. Trusting a specific path is accepted
-as-is; trusting a whole domain is broad and must be opted into with `--broad`.
-Entries expire after 30 days by default, so a temporary allow does not linger.
+toward the narrowest scope that works. Every grant names the rule it allows
+with `--rule` (or explicitly `--all-rules`). Trusting a specific path is
+accepted as-is; trusting a whole domain is broad and must be opted into with
+`--broad`. Entries expire after 30 days by default, so a temporary allow does
+not linger.
 
 ```bash
-# Narrow: trust one exact HTTPS resource. Expires in 30 days.
+# Narrow: trust one exact HTTPS resource for one rule. Expires in 30 days.
 # Schemeless host/path patterns are normalized as HTTPS.
-tirith trust add raw.githubusercontent.com/org/repo/main/get.sh
+tirith trust add raw.githubusercontent.com/org/repo/main/get.sh --rule pipe_to_interpreter
 
 # Broad: trust a whole domain for one rule only. --broad is required.
 tirith trust add get.docker.com --broad --rule curl_pipe_shell
@@ -350,9 +352,11 @@ before requiring cards for a workflow.
 ## 9. Untrusted-Task Gate (observation first)
 
 Start in `observe`. It decides without withholding, and an `off` gate does not
-even write an audit line. Be aware that only the `gateway_forward` boundary
-actually writes a record: the other eight decide and write nothing in any mode,
-so an observation burn-in cannot measure them.
+even write an audit line. Be aware that only seven of the nine boundaries write
+a record (`gateway_forward`, `fetch_cloaking`, `remote_script_run`,
+`package_manager_network`, `package_manager_execution`, `verify_self` and
+`self_update`): `config_write` and `capsule_preset_run` decide and write nothing
+in any mode, so an observation burn-in cannot measure those two.
 
 ```yaml
 # ~/.config/tirith/policy.yaml
@@ -371,21 +375,26 @@ task_gate:
 ```
 
 **That denied-effect set applies to YOUR commands too.** Every tirith-owned
-boundary reports its source as unattributed and untrusted, so the effect is
-denied on every call. With the snippet above, `tirith pkg approve` and
-`tirith policy init` both refuse. Under `mode: observe` they do not. Enable it
+boundary reports an untrusted source (unattributed, or for `verify_self` and
+`self_update` an operator ingest of unknown kind), so the effect is denied on
+every call. With the snippet above, `tirith policy init` refuses.
+Under `mode: observe` it does not. Enable it
 knowing that.
 
 **`action_incomplete_analysis: block` is narrower than it sounds.** Task effect
 inference models the Web3 shell grammar and nothing else, so nearly every
-ordinary SHELL command is reported incomplete. But package-install and
-config-write envelopes always assess as complete, so `block` refuses unmodelled
-shell at five of the nine boundaries (`capsule_preset_run`, `gateway_forward`,
-`remote_script_run`, `package_manager_network`, and
-`package_manager_execution`) and changes nothing at `pkg approve`, the two
-`pkg install` stages, or config writes. `warn`
-is the conservative default; `block` is a real option once you have measured
-your own incomplete rate on those five.
+ordinary SHELL command is reported incomplete. `block` refuses unmodelled shell
+at the five boundaries that submit a shell envelope (`capsule_preset_run`,
+`gateway_forward`, `remote_script_run`, `package_manager_network`, and
+`package_manager_execution`). It also refuses the narrative actions that
+`gateway_forward` (MCP tool calls it cannot model), `verify_self` and
+`self_update` submit when the operation names no destination file:
+`tirith verify-self`, `tirith update --dry-run` and the dashboard's "Refresh
+threat DB now". Config-write envelopes and the cloaking probe always assess as
+complete, so it changes nothing at config writes, `tirith fetch`, or a real
+`tirith update` or rollback. `pkg approve` and `pkg install` refuse before any
+boundary. `warn` is the conservative default; `block` is a real option once you
+have measured your own incomplete rate on the five shell boundaries.
 
 Unlike `web3_guard`, every `task_gate` field is restriction-shaped, so a
 repository may tighten all of them. A repo policy that tries to LOOSEN the mode

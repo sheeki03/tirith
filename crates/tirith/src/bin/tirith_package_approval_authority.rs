@@ -1,19 +1,15 @@
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[path = "../cli/package_approval_authority_helper.rs"]
-mod package_approval_authority_helper;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[path = "../cli/package_approval_authority_native.rs"]
-mod package_approval_authority_native;
+//! Fixed-path package-approval helper kept in the release packages.
+//!
+//! `tirith pkg approve` refuses with `private_input_execution_unqualified`
+//! because contained package execution, the only consumer of an approval, is
+//! disabled. The helper therefore refuses every operation on every platform: it
+//! reads no request, creates no authority key or directory, and signs nothing.
+//! It stays installed at its fixed path so installers, packages, and
+//! `tirith update` keep one stable file set.
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn main() {
-    std::process::exit(package_approval_authority_helper::helper_main());
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn main() {
     eprintln!(
-        "tirith-package-approval-authority: blocked_native: package approval issuance is supported only for redeemable x86_64 Linux installs"
+        "tirith-package-approval-authority: blocked_native: package approval is disabled in this release (private_input_execution_unqualified); this helper issues no approvals and creates no authority state"
     );
     std::process::exit(1);
 }

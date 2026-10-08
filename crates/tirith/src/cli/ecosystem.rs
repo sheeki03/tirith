@@ -648,6 +648,7 @@ mod tests {
 
     #[test]
     fn scan_of_missing_path_exits_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A path that does not exist is a usage error → exit 2, never 1
         // (1 is reserved for a BLOCK-level finding).
         let code = scan(
@@ -664,6 +665,10 @@ mod tests {
 
     #[test]
     fn scan_of_clean_temp_project_exits_0() {
+        // Isolate HOME/XDG and serialize with the tests that enroll a team
+        // policy under a fixture HOME: discovery reads the user and team layers,
+        // and a concurrent enrolled fixture would make it fail closed.
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
         // A temp project whose sole dependency is unknown to the (absent)
         // threat DB yields no findings → exit 0.
         let dir = tempdir().unwrap();
@@ -686,6 +691,10 @@ mod tests {
 
     #[test]
     fn scan_discovers_policy_from_scan_target_not_cwd() {
+        // Isolate HOME/XDG and serialize with the tests that enroll a team
+        // policy under a fixture HOME: discovery reads the user and team layers,
+        // and a concurrent enrolled fixture would make it fail closed.
+        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
         // PR #121 fix-list item 14 regression pin — `Policy::discover` must
         // anchor at the SCAN TARGET, not cwd. Discovery-anchoring test (not
         // end-to-end): we assert the resolved policy carries the target's
@@ -755,6 +764,7 @@ mod tests {
 
     #[test]
     fn scan_max_installed_entries_out_of_range_is_usage_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         // Below the minimum.
         let too_low = scan(dir.path().to_str(), false, false, true, 10, true, true);

@@ -315,6 +315,22 @@ pub struct DaemonRequest {
     /// server ignores the unknown field (serde's default) (repo-0373).
     #[serde(default)]
     pub offline: bool,
+    /// Client-side decision: the invoking shell has a non-empty
+    /// `PYTHONINSPECT`, so `python3 -c <literal>` pipe sinks may run piped
+    /// stdin as code. Like `offline`, only the CALLER's environment matters;
+    /// the daemon's own environment is never consulted. `#[serde(default)]`
+    /// keeps old clients and servers compatible.
+    #[serde(default)]
+    pub python_inspect_inherited: bool,
+    /// Client-side decision: the invoking shell has a non-empty `CDPATH`, so
+    /// a `cd` to a bare directory name on the line (`cd infra`) may change to
+    /// another directory than the one tirith would read a plan from. Like
+    /// `python_inspect_inherited`, only the CALLER's environment matters. An
+    /// older client sends no field (`None`), which counts as `CDPATH` set:
+    /// the IaC plan gate then does not follow such a `cd` (fail closed). An
+    /// old server ignores the field.
+    #[serde(default)]
+    pub cdpath_inherited: Option<bool>,
 }
 
 fn default_context() -> String {
@@ -405,6 +421,8 @@ pub fn try_daemon_check(
         // INVOKING shell both force offline analysis; the daemon's own env
         // (set at server start) is deliberately irrelevant (repo-0373).
         offline: offline || super::offline_env_active(),
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: Some(tirith_core::engine::cdpath_env_active()),
     };
 
     let mut payload = serde_json::to_string(&req).ok()?;
@@ -536,6 +554,9 @@ fn handle_request_with_analysis(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: req.python_inspect_inherited,
+        // An older client does not say: treat its `CDPATH` as set.
+        cdpath_inherited: req.cdpath_inherited.unwrap_or(true),
     };
 
     // Retain the engine's resolved policy, including remote policy and local
@@ -1330,6 +1351,8 @@ pub fn status() -> i32 {
         interactive: false,
         bypass_requested: false,
         offline: false,
+        python_inspect_inherited: false,
+        cdpath_inherited: Some(false),
     };
 
     let ok = (|| -> Option<()> {
@@ -1412,6 +1435,8 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
+            cdpath_inherited: Some(false),
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         assert!(wire.contains("\"offline\":true"), "got: {wire}");
@@ -1427,6 +1452,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn offline_check_skips_network_url_enrichment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let req = super::DaemonRequest {
             command: "check".to_string(),
             input:
@@ -1438,6 +1464,8 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
+            cdpath_inherited: Some(false),
         };
         let resp = super::handle_request(&req);
         let mut disclosed_package_skip = false;
@@ -1462,6 +1490,82 @@ mod tests {
             disclosed_package_skip,
             "offline daemon package enrichment must stop at cache miss and disclose it: {resp:?}"
         );
+    }
+
+    /// Bug 4 follow-up: an inherited PYTHONINSPECT is the CLIENT's decision
+    /// and rides the request, like `offline`. The daemon analyzes for other
+    /// shells, so its own environment must not decide the issue #136
+    /// `python3 -c` exemption. The request is read from the wire so an old
+    /// client (no field) keeps the exemption.
+    #[cfg(unix)]
+    #[test]
+    fn python_inspect_inherited_rides_the_daemon_request() {
+        let _global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let fires = |wire: &str| {
+            let req: super::DaemonRequest = serde_json::from_str(wire).expect("deserialize");
+            let resp = super::handle_request(&req);
+            resp.findings
+                .iter()
+                .chain(resp.raw_findings.as_deref().unwrap_or(&[]).iter())
+                .any(|f| f.rule_id == tirith_core::verdict::RuleId::PipeToInterpreter)
+        };
+        let base = r#""command":"check","input":"echo payload | python3 -c 'print(1)'","context":"exec","cwd":null,"shell":"posix","interactive":false,"bypass_requested":false,"offline":true"#;
+        assert!(
+            fires(&format!(r#"{{{base},"python_inspect_inherited":true}}"#)),
+            "a client with PYTHONINSPECT set must refuse the exemption"
+        );
+        assert!(
+            !fires(&format!(r#"{{{base},"python_inspect_inherited":false}}"#)),
+            "a client without PYTHONINSPECT keeps the #136 exemption"
+        );
+        assert!(
+            !fires(&format!("{{{base}}}")),
+            "an old client without the field keeps the #136 exemption"
+        );
+    }
+
+    /// Review of PR #274: the IaC plan gate follows a `cd` to a bare name
+    /// only when the shell that runs the line has no `CDPATH`. The daemon
+    /// analyzes for other shells, so that is the CLIENT's decision and rides
+    /// the request, whatever the daemon's own environment holds. An old
+    /// client (no field, or null) counts as having one: fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn cdpath_inherited_rides_the_daemon_request() {
+        let mut global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let base = r#""command":"check","input":"cd infra; terraform apply tfplan","context":"exec","cwd":null,"shell":"posix","interactive":false,"bypass_requested":false,"offline":true"#;
+        for daemon_cdpath in [None, Some("/srv/projects")] {
+            match daemon_cdpath {
+                Some(value) => global.set_env("CDPATH", value),
+                None => global.remove_env("CDPATH"),
+            }
+            let analysed_with = |fields: &str| {
+                let wire = format!("{{{base}{fields}}}");
+                let req: super::DaemonRequest = serde_json::from_str(&wire).expect("deserialize");
+                let mut seen = None;
+                super::handle_request_with_analysis(&req, |ctx| {
+                    seen = Some(ctx.cdpath_inherited);
+                    tirith_core::engine::analyze_returning_policy(ctx)
+                });
+                seen.expect("the request was analysed")
+            };
+            assert!(
+                analysed_with(r#","cdpath_inherited":true"#),
+                "a client with CDPATH set ({daemon_cdpath:?} in the daemon)"
+            );
+            assert!(
+                !analysed_with(r#","cdpath_inherited":false"#),
+                "a client without CDPATH ({daemon_cdpath:?} in the daemon)"
+            );
+            assert!(
+                analysed_with(""),
+                "an old client without the field ({daemon_cdpath:?} in the daemon)"
+            );
+            assert!(
+                analysed_with(r#","cdpath_inherited":null"#),
+                "a null field ({daemon_cdpath:?} in the daemon)"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1490,6 +1594,8 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
+            cdpath_inherited: Some(false),
         };
         let resp = super::handle_request(&req);
         let runtime = resp
@@ -1524,6 +1630,8 @@ mod tests {
             interactive: false,
             bypass_requested: false,
             offline: true,
+            python_inspect_inherited: false,
+            cdpath_inherited: Some(false),
         };
 
         let response = super::handle_request_with_analysis(&req, |ctx| {
@@ -1755,6 +1863,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runtime_dir_drives_socket_and_pid_paths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = super::runtime_dir();
         if let Some(state) = tirith_core::policy::state_dir() {
             assert_eq!(dir, state, "runtime dir should prefer state_dir when set");

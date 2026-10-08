@@ -161,6 +161,7 @@ fn mutate_discovery(paths: &Paths, update: impl FnOnce(&mut ServiceRecord)) {
 #[test]
 #[ignore = "requires the owned, isolated native service fixture runner; no public release claim"]
 fn pending_job_quiesce_and_identity_native_fixture() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     assert_ne!(
         unsafe { libc::geteuid() },
         0,

@@ -139,52 +139,6 @@ pub struct TaskSourceInput {
     pub receipt: Option<ProvenanceReceipt>,
 }
 
-/// A core-constructed description of an inert local package tree operation.
-/// There is no Deserialize implementation or public field/constructor: an
-/// untrusted envelope cannot relabel a shell/package execution as this action.
-/// This value describes effects; only the materializer's distinct sealed
-/// boundary and exact live operation can consume its resulting permit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LocalPackageTreeAction {
-    operation_id: String,
-    packages: Vec<String>,
-    destination: String,
-    inventory_sha256: String,
-}
-impl LocalPackageTreeAction {
-    pub(crate) fn new(
-        operation_id: &str,
-        packages: Vec<String>,
-        destination: String,
-        inventory_sha256: String,
-    ) -> Self {
-        Self {
-            operation_id: operation_id.into(),
-            packages,
-            destination,
-            inventory_sha256,
-        }
-    }
-    fn invalid(&self) -> bool {
-        !uuid::Uuid::parse_str(&self.operation_id)
-            .is_ok_and(|id| !id.is_nil() && id.to_string() == self.operation_id)
-            || self.packages.is_empty()
-            || self.packages.len() > 8
-            || self
-                .packages
-                .iter()
-                .any(|p| p.is_empty() || p.len() > MAX_STRING_BYTES)
-            || self.destination.is_empty()
-            || self.destination.len() > MAX_PATH_BYTES
-            || !std::path::Path::new(&self.destination).is_absolute()
-            || self.inventory_sha256.len() != 64
-            || !self
-                .inventory_sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    }
-}
-
 /// An operation the task proposes. Effects are inferred from this, never taken
 /// from the document's own description of itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,23 +150,6 @@ pub enum ProposedAction {
     PackageInstall {
         ecosystem: String,
         package: String,
-    },
-    /// Native data-only writes; never arbitrary npm execution. Not accepted
-    /// from deserialized task documents.
-    #[serde(skip_deserializing)]
-    LocalPackageMaterialize {
-        binding: LocalPackageTreeAction,
-    },
-    /// Fresh observation of an already published tree, with only a durable
-    /// reconfirmation-history write. Cannot be supplied by task documents.
-    #[serde(skip_deserializing)]
-    LocalPackageReconfirm {
-        binding: LocalPackageTreeAction,
-    },
-    /// Exact existing inventory removal, including a fixed private relocation.
-    #[serde(skip_deserializing)]
-    LocalPackageUndo {
-        binding: LocalPackageTreeAction,
     },
     ConfigWrite {
         path: String,
@@ -555,9 +492,6 @@ pub fn validate_envelope(envelope: &TaskEnvelopeInput) -> Vec<EnvelopeRejection>
             ProposedAction::PackageInstall { ecosystem, package } => {
                 ecosystem.len() > MAX_STRING_BYTES || package.len() > MAX_STRING_BYTES
             }
-            ProposedAction::LocalPackageMaterialize { binding }
-            | ProposedAction::LocalPackageUndo { binding }
-            | ProposedAction::LocalPackageReconfirm { binding } => binding.invalid(),
             ProposedAction::ConfigWrite { path } => path.len() > MAX_PATH_BYTES,
             ProposedAction::Narrative { text } => text.len() > MAX_STRING_BYTES,
         };
@@ -834,18 +768,6 @@ pub fn infer_effects_detailed_with_context(
             // policy that permits an ordinary write but denies persistence can
             // still refuse package transitions.
             effects.insert(CommandEffectKind::PersistenceChange);
-        }
-        ProposedAction::LocalPackageMaterialize { binding } => {
-            effects.insert(CommandEffectKind::PackageInstall);
-            effects.insert(CommandEffectKind::FilesystemWrite);
-            effects.insert(CommandEffectKind::PersistenceChange);
-            complete &= !binding.invalid();
-        }
-        ProposedAction::LocalPackageUndo { binding }
-        | ProposedAction::LocalPackageReconfirm { binding } => {
-            effects.insert(CommandEffectKind::FilesystemWrite);
-            effects.insert(CommandEffectKind::PersistenceChange);
-            complete &= !binding.invalid();
         }
         ProposedAction::ConfigWrite { path } => {
             effects.insert(CommandEffectKind::FilesystemWrite);
@@ -1279,6 +1201,7 @@ mod tests {
 
     #[test]
     fn effects_are_inferred_from_the_operation_not_the_description() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The envelope says nothing about installing; the action does.
         let effects = infer_effects(&ProposedAction::PackageInstall {
             ecosystem: "npm".into(),
@@ -1304,6 +1227,7 @@ mod tests {
     /// the other runs a binary already on disk and names no package.
     #[test]
     fn npm_shell_actions_are_modelled_but_script_indirection_is_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let install = infer_effects_detailed(&ProposedAction::Shell {
             command: "npm install left-pad".into(),
         });
@@ -1407,6 +1331,7 @@ mod tests {
 
     #[test]
     fn normalized_tirith_policy_writes_are_policy_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for path in [
             ".tirith/policy.yaml",
             ".tirith/policy.yml",
@@ -1430,6 +1355,7 @@ mod tests {
 
     #[test]
     fn escaped_ambiguous_or_nonpolicy_paths_are_not_policy_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for path in [
             ".tirith/../policy.yaml",
             ".TIRITH/policy.yaml",
@@ -1458,6 +1384,7 @@ mod tests {
 
     #[test]
     fn requesting_an_effect_never_grants_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::ConfigWrite {
                 path: "notes.md".into(),
@@ -1492,6 +1419,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_source_cannot_reach_a_provenance_gated_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1521,6 +1449,7 @@ mod tests {
 
     #[test]
     fn public_receipt_status_values_cannot_forge_verified_provenance() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1548,6 +1477,7 @@ mod tests {
 
     #[test]
     fn two_untrusted_sources_cannot_launder_each_other() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Composition must not average out to "verified": the weakest source
         // decides, because effects cannot be attributed to one source.
         let mut verified = untrusted(SourceKind::IssueBody);
@@ -1572,6 +1502,7 @@ mod tests {
 
     #[test]
     fn an_oversized_or_deep_envelope_is_refused_before_analysis() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let deep = format!(
             "{}{}",
             "[".repeat(MAX_JSON_DEPTH + 2),
@@ -1629,6 +1560,7 @@ mod tests {
 
     #[test]
     fn a_narrative_action_makes_the_assessment_incomplete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::Narrative {
                 text: "do the needful".into(),
@@ -1650,6 +1582,7 @@ mod tests {
 
     #[test]
     fn an_observing_gate_records_denials_without_withholding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             actions: vec![ProposedAction::PackageInstall {
                 ecosystem: "npm".into(),
@@ -1893,6 +1826,7 @@ mod tests {
 
     #[test]
     fn a_verified_receipt_does_not_exceed_the_trusted_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The exit gate: a receipt can only ever fail to lift a restriction.
         // It must never authorize an effect the policy denies outright.
         let mut verified = untrusted(SourceKind::IssueBody);
@@ -1927,79 +1861,5 @@ mod tests {
         assert!(!decision
             .allowed_effects
             .contains(&CommandEffectKind::PersistenceChange));
-    }
-}
-
-#[cfg(test)]
-mod local_package_tree_tests {
-    use super::*;
-    fn binding() -> LocalPackageTreeAction {
-        LocalPackageTreeAction::new(
-            "11111111-1111-4111-8111-111111111111",
-            vec!["leaf@1.0.0".into()],
-            if cfg!(windows) {
-                r"C:\tirith-test\exact-new-tree"
-            } else {
-                "/tmp/exact-new-tree"
-            }
-            .into(),
-            "a".repeat(64),
-        )
-    }
-    #[test]
-    fn inert_materialization_and_cleanup_have_distinct_fixed_effects() {
-        let materialize =
-            infer_effects_detailed(&ProposedAction::LocalPackageMaterialize { binding: binding() });
-        let undo = infer_effects_detailed(&ProposedAction::LocalPackageUndo { binding: binding() });
-        let reconfirm =
-            infer_effects_detailed(&ProposedAction::LocalPackageReconfirm { binding: binding() });
-        assert!(reconfirm.complete);
-        assert_eq!(reconfirm.effects, undo.effects);
-        assert!(!reconfirm
-            .effects
-            .contains(&CommandEffectKind::PackageInstall));
-        assert!(materialize.complete && undo.complete);
-        assert_eq!(
-            materialize.effects,
-            BTreeSet::from([
-                CommandEffectKind::PackageInstall,
-                CommandEffectKind::FilesystemWrite,
-                CommandEffectKind::PersistenceChange
-            ])
-        );
-        assert_eq!(
-            undo.effects,
-            BTreeSet::from([
-                CommandEffectKind::FilesystemWrite,
-                CommandEffectKind::PersistenceChange
-            ])
-        );
-        assert!(infer_effects(&ProposedAction::PackageInstall {
-            ecosystem: "npm".into(),
-            package: "leaf".into()
-        })
-        .contains(&CommandEffectKind::NetworkEgress));
-    }
-    #[test]
-    fn untrusted_envelope_cannot_request_native_only_action_variants() {
-        for action in [
-            ProposedAction::LocalPackageMaterialize { binding: binding() },
-            ProposedAction::LocalPackageUndo { binding: binding() },
-            ProposedAction::LocalPackageReconfirm { binding: binding() },
-        ] {
-            let value = serde_json::to_value(action).unwrap();
-            assert!(serde_json::from_value::<ProposedAction>(value.clone()).is_err());
-            let document = serde_json::json!({"actions":[value]}).to_string();
-            assert!(parse_envelope(&document).is_err());
-        }
-    }
-    #[test]
-    fn malformed_internal_native_binding_cannot_claim_complete_analysis() {
-        let mut bad = binding();
-        bad.operation_id = uuid::Uuid::nil().to_string();
-        assert!(
-            !infer_effects_detailed(&ProposedAction::LocalPackageMaterialize { binding: bad })
-                .complete
-        );
     }
 }

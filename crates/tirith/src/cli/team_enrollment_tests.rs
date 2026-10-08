@@ -90,6 +90,7 @@ fn expected_activation_never_reinterprets_malformed_or_replaced_state() {
 }
 #[test]
 fn pending_roundtrip_preserves_exact_request_id_sequence_and_observation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let original = record();
     let request = serde_json::to_vec(&original.request).unwrap();
     let restored = decode_report(&encoded(&original).unwrap()).unwrap();
@@ -107,6 +108,7 @@ fn pending_roundtrip_preserves_exact_request_id_sequence_and_observation() {
 }
 #[test]
 fn pending_schema_rejects_ambiguous_unknown_oversized_or_rebound_fields() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let original = record();
     let bytes = encoded(&original).unwrap();
     let mut value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -135,6 +137,7 @@ fn pending_schema_rejects_ambiguous_unknown_oversized_or_rebound_fields() {
 }
 #[test]
 fn downloaded_failed_or_invented_receipt_cannot_promote_pending_report() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for state in [ReportState::Downloaded, ReportState::Failed] {
         let mut r = record();
         r.request.state = state;
@@ -154,6 +157,7 @@ fn downloaded_failed_or_invented_receipt_cannot_promote_pending_report() {
 }
 #[test]
 fn report_projection_omits_private_commitments_policy_and_paths() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let r = record();
     let output = report_result(
         &r,
@@ -179,6 +183,7 @@ fn report_projection_omits_private_commitments_policy_and_paths() {
 
 #[test]
 fn bounded_archive_preserves_exact_context_and_never_silently_evicts() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut previous = record();
     let original = serde_json::to_vec(&previous.request).unwrap();
     previous.phase = ReportPhase::ArchivedUnknown;
@@ -204,6 +209,7 @@ fn bounded_archive_preserves_exact_context_and_never_silently_evicts() {
 }
 #[test]
 fn deterministic_report_id_reuse_requires_exact_archive_identity_for_reconciliation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut current = record();
     let mut archived = current.clone();
     archived.phase = ReportPhase::ArchivedUnknown;
@@ -223,6 +229,7 @@ fn deterministic_report_id_reuse_requires_exact_archive_identity_for_reconciliat
 }
 #[test]
 fn nested_archive_and_private_history_projection_are_bounded() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut current = record();
     let mut archived = record();
     archived.phase = ReportPhase::ArchivedUnknown;
@@ -492,6 +499,128 @@ mod native {
         assert_eq!(carry_archives(Some(&stored)).unwrap().len(), 1);
     }
     #[test]
+    fn status_offline_cache_fails_closed_when_runtime_refuses_a_fresh_cache() {
+        use tirith_core::policy_team::{PolicyDocument, POLICY_SEMANTICS_VERSION};
+        use tirith_core::policy_team_client::AuthorityBinding;
+        let (mut guard, parent) = fixture();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        let authority_id = Id::new();
+        let policy_id = Id::new();
+        let connection_id = Id::new();
+        let binding = AuthorityBinding {
+            schema_version: SCHEMA_VERSION,
+            base_url: "https://must-not-contact.invalid".into(),
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            transport: Default::default(),
+        };
+        private_file(&parent.join("connection.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"binding":binding,"credential":"c".repeat(64)})).unwrap());
+        let connection = SelectedConnection::capture_current().unwrap();
+        let now = now_ms().unwrap();
+        let document = PolicyDocument {
+            schema_version: 1,
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            revision: Id::new(),
+            created_unix_ms: now,
+            policy_semantics_version: POLICY_SEMANTICS_VERSION,
+            yaml: "paranoia: 2\n".into(),
+        };
+        private_file(&parent.join("enrollment.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"authority_id":authority_id,"policy_id":policy_id,"activation_id":Id::new(),"client_id":Id::new(),"selection_commitment":connection.private_selection_commitment().unwrap(),"fetched_unix_ms":now,"cached_policy":document})).unwrap());
+        let cwd = guard.roots().cwd.clone();
+        let status = || {
+            TeamEnrollmentService::capture(cwd.to_str())
+                .unwrap()
+                .current()
+                .unwrap()
+        };
+        let ready = status();
+        assert_eq!(ready["state"], "ready_offline_cache", "{ready}");
+        assert_eq!(ready["offline_cache"]["state"], "fresh");
+        assert_eq!(ready["offline_cache"]["enforced"], true);
+        assert_eq!(ready["offline_cache"]["fails_closed"], false);
+        assert_eq!(ready["offline_cache"]["runtime_refused"], false);
+
+        // A competing legacy authority makes Runtime fail closed although the
+        // cache is fresh by age; the cache projection must agree.
+        guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
+        guard.set_env("TIRITH_API_KEY", "legacy-secret");
+        let refused = status();
+        assert_eq!(refused["state"], "runtime_refused", "{refused}");
+        let cache = &refused["offline_cache"];
+        assert_eq!(cache["state"], "fresh");
+        assert_eq!(cache["runtime_refused"], true);
+        assert_eq!(cache["enforced"], false);
+        assert_eq!(cache["fails_closed"], true);
+        assert!(cache["time_left_ms"].is_null());
+        let summary = cache["summary"].as_str().unwrap();
+        assert!(summary.contains("Runtime refuses"), "{summary}");
+        assert!(!summary.contains("is enforced"), "{summary}");
+        assert!(!refused.to_string().contains("legacy-secret"));
+    }
+    /// R4.5: an expired cache is itself why Runtime refuses the enrollment, so
+    /// status must name that cause, not a competing authority. With a
+    /// competing authority as well, the cache cause still comes first: a sync
+    /// is needed either way, and both fail closed.
+    #[test]
+    fn status_offline_cache_names_the_cache_cause_when_the_cache_is_unusable() {
+        use tirith_core::policy_team::{PolicyDocument, POLICY_SEMANTICS_VERSION};
+        use tirith_core::policy_team_client::AuthorityBinding;
+        let (mut guard, parent) = fixture();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        let authority_id = Id::new();
+        let policy_id = Id::new();
+        let connection_id = Id::new();
+        let binding = AuthorityBinding {
+            schema_version: SCHEMA_VERSION,
+            base_url: "https://must-not-contact.invalid".into(),
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            transport: Default::default(),
+        };
+        private_file(&parent.join("connection.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"binding":binding,"credential":"c".repeat(64)})).unwrap());
+        let connection = SelectedConnection::capture_current().unwrap();
+        // 24 h fresh window + 72 h default grace have both passed.
+        let fetched = now_ms().unwrap() - 200 * 3_600_000;
+        let document = PolicyDocument {
+            schema_version: 1,
+            authority_id: authority_id.clone(),
+            policy_id: policy_id.clone(),
+            revision: Id::new(),
+            created_unix_ms: fetched,
+            policy_semantics_version: POLICY_SEMANTICS_VERSION,
+            yaml: "paranoia: 2\n".into(),
+        };
+        private_file(&parent.join("enrollment.json"), &serde_json::to_vec(&json!({"schema_version":1,"connection_id":connection_id,"authority_id":authority_id,"policy_id":policy_id,"activation_id":Id::new(),"client_id":Id::new(),"selection_commitment":connection.private_selection_commitment().unwrap(),"fetched_unix_ms":fetched,"cached_policy":document})).unwrap());
+        let cwd = guard.roots().cwd.clone();
+        let status = || {
+            TeamEnrollmentService::capture(cwd.to_str())
+                .unwrap()
+                .current()
+                .unwrap()
+        };
+        let check = |view: &Value| {
+            assert_eq!(view["state"], "runtime_refused", "{view}");
+            let cache = &view["offline_cache"];
+            assert_eq!(cache["state"], "expired", "{view}");
+            assert_eq!(cache["runtime_refused"], false, "{view}");
+            assert_eq!(cache["enforced"], false);
+            assert_eq!(cache["fails_closed"], true);
+            assert_eq!(cache["time_left_ms"], 0);
+            let summary = cache["summary"].as_str().unwrap();
+            assert!(summary.contains("expired after its 72h"), "{summary}");
+            assert!(summary.contains("blocked (fail closed)"), "{summary}");
+            assert!(!summary.contains("Runtime refuses"), "{summary}");
+            assert!(!summary.contains("competing"), "{summary}");
+        };
+        check(&status());
+        guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
+        guard.set_env("TIRITH_API_KEY", "legacy-secret");
+        let competing = status();
+        check(&competing);
+        assert!(!competing.to_string().contains("legacy-secret"));
+    }
+    #[test]
     fn withdrawal_between_capture_and_resolution_never_falls_through_to_legacy_contact() {
         let (mut guard, parent) = fixture();
         guard.set_env("TIRITH_SERVER_URL", "https://must-not-contact.invalid");
@@ -504,4 +633,221 @@ mod native {
         assert!(retained.revalidate().is_err());
         assert!(!parent.join("report.json").exists());
     }
+}
+
+mod background_refresh {
+    use super::*;
+
+    #[test]
+    fn background_refresh_is_claimed_at_most_once_per_interval() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let state = tirith_core::policy::state_dir().unwrap();
+        let now = 10 * REFRESH_CLAIM_INTERVAL_MS;
+        assert!(claim_background_refresh(&state, now));
+        assert!(!claim_background_refresh(&state, now));
+        assert!(!claim_background_refresh(
+            &state,
+            now + REFRESH_CLAIM_INTERVAL_MS - 1
+        ));
+        assert!(claim_background_refresh(
+            &state,
+            now + REFRESH_CLAIM_INTERVAL_MS
+        ));
+        // A clock that moved backwards cannot suppress refresh indefinitely.
+        assert!(claim_background_refresh(&state, now));
+        // Another process holding the claim lock means no claim here.
+        #[cfg(unix)]
+        {
+            let _held = crate::cli::setup::fs_helpers::try_lock_operation(
+                &state.join(REFRESH_CLAIM_LOCK),
+                &state,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!claim_background_refresh(
+                &state,
+                now + 5 * REFRESH_CLAIM_INTERVAL_MS
+            ));
+        }
+    }
+
+    /// R4.8: one attempt per claim interval within a process, so the
+    /// long-running MCP server and gateway retry while `tirith check` (one
+    /// call) behaves as before.
+    #[test]
+    fn refresh_gate_allows_one_attempt_per_interval_in_a_process() {
+        let gate = RefreshGate(AtomicU64::new(0));
+        let now = 10 * REFRESH_CLAIM_INTERVAL_MS;
+        assert!(gate.try_pass(now));
+        assert!(!gate.try_pass(now));
+        assert!(!gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS - 1));
+        assert!(gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS));
+        assert!(!gate.try_pass(now + REFRESH_CLAIM_INTERVAL_MS + 1));
+        // A clock that moved back by more than an interval does not
+        // suppress refresh indefinitely.
+        assert!(gate.try_pass(now - 5 * REFRESH_CLAIM_INTERVAL_MS));
+    }
+
+    #[test]
+    fn offline_mode_and_missing_enrollment_never_claim_or_spawn() {
+        let mut guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let state = tirith_core::policy::state_dir().unwrap();
+        guard.set_env("TIRITH_OFFLINE", "1");
+        maybe_background_refresh(false);
+        assert!(!state.join(REFRESH_CLAIM_FILE).exists());
+        // Not enrolled: nothing is due, so nothing is claimed.
+        assert!(TeamEnrollment::background_refresh_target(now_ms().unwrap()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_child_that_outlives_its_limit_is_killed_and_reaped() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        reap_refresh_child(child, std::time::Duration::from_millis(200));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the server refresh thread must not wait for a stuck child: {:?}",
+            started.elapsed()
+        );
+        // Reaped: the pid no longer names our child.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "child {pid} is still running");
+    }
+
+    #[test]
+    fn background_child_arguments_parse_as_a_hidden_exact_sync() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            action: Action,
+        }
+        let (connection, activation) = (Id::new(), Id::new());
+        let args = background_sync_args(&connection, &activation);
+        assert_eq!(&args[..4], ["policy", "team", "enrollment", "sync"]);
+        let parsed = Harness::try_parse_from(
+            std::iter::once("enrollment".to_string()).chain(args[3..].iter().cloned()),
+        )
+        .unwrap();
+        match parsed.action {
+            Action::Sync {
+                options,
+                background,
+                json,
+            } => {
+                assert!(background);
+                assert!(!json);
+                assert_eq!(options.expected_connection_id, connection.as_str());
+                assert_eq!(options.expected_activation_id, activation.as_str());
+            }
+            _ => panic!("background child must run the exact sync action"),
+        }
+    }
+}
+#[test]
+fn status_shows_fresh_grace_and_fail_closed_cache_states_with_time_left() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    const HOUR: u64 = 3_600_000;
+    let now = 1_000 * HOUR;
+    let status = |state, fetched_age: u64| CacheStatus {
+        state,
+        fetched_unix_ms: now - fetched_age,
+        fresh_until_unix_ms: now - fetched_age + 24 * HOUR,
+        grace_ms: Some(72 * HOUR),
+        grace_until_unix_ms: Some(now - fetched_age + 96 * HOUR),
+        refresh_due: fetched_age >= HOUR,
+    };
+    let fresh = offline_cache_projection(&status(CacheState::Fresh, 2 * HOUR), now, true);
+    assert_eq!(fresh["state"], "fresh");
+    assert_eq!(fresh["enforced"], true);
+    assert_eq!(fresh["fails_closed"], false);
+    assert_eq!(fresh["time_left_ms"], 22 * HOUR);
+    assert_eq!(fresh["grace_hours"], 72);
+    assert_eq!(fresh["refresh_due"], true);
+    let summary = fresh["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("fresh") && summary.contains("22h 0m more"),
+        "{summary}"
+    );
+    assert!(summary.contains("background refresh is due"), "{summary}");
+
+    let grace = offline_cache_projection(&status(CacheState::Grace, 30 * HOUR + 90_000), now, true);
+    assert_eq!(grace["state"], "grace");
+    assert_eq!(grace["enforced"], true);
+    assert_eq!(grace["time_left_ms"], 66 * HOUR - 90_000);
+    let summary = grace["summary"].as_str().unwrap();
+    assert!(summary.contains("grace period"), "{summary}");
+    assert!(summary.contains("2d 17h more"), "{summary}");
+    assert!(summary.contains("fail closed"), "{summary}");
+    assert!(
+        summary.contains("tirith policy team enrollment sync"),
+        "{summary}"
+    );
+
+    let expired = offline_cache_projection(&status(CacheState::Expired, 97 * HOUR), now, true);
+    assert_eq!(expired["state"], "expired");
+    assert_eq!(expired["enforced"], false);
+    assert_eq!(expired["fails_closed"], true);
+    assert_eq!(expired["time_left_ms"], 0);
+    let summary = expired["summary"].as_str().unwrap();
+    assert!(summary.contains("expired after its 72h"), "{summary}");
+    assert!(summary.contains("blocked (fail closed)"), "{summary}");
+
+    for state in [
+        CacheState::FutureTimestamp,
+        CacheState::Missing,
+        CacheState::Invalid,
+    ] {
+        let value = offline_cache_projection(&status(state, 0), now, true);
+        assert_eq!(value["fails_closed"], true, "{state:?}");
+        assert!(value["time_left_ms"].is_null());
+        assert!(value["summary"].as_str().unwrap().contains("fail closed"));
+    }
+    // A fresh or in-grace cache that Runtime refuses (competing authority,
+    // replaced connection) is not enforced: every command fails closed.
+    for state in [CacheState::Fresh, CacheState::Grace] {
+        let value = offline_cache_projection(&status(state, 2 * HOUR), now, false);
+        assert_eq!(value["runtime_refused"], true, "{state:?}");
+        assert_eq!(value["enforced"], false, "{state:?}");
+        assert_eq!(value["fails_closed"], true, "{state:?}");
+        assert!(value["time_left_ms"].is_null(), "{state:?}");
+        let summary = value["summary"].as_str().unwrap();
+        assert!(summary.contains("Runtime refuses"), "{summary}");
+        assert!(summary.contains("fail closed"), "{summary}");
+        assert!(!summary.contains("is enforced"), "{summary}");
+    }
+    // R4.5: Runtime refuses an expired, future, missing or invalid cache
+    // because of that state, so `runtime_ready` is false there. The projection
+    // must still give the per-state cause, exactly as when it is true.
+    for (state, cause) in [
+        (CacheState::Expired, "expired after its 72h"),
+        (CacheState::FutureTimestamp, "future fetch time"),
+        (CacheState::Missing, "cache is missing"),
+        (CacheState::Invalid, "cache is invalid"),
+    ] {
+        let refused = offline_cache_projection(&status(state, 97 * HOUR), now, false);
+        let ready = offline_cache_projection(&status(state, 97 * HOUR), now, true);
+        assert_eq!(refused, ready, "{state:?}");
+        assert_eq!(refused["runtime_refused"], false, "{state:?}");
+        assert_eq!(refused["enforced"], false, "{state:?}");
+        assert_eq!(refused["fails_closed"], true, "{state:?}");
+        let summary = refused["summary"].as_str().unwrap();
+        assert!(summary.contains(cause), "{summary}");
+        assert!(summary.contains("fail closed"), "{summary}");
+        assert!(!summary.contains("Runtime refuses"), "{summary}");
+    }
+    assert_eq!(fresh["runtime_refused"], false);
+    assert_eq!(duration(59_999), "0m");
+    assert_eq!(duration(HOUR + 60_000), "1h 1m");
+    assert_eq!(duration(49 * HOUR), "2d 1h");
 }

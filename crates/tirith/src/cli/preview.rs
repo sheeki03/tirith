@@ -247,6 +247,7 @@ mod tests {
 
     #[test]
     fn empty_command_exits_two() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(run("   ", false), 2);
     }
 

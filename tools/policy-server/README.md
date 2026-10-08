@@ -39,7 +39,7 @@ The shared `tirith_core::policy_team` types define schema1 and contract `tirith_
 | GET `/api/policy/v1/capabilities` | Any role; authority/policy/role/expiry/limits. Client role additionally receives its stable client ID and current report-sequence high-water. |
 | GET `/api/policy/v1/current` | Any role; current exact YAML and random revision. |
 | GET `/api/policy/fetch` | Any role; legacy YAML, with `X-Tirith-Authority-Id`, `X-Tirith-Policy-Id`, `X-Tirith-Policy-Revision`. Fetching never emits an applied report. |
-| POST `/api/policy/v1/publications` | Publisher; exact reviewed candidate, authority/policy/current-revision CAS, operation ID and review commitment. Review age must be below24 hours. |
+| POST `/api/policy/v1/publications` | Publisher; exact reviewed candidate, authority/policy/current-revision CAS, operation ID and review commitment. Review age must be below 24 hours. |
 | GET `/api/policy/v1/operations/{id}` | Publisher/observer; closed operation status without YAML, token hashes or private commitments. |
 | POST `/api/policy/v1/reconcile` | Publisher; read-only lookup of the exact retained publication/rollback request and principal. Never publishes or creates a missing operation. |
 | POST `/api/policy/v1/rollbacks` | Publisher; original publication, current-revision CAS and fresh operation ID. Restores exact retained prior YAML as a new revision before7 days, only while that publication is still current. |
@@ -59,7 +59,7 @@ Client recovery is independent of server operation history. `enrollment disable 
 
 The client privately saves every exact pending report before sending. Explicit `enrollment abandon --report-id REPORT_UUID --acknowledge-unknown-outcome` preserves that request/context as locally archived unknown, not cancelled or proven uncommitted. Its fixed 16 KiB report file holds at most four historical entries and refuses either bound without silent eviction. New reporting requires fresh valid Runtime and authenticated sequence; an older late commit can still cause an explicit conflict. Read-only reconciliation of a retained archived context never relaxes the requirements for a new Applied report.
 
-Observations must reference a known retained revision, occur no more than60 seconds ahead, be less than24 hours old, and advance the prior observation time. Missing reports mean unreported, never proof of offline state. Downloaded, failed and applied are closed client assertions. `applied_current` means only that an authenticated client reported applying the sampled current revision. `fleet_adoption_verified` is always false. Complete roster coverage means only that all explicitly registered active targets are included, and creates no current enforcement authority.
+Observations must reference a known retained revision, occur no more than 60 seconds ahead, be less than 24 hours old, and advance the prior observation time. Missing reports mean unreported, never proof of offline state. Downloaded, failed and applied are closed client assertions. `applied_current` means only that an authenticated client reported applying the sampled current revision. `fleet_adoption_verified` is always false. Complete roster coverage means only that all explicitly registered active targets are included, and creates no current enforcement authority.
 
 ## Storage bounds and recovery
 

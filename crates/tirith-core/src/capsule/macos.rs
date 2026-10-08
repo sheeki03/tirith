@@ -532,6 +532,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_without_sandbox_exec_is_fully_degraded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The core E3 honesty guarantee: a missing/removed sandbox-exec is reported
         // as degraded (everything false), NEVER a silent NoOp success.
         let spec = CapsuleSpec::locked_down();
@@ -547,6 +548,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_denyall_with_sandbox_exec() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // sandbox-exec usable + a locked-down deny-all spec -> FS enforced, raw-net
         // denied, exec limited, and NEVER egress. The E5 wrapper applies the
         // env/handle policy. The aggregate resource bit remains false because the
@@ -572,6 +574,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_overlapping_deny_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join(".ssh");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -590,6 +593,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_does_not_claim_fs_for_unrepresentable_deny_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = CapsuleSpec::locked_down();
         spec.filesystem.deny_roots = vec![PathBuf::from("/tmp/credential\"store")];
         let probe = SeatbeltProbe {
@@ -604,6 +608,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_locked_down_is_degraded_on_unenforced_resource_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The wrapper delivers filesystem, network, env, handle, and its supported
         // rlimits, but locked_down also requests process/output/wall dimensions it
         // cannot enforce. The aggregate resource bit must fail closed.
@@ -620,6 +625,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_resource_flag_tracks_rlimitable_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Honesty: the resource flag follows the dimensions the wrapper enforces
         // (CPU/open-files), not a blanket true.
         let probe = SeatbeltProbe {
@@ -646,6 +652,7 @@ mod tests {
 
     #[test]
     fn derive_coverage_allowlist_never_claims_egress() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Even for an allow-list spec, E3 reports network_raw_denied (the carve-out
         // is localhost-only) but NEVER domain_proxy_enforced -> the allow-list
         // level stays degraded against its requirement and the surface fails closed.
@@ -667,6 +674,7 @@ mod tests {
 
     #[test]
     fn profile_denies_default_and_network_for_denyall() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let profile = sandbox_profile(&spec).expect("profile");
         assert!(profile.contains("(deny default)"));
@@ -680,6 +688,7 @@ mod tests {
 
     #[test]
     fn profile_carves_out_only_loopback_for_allowlist() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = CapsuleSpec::locked_down();
         spec.network = NetworkPolicy::AllowListedDomains {
             domains: ["pypi.org".to_string()].into_iter().collect(),
@@ -699,6 +708,7 @@ mod tests {
 
     #[test]
     fn profile_emits_read_and_write_subpaths() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let read = temp.path().join("read-data");
         let write = temp.path().join("build-out");
@@ -725,6 +735,7 @@ mod tests {
 
     #[test]
     fn profile_refuses_covering_allow_before_launch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().expect("tempdir");
         let denied = temp.path().join("credentials");
         std::fs::create_dir(&denied).expect("create denied root");
@@ -738,6 +749,7 @@ mod tests {
 
     #[test]
     fn profile_rejects_path_with_quote_or_backslash() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // SBPL string literals have no escape; a path with a quote/backslash must be
         // refused, not emitted (an unescaped quote would widen the profile).
         let mut spec = CapsuleSpec::locked_down();
@@ -762,6 +774,7 @@ mod tests {
 
     #[test]
     fn sandbox_exec_argv_denyall_builds_command() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let argv = sandbox_exec_argv(&spec, "/usr/bin/python3", &["-m".into(), "pip".into()])
             .expect("argv");
@@ -778,6 +791,7 @@ mod tests {
 
     #[test]
     fn sandbox_exec_argv_refuses_allowlisted_domains() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // E3 enforces DenyAll natively; an allow-list needs E5's broker, so the
         // argv builder fails closed (mirrors derive_coverage reporting it degraded).
         let mut spec = CapsuleSpec::locked_down();
@@ -794,6 +808,7 @@ mod tests {
 
     #[test]
     fn sandbox_exec_argv_rejects_interior_nul() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let spec = CapsuleSpec::locked_down();
         let err =
             sandbox_exec_argv(&spec, "/bin/sh", &["a\0b".into()]).expect_err("NUL must error");
@@ -817,6 +832,7 @@ mod tests {
 
     #[test]
     fn max_processes_alone_is_not_reported_enforced_on_macos() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // IM4: macOS cannot enforce a per-process fork-bomb cap (RLIMIT_NPROC is
         // per-UID), so a spec whose ONLY resource limit is `max_processes` must NOT
         // claim resource_limits_enforced. Otherwise an enforcing surface would run
@@ -845,6 +861,7 @@ mod tests {
 
     #[test]
     fn mixed_cpu_and_max_processes_does_not_claim_all_resource_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
@@ -865,6 +882,7 @@ mod tests {
 
     #[test]
     fn memory_limit_is_not_reported_enforced_on_macos() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
@@ -881,6 +899,7 @@ mod tests {
 
     #[test]
     fn macos_supported_only_resource_limits_are_reported_enforced() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probe = SeatbeltProbe {
             sandbox_exec_usable: true,
         };
@@ -898,6 +917,7 @@ mod tests {
 
     #[test]
     fn conservative_limits_expose_unsupported_dimensions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Conservative limits include process-count, output, and wall-clock caps
         // the wrapper does not apply, so the aggregate bit must remain false.
         let mut spec = CapsuleSpec::locked_down();

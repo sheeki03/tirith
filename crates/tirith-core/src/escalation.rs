@@ -634,7 +634,7 @@ fn clear_approval_metadata(verdict: &mut Verdict) {
 /// Keep the action and approval channel as one invariant at every return seam:
 /// a Block is never approvable, and a caller without a prompt channel must turn
 /// a live approval requirement into an unambiguous Block.
-fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
+pub(crate) fn normalize_approval_contract(verdict: &mut Verdict, caller: CallerContext) {
     if verdict.action == Action::Block {
         clear_approval_metadata(verdict);
         return;
@@ -736,14 +736,47 @@ fn post_process_verdict_for_verification_with_urls(
 ) -> Verdict {
     let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
     let session = crate::session_warnings::load(session_id);
+    apply_read_only_session_effects(
+        &mut effective,
+        policy,
+        caller,
+        &session,
+        chrono::Utc::now(),
+        (cmd, shell, urls),
+        |provisional_events| {
+            crate::session_warnings::correlate_session_with_provisional(
+                session_id,
+                provisional_events,
+            )
+        },
+    );
+    effective
+}
 
+/// The read-only session stages that follow [`apply_stateless_policy_effects`]:
+/// escalation against the session's warning history, cross-event correlation
+/// of THIS command's provisional typed events (no events, no correlation, as in
+/// the live pipeline), the monotonic re-pass when correlation added findings,
+/// and the final approval-contract normalization. Candidate verification and
+/// the frozen preview (`evaluation::FrozenEvaluation`) both use it, so the
+/// preview cannot drift from what verification enforces. `correlate` receives
+/// the non-empty provisional events and returns the hits against the session.
+pub(crate) fn apply_read_only_session_effects(
+    effective: &mut Verdict,
+    policy: &crate::policy::Policy,
+    caller: CallerContext,
+    session: &SessionWarnings,
+    now: chrono::DateTime<chrono::Utc>,
+    (cmd, shell, urls): (&str, ShellType, &[crate::extract::ExtractedUrl]),
+    correlate: impl FnOnce(&[TypedEvent]) -> Vec<crate::event_buffer::CorrelationHit>,
+) {
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let (new_action, _caused_by, _hits, reason) = apply_escalation_at_with_urls(
             effective.action,
             &effective.findings,
-            &session,
+            session,
             &policy.escalation,
-            chrono::Utc::now(),
+            now,
             urls,
         );
         if new_action != effective.action {
@@ -752,19 +785,30 @@ fn post_process_verdict_for_verification_with_urls(
         effective.action = new_action;
     }
 
-    let provisional_events = derive_typed_events_with_urls(cmd, &effective, shell, urls);
+    let timestamp = now.to_rfc3339();
+    let provisional_events: Vec<TypedEvent> =
+        derive_event_prototypes_with_urls(cmd, effective, shell, urls)
+            .into_iter()
+            .map(|prototype| {
+                prototype.materialize(
+                    String::new(),
+                    0,
+                    timestamp.clone(),
+                    crate::event_buffer::EventProvenance::Confirmed,
+                )
+            })
+            .collect();
     let correlation_hits = if provisional_events.is_empty() {
         Vec::new()
     } else {
-        crate::session_warnings::correlate_session_with_provisional(session_id, &provisional_events)
+        correlate(&provisional_events)
     };
-    apply_correlation_findings(&mut effective, policy, &correlation_hits);
+    apply_correlation_findings(effective, policy, &correlation_hits);
     if !correlation_hits.is_empty() {
-        reapply_monotonic_policy_effects(&mut effective, policy, caller);
+        reapply_monotonic_policy_effects(effective, policy, caller);
     }
 
-    normalize_approval_contract(&mut effective, caller);
-    effective
+    normalize_approval_contract(effective, caller);
 }
 
 /// Re-run the monotonic policy controls (action overrides, approval, paranoia
@@ -1464,6 +1508,24 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<
         }
     }
     paths
+}
+
+/// A segment's arguments without its shell redirections: an operator word
+/// (`2>/dev/null`, `>&2`, `<in`) and the separate target of a bare operator
+/// (`> log`) belong to the shell, not to the command's argv.
+pub(crate) fn args_without_redirections(args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len());
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        match shell_redirection_token(word) {
+            Some(true) => {
+                words.next();
+            }
+            Some(false) => {}
+            None => argv.push(word.clone()),
+        }
+    }
+    argv
 }
 
 /// Split the first unquoted, unescaped redirection suffix from a preceding argv
@@ -2202,6 +2264,10 @@ fn write_targets(seg: &tokenize::Segment, leader_base: &str, args: &[String]) ->
 
     // 3) Copy/move/tee/install destination. For cp/mv/install the destination is
     // normally the LAST non-flag arg; for tee it is the first non-flag arg.
+    // Redirections (written to `out` above) are not argv: `cp a .env >/dev/null`
+    // copies to `.env`.
+    let argv = args_without_redirections(args);
+    let args = argv.as_slice();
     match leader_base {
         "cp" | "mv" | "install" => {
             // `-t DIR` / `--target-directory=DIR` inverts the layout: the DIRECTORY
@@ -2814,6 +2880,7 @@ mod tests {
 
     #[test]
     fn test_post_process_noop_on_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let raw = Verdict {
             action: Action::Allow,
             findings: vec![],
@@ -2848,6 +2915,7 @@ mod tests {
 
     #[test]
     fn test_post_process_action_override_upgrades() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = vec![make_finding(RuleId::ShortenedUrl, Severity::Medium)];
         let raw = Verdict {
             action: Action::Warn,
@@ -2887,6 +2955,7 @@ mod tests {
 
     #[test]
     fn test_post_process_ordering_override_before_escalation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Override must fire first; escalation then sees action already at Block
         // and becomes a no-op.
         let findings = vec![make_finding(RuleId::ShortenedUrl, Severity::Medium)];
@@ -2975,6 +3044,7 @@ mod tests {
 
     #[test]
     fn test_hidden_count_multiset_with_duplicates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression guard: duplicate findings sharing all identity fields
         // must count as two in the raw-vs-effective multiset diff, so one
         // surviving finding leaves one in the hidden set (not zero).
@@ -3088,6 +3158,7 @@ mod tests {
 
     #[test]
     fn agent_rules_deny_forces_block_on_allow_verdict() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Allow verdict + deny-humans policy → Block with the sole (injected) finding.
         let raw = raw_verdict_with(
             Action::Allow,
@@ -3124,6 +3195,7 @@ mod tests {
 
     #[test]
     fn agent_rules_deny_keeps_block_on_already_blocked_verdict() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Deny on an already-Block verdict still injects the finding (for the
         // audit log) without double-blocking; existing detection findings persist.
         let detection_finding = make_finding(RuleId::CurlPipeShell, Severity::High);
@@ -3165,6 +3237,7 @@ mod tests {
 
     #[test]
     fn agent_rules_allow_does_not_bypass_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `allow` is NOT a bypass: an already-blocked verdict stays blocked.
         let detection_finding = make_finding(RuleId::CurlPipeShell, Severity::High);
         let raw = raw_verdict_with(
@@ -3207,6 +3280,7 @@ mod tests {
 
     #[test]
     fn agent_rules_unspecified_leaves_verdict_unchanged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Human caller vs an allow-only-Agents policy → Unspecified, no change.
         let raw = raw_verdict_with(
             Action::Allow,
@@ -3238,6 +3312,7 @@ mod tests {
 
     #[test]
     fn agent_rules_unset_does_not_introduce_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression guard: a legacy (empty `agent_rules`) policy never injects
         // AgentDeniedByPolicy and never flips the action.
         let detection_finding = make_finding(RuleId::ShortenedUrl, Severity::Medium);
@@ -3362,6 +3437,7 @@ mod tests {
 
     #[test]
     fn post_process_deny_does_not_emit_approval_metadata() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PR #121 item 9: a denied caller whose raw verdict also matched an
         // approval rule must NOT receive both `action: Block` and
         // `requires_approval: true`. (Mirrors the MCP-side pin.)
@@ -3482,6 +3558,7 @@ mod tests {
 
     #[test]
     fn derive_benign_command_records_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A clean Allow with no findings and no security-relevant shape: empty.
         let v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(derive_typed_events("ls -la /tmp", &v).is_empty());
@@ -3490,6 +3567,7 @@ mod tests {
 
     #[test]
     fn derive_network_from_curl_leader() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         let events = derive_typed_events("curl https://example.com/x", &v);
         assert!(kinds(&events).contains(&EventKind::Network));
@@ -3497,6 +3575,7 @@ mod tests {
 
     #[test]
     fn derive_network_curl_remote_name_flag_is_not_value_taking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // D2: curl `-O`/`--remote-name` is BOOLEAN (consumes no token). It must NOT
         // skip the following URL, or `curl -O https://example.com/x` records no
         // Network event. The host must still be extracted.
@@ -3531,6 +3610,7 @@ mod tests {
 
     #[test]
     fn derive_network_httpie_download_flag_is_not_value_taking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // D2: httpie `-d`/`--download` is BOOLEAN (it enables download mode and
         // consumes no token), UNLIKE curl `-d`. It must NOT skip the following
         // target, or `http --download example.com/x` records no Network event.
@@ -3546,6 +3626,7 @@ mod tests {
 
     #[test]
     fn derive_network_curl_data_flag_stays_value_taking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // D2 guard: curl `-d`/`--data` IS value-taking, so its value must still be
         // skipped (not read as a host). `curl -d @payload example.com/x` is still a
         // Network event because of the trailing host, but `curl -d secret.txt`
@@ -3567,6 +3648,7 @@ mod tests {
 
     #[test]
     fn derive_network_from_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Even without a curl/wget leader, a network-class finding records Network.
         let v = raw_verdict_with(
             Action::Warn,
@@ -3579,6 +3661,7 @@ mod tests {
 
     #[test]
     fn derive_shell_pipe_from_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(
             Action::Warn,
             vec![make_finding(RuleId::CurlPipeShell, Severity::High)],
@@ -3593,6 +3676,7 @@ mod tests {
 
     #[test]
     fn derive_secret_write_from_redirection() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         let events = derive_typed_events("printf 'TOKEN=x' > ~/.npmrc", &v);
         let secret = events
@@ -3607,6 +3691,7 @@ mod tests {
 
     #[test]
     fn derive_secret_write_from_curl_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         let events = derive_typed_events("curl https://x.example/k -o id_rsa", &v);
         let ks = kinds(&events);
@@ -3616,6 +3701,7 @@ mod tests {
 
     #[test]
     fn derive_secret_write_from_httpie_https_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The `https` HTTPie alias is a network leader (line 707), so its
         // `--output` target must also be detected as a SecretWrite; otherwise
         // `https ... --output .env` would silently drop the follow-on correlation.
@@ -3631,6 +3717,7 @@ mod tests {
 
     #[test]
     fn derive_secret_write_from_wget_output_document_attached() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // wget's ATTACHED `--output-document=path` form must record the same
         // SecretWrite (and target path) as the separated `-O path` form. Without it,
         // `wget --output-document=.env https://x` emits only a Network event and the
@@ -3659,6 +3746,7 @@ mod tests {
 
     #[test]
     fn curl_remote_name_flag_is_not_an_output_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // OUTPUT-TARGET parity with the network value-flag list: curl `-O`/
         // `--remote-name` is BOOLEAN (the filename is derived from the URL, not the
         // next token). So `curl -O -L https://x` must NOT treat the FOLLOWING token
@@ -3697,6 +3785,7 @@ mod tests {
 
     #[test]
     fn wget_output_document_flag_is_value_taking() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The mirror of the curl case: wget `-O`/`--output-document` IS value-taking,
         // so `wget -O <file> https://x` MUST capture the FOLLOWING token as the output
         // target. Using a recognised secret basename (`.env`, matching `is_secret_file`)
@@ -3723,6 +3812,7 @@ mod tests {
 
     #[test]
     fn curl_glued_short_output_flag_detects_secret_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // GLUED short form: `curl -oid_rsa https://x` means `-o id_rsa`. Lowercase
         // `-o` is value-taking for curl, so the glued value is the output target and
         // a secret basename must seed a SecretWrite the W7 follow-on can pair with.
@@ -3745,6 +3835,7 @@ mod tests {
 
     #[test]
     fn wget_glued_short_output_flag_detects_secret_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // GLUED short form for wget's value-taking uppercase `-O`: `wget -O.env`
         // means `-O .env`. The glued value is the output target, so `.env` records a
         // SecretWrite that seeds SecretWriteThenNetwork.
@@ -3764,6 +3855,7 @@ mod tests {
 
     #[test]
     fn curl_glued_remote_name_flag_is_not_an_output_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // TOOL-AWARE parity with the separated form: curl `-O` is BOOLEAN, so the
         // glued `curl -O.foo https://x` is NOT `-O .foo`. `.foo` must NOT be recorded
         // as an output target (no FileWrite / SecretWrite), and certainly `.env` must
@@ -3785,6 +3877,7 @@ mod tests {
 
     #[test]
     fn derive_non_secret_write_records_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Writing an ordinary file is NOT recorded from the command string.
         let v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(derive_typed_events("echo hi > notes.txt", &v).is_empty());
@@ -3792,6 +3885,7 @@ mod tests {
 
     #[test]
     fn derive_dependency_manifest_write_is_flagged_filewrite() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A write whose target is a dependency manifest records a FileWrite with
         // the manifest flag, so the dependency-change correlation can match it.
         let v = raw_verdict_with(Action::Allow, vec![], None);
@@ -3814,6 +3908,7 @@ mod tests {
 
     #[test]
     fn cp_target_directory_flag_makes_positionals_sources() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `cp -t /dest package.json .env`: `-t` makes `/dest` the destination DIR and
         // EVERY positional a SOURCE, written to `/dest/<basename>`. The DIRECTORY
         // basename must NOT itself be classified (so `cp -t .env src` / `cp -t
@@ -3854,6 +3949,7 @@ mod tests {
 
     #[test]
     fn cp_target_directory_yields_directory_basename_not_a_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The reported regression: `cp -t .env src.txt` / `cp -t package.json src.txt`
         // must NOT synthesize a secret/manifest write FROM THE DIRECTORY basename. The
         // real write is `.env/src.txt` (basename `src.txt`, ordinary), so nothing is
@@ -3891,6 +3987,7 @@ mod tests {
 
     #[test]
     fn cp_without_target_directory_keeps_last_positional_as_dest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Without `-t`, the normal `cp src dst` layout is preserved: the LAST
         // positional is the destination. A secret destination still records a
         // SecretWrite (so the regression fix does not weaken ordinary detection).
@@ -3911,6 +4008,7 @@ mod tests {
 
     #[test]
     fn derive_git_force_push() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(
             kinds(&derive_typed_events("git push --force origin main", &v))
@@ -3943,6 +4041,7 @@ mod tests {
 
     #[test]
     fn derive_git_force_push_refspec_plus_and_mirror() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A leading `+` on a positional refspec (`git push origin +main`) and the
         // `--mirror` flag both force-update remote refs, so both must synthesize a
         // GitForcePush even without an explicit `--force`/`-f`/`--force-with-lease`.
@@ -3967,6 +4066,7 @@ mod tests {
 
     #[test]
     fn derive_git_force_push_skips_value_taking_globals() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F7: value-taking git globals (`--git-dir`, `--work-tree`, `--namespace`)
         // consume a SEPARATE following token. If that token were misread as the
         // subcommand, a real `push --force` behind it would be missed.
@@ -4005,6 +4105,7 @@ mod tests {
 
     #[test]
     fn derive_git_force_push_ignores_force_consumed_as_global_value() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F8: a force token that is actually the VALUE of a value-taking global
         // must NOT synthesize a force-push. In `git --git-dir --force push`,
         // `--force` is the value of `--git-dir` (the subcommand is `push`, with NO
@@ -4030,6 +4131,7 @@ mod tests {
 
     #[test]
     fn derive_network_excludes_help_and_version() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F3: a network LEADER alone is not a Network egress; there must be an
         // actual remote target. A pure informational invocation performs no
         // request, so it must record NO Network event (otherwise it could complete
@@ -4070,6 +4172,7 @@ mod tests {
 
     #[test]
     fn derive_network_from_curl_url_flag_forms() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // curl `--url <URL>` (separated) and `--url=<URL>` (attached) both name the
         // request target explicitly. The attached form is a single `-`-leading token
         // that the generic flag skip would otherwise discard, dropping the Network
@@ -4104,6 +4207,7 @@ mod tests {
 
     #[test]
     fn derive_write_targets_accumulate_redirect_and_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A command with BOTH a (benign) shell redirection and a downloader `-o`
         // secret output must record BOTH the Network egress AND the `.env`
         // SecretWrite. Short-circuiting on the redirection alone would drop the
@@ -4172,6 +4276,7 @@ mod tests {
 
     #[test]
     fn quoted_and_secondary_redirection_targets_still_raise_secret_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // repo-0282 regression: a quoted destination and a concealed later
         // redirect must both still produce the SecretWrite event.
         for cmd in ["printf x > \".env\"", "printf x > /tmp/log > .env"] {
@@ -4249,6 +4354,7 @@ mod tests {
 
     #[test]
     fn derive_network_excludes_local_and_file_targets() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // R4: a downloader pointed at a LOCAL/loopback host or a `file://` URL is
         // not a remote egress, so it must record NO Network event (and so cannot
         // feed a false W7 secret-write/dependency-change correlation). A genuine
@@ -4335,6 +4441,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_with_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         let events = derive_typed_events("rm -rf src/old.rs", &v);
         let del = events
@@ -4349,6 +4456,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_through_sudo_wrapper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // resolve_wrapped_command peels `sudo`, so the leader is still `rm`.
         let v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(
@@ -4359,6 +4467,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_records_multipath_count() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A single multi-path delete records ONE FileDelete event whose `count`
         // metadatum is the number of path operands, so the mass-deletion
         // correlation can weigh it by paths (4) rather than commands (1).
@@ -4403,6 +4512,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_honors_end_of_options_separator() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // C5: a bare `--` ends option parsing, so dash-led tokens after it are
         // POSITIONAL paths. `rm -- -a -b -c` deletes three files literally named
         // `-a`/`-b`/`-c` (3 deletes), and `rm -f -- -a file` deletes `-a` and
@@ -4439,6 +4549,7 @@ mod tests {
 
     #[test]
     fn delete_operand_count_ignores_attached_and_separated_shell_redirections() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let verdict = raw_verdict_with(Action::Allow, vec![], None);
         for command in [
             "rm -f authored.txt 2>/dev/null",
@@ -4518,6 +4629,7 @@ mod tests {
 
     #[test]
     fn hermes_snapshot_fallback_remains_counted_when_commands_can_be_shadowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let command = hermes_snapshot_wrapper(
             "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
             "/data/data/com.termux/files/usr/tmp/hermes-snap-session.sh",
@@ -4574,6 +4686,7 @@ mod tests {
 
     #[test]
     fn hermes_snapshot_cleanup_keeps_other_delete_segments_counted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let wrapper = hermes_snapshot_wrapper(
             "/var/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
             "/var/tmp/hermes-snap-session.sh",
@@ -4588,6 +4701,7 @@ mod tests {
 
     #[test]
     fn hermes_wrapper_whitespace_and_newline_mutations_never_gain_an_exemption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let command = hermes_snapshot_wrapper(
             "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
             "/tmp/hermes-snap-session.sh",
@@ -4618,6 +4732,7 @@ mod tests {
 
     #[test]
     fn hermes_cleanup_interacts_safely_with_redirections_and_shell_types() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let command = hermes_snapshot_wrapper(
             "/tmp/hermes-snap-session.sh.tmp.XXXXXXXXXX",
             "/tmp/hermes-snap-session.sh",
@@ -4643,6 +4758,7 @@ mod tests {
 
     #[test]
     fn concrete_hermes_artifacts_are_excluded_but_authored_lookalikes_are_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             delete_counts_for_shell(
                 "rm -rf '/tmp/hermes_sandbox_job' \
@@ -4763,6 +4879,7 @@ mod tests {
 
     #[test]
     fn attached_redirection_suffix_preserves_only_the_real_delete_operand() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let args = ["target>/dev/null"]
             .into_iter()
             .map(str::to_string)
@@ -4838,6 +4955,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_mixed_paths_counts_only_non_build() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A7: a MIXED delete records total `count` for every path but a
         // `non_build_count` that excludes build artifacts. `rm app.rs dist/x dist/y`
         // is 3 paths total, 1 non-build, so it must NOT trip mass-deletion alone.
@@ -4876,6 +4994,7 @@ mod tests {
 
     #[test]
     fn derive_file_delete_shred_skips_value_taking_option_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // D1: `shred`'s `-n N` / `--iterations N` and `-s N` / `--size N` consume
         // the NEXT token as a value, NOT a path. Treating that value as a path
         // fabricates a delete of `3` and overcounts the mass-delete weight.
@@ -5016,6 +5135,7 @@ mod tests {
 
     #[test]
     fn derive_package_install() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = raw_verdict_with(Action::Allow, vec![], None);
         assert!(kinds(&derive_typed_events("npm install left-pad", &v))
             .contains(&EventKind::PackageInstall));
@@ -5251,6 +5371,7 @@ mod contextual_escalation_tests {
 
     #[test]
     fn domain_scoped_escalation_and_cooldown_use_contextual_authorities() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let now = chrono::Utc::now();
         let mut session = SessionWarnings::new("context-fixture");
         let rule_id = RuleId::PlainHttpToSink.to_string();
@@ -5318,6 +5439,7 @@ mod contextual_escalation_tests {
 
     #[test]
     fn network_event_does_not_choose_one_of_conflicting_authorities() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let verdict = verdict();
         for (command, expected) in [
             ("curl http://0x7f.0x/path", Some("0x7f.0x")),
@@ -5339,6 +5461,7 @@ mod contextual_escalation_tests {
 
     #[test]
     fn ordinary_distinct_urls_keep_the_existing_representative_network_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut verdict = verdict();
         verdict.findings[0].evidence = vec![
             Evidence::Url {

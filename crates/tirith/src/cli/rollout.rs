@@ -57,7 +57,7 @@ impl RolloutService {
     }
 
     pub fn prepare(&self, id: &str, request: RolloutRequest) -> Result<Value, String> {
-        RecordId::parse(id)?;
+        policy_rollout::record_id(id)?;
         if request.commands.is_empty()
             || request.commands.len() > 32
             || request
@@ -90,7 +90,7 @@ impl RolloutService {
             request.scope,
         )?;
         let (candidate, coverage) = prepared.rollout_candidate()?;
-        let owner = RecordId::parse(&uuid::Uuid::new_v4().to_string())?;
+        let owner = RecordId::new();
         let frozen: Vec<_> = request
             .commands
             .iter()
@@ -110,6 +110,8 @@ impl RolloutService {
                         card_ref: None,
                         clipboard_source:
                             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
                     },
                     &prepared.snapshot,
                     tirith_core::escalation::CallerContext::Cli,
@@ -121,7 +123,7 @@ impl RolloutService {
         let workflows: Vec<_> = frozen
             .iter()
             .map(|evidence| Workflow {
-                id: RecordId::parse(&uuid::Uuid::new_v4().to_string()).unwrap(),
+                id: RecordId::new(),
                 evidence,
                 owner: Some(owner.clone()),
             })
@@ -138,14 +140,14 @@ impl RolloutService {
             .collect();
         let now = Utc::now();
         let clients = [ClientObservation::local_runtime(
-            RecordId::parse(&uuid::Uuid::new_v4().to_string())?,
+            RecordId::new(),
             &prepared.snapshot,
             &candidate,
             now,
         )];
         let report = policy_rollout::review(policy_rollout::ImpactRequest {
-            id: RecordId::parse(&uuid::Uuid::new_v4().to_string())?,
-            candidate_id: RecordId::parse(id)?,
+            id: RecordId::new(),
+            candidate_id: policy_rollout::record_id(id)?,
             scope: request.scope.report_scope(),
             baseline: &prepared.snapshot,
             candidate: &candidate,
@@ -179,7 +181,7 @@ impl RolloutService {
     }
 
     pub fn show(&self, id: &str) -> Result<Value, String> {
-        RecordId::parse(id)?;
+        policy_rollout::record_id(id)?;
         let writer = MutationService::current()?;
         let report = writer
             .impact_review(id)?
@@ -196,7 +198,7 @@ impl RolloutService {
     }
 
     pub fn activate(&self, id: &str, undo: bool) -> Result<Value, String> {
-        RecordId::parse(id)?;
+        policy_rollout::record_id(id)?;
         let writer = MutationService::current()?;
         let review = writer
             .impact_review(id)?
@@ -363,7 +365,7 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
                     value["operation"]["operation_id"]
                         .as_str()
                         .unwrap_or("unknown"),
-                    value["operation"]["state"].as_str().unwrap_or("unknown")
+                    super::profile::human_state(&value["operation"])
                 );
                 for (index, workflow) in value["impact"]["workflows"]
                     .as_array()
@@ -410,14 +412,7 @@ fn run(json_output: bool, action: impl FnOnce(&RolloutService) -> Result<Value, 
 fn operation_exit(value: &serde_json::Value) -> i32 {
     use super::setup::change_plan::JobState;
     match serde_json::from_value::<JobState>(value.clone()) {
-        Ok(
-            JobState::Planned
-            | JobState::Completed
-            | JobState::CompletedWithRecovery
-            | JobState::Undone
-            | JobState::UndoneWithRecovery
-            | JobState::Cancelled,
-        ) => 0,
+        Ok(JobState::Planned | JobState::Completed | JobState::Undone | JobState::Cancelled) => 0,
         _ => 1,
     }
 }
@@ -460,9 +455,7 @@ mod tests {
         for state in [
             JobState::Planned,
             JobState::Completed,
-            JobState::CompletedWithRecovery,
             JobState::Undone,
-            JobState::UndoneWithRecovery,
             JobState::Cancelled,
         ] {
             assert_eq!(
@@ -499,7 +492,7 @@ mod tests {
         let snapshot = EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime);
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let owner = RecordId::parse(&uuid::Uuid::new_v4().to_string()).unwrap();
+        let owner = RecordId::new();
         let grants: Vec<_> = (0..400)
             .map(|_| TrustGrant {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -522,7 +515,7 @@ mod tests {
             .collect();
         let report = policy_rollout::review(policy_rollout::ImpactRequest {
             id: owner.clone(),
-            candidate_id: RecordId::parse(&id).unwrap(),
+            candidate_id: policy_rollout::record_id(&id).unwrap(),
             scope: RolloutScope::PersonalUser,
             baseline: &snapshot,
             candidate: &snapshot.policy,
@@ -535,13 +528,13 @@ mod tests {
         })
         .unwrap();
         let status = OperationStatus {
-            setup_activation: None,
             schema_version: 1,
             operation_id: id.clone(),
             kind: OperationKind::SetProfile,
             client_version: env!("CARGO_PKG_VERSION").into(),
             policy_identity: snapshot.identity.clone(),
             state: JobState::Planned,
+            recovery: false,
             no_op: false,
             irreversible: false,
             active_action: None,
@@ -553,6 +546,7 @@ mod tests {
                 description: "d".repeat(120000),
                 activation: true,
                 state: StepState::Pending,
+                recovery: false,
             }],
         };
         let value = project_output(
@@ -568,14 +562,14 @@ mod tests {
         assert_eq!(value["impact"]["candidate_id"], id);
         assert_eq!(value["operation"]["state"], "planned");
         assert_eq!(value["live"]["impact_observation"]["schema_version"], 1);
-        assert_eq!(
-            value["live"]["impact_observation"]["current_grant_state_observed"],
-            false
-        );
-        assert_eq!(
-            value["live"]["impact_observation"]["current_client_policy_observed"],
-            false
-        );
+        // A historical projection observes nothing current, so it has no
+        // current-observation flags.
+        for absent in [
+            "current_grant_state_observed",
+            "current_client_policy_observed",
+        ] {
+            assert!(value["live"]["impact_observation"].get(absent).is_none());
+        }
         assert_eq!(
             value["live"]["impact_freshness"],
             value["live"]["impact_observation"]["review_freshness"]

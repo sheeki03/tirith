@@ -1230,6 +1230,7 @@ mod tests {
 
     #[test]
     fn matcher_outcomes_are_bound_to_the_exact_compiled_policy_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let guard_for = |prefix: &str| Web3GuardPolicy {
             networks: vec![TrustedNetwork {
                 name: "prod".into(),
@@ -1268,6 +1269,7 @@ mod tests {
 
     #[test]
     fn command_card_privacy_firewall_runs_without_policy_keys_and_never_echoes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let private_key = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mnemonic =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1594,6 +1596,7 @@ mod tests {
 
     #[test]
     fn every_declared_unclassified_action_survives_as_a_decision() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (action, expected_finding) in [
             (Web3GuardAction::Allow, false),
             (Web3GuardAction::Warn, true),
@@ -1642,6 +1645,7 @@ mod tests {
 
     #[test]
     fn hardhat_selector_alias_and_command_card_actions_are_complete_lattices() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let aliases: std::collections::BTreeMap<String, String> =
             [("mainnet".to_string(), "prod".to_string())]
                 .into_iter()
@@ -1744,6 +1748,7 @@ mod tests {
 
     #[test]
     fn configured_incomplete_analysis_action_is_a_complete_lattice() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let oversized = "x".repeat(crate::rules::web3::MAX_INPUT_BYTES + 1);
         for action in [
             Web3GuardAction::Allow,
@@ -1796,6 +1801,7 @@ mod tests {
 
     #[test]
     fn signer_policy_is_exhaustive_even_when_rpc_is_absent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let guard = Web3GuardPolicy {
             allowed_signers: [crate::web3_policy::TrustedSignerKind::KeypairFile]
                 .into_iter()
@@ -1970,6 +1976,7 @@ mod tests {
 
     #[test]
     fn rpc_candidates_are_identity_filtered_and_never_first_match_wins() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let endpoint = RpcMatcher {
             scheme: "https".into(),
             host: "shared.test".into(),
@@ -2082,6 +2089,7 @@ mod tests {
 
     #[test]
     fn exact_card_authoring_refuses_unbound_execution_and_artifact_rechecks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let guard = Web3GuardPolicy {
             networks: vec![TrustedNetwork {
                 name: "prod".into(),

@@ -43,10 +43,7 @@ pub struct PublisherObservation {
 }
 
 fn clock_ms() -> Result<u64, ErrorCode> {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| ErrorCode::InvalidResponse)
+    crate::util::now_ms().ok_or(ErrorCode::InvalidResponse)
 }
 fn endpoint(raw: &str, options: &EndpointOptions) -> Result<url::Url, ErrorCode> {
     if raw.is_empty() || raw.len() > 2048 || raw.chars().any(char::is_control) {

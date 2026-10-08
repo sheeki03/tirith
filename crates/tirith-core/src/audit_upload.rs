@@ -446,11 +446,13 @@ mod tests {
 
     #[test]
     fn test_spool_path_uses_xdg_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _path = spool_path();
     }
 
     #[test]
     fn test_enforce_retention_max_events() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lines: Vec<String> = (0..20).map(|i| format!("{{\"n\":{i}}}")).collect();
         let trimmed = enforce_retention(lines, 10, u64::MAX);
         assert_eq!(trimmed.len(), 10);
@@ -461,6 +463,7 @@ mod tests {
 
     #[test]
     fn test_enforce_retention_max_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Each line is ~10 bytes + newline = 11 bytes; 55-byte cap fits ~5 lines.
         let lines: Vec<String> = (0..100).map(|i| format!("{{\"n\":{i:03}}}")).collect();
         let trimmed = enforce_retention(lines, usize::MAX, 55);
@@ -469,6 +472,7 @@ mod tests {
 
     #[test]
     fn test_enforce_retention_within_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lines: Vec<String> = (0..5).map(|i| format!("{{\"n\":{i}}}")).collect();
         let trimmed = enforce_retention(lines.clone(), 100, u64::MAX);
         assert_eq!(trimmed.len(), 5);
@@ -476,6 +480,7 @@ mod tests {
 
     #[test]
     fn test_spool_event_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tirith").join("audit-queue.jsonl");
 
@@ -497,6 +502,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_spool_empty() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "line1\nline2\n").unwrap();
@@ -509,6 +515,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_spool_with_remaining() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         // The on-disk spool holds the drainer's snapshot (sent + unsent lines).
@@ -527,6 +534,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_spool_preserves_concurrent_appends() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // repo-0250: lines appended by another process AFTER the drainer's
         // snapshot must survive when the snapshotted prefix is still intact.
         // A changed prefix is covered by the fail-closed test below.
@@ -549,6 +557,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_spool_preserves_append_after_fully_sent_snapshot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "line1\nline2\nline3-new\n").unwrap();
@@ -561,6 +570,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_spool_refuses_changed_snapshot_prefix() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         fs::write(&path, "other\nline2\nline3-new\n").unwrap();

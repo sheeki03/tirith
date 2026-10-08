@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 
 use crate::agent_origin::AgentOrigin;
@@ -32,25 +33,17 @@ use crate::verdict::{Action, Verdict};
 
 mod shell_receipt;
 pub use shell_receipt::{
-    acknowledge_shell_execution_receipt, arm_shell_execution_receipt, authenticate_shell_context,
+    acknowledge_shell_execution_receipt, arm_shell_execution_receipt,
     consume_shell_execution_receipt, create_shell_execution_receipt,
-    discard_shell_execution_receipt, execute_automatic_shell_verification_probe,
-    execute_shell_verification_probe, finish_automatic_shell_verification_status,
-    finish_shell_verification, finish_shell_verification_authenticated,
-    observe_shell_verification_hook, reconcile_shell_execution_receipt,
-    register_shell_hook_instance, register_shell_hook_instance_with_delivery,
-    shell_execution_receipt_context, start_shell_verification, validate_shell_hook_instance,
-    AuthenticatedShellContext, ShellApprovalOutcome, ShellHookFamily, ShellReceiptChannel,
-    ShellReceiptContext, ShellVerificationChallenge, ShellVerificationHookDecision,
-    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
-    ShellVerificationStatus, SHELL_RECEIPT_READ_VERSIONS,
-};
-#[cfg(unix)]
-pub use shell_receipt::{
-    activation_client_exchange, activation_server_receive, start_automatic_shell_verification,
-    ActivationExchangeId, ActivationReplyOwner, ActivationTransportError,
-    AutomaticShellVerification, AutomaticVerificationStage, ACTIVATION_REPLY_CAP,
-    ACTIVATION_REQUEST_CAP,
+    discard_shell_execution_receipt, execute_shell_verification_probe, finish_shell_verification,
+    finish_shell_verification_authenticated, hook_freshness, observe_shell_verification_hook,
+    reconcile_shell_execution_receipt, register_hook_presence, register_shell_hook_instance,
+    register_shell_hook_instance_with_delivery, shell_execution_receipt_context,
+    start_shell_verification, validate_shell_hook_instance, HookFreshness, HookFreshnessState,
+    HookPresenceFamily, HookRegistration, ShellApprovalOutcome, ShellHookFamily,
+    ShellReceiptChannel, ShellReceiptContext, ShellVerificationChallenge,
+    ShellVerificationHookDecision, ShellVerificationObservation, ShellVerificationProbe,
+    ShellVerificationProof, ShellVerificationStatus, SHELL_RECEIPT_READ_VERSIONS,
 };
 
 pub const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 3;
@@ -4811,9 +4804,7 @@ pub(crate) fn unix_time_ms() -> Result<u64, String> {
     u64::try_from(millis).map_err(|_| "system clock is outside the supported range".to_string())
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+pub(crate) use crate::util::sha256_hex;
 
 fn validate_stable_id(kind: &str, value: &str) -> Result<(), String> {
     if value.is_empty()
@@ -7186,6 +7177,7 @@ mod contextual_warning_identity_tests {
 
     #[test]
     fn strict_warning_prototypes_keep_both_client_identities_including_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut verdict = verdict();
         for (command, expected) in [
             ("curl http://0x7f.0x/path", vec!["0x7f.0x"]),

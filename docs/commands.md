@@ -1,12 +1,13 @@
 # Command reference
 
-`tirith --help` prints the available top-level commands
-grouped by category, and `tirith <command> --help` documents any one in detail.
+Running `tirith` with no command (or `tirith -h`) prints a short list of common
+tasks and the command for each. `tirith --help` prints that list followed by the
+available top-level commands grouped by category, and `tirith <command> --help`
+documents any one in detail.
 The groups below mirror that built-in grouping. The [README](../README.md)
-covers the everyday subset; this is the complete reference. The unreleased
-[cycle journeys](next-cycle/user-journeys.md) cover terminal and agent setup,
-project review, interruptions, upgrade and removal; their final-candidate
-qualification remains tracked separately.
+covers the everyday subset; this is the complete reference.
+[Everyday workflows](user-journeys.md) walk through terminal and agent setup,
+project review, interruptions, upgrade and removal.
 
 ## Scan & analyze
 
@@ -38,10 +39,10 @@ qualification remains tracked separately.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith status` | "Am I protected?": protection mode, hook health, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
+| `tirith status` | "Am I protected?": protection mode, hook health, whether this terminal's loaded hook is current, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
 | `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a static shell/terminal report, `--quick` is a pollable snapshot, and `--verify-shell` gives the actual caller-shell challenge. Use `--bundle --bundle-preview` to review selected diagnostics before private export (`--bundle-incident`, `--bundle-operation`) |
 | `tirith prompt-status` | One-line protection and active-context indicator for your prompt (`--short`, `--json`; 30s cache) |
-| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review and lifecycle operations (`--no-browser --json` for headless access); `export` retains the static report route |
+| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review, copyable upgrade commands and a guarded ThreatDB refresh (`--no-browser --json` for headless access; each printed URL signs in once and expires after 2 minutes); `export` retains the static report route |
 | `tirith warnings` | Session warnings (`--summary` for shell exit hooks, `--clear`, `--format json`) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith logs {scan,summarize,redact}` | Review agent / CLI logs for injection seeds, secrets, and escape bytes (`summarize --safe-for-agent`) |
@@ -52,9 +53,9 @@ qualification remains tracked separately.
 | Command | What it does |
 |---------|-------------|
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
-| `tirith onboard` | Guided first-run wizard: detect the environment and recommend a policy template (`--apply`) |
+| `tirith onboard` | Guided first-run wizard: detect the environment and recommend the personal Balanced profile, or a legacy template with `--team` / `--ai-agent-heavy` (`--apply`) |
 | `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
-| `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
+| `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--agent claude-code` also configures the Claude Code Bash hook in the same undoable plan (macOS and Linux); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
 | `tirith setup shell` | Set up, repair (`--force`) or remove owned startup blocks (`--remove`) for an explicit `--shell`; activation and verified blocking are separate |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
 | `tirith verify-self` / `update` / `version --provenance` | Verify the running binary, signature-verified self-update, and build / install provenance |
@@ -67,9 +68,11 @@ qualification remains tracked separately.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](next-cycle/policy-snapshots.md)) |
+| `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](internals.md#effective-policy-snapshot)) |
 | `tirith policy {profile,setting,operation,simulate}` | Preview/apply typed personal changes, inspect/retry/cancel/undo saved operations, and compare effective decisions for a captured command without executing it |
-| `tirith trust {add,list,explain,diff,remove,gc,last,from-last-trigger}` | Manage trusted patterns (narrow scope, 30-day TTL by default); `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
+| `tirith trust {add,expiry,revoke,migrate,list,explain,diff,remove,gc,last,from-last-trigger,audit}` | Manage [trust grants](trust-grants.md) (narrow scope, 30-day TTL by default; `add` needs `--rule` or explicit `--all-rules`; `--scope project` binds one checkout); `migrate --scope user` moves legacy entries; `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
+| `tirith policy rollout {prepare,show,activate,undo}` | Measure a profile against representative commands, then activate or undo it as one reviewed operation ([rollouts](policy-rollouts.md)) |
+| `tirith policy team {connect,disconnect,status,enrollment,rollout}` | Optional self-hosted [team policy](team-policy.md): connection, explicit enrollment with background refresh and an offline grace period, reviewed publication, rollback and fleet reports |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
 | `tirith output wrap {on,off,status}` | Install or remove the `tirith-out` wrapper that runs a command's output through `tirith view` |
 
@@ -108,17 +111,16 @@ qualification remains tracked separately.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
+| `tirith pkg approve <backend> <spec>` | Currently disabled. Checks the native approval authority, then refuses with `private_input_execution_unqualified`; records no approval, because contained `pkg install` is disabled |
 | `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
-| `tirith pkg install-npm` | Review, apply, inspect history and reconfirm a bounded local leaf installation. GNU Linux AArch64 only, with exact pinned tools, disabled scripts, full native confinement and a current production-signed v2 threat feed. The published v1 feed is insufficient; unsupported or incomplete requests refuse. See the [installation contract](npm-install-contract.md) |
 | `tirith pkg inspect <artifact>...` | Inspect exact local npm tarballs or Python wheels without execution. [npm reports](npm-inspection.md) preserve captured hashes and explicit coverage; ambiguous `.tar.gz` files require `--ecosystem npm` for the npm reader (`--format json`, npm `--format sarif`) |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
-| `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
+| `tirith pkg trust-tool` | Record a canonical-path + SHA-256 pin for a fully static native Linux `uv` executable. The pin is not yet enforced: nothing in this release reads it, because contained `pkg install` is disabled. JSON output carries `"enforced": false` |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |
 | `tirith pkg diff <old> <new>` | Compare two local npm tarballs or Python wheels. [npm comparison](npm-inspection.md) retains exact artifact hashes and separates byte changes from analyzer/coverage changes; it grants no installation authority (`--ecosystem`, `--format json`, npm `--format sarif`) |
 | `tirith pkg attest <wheel>` | Fetch a wheel's PyPI publish attestation and bind the attested subject digest to the wheel's SHA-256. Evidence only, never an auto-allow |
 | `tirith pkg attest-npm` | Ask the project's own npm to verify its installed packages' registry signatures and provenance attestations, bound to the exact `package-lock.json` and `node_modules` inventory, and emit a signed receipt. Tirith does not download, inspect, or bind the tarball bytes npm installs (`--project`, `--require-provenance`, `--out`, `--format json`) |
-| `tirith pkg receipt {list,last,show}` | List or show the package-firewall tamper-evident receipts |
+| `tirith pkg receipt {list,last,show}` | List or show stored tamper-evident artifact-scan receipts |
 
 ## AI-agent integrations
 

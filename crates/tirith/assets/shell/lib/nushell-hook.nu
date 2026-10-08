@@ -20,6 +20,16 @@
 if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
     $env._TIRITH_NU_LOADED = true
 
+    # Give this shell its own session ID, like the other hooks, so unrelated
+    # shells that inherited one ID do not share warning history. Keep any
+    # inherited value only when `tirith __session-id` is unavailable.
+    let tirith_session = (try {
+        do { ^tirith __session-id } | complete | get stdout | str trim
+    } catch { "" })
+    if ($tirith_session =~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+        $env.TIRITH_SESSION_ID = $tirith_session
+    }
+
     # M8 ch2 — surface "this shell is on the remote side of an SSH session"
     # to `tirith prompt-status` (planned for M8 ch6) and any other
     # downstream consumer. Set NOW so chunk 6 can read it without a
@@ -80,6 +90,18 @@ if (($nu.is-interactive) and (not ('_TIRITH_NU_LOADED' in $env))) {
     # A double-source guard never reaches this version publication.
     $env.TIRITH_INTEGRATION_VERSION = ($env._TIRITH_INIT_VERSION? | default "unknown")
     $env.TIRITH_INTEGRATION_SHELL = "nushell"
+
+    # Record that this hook loaded, so `tirith status` and `tirith doctor` can
+    # say whether this terminal runs the hook of the current Tirith
+    # executable. The private record names this live process and that
+    # executable; it carries no secret and grants nothing. Unix only: on
+    # Windows the readout keeps the inherited, unverified integration version.
+    # Failure only leaves the readout `unregistered`.
+    if ($nu.os-info.name != "windows") {
+        try {
+            do { ^tirith __hook-presence --family nushell --shell-pid $nu.pid } | complete | ignore
+        }
+    }
 }
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────

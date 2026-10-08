@@ -187,6 +187,12 @@ fn check_raw_ip(url: &UrlLike, raw_url: Option<&str>, findings: &mut Vec<Finding
     let Some(host) = url.host() else {
         return;
     };
+    // curl keeps an empty-hex host (`0xa.0x.0x.0x5`) as a DNS name, but a libc
+    // `inet_aton` resolver reads the same spelling as an IPv4 address. Check
+    // that numeric reading too.
+    let numeric_reading =
+        crate::parse::curl_empty_hex_numeric_reading(host).map(|address| address.to_string());
+    let host = numeric_reading.as_deref().unwrap_or(host);
     let (title, address_kind) = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         // Loopback (127.x) is benign local development — skip.
         if ip.octets()[0] == 127 {
@@ -220,7 +226,12 @@ fn check_raw_ip(url: &UrlLike, raw_url: Option<&str>, findings: &mut Vec<Finding
         .as_deref()
         .or_else(|| url.raw_host())
         .unwrap_or(host);
-    let description = if raw_host == host {
+    let description = if numeric_reading.is_some() {
+        format!(
+            "URL host '{raw_host}' is read as {address_kind} {host} by resolvers that parse \
+             it numerically, instead of a domain name"
+        )
+    } else if raw_host == host {
         format!("URL points to {address_kind} {host} instead of a domain name")
     } else {
         format!(

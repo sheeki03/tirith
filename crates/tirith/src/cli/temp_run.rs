@@ -636,6 +636,7 @@ mod tests {
 
     #[test]
     fn copy_repo_excludes_git_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
 

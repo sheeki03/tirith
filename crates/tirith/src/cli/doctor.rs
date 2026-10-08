@@ -1070,6 +1070,9 @@ struct DoctorInfo {
     protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     audit_recording: super::audit_health::AuditHealth,
     package_approval: super::package_approval_authority::PackageApprovalAvailability,
+    /// Whether this terminal's loaded hook was registered by this executable.
+    /// Loaded-hook evidence only, never blocking proof.
+    hook_freshness: super::hook_freshness::HookFreshnessReport,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1385,6 +1388,7 @@ fn gather_info() -> DoctorInfo {
         ),
         audit_recording: super::audit_health::read(),
         package_approval: super::package_approval_authority::availability(),
+        hook_freshness: super::hook_freshness::gather(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
         detected_shell,
@@ -2568,6 +2572,9 @@ fn print_human(info: &DoctorInfo) {
         println!();
     }
     println!("{}", format_protection_evidence(&info.protection_evidence));
+    for line in info.hook_freshness.human_lines() {
+        println!("  {line}");
+    }
     print!(
         "{}",
         format_protection_status(info.tirith_status.as_deref())
@@ -3385,6 +3392,7 @@ mod tests {
 
     #[test]
     fn hook_reads_refuse_symlinks_fifos_and_oversized_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -3835,6 +3843,7 @@ mod tests {
 
     #[test]
     fn detect_shell_tool_conflicts_reports_only_profile_hits_when_offline_of_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A tool mentioned only in the profile (not on PATH) must still be
         // surfaced, with `in_profile` true and `on_path` reflecting reality.
         let tmp = tempfile::tempdir().unwrap();
@@ -3905,6 +3914,7 @@ mod tests {
 
     #[test]
     fn redact_home_path_masks_the_literal_home_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = std::path::Path::new("/Users/alice");
         let text = "hook dir: /Users/alice/.local/share/tirith/shell\npolicy: /Users/alice/.tirith/policy.yaml";
         let red = redact_home_path(text, Some(home));
@@ -4207,6 +4217,7 @@ mod tests {
     /// fish, and PowerShell hooks too, so the line must not be bash-gated.
     #[test]
     fn compat_human_surfaces_tirith_status_for_non_bash_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for shell in ["zsh", "fish", "powershell", "nushell"] {
             let report = compat_report_for(shell, Some("degraded"));
             let out = format_compat_human(&report);
@@ -4230,6 +4241,7 @@ mod tests {
     /// A plain (non-degraded) status is surfaced verbatim for a non-bash shell.
     #[test]
     fn compat_human_surfaces_plain_status_for_non_bash_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = compat_report_for("zsh", Some("warn-only"));
         let out = format_compat_human(&report);
         assert!(
@@ -4242,6 +4254,7 @@ mod tests {
     /// `protection status:` line, and no panic / stray formatting.
     #[test]
     fn compat_human_omits_status_line_when_unset() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = compat_report_for("zsh", None);
         let out = format_compat_human(&report);
         assert!(
@@ -4322,6 +4335,9 @@ mod tests {
             assert!(!human.contains("observed-blocking"));
             assert!(format_protection_evidence(&full.protection_evidence)
                 .contains("blocking unverified"));
+            let full_value = serde_json::to_value(&full).unwrap();
+            assert_eq!(full_value["hook_freshness"]["blocking_proof"], false);
+            assert!(full_value["hook_freshness"]["this_shell"].is_string());
         }
     }
 
@@ -4401,6 +4417,7 @@ mod tests {
 
     #[test]
     fn compat_human_ps_psreadline_some_true_renders_yes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let out = format_compat_human(&compat_report_with_ps(Some(true)));
         assert!(
             out.contains("PSReadLine module: yes") || out.contains("PSReadLine module:     yes"),
@@ -4410,6 +4427,7 @@ mod tests {
 
     #[test]
     fn compat_human_ps_psreadline_some_false_renders_no_with_hint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let out = format_compat_human(&compat_report_with_ps(Some(false)));
         assert!(
             out.contains("no (key binding will not work)"),
@@ -4619,6 +4637,7 @@ mod tests {
     /// (the extension contract must stay minimal/stable).
     #[test]
     fn quick_json_has_exactly_the_documented_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let info = QuickDoctorInfo {
             schema_version: 1,
             protection_mode: "guarded".to_string(),
@@ -4791,6 +4810,7 @@ mod tests {
     /// create-new semantics through the contained writer.
     #[test]
     fn create_policy_contained_creates_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let path = repo.path().join(".tirith").join("policy.yaml");
         create_policy_contained(repo.path(), &path, "fail_mode: open\n").unwrap();
@@ -4801,6 +4821,7 @@ mod tests {
     /// "already exists" error is preserved.
     #[test]
     fn create_policy_contained_refuses_to_clobber_existing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path().join(".tirith");
         std::fs::create_dir_all(&dir).unwrap();
@@ -4817,6 +4838,7 @@ mod tests {
     /// file OUTSIDE the repo).
     #[test]
     fn create_policy_contained_refuses_symlinked_tirith_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join(".tirith")).unwrap();
@@ -4834,6 +4856,7 @@ mod tests {
     /// contained writer refuses it.
     #[test]
     fn create_policy_contained_refuses_dangling_symlink_at_final_component() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");

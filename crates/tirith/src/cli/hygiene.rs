@@ -364,6 +364,7 @@ mod tests {
 
     #[test]
     fn scan_json_body_counts_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Empty input → zero counts, well-formed envelope.
         let body = scan_json_body(&[]);
         assert_eq!(body["total"], 0);

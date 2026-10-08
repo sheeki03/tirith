@@ -787,6 +787,13 @@ pub fn capsule_receipts_dir() -> Option<PathBuf> {
     crate::policy::data_dir().map(|dir| dir.join("capsule-receipts"))
 }
 
+/// A coherent `contained` receipt for tests in other modules (the audit
+/// chain-anchor tests, which are Unix-only).
+#[cfg(all(test, unix))]
+pub(crate) fn sample_contained_receipt() -> CapsuleRunReceipt {
+    CapsuleRunReceipt::new(tests::contained_facts())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,7 +820,7 @@ mod tests {
         }
     }
 
-    fn contained_facts() -> CapsuleRunFacts {
+    pub(super) fn contained_facts() -> CapsuleRunFacts {
         CapsuleRunFacts {
             status: CapsuleRunStatus::Contained,
             policy_projection_hash: "a".repeat(64),
@@ -858,6 +865,7 @@ mod tests {
 
     #[test]
     fn in_project_receipt_parent_is_prepared_and_exclusion_is_exact() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("project");
         std::fs::create_dir(&project).expect("project");
@@ -874,6 +882,7 @@ mod tests {
 
     #[test]
     fn a_directory_cannot_become_a_broad_receipt_exclusion() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("project");
         let requested = project.join("receipts/run.json");
@@ -888,6 +897,7 @@ mod tests {
 
     #[test]
     fn publication_requires_immediate_retained_and_visible_readback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("project");
         std::fs::create_dir_all(project.join("receipts")).expect("receipt parent");
@@ -922,6 +932,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn retained_receipt_accepts_the_approved_macos_var_alias() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let canonical_base = std::fs::canonicalize(base.path()).expect("canonical tempdir");
         let suffix = canonical_base
@@ -946,6 +957,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_receipt_rejects_a_symlink_below_the_project_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("project");
         let outside = base.path().join("outside");

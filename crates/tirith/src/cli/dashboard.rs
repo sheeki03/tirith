@@ -19,11 +19,18 @@
 //! * Zero telemetry/network beyond the bound loopback port.
 //!
 //! The authorization decision is a PURE function ([`authorize`]), unit-testable
-//! without a socket; the accept loop is a thin shell around it.
+//! without a socket; the accept loop is a thin shell around it. Requests are
+//! read and answered by the same bounded loopback transport as the control
+//! dashboard (`cli::control::http`), with the report's own request rules and
+//! response policy.
 
-use std::net::SocketAddr;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::cli::control::http;
 
 use chrono::{DateTime, Utc};
 use tirith_core::dashboard::{self, DashboardSnapshot, HookSummary};
@@ -40,9 +47,33 @@ fn mono_ttl_expired(elapsed: Duration) -> bool {
     elapsed >= TOKEN_TTL
 }
 
-/// How long the accept loop blocks per `recv_timeout` before re-checking the
-/// TTL / shutdown — responsive to expiry without busy-polling.
-const ACCEPT_POLL: Duration = Duration::from_millis(500);
+/// How long the accept loop waits between polls of its nonblocking listener
+/// before re-checking the TTL — responsive to expiry without busy-polling.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Connections served at once. A slow client holds one slot for at most the
+/// transport's request deadline; further connections are closed immediately.
+const MAX_CONNECTIONS: usize = 8;
+
+/// At most this many requests are answered on one connection (pipelined or
+/// keep-alive); the last of them announces `Connection: close`.
+const MAX_REQUESTS_PER_CONNECTION: usize = 8;
+
+/// A connection holds its slot for at most this long in total, however many
+/// requests it carries: the first request's head deadline (1 s) plus the
+/// report's response deadline, the same bound as a single request.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(31);
+
+/// The report has no scripts; inline styles only.
+const REPORT_RESPONSE: http::ResponsePolicy = http::ResponsePolicy {
+    content_security_policy: "default-src 'none'; style-src 'unsafe-inline'",
+    max_bytes: usize::MAX,
+    deadline: Duration::from_secs(30),
+    // Every method token gets the report decision; GET and HEAD are the ones
+    // that mean something.
+    allow: "GET, HEAD",
+    date: true,
+};
 
 /// The outcome of authorizing a request — maps directly to an HTTP status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,11 +380,8 @@ fn write_html_file(path: &Path, html: &str) -> Result<(), String> {
 /// `127.0.0.1:0` when `port` is `None`. NEVER `0.0.0.0`: the dashboard must not
 /// be reachable off-host. Factored out of [`serve`] so the loopback-only
 /// invariant is unit-testable against the production bind (finding F2).
-fn bind_loopback(
-    port: Option<u16>,
-) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let bind_addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
-    tiny_http::Server::http(bind_addr)
+fn bind_loopback(port: Option<u16>) -> std::io::Result<TcpListener> {
+    TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(0)))
 }
 
 /// `tirith dashboard serve [--port <p>] [--json]`. Binds `127.0.0.1:<port>`
@@ -389,14 +417,18 @@ pub fn serve(port: Option<u16>, json: bool) -> i32 {
         }
     };
 
-    // Resolve the actual bound port (the ephemeral `:0` case).
-    let actual_port = match server.server_addr().to_ip() {
-        Some(addr) => addr.port(),
-        None => {
+    // Resolve the actual bound port (the ephemeral `:0` case). The accept
+    // loop polls a nonblocking listener so it can stop at the TTL.
+    let actual_port = match server
+        .set_nonblocking(true)
+        .and_then(|()| server.local_addr())
+    {
+        Ok(addr) => addr.port(),
+        Err(e) => {
             if !emit_error(
                 json,
                 "tirith dashboard serve",
-                "bound socket has no IP address",
+                &format!("cannot configure the bound socket: {e}"),
             ) {
                 return 2;
             }
@@ -466,17 +498,19 @@ fn loop_outcome_exit_code(outcome: LoopOutcome) -> i32 {
     }
 }
 
-/// The blocking accept loop — re-renders the snapshot per request and routes
-/// each through [`authorize`]. `recv_timeout` lets it wake periodically and exit
-/// once the TTL elapses (the token can't be revived); SIGINT ends the process.
-/// TTL is enforced with a MONOTONIC [`Instant`] (clock-jump-resistant); the
-/// wall-clock TTL in [`authorize`] stays as defense-in-depth.
+/// The accept loop — each connection is read and answered on its own thread
+/// (at most [`MAX_CONNECTIONS`] at once) through [`handle_connection`]. The
+/// listener is polled so the loop exits once the TTL elapses (the token can't
+/// be revived); SIGINT ends the process. TTL is enforced with a MONOTONIC
+/// [`Instant`] (clock-jump-resistant); the wall-clock TTL in [`authorize`]
+/// stays as defense-in-depth.
 fn serve_loop(
-    server: &tiny_http::Server,
+    server: &TcpListener,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
 ) -> LoopOutcome {
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         // Stop once the token expires (every request would 401). Monotonic:
         // immune to a backward clock jump. Normal end-of-life, not a failure.
@@ -485,10 +519,43 @@ fn serve_loop(
             return LoopOutcome::TtlExpired;
         }
 
-        match server.recv_timeout(ACCEPT_POLL) {
-            Ok(Some(request)) => handle_request(request, token, issued_at, issued_mono),
-            Ok(None) => continue, // expected TTL-poll tick; re-check the TTL
-            // A genuine recv/accept error: the server can no longer serve, so
+        match server.accept() {
+            Ok((stream, _)) => {
+                // Rust 1.99 deprecates `fetch_update` as a rename to
+                // `try_update`, which the 1.83 MSRV does not have.
+                #[allow(deprecated)]
+                let admitted = active
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < MAX_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_ok();
+                if !admitted {
+                    // Closing immediately bounds overload work.
+                    continue;
+                }
+                let slot = Arc::clone(&active);
+                let token = token.to_string();
+                let spawned = std::thread::Builder::new()
+                    .name("tirith-dashboard".into())
+                    .spawn(move || {
+                        handle_connection(stream, &token, issued_at, issued_mono);
+                        slot.fetch_sub(1, Ordering::AcqRel);
+                    });
+                if spawned.is_err() {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            // The expected poll tick; re-check the TTL.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_POLL),
+            // A connection that went away before it was accepted.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            // A genuine accept error: the server can no longer serve, so
             // surface it as fatal rather than a false success.
             Err(e) => {
                 eprintln!("tirith dashboard serve: accept error: {e}");
@@ -498,91 +565,116 @@ fn serve_loop(
     }
 }
 
-/// Apply the response-hardening header set (Cache-Control no-store, strict CSP,
-/// nosniff, no-referrer) to `response`. Applied to EVERY response — 200/401/403
-/// — so hardening can't drift between paths (finding D6-3). `Header::from_bytes`
-/// only fails on non-ASCII, which none of these are.
-fn with_security_headers(
-    mut response: tiny_http::Response<std::io::Cursor<Vec<u8>>>,
-) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    for (name, value) in [
-        ("Content-Type", "text/html; charset=utf-8"),
-        // Strict CSP — the report has no scripts; this blocks any injected one.
-        (
-            "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'",
-        ),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Referrer-Policy", "no-referrer"),
-        ("Cache-Control", "no-store"),
-    ] {
-        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response = response.with_header(h);
-        }
-    }
-    response
-}
-
-/// Authorize + respond to one request: pull `Host` + the `token` query param,
-/// call [`authorize`], emit 200 (HTML) / 401 / 403. Authorization is decided
-/// BEFORE the body is touched (finding K), so an unauthenticated client can't
-/// make us buffer an unbounded body. We never read the body at all — even when
-/// authorized (finding R12-4): a post-auth drain would let a valid-token client
-/// trickle a body and stall this single-threaded loop. `tiny_http` discards any
-/// unread body on drop.
-fn handle_request(
-    request: tiny_http::Request,
+/// The status and body for one request: the authoritative monotonic TTL
+/// first, then [`authorize`] (Host before token), then a fresh render.
+fn respond_to(
+    request: &http::Request,
     token: &str,
     issued_at: DateTime<Utc>,
     issued_mono: Instant,
-) {
+) -> (u16, String) {
     // AUTHORITATIVE TTL gate, checked FIRST (R7-4): a monotonic `Instant` can't
     // be wound back, so an expired token 401s here even if `authorize`'s
     // wall-clock TTL were defeated by a backward clock jump.
     if mono_ttl_expired(issued_mono.elapsed()) {
-        let response = tiny_http::Response::from_string("401 Unauthorized").with_status_code(401);
-        let _ = request.respond(with_security_headers(response));
-        return;
+        return (401, "401 Unauthorized".into());
     }
-
-    let host_header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().to_string());
-    let query_token = token_from_target(request.url());
-
-    let decision = authorize(
-        host_header.as_deref(),
+    // An absolute-form target names the request's host (RFC 9112 section
+    // 3.2.2). It must be loopback too, and the Host header is still checked
+    // below, so neither can be used to get around the other.
+    if request
+        .authority
+        .as_deref()
+        .is_some_and(|authority| !is_loopback_host(authority))
+    {
+        return (403, "403 Forbidden".into());
+    }
+    let query_token = token_from_target(&request.target);
+    match authorize(
+        request.header("host"),
         query_token.as_deref(),
         token,
         Utc::now(),
         issued_at,
-    );
-
-    // Reject unauthorized/forbidden immediately, WITHOUT reading the body, with
-    // the same hardening headers as the 200 path.
-    if decision != Decision::Ok {
-        let response = match decision {
-            Decision::Unauthorized => {
-                tiny_http::Response::from_string("401 Unauthorized").with_status_code(401)
-            }
-            Decision::Forbidden => {
-                tiny_http::Response::from_string("403 Forbidden").with_status_code(403)
-            }
-            Decision::Ok => unreachable!("handled above"),
-        };
-        let _ = request.respond(with_security_headers(response));
-        return;
+    ) {
+        // Re-render fresh so a long-lived tab reflects new activity (the
+        // render escapes every value).
+        Decision::Ok => (200, dashboard::render_html(&build_snapshot())),
+        Decision::Unauthorized => (401, "401 Unauthorized".into()),
+        Decision::Forbidden => (403, "403 Forbidden".into()),
     }
+}
 
-    // Authorized — respond immediately without reading the body (R12-4); a
-    // post-auth drain would stall this single-threaded loop. Re-render fresh so
-    // a long-lived tab reflects new activity (the render escapes every value).
-    let snapshot = build_snapshot();
-    let html = dashboard::render_html(&snapshot);
-    let response = with_security_headers(tiny_http::Response::from_string(html));
-    let _ = request.respond(response);
+/// Read request heads and answer them in order. Authorization is decided
+/// from each head before any body is touched (finding K), and a body is never
+/// read before the response, even when authorized (finding R12-4); afterwards
+/// the transport briefly discards what the client still sends so the response
+/// is not lost to a connection reset. Every response, including transport
+/// errors, carries the same hardening headers (finding D6-3).
+///
+/// Like the 0.4.2 server, a persistent HTTP/1.1 (or `keep-alive` HTTP/1.0)
+/// connection may carry further, possibly pipelined, requests. That run is
+/// bounded: at most [`MAX_REQUESTS_PER_CONNECTION`] requests within
+/// [`CONNECTION_DEADLINE`], each next head within the transport's head
+/// deadline. A request that may carry a body ends the connection, because the
+/// report never frames a body; so does any transport error.
+fn handle_connection(
+    mut stream: TcpStream,
+    token: &str,
+    issued_at: DateTime<Utc>,
+    issued_mono: Instant,
+) {
+    let opened = Instant::now();
+    let mut carry = Vec::new();
+    for served in 0..MAX_REQUESTS_PER_CONNECTION {
+        let (status, body, framing) =
+            match http::read_next(&mut stream, http::Rules::Report, &mut carry, |_| Ok(())) {
+                Ok((request, ())) => {
+                    let (status, body) = respond_to(&request, token, issued_at, issued_mono);
+                    let framing = http::Framing {
+                        http_1_0: request.http_1_0,
+                        head: request.method == "HEAD",
+                        // Only when the next head's whole deadline still fits.
+                        keep_alive: served + 1 < MAX_REQUESTS_PER_CONNECTION
+                            && request.wants_keep_alive()
+                            && !request.may_have_body
+                            && opened.elapsed() + http::HEADER_DEADLINE < CONNECTION_DEADLINE,
+                    };
+                    (status, body, framing)
+                }
+                // An idle persistent connection that sends nothing more (or
+                // closes) is simply closed, without an error response.
+                Err(error) if served > 0 && error.status == 408 => break,
+                Err(error) => (
+                    error.status,
+                    format!("{} {}", error.status, error.message),
+                    http::Framing::CLOSE,
+                ),
+            };
+        let Some(deadline) = CONNECTION_DEADLINE
+            .checked_sub(opened.elapsed())
+            .map(|left| left.min(REPORT_RESPONSE.deadline))
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        let policy = http::ResponsePolicy {
+            deadline,
+            ..REPORT_RESPONSE
+        };
+        let written = http::respond_framed(
+            &mut stream,
+            status,
+            "text/html; charset=utf-8",
+            &policy,
+            body.as_bytes(),
+            framing,
+        );
+        if written.is_err() || !framing.keep_alive {
+            break;
+        }
+    }
+    http::linger(&mut stream);
 }
 
 #[cfg(test)]
@@ -707,11 +799,8 @@ mod tests {
 
     /// Assert a `bind_loopback` server's address is IPv4 loopback specifically
     /// (loopback AND not `0.0.0.0`).
-    fn assert_bound_loopback(server: &tiny_http::Server, label: &str) {
-        let addr = server
-            .server_addr()
-            .to_ip()
-            .expect("bound socket has an IP");
+    fn assert_bound_loopback(server: &TcpListener, label: &str) {
+        let addr = server.local_addr().expect("bound socket has an IP");
         assert!(
             addr.ip().is_loopback(),
             "{label}: bind address {} must be loopback",
@@ -730,7 +819,7 @@ mod tests {
         // `None` → ephemeral `127.0.0.1:0`; the IP must still be IPv4 loopback.
         let server = bind_loopback(None).expect("ephemeral loopback bind must succeed");
         assert_bound_loopback(&server, "bind_loopback(None)");
-        let port = server.server_addr().to_ip().unwrap().port();
+        let port = server.local_addr().unwrap().port();
         assert_ne!(port, 0, "an ephemeral bind must resolve to a concrete port");
     }
 
@@ -743,7 +832,7 @@ mod tests {
         // P stays occupied for the whole window.
         let held = bind_loopback(None).expect("hold a loopback server");
         assert_bound_loopback(&held, "held loopback server");
-        let port = held.server_addr().to_ip().unwrap().port();
+        let port = held.local_addr().unwrap().port();
 
         let second = bind_loopback(Some(port));
         assert!(
@@ -768,6 +857,7 @@ mod tests {
 
     #[test]
     fn authorize_ok_for_loopback_host_and_good_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         assert_eq!(
             authorize(Some("127.0.0.1:8080"), Some(token()), token(), n, n),
@@ -791,6 +881,7 @@ mod tests {
 
     #[test]
     fn authorize_forbids_foreign_host_dns_rebinding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         // A DNS-rebinding attacker's browser sends the attacker hostname in Host.
         assert_eq!(
@@ -827,6 +918,7 @@ mod tests {
 
     #[test]
     fn authorize_unauthorized_for_missing_or_wrong_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let n = now();
         // Missing token.
         assert_eq!(
@@ -854,6 +946,7 @@ mod tests {
 
     #[test]
     fn authorize_unauthorized_when_token_expired() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let issued = Utc::now() - chrono::Duration::hours(2); // older than TTL
         let n = Utc::now();
         // Correct Host AND correct token, but the token has aged out → 401.
@@ -886,6 +979,7 @@ mod tests {
 
     #[test]
     fn authorize_host_checked_before_ttl_and_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A foreign Host with an expired token + wrong token still reports 403
         // (Forbidden), proving Host is evaluated first.
         let issued = Utc::now() - chrono::Duration::hours(5);
@@ -944,6 +1038,7 @@ mod tests {
 
     #[test]
     fn resolve_export_path_variants() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `--out .` → ./dashboard.html
         let p = resolve_export_path(Some(".")).unwrap();
         assert_eq!(p, Path::new("./dashboard.html"));
@@ -961,6 +1056,7 @@ mod tests {
 
     #[test]
     fn resolve_export_path_existing_dir_gets_dashboard_html() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = resolve_export_path(Some(dir.path().to_str().unwrap())).unwrap();
         assert_eq!(p, dir.path().join("dashboard.html"));
@@ -1013,6 +1109,7 @@ mod tests {
     /// the complete new content and keeps 0600 — never a half-written file.
     #[test]
     fn write_html_file_overwrite_preserves_intact_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dashboard.html");
 
@@ -1039,12 +1136,35 @@ mod tests {
     // Light integration test (invariants B/D/E end-to-end over a real socket).
     // The security LOGIC lives in the pure `authorize` tests above; this binds
     // 127.0.0.1:0 and pushes forged raw HTTP/1.1 requests through
-    // `handle_request` to confirm the bound server wires each decision to the
+    // `handle_connection` to confirm the bound server wires each decision to the
     // right status code. We forge the `Host` header by hand — what a
     // DNS-rebinding attacker's browser does.
 
     use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
+
+    /// Bind through the production `bind_loopback` and answer `count`
+    /// connections, one at a time, through the production `handle_connection`.
+    fn serve_connections(
+        count: usize,
+        token: &str,
+        issued: DateTime<Utc>,
+        issued_mono: Instant,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let server = bind_loopback(None).expect("bind 127.0.0.1:0");
+        let addr = server.local_addr().expect("ip addr");
+        // INVARIANT B: the bound address is loopback, never 0.0.0.0.
+        assert!(addr.ip().is_loopback(), "must bind a loopback address");
+        let tok = token.to_string();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                match server.accept() {
+                    Ok((stream, _)) => handle_connection(stream, &tok, issued, issued_mono),
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr.port(), handle)
+    }
 
     /// Send a raw HTTP/1.1 GET with an explicit `Host` and return
     /// `(status_code, raw_text)` — the raw text includes the header block for
@@ -1079,23 +1199,8 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let addr = server.server_addr().to_ip().expect("ip addr");
-        // INVARIANT B: the bound address is loopback, never 0.0.0.0.
-        assert!(addr.ip().is_loopback(), "must bind a loopback address");
-        let port = addr.port();
-
         // Handle exactly three requests on a worker thread, then drop the server.
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
-                match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
-                    Err(_) => break,
-                }
-            }
-        });
+        let (port, handle) = serve_connections(3, token, issued, issued_mono);
 
         // 1. Good loopback Host + good token → 200.
         assert_eq!(
@@ -1134,20 +1239,8 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let port = server.server_addr().to_ip().expect("ip addr").port();
-
         // Handle exactly two requests: one 401, one 403.
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
-                match server.recv() {
-                    Ok(req) => handle_request(req, &tok, issued, issued_mono),
-                    Err(_) => break,
-                }
-            }
-        });
+        let (port, handle) = serve_connections(2, token, issued, issued_mono);
 
         // Assert a response's header block carries every hardening header,
         // case-insensitively (HTTP header names are case-insensitive).
@@ -1179,11 +1272,10 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    // Finding K — authorization happens BEFORE the body is read. We can't
-    // observe "didn't read the body" over a real socket (`respond()` itself
-    // drains for framing), so we assert the observable contract: a body-bearing
-    // POST with a foreign Host is rejected 403 — the verdict never depends on
-    // the body.
+    // Finding K — authorization happens BEFORE the body is read. Here a
+    // body-bearing POST with a foreign Host is rejected 403 (the verdict never
+    // depends on the body); `report_decision_never_waits_for_or_depends_on_the_body`
+    // proves the "before" part with bodies that never arrive.
     #[test]
     fn unauthorized_body_bearing_request_is_rejected_by_auth() {
         use std::time::Duration as StdDuration;
@@ -1192,16 +1284,7 @@ mod tests {
         let issued = Utc::now();
         let issued_mono = Instant::now();
 
-        let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("bind 127.0.0.1:0");
-        let port = server.server_addr().to_ip().expect("ip addr").port();
-
-        let tok = token.to_string();
-        let handle = std::thread::spawn(move || {
-            if let Ok(req) = server.recv() {
-                handle_request(req, &tok, issued, issued_mono);
-            }
-        });
+        let (port, handle) = serve_connections(1, token, issued, issued_mono);
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         // Foreign Host + a complete body present, so the 403 verdict provably
@@ -1245,10 +1328,10 @@ mod tests {
     }
 
     // R12-4 — an authorized request is answered WITHOUT a pre-response body
-    // drain (the deleted drain blocked the single-threaded loop). We assert both
-    // shapes the surface sees — a plain GET and a complete-body POST — return
-    // 200 promptly; a deadline-bounded read turns a re-introduced drain into a
-    // timeout failure rather than a hang. Each request uses its own server so
+    // drain. We assert a plain GET, a complete-body POST, and a POST whose
+    // declared body never arrives all return 200 promptly; the last one is what
+    // turns a re-introduced pre-response drain into a failure (it would answer
+    // 408 at the request deadline). Each request uses its own server so
     // `Connection: close` teardowns don't interact.
     //
     // ENV ISOLATION (fixes a parallel-suite flake): the 200 path runs
@@ -1258,9 +1341,6 @@ mod tests {
     // work, pushing the render past the read deadline (intermittent status-0).
     // We hold `ENV_LOCK` and point every base at fresh empty temp dirs (+ empty
     // cwd, no `.git`) so the build is fast, deterministic, and unraceable.
-    //
-    // (We don't test a never-completed oversized body: tiny_http 0.12's own
-    // `respond` blocks reconciling an unread lazy body regardless of our code.)
     #[test]
     fn authorized_request_is_served_without_body_drain() {
         use crate::cli::test_harness::{CwdGuard, EnvGuard, ENV_LOCK};
@@ -1294,22 +1374,13 @@ mod tests {
         // Empty cwd (no `.git`) so the repo-scope overlays resolve to nothing.
         let _cwd = CwdGuard::set(cwd_tmp.path());
 
-        // Serve one forged request through the real `handle_request` and return
+        // Serve one forged request through the real `handle_connection` and return
         // its status. A deadline-bounded read makes a re-introduced drain fail
         // (not flakily).
         fn serve_one(token: &str, raw_request: &str) -> u16 {
             let issued = Utc::now();
             let issued_mono = Instant::now();
-            let server = tiny_http::Server::http(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .expect("bind 127.0.0.1:0");
-            let port = server.server_addr().to_ip().expect("ip addr").port();
-
-            let tok = token.to_string();
-            let handle = std::thread::spawn(move || {
-                if let Ok(req) = server.recv() {
-                    handle_request(req, &tok, issued, issued_mono);
-                }
-            });
+            let (port, handle) = serve_connections(1, token, issued, issued_mono);
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
             // The forged request carries a `{port}` placeholder for the Host.
@@ -1398,6 +1469,568 @@ mod tests {
             serve_one(token, &post),
             200,
             "an authorized request with a complete body must still be served 200"
+        );
+
+        // 3. Authorized request whose declared body never arrives: a pre-response
+        //    drain would hold the status line until the request deadline and
+        //    then answer 408, so only a head-only decision passes this.
+        let partial = "POST /?token={token} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Length: 100\r\n\
+             Connection: close\r\n\r\n\
+             abc"
+        .replace("{token}", token);
+        let started = StdInstant::now();
+        assert_eq!(
+            serve_one(token, &partial),
+            200,
+            "an authorized request must be served without waiting for its body"
+        );
+        assert!(
+            started.elapsed() < StdDuration::from_secs(2),
+            "the 200 must not wait for the body: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The shared transport keeps what browsers and simple clients send working:
+    // HTTP/1.0, other methods, and large cookie headers for the loopback host.
+    #[test]
+    fn report_requests_beyond_the_control_api_shape_still_get_the_report_decision() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let (port, handle) = serve_connections(3, token, Utc::now(), Instant::now());
+        let send = |raw: String| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            stream.write_all(raw.as_bytes()).expect("write request");
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let http10 = send(format!(
+            "GET /?token={token} HTTP/1.0\r\nHost: evil.example.com\r\n\r\n"
+        ));
+        assert!(http10.starts_with("HTTP/1.0 403"), "{http10:?}");
+        let head = send(format!(
+            "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        ));
+        assert!(head.starts_with("HTTP/1.1 401"), "{head:?}");
+        let cookies = send(format!(
+            "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {}\r\n\r\n",
+            "c".repeat(16 * 1024)
+        ));
+        assert!(cookies.starts_with("HTTP/1.1 401"), "{cookies:?}");
+        assert!(cookies
+            .to_ascii_lowercase()
+            .contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'"));
+        handle.join().expect("server thread");
+    }
+
+    /// Send `raw` and return the status of the first response line with the
+    /// time it took, reading only until that line arrives (never to EOF), so a
+    /// server that waits for the body shows up as a late or missing status.
+    fn status_within(port: u16, raw: &str) -> (u16, std::time::Duration) {
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+        let started = StdInstant::now();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(raw.as_bytes()).expect("write request");
+        stream.flush().expect("flush");
+        stream
+            .set_read_timeout(Some(StdDuration::from_millis(200)))
+            .expect("set read timeout");
+        let mut acc = Vec::new();
+        while started.elapsed() < StdDuration::from_secs(10) {
+            if let Some((line, _)) = String::from_utf8_lossy(&acc).split_once("\r\n") {
+                let status = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|code| code.parse().ok())
+                    .unwrap_or(0);
+                return (status, started.elapsed());
+            }
+            let mut buf = [0u8; 256];
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        (0, started.elapsed())
+    }
+
+    // Findings K and R12-4: the report decides from the request head alone and
+    // never waits for, bounds, or frames a body. A declared body that never
+    // arrives, one larger than the control API's limit, a streamed body, an
+    // `Expect`, or a repeated header all get the Host/token verdict at once,
+    // not a transport error after the request deadline.
+    #[test]
+    fn report_decision_never_waits_for_or_depends_on_the_body() {
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let cases = [
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 100\r\n\r\nabc"
+                    .to_string(),
+                401,
+            ),
+            (
+                format!("POST /?token={token} HTTP/1.1\r\nHost: evil.example.com\r\nContent-Length: 100\r\n\r\nabc"),
+                403,
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 20000\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\nAccept: text/html\r\n\r\n"
+                    .to_string(),
+                401,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+            let raw = raw.replace("{port}", &port.to_string());
+            let (status, took) = status_within(port, &raw);
+            assert_eq!(status, expected, "{raw:?}");
+            assert!(
+                took < std::time::Duration::from_millis(1500),
+                "the verdict must not wait for the body: {took:?} for {raw:?}"
+            );
+            handle.join().expect("server thread");
+        }
+    }
+
+    /// One response read off a connection.
+    #[derive(Debug)]
+    struct Answer {
+        status_line: String,
+        headers: std::collections::BTreeMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    /// Send `raw` on one connection and split everything the server sends
+    /// until it closes into responses. `head[i]` marks a response to `HEAD`,
+    /// which carries a `Content-Length` but no body.
+    fn exchange(port: u16, raw: &str, head: &[bool]) -> (Vec<Answer>, usize) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(raw.as_bytes()).expect("write request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .expect("set read timeout");
+        let mut bytes = Vec::new();
+        let _ = stream.read_to_end(&mut bytes);
+        let mut answers = Vec::new();
+        let mut rest = bytes.as_slice();
+        while let Some(end) = rest.windows(4).position(|w| w == b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&rest[..end]).into_owned();
+            let mut lines = text.split("\r\n");
+            let status_line = lines.next().unwrap_or_default().to_string();
+            let headers: std::collections::BTreeMap<_, _> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            rest = &rest[end + 4..];
+            let length: usize = headers
+                .get("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let take = if head.get(answers.len()).copied().unwrap_or(false) {
+                0
+            } else {
+                length.min(rest.len())
+            };
+            let body = rest[..take].to_vec();
+            rest = &rest[take..];
+            answers.push(Answer {
+                status_line,
+                headers,
+                body,
+            });
+        }
+        (answers, rest.len())
+    }
+
+    // `dashboard serve` shipped in 0.4.2 on tiny_http. Its observable HTTP
+    // behaviour (recorded with a raw-socket probe against the e2527aba build and
+    // the 0.4.2 release, identical) is kept where it is RFC-correct: HEAD gets
+    // the GET headers without a body, HTTP/1.0 is answered in HTTP/1.0, an
+    // absolute-form target is accepted, method tokens are not upper-case only,
+    // and pipelined keep-alive requests are answered in order. Stricter than
+    // 0.4.2: an absolute-form authority must be loopback like the Host header,
+    // user info is refused, and a request that may carry a body ends the
+    // connection with `Connection: close`.
+    #[test]
+    fn serve_matches_rfc_and_0_4_2_http_edge_cases() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+        let statuses = |answers: &[Answer]| {
+            answers
+                .iter()
+                .map(|a| a.status_line.clone())
+                .collect::<Vec<_>>()
+        };
+        let run = |raw: &str, head: &[bool]| {
+            let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+            let raw = raw
+                .replace("{port}", &port.to_string())
+                .replace("{token}", token);
+            let out = exchange(port, &raw, head);
+            handle.join().expect("server thread");
+            out
+        };
+        let get = "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
+        let bad = "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n";
+
+        // A GET carries the whole body its Content-Length announces.
+        let announced = |answer: &Answer| {
+            answer
+                .headers
+                .get("content-length")
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        let (full, _) = run(
+            &get.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"),
+            &[],
+        );
+        assert!(!full[0].body.is_empty());
+        assert_eq!(announced(&full[0]), Some(full[0].body.len()));
+        // HEAD: the GET status and headers, no body. Every request renders
+        // the page afresh, and its three RFC 3339 timestamps print 0, 3, 6
+        // or 9 fractional digits depending on the clock value, so two
+        // renders can differ in length (often with Windows' 100 ns clock).
+        // Compare with a GET rendered the same length, retrying a bounded
+        // number of times.
+        let mut mismatches = Vec::new();
+        loop {
+            let (get_again, _) = run(
+                &get.replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            let (head, trailing) = run(
+                "HEAD /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                &[true],
+            );
+            assert_eq!(statuses(&head), ["HTTP/1.1 200 OK"]);
+            assert_eq!(trailing, 0, "HEAD must not send a body");
+            assert!(head[0].body.is_empty(), "HEAD must not send a body");
+            let lengths = (announced(&get_again[0]), announced(&head[0]));
+            if lengths.0.is_some() && lengths.0 == lengths.1 {
+                break;
+            }
+            mismatches.push(lengths);
+            assert!(
+                mismatches.len() < 10,
+                "HEAD Content-Length never matched a GET: {mismatches:?}"
+            );
+        }
+        let (head401, trailing) = run(
+            "HEAD /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            &[true],
+        );
+        assert_eq!(statuses(&head401), ["HTTP/1.1 401 Unauthorized"]);
+        assert_eq!(trailing, 0);
+
+        // HTTP/1.0: answered in HTTP/1.0, closed unless keep-alive was asked.
+        let (old, _) = run(
+            "GET /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            &[],
+        );
+        assert_eq!(statuses(&old), ["HTTP/1.0 200 OK"]);
+        assert_eq!(old[0].headers["connection"], "close");
+        let (old_ka, _) = run(
+            "GET /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\nGET /?token=wrong HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            &[],
+        );
+        assert_eq!(
+            statuses(&old_ka),
+            ["HTTP/1.0 200 OK", "HTTP/1.0 401 Unauthorized"]
+        );
+
+        // Method tokens other than upper case get the report decision.
+        for method in ["get", "Get", "POST"] {
+            let (answers, _) = run(
+                &format!("{method} /?token={{token}} HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            assert_eq!(statuses(&answers), ["HTTP/1.1 200 OK"], "{method}");
+        }
+        // `head` is not HEAD (methods are case-sensitive): it gets the body.
+        let (lower_head, _) = run(
+            "head /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            &[false],
+        );
+        assert!(!lower_head[0].body.is_empty());
+        assert_eq!(announced(&lower_head[0]), Some(lower_head[0].body.len()));
+
+        // Absolute-form: accepted with a loopback authority; the authority and
+        // the Host header must both be loopback.
+        for (target, host, expected) in [
+            (
+                "http://127.0.0.1:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "HTTP://localhost:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "http://127.0.0.1:{port}/?token=wrong",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 401 Unauthorized",
+            ),
+            (
+                "http://evil.example/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "http://127.0.0.1:{port}/?token={token}",
+                "evil.example",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "http://u@127.0.0.1:{port}/?token={token}",
+                "127.0.0.1:{port}",
+                "HTTP/1.1 400 Bad Request",
+            ),
+        ] {
+            let (answers, _) = run(
+                &format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+                &[],
+            );
+            assert_eq!(statuses(&answers), [expected], "{target} / {host}");
+        }
+
+        // Pipelined keep-alive requests are answered in order, each decided on
+        // its own head.
+        let (two, _) = run(&format!("{get}{bad}"), &[]);
+        assert_eq!(
+            statuses(&two),
+            ["HTTP/1.1 200 OK", "HTTP/1.1 401 Unauthorized"]
+        );
+        assert_eq!(two[0].headers["connection"], "keep-alive");
+        let (mixed, _) = run(
+            &format!(
+                "{bad}HEAD /?token={{token}} HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\n\r\n{get}"
+            ),
+            &[false, true, false],
+        );
+        assert_eq!(
+            statuses(&mixed),
+            [
+                "HTTP/1.1 401 Unauthorized",
+                "HTTP/1.1 200 OK",
+                "HTTP/1.1 200 OK"
+            ]
+        );
+        assert!(mixed[1].body.is_empty() && !mixed[2].body.is_empty());
+        // `Connection: close` ends the run after its response.
+        let (closed, _) = run(
+            &format!("GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n{get}"),
+            &[],
+        );
+        assert_eq!(statuses(&closed), ["HTTP/1.1 401 Unauthorized"]);
+        // A body is never framed, so a request that may carry one ends the
+        // connection, announced with `Connection: close`.
+        let (body, _) = run(
+            &format!("POST /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nContent-Length: 3\r\n\r\nabc{get}"),
+            &[],
+        );
+        assert_eq!(statuses(&body), ["HTTP/1.1 401 Unauthorized"]);
+        assert_eq!(body[0].headers["connection"], "close");
+        // The run is bounded; the last allowed response says so.
+        let (capped, _) = run(&bad.repeat(MAX_REQUESTS_PER_CONNECTION + 2), &[]);
+        assert_eq!(capped.len(), MAX_REQUESTS_PER_CONNECTION);
+        assert!(capped[..MAX_REQUESTS_PER_CONNECTION - 1]
+            .iter()
+            .all(|a| a.headers["connection"] == "keep-alive"));
+        assert_eq!(
+            capped[MAX_REQUESTS_PER_CONNECTION - 1].headers["connection"],
+            "close"
+        );
+        // A malformed pipelined request gets its error and the connection ends.
+        let (malformed, _) = run(
+            &format!("{bad}GET nope HTTP/1.1\r\nHost: x\r\n\r\n{get}"),
+            &[],
+        );
+        assert_eq!(
+            statuses(&malformed),
+            ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 400 Bad Request"]
+        );
+    }
+
+    /// Answer one raw request on one connection through the production
+    /// `handle_connection` (env cleared like the other serve tests).
+    fn serve_one(token: &str, raw: &str) -> Vec<Answer> {
+        let (port, handle) = serve_connections(1, token, Utc::now(), Instant::now());
+        let raw = raw
+            .replace("{port}", &port.to_string())
+            .replace("{token}", token);
+        let (answers, _) = exchange(port, &raw, &[]);
+        handle.join().expect("server thread");
+        answers
+    }
+
+    // RFC 9110 section 15.5.6: a 405 MUST carry `Allow`. `dashboard serve`
+    // answers every method token of up to 16 bytes with the report decision,
+    // so its 405 must say what it refuses (a method that is not such a token),
+    // not the control API's "only GET and POST".
+    #[test]
+    fn serve_405_carries_allow_and_names_what_it_refuses() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+
+        // A method token over 16 bytes, an empty method (leading space), and a
+        // method with a byte that is not a token character.
+        for raw in [
+            "ABCDEFGHIJKLMNOPQ /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            " GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            "G(T /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+        ] {
+            let answers = serve_one(token, raw);
+            assert_eq!(answers.len(), 1, "{raw:?}");
+            let answer = &answers[0];
+            assert_eq!(answer.status_line, "HTTP/1.1 405 Method Not Allowed");
+            assert_eq!(
+                answer.headers.get("allow").map(String::as_str),
+                Some("GET, HEAD"),
+                "{raw:?}: {answer:?}"
+            );
+            let body = String::from_utf8_lossy(&answer.body);
+            assert_eq!(
+                body, "405 the method must be a token of 1 to 16 bytes, such as GET or HEAD",
+                "{raw:?}"
+            );
+        }
+
+        // A method token the report answers gets the report decision, not 405.
+        let answers = serve_one(
+            token,
+            "PROPFIND /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status_line, "HTTP/1.1 200 OK");
+        assert!(!answers[0].headers.contains_key("allow"));
+    }
+
+    // RFC 9110 section 6.6.1: an origin server with a clock sends `Date` on
+    // every 2xx and 4xx response, here including transport errors (400, 405,
+    // 408) and HEAD and HTTP/1.0 answers. tiny_http sent it in 0.4.2.
+    #[test]
+    fn every_serve_response_carries_an_imf_fixdate_date() {
+        use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _policy_root = EnvGuard::remove("TIRITH_POLICY_ROOT");
+        let _server_url = EnvGuard::remove("TIRITH_SERVER_URL");
+        let _api_key = EnvGuard::remove("TIRITH_API_KEY");
+        let token = "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface";
+
+        for (raw, expected) in [
+            (
+                "GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK",
+            ),
+            (
+                "HEAD /?token={token} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.0 200 OK",
+            ),
+            (
+                "GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 401 Unauthorized",
+            ),
+            (
+                "GET /?token={token} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden",
+            ),
+            (
+                "GET nope HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.1 400 Bad Request",
+            ),
+            (
+                "ABCDEFGHIJKLMNOPQ /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+                "HTTP/1.1 405 Method Not Allowed",
+            ),
+            // An incomplete head: 408 after the 1 s head deadline.
+            (
+                "GET /?token={token} HTTP/1.1\r\n",
+                "HTTP/1.1 408 Request Timeout",
+            ),
+        ] {
+            let answers = serve_one(token, raw);
+            assert_eq!(answers.len(), 1, "{raw:?}");
+            let answer = &answers[0];
+            assert_eq!(answer.status_line, expected, "{raw:?}");
+            if !expected.contains(" 405 ") {
+                assert!(!answer.headers.contains_key("allow"), "{raw:?}");
+            }
+            let date = answer
+                .headers
+                .get("date")
+                .unwrap_or_else(|| panic!("{raw:?}: no Date header: {answer:?}"));
+            // IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+            assert_eq!(date.len(), 29, "{raw:?}: {date:?}");
+            let parsed = chrono::NaiveDateTime::parse_from_str(date, "%a, %d %b %Y %H:%M:%S GMT")
+                .unwrap_or_else(|e| panic!("{raw:?}: {date:?} is not an IMF-fixdate: {e}"))
+                .and_utc();
+            let skew = (Utc::now() - parsed).num_seconds().abs();
+            assert!(skew < 120, "{raw:?}: Date {date:?} is {skew} s off");
+        }
+    }
+
+    // An idle keep-alive connection gives its slot back after the head
+    // deadline, without an error response.
+    #[test]
+    fn idle_keep_alive_connection_is_closed_quietly_after_the_head_deadline() {
+        let (port, handle) = serve_connections(1, "token", Utc::now(), Instant::now());
+        let started = Instant::now();
+        let (answers, trailing) = exchange(
+            port,
+            &format!("GET /?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+            &[],
+        );
+        handle.join().expect("server thread");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status_line, "HTTP/1.1 401 Unauthorized");
+        assert_eq!(trailing, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    // The accept loop ends at the monotonic TTL (exit 0) without needing a
+    // request to arrive.
+    #[test]
+    fn serve_loop_stops_at_the_token_ttl() {
+        let Some(issued_mono) = Instant::now().checked_sub(TOKEN_TTL) else {
+            return;
+        };
+        let server = bind_loopback(None).expect("bind 127.0.0.1:0");
+        server.set_nonblocking(true).expect("nonblocking listener");
+        assert_eq!(
+            serve_loop(&server, "token", Utc::now(), issued_mono),
+            LoopOutcome::TtlExpired
         );
     }
 }

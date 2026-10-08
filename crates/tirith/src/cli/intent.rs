@@ -176,16 +176,19 @@ mod tests {
 
     #[test]
     fn empty_intent_exits_two() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(run("   ", "ls", false, false, "posix"), 2);
     }
 
     #[test]
     fn empty_command_exits_two() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(run("install a formatter", "   ", false, false, "posix"), 2);
     }
 
     #[test]
     fn mismatch_exits_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let code = run(
             "install a formatter",
             "curl https://x/install.sh | bash",
@@ -198,6 +201,7 @@ mod tests {
 
     #[test]
     fn justified_exits_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let code = run(
             "download and run an installer",
             "curl https://x/install.sh | bash",
@@ -210,11 +214,13 @@ mod tests {
 
     #[test]
     fn clean_command_exits_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(run("list files", "ls -la", false, false, "posix"), 0);
     }
 
     #[test]
     fn mismatch_json_exits_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let code = run(
             "install a formatter",
             "curl https://x/install.sh | bash",
@@ -227,6 +233,7 @@ mod tests {
 
     #[test]
     fn human_output_sanitizes_control_sequences() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: repo-0390 — attacker-controlled intent/command text must
         // not reach the terminal with ANSI/OSC, bidi, zero-width, or newline
         // content intact on the human path.

@@ -1,11 +1,14 @@
-//! Bounded, incremental reads of authoritative audit records.
+//! Bounded, stateless reads of authoritative audit records.
 //!
-//! Cursors are opaque, process-local capabilities. A restarted collector asks
-//! consumers to replace their view; it never silently replays old records as
-//! new checks. Parsing is not chain verification, and a check is not proof of
-//! execution. This reader never rewrites a log or its signed representation.
+//! Cursors are opaque, process-local capabilities: each one carries its read
+//! position and is sealed with a per-reader secret over the source identity,
+//! the inspected prefix, the read direction and the filter. A restarted
+//! collector (new secret), a replaced or truncated log, or a different filter
+//! asks consumers to replace their view; it never silently replays old records
+//! as new checks. The reader keeps no cursor table. Parsing is not chain
+//! verification, and a check is not proof of execution. This reader never
+//! rewrites a log or its signed representation.
 
-use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -18,8 +21,12 @@ use crate::audit_aggregator::AuditRecord;
 const PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const LINE_BYTES: usize = 1024 * 1024;
 const PAGE_RECORDS: usize = 500;
-const CURSORS: usize = 128;
 const ANCHOR_BYTES: u64 = 4096;
+/// offset (8) + flags (1) + source length (8) + generation (16).
+const CURSOR_PAYLOAD: usize = 33;
+const CURSOR_SEAL: usize = 32;
+/// Hex spelling of a sealed cursor; anything else is not one this reader issued.
+pub const CURSOR_HEX_LEN: usize = (CURSOR_PAYLOAD + CURSOR_SEAL) * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,66 +147,103 @@ enum ReadOrder {
     NewestPage,
 }
 
-#[derive(Clone)]
+impl ReadOrder {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Forward => 0,
+            Self::Recent => 1,
+            Self::NewestPage => 2,
+        }
+    }
+}
+
+/// The position a sealed cursor carries back to the reader.
 struct Cursor {
-    order: ReadOrder,
     offset: u64,
-    filter: HistoryFilter,
     earlier_uninspected: bool,
     discarding_line: bool,
+    /// Source length when the cursor was issued; the sealed anchor covers it.
+    length: u64,
+    generation: [u8; 16],
+}
+
+impl Cursor {
+    fn payload(&self) -> [u8; CURSOR_PAYLOAD] {
+        let mut bytes = [0; CURSOR_PAYLOAD];
+        bytes[..8].copy_from_slice(&self.offset.to_be_bytes());
+        bytes[8] = u8::from(self.earlier_uninspected) | (u8::from(self.discarding_line) << 1);
+        bytes[9..17].copy_from_slice(&self.length.to_be_bytes());
+        bytes[17..].copy_from_slice(&self.generation);
+        bytes
+    }
+
+    fn parse(bytes: &[u8; CURSOR_PAYLOAD]) -> Option<Self> {
+        if bytes[8] > 0b11 {
+            return None;
+        }
+        let cursor = Self {
+            offset: u64::from_be_bytes(bytes[..8].try_into().ok()?),
+            earlier_uninspected: bytes[8] & 1 != 0,
+            discarding_line: bytes[8] & 2 != 0,
+            length: u64::from_be_bytes(bytes[9..17].try_into().ok()?),
+            generation: bytes[17..].try_into().ok()?,
+        };
+        (cursor.offset <= cursor.length).then_some(cursor)
+    }
 }
 
 /// One allowlisted log path, chosen by the service/CLI, never by a browser.
-/// Memory is bounded independently of the log size and refresh count.
+/// Memory is bounded independently of the log size and refresh count, and no
+/// per-cursor state is retained between reads.
 pub struct HistoryReader {
     path: PathBuf,
-    generation: String,
-    source: Option<Source>,
-    cursors: BTreeMap<String, Cursor>,
-    order: VecDeque<String>,
-}
-
-struct Source {
-    // Keep the handle alive so inode/file-ID reuse cannot alias the old source.
-    _held: File,
-    identity: (u64, u64),
-    length: u64,
-    anchor: [u8; 32],
+    key: [u8; 32],
 }
 
 impl HistoryReader {
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            generation: uuid::Uuid::new_v4().to_string(),
-            source: None,
-            cursors: BTreeMap::new(),
-            order: VecDeque::new(),
-        }
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        Self { path, key }
     }
 
     /// Start with a bounded recent suffix, or continue a previously issued
     /// cursor. Identical retries keep the same record IDs and byte position.
     /// A supplied cursor cannot select a file or an arbitrary seek offset.
     pub fn query(
-        &mut self,
+        &self,
         cursor: Option<&str>,
         filter: HistoryFilter,
         limit: usize,
         logging_enabled: bool,
     ) -> Result<HistoryQueryResult, &'static str> {
+        check_limit(limit)?;
         self.query_window(cursor, filter, limit, logging_enabled, ReadOrder::Forward)
     }
 
     /// Select the newest matching records within one bounded suffix. This
     /// snapshot has no continuation cursor; use `query` for forward paging.
     pub fn recent(
-        &mut self,
+        &self,
         filter: HistoryFilter,
         limit: usize,
         logging_enabled: bool,
     ) -> Result<HistoryQueryResult, &'static str> {
+        check_limit(limit)?;
         self.query_window(None, filter, limit, logging_enabled, ReadOrder::Recent)
+    }
+
+    /// Every record of the bounded newest suffix (at most one 2 MiB window),
+    /// oldest first. Used by aggregates that summarize the window as a whole.
+    pub(crate) fn suffix(&self, logging_enabled: bool) -> Result<HistoryQueryResult, &'static str> {
+        self.query_window(
+            None,
+            HistoryFilter::default(),
+            usize::MAX,
+            logging_enabled,
+            ReadOrder::Forward,
+        )
     }
 
     /// Start at the newest records and page toward older history. Each page
@@ -207,12 +251,13 @@ impl HistoryReader {
     /// direction. Appending records does not shift an issued older-page bound;
     /// refresh without a cursor to observe new records.
     pub fn newest_page(
-        &mut self,
+        &self,
         cursor: Option<&str>,
         filter: HistoryFilter,
         limit: usize,
         logging_enabled: bool,
     ) -> Result<HistoryQueryResult, &'static str> {
+        check_limit(limit)?;
         self.query_window(
             cursor,
             filter,
@@ -222,8 +267,105 @@ impl HistoryReader {
         )
     }
 
+    fn keyed(&self, domain: &[u8]) -> Sha256 {
+        let mut hash = Sha256::new();
+        hash.update(self.key);
+        hash.update(domain);
+        hash
+    }
+
+    /// Bind a cursor to this reader, its read direction and filter, the
+    /// opened source identity, and the source prefix it was issued against.
+    fn seal(
+        &self,
+        order: ReadOrder,
+        filter: &HistoryFilter,
+        identity: (u64, u64),
+        anchor: &[u8; 32],
+        payload: &[u8; CURSOR_PAYLOAD],
+    ) -> [u8; CURSOR_SEAL] {
+        let filter = serde_json::to_vec(filter).unwrap_or_default();
+        let mut hash = self.keyed(b"tirith-history-cursor-v1\0");
+        hash.update([order.tag()]);
+        hash.update((filter.len() as u64).to_be_bytes());
+        hash.update(&filter);
+        hash.update(identity.0.to_be_bytes());
+        hash.update(identity.1.to_be_bytes());
+        hash.update(anchor);
+        hash.update(payload);
+        hash.finalize().into()
+    }
+
+    /// A generation names one source as seen by this reader: its identity and
+    /// its first record. Replacing the file or rewriting its beginning yields
+    /// a different generation, and so different record IDs.
+    fn generation(&self, identity: (u64, u64), file: &mut File) -> std::io::Result<[u8; 16]> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut head = Vec::new();
+        (&mut *file).take(ANCHOR_BYTES).read_to_end(&mut head)?;
+        if let Some(end) = head.iter().position(|byte| *byte == b'\n') {
+            head.truncate(end + 1);
+        }
+        let mut hash = self.keyed(b"tirith-history-generation-v1\0");
+        hash.update(identity.0.to_be_bytes());
+        hash.update(identity.1.to_be_bytes());
+        hash.update(&head);
+        let digest = hash.finalize();
+        let mut generation = [0; 16];
+        generation.copy_from_slice(&digest[..16]);
+        Ok(generation)
+    }
+
+    /// The generation reported when no source could be opened.
+    fn unavailable_generation(&self) -> String {
+        let digest = self.keyed(b"tirith-history-unavailable-v1\0").finalize();
+        let mut generation = [0; 16];
+        generation.copy_from_slice(&digest[..16]);
+        generation_text(&generation)
+    }
+
+    /// The position a cursor carries, if this reader sealed it for this
+    /// direction, filter and the unchanged source prefix.
+    fn open_cursor(
+        &self,
+        text: &str,
+        order: ReadOrder,
+        filter: &HistoryFilter,
+        identity: (u64, u64),
+        file: &mut File,
+        length: u64,
+    ) -> Result<Option<Cursor>, &'static str> {
+        if text.len() != CURSOR_HEX_LEN {
+            return Ok(None);
+        }
+        let Ok(bytes) = hex::decode(text) else {
+            return Ok(None);
+        };
+        if crate::util::hex(&bytes) != text {
+            return Ok(None);
+        }
+        let (payload, seal) = bytes.split_at(CURSOR_PAYLOAD);
+        let Ok(payload) = <[u8; CURSOR_PAYLOAD]>::try_from(payload) else {
+            return Ok(None);
+        };
+        let Some(cursor) = Cursor::parse(&payload) else {
+            return Ok(None);
+        };
+        if cursor.length > length {
+            return Ok(None);
+        }
+        let anchor = anchor(file, cursor.length).map_err(|_| "cannot check history generation")?;
+        let expected = self.seal(order, filter, identity, &anchor, &payload);
+        let matched = expected
+            .iter()
+            .zip(seal)
+            .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+            == 0;
+        Ok(matched.then_some(cursor))
+    }
+
     fn query_window(
-        &mut self,
+        &self,
         cursor: Option<&str>,
         filter: HistoryFilter,
         limit: usize,
@@ -232,10 +374,7 @@ impl HistoryReader {
     ) -> Result<HistoryQueryResult, &'static str> {
         let recent = order != ReadOrder::Forward;
         filter.validate()?;
-        if !(1..=PAGE_RECORDS).contains(&limit) {
-            return Err("history limit must be between 1 and 500");
-        }
-        let mut result = self.empty_result(filter.clone());
+        let mut result = empty_result(self.unavailable_generation(), filter.clone());
         if !logging_enabled {
             result.availability = Availability::Disabled;
             result.detail = Some("logging is disabled; retained history may still exist");
@@ -244,8 +383,6 @@ impl HistoryReader {
         let mut file = match crate::util::open_read_no_follow_capped(&self.path, u64::MAX) {
             Ok(file) => file,
             Err(crate::util::OpenRegularError::NotFound) => {
-                self.reset();
-                result.generation = self.generation.clone();
                 result.availability = Availability::Absent;
                 return Ok(result);
             }
@@ -255,45 +392,29 @@ impl HistoryReader {
             }
         };
         let metadata = file.metadata().map_err(|_| "cannot inspect history file")?;
-        let identity = file_identity(&file).map_err(|_| "history file identity is unavailable")?;
+        let identity = crate::util::file_identity(&file)
+            .map_err(|_| "history file identity is unavailable")?;
         let length = metadata.len();
-        let source_changed = if let Some(source) = &self.source {
-            source.identity != identity
-                || length < source.length
-                || anchor(&mut file, source.length)
-                    .map_err(|_| "cannot check history generation")?
-                    != source.anchor
-        } else {
-            false
-        };
-        if source_changed {
-            self.reset();
-        }
-        if self.source.is_none() {
-            self.source = Some(Source {
-                _held: file
-                    .try_clone()
-                    .map_err(|_| "cannot retain history identity")?,
-                identity,
-                length,
-                anchor: anchor(&mut file, length)
-                    .map_err(|_| "cannot inspect history generation")?,
-            });
-        }
-        result.generation = self.generation.clone();
         let continuation = match cursor {
-            Some(cursor) if cursor.len() <= 64 => self
-                .cursors
-                .get(cursor)
-                .filter(|saved| saved.filter == filter && saved.order == order)
-                .cloned(),
-            _ => None,
+            Some(text) => {
+                match self.open_cursor(text, order, &filter, identity, &mut file, length)? {
+                    Some(continuation) => Some(continuation),
+                    None => {
+                        result.availability = Availability::RefreshRequired;
+                        result.detail = Some("history changed, the reader restarted, or this cursor expired; replace the previous view");
+                        return Ok(result);
+                    }
+                }
+            }
+            None => None,
         };
-        if cursor.is_some() && continuation.is_none() {
-            result.availability = Availability::RefreshRequired;
-            result.detail = Some("history changed, the reader restarted, or this cursor expired; replace the previous view");
-            return Ok(result);
-        }
+        let generation = match &continuation {
+            Some(continuation) => continuation.generation,
+            None => self
+                .generation(identity, &mut file)
+                .map_err(|_| "cannot inspect history generation")?,
+        };
+        result.generation = generation_text(&generation);
         let window_end = if order == ReadOrder::NewestPage {
             continuation.as_ref().map_or(length, |saved| saved.offset)
         } else {
@@ -417,7 +538,7 @@ impl HistoryReader {
                 _ => "unclassified_record",
             };
             result.events.push(HistoryEvent {
-                record_id: format!("{}:{record_offset}", self.generation),
+                record_id: format!("{}:{record_offset}", result.generation),
                 semantics,
                 execution_evidence: "not_established_by_this_record",
                 record,
@@ -430,16 +551,10 @@ impl HistoryReader {
         if after.len() < length
             || (after.len() == length && after.modified().ok() != metadata.modified().ok())
         {
-            self.reset();
-            let mut changed = self.empty_result(filter);
+            let mut changed = empty_result(result.generation, filter);
             changed.availability = Availability::RefreshRequired;
             changed.detail = Some("history was modified while reading; replace the previous view");
             return Ok(changed);
-        }
-        if let Some(source) = &mut self.source {
-            source.length = length;
-            source.anchor =
-                anchor(&mut file, length).map_err(|_| "cannot retain history generation")?;
         }
         result.more_available = if order == ReadOrder::NewestPage {
             older_end > 0
@@ -463,55 +578,55 @@ impl HistoryReader {
         if order == ReadOrder::Recent || (order == ReadOrder::NewestPage && older_end == 0) {
             return Ok(result);
         }
-        let token = uuid::Uuid::new_v4().to_string();
-        self.cursors.insert(
-            token.clone(),
-            Cursor {
-                order,
-                offset: if order == ReadOrder::NewestPage {
-                    older_end
-                } else {
-                    offset
-                },
-                filter,
-                earlier_uninspected: earlier,
-                discarding_line,
+        let next = Cursor {
+            offset: if order == ReadOrder::NewestPage {
+                older_end
+            } else {
+                offset
             },
-        );
-        self.order.push_back(token.clone());
-        while self.order.len() > CURSORS {
-            if let Some(old) = self.order.pop_front() {
-                self.cursors.remove(&old);
-            }
-        }
-        result.next_cursor = Some(token);
+            earlier_uninspected: earlier,
+            discarding_line,
+            length,
+            generation,
+        };
+        let payload = next.payload();
+        let anchor = anchor(&mut file, length).map_err(|_| "cannot retain history generation")?;
+        let seal = self.seal(order, &filter, identity, &anchor, &payload);
+        let mut sealed = payload.to_vec();
+        sealed.extend_from_slice(&seal);
+        result.next_cursor = Some(crate::util::hex(&sealed));
         Ok(result)
     }
+}
 
-    fn empty_result(&self, filter: HistoryFilter) -> HistoryQueryResult {
-        HistoryQueryResult {
-            schema_version: 1,
-            generation: self.generation.clone(),
-            availability: Availability::Empty,
-            next_cursor: None,
-            events: Vec::new(),
-            filter,
-            inspected_bytes: 0,
-            malformed_lines: 0,
-            oversized_lines: 0,
-            incomplete_tail: false,
-            earlier_history_uninspected: false,
-            more_available: false,
-            integrity: "not_verified_by_history_reader",
-            detail: None,
-        }
+fn check_limit(limit: usize) -> Result<(), &'static str> {
+    if (1..=PAGE_RECORDS).contains(&limit) {
+        Ok(())
+    } else {
+        Err("history limit must be between 1 and 500")
     }
+}
 
-    fn reset(&mut self) {
-        self.generation = uuid::Uuid::new_v4().to_string();
-        self.source = None;
-        self.cursors.clear();
-        self.order.clear();
+fn generation_text(generation: &[u8; 16]) -> String {
+    uuid::Uuid::from_bytes(*generation).to_string()
+}
+
+fn empty_result(generation: String, filter: HistoryFilter) -> HistoryQueryResult {
+    HistoryQueryResult {
+        schema_version: 1,
+        generation,
+        availability: Availability::Empty,
+        next_cursor: None,
+        events: Vec::new(),
+        filter,
+        inspected_bytes: 0,
+        malformed_lines: 0,
+        oversized_lines: 0,
+        incomplete_tail: false,
+        earlier_history_uninspected: false,
+        more_available: false,
+        integrity: "not_verified_by_history_reader",
+        detail: None,
     }
 }
 
@@ -563,37 +678,6 @@ fn anchor(file: &mut File, length: u64) -> std::io::Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-#[cfg(unix)]
-fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((
-        u64::from(info.dwVolumeSerialNumber),
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity(_: &File) -> std::io::Result<(u64, u64)> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "history identity is unavailable",
-    ))
-}
-
 /// Project all untrusted audit content separately from the signed source. No
 /// signature or chain hash is copied into this display record.
 pub fn display_projection(result: &HistoryQueryResult, patterns: &[String]) -> serde_json::Value {
@@ -629,7 +713,7 @@ mod tests {
             serde_json::json!({"timestamp":"2026-09-12T00:00:00Z", "action":"Block", "command_redacted":command, "rule_ids":["curl_pipe_shell"]})
         )
     }
-    fn query(reader: &mut HistoryReader, cursor: Option<&str>, limit: usize) -> HistoryQueryResult {
+    fn query(reader: &HistoryReader, cursor: Option<&str>, limit: usize) -> HistoryQueryResult {
         reader
             .query(cursor, HistoryFilter::default(), limit, true)
             .unwrap()
@@ -643,8 +727,8 @@ mod tests {
             .map(|index| line(&format!("check-{index}")))
             .collect::<String>();
         std::fs::write(&path, &bytes).unwrap();
-        let mut reader = HistoryReader::new(path.clone());
-        let first = query(&mut reader, None, 10);
+        let reader = HistoryReader::new(path.clone());
+        let first = query(&reader, None, 10);
         let recent = reader.recent(HistoryFilter::default(), 10, true).unwrap();
         assert_eq!(recent.events.len(), 10);
         assert_eq!(recent.events[0].record.command_redacted, "check-590");
@@ -653,7 +737,7 @@ mod tests {
         assert_eq!(recent.availability, Availability::Partial);
         assert!(recent.next_cursor.is_none());
         assert!(recent.inspected_bytes <= PAGE_BYTES);
-        let next = query(&mut reader, first.next_cursor.as_deref(), 10);
+        let next = query(&reader, first.next_cursor.as_deref(), 10);
         assert_eq!(next.events[0].record.command_redacted, "check-10");
         assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
     }
@@ -669,7 +753,7 @@ mod tests {
             line("allowed").replace("\"Block\"", "\"Allow\"")
         );
         std::fs::write(&path, &bytes).unwrap();
-        let mut reader = HistoryReader::new(path);
+        let reader = HistoryReader::new(path);
         let filter = HistoryFilter {
             action: Some(crate::verdict::Action::Block),
             ..Default::default()
@@ -697,7 +781,7 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut reader = HistoryReader::new(path.clone());
+        let reader = HistoryReader::new(path.clone());
         let first = reader
             .newest_page(None, HistoryFilter::default(), 100, true)
             .unwrap();
@@ -736,10 +820,10 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            query(&mut reader, first.next_cursor.as_deref(), 100).availability,
+            query(&reader, first.next_cursor.as_deref(), 100).availability,
             Availability::RefreshRequired
         );
-        let forward = query(&mut reader, None, 100);
+        let forward = query(&reader, None, 100);
         assert_eq!(
             reader
                 .newest_page(
@@ -804,7 +888,7 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut reader = HistoryReader::new(path);
+        let reader = HistoryReader::new(path);
         let mut cursor = None;
         let mut observed = Vec::new();
         for _ in 0..10 {
@@ -839,7 +923,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut reader = HistoryReader::new(path);
+        let reader = HistoryReader::new(path);
         let mut cursor = None;
         let mut observed = Vec::new();
         for _ in 0..10 {
@@ -867,16 +951,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         std::fs::write(&path, line("first")).unwrap();
-        let mut reader = HistoryReader::new(path.clone());
-        let first = query(&mut reader, None, 50);
+        let reader = HistoryReader::new(path.clone());
+        let first = query(&reader, None, 50);
         assert_eq!(first.events.len(), 1);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         file.write_all(line("second").as_bytes()).unwrap();
-        let next = query(&mut reader, first.next_cursor.as_deref(), 50);
-        let retry = query(&mut reader, first.next_cursor.as_deref(), 50);
+        let next = query(&reader, first.next_cursor.as_deref(), 50);
+        let retry = query(&reader, first.next_cursor.as_deref(), 50);
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.events[0].record.command_redacted, "second");
         assert_eq!(next.events[0].record_id, retry.events[0].record_id);
@@ -886,7 +970,7 @@ mod tests {
             next.events[0].execution_evidence,
             "not_established_by_this_record"
         );
-        assert!(query(&mut reader, next.next_cursor.as_deref(), 50)
+        assert!(query(&reader, next.next_cursor.as_deref(), 50)
             .events
             .is_empty());
     }
@@ -897,8 +981,8 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let record = line("later");
         std::fs::write(&path, &record[..record.len() - 1]).unwrap();
-        let mut reader = HistoryReader::new(path.clone());
-        let first = query(&mut reader, None, 10);
+        let reader = HistoryReader::new(path.clone());
+        let first = query(&reader, None, 10);
         assert!(first.incomplete_tail);
         assert!(first.events.is_empty());
         std::fs::OpenOptions::new()
@@ -907,7 +991,7 @@ mod tests {
             .unwrap()
             .write_all(b"\n")
             .unwrap();
-        let next = query(&mut reader, first.next_cursor.as_deref(), 10);
+        let next = query(&reader, first.next_cursor.as_deref(), 10);
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.malformed_lines, 0);
     }
@@ -917,25 +1001,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         std::fs::write(&path, line("initial")).unwrap();
-        let mut reader = HistoryReader::new(path.clone());
-        let first = query(&mut reader, None, 10);
+        let reader = HistoryReader::new(path.clone());
+        let first = query(&reader, None, 10);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         file.write_all(&vec![b'x'; (PAGE_BYTES * 3) as usize])
             .unwrap();
-        let mut page = query(&mut reader, first.next_cursor.as_deref(), 10);
+        let mut page = query(&reader, first.next_cursor.as_deref(), 10);
         assert_eq!(page.oversized_lines, 1);
         for _ in 0..2 {
-            page = query(&mut reader, page.next_cursor.as_deref(), 10);
+            page = query(&reader, page.next_cursor.as_deref(), 10);
             assert_eq!(page.oversized_lines, 0);
             assert!(page.inspected_bytes <= PAGE_BYTES);
         }
         assert!(page.incomplete_tail);
         file.write_all(format!("\n{}", line("after-oversize")).as_bytes())
             .unwrap();
-        let next = query(&mut reader, page.next_cursor.as_deref(), 10);
+        let next = query(&reader, page.next_cursor.as_deref(), 10);
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.events[0].record.command_redacted, "after-oversize");
         assert_eq!(next.malformed_lines, 0);
@@ -946,11 +1030,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         std::fs::write(&path, line("initial")).unwrap();
-        let mut reader = HistoryReader::new(path.clone());
-        let first = query(&mut reader, None, 10);
-        let mut restart = HistoryReader::new(path.clone());
+        let reader = HistoryReader::new(path.clone());
+        let first = query(&reader, None, 10);
+        let restart = HistoryReader::new(path.clone());
         assert_eq!(
-            query(&mut restart, first.next_cursor.as_deref(), 10).availability,
+            query(&restart, first.next_cursor.as_deref(), 10).availability,
             Availability::RefreshRequired
         );
         let filter = HistoryFilter {
@@ -966,27 +1050,25 @@ mod tests {
         );
         std::fs::write(&path, line("replace")).unwrap();
         assert_eq!(
-            query(&mut reader, first.next_cursor.as_deref(), 10).availability,
+            query(&reader, first.next_cursor.as_deref(), 10).availability,
             Availability::RefreshRequired
         );
-        let fresh = query(&mut reader, None, 10);
+        let fresh = query(&reader, None, 10);
         assert_ne!(fresh.generation, first.generation);
         std::fs::write(&path, "").unwrap();
         assert_eq!(
-            query(&mut reader, fresh.next_cursor.as_deref(), 10).availability,
+            query(&reader, fresh.next_cursor.as_deref(), 10).availability,
             Availability::RefreshRequired
         );
     }
 
     #[test]
     fn errors_large_logs_and_limits_have_explicit_coverage() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let mut reader = HistoryReader::new(path.clone());
-        assert_eq!(
-            query(&mut reader, None, 10).availability,
-            Availability::Absent
-        );
+        let reader = HistoryReader::new(path.clone());
+        assert_eq!(query(&reader, None, 10).availability, Availability::Absent);
         assert_eq!(
             reader
                 .query(None, HistoryFilter::default(), 10, false)
@@ -995,16 +1077,13 @@ mod tests {
             Availability::Disabled
         );
         std::fs::write(&path, "broken\n").unwrap();
-        assert_eq!(
-            query(&mut reader, None, 10).availability,
-            Availability::Corrupt
-        );
+        assert_eq!(query(&reader, None, 10).availability, Availability::Corrupt);
         let mut file = std::fs::File::create(&path).unwrap();
         file.set_len(300 * 1024 * 1024).unwrap();
         file.seek(SeekFrom::End(0)).unwrap();
         file.write_all(format!("\n{}", line("recent")).as_bytes())
             .unwrap();
-        let result = query(&mut reader, None, 10);
+        let result = query(&reader, None, 10);
         assert!(result.earlier_history_uninspected);
         assert!(result.inspected_bytes <= PAGE_BYTES);
         assert_eq!(result.events.len(), 1);
@@ -1022,5 +1101,74 @@ mod tests {
                 true
             )
             .is_err());
+    }
+
+    #[test]
+    fn cursors_are_sealed_stateless_and_never_expire_while_the_source_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(
+            &path,
+            (0..300)
+                .map(|i| line(&format!("check-{i}")))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let reader = HistoryReader::new(path.clone());
+        let first = reader
+            .newest_page(None, HistoryFilter::default(), 10, true)
+            .unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+        assert_eq!(cursor.len(), CURSOR_HEX_LEN);
+        // No cursor table: issuing many more cursors does not evict this one.
+        for _ in 0..200 {
+            reader
+                .newest_page(None, HistoryFilter::default(), 10, true)
+                .unwrap();
+        }
+        let older = reader
+            .newest_page(Some(&cursor), HistoryFilter::default(), 10, true)
+            .unwrap();
+        assert_eq!(older.events[0].record.command_redacted, "check-280");
+        assert_eq!(older.generation, first.generation);
+        // Any change to the sealed bytes, or a spelling this reader never
+        // issues, asks for a fresh view instead of seeking anywhere.
+        let mut tampered = cursor.clone().into_bytes();
+        tampered[15] = if tampered[15] == b'0' { b'1' } else { b'0' };
+        for bad in [
+            String::from_utf8(tampered).unwrap(),
+            cursor.to_uppercase(),
+            cursor[..CURSOR_HEX_LEN - 2].to_string(),
+            format!("{cursor}00"),
+            uuid::Uuid::new_v4().to_string(),
+        ] {
+            assert_eq!(
+                reader
+                    .newest_page(Some(&bad), HistoryFilter::default(), 10, true)
+                    .unwrap()
+                    .availability,
+                Availability::RefreshRequired,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bounded_suffix_holds_every_record_of_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(
+            &path,
+            (0..1200)
+                .map(|i| line(&format!("check-{i}")))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let suffix = HistoryReader::new(path).suffix(true).unwrap();
+        assert_eq!(suffix.events.len(), 1200);
+        assert_eq!(suffix.events[0].record.command_redacted, "check-0");
+        assert_eq!(suffix.availability, Availability::Available);
+        assert!(!suffix.more_available);
+        assert!(suffix.next_cursor.is_some());
     }
 }

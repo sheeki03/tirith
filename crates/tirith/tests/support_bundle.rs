@@ -79,6 +79,47 @@ fn home_substitution_cannot_bypass_custom_dlp_and_large_unselected_rows_do_not_h
 }
 
 #[test]
+fn recent_incident_is_found_behind_more_than_one_page_of_older_history() {
+    let state = state();
+    let audit = tirith_core::audit::audit_log_path().unwrap();
+    std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+    let selected = uuid::Uuid::new_v4().to_string();
+    let mut log = String::new();
+    for index in 0..600 {
+        let id = if index == 599 {
+            selected.clone()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        log.push_str(&format!(
+            "{}\n",
+            json!({"timestamp":"2026-09-12T00:00:00Z","action":"Block","event_id":id,
+                "command_redacted":format!("check-{index}")})
+        ));
+    }
+    std::fs::write(&audit, log).unwrap();
+    let report = success(run(
+        &state,
+        &[
+            "doctor",
+            "--bundle",
+            "--bundle-preview",
+            "--bundle-incident",
+            &selected,
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        report["incidents"][0]["availability"], "available",
+        "{report}"
+    );
+    assert_eq!(
+        report["incidents"][0]["content"]["record"]["command_redacted"],
+        "check-599"
+    );
+}
+
+#[test]
 fn preview_selects_only_requested_incidents_and_uses_fresh_dlp() {
     let mut state = state();
     state.set_env("TERM_PROGRAM", "support-secret-visible-before-policy");

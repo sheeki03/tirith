@@ -12,10 +12,6 @@ pub(crate) mod fs_helpers;
 mod fs_transaction;
 pub(crate) use fs_transaction::{write_private_notice_bounded, TransactionOutcome};
 
-#[allow(dead_code)] // Fresh-terminal coordinator integration remains private and unavailable.
-mod activation_clock;
-#[allow(dead_code)] // Closed protocol only; the authenticated broker is not enabled.
-pub(crate) mod activation_protocol;
 pub(crate) mod audit_segments;
 pub(crate) mod audit_service;
 pub(crate) mod change_plan;
@@ -27,11 +23,11 @@ pub(crate) mod recommended;
 mod fs_helpers_windows_path;
 
 mod claude_config;
-mod claude_service;
 mod merge;
 mod shell_profile;
 pub(crate) mod shell_service;
 mod tools;
+mod yaml_edit;
 pub(crate) use shell_profile::shell_quote;
 pub(crate) use tools::{
     cline_hooks_dir, omp_user_guard_path, pi_cli_user_guard_path, prime_agent_user_guard_path,
@@ -478,7 +474,7 @@ mod run_impl {
     /// Resolve a dependency that generated security configuration will execute
     /// later. The first PATH hit is authoritative: a project/temp shadow is an
     /// error, not a reason to skip ahead to a more convenient interpreter.
-    fn resolve_hook_dependency(
+    pub(super) fn resolve_hook_dependency(
         names: &[&str],
         label: &str,
         dry_run: bool,
@@ -1054,6 +1050,7 @@ mod run_impl {
 
         #[test]
         fn generated_tirith_bin_never_falls_back_to_bare_name() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             assert!(choose_generated_tirith_bin(None, None).is_err());
             // Whether the RUNNING binary validates depends on the host: CI
             // runners execute tests from checkout/build directories owned by a

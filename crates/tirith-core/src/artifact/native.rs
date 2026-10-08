@@ -2146,6 +2146,7 @@ mod tests {
 
     #[test]
     fn elf_parses_and_extracts_pyinit_and_constructor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let elf = build_elf(&["PyInit__core"], true, b"just some benign rodata\0");
         let facts = extract_from_buffer(&elf);
         assert_eq!(
@@ -2173,6 +2174,7 @@ mod tests {
 
     #[test]
     fn elf_import_cap_is_applied_before_name_allocation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let names = (0..=caps::MAX_IMPORTS)
             .map(|index| format!("import_{index}"))
             .collect::<Vec<_>>();
@@ -2192,6 +2194,7 @@ mod tests {
 
     #[test]
     fn structured_import_and_pyinit_names_are_bounded_before_copy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let oversized_import = "i".repeat(caps::MAX_IMPORT_NAME_LENGTH + 1);
         let oversized_pyinit = format!(
             "PyInit_{}",
@@ -2221,6 +2224,7 @@ mod tests {
 
     #[test]
     fn elf_without_init_array_has_no_constructor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let elf = build_elf(&["PyInit__core"], false, b"\0");
         let facts = extract_from_buffer(&elf);
         // .init_array section present but EMPTY -> not a constructor.
@@ -2234,6 +2238,7 @@ mod tests {
 
     #[test]
     fn elf_rodata_capability_strings_are_extracted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The campaign pattern as it appears on disk: a SINGLE argv/command string
         // co-locating the spawn verb, the runtime, and the sibling payload
         // (`system("bun run ./payload/_index.js")`), plus a separate credential path
@@ -2272,6 +2277,7 @@ mod tests {
 
     #[test]
     fn benign_libc_strings_and_homepage_url_are_not_danger() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The false-positive case the review caught: an ordinary extension whose
         // rodata contains libc symbol STRINGS (socket/connect/dlopen) and a benign
         // homepage URL and a `.py` sibling, but with NO co-located spawn+runtime.
@@ -2312,6 +2318,7 @@ mod tests {
 
     #[test]
     fn spawn_import_with_separate_argv_strings_corroborates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // EVASION CLOSURE: a malicious .so that IMPORTS posix_spawn (so the spawn
         // verb is NOT a rodata string) and carries the runtime name and payload path
         // as SEPARATE argv strings (`"bun"`, `"run"`, `"./_x.js"`) must still
@@ -2354,6 +2361,7 @@ mod tests {
 
     #[test]
     fn benign_extension_with_py_siblings_and_no_spawn_import_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The contrast: the SAME bare runtime/sibling strings but WITHOUT a spawn or
         // loader import (an ordinary extension) must NOT corroborate.
         let mut facts = NativeFacts {
@@ -2384,6 +2392,7 @@ mod tests {
     /// signal as an IMPORTED symbol, not as a string word).
     #[test]
     fn benign_extension_system_error_string_with_py_sibling_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts::default();
         scan_test_string("system error: cannot find helper.py", &mut facts);
         assert!(
@@ -2396,6 +2405,7 @@ mod tests {
     /// every scheme occurrence is scanned, not just the first.
     #[test]
     fn second_suspicious_url_in_one_string_sets_flag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts::default();
         scan_test_string(
             "http://docs.example.org/ https://198.51.100.1:4444/stage2",
@@ -2433,6 +2443,7 @@ mod tests {
 
     #[test]
     fn magic_classifier_recognizes_each_format() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut pe = vec![0u8; 0x58];
         pe[..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&(0x40u32).to_le_bytes());
@@ -2473,6 +2484,7 @@ mod tests {
 
     #[test]
     fn triage_never_panics_on_malformed_corpus() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A deterministic corpus of adversarial inputs: truncated headers, claimed
         // ELF/Mach-O/PE magics over garbage, all-zero, and a truncation of a real
         // ELF at every length.
@@ -2550,6 +2562,7 @@ mod tests {
 
     #[test]
     fn full_conjunction_trips_critical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // execution_entry (PyInit_) + a single string that LAUNCHES a runtime against
         // a sibling payload (danger AND corroboration in one co-located string).
         assert!(
@@ -2565,6 +2578,7 @@ mod tests {
 
     #[test]
     fn near_miss_no_execution_entry_stays_informational() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Danger + corroboration (a runtime launch) but NO execution entry.
         let elf = build_elf(&[], false, b"system(\"bun run ./loader/_index.js\")\0");
         let triage = triage_native(&buffered(elf), false, false);
@@ -2581,6 +2595,7 @@ mod tests {
 
     #[test]
     fn near_miss_no_danger_capability_stays_informational() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PyInit + constructor but NO danger capability and NO corroboration: a
         // NumPy/SciPy-shaped extension. MUST NOT trip Critical.
         assert!(
@@ -2596,6 +2611,7 @@ mod tests {
 
     #[test]
     fn near_miss_no_corroboration_stays_informational() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PyInit + a danger capability (a SUSPICIOUS url, which is danger but NOT
         // corroboration) and nothing else. MUST NOT trip Critical.
         let rodata = b"https://203.0.113.9:9000/beacon\0";
@@ -2612,6 +2628,7 @@ mod tests {
 
     #[test]
     fn known_malicious_indicator_satisfies_corroboration() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PyInit + danger (suspicious URL) + NO string corroboration, but the caller
         // passes known_malicious=true (a hash match). That satisfies corroboration.
         let rodata = b"https://203.0.113.9:9000/beacon\0";
@@ -2625,6 +2642,7 @@ mod tests {
 
     #[test]
     fn numpy_shaped_so_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A more complete NumPy-shaped control: PyInit, constructor, BLAS-ish
         // imports/strings, but nothing dangerous.
         let rodata = b"PyInit__multiarray_umath\0cblas_dgemm\0numpy.linalg\0_ARRAY_API\0";
@@ -2642,6 +2660,7 @@ mod tests {
 
     #[test]
     fn renaming_payload_does_not_evade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The relationship is generic: ANY runtime launched against ANY sibling
         // script qualifies, so renaming the payload (or swapping bun->node) does not
         // evade. The rule keys on the spawn+runtime co-occurrence, not the filename.
@@ -2662,6 +2681,7 @@ mod tests {
 
     #[test]
     fn streaming_path_is_partial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The above-cap streaming handoff: header window (ELF magic) + collected
         // strings. Triage must be Partial and still extract capability strings.
         let header = build_elf(&["PyInit_x"], true, b"\0"); // a real ELF prefix
@@ -2702,6 +2722,7 @@ mod tests {
 
     #[test]
     fn presence_only_yields_no_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A bare module with no entry, no capability, no corroboration: only the
         // informational presence signal, never a finding.
         let elf = build_elf(&[], false, b"plain data section\0");
@@ -2719,6 +2740,7 @@ mod tests {
 
     #[test]
     fn word_boundary_avoids_substring_false_positive() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `node` must not fire inside `nodeenv`; `bun` must not fire inside `bunny`.
         let elf = build_elf(&["PyInit_x"], true, b"posix_spawn\0nodeenv\0bunny_data\0");
         let facts = extract_from_buffer(&elf);
@@ -2734,6 +2756,7 @@ mod tests {
 
     #[test]
     fn sibling_extension_word_boundary() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `.js` must not fire inside `.jsonp`; a real `.js` reference must.
         let mut facts = NativeFacts::default();
         scan_test_string("config.jsonp", &mut facts);
@@ -2757,6 +2780,7 @@ mod tests {
 
     #[test]
     fn sibling_reference_skips_prefix_extension_to_later_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `.js` is a PREFIX of `.json`: a string with `.json` BEFORE a real `.js` must still
         // detect the later `.js` sibling. The old `find` stopped at the `.json` occurrence
         // (its boundary check failed) and silently dropped the real reference, leaving the
@@ -2772,6 +2796,7 @@ mod tests {
 
     #[test]
     fn every_same_extension_sibling_in_one_string_is_retained() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -2793,6 +2818,7 @@ mod tests {
 
     #[test]
     fn wheel_native_handoff_triages_to_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The full A4 -> B7 contract: a wheel carries a malicious native member;
         // the archive reader streams it into a Buffered handoff; B7 triages that
         // handoff and the chain fires. This exercises the contract B8 will drive
@@ -2873,6 +2899,7 @@ mod tests {
 
     #[test]
     fn thin_macho_mod_init_func_sets_execution_entry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A single thin Mach-O whose only constructor is `__mod_init_func` (no
         // PyInit_*) sets has_macho_mod_init: the per-object format keys the section
         // match, so the Mach-O arm fires.
@@ -2892,6 +2919,7 @@ mod tests {
 
     #[test]
     fn fat_macho_mod_init_func_slice_sets_execution_entry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A 2-slice fat/universal Mach-O whose only constructor is `__mod_init_func`
         // (no PyInit_*). Before the fix the section-presence match keyed on
         // `facts.format` (which is MachOFat for the container), so the MachO arm
@@ -2960,6 +2988,7 @@ mod tests {
 
     #[test]
     fn printable_run_cap_edge_marks_only_truncated_run_partial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut at_cap = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -3038,6 +3067,7 @@ mod tests {
 
     #[test]
     fn extracted_string_cap_peeks_and_is_member_scoped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut at_cap = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -3095,6 +3125,7 @@ mod tests {
 
     #[test]
     fn sibling_reference_cap_marks_only_distinct_cap_plus_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -3125,6 +3156,7 @@ mod tests {
 
     #[test]
     fn embedded_url_cap_marks_only_distinct_cap_plus_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -3185,6 +3217,7 @@ mod tests {
 
     #[test]
     fn url_and_py_init_length_caps_distinguish_exact_from_plus_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact_url = format!(
             "https://{}",
             "a".repeat(caps::MAX_URL_LENGTH - "https://".len())
@@ -3234,6 +3267,7 @@ mod tests {
 
     #[test]
     fn printable_token_occurrences_and_sibling_names_are_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let exact = ".js ".repeat(caps::MAX_STRING_TOKEN_OCCURRENCES);
         let mut exact_facts = NativeFacts {
             coverage: NativeCoverage::Full,
@@ -3267,6 +3301,7 @@ mod tests {
 
     #[test]
     fn fixed_runtime_and_sensitive_path_universes_are_fully_retained() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut facts = NativeFacts {
             coverage: NativeCoverage::Full,
             ..NativeFacts::default()
@@ -3333,6 +3368,7 @@ mod tests {
 
     #[test]
     fn whole_buffer_string_scan_retains_in_cap_section_evidence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Native section data is a subset of the bounded member buffer. The scanner
         // now makes one member-wide pass instead of resetting its string budget for
         // every section and fat slice; ordinary section evidence remains visible.

@@ -1,6 +1,7 @@
 //! Reviewed publication to an explicitly selected team authority. Private local
 //! history is a precondition record; only the authenticated server commits CAS.
 use super::setup::{self, fs_helpers::FileUpdate};
+use super::team_shared::{error as err, network_allowed, now_ms};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,8 +9,7 @@ use std::path::Path;
 use tirith_core::evaluation::{FrozenEvaluation, SessionEvidence};
 use tirith_core::policy::{BoundedRuntimePolicyInputs, PolicyDiagnosticCapture};
 use tirith_core::policy_rollout::{
-    self, CandidateCoverage, Exception, ExceptionOwner, ImpactReport, RecordId, RolloutScope,
-    Workflow,
+    self, CandidateCoverage, Exception, ExceptionOwner, ImpactReport, RolloutScope, Workflow,
 };
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
 use tirith_core::policy_team::*;
@@ -196,22 +196,6 @@ struct Record {
     intent: Intent,
     phase: Phase,
     observation: Option<OperationStatus>,
-}
-fn err(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-fn now_ms() -> Result<u64, String> {
-    Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| "invalid local clock".into())
-}
-fn network_allowed() -> Result<(), String> {
-    if super::offline_env_active() {
-        Err("team authority contact is disabled by offline mode".into())
-    } else {
-        Ok(())
-    }
 }
 fn validate_input(input: &ReviewInput) -> Result<(), String> {
     validate_policy(&input.yaml).map_err(err)?;
@@ -505,6 +489,8 @@ impl TeamRolloutService {
                         card_ref: None,
                         clipboard_source:
                             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
+                        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
                     },
                     &baseline,
                     tirith_core::escalation::CallerContext::Cli,
@@ -513,11 +499,11 @@ impl TeamRolloutService {
                 )
             })
             .collect();
-        let owner = RecordId::parse(Id::new().as_str()).map_err(err)?;
+        let owner = Id::new();
         let workflows: Vec<_> = frozen
             .iter()
             .map(|evidence| Workflow {
-                id: RecordId::parse(Id::new().as_str()).unwrap(),
+                id: Id::new(),
                 evidence,
                 owner: Some(owner.clone()),
             })
@@ -540,8 +526,8 @@ impl TeamRolloutService {
             .map_err(|_| "invalid review clock")?;
         let report = policy_rollout::review_for_publisher(
             policy_rollout::ImpactRequest {
-                id: RecordId::parse(Id::new().as_str()).map_err(err)?,
-                candidate_id: RecordId::parse(id.as_str()).map_err(err)?,
+                id: Id::new(),
+                candidate_id: id.clone(),
                 scope: RolloutScope::RemoteManaged,
                 baseline: &baseline,
                 candidate: &proposed.policy,

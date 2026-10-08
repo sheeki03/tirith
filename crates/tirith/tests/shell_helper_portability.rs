@@ -204,9 +204,11 @@ _tirith_preexec 3 1 'echo changed_command'
         );
         let output = run(&shell, "bash", root.path(), false, &script);
         assert_eq!(fs::read_to_string(history_log).unwrap(), "read\nread\n");
+        // Sourcing asks the pinned binary once for this shell's session ID;
+        // after that, only the drifted user line reaches `check`.
         assert_eq!(
             fs::read_to_string(check_log).unwrap(),
-            "check --shell posix --warn-only -- _tirith_preexec_prompt_begin\n"
+            "__session-id\ncheck --shell posix --warn-only -- _tirith_preexec_prompt_begin\n"
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("DRIFT_BLOCKED"));
     }

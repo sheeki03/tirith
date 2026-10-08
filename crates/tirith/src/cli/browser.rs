@@ -487,6 +487,7 @@ mod tests {
     /// the extension id as a `chrome-extension://` origin.
     #[test]
     fn manifest_contains_required_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let m = render_manifest("/usr/local/bin/tirith", "abcdefghijklmnopabcdefghijklmnop");
         let parsed: serde_json::Value = serde_json::from_str(&m).expect("manifest is valid JSON");
         assert_eq!(parsed["name"], HOST_NAME);
@@ -581,6 +582,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn manifest_path_targets_native_messaging_hosts_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Skip rather than fail if HOME is unset (CI sandboxes occasionally do).
         let Some(p) = manifest_path(Browser::Chrome) else {
             eprintln!("skipping: no home dir resolved in this environment");
@@ -599,6 +601,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn manifest_path_is_per_browser() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cases = [
             (
                 Browser::Chrome,
@@ -702,6 +705,7 @@ mod tests {
 
     #[test]
     fn manifest_deny_creates_neither_parent_nor_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let parent = root
             .path()
@@ -726,6 +730,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn manifest_write_refuses_a_final_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let parent = root.path().join("NativeMessagingHosts");

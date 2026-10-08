@@ -1283,6 +1283,7 @@ mod tests {
 
     #[test]
     fn sudo_sh_fires_shell_spawn() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo sh", ShellType::Posix, &policy);
         assert!(
@@ -1295,6 +1296,7 @@ mod tests {
 
     #[test]
     fn sudo_bash_fires_shell_spawn() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo bash", ShellType::Posix, &policy);
         assert!(findings
@@ -1304,6 +1306,7 @@ mod tests {
 
     #[test]
     fn sudo_with_user_flag_then_shell_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo -u root bash", ShellType::Posix, &policy);
         assert!(findings
@@ -1313,6 +1316,7 @@ mod tests {
 
     #[test]
     fn sudo_canonical_shell_modes_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "sudo -s",
@@ -1335,6 +1339,7 @@ mod tests {
 
     #[test]
     fn sudo_apt_update_does_not_fire_shell_spawn() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo apt update", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -1342,6 +1347,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_etc_cron_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo tee /etc/cron.d/foo", ShellType::Posix, &policy);
         assert!(
@@ -1354,6 +1360,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_usr_local_bin_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo tee /usr/local/bin/tool", ShellType::Posix, &policy);
         assert!(findings
@@ -1363,6 +1370,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_tmp_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo tee /tmp/foo", ShellType::Posix, &policy);
         assert!(
@@ -1373,6 +1381,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_home_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo tee ~/foo", ShellType::Posix, &policy);
         assert!(
@@ -1383,6 +1392,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_home_dotfile_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression PR-127 #3: `sudo tee ~/.bashrc` (persistence vector) previously
         // bypassed every sudo rule AND dotfile_overwrite (which only matches the redirect).
         let policy = Policy::default();
@@ -1408,6 +1418,7 @@ mod tests {
 
     #[test]
     fn sudo_tee_webroot_and_persistent_dirs_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression PR-127 #16: /var/www, /srv, /root, /boot, /var/lib were missing.
         let policy = Policy::default();
         for path in [
@@ -1430,6 +1441,7 @@ mod tests {
 
     #[test]
     fn sudo_curl_o_usr_local_bin_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "sudo curl -o /usr/local/bin/foo https://example.com/foo",
@@ -1446,6 +1458,7 @@ mod tests {
 
     #[test]
     fn later_tee_and_download_targets_cannot_hide_behind_safe_ones() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "sudo tee /tmp/preview /etc/cron.d/payload",
@@ -1465,6 +1478,7 @@ mod tests {
 
     #[test]
     fn sudo_curl_to_home_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "sudo curl -o ~/foo https://example.com/foo",
@@ -1476,6 +1490,7 @@ mod tests {
 
     #[test]
     fn sudo_wget_glued_output_etc_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "sudo wget --output-document=/etc/foo https://example.com/foo",
@@ -1489,6 +1504,7 @@ mod tests {
 
     #[test]
     fn downloader_attached_output_forms_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "sudo curl -o/usr/local/bin/tool https://example.com/tool",
@@ -1508,6 +1524,7 @@ mod tests {
 
     #[test]
     fn sudo_chmod_r_777_home_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo chmod -R 777 /home", ShellType::Posix, &policy);
         assert!(
@@ -1520,6 +1537,7 @@ mod tests {
 
     #[test]
     fn sudo_chmod_r_777_narrow_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo chmod -R 777 /home/me/proj", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -1527,6 +1545,7 @@ mod tests {
 
     #[test]
     fn sudo_chown_r_root_etc_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo chown -R root:root /etc", ShellType::Posix, &policy);
         assert!(findings
@@ -1536,6 +1555,7 @@ mod tests {
 
     #[test]
     fn sudo_chmod_without_recursive_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("sudo chmod 777 /home", ShellType::Posix, &policy);
         assert!(findings.is_empty(), "{findings:?}");
@@ -1543,6 +1563,7 @@ mod tests {
 
     #[test]
     fn non_sudo_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("ls /etc", ShellType::Posix, &policy);
         assert!(findings.is_empty());
@@ -1550,6 +1571,7 @@ mod tests {
 
     #[test]
     fn env_wrapped_sudo_sh_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("env FOO=bar sudo bash", ShellType::Posix, &policy);
         assert!(findings
@@ -1559,6 +1581,7 @@ mod tests {
 
     #[test]
     fn value_aware_and_recursive_wrappers_reach_sudo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "env -u SUDO_ASKPASS sudo bash",
@@ -1584,6 +1607,7 @@ mod tests {
 
     #[test]
     fn wrapper_depth_boundaries_fail_closed_instead_of_disabling_sudo_analysis() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for depth in [31usize, 32, 33] {
             let command = format!(
@@ -1623,6 +1647,7 @@ mod tests {
 
     #[test]
     fn active_sudo_session_cannot_downgrade_wrapper_analysis_exhaustion() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for depth in [31usize, 32, 33] {
             let command = format!("{}sudo sh", "command ".repeat(depth));
@@ -1655,6 +1680,7 @@ mod tests {
 
     #[test]
     fn preserve_env_named_aws_secret_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Uses the explicit `--preserve-env=AWS_SECRET_ACCESS_KEY` form (no env mutation,
         // so the libc-environ race is irrelevant).
         let policy = Policy::default();
@@ -1673,6 +1699,7 @@ mod tests {
 
     #[test]
     fn preserve_env_named_non_sensitive_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "sudo --preserve-env=PATH,LANG pip install foo",
@@ -1690,6 +1717,7 @@ mod tests {
 
     #[test]
     fn env_clear_unset_and_empty_scopes_mask_preserved_secrets() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "env -u AWS_SECRET_ACCESS_KEY sudo -E pip install foo",
@@ -1782,6 +1810,7 @@ mod tests {
 
     #[test]
     fn leading_env_duplicates_use_last_assignment_and_env_null_does_not_clear() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "AWS_SECRET_ACCESS_KEY= AWS_SECRET_ACCESS_KEY=hunter2 sudo -E pip install foo",
@@ -1800,6 +1829,7 @@ mod tests {
 
     #[test]
     fn preserve_env_uses_kind_aware_exact_and_prefix_registry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let public_rpc = check(
             "sudo --preserve-env=RPC_URL pip install foo",
@@ -1890,6 +1920,7 @@ mod tests {
 
     #[test]
     fn preserve_env_uses_exact_posix_identity_for_rpc_aliases() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let scoped_secret = "providerToken123456789";
         let public = "https://rpc.example/rpc";

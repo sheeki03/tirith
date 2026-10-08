@@ -10,20 +10,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{collections::BTreeSet, marker::PhantomData};
 
-use sha2::{Digest, Sha256};
 use tirith_core::selfupdate::{self, InstallMethod, Provenance, SemVer, VerificationStatus};
 
 #[path = "lifecycle.rs"]
 mod lifecycle;
-#[path = "lifecycle_operations.rs"]
-pub(crate) mod lifecycle_operations;
-#[path = "lifecycle_service.rs"]
-pub(crate) mod lifecycle_service;
 #[path = "release_compatibility.rs"]
 mod release_compatibility;
 
 pub(crate) fn gather_lifecycle_facts() -> lifecycle::LifecycleFacts {
     lifecycle::gather(&gather_cli_provenance(), None)
+}
+
+pub(crate) fn inherited_integration_version() -> Option<String> {
+    lifecycle::inherited_integration_version()
 }
 
 /// GitHub repository slug for tirith releases.
@@ -151,6 +150,7 @@ fn prepare_self_authorization_with_audit<B: tirith_core::task_boundary::Boundary
     )
 }
 
+#[cfg(test)]
 fn prepare_self_authorization_with_policy<B: tirith_core::task_boundary::BoundaryMarker>(
     envelope: tirith_core::task::TaskEnvelopeInput,
     effects: BTreeSet<tirith_core::effects::CommandEffectKind>,
@@ -207,6 +207,31 @@ fn prepare_self_authorization_with_policy_and_audit<
         lease,
         marker: PhantomData,
     })
+}
+
+/// Task-gate authorization for the dashboard's ThreatDB refresh. The decision
+/// is audited like every self-integrity operation, and its retained lease is
+/// rechecked immediately before each database publication.
+pub(crate) struct ThreatDbRefreshAuthorization(
+    RetainedSelfAuthorization<tirith_core::task_boundary::SelfUpdateBoundary>,
+);
+
+impl ThreatDbRefreshAuthorization {
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        self.0.authorize_effect()
+    }
+}
+
+pub(crate) fn authorize_threatdb_refresh() -> Result<ThreatDbRefreshAuthorization, String> {
+    prepare_self_authorization::<tirith_core::task_boundary::SelfUpdateBoundary>(
+        self_boundary_envelope(
+            "browser-threatdb-refresh",
+            serde_json::json!({"force": false}),
+            None,
+        )?,
+        update_effects(false, false),
+    )
+    .map(ThreatDbRefreshAuthorization)
 }
 
 /// System and package-manager roots must never gain self-replacement authority
@@ -3741,12 +3766,7 @@ fn dir_is_writable(dir: &Path) -> bool {
         .is_ok()
 }
 
-/// SHA-256 of a byte slice, lowercase hex.
-fn hex_sha256(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    format!("{:x}", h.finalize())
-}
+use tirith_core::util::sha256_hex as hex_sha256;
 
 /// SHA-256 of a file's contents, lowercase hex; `None` if it cannot be read.
 fn hash_file_opt(path: &Path) -> Option<String> {
@@ -4096,6 +4116,7 @@ mod tests {
 
     #[test]
     fn hermes_updates_never_request_privileged_helper_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::effects::CommandEffectKind;
 
         let manages_helper =
@@ -4260,6 +4281,7 @@ mod tests {
 
     #[test]
     fn selfupdate_rejects_unsafe_initial_destinations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for url in [
             "ftp://127.0.0.1/release",
             "https://127.0.0.1/release",
@@ -4278,6 +4300,7 @@ mod tests {
 
     #[test]
     fn selfupdate_guarded_http_client_builds() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         http_client(1).expect("the connect-time resolver and redirect policy must install");
     }
 
@@ -4438,6 +4461,7 @@ mod tests {
 
     #[test]
     fn selfupdate_refuses_stale_binary_preimage_without_writing_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         let new = dir.path().join("new-tirith");
@@ -4461,6 +4485,7 @@ mod tests {
 
     #[test]
     fn selfupdate_refuses_candidate_changed_after_compatibility_verification() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         let new = dir.path().join("new-tirith");
@@ -4485,6 +4510,7 @@ mod tests {
 
     #[test]
     fn atomic_self_replace_swaps_and_keeps_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         let new = dir.path().join("new-tirith");
@@ -4503,6 +4529,7 @@ mod tests {
 
     #[test]
     fn failed_second_self_replace_preserves_the_existing_rollback_point() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         let missing_new = dir.path().join("missing-new-tirith");
@@ -4638,6 +4665,7 @@ mod tests {
 
     #[test]
     fn verify_self_carves_out_cargo_before_any_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A cargo (source-built) install must short-circuit to Unverified BEFORE
         // the release download, so this runs with no network and is a benign
         // "cannot verify" (exit 0), not an operational error or a Failed.
@@ -4692,6 +4720,7 @@ mod tests {
     /// `--rollback` property: restoring from the backup recovers the original.
     #[test]
     fn rollback_from_backup_restores_original() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
         let new = dir.path().join("new-tirith");
@@ -4741,6 +4770,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn atomic_self_replace_sets_executable_bit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("tirith");
@@ -4915,6 +4945,7 @@ mod tests {
     /// unverified (not operational): exit 0 must be kept.
     #[test]
     fn verify_self_dev_build_short_circuits_offline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prov = Provenance {
             version: "0.3.1".to_string(),
             binary_path: Some(PathBuf::from("/home/dev/tirith/target/release/tirith")),
@@ -4939,6 +4970,7 @@ mod tests {
     /// An unpublished platform short-circuits to Unverified, not operational.
     #[test]
     fn verify_self_unpublished_platform_short_circuits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prov = Provenance {
             version: "0.3.1".to_string(),
             binary_path: Some(PathBuf::from("/usr/bin/tirith")),
@@ -4963,6 +4995,7 @@ mod tests {
     /// OPERATIONAL error — surfaced as `Unverified` but exits non-zero.
     #[test]
     fn verify_self_unreadable_own_binary_is_operational_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prov = Provenance {
             version: "0.3.1".to_string(),
             binary_path: Some(PathBuf::from("/usr/local/bin/tirith")),
@@ -4987,6 +5020,7 @@ mod tests {
     /// F2: an unknown own-binary path (`binary_path == None`) is operational too.
     #[test]
     fn verify_self_unknown_own_path_is_operational_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let prov = Provenance {
             version: "0.3.1".to_string(),
             binary_path: None,
@@ -5012,6 +5046,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_finds_member_in_targz() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // tar.gz with a `tirith` file plus a decoy, built without relying on
         // host-specific tar fixture-creation flags.
@@ -5031,6 +5066,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_errors_when_no_binary() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let stage = dir.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -5055,6 +5091,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_rejects_symlink_escaping_extract_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
 
         // A sensitive file OUTSIDE the extraction dir the payload targets.
@@ -5104,6 +5141,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_dotdot_member_writes_nothing_outside() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // Archive the member under a `../escaped-tirith` name.
         let archive = dir.path().join("tirith-x86_64-unknown-linux-gnu.tar.gz");
@@ -5126,6 +5164,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_tirith_binary_preexisting_in_bounds_file_is_allowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let stage = dir.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -5281,7 +5320,3 @@ mod tests {
         assert_eq!(status_detail(&f), "mismatch");
     }
 }
-
-#[cfg(all(test, unix))]
-#[path = "selfupdate_signed_fixture_tests.rs"]
-mod signed_fixture_tests;

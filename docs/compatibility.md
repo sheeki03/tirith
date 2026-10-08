@@ -4,9 +4,9 @@ This matrix describes Tirith 0.4.2. The
 [0.4.2 release notes](release-notes-0.4.2.md) cover what that patch release
 changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
 0.4 line's published capabilities, compatibility boundaries, and remaining
-limitations. The working tree also contains unreleased cycle features; their
-[task guides](next-cycle/user-journeys.md) and [verification record](next-cycle/verification.md)
-do not establish published-package or final-release qualification.
+limitations. The working tree also contains unreleased features, described in
+[everyday workflows](user-journeys.md) and [internals](internals.md); they are
+not part of a published release yet.
 
 ## Stability Tiers
 
@@ -45,9 +45,8 @@ what an experimental command must satisfy to move to stable.
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
 | `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
-| `pkg approve` | Experimental | Non-installing pip approval flow subject to its native authority and platform requirements. An approval cannot enable the disabled package-install backend. |
+| `pkg approve` | Experimental | Disabled with `pkg install`: after its native-authority check it refuses with `private_input_execution_unqualified` and records no approval. |
 | `pkg install` | Experimental | Disabled on every host: `private_input_execution_unqualified` refuses before resolver, quarantine, checkpoint, or package execution. Flags and elevation cannot enable it. Local inspection, `pkg verify-env`, ordinary command checks, and shell protection remain available. |
-| `pkg install-npm` | Experimental, unreleased | Separate local-leaf contract qualified only on GNU Linux AArch64. Requires exact inspected archives, pinned tools, disabled scripts, full native containment and a current production-signed v2 feed. Status is historical; recovery never replays npm. The published v1 feed is insufficient. See the [contract](npm-install-contract.md). |
 | `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
 | `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
 | `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |

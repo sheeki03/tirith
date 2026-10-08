@@ -440,6 +440,7 @@ mod tests {
 
     #[test]
     fn expand_path_handles_tilde_and_plain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(expand_path("/usr/bin/git"), PathBuf::from("/usr/bin/git"));
         if let Some(home) = home::home_dir() {
             assert_eq!(expand_path("~/bin/x"), home.join("bin/x"));
@@ -465,12 +466,14 @@ mod tests {
 
     #[test]
     fn check_nonexistent_command_exits_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A command guaranteed not on PATH → exit 2 (not resolved).
         assert_eq!(check("tirith-no-such-bin-xyz-9999", true), 2);
     }
 
     #[test]
     fn guard_unknown_action_returns_2() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(guard("bogus", false), 2);
     }
 
@@ -515,6 +518,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_ignores_indented_lookalike() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let tirith_dir = dir.path().join(".tirith");
         std::fs::create_dir(&tirith_dir).unwrap();
@@ -550,6 +554,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_rejects_unparseable_candidate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let tirith_dir = dir.path().join(".tirith");
         std::fs::create_dir(&tirith_dir).unwrap();
@@ -575,6 +580,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_does_not_follow_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join("sentinel.yaml");
         let original = "paranoia: 2\n# do not clobber\n";
@@ -612,6 +618,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_rejects_symlinked_intermediate_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().unwrap();
 
         // An outside directory holding a real (non-symlink) policy.yaml sentinel.

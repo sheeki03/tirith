@@ -207,7 +207,7 @@ policy_complete = true
 name = "dashboard"
 group = "Status & health"
 inspected = "none"
-coverage = "Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants, retention and lifecycle changes. History, project and artifact evidence have explicit limits; a running service does not prove shell interception."
+coverage = "Loopback-only authenticated local controls share typed CLI plans for personal setup, policy, grants and retention, plus a guarded ThreatDB refresh; binary updates stay CLI commands. History, project and artifact evidence have explicit limits; a running service does not prove shell interception."
 policy_complete = false
 
 [[command]]
@@ -253,7 +253,7 @@ policy_complete = true
 name = "onboard"
 group = "Setup & onboarding"
 inspected = "none"
-coverage = "Guided first-run wizard: detects the environment and recommends a policy template. Configuration surface."
+coverage = "Guided first-run wizard: detects the environment, lists the integrations it found and recommends the personal Balanced protection profile (a legacy policy template only with --team or --ai-agent-heavy). Configuration surface."
 policy_complete = true
 
 [[command]]
@@ -627,21 +627,22 @@ coverage = "Clipboard with secret-shape gating and browser source attribution; i
 policy_complete = true
 
 # ---------------------------------------------------------------------------
-# Package firewall (Python; installation has separate native qualification gates)
+# Package firewall (local npm/Python artifact inspection and environment
+# verification; contained package installation is disabled)
 # ---------------------------------------------------------------------------
+
+[[command]]
+name = "pkg inspect"
+group = "Package firewall"
+inspected = "partial"
+coverage = "The local artifact route shared with `package inspect`: inspects exact local npm tarballs or Python wheels without installing or executing them. npm inspection is bounded static evidence over the compressed bytes with explicit coverage gaps. It never contacts a registry and never issues installation approval."
+policy_complete = false
 
 [[command]]
 name = "pkg install"
 group = "Package firewall"
 inspected = "none"
-coverage = "This legacy package-execution route is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation through this route is unavailable. Local leaf npm installation has a separate contract."
-policy_complete = true
-
-[[command]]
-name = "pkg install-npm"
-group = "Package firewall"
-inspected = "full"
-coverage = "Review and install exact local leaf npm tarballs into a new dedicated target; no dependency resolution or script execution. Qualified only on little-endian 64-bit GNU Linux AArch64 with pinned Node/npm/runtime files, complete native containment, fresh policy/task authority and a current production-signed ThreatDB v2. The published v1 feed is insufficient. Incomplete analysis and implicit native builds refuse before transaction effects. Status is historical; recovery only reconfirms an unchanged published tree and never replays npm. General pkg install remains disabled."
+coverage = "Package execution is disabled on every host because private named-input lifetime protection is unqualified. Valid pip requests refuse before resolver, network, quarantine, checkpoint or target effects. Confirmation flags, degraded mode and administrator access do not enable it. Use package inspection or verify-env for separate read-only workflows; npm/cargo installation is unavailable."
 policy_complete = true
 
 [[command]]
@@ -654,8 +655,15 @@ policy_complete = true
 [[command]]
 name = "pkg approve"
 group = "Package firewall"
-inspected = "full"
-coverage = "Binds an approval to the inspected artifact hashes, packages, target environment, policy projection, and DB sequence. This explicit approval route requires the opt-in privileged helper and its supported authority, currently Linux x86_64. It is unavailable by default. Ordinary checks do not require it, and an approval cannot enable the currently disabled package-execution backend."
+inspected = "none"
+coverage = "Approval is disabled with package execution, its only consumer. After the native approval-authority check (available only on Linux x86_64 with the opt-in privileged helper), valid pip requests refuse with the same private-input qualification reason before resolver, network, quarantine or approval-record effects. No approval is recorded. Ordinary checks do not require the authority."
+policy_complete = true
+
+[[command]]
+name = "pkg trust-tool"
+group = "Package firewall"
+inspected = "none"
+coverage = "Records a canonical path and SHA-256 pin for a fully static, native Linux uv executable. The pin is not yet enforced: nothing in this release reads it, because contained package installation is disabled."
 policy_complete = true
 
 [[command]]
@@ -669,14 +677,14 @@ policy_complete = true
 name = "pkg diff"
 group = "Package firewall"
 inspected = "full"
-coverage = "Local release differential between two wheels; inspects members for execution-shape drift (pure to native, hooks added)."
+coverage = "Local release differential between two npm tarballs or two Python wheels; inspects members for execution-shape drift (pure to native, startup hooks, bundled payloads, newly gained execution capabilities). npm comparisons qualify differences when analyzer or coverage differs. No registry or network access."
 policy_complete = true
 
 [[command]]
 name = "pkg attest"
 group = "Package firewall"
 inspected = "full"
-coverage = "Binds a PyPI provenance attestation subject digest to the quarantined sha256 and verifies it (optional sigstore feature). Missing or invalid attestation is evidence, never an auto-allow."
+coverage = "Fetches a local wheel's PyPI publish attestation, binds its subject digest to the wheel's SHA-256, and verifies it only with the optional sigstore feature. Missing or invalid attestation is evidence, never an auto-allow."
 policy_complete = true
 
 [[command]]
@@ -690,5 +698,5 @@ policy_complete = true
 name = "pkg receipt"
 group = "Package firewall"
 inspected = "none"
-coverage = "Lists and shows tamper-evident artifact-scan receipts. Reporting surface over recorded receipts."
+coverage = "Lists and shows stored artifact-scan receipts and flags one whose content no longer matches its content-addressed id. Reporting surface only: receipts were written by contained installs in earlier releases, and nothing in this release writes new ones."
 policy_complete = true

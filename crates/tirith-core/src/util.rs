@@ -711,6 +711,139 @@ pub fn normalize_path_separators(path: Option<&Path>) -> Option<String> {
     path.map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
+/// Lowercase hex encoding of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// Stable identity of an open file: Unix `(st_dev, st_ino)`, Windows volume
+/// serial and file index. Taken from the open handle, never from a path.
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    dirfd::file_identity(file)
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// `value` is exactly `len` lowercase hex digits (`0-9a-f`; no uppercase).
+pub fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// `value` is a UUID in canonical form: lowercase, hyphenated, 36 bytes, the
+/// exact spelling `uuid::Uuid::to_string` produces. Uppercase, braced, URN and
+/// simple (unhyphenated) spellings are refused.
+pub fn is_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+/// Milliseconds since the Unix epoch, or `None` when the local clock reads
+/// before the epoch.
+pub fn now_ms() -> Option<u64> {
+    chrono::Utc::now().timestamp_millis().try_into().ok()
+}
+
+/// CPU time the calling thread has used so far.
+///
+/// Wall-clock time also counts the time the thread waits for a CPU, so on
+/// a loaded host (the parallel workspace test run) linear work looked slow.
+/// A thread's CPU time is never more than its wall time, so a bound on it
+/// is never stricter than the same bound on wall time.
+#[cfg(all(test, unix))]
+pub(crate) fn thread_cpu_time() -> std::time::Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the call.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    assert_eq!(
+        rc,
+        0,
+        "CLOCK_THREAD_CPUTIME_ID: {}",
+        std::io::Error::last_os_error()
+    );
+    std::time::Duration::new(
+        u64::try_from(now.tv_sec).expect("non-negative seconds"),
+        u32::try_from(now.tv_nsec).expect("nanoseconds below one second"),
+    )
+}
+
+/// CPU time the calling thread has used so far (kernel plus user time).
+#[cfg(all(test, windows))]
+pub(crate) fn thread_cpu_time() -> std::time::Duration {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the pseudo-handle names the calling thread and every out
+    // pointer is a valid, writable FILETIME.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0, "GetThreadTimes: {}", std::io::Error::last_os_error());
+    // FILETIME counts 100-nanosecond intervals.
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::{hex, is_lower_hex, is_uuid, now_ms, sha256_hex};
+
+    #[test]
+    fn hex_and_sha256_hex_are_lowercase() {
+        assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex(&[]), "");
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn is_lower_hex_requires_exact_length_and_lowercase() {
+        assert!(is_lower_hex("0123456789abcdef", 16));
+        assert!(!is_lower_hex("0123456789ABCDEF", 16));
+        assert!(!is_lower_hex("0123456789abcdeg", 16));
+        assert!(!is_lower_hex("abc", 4));
+        assert!(!is_lower_hex("abcd", 3));
+        assert!(is_lower_hex("", 0));
+    }
+
+    #[test]
+    fn is_uuid_accepts_only_the_canonical_spelling() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(is_uuid(&id));
+        assert!(!is_uuid(&id.to_uppercase()));
+        assert!(!is_uuid(&id.replace('-', "")));
+        assert!(!is_uuid(&format!("{{{id}}}")));
+        assert!(!is_uuid(&format!("urn:uuid:{id}")));
+        assert!(!is_uuid("not-a-uuid"));
+    }
+
+    #[test]
+    fn now_ms_reads_the_current_clock() {
+        let now = now_ms().expect("test host clock is after the epoch");
+        // 2020-01-01T00:00:00Z
+        assert!(now > 1_577_836_800_000);
+    }
+}
+
 #[cfg(test)]
 mod open_regular_tests {
     use super::{
@@ -1066,6 +1199,7 @@ mod no_follow_tests {
     #[cfg(unix)]
     #[test]
     fn canonical_within_false_when_intermediate_dir_is_symlink_outside_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempdir().unwrap();
         let root = base.path().join("root");
         std::fs::create_dir(&root).unwrap();
@@ -1180,6 +1314,7 @@ mod store_line_tests {
 
     #[test]
     fn raw_variant_preserves_surrounding_whitespace_but_drops_blank_lines() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use super::collect_store_lines_raw_complete;
         // CodeRabbit R15 #3 — the raw collector preserves surrounding whitespace
         // on content lines (for a byte-for-byte rewrite) but still drops blank ones.
@@ -1239,6 +1374,7 @@ mod write_file_atomic_tests {
 
     #[test]
     fn publishes_whole_file_and_leaves_no_temp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The crash-atomic write must publish the COMPLETE bytes under the target
         // name and leave NO temp sibling behind (proving it used temp+rename, not
         // an in-place write a crash mid-write could truncate). It must also fully

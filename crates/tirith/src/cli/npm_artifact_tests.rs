@@ -28,6 +28,7 @@ fn fixture() -> NpmInspection {
 
 #[test]
 fn broad_dlp_preserves_only_canonical_hashes_statuses_and_protocol_enums() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let inspection = fixture();
     let hash = inspection.artifact.sha256.clone().unwrap();
     let compiled = CompiledCustomPatterns::new_silent(&[".+".to_owned()]);
@@ -59,6 +60,7 @@ fn broad_dlp_preserves_only_canonical_hashes_statuses_and_protocol_enums() {
 
 #[test]
 fn dynamic_metadata_keys_are_redacted_without_collapsing_rows() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut inspection = fixture();
     let scripts = &mut inspection.metadata.as_mut().unwrap().scripts;
     scripts.insert("PRIVATE_ONE".to_owned(), "PRIVATE_VALUE_ONE".to_owned());
@@ -77,6 +79,7 @@ fn dynamic_metadata_keys_are_redacted_without_collapsing_rows() {
 
 #[test]
 fn full_string_redaction_precedes_all_display_caps_and_invalid_hashes_have_no_exemption() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut inspection = fixture();
     let secret = format!("PRIVATE_BEGIN{}PRIVATE_END", "x".repeat(1800));
     inspection
@@ -97,6 +100,7 @@ fn full_string_redaction_precedes_all_display_caps_and_invalid_hashes_have_no_ex
 
 #[test]
 fn bounded_projection_keeps_late_review_signal_and_reports_omitted_rows() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut inspection = fixture();
     for index in 0..200 {
         inspection.signals.push(NpmSignal {
@@ -137,6 +141,7 @@ fn bounded_projection_keeps_late_review_signal_and_reports_omitted_rows() {
 
 #[test]
 fn comparison_projection_and_sarif_share_redacted_content_and_exact_identities() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = fixture();
     let mut new = old.clone();
     new.artifact.sha256 = Some("a".repeat(64));
@@ -173,6 +178,7 @@ fn comparison_projection_and_sarif_share_redacted_content_and_exact_identities()
 
 #[test]
 fn no_follow_file_reader_refuses_symlinks_and_inspection_exit_is_honest() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("fixture.tgz");
     std::fs::write(

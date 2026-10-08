@@ -155,9 +155,15 @@ def await_discovery(path, job, startup_id, binary_sha256, project):
 
 
 def verify_launch(launch, record):
-    expected = f"http://127.0.0.1:{record['port']}/#token={record['token']}"
+    # The launch URL carries a fresh single-use sign-in code, never the
+    # reusable service credential from the private record.
+    prefix = f"http://127.0.0.1:{record['port']}/#code="
     assert launch["kind"] == "dashboard_launch" and launch["service_id"] == record["service_id"]
-    assert launch["url"] == expected, "launcher did not reuse the owned service"
+    url = launch["url"]
+    assert type(url) is str and url.startswith(prefix), "launcher did not reuse the owned service"
+    code = url[len(prefix):]
+    assert len(code) == 64 and all(c in "0123456789abcdef" for c in code), "launch URL lacks a sign-in code"
+    assert code != record["token"] and record["token"] not in url, "launch URL exposes the service credential"
     assert launch["browser_opened"] is False and launch["protection_changed"] is False
 
 
@@ -409,7 +415,7 @@ def run(binary, output):
                     page.wait_for_load_state("networkidle")
                     page.get_by_role("heading", name="Overview", exact=True).wait_for()
                     page.locator('#content[aria-busy="false"]').wait_for()
-                    assert "token=" not in page.url
+                    assert "token=" not in page.url and "code=" not in page.url
                     assert page.get_by_text("Configured. Verify in your shell.").count() or page.get_by_text("Check your integration.").count()
                     page.screenshot(path=str(output / "overview-wide.png"), full_page=True)
                     report["checks"].append("overview_uses_evidence_not_assumed_blocking")
@@ -710,36 +716,47 @@ def run(binary, output):
                     page.get_by_label("Personal setup shell", exact=True).select_option("bash")
                     selected_agent = page.get_by_label("Include Claude Code", exact=True)
                     assert not selected_agent.is_checked(), "agent configuration requires explicit selection"
-                    # This real-backend case deliberately has no Claude host.
-                    # It qualifies browser selection/refusal, not installed-agent
-                    # activation or successful native Claude configuration.
-                    assert shutil.which("claude", path=env["PATH"]) is None, "refusal fixture unexpectedly has a Claude host"
+                    # Combined Claude setup has no host-version or platform pin:
+                    # it needs only a trusted python3 (the fixture PATH has the
+                    # system one) and writes the explicit personal hook command.
+                    # Configuration only; this proves no running agent is protected.
+                    assert shutil.which("python3", path=env["PATH"]), "fixture needs a system python3"
                     before_agent_policy = policy.read_bytes()
-                    before_agent_profiles = {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()}
                     assert not (root / "home/.claude").exists()
                     selected_agent.check()
-                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as refused_plan:
+                    with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as agent_plan:
                         page.get_by_role("button", name="Review personal setup", exact=True).click()
-                    refused_response = refused_plan.value
-                    refused_request = refused_response.request.post_data_json
-                    assert refused_request["kind"] == "recommended_setup"
-                    assert refused_request["change"] == {"scope":"user", "shell":"bash", "profile":"balanced", "agents":["claude-code"]}
-                    assert str(uuid.UUID(refused_request["operation_id"])) == refused_request["operation_id"]
-                    assert refused_response.status == 409, "unsupported agent must refuse the whole plan"
-                    refused_body = refused_response.json()
-                    assert "agent executable" in refused_body["error"] or "qualified native macOS host evidence" in refused_body["error"], refused_body
-                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).wait_for()
-                    assert page.get_by_role("button", name="Apply reviewed change", exact=True).count() == 0
+                    agent_response = agent_plan.value
+                    agent_request = agent_response.request.post_data_json
+                    assert agent_request["kind"] == "recommended_setup"
+                    assert agent_request["change"] == {"shell":"bash", "profile":"balanced", "claude_code":True}
+                    assert str(uuid.UUID(agent_request["operation_id"])) == agent_request["operation_id"]
+                    assert agent_response.status == 200, agent_response.text()
+                    agent_preview = agent_response.json()["preview"]["agent"]
+                    assert agent_preview["kind"] == "claude_setup_preview" and agent_preview["applied"] is False, agent_preview
+                    assert "host_version" not in agent_preview and agent_preview["verified_blocking"] is False
+                    assert not (root / "home/.claude").exists(), "review must not write Claude configuration"
+                    agent_started = time.monotonic()
+                    page.get_by_role("button", name="Apply reviewed change", exact=True).click()
+                    page.get_by_role("button", name="Undo owned change", exact=True).wait_for(timeout=120000)
+                    report["operation_observations"].append({"kind":"combined_personal_setup_with_claude_apply",
+                        "elapsed_seconds":time.monotonic() - agent_started, "fixture_deadline_seconds":120})
+                    claude_settings = json.loads((root / "home/.claude/settings.json").read_text())
+                    claude_command = claude_settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                    assert claude_command.endswith(' "$HOME/.claude/hooks/tirith-check.py" || exit 2'), claude_command
+                    assert (root / "home/.claude/hooks/tirith-check.py").is_file()
+                    page.get_by_role("button", name="Undo owned change", exact=True).click()
+                    page.locator("#operation-content .badge").filter(has_text="undone").wait_for(timeout=120000)
+                    assert json.loads((root / "home/.claude/settings.json").read_text()) == {}
                     assert policy.read_bytes() == before_agent_policy
-                    assert {path.name: path.read_bytes() for path in (root / "home").glob(".bash*") if path.is_file()} == before_agent_profiles
-                    assert not (root / "home/.claude").exists()
-                    report["checks"].append("explicit_claude_selection_reaches_real_backend_and_unavailable_host_preserves_all_configuration")
-                    page.get_by_role("button", name="Leave this plan unapplied", exact=True).click()
+                    assert all("BEGIN tirith-hook" not in path.read_text() for path in (root / "home").glob(".bash*"))
+                    report["checks"].append("explicit_claude_selection_plans_applies_and_undoes_the_personal_claude_hook")
+                    page.get_by_role("button", name="Close change details").click()
                     selected_agent.uncheck()
                     with page.expect_response(lambda response: urllib.parse.urlsplit(response.url).path == "/api/plans") as shell_only_plan:
                         page.get_by_role("button", name="Review personal setup", exact=True).click()
                     assert shell_only_plan.value.status == 200
-                    assert shell_only_plan.value.request.post_data_json["change"]["agents"] == []
+                    assert shell_only_plan.value.request.post_data_json["change"]["claude_code"] is False
                     combined_started = time.monotonic()
                     page.get_by_role("button", name="Apply reviewed change", exact=True).click()
                     # The first three-step debug run was still making recorded
@@ -783,7 +800,7 @@ def run(binary, output):
 
 
 def run_response_order(binary, output, app_js=None):
-    """Delay real API responses; all plans, mutations and lifecycle state are real."""
+    """Delay real API responses; all plans, mutations and refresh refusals are real."""
     source = app_js.read_bytes() if app_js else None
     report = {"schema_version": 1, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "source_override": source is not None,
@@ -884,7 +901,7 @@ def run_response_order(binary, output, app_js=None):
                     page.get_by_role("button", name="Apply reviewed change", exact=True).wait_for()
                     return stored()["operation_id"]
 
-                def terminal(operation_id, allowed=("completed", "completed-with-recovery")):
+                def terminal(operation_id, allowed=("completed",)):
                     latest = None
                     def finished():
                         nonlocal latest
@@ -902,7 +919,7 @@ def run_response_order(binary, output, app_js=None):
                 try:
                     page.goto(launch["url"])
                     page.locator('#content[aria-busy="false"]').wait_for()
-                    assert "token=" not in page.url
+                    assert "token=" not in page.url and "code=" not in page.url
                     first_id = profile("balanced")
                     delay("old-planned-status", "/api/operations", {"operation_id":first_id, "action":"status"})
                     page.get_by_role("button", name="Refresh stored status", exact=True).click()
@@ -964,34 +981,40 @@ def run_response_order(binary, output, app_js=None):
                     page.get_by_role("button", name="Request cancellation", exact=True).click()
                     page.locator("#operation-content > .badge").filter(has_text="cancelled").wait_for(timeout=40000)
                     assert terminal(new_id, ("cancelled",))["operation_id"] == new_id
-                    assert terminal(old_id)["state"] in ("completed", "completed-with-recovery")
+                    assert terminal(old_id)["state"] == "completed"
                     close()
                     report["checks"].append("late_apply_response_cannot_replace_or_redirect_a_new_settings_operation")
 
                     navigate("Settings")
-                    page.get_by_role("button", name="Check and review database refresh", exact=True).click()
-                    # Redirected isolated ThreatDB paths deliberately refuse
-                    # preview before network access. The real reserved operation
-                    # still has persisted refusal state which status can read.
-                    page.get_by_role("button", name="Inspect saved lifecycle request", exact=True).wait_for(timeout=40000)
-                    page.get_by_role("button", name="Inspect saved lifecycle request", exact=True).click()
-                    page.get_by_role("button", name="Refresh lifecycle status", exact=True).wait_for(timeout=40000)
-                    lifecycle = json.loads(page.locator("#operation-content details pre").last.text_content())
-                    assert lifecycle["phase"] in ("failed", "refresh_required"), lifecycle
-                    assert lifecycle["preview"]["compatible"] is False, lifecycle
-                    lifecycle_id = lifecycle["operation_id"]
-                    delay("old-lifecycle-status", "/api/lifecycle/operation", {"operation_id":lifecycle_id, "action":"status"})
-                    page.get_by_role("button", name="Refresh lifecycle status", exact=True).click()
-                    delayed("old-lifecycle-status")
-                    close()
+                    # Updates are terminal commands; the view offers copyable
+                    # commands and no browser update or rollback.
+                    page.get_by_text("tirith threat-db update", exact=True).wait_for()
+                    assert page.get_by_role("button", name="Copy command").count() >= 2
+                    for removed in ("Check and review update", "Review saved rollback", "Check and review database refresh"):
+                        assert not page.get_by_role("button", name=removed, exact=True).count(), removed
+                    # Redirected isolated ThreatDB paths make the guarded refresh
+                    # refuse before network access. Hold that real response
+                    # while a settings plan is opened; the late refusal must
+                    # not take over the new dialog.
+                    delay("late-threatdb-refresh", "/api/threatdb/refresh")
+                    page.get_by_role("button", name="Refresh threat DB now", exact=True).click()
+                    page.get_by_text("Refreshing the signed threat database", exact=False).wait_for()
+                    refused = delayed("late-threatdb-refresh")
+                    assert refused["response"].status == 409 and "redirected" in refused["body"]["error"], refused["body"]
                     settings_id = profile("balanced")
-                    release("old-lifecycle-status")
+                    release("late-threatdb-refresh")
                     assert stored()["operation_id"] == settings_id
                     page.get_by_role("button", name="Request cancellation", exact=True).click()
                     page.locator("#operation-content > .badge").filter(has_text="cancelled").wait_for(timeout=40000)
-                    assert not any(item["path"] == "/api/lifecycle/operation" and item.get("action") == "apply" for item in report["requests"])
                     close()
-                    report["checks"].append("stale_lifecycle_response_cannot_take_over_settings_or_launch_an_update")
+                    refreshes = [item for item in report["requests"] if item["path"] == "/api/threatdb/refresh"]
+                    assert len(refreshes) == 1, refreshes
+                    assert not any(item["path"].startswith("/api/lifecycle/") for item in report["requests"])
+                    navigate("Settings")
+                    page.get_by_role("button", name="Refresh threat DB now", exact=True).click()
+                    page.get_by_text("Refresh did not complete:", exact=False).wait_for(timeout=40000)
+                    assert "redirected" in page.locator("#notice").inner_text()
+                    report["checks"].append("settings_shows_commands_and_guarded_threatdb_refresh_cannot_take_over_settings")
 
                     navigate("Protection")
                     page.get_by_role("button", name="Compare and review", exact=True).nth(2).click()

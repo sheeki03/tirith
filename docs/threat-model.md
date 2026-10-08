@@ -60,22 +60,34 @@
   they stop nothing, and both declare `enforceability: observe_only` so the
   limit is visible in their own output rather than only in this document. An
   arbitrary shell, or an MCP client that does not route through `tirith gateway
-  run`, can ignore them entirely. The task gate ENFORCES at exactly six
-  tirith-owned irreversible transitions, and nowhere else:
-  - the MCP gateway's upstream forward, before pending registration;
-  - `tirith pkg approve` / `tirith pkg install`, before resolver network and
-    again before install preparation;
+  run`, can ignore them entirely. The task gate ENFORCES at exactly nine
+  tirith-owned boundaries, and nowhere else:
+  - the MCP gateway's upstream forward, before pending registration
+    (`gateway_forward`);
   - `tirith install <manager>`, before registry network and before the manager
-    is spawned;
+    is spawned (`package_manager_network`, `package_manager_execution`);
   - `tirith run <url>` and `tirith install url <URL>`, before download and
-    launch. Both spellings reach the same runner, so both are gated;
-  - a tirith-owned configuration write, before the final atomic rename. This
-    covers every `.tirith/` file tirith publishes: the policy, the commands
-    manifest, the MCP lock (from `tirith mcp lock` and from the gateway's
-    descriptor approval alike), and the MCP policy scaffold;
+    launch (`remote_script_run`). Both spellings reach the same runner, so both
+    are gated;
+  - `tirith fetch` and its MCP tool, before the cloaking probe set runs
+    (`fetch_cloaking`);
+  - a tirith-owned configuration write, before the final atomic rename
+    (`config_write`). This covers every `.tirith/` file tirith publishes: the
+    policy, the commands manifest, the MCP lock (from `tirith mcp lock` and
+    from the gateway's descriptor approval alike), and the MCP policy scaffold;
+  - `tirith verify-self`, before it creates private state and contacts the
+    release origin (`verify_self`);
+  - `tirith update`, before it contacts the release origin and updates or
+    rolls back, and the dashboard's "Refresh threat DB now", before it
+    refreshes the threat database (`self_update`);
   - `tirith capsule run --preset untrusted-project`, before the untrusted
     project is copied into the held ephemeral directory and before anything is
-    spawned.
+    spawned (`capsule_preset_run`).
+
+  `tirith pkg approve` and `tirith pkg install` refuse before any of them. Their
+  `package_approval`, `package_resolve` and `package_install_preparation`
+  tokens are kept only so receipts, schemas and policies that name them keep
+  parsing; no code evaluates them.
 
   Two consequences are stated rather than papered over. First, the `tirith run`
   download itself lives in `tirith-core`'s runner, so the gate sits in the CLI:
@@ -87,9 +99,11 @@
   Web3 command grammar and reports every other shell segment as INCOMPLETE.
   With `task_gate.mode: enforce`, `action_incomplete_analysis: block` therefore
   refuses nearly every unmodelled shell command at the five boundaries that
-  submit a shell envelope. It changes nothing at the four that submit package or
-  config-write envelopes, which always assess as complete. `warn` is the
-  default. `effects_denied_for_untrusted_sources` is the alternative, but it
+  submit a shell envelope. It also refuses the narrative actions that MCP tool
+  calls the gateway cannot model, `tirith verify-self`,
+  `tirith update --dry-run` and the dashboard's ThreatDB refresh submit. It
+  changes nothing at config writes, `tirith fetch`, or a real `tirith update`
+  or rollback, which always assess as complete. `warn` is the default. `effects_denied_for_untrusted_sources` is the alternative, but it
   denies the named effect on EVERY call at every owned boundary, including
   commands the operator typed, because no source at these boundaries is ever
   trusted.
@@ -111,11 +125,7 @@
   it, writing its contents to disk, or executing package code. Captured hashes
   identify the inspected bytes, not a later mutable path or a verified publisher, and do not authorize
   installation. `tirith pkg install` is disabled for both npm and Python on every
-  host pending private-input execution qualification. The separate
-  [local leaf npm installer](npm-install-contract.md) is limited to its qualified
-  GNU Linux AArch64 contract, exact inspected bytes, disabled scripts and a
-  current production-signed v2 feed; it is not general registry installation or
-  a claim that package code is safe.
+  host pending private-input execution qualification.
 - **Browser forensics or monitoring**: `tirith browser audit` is an explicit,
   one-shot, read-only integrity audit of extension SOURCE trees for Chrome,
   Chromium, Brave, and Edge. It never reads cookies, history, saved passwords,

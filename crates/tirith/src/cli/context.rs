@@ -494,6 +494,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         update_policy_guard_key(&path, true).unwrap();
@@ -503,6 +504,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_replaces_existing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(
@@ -520,6 +522,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_appends_when_missing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(&path, "paranoia: 2\n").unwrap();
@@ -531,6 +534,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_ignores_indented_lookalike() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An indented nested-mapping lookalike must not be rewritten at column
         // zero; the real root key is appended and the document stays valid.
         let dir = tempdir().unwrap();
@@ -560,6 +564,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_refuses_symlink_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: repo-0371 — a repository-controlled policy.yaml symlink
         // must not turn the guard update into an arbitrary-file rewrite.
         let dir = tempdir().unwrap();
@@ -574,6 +579,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_refuses_non_utf8_existing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: repo-0371 — non-UTF-8 content must not be treated as
         // empty and clobbered with only the guard key.
         let dir = tempdir().unwrap();

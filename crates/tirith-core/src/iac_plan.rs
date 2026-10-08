@@ -252,17 +252,7 @@ fn record_high_risk(summary: &mut PlanSummary, address: &str, resource_type: &st
 }
 
 /// Compute the SHA-256 of a byte buffer as a lowercase hex string.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let result = hasher.finalize();
-    let mut s = String::with_capacity(result.len() * 2);
-    for b in result {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+pub use crate::util::sha256_hex;
 
 /// Metadata stored alongside the recorded plan-hash (the plan body is NOT
 /// recorded — kept small so the store stays fast to walk).
@@ -683,6 +673,7 @@ mod tests {
 
     #[test]
     fn parse_terraform_plan_counts_actions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(TF_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(summary.create, 2);
         assert_eq!(summary.update, 1);
@@ -693,12 +684,14 @@ mod tests {
 
     #[test]
     fn parse_terraform_plan_flags_iam() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(TF_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(summary.iam_changes, vec!["aws_iam_role.app"]);
     }
 
     #[test]
     fn parse_terraform_plan_flags_security_group() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(TF_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(
             summary.security_group_changes,
@@ -708,18 +701,21 @@ mod tests {
 
     #[test]
     fn parse_terraform_plan_flags_db_delete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(TF_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(summary.db_changes, vec!["aws_db_instance.primary"]);
     }
 
     #[test]
     fn parse_terraform_plan_high_risk_true() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(TF_PLAN_JSON.as_bytes()).unwrap();
         assert!(summary.has_high_risk_changes());
     }
 
     #[test]
     fn parse_pulumi_plan_counts_actions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(PULUMI_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(summary.create, 1);
         assert_eq!(summary.destroy, 1);
@@ -728,6 +724,7 @@ mod tests {
 
     #[test]
     fn parse_pulumi_plan_flags_iam_from_urn() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let summary = parse_plan_json(PULUMI_PLAN_JSON.as_bytes()).unwrap();
         assert_eq!(summary.iam_changes.len(), 1);
         assert!(summary.iam_changes[0].contains("iam/role:Role"));
@@ -735,6 +732,7 @@ mod tests {
 
     #[test]
     fn parse_plan_rejects_unknown_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let bad = r#"{ "foo": [] }"#;
         let err = parse_plan_json(bad.as_bytes()).unwrap_err();
         assert!(err.contains("unrecognized plan JSON shape"));
@@ -742,6 +740,7 @@ mod tests {
 
     #[test]
     fn parse_plan_rejects_invalid_json() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let bad = "not json at all";
         let err = parse_plan_json(bad.as_bytes()).unwrap_err();
         assert!(err.contains("json parse error"));
@@ -860,6 +859,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervised_drain_kills_child_past_output_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // repo-0286 regression: the shared drain enforces the byte cap DURING
         // the read (stop reading, kill, reap the process group); it does not
         // buffer the child's complete stdout and check afterwards. 8 MiB far

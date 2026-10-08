@@ -1,11 +1,11 @@
 //! Explicit immutable segment export and irreversible retention deletion.
 //! Only server-derived UUID paths are accepted. No active log is modified.
-use super::change_plan::{Edit, MutationService, OperationKind, RequestedChange};
+use super::change_plan::{Edit, MutationService, OperationKind, PlanRequest, RequestedChange};
 use super::fs_helpers;
 use super::fs_transaction::{FileUpdate, TransactionOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+
 use std::path::{Path, PathBuf};
 use tirith_core::audit::retention::RotationPlan;
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
@@ -113,12 +113,13 @@ pub(crate) fn prepare(
     let original = service.rotation_plan(change.source())?;
     let plan = SegmentPlan::capture(id, change.clone(), &original)?;
     let preview = plan.projection();
-    let status = service.plan_with_preimages_and_intent(id, kind, vec![RequestedChange {
+    let request = PlanRequest::change(kind, vec![RequestedChange {
         target: plan.target(), scope_root: plan.root.clone(), edit: Edit::AuditSegment(plan),
         activation: true, description: if matches!(change, SegmentChange::Delete { .. }) {
             "Irreversibly delete the selected retained records; preserve their checkpoint and a deletion record".into()
         } else { "Export the selected exact audit segment into a separate private bundle".into() },
-    }], &snapshot, &BTreeMap::new(), &intent)?;
+    }]).intent(&intent)?;
+    let status = service.submit(id, &snapshot, request)?;
     display(status, Some(preview), cwd)
 }
 fn display(
@@ -136,15 +137,13 @@ fn display(
     )
 }
 fn canonical_id(id: &str) -> Result<(), String> {
-    if uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id) {
+    if tirith_core::util::is_uuid(id) {
         Ok(())
     } else {
         Err("audit segment and operation IDs must be canonical UUIDs".into())
     }
 }
-fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+use tirith_core::util::sha256_hex as hash;
 fn private_read(path: &Path, root: &Path) -> Result<Option<Vec<u8>>, String> {
     let snapshot = fs_helpers::read_snapshot_scoped(path, root)?;
     snapshot.require_private()?;
@@ -548,12 +547,7 @@ mod tests {
         let active = tirith_core::audit::audit_log_path().unwrap();
         let original = std::fs::read(&active).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        super::super::audit_service::prepare(
-            &id,
-            super::super::audit_service::AuditChange::Rotate,
-            None,
-        )
-        .unwrap();
+        super::super::audit_service::prepare(&id, None).unwrap();
         let state = MutationService::current()
             .unwrap()
             .apply(
@@ -561,10 +555,7 @@ mod tests {
                 &EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime),
             )
             .unwrap();
-        assert!(matches!(
-            state.state,
-            JobState::Completed | JobState::CompletedWithRecovery
-        ));
+        assert_eq!(state.state, JobState::Completed);
         (id, active, original)
     }
     #[test]

@@ -40,7 +40,6 @@ enum PlanRequest {
     },
     AuditRetention {
         operation_id: String,
-        change: super::super::setup::audit_service::AuditChange,
     },
     PolicyRollout {
         operation_id: String,
@@ -128,40 +127,100 @@ struct ShellRequest {
     shell: ShellKind,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LifecyclePrepare {
-    operation_id: String,
-    action: super::super::selfupdate::lifecycle_operations::Action,
-}
-
 fn body<T: serde::de::DeserializeOwned>(request: &http::Request) -> Result<T, String> {
     serde_json::from_slice(&request.body)
         .map_err(|_| "request does not match the endpoint schema".into())
 }
 
+/// Full Runtime resolution, which may contact a configured remote policy
+/// server. Only routes that show or act on the effective policy use it.
 fn snapshot(service: &Service) -> (EffectivePolicySnapshot, CompiledCustomPatterns) {
     let snapshot =
         EffectivePolicySnapshot::resolve(Some(&service.record.cwd), ResolutionMode::Runtime);
-    let compiled = CompiledCustomPatterns::new_silent(&captured_policy_dlp_patterns_or(
-        &snapshot.policy.dlp_custom_patterns,
-    ));
+    let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);
+    service.observe_runtime(&snapshot, &patterns);
+    let compiled = CompiledCustomPatterns::new_silent(&patterns);
     (snapshot, compiled)
 }
 
-pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Value) {
-    if let Err(error) = service.auth.check(request) {
-        return (error.status, json!({"error": error.message}));
+/// What read-only routes take from the policy, without any network request.
+struct ReadView {
+    patterns: Vec<String>,
+    refresh_interval_hours: u64,
+}
+
+/// A fresh no-network Runtime resolution (local inputs and the team cache)
+/// plus every DLP pattern from Runtime resolutions this service already made.
+/// When a legacy remote policy server is configured, the no-network
+/// resolution stops before it, so the ThreatDB interval comes from the latest
+/// full Runtime resolution instead.
+fn read_view(service: &Service) -> ReadView {
+    let local = EffectivePolicySnapshot::resolve_runtime_without_network(Some(&service.record.cwd));
+    let (runtime_patterns, runtime_interval) = service.runtime_view();
+    let mut patterns = captured_policy_dlp_patterns_or(&local.policy.dlp_custom_patterns);
+    for pattern in local
+        .policy
+        .dlp_custom_patterns
+        .iter()
+        .cloned()
+        .chain(runtime_patterns)
+    {
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
     }
+    let refresh_interval_hours = match runtime_interval {
+        Some(interval) if local.remote.availability == "refused_local_mutation" => interval,
+        _ => local.policy.threat_intel.auto_update_hours,
+    };
+    ReadView {
+        patterns,
+        refresh_interval_hours,
+    }
+}
+
+fn read_patterns(service: &Service) -> Vec<String> {
+    read_view(service).patterns
+}
+
+/// The policy a read-only route evaluates against: a fresh no-network
+/// Runtime resolution or, when a legacy remote policy server makes that
+/// resolution refuse, the service's latest full Runtime resolution while its
+/// local inputs (policy files, trust store, trust expiry) are still current.
+/// When they changed, or no full resolution finished, resolve again as
+/// GET /api/policy does (which may contact that server) and keep the result:
+/// a stale snapshot would make every list/explain refuse, and the no-network
+/// result in that mode is only the fail-closed placeholder.
+fn read_snapshot(service: &Service) -> EffectivePolicySnapshot {
+    let local = EffectivePolicySnapshot::resolve_runtime_without_network(Some(&service.record.cwd));
+    if local.remote.availability != "refused_local_mutation" {
+        return local;
+    }
+    match service.runtime_snapshot() {
+        Some(runtime) if runtime.revalidate_inputs().is_ok() => runtime,
+        _ => snapshot(service).0,
+    }
+}
+
+/// Route an authorized request. `grant` is the credential decision made
+/// when the request was read; it is not re-derived here.
+pub(super) fn dispatch(
+    service: &Service,
+    request: &http::Request,
+    grant: &http::Grant,
+) -> (u16, Value) {
     if request.method == "GET" && request.target == "/api/session" {
         return (
             200,
             json!({"protocol": super::lifecycle::PROTOCOL, "service_id": service.record.service_id,
             "version": service.record.version, "binary_sha256": service.record.binary_sha256,
-            "csrf": service.auth.csrf, "quiescing": service.quiescing.load(std::sync::atomic::Ordering::Acquire),
-            "expires_in_seconds": service.auth.lifetime.saturating_sub(service.auth.issued.elapsed()).as_secs(),
+            "csrf": grant.csrf, "quiescing": service.quiescing.load(std::sync::atomic::Ordering::Acquire),
+            "expires_in_seconds": grant.expires_in.as_secs(),
             "active_jobs": super::super::setup::change_plan::active_job_count()}),
         );
+    }
+    if request.method == "POST" && request.target == "/api/session/code" {
+        return sign_in_code(service, request, grant);
     }
     let _capture = PolicyDiagnosticCapture::start();
     let result = route(service, request);
@@ -180,6 +239,42 @@ pub(super) fn dispatch(service: &Service, request: &http::Request) -> (u16, Valu
             json!({"error": tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &compiled),
             "diagnostics": diagnostics, "refresh_required": true}),
         ),
+    }
+}
+
+/// A single-use launch code, issued only to the private service credential.
+fn sign_in_code(service: &Service, request: &http::Request, grant: &http::Grant) -> (u16, Value) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    if !grant.service {
+        return (
+            403,
+            json!({"error": "sign-in codes are issued only to the local launcher"}),
+        );
+    }
+    if body::<Empty>(request).is_err() {
+        return (
+            400,
+            json!({"error": "request does not match the endpoint schema"}),
+        );
+    }
+    if service.quiescing.load(std::sync::atomic::Ordering::Acquire) {
+        return (
+            409,
+            json!({"error": "service is draining; reopen it after active jobs finish"}),
+        );
+    }
+    let code = super::lifecycle::secret();
+    match service
+        .auth
+        .issue_code(code.clone(), std::time::Instant::now())
+    {
+        Ok(expires) => (
+            200,
+            json!({"schema_version": 1, "code": code, "expires_in_seconds": expires.as_secs()}),
+        ),
+        Err(error) => (error.status, json!({"error": error.message})),
     }
 }
 
@@ -214,20 +309,10 @@ fn merge_diagnostics(
         .filter_map(|value| value.as_str().map(str::to_string))
         .chain(diagnostics)
         .collect();
-    let omitted = previous_omitted.saturating_add(messages.len().saturating_sub(32) as u64);
-    let messages: Vec<_> = messages
-        .into_iter()
-        .take(32)
-        .map(|message| {
-            let redacted =
-                tirith_core::redact::redact_sanitize_redact_with_compiled(&message, compiled);
-            if redacted.len() > 1024 {
-                "[withheld: diagnostic exceeds output limit]".into()
-            } else {
-                redacted
-            }
-        })
-        .collect();
+    let (messages, omitted_now) = super::super::bounded_diagnostics(messages, 32, |message| {
+        tirith_core::redact::redact_sanitize_redact_with_compiled(message, compiled)
+    });
+    let omitted = previous_omitted.saturating_add(omitted_now as u64);
     object.insert("diagnostics".into(), json!(messages));
     object.insert("omitted_diagnostics".into(), json!(omitted));
 }
@@ -413,90 +498,61 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             let query: ReviewRequest = body(request)?;
             super::super::project_review::revalidate(&query.report_id, cwd)
         }
-        ("POST", "/api/lifecycle/prepare") => {
-            let query: LifecyclePrepare = body(request)?;
+        ("POST", "/api/threatdb/refresh") => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Empty {}
+            let _: Empty = body(request)?;
             let _admission = admission(service, request)?;
-            let view = super::super::selfupdate::lifecycle_service::prepare(
-                &query.operation_id,
-                query.action,
-            )?;
-            lifecycle_projection(view, service)
-        }
-        ("POST", "/api/lifecycle/operation") => {
-            let query: OperationRequest = body(request)?;
-            let service_api = super::super::selfupdate::lifecycle_service::status;
-            let view = if query.action == OperationAction::Status {
-                service_api(&query.operation_id)?
-            } else {
-                let _admission = admission(service, request)?;
-                match query.action {
-                    OperationAction::Apply => {
-                        let saved = service_api(&query.operation_id)?;
-                        if saved.phase != super::super::selfupdate::lifecycle_operations::Phase::Prepared {
-                            saved
-                        } else if saved.action == super::super::selfupdate::lifecycle_operations::Action::RefreshThreatDb {
-                            super::super::threatdb_cmd::lifecycle::apply(&query.operation_id)?
-                        } else {
-                            super::lifecycle_worker::start(&query.operation_id)?
-                        }
-                    }
-                    OperationAction::Cancel => {
-                        super::super::selfupdate::lifecycle_service::cancel(&query.operation_id)?
-                    }
-                    OperationAction::Undo => {
-                        return Err("prepare an explicit compatible rollback from Settings".into())
-                    }
-                    OperationAction::Status => unreachable!(),
-                }
-            };
-            lifecycle_projection(view, service)
+            super::super::threatdb_cmd::lifecycle::guarded_refresh(std::path::Path::new(
+                &service.record.cwd,
+            ))?;
+            Ok(
+                json!({"schema_version": 1, "kind": "threatdb_refresh", "state": "completed",
+                "freshness": freshness_projection(service)?}),
+            )
         }
         ("POST", "/api/support/preview") => {
             let selection: super::super::support_bundle::Selection = body(request)?;
             super::super::support_bundle::preview(&selection, cwd)
         }
         ("GET", "/api/jobs") => {
-            let _ = snapshot(service);
             let recent = MutationService::current()?.recent_statuses(30)?;
             // Inventory rows need identities and stored states, not every
             // potentially large destination. Opening a selected operation
             // obtains the complete reviewed step projection separately.
             let operations: Vec<_> = recent.operations.iter().map(|status| {
                 json!({"schema_version":status.schema_version,"operation_id":status.operation_id,
-                "kind":status.kind,"state":status.state,"no_op":status.no_op,"active_action":status.active_action,
-                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len(),"setup_activation":status.setup_activation})
+                "kind":status.kind,"state":status.state,"recovery":status.recovery,"no_op":status.no_op,"active_action":status.active_action,
+                "created_at":status.created_at,"updated_at":status.updated_at,"step_count":status.steps.len()})
             }).collect();
             Ok(
                 json!({"schema_version":1,"kind":"recent_operations", "operations":operations,"coverage":recent.coverage}),
             )
         }
         ("GET", "/api/activity/summary") => {
-            let (policy, _) = snapshot(service);
-            let mut report = service
-                .aggregate
-                .lock()
-                .map_err(|_| "history aggregate is unavailable")?
-                .refresh(
-                    chrono::Utc::now(),
-                    7,
-                    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
-                )?;
+            let patterns = read_patterns(service);
+            let mut report = tirith_core::history_aggregate::summarize(
+                &service.history,
+                chrono::Utc::now(),
+                7,
+                tirith_core::audit::logging_enabled(),
+            )?;
             let omitted = report.rules.len().saturating_sub(100);
             report.rules.truncate(100);
-            let mut view = tirith_core::history_aggregate::display_projection(
-                &report,
-                &captured_policy_dlp_patterns_or(&policy.policy.dlp_custom_patterns),
-            );
+            let mut view = tirith_core::history_aggregate::display_projection(&report, &patterns);
             view["omitted_rules_this_view"] = omitted.into();
             Ok(view)
         }
-        ("GET", "/api/policy/tuning") => super::super::tuning::review(cwd),
+        ("GET", "/api/policy/tuning") => {
+            super::super::tuning::review_with_patterns(read_patterns(service))
+        }
         ("POST", "/api/integrations/inspect") => {
             let query: ShellRequest = body(request)?;
             shell_service::inspect(query.shell, cwd)
         }
         ("GET", "/api/state") | ("GET", "/api/integrations") => {
-            let (_, compiled) = snapshot(service);
+            let compiled = CompiledCustomPatterns::new_silent(&read_patterns(service));
             let mut info = super::super::doctor::gather_quick_info();
             info.policy_path_used = info.policy_path_used.map(|path| {
                 tirith_core::redact::redact_sanitize_redact_with_compiled(&path, &compiled)
@@ -519,89 +575,41 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                 .map_err(|_| "cannot project effective policy".into())
         }
         ("GET", "/api/exceptions") => {
-            trust_lifecycle::TrustService::capture(cwd)?.list(None, true, "all")
+            let mut trust = trust_lifecycle::TrustService::capture_read_only(
+                cwd,
+                read_snapshot(service),
+                &read_patterns(service),
+            )?;
+            let mut value = trust.list(None, true, "all")?;
+            // Policy diagnostics from the trust context's own capture are part
+            // of this response (merged with the route's by `dispatch`).
+            value["diagnostics"] = json!(std::mem::take(&mut trust.diagnostics));
+            Ok(value)
         }
         ("GET", "/api/lifecycle") => {
             let value = serde_json::to_value(super::super::selfupdate::gather_lifecycle_facts())
                 .map_err(|_| "cannot project lifecycle state")?;
             Ok(value)
         }
-        ("GET", "/api/freshness") => {
-            let (_, compiled) = snapshot(service);
-            let mut value = serde_json::to_value(super::super::threatdb_cmd::gather_health())
-                .map_err(|_| "cannot project ThreatDB health")?;
-            // The signed blob stays private; the existing health projection is
-            // display-only and does not mutate verification material.
-            for pointer in [
-                "/path",
-                "/error",
-                "/supplemental/path",
-                "/freshness/source_evidence_error",
-            ] {
-                if let Some(content) = value.pointer_mut(pointer) {
-                    tirith_core::redact::redact_json_strings(content, &compiled);
-                }
-            }
-            project_update_record(&mut value["last_update"], &compiled);
-            if let Some(sources) = value
-                .pointer_mut("/freshness/sources")
-                .and_then(Value::as_array_mut)
-            {
-                for source in sources {
-                    for (field, canonical) in [
-                        (
-                            "source",
-                            source["source"].as_str().is_some_and(|s| {
-                                tirith_core::threatdb::operations::SOURCE_IDS.contains(&s)
-                            }),
-                        ),
-                        (
-                            "revision",
-                            source["revision"].as_str().is_some_and(|s| {
-                                s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
-                            }),
-                        ),
-                        (
-                            "pin_selected_at",
-                            source["pin_selected_at"]
-                                .as_str()
-                                .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
-                        ),
-                    ] {
-                        if !canonical {
-                            if let Some(content) = source.get_mut(field) {
-                                tirith_core::redact::redact_json_strings(content, &compiled);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(value)
-        }
+        ("GET", "/api/freshness") => freshness_projection(service),
         ("POST", "/api/history") => {
             let query: HistoryRequest = body(request)?;
-            if query
-                .cursor
-                .as_ref()
-                .is_some_and(|cursor| uuid::Uuid::parse_str(cursor).is_err())
-            {
+            if query.cursor.as_ref().is_some_and(|cursor| {
+                cursor.len() != tirith_core::history::CURSOR_HEX_LEN
+                    || !cursor
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }) {
                 return Err("history cursor must be one issued by this service".into());
             }
-            let (policy, _) = snapshot(service);
-            let history = service
-                .history
-                .lock()
-                .map_err(|_| "history reader is unavailable")?
-                .newest_page(
-                    query.cursor.as_deref(),
-                    query.filter,
-                    query.limit,
-                    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
-                )?;
-            Ok(super::super::history::projection(
-                &history,
-                &captured_policy_dlp_patterns_or(&policy.policy.dlp_custom_patterns),
-            ))
+            let patterns = read_patterns(service);
+            let history = service.history.newest_page(
+                query.cursor.as_deref(),
+                query.filter,
+                query.limit,
+                tirith_core::audit::logging_enabled(),
+            )?;
+            Ok(super::super::history::projection(&history, &patterns))
         }
         ("POST", "/api/profile/preview") => {
             let query: ProfileRequest = body(request)?;
@@ -613,13 +621,20 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
         }
         ("POST", "/api/exceptions/explain") => {
             let query: ExplainTrust = body(request)?;
-            trust_lifecycle::TrustService::capture(cwd)?.explain(
+            let mut trust = trust_lifecycle::TrustService::capture_read_only(
+                cwd,
+                read_snapshot(service),
+                &read_patterns(service),
+            )?;
+            let mut value = trust.explain(
                 &query.target,
                 match query.scope {
                     GrantScope::User => "user",
                     GrantScope::Project => "project",
                 },
-            )
+            )?;
+            value["diagnostics"] = json!(std::mem::take(&mut trust.diagnostics));
+            Ok(value)
         }
         ("POST", "/api/plans") => {
             let query: PlanRequest = body(request)?;
@@ -633,10 +648,9 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
                     operation_id,
                     change,
                 } => super::super::setup::audit_segments::prepare(&operation_id, change, cwd),
-                PlanRequest::AuditRetention {
-                    operation_id,
-                    change,
-                } => super::super::setup::audit_service::prepare(&operation_id, change, cwd),
+                PlanRequest::AuditRetention { operation_id } => {
+                    super::super::setup::audit_service::prepare(&operation_id, cwd)
+                }
                 PlanRequest::PolicyRollout {
                     operation_id,
                     change,
@@ -714,18 +728,21 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
             let query: OperationRequest = body(request)?;
             uuid::Uuid::parse_str(&query.operation_id)
                 .map_err(|_| "operation ID must be a UUID")?;
-            let (policy, compiled) = snapshot(service);
             let mutations = MutationService::current()?;
-            let status = if query.action == OperationAction::Status {
-                mutations.status(&query.operation_id)?
+            let (status, compiled) = if query.action == OperationAction::Status {
+                // A status read never resolves the remote policy.
+                let compiled = CompiledCustomPatterns::new_silent(&read_patterns(service));
+                (mutations.status(&query.operation_id)?, compiled)
             } else {
+                let (policy, compiled) = snapshot(service);
                 let _admission = admission(service, request)?;
-                match query.action {
+                let status = match query.action {
                     OperationAction::Apply => mutations.apply_async(query.operation_id, policy)?,
                     OperationAction::Undo => mutations.undo_async(query.operation_id, policy)?,
                     OperationAction::Cancel => mutations.cancel(&query.operation_id)?,
                     OperationAction::Status => unreachable!(),
-                }
+                };
+                (status, compiled)
             };
             let mut result = profile::status_projection(&status, &compiled)?;
             if let Some(review) = mutations.impact_review(&status.operation_id)? {
@@ -769,60 +786,23 @@ fn route_for_project(service: &Service, request: &http::Request) -> Result<Value
     }
 }
 
-fn lifecycle_projection(
-    view: super::super::selfupdate::lifecycle_operations::OperationView,
-    service: &Service,
-) -> Result<Value, String> {
-    let (_, compiled) = snapshot(service);
-    let mut value = serde_json::to_value(view).map_err(|_| "cannot project lifecycle operation")?;
-    // Canonical action/phase/UUID/time fields are protocol. Candidate prose is
-    // a display copy and receives the current privacy rules on every request.
-    for pointer in [
-        "/preview/current_version",
-        "/preview/candidate_version",
-        "/preview/evidence",
-        "/preview/issues",
-        "/next_action",
-    ] {
-        if let Some(content) = value.pointer_mut(pointer) {
-            tirith_core::redact::redact_json_strings(content, &compiled);
-        }
-    }
+fn freshness_projection(service: &Service) -> Result<Value, String> {
+    let view = read_view(service);
+    let compiled = CompiledCustomPatterns::new_silent(&view.patterns);
+    let mut value = serde_json::to_value(super::super::threatdb_cmd::gather_health_with_interval(
+        view.refresh_interval_hours,
+    ))
+    .map_err(|_| "cannot project ThreatDB health")?;
+    // The signed blob stays private; the existing health projection is
+    // display-only and does not mutate verification material. Only canonical
+    // protocol values (status tokens, source IDs, revisions, update phases)
+    // stay verbatim; paths, errors and recovery text receive full DLP.
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::ThreatDbHealth,
+        &compiled,
+    );
     Ok(value)
-}
-
-fn project_update_record(value: &mut Value, compiled: &CompiledCustomPatterns) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for (key, value) in object {
-        let canonical = match (key.as_str(), value.as_str()) {
-            ("status", Some("partial" | "failed" | "complete")) => true,
-            ("phase", Some("primary" | "supplemental" | "complete")) => true,
-            ("failure_category", Some(category)) => update_category(category),
-            ("incident_key", Some(key)) => key.split_once(':').is_some_and(|(phase, category)| {
-                matches!(phase, "primary" | "supplemental" | "complete")
-                    && update_category(category)
-            }),
-            _ => false,
-        };
-        if !canonical {
-            tirith_core::redact::redact_json_strings(value, compiled);
-        }
-    }
-}
-
-fn update_category(value: &str) -> bool {
-    matches!(
-        value,
-        "integrity"
-            | "rollback"
-            | "rate_limit"
-            | "validation"
-            | "completeness"
-            | "transport"
-            | "operation"
-    )
 }
 
 fn admission<'a>(
@@ -927,18 +907,38 @@ mod tests {
 
     #[test]
     fn update_display_preserves_canonical_state_under_broad_dlp() {
+        use tirith_core::output_contract::{redact_projection, Projection};
         let compiled = CompiledCustomPatterns::new_silent(&[".+".into()]);
-        let mut value = json!({"status":"failed","phase":"primary","failure_category":"integrity","incident_key":"primary:integrity","next_action":"private content","consecutive_failures":2});
-        project_update_record(&mut value, &compiled);
-        assert_eq!(value["status"], "failed");
-        assert_eq!(value["incident_key"], "primary:integrity");
-        assert_eq!(value["consecutive_failures"], 2);
-        assert!(!value["next_action"]
-            .as_str()
-            .unwrap()
-            .contains("private content"));
-        let mut invalid = json!({"status":"private content","incident_key":"private:token"});
-        project_update_record(&mut invalid, &compiled);
+        let mut value = json!({"status":"error","path":"/private/home/threat.db","error":"private error",
+            "supplemental":{"present":true,"path":"/private/supplemental"},"counts":{"total":3},
+            "freshness":{"publication_time_basis":"signed_build_timestamp","source_evidence":"unavailable",
+                "source_evidence_error":"private evidence","sources":[
+                    {"source":"private source","revision":"0123456789abcdef0123456789abcdef01234567",
+                     "pin_selected_at":"2026-10-01T00:00:00Z","accepted":4}]},
+            "last_update":{"status":"failed","phase":"primary","failure_category":"integrity","incident_key":"primary:integrity","next_action":"private content","consecutive_failures":2}});
+        redact_projection(&mut value, Projection::ThreatDbHealth, &compiled);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["counts"]["total"], 3);
+        assert_eq!(
+            value["freshness"]["publication_time_basis"],
+            "signed_build_timestamp"
+        );
+        assert_eq!(value["freshness"]["source_evidence"], "unavailable");
+        let source = &value["freshness"]["sources"][0];
+        assert_eq!(
+            source["revision"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(source["pin_selected_at"], "2026-10-01T00:00:00Z");
+        assert_eq!(source["accepted"], 4);
+        let update = &value["last_update"];
+        assert_eq!(update["status"], "failed");
+        assert_eq!(update["incident_key"], "primary:integrity");
+        assert_eq!(update["consecutive_failures"], 2);
+        assert!(!value.to_string().contains("private"), "{value}");
+        let mut invalid =
+            json!({"last_update":{"status":"private content","incident_key":"private:token"}});
+        redact_projection(&mut invalid, Projection::ThreatDbHealth, &compiled);
         assert!(!invalid.to_string().contains("private"));
     }
 }

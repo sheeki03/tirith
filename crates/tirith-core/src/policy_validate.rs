@@ -636,6 +636,18 @@ fn validate_package_policy(policy: &crate::policy::Policy, issues: &mut Vec<Poli
 }
 
 fn validate_fail_mode_fields(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    if let Some(hours) = policy.team_offline_grace_hours {
+        let max = crate::policy_team_enrollment::MAX_GRACE_HOURS;
+        if hours > max {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Error,
+                message: format!(
+                    "team_offline_grace_hours: {hours} exceeds the maximum of {max} hours"
+                ),
+                field: Some("team_offline_grace_hours".into()),
+            });
+        }
+    }
     if let Some(ref mode) = policy.policy_fetch_fail_mode {
         let valid = ["open", "closed", "cached"];
         if !valid.contains(&mode.as_str()) {
@@ -2019,6 +2031,7 @@ custom_rules:
 
     #[test]
     fn test_dsl_rule_all_command_and_file_is_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // round-9 R9-1: `all(command.*, file.*)` mixes contexts that never
         // co-occur, so its satisfiable set is ∅ — rejected with the dedicated
         // "never co-occur" message (not the generic coverage one), even with both

@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write as _};
+use std::path::Path;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -249,6 +250,9 @@ pub fn run(
     // Must run before any early return so hooks calling `--approval-check` still
     // trigger updates. `--offline`/`TIRITH_OFFLINE` makes this a guaranteed no-op.
     crate::cli::threatdb_cmd::maybe_background_update(offline);
+    // Same contract for an enrolled team policy cache: a detached, rate-limited
+    // sync child; this command never waits for the team server.
+    crate::cli::team_enrollment::maybe_background_refresh(offline);
 
     let session_id = tirith_core::session::resolve_session_id();
 
@@ -325,6 +329,8 @@ pub fn run(
                     clipboard_html: None,
                     card_ref: card.clone(),
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                    python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                    cdpath_inherited: tirith_core::engine::cdpath_env_active(),
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -343,6 +349,8 @@ pub fn run(
                 clipboard_html: None,
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                cdpath_inherited: tirith_core::engine::cdpath_env_active(),
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -361,6 +369,8 @@ pub fn run(
             clipboard_html: None,
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
         };
         let (v, p) = if execution_receipt.is_some() {
             // A durable receipt must freeze every effective policy overlay even
@@ -563,7 +573,9 @@ pub fn run(
     // traverses the whole cwd (seconds on large dirs) and hooks need fast responses.
     if interactive
         && effective.action != Action::Block
-        && tirith_core::checkpoint::should_auto_checkpoint(cmd)
+        && (tirith_core::checkpoint::should_auto_checkpoint(cmd)
+            || tirith_core::extract::posix_variable_command_literal_view(cmd, shell_type)
+                .is_some_and(|view| tirith_core::checkpoint::should_auto_checkpoint(&view)))
     {
         if let Some(cwd_val) = &cwd {
             let cwd_owned = cwd_val.clone();
@@ -718,6 +730,8 @@ pub fn run(
             clipboard_html: None,
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
         };
         if ran_locally {
             tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
@@ -1700,23 +1714,6 @@ type SigpipePublicationGuard = SigpipeDeliveryGuard;
 #[cfg(target_os = "macos")]
 type SigpipePublicationGuard = SigpipeDescriptorGuard;
 
-/// One nonblocking pipe write under the existing scoped SIGPIPE protection.
-/// Callers poll before entering: Darwin's descriptor-policy mutex must never
-/// cover a readiness wait. Preserve EPIPE/WouldBlock for the framing caller.
-#[cfg(unix)]
-pub(crate) fn write_pipe_sigpipe_safe(writer: &mut File, bytes: &[u8]) -> std::io::Result<usize> {
-    let mut guard =
-        SigpipePublicationGuard::begin(writer.as_raw_fd()).map_err(std::io::Error::other)?;
-    let result = writer.write(bytes);
-    match (result, guard.finish()) {
-        (result, Ok(())) => result,
-        (Ok(_), Err(error)) => Err(std::io::Error::other(error)),
-        (Err(error), Err(signal_error)) => Err(std::io::Error::other(format!(
-            "pipe write: {error}; {signal_error}"
-        ))),
-    }
-}
-
 #[cfg(unix)]
 fn write_stdout_line_sigpipe_safe(line: &str) -> Result<(), String> {
     let mut guard = SigpipePublicationGuard::begin(libc::STDOUT_FILENO)?;
@@ -2469,7 +2466,32 @@ pub fn arm_receipt(
     1
 }
 
-pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
+/// Run a receipt operation in the working directory its hook bound the receipt
+/// to. `--cwd` replaces the hook's former `sh -c 'cd …; exec tirith …'` hop, so
+/// Tirith stays the shell's direct child with one process launch. A directory
+/// that cannot be entered fails exactly like that silenced `cd` did: exit 1
+/// without a diagnostic. The receipt's sealed working-directory binding is
+/// still checked against the directory actually entered.
+fn enter_receipt_cwd(cwd: Option<&Path>) -> Result<(), i32> {
+    match cwd {
+        Some(cwd) => std::env::set_current_dir(cwd).map_err(|_| 1),
+        None => Ok(()),
+    }
+}
+
+/// Retire a receipt whose terminal outcome this process just observed. Hooks
+/// used to send a separate `acknowledge` call after every successful consume,
+/// discard or reconcile; doing it here saves that process launch. It stays best
+/// effort: a failed retirement never changes the operation's own result, and an
+/// unretired receipt still answers reconciliation and refuses replay.
+fn retire_receipt_best_effort(token: &str, channel: ShellReceiptChannel) {
+    let _ = execution_state::acknowledge_shell_execution_receipt(token, channel);
+}
+
+pub fn discard_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2485,7 +2507,10 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
         }
     };
     match execution_state::discard_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
+        Ok(()) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to discard shell execution receipt: {error}");
             1
@@ -2493,31 +2518,19 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
     }
 }
 
-pub fn acknowledge_receipt(channel: ShellReceiptChannel) -> i32 {
-    let bytes = match read_receipt_stdin() {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    let token = match parse_receipt_token_frame(&bytes) {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    match execution_state::acknowledge_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("tirith: failed to acknowledge shell execution receipt: {error}");
-            1
-        }
-    }
+/// `__execution-receipt acknowledge` from a hook loaded before this binary
+/// retired receipts itself. The preceding consume/discard/reconcile already did
+/// the work, so succeed without reading or trusting anything. The token frame
+/// is drained so an older hook's writer never sees a broken pipe.
+pub fn acknowledge_receipt_compat() -> i32 {
+    let _ = read_receipt_stdin();
+    0
 }
 
-pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn reconcile_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2537,7 +2550,10 @@ pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
         channel,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(true) => 0,
+        Ok(true) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Ok(false) => 1,
         Err(error) => {
             eprintln!("tirith: failed to reconcile shell execution receipt: {error}");
@@ -2584,6 +2600,8 @@ pub(super) fn prepare_receipt_consumption_with_network(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
@@ -2610,7 +2628,10 @@ pub(super) fn prepare_receipt_consumption_with_network(
     )
 }
 
-pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn consume_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2646,7 +2667,10 @@ pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
         prepared,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to consume shell execution receipt: {error}");
             1
@@ -3003,6 +3027,7 @@ mod receipt_interaction_tests {
     #[cfg(unix)]
     #[test]
     fn terminal_mode_guard_restores_full_mode_on_restore_and_unwind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::FromRawFd as _;
 
         let mut master = -1;
@@ -3546,6 +3571,7 @@ mod contextual_display_tests {
 
     #[test]
     fn display_cooldown_requires_every_client_authority() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let finding = finding();
         let urls = tirith_core::extract::extract_urls(
             "curl http://0x7f.0x/path; wget http://0x7f.0x/path",

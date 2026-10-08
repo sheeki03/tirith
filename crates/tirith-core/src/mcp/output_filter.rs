@@ -3178,6 +3178,7 @@ mod tests {
 
     #[test]
     fn warn_prepends_notice_and_sanitizes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Force a Warn-shaped scenario via a hidden-text run (>8 zero-width
         // chars → Medium → Warn).
         let mut zw_block = String::new();
@@ -3887,6 +3888,7 @@ mod tests {
 
     #[test]
     fn redact_on_multiple_items_blanks_every_seed_span() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Multi-item redact gate: a ToolCallResult with TWO text items, one carrying
         // a RAW seed and one carrying a BASE64-encoded seed (both attributable /
         // blankable). Redact ON -> Warn; BOTH items have their seed spans blanked,

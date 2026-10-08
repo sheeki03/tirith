@@ -495,6 +495,7 @@ mod tests {
 
     #[test]
     fn denied_license_mutations_preserve_present_bytes_and_absent_namespace() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
         let path = config.join("license.key");
@@ -517,6 +518,7 @@ mod tests {
 
     #[test]
     fn concurrent_license_writers_publish_only_one_complete_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
         std::fs::create_dir(&config).unwrap();
@@ -547,6 +549,7 @@ mod tests {
 
     #[test]
     fn concurrent_license_delete_and_write_are_parent_serialized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config");
         std::fs::create_dir(&config).unwrap();

@@ -1,24 +1,13 @@
-//! Exact signed ThreatDB candidates and typed local lifecycle operations.
-use std::collections::BTreeMap;
+//! Exact signed ThreatDB candidates, plus the guarded dashboard refresh that
+//! runs the same update code as `tirith threatdb update`.
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tirith_core::policy_snapshot::{
-    EffectivePolicySnapshot, PrivatePolicyReplayGuard, ResolutionMode,
-};
+use tirith_core::policy_snapshot::{EffectivePolicySnapshot, ResolutionMode};
 use tirith_core::threatdb::ThreatDb;
 
-use crate::cli::control::identity::{BinaryIdentity, DirectoryIdentity};
-use crate::cli::selfupdate::lifecycle_operations::{
-    Action, Operation, OperationView, Phase, Preview, Store,
-};
-use crate::cli::selfupdate::lifecycle_service::authorize_threatdb;
+use crate::cli::control::identity::DirectoryIdentity;
 use crate::cli::setup::fs_helpers;
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "channel", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Candidate {
     Index {
         index: super::IndexV2,
@@ -103,8 +92,8 @@ pub(super) fn resolve_legacy() -> Result<Candidate, String> {
     Ok(candidate)
 }
 
-/// Shared by CLI and browser. All publication uses the exact signed asset;
-/// browser callers never request force or choose another candidate on failure.
+/// Shared by the CLI and the dashboard refresh. All publication uses the exact
+/// signed asset; the dashboard never requests force.
 pub(super) fn apply_primary(
     candidate: &Candidate,
     force: bool,
@@ -119,7 +108,7 @@ pub(super) fn apply_primary(
         return Ok(super::UpdateOutcome::AlreadyCurrent);
     }
     let bytes = super::download_url(asset.url, asset.size)?;
-    if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+    if bytes.len() as u64 != asset.size || tirith_core::util::sha256_hex(&bytes) != asset.sha256 {
         return Err("downloaded ThreatDB differs from its exact signed size/checksum".into());
     }
     let equal_sequence_switch =
@@ -138,36 +127,15 @@ pub(super) fn apply_primary(
     Ok(super::UpdateOutcome::Installed)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilePreimage {
-    path: PathBuf,
-    sha256: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Plan {
-    cwd: PathBuf,
-    data_directory: PathBuf,
-    policy: PrivatePolicyReplayGuard,
-    files: Vec<FilePreimage>,
-    candidate: Candidate,
-}
-
-struct DataState {
-    directory: DirectoryIdentity,
-    files: Vec<Option<BinaryIdentity>>,
-}
-
+/// The canonical operator data directory and its four database paths. The
+/// dashboard writes only there; redirected cache paths are explicit CLI
+/// operations owned by the terminal that set them.
 fn data_paths() -> Result<(PathBuf, Vec<PathBuf>), String> {
-    // Browser writes stay in the operator's canonical data directory. Redirected
-    // cache paths are explicit CLI operations, never browser capabilities.
     if ["TIRITH_THREATDB_PATH", "TIRITH_THREATDB_SUPPLEMENTAL_PATH"]
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
     {
-        return Err("ThreatDB paths are redirected; use `tirith threat-db update` in the terminal that owns those paths".into());
+        return Err("ThreatDB paths are redirected; use `tirith threatdb update` in the terminal that owns those paths".into());
     }
     let root = tirith_core::policy::data_dir().ok_or("cannot locate operator data directory")?;
     if !root.is_absolute()
@@ -195,295 +163,105 @@ fn data_paths() -> Result<(PathBuf, Vec<PathBuf>), String> {
     Ok((root, paths))
 }
 
-impl DataState {
-    fn capture(root: &Path, paths: &[PathBuf]) -> Result<(Self, Vec<FilePreimage>), String> {
-        let directory = DirectoryIdentity::capture_trusted(root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata =
-                std::fs::symlink_metadata(root).map_err(|_| "cannot inspect ThreatDB directory")?;
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                return Err("ThreatDB directory is administrator-owned; use the owning terminal or installer".into());
-            }
+/// The account the refresh runs as. Tests substitute it to reach the root and
+/// directory-owner refusals.
+#[derive(Clone, Copy)]
+struct Account {
+    #[cfg(unix)]
+    euid: u32,
+}
+
+impl Account {
+    fn current() -> Self {
+        Self {
+            #[cfg(unix)]
+            euid: unsafe { libc::geteuid() },
         }
-        let mut files = Vec::new();
-        let mut preimages = Vec::new();
-        for path in paths {
-            let held = match std::fs::symlink_metadata(path) {
-                Ok(_) => Some(BinaryIdentity::capture(path)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(_) => return Err("cannot inspect existing ThreatDB state".into()),
-            };
-            preimages.push(FilePreimage {
-                path: path.clone(),
-                sha256: held.as_ref().map(|file| file.sha256().into()),
-            });
-            files.push(held);
-        }
-        let result = Self { directory, files };
-        result.revalidate(&preimages)?;
-        Ok((result, preimages))
-    }
-    fn revalidate(&self, preimages: &[FilePreimage]) -> Result<(), String> {
-        self.directory.revalidate()?;
-        if self.files.len() != preimages.len() {
-            return Err("ThreatDB preimage list changed".into());
-        }
-        for (held, before) in self.files.iter().zip(preimages) {
-            match held {
-                Some(file) => {
-                    file.revalidate()?;
-                    if Some(file.sha256()) != before.sha256.as_deref() || file.path() != before.path
-                    {
-                        return Err("ThreatDB preimage changed after preparation".into());
-                    }
-                }
-                None => match std::fs::symlink_metadata(&before.path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err("an absent database entry appeared after preparation".into()),
-                },
-            }
-        }
-        Ok(())
     }
 }
 
-struct Retained {
-    store: Store,
-    state: DataState,
-}
-fn retained() -> &'static Mutex<BTreeMap<String, Arc<Retained>>> {
-    static RETAINED: OnceLock<Mutex<BTreeMap<String, Arc<Retained>>>> = OnceLock::new();
-    RETAINED.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-fn cwd() -> Result<PathBuf, String> {
-    std::env::current_dir()
-        .and_then(|dir| dir.canonicalize())
-        .map_err(|_| "cannot resolve operation working directory".into())
-}
-fn snapshot(plan: Option<&Plan>) -> Result<EffectivePolicySnapshot, String> {
-    let cwd = cwd()?;
-    if plan.is_some_and(|plan| plan.cwd != cwd) {
-        return Err("working directory changed after ThreatDB preview".into());
+/// Refuse a root service and an administrator-owned data directory, then hold
+/// the directory identity so a swap before publication is detected.
+fn owned_data_directory(root: &Path, account: Account) -> Result<DirectoryIdentity, String> {
+    #[cfg(unix)]
+    if account.euid == 0 {
+        return Err("the dashboard does not refresh ThreatDB for the root account; run `tirith threatdb update` in the owning terminal".into());
     }
-    let snapshot = EffectivePolicySnapshot::resolve(cwd.to_str(), ResolutionMode::Runtime);
-    snapshot
+    if !root.exists() {
+        fs_helpers::ensure_private_directory(root, root)?;
+    }
+    let directory = DirectoryIdentity::capture_trusted(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata =
+            std::fs::symlink_metadata(root).map_err(|_| "cannot inspect ThreatDB directory")?;
+        if metadata.uid() != account.euid {
+            return Err(
+                "ThreatDB directory is administrator-owned; use the owning terminal or installer"
+                    .into(),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = account;
+    Ok(directory)
+}
+
+/// A configured remote policy authority must still admit local mutation.
+fn require_mutable_policy(cwd: &Path) -> Result<(), String> {
+    EffectivePolicySnapshot::resolve(cwd.to_str(), ResolutionMode::Runtime)
         .revalidate_for_mutation()
-        .map_err(|error| error.to_string())?;
-    if plan.is_some_and(|plan| snapshot.private_replay_guard() != plan.policy) {
-        return Err(
-            "policy, feed settings, trust or environment changed; prepare another ThreatDB refresh"
-                .into(),
-        );
-    }
-    Ok(snapshot)
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) fn prepare(id: &str) -> Result<OperationView, String> {
-    let store = Store::current()?;
-    if store.reserve(id, Action::RefreshThreatDb)?.is_some() {
-        return crate::cli::selfupdate::lifecycle_service::status(id);
-    }
-    let result = prepare_reserved(id, store);
-    if result.is_err() {
-        let _ = Store::current().and_then(|store| store.fail_preparation(id));
-    }
-    result
+/// Dashboard "Refresh threat DB now". Every refusal (task gate with audit,
+/// redirected paths, root, directory owner, remote policy, a concurrent update)
+/// happens before any network access. It then runs the same update as
+/// `tirith threatdb update` under the same foreground update lock, and
+/// rechecks the task lease, data directory and policy before each publication.
+pub(crate) fn guarded_refresh(cwd: &Path) -> Result<(), String> {
+    guarded_refresh_with(
+        cwd,
+        crate::cli::selfupdate::authorize_threatdb_refresh,
+        Account::current(),
+        |before_publish| super::do_update_checked(false, before_publish),
+    )
 }
 
-fn prepare_reserved(id: &str, store: Store) -> Result<OperationView, String> {
-    let auth = authorize_threatdb(
-        "browser-threatdb-prepare",
-        serde_json::json!({"force":false}),
-    )?;
-    auth.revalidate()?;
-    let policy = snapshot(None)?;
-    let (data_directory, paths) = data_paths()?;
-    if !data_directory.exists() {
-        fs_helpers::ensure_private_directory(&data_directory, &data_directory)?;
-    }
-    let (state, files) = DataState::capture(&data_directory, &paths)?;
-    let candidate = resolve_candidate()?;
-    let asset = candidate.asset()?;
-    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
-    super::index_install_needed(asset.sequence, asset.format, current, false)?;
-    let preview = Preview {
-        current_version: env!("CARGO_PKG_VERSION").into(),
-        candidate_version: None,
-        candidate_sequence: Some(asset.sequence),
-        candidate_format: Some(asset.format),
-        evidence: "pinned_ed25519_signed_manifest_and_internal_database_signature_required".into(),
-        compatible: true,
-        issues: vec![],
-        configuration_changed: false,
-        integration_reload_required: false,
-        service_restart_required: false,
-    };
-    state.revalidate(&files)?;
-    policy
-        .revalidate_for_mutation()
-        .map_err(|error| error.to_string())?;
-    auth.revalidate()?;
-    let plan = Plan {
-        cwd: cwd()?,
-        data_directory,
-        policy: policy.private_replay_guard(),
-        files,
-        candidate,
-    };
-    let held = Arc::new(Retained { store, state });
-    let mut registry = retained()
-        .lock()
-        .map_err(|_| "ThreatDB preview registry unavailable")?;
-    registry.retain(|id, held| {
-        held.store
-            .load::<Plan>(id)
-            .is_ok_and(|operation| operation.phase() == Phase::Prepared && !operation.is_expired())
-    });
-    if registry.len() >= 16 {
-        return Err("too many ThreatDB previews; cancel an unused preview first".into());
-    }
-    let operation = held
-        .store
-        .create(id, Action::RefreshThreatDb, preview, plan)?;
-    registry.insert(operation.id().into(), held);
-    Ok(operation.view())
+/// The task-gate decision a refresh holds; it is rechecked before each
+/// publication.
+trait RefreshAuthorization {
+    fn revalidate(&self) -> Result<(), String>;
 }
 
-pub(crate) fn release_preview(id: &str) -> Result<(), String> {
-    retained()
-        .lock()
-        .map_err(|_| "ThreatDB preview registry unavailable")?
-        .remove(id);
-    Ok(())
-}
-pub(crate) fn has_preview(id: &str) -> bool {
-    retained()
-        .lock()
-        .is_ok_and(|registry| registry.contains_key(id))
+impl RefreshAuthorization for crate::cli::selfupdate::ThreatDbRefreshAuthorization {
+    fn revalidate(&self) -> Result<(), String> {
+        crate::cli::selfupdate::ThreatDbRefreshAuthorization::revalidate(self)
+    }
 }
 
-/// Called as a counted control-service job. It needs no service restart or
-/// elevation. A binary update waits for this job through normal quiescence.
-pub(crate) fn apply(id: &str) -> Result<OperationView, String> {
-    let held = retained()
-        .lock()
-        .map_err(|_| "ThreatDB preview registry unavailable")?
-        .remove(id)
-        .ok_or("ThreatDB preview context was lost or already applied; prepare a fresh preview")?;
-    let _operation_lock = held
-        .store
-        .lock(id)?
-        .ok_or("this operation already has an active worker")?;
-    let mut operation = held.store.load::<Plan>(id)?;
-    held.store.require_original_client(&operation)?;
-    if operation.phase() != Phase::Prepared || operation.is_expired() {
-        return Err(
-            "ThreatDB preview expired or was already accepted; inspect status and prepare again"
-                .into(),
-        );
-    }
-    let auth = authorize_threatdb(
-        "browser-threatdb-apply",
-        serde_json::json!({"operation_id":id,"plan_sha256":operation.plan_sha256(),"force":false}),
-    )?;
-    let _update_lock = super::lock_foreground_update()?;
-    held.state.revalidate(&operation.payload().files)?;
-    snapshot(Some(operation.payload()))?;
-    held.store.transition(
-        &mut operation,
-        Phase::Accepted,
-        false,
-        None,
-        "Refreshing the exact signed ThreatDB candidate.",
-    )?;
-    held.store.transition(
-        &mut operation,
-        Phase::Verifying,
-        false,
-        None,
-        "Validating signed database bytes; the previous database remains active until publication.",
-    )?;
-    let result = apply_inner(&held, &mut operation, &auth);
-    if let Err(error) = result {
-        let _ = held.store.record_failure(operation.id(), &error);
-        let started = matches!(
-            operation.phase(),
-            Phase::PublicationIntent | Phase::Published
-        );
-        let published = operation.view().published;
-        held.store.transition(&mut operation, if started { Phase::RecoveryRequired } else { Phase::Failed }, published, Some(if started { "refresh_publication_requires_inspection" } else { "refresh_failed" }), "Refresh stopped. Retain the last-known-good databases, inspect health, and prepare a new explicit refresh; this operation will not choose another generation.")?;
-        super::evidence::record("primary", Some(&error));
-        return Err(error);
-    }
-    Ok(operation.view())
-}
-
-fn apply_inner(
-    held: &Retained,
-    operation: &mut Operation<Plan>,
-    auth: &crate::cli::selfupdate::lifecycle_service::ThreatDbAuthorization,
+fn guarded_refresh_with<A: RefreshAuthorization>(
+    cwd: &Path,
+    authorize: impl FnOnce() -> Result<A, String>,
+    account: Account,
+    update: impl FnOnce(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let candidate = operation.payload().candidate.clone();
-    // Download and verify BEFORE publication intent, then keep the same signed
-    // candidate for publication. The callback transitions immediately before the
-    // durable write; RefCell serializes this synchronous one-worker callback.
-    let operation_cell = std::cell::RefCell::new(operation);
-    let outcome = apply_primary(&candidate, false, |will_publish| {
+    let auth = authorize()?;
+    let (root, _) = data_paths()?;
+    let directory = owned_data_directory(&root, account)?;
+    require_mutable_policy(cwd)?;
+    let _update_lock = super::lock_foreground_update()?;
+    let check = |_will_publish: bool| -> Result<(), String> {
         auth.revalidate()?;
-        let mut operation = operation_cell.borrow_mut();
-        held.store.revalidate()?;
-        held.state.revalidate(&operation.payload().files)?;
-        snapshot(Some(operation.payload()))?;
-        if will_publish && operation.phase() == Phase::Verifying {
-            held.store.transition(
-                &mut operation,
-                Phase::PublicationIntent,
-                false,
-                None,
-                "Signed database bytes verified; exact database publication is starting.",
-            )?;
+        directory.revalidate()?;
+        if data_paths()?.0 != root {
+            return Err("ThreatDB data scope changed during the refresh".into());
         }
-        Ok(())
-    })?;
-    let operation = operation_cell.into_inner();
-    ThreatDb::refresh_cache();
-    let published = outcome == super::UpdateOutcome::Installed;
-    if published {
-        held.store.transition(
-            operation,
-            Phase::Published,
-            true,
-            None,
-            "The exact signed primary database was installed and verified.",
-        )?;
-    }
-    let (root, paths) = data_paths()?;
-    if root != operation.payload().data_directory {
-        return Err("ThreatDB data scope changed during publication".into());
-    }
-    let (after_primary, preimages) = DataState::capture(&root, &paths)?;
-    let policy = snapshot(Some(operation.payload()))?;
-    auth.revalidate()?;
-    let supplemental = super::update_supplemental_db_checked(&policy.policy, &|| {
-        auth.revalidate()?;
-        held.store.revalidate()?;
-        after_primary.revalidate(&preimages)?;
-        snapshot(Some(operation.payload()))?;
-        Ok(())
-    });
-    match supplemental {
-        Ok(()) => {
-            super::evidence::record("complete", None);
-            held.store.transition(operation, Phase::Completed, published, None, "Signed ThreatDB generation is current. Enabled supplemental feeds were reconciled; shell protection continues without restart.")?;
-        }
-        Err(error) => {
-            super::evidence::record("supplemental", Some(&error));
-            held.store.transition(operation, Phase::Partial, published, Some("supplemental_refresh_incomplete"), "The signed primary generation is current. A supplemental feed failed; its prior valid overlay was retained. Inspect ThreatDB health and explicitly retry later.")?;
-        }
-    }
-    Ok(())
+        require_mutable_policy(cwd)
+    };
+    check(false)?;
+    update(&check)
 }
 
 #[cfg(test)]
@@ -491,7 +269,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_candidate_reauthenticates_signature_before_any_download() {
+    fn unverifiable_candidate_is_refused_before_any_download() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let candidate = Candidate::Legacy {
             manifest: super::super::Manifest {
                 sha256: "0".repeat(64),
@@ -511,11 +290,302 @@ mod tests {
         assert_eq!(calls.get(), 0);
     }
 
-    #[test]
-    fn candidate_plan_cannot_enable_forced_or_arbitrary_actions() {
-        assert!(serde_json::from_value::<Candidate>(
-            serde_json::json!({"channel":"unsigned","url":"https://example.invalid","force":true})
+    fn canonical_data_state() -> tirith_test_support::GlobalStateGuard {
+        let mut state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        state.remove_env("TIRITH_THREATDB_PATH");
+        state.remove_env("TIRITH_THREATDB_SUPPLEMENTAL_PATH");
+        state.remove_env("TIRITH_SERVER_URL");
+        state.remove_env("TIRITH_API_KEY");
+        state
+    }
+
+    /// The dashboard route's own authorization and account.
+    fn live_refresh(
+        cwd: &Path,
+        update: impl FnOnce(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        guarded_refresh_with(
+            cwd,
+            crate::cli::selfupdate::authorize_threatdb_refresh,
+            Account::current(),
+            update,
         )
-        .is_err());
+    }
+
+    /// A refusal must come before the update (and so before any network).
+    fn refused_before_update(
+        refresh: impl FnOnce(
+            &mut dyn FnMut(&dyn Fn(bool) -> Result<(), String>) -> Result<(), String>,
+        ) -> Result<(), String>,
+    ) -> String {
+        let mut called = false;
+        let error = refresh(&mut |_: &dyn Fn(bool) -> Result<(), String>| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called, "the update ran despite the refusal: {error}");
+        error
+    }
+
+    #[test]
+    fn dashboard_refresh_refuses_redirected_paths_before_any_update() {
+        // The shared fixture redirects both ThreatDB paths.
+        let state = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let called = std::cell::Cell::new(false);
+        let error = live_refresh(&state.roots().cwd, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("redirected"), "{error}");
+        assert!(!called.get());
+    }
+
+    /// The other updater holds the lock on its own thread: on Windows the
+    /// lock is a named mutex, which the thread that owns it may take again,
+    /// so exclusion is between threads and processes, as in production.
+    #[test]
+    fn dashboard_refresh_refuses_while_another_update_holds_the_cli_lock() {
+        let state = canonical_data_state();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || match super::super::lock_foreground_update() {
+            Ok(lock) => {
+                held_tx.send(None).unwrap();
+                let _ = release_rx.recv();
+                drop(lock);
+            }
+            Err(error) => held_tx.send(Some(error)).unwrap(),
+        });
+        let held = held_rx.recv().unwrap();
+        assert!(held.is_none(), "take the competing update lock: {held:?}");
+        let called = std::cell::Cell::new(false);
+        let result = live_refresh(&state.roots().cwd, |_| {
+            called.set(true);
+            Ok(())
+        });
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("another ThreatDB update is active"),
+            "{error}"
+        );
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn dashboard_refresh_runs_the_update_under_the_cli_lock_and_rechecks_before_publish() {
+        let state = canonical_data_state();
+        let calls = std::cell::Cell::new(0);
+        live_refresh(&state.roots().cwd, |before_publish| {
+            calls.set(calls.get() + 1);
+            // The CLI and background updaters (other threads or processes)
+            // are excluded while it runs.
+            let other_updater =
+                std::thread::spawn(|| super::super::lock_foreground_update().is_err());
+            assert!(other_updater.join().unwrap());
+            before_publish(true)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(super::super::lock_foreground_update().is_ok());
+    }
+
+    /// On Unix the held directory identity allows the rename, so the swap is
+    /// detected before publication.
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_refresh_refuses_publication_after_the_data_directory_is_swapped() {
+        let state = canonical_data_state();
+        let error = live_refresh(&state.roots().cwd, |before_publish| {
+            let (root, _) = data_paths()?;
+            std::fs::rename(&root, root.with_extension("moved")).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            before_publish(true)
+        })
+        .unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    /// On Windows the held directory identity opens the data directory and
+    /// its ancestors without delete sharing, so the swap itself is refused
+    /// while the refresh runs, and publication proceeds on the same directory.
+    #[cfg(windows)]
+    #[test]
+    fn dashboard_refresh_holds_the_data_directory_against_a_swap() {
+        let state = canonical_data_state();
+        let calls = std::cell::Cell::new(0);
+        live_refresh(&state.roots().cwd, |before_publish| {
+            calls.set(calls.get() + 1);
+            let (root, _) = data_paths()?;
+            assert!(std::fs::rename(&root, root.with_extension("moved")).is_err());
+            before_publish(true)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// A data-directory scope that changes during the refresh (the platform's
+    /// data root now points elsewhere) is refused before publication, on every
+    /// platform and without renaming the held directory.
+    #[test]
+    fn dashboard_refresh_refuses_publication_after_the_data_scope_changes() {
+        let mut state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        let elsewhere = state.roots().root.join("elsewhere-data");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let error = live_refresh(&cwd, |before_publish| {
+            let (root, _) = data_paths()?;
+            #[cfg(windows)]
+            state.set_env("APPDATA", &elsewhere);
+            #[cfg(not(windows))]
+            state.set_env("XDG_DATA_HOME", &elsewhere);
+            assert_ne!(data_paths()?.0, root);
+            before_publish(true)
+        })
+        .unwrap_err();
+        assert!(error.contains("data scope changed"), "{error}");
+    }
+
+    #[test]
+    fn dashboard_refresh_task_gate_refusal_is_audited_before_any_update() {
+        let mut state = canonical_data_state();
+        state.set_env("TIRITH_LOG", "1");
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [network_egress, filesystem_write]\n",
+        )
+        .unwrap();
+        let cwd = state.roots().cwd.clone();
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("task gate refused"), "{error}");
+        let log_path = tirith_core::audit::audit_log_path().unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let audited = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|entry| {
+                entry["entry_type"] == "task_boundary"
+                    && entry["event"] == "owned_boundary_assessment"
+                    && entry["action"] == "deny"
+            });
+        assert!(
+            audited,
+            "the refusal must be audited in {log_path:?}: {log}"
+        );
+    }
+
+    struct Revocable(std::rc::Rc<std::cell::Cell<bool>>);
+
+    impl RefreshAuthorization for Revocable {
+        fn revalidate(&self) -> Result<(), String> {
+            if self.0.get() {
+                Err("task authorization is no longer valid: revoked".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_refresh_rechecks_the_task_authorization_before_the_update_and_each_publish() {
+        let state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // Lapsed before the update starts: refused before any download.
+        let revoked = std::rc::Rc::new(std::cell::Cell::new(true));
+        let auth = Revocable(std::rc::Rc::clone(&revoked));
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(&cwd, || Ok(auth), Account::current(), update)
+        });
+        assert!(error.contains("revoked"), "{error}");
+        // Lapsed during the update: the publication is refused.
+        let revoked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let auth = Revocable(std::rc::Rc::clone(&revoked));
+        let error = guarded_refresh_with(
+            &cwd,
+            || Ok(auth),
+            Account::current(),
+            |before_publish| {
+                before_publish(false)?;
+                revoked.set(true);
+                before_publish(true)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("revoked"), "{error}");
+    }
+
+    #[test]
+    fn dashboard_refresh_refuses_a_remote_policy_before_the_lock_and_before_publish() {
+        let mut state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // A legacy policy server; plain HTTP is refused before any socket opens.
+        state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+        state.set_env("TIRITH_API_KEY", "fixture-key");
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("remote policy authority"), "{error}");
+        // Checked before the update lock, so a concurrent update cannot mask it.
+        let held = super::super::lock_foreground_update().unwrap();
+        let error = refused_before_update(|update| live_refresh(&cwd, update));
+        assert!(error.contains("remote policy authority"), "{error}");
+        drop(held);
+
+        // Configured while the update runs: the publication is refused.
+        state.remove_env("TIRITH_SERVER_URL");
+        state.remove_env("TIRITH_API_KEY");
+        let error = live_refresh(&cwd, |before_publish| {
+            before_publish(false)?;
+            state.set_env("TIRITH_SERVER_URL", "http://127.0.0.1:1");
+            state.set_env("TIRITH_API_KEY", "fixture-key");
+            before_publish(true)
+        })
+        .unwrap_err();
+        assert!(error.contains("remote policy authority"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_refresh_refuses_the_root_account_before_touching_the_data_directory() {
+        let mut state = canonical_data_state();
+        state.set_env("TIRITH_LOG", "0");
+        let cwd = state.roots().cwd.clone();
+        let (root, _) = data_paths().unwrap();
+        assert!(!root.exists());
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(
+                &cwd,
+                crate::cli::selfupdate::authorize_threatdb_refresh,
+                Account { euid: 0 },
+                update,
+            )
+        });
+        assert!(error.contains("root account"), "{error}");
+        assert!(!root.exists(), "the root refusal must not create {root:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_refresh_refuses_a_data_directory_owned_by_another_account() {
+        let state = canonical_data_state();
+        let cwd = state.roots().cwd.clone();
+        // The refresh creates the directory as this test's account but runs
+        // as another, non-root one.
+        let owner = Account::current().euid;
+        let other = Account {
+            euid: if owner == 1 { 2 } else { 1 },
+        };
+        let error = refused_before_update(|update| {
+            guarded_refresh_with(
+                &cwd,
+                crate::cli::selfupdate::authorize_threatdb_refresh,
+                other,
+                update,
+            )
+        });
+        assert!(error.contains("administrator-owned"), "{error}");
     }
 }

@@ -65,7 +65,6 @@ pub mod archive;
 /// Bounded local npm gzip/ustar/PAX reader and calibrated static observations.
 /// Captures exact artifact/member hashes without extraction or execution.
 pub mod npm_archive;
-pub mod npm_install;
 
 /// Pure npm release comparison, separating package byte changes from analyzer
 /// version, limit and coverage changes.
@@ -101,43 +100,14 @@ pub mod correlate;
 /// cross-distribution loader/payload splits across multiple wheels.
 pub mod inspect;
 
-/// Content-addressed quarantine store for the package firewall (PR D1): land
-/// resolver downloads as immutable verified blobs and materialise per-install
-/// transaction copies, with atomic publishes, path containment, file leases, and
-/// GC. The store the D3 inspection and D4 install-from-digest stand on.
-pub mod quarantine;
-
-/// Hash-locked Python wheel resolver for the package firewall (PR D2): turn
-/// requirement specs into a fully hash-pinned lock
-/// (`uv pip compile --generate-hashes --no-build`), download only the pinned,
-/// binary-only wheels (`python -m pip download --only-binary=:all:
-/// --require-hashes`) into the D1 quarantine, and refuse sdist / VCS / editable /
-/// local-path / direct-URL / credentialed-index / repo-config inputs. The
-/// controlled-network step D3 inspection and D4 install-from-digest stand on.
+/// Python requirement validation and resolver-tool enrollment used by the
+/// refusing `tirith pkg approve` / `tirith pkg install` and by
+/// `tirith pkg trust-tool`.
 pub mod resolver;
 
-/// Internal connect-time network boundary used by the Python resolver. Kept
-/// private to the artifact package so callers cannot repurpose it as a general
-/// proxy.
-mod resolver_broker;
-
-/// The package firewall's inspect-and-verdict layer (PR D3): re-hash each
-/// content-addressed quarantine blob (the TOCTOU re-bind), run the wheel-set
-/// inspection over the verified bytes, fold the signal/native/cross findings plus
-/// the threat-DB hash lookup through `finalize_static_verdict`, and surface a
-/// download-vs-expected hash mismatch as the Critical
-/// [`crate::verdict::RuleId::ArtifactDownloadIntegrityMismatch`]. The verdict D4
-/// install-from-digest gates on.
-pub mod firewall;
-
-/// Install-from-digest planning for the package firewall (PR D4): re-bind the
-/// approval against the live threat DB immediately before launch (re-hash every
-/// quarantine blob via the firewall, reject a stale DB sequence), generate the
-/// `approved.txt` direct-reference requirements (`name @ file://... --hash=...`),
-/// the pinned `python -m pip install --isolated --no-index --no-deps
-/// --require-hashes --no-cache-dir --force-reinstall` argv, and the locked-down
-/// deny-all capsule spec. The pure planning half; the CLI crate runs the plan
-/// through the fail-closed capsule launcher (never the uncontained install runner).
+/// Installed-environment checks that outlive contained package execution: the
+/// D5 post-install RECORD verification behind `tirith pkg verify-env` and the
+/// distribution enumeration behind `tirith env graph`.
 pub mod install;
 
 /// Local release differential between two versions of the same distribution (PR
@@ -562,8 +532,10 @@ impl InspectionCoverage {
 /// findings. Artifact gaps are always security-relevant: they describe bytes in
 /// an installable artifact, not an ordinary oversized text file.
 ///
-/// `fail_closed` is used by the package firewall/install path, where every byte
-/// must be covered before extraction. Other artifact-evaluation surfaces retain
+/// `fail_closed` is used by `tirith package` (cli/package.rs), the release diff
+/// (release_diff.rs) and `tirith lab` (cli/lab.rs), where every artifact byte
+/// must be covered. (The removed pip package firewall also used it before
+/// extraction.) Other artifact-evaluation surfaces retain
 /// the configured gap action, but floor it at Warn so an incomplete artifact can
 /// never finalize as Allow. `scan.require_complete` upgrades every artifact gap
 /// to the fail-closed Block grade.
@@ -617,8 +589,8 @@ pub(crate) fn artifact_analysis_incomplete_findings(
 /// Restore the minimum action and typed findings required by artifact coverage
 /// after the shared policy finalizer runs. Severity overrides and paranoia are
 /// presentation/policy controls; neither may turn an incomplete installable
-/// artifact into `Allow`, and the enforcing firewall path may never fall below
-/// `Block`.
+/// artifact into `Allow`, and a `fail_closed` caller (`tirith package`, the
+/// release diff, `tirith lab`) may never fall below `Block`.
 pub fn enforce_artifact_coverage_floor(
     verdict: &mut Verdict,
     gaps: &[CoverageGap],
@@ -801,6 +773,7 @@ mod tests {
 
     #[test]
     fn round_trips_installed_distribution_subject() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let subject = InspectionSubject::InstalledDistribution(DistributionIdentity {
             ecosystem: Ecosystem::PyPI,
             name: "demo".to_string(),
@@ -829,6 +802,7 @@ mod tests {
 
     #[test]
     fn round_trips_installed_file_subject() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let subject = InspectionSubject::InstalledFile(InstalledFileIdentity {
             location: SubjectLocation::installed("/venv/lib/site-packages/__editable__.pth"),
             sha256: None,
@@ -944,6 +918,7 @@ mod tests {
 
     #[test]
     fn incomplete_artifact_evaluation_cannot_finalize_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
         assert_eq!(verdict.action, Action::Warn);
@@ -955,6 +930,7 @@ mod tests {
 
     #[test]
     fn incomplete_counters_without_explicit_gap_cannot_finalize_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut inspection = ArtifactInspection::new(artifact_subject());
         inspection.coverage = InspectionCoverage {
             members_total: 2,
@@ -973,6 +949,7 @@ mod tests {
 
     #[test]
     fn require_complete_blocks_incomplete_artifact_evaluation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let mut policy = Policy::default();
         policy.scan.require_complete = true;
@@ -985,6 +962,7 @@ mod tests {
 
     #[test]
     fn severity_override_cannot_hide_artifact_incompleteness() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = incomplete_artifact_inspection();
         let mut policy = Policy::default();
         policy
@@ -1101,6 +1079,7 @@ mod tests {
     /// analyzers, no findings) and routes through the policy helper.
     #[test]
     fn evaluate_artifact_skeleton_is_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = ArtifactInspection::new(artifact_subject());
         let verdict = evaluate_artifact(&inspection, &Policy::default(), None);
         assert_eq!(verdict.action, Action::Allow);

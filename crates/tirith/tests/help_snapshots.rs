@@ -812,3 +812,89 @@ fn package_install_help_states_the_disabled_execution_scope() {
         assert!(text.contains("verify-env"));
     }
 }
+
+#[test]
+fn package_approve_help_states_that_it_refuses_and_records_nothing() {
+    let out = tirith()
+        .args(["pkg", "approve", "--help"])
+        .output()
+        .expect("read package approve help");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("currently disabled on every host"), "{text}");
+    assert!(text.contains("native_authority"), "{text}");
+    assert!(
+        text.contains("private_input_execution_unqualified"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("approve its install plan"),
+        "help must not imply a working approval path: {text}"
+    );
+}
+
+fn normalized_help(args: &[&str]) -> String {
+    let out = tirith().args(args).output().expect("read help");
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Contained installation is disabled for every ecosystem, so `pkg install` and
+/// `pkg approve` help must not say pip installs are enforced, and the accepted
+/// `--target` flag must not be described as a required install directory.
+#[test]
+fn package_install_and_approve_help_do_not_claim_an_enforced_ecosystem() {
+    for command in ["install", "approve"] {
+        let text = normalized_help(&["pkg", command, "--help"]);
+        for stale in [
+            "only `pip` is enforced",
+            "the only enforced ecosystem",
+            "not enforced in this version",
+            "Required new dedicated install directory",
+        ] {
+            assert!(!text.contains(stale), "pkg {command}: {stale:?} in {text}");
+        }
+        assert!(
+            text.contains("disabled for every ecosystem"),
+            "pkg {command}: {text}"
+        );
+        assert!(
+            text.contains("Accepted for compatibility and ignored"),
+            "pkg {command} --target: {text}"
+        );
+    }
+}
+
+/// `trust gc` / `trust prune` help must describe what gc really collects
+/// (trust_lifecycle::prune_grants) and must not name a nonexistent module.
+#[test]
+fn trust_gc_and_prune_help_describe_the_actual_collection() {
+    for command in ["gc", "prune"] {
+        let text = normalized_help(&["trust", command, "--help"]);
+        for stale in ["cli::trust::gc", "currently the only collection mode"] {
+            assert!(
+                !text.contains(stale),
+                "trust {command}: {stale:?} in {text}"
+            );
+        }
+        for expected in [
+            "expired grants",
+            "revocations older than 30 days",
+            "above 768 KiB",
+            "has no effect",
+        ] {
+            assert!(
+                text.contains(expected),
+                "trust {command}: missing {expected:?} in {text}"
+            );
+        }
+    }
+}

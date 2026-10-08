@@ -1059,6 +1059,8 @@ fn analyze_command(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
     };
     engine::analyze_returning_policy(&ctx)
 }
@@ -1345,6 +1347,7 @@ mod tests {
 
     #[test]
     fn list_human_near_manifest_cap_has_one_deterministic_omission_receipt() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::commands_manifest::{AllowedEntry, CommandsManifest, DangerousEntry};
 
         let manifest = CommandsManifest {
@@ -1395,6 +1398,7 @@ mod tests {
 
     #[test]
     fn list_human_keeps_policy_diagnostics_on_stderr_under_the_shared_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = "C02_COMMANDS_LIST_DIAGNOSTIC_SECRET";
         let split = format!("{}\u{1b}[31m{}", &secret[..16], &secret[16..]);
         let patterns = vec![regex::escape(secret)];
@@ -1418,6 +1422,7 @@ mod tests {
 
     #[test]
     fn list_human_diagnostic_truncation_receipt_stays_on_stderr() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let source = format!(
             "C02_COMMANDS_LIST_DIAGNOSTIC_FLOOD-{}",
             "x".repeat(tirith_core::verdict::MAX_PRESENTATION_BYTES * 2)
@@ -1667,6 +1672,7 @@ mod tests {
 
     #[test]
     fn captured_policy_diagnostics_join_the_single_bounded_json_envelope() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let custom = "C02_POLICY_DIAGNOSTIC_CUSTOM_CANARY";
         let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
         let source = format!(
@@ -1823,6 +1829,7 @@ mod tests {
     /// reports `running:true` — is the companion integration test).
     #[test]
     fn run_json_spawn_failure_reports_not_running_with_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use super::build_run_json;
         use tirith_core::verdict::{Timings, Verdict};
 

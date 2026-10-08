@@ -1095,22 +1095,6 @@ pub fn is_wheel_filename(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".whl")
 }
 
-/// The PEP 503-normalised distribution (project) name parsed from a wheel
-/// filename, or `None` if `filename` is not a parseable wheel name.
-///
-/// A wheel is `name-version-...tags....whl`; the first `-`-separated field is the
-/// distribution name (with the name's own separators normalised to `_` in the
-/// filename). This returns that field run through PEP 503 normalisation
-/// (lowercase, runs of `-`/`_`/`.` collapsed to a single `-`), the canonical form
-/// a `name @ file://...` direct-reference requirement should use so pip records the
-/// install under the right distribution. Reuses the same internal parsers the
-/// wheel-identity check uses, so the name derived here cannot drift from the one
-/// the inspection validates the wheel against.
-pub fn wheel_distribution_name(filename: &str) -> Option<String> {
-    let parsed = parse_wheel_filename(filename)?;
-    Some(normalize_project_name(&parsed.name))
-}
-
 /// The structural check for traversal / Windows-ambiguous members. `enclosed_name`
 /// fail-closes absolute / `..` / non-UTF-8 paths, so a `None` enclosed name is a
 /// traversal violation; we ALSO scan the raw name for backslash / drive-letter /
@@ -3436,6 +3420,7 @@ mod tests {
 
     #[test]
     fn printable_scanner_bounds_single_giant_run() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // REGRESSION (T3.8): a single long printable run with NO separator never
         // hits `flush_current`, so `captured_bytes` (only bumped on flush) used to
         // stay 0 and the in-progress `current` grew without bound. Feed several MiB

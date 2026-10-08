@@ -6,13 +6,15 @@ use std::path::PathBuf;
 use crate::cli::{HumanJsonFormat, HumanJsonSarifFormat};
 use clap::{Parser, Subcommand};
 
-/// A categorized command overview appended to `tirith --help` (the long help),
-/// since clap-derive cannot group subcommands by category. The
-/// `every_command_is_categorized` test guards this against drift.
-const COMMANDS_BY_CATEGORY: &str = "\
+/// The categorized command overview, as a macro so it can be `concat!`ed
+/// into the long help after the task list. The `every_command_is_categorized`
+/// test guards this against drift.
+macro_rules! commands_by_category_text {
+    () => {
+        "\
 COMMANDS BY CATEGORY:
   Scan & Analyze:   check paste run score diff fetch fix scan review view preview watch temp-run capsule taint intend task lab explain why visual-audit
-  Status & Health:  status doctor prompt-status dashboard menu warnings receipt logs baseline
+  Status & Health:  status doctor prompt-status dashboard warnings receipt logs baseline
   Setup & Onboard:  init onboard setup install activate update version verify-self browser devcontainer codespaces
   Policy & Trust:   policy trust rule output
   Shell & System:   daemon hooks exec env path sudo ssh context persistence hygiene aliases
@@ -20,14 +22,57 @@ COMMANDS BY CATEGORY:
   Integrations:     mcp mcp-server gateway agent ai lsp license
   Forensics:        audit incident checkpoint pending share redact clipboard
 
-Run `tirith <command> --help` for details on any command.";
+Run `tirith <command> --help` for details on any command."
+    };
+}
+
+/// A short task list shown after the short help, so bare `tirith`, `tirith -h`
+/// and `tirith --help` all show a beginner which command does what. It only
+/// prints commands; it never runs them. `tasks_help_commands_parse` checks
+/// that every `tirith ...` command named here parses against the real CLI.
+macro_rules! tasks_help_text {
+    () => {
+        "\
+COMMON TASKS:
+  New here?               tirith onboard   (or: tirith setup recommended --dry-run)
+  Check protection        tirith status
+  See recent blocks       tirith audit recent --action block
+  Why was this blocked?   tirith why
+  Resolve an exception    tirith trust explain PATTERN  |  tirith trust add --help
+  Remove an exception     tirith trust revoke GRANT_ID
+  Change profile          tirith policy profile --help
+  Open the dashboard      tirith dashboard
+  Upgrade                 tirith update --dry-run
+  Remove shell hooks      tirith setup shell --remove --dry-run
+  Scripts / JSON          tirith status --json; tirith audit recent --limit 25 --action block --json"
+    };
+}
+
+/// Shown after the short help (bare `tirith` and `tirith -h`).
+const TASKS_HELP: &str = concat!(
+    tasks_help_text!(),
+    "\n\nRun `tirith --help` for all commands by category."
+);
+
+/// The task list alone, as it also appears in the long help.
+#[cfg(test)]
+const TASKS_LIST: &str = tasks_help_text!();
+
+/// The category block alone, for the `every_command_is_categorized` test.
+#[cfg(test)]
+const COMMANDS_BY_CATEGORY: &str = commands_by_category_text!();
+
+/// Shown after the long help (`tirith --help`): the task list, then every
+/// command by category (clap-derive cannot group subcommands itself).
+const LONG_AFTER_HELP: &str = concat!(tasks_help_text!(), "\n\n", commands_by_category_text!());
 
 #[derive(Parser)]
 #[command(
     name = "tirith",
     version,
     about = "URL security analysis for shell environments",
-    after_long_help = COMMANDS_BY_CATEGORY
+    after_help = TASKS_HELP,
+    after_long_help = LONG_AFTER_HELP
 )]
 pub struct Cli {
     /// Suppress low-value advisory output (clean "no issues" lines, shadow-binary
@@ -169,6 +214,21 @@ impl From<ShellHookFamilyArg> for tirith_core::execution_state::ShellHookFamily 
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum HookPresenceFamilyArg {
+    Powershell,
+    Nushell,
+}
+
+impl From<HookPresenceFamilyArg> for tirith_core::execution_state::HookPresenceFamily {
+    fn from(value: HookPresenceFamilyArg) -> Self {
+        match value {
+            HookPresenceFamilyArg::Powershell => Self::PowerShell,
+            HookPresenceFamilyArg::Nushell => Self::Nushell,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum ShellApprovalOutcomeArg {
     Granted,
     Rejected,
@@ -187,7 +247,14 @@ impl From<ShellApprovalOutcomeArg> for tirith_core::execution_state::ShellApprov
 
 #[derive(Subcommand)]
 enum ExecutionReceiptAction {
-    Capability,
+    Capability {
+        /// Also confirm that consume/discard/reconcile accept `--cwd`. Binaries
+        /// that predate `--cwd` reject this flag, so a newer zsh/fish hook that
+        /// probes with it falls back to the legacy check flow instead of
+        /// failing every receipt operation.
+        #[arg(long)]
+        require_cwd: bool,
+    },
     Register {
         #[arg(long, value_enum)]
         family: ShellHookFamilyArg,
@@ -206,18 +273,32 @@ enum ExecutionReceiptAction {
         #[arg(long)]
         warn_acknowledged: bool,
     },
+    /// Consume an armed receipt; a success also retires (acknowledges) it.
     Consume {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Reconcile a prior consume; a durable commit is also retired (acknowledged).
     Reconcile {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Discard a receipt; a success also retires (acknowledges) it.
     Discard {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
+        /// Working directory the receipt was bound to (default: current directory)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
     },
+    /// Compatibility no-op for hooks loaded before consume/discard/reconcile
+    /// retired receipts themselves. Always succeeds; any token sent is drained, never used.
     Acknowledge {
         #[arg(long, value_enum)]
         channel: ShellReceiptChannelArg,
@@ -226,23 +307,6 @@ enum ExecutionReceiptAction {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Open an optional terminal menu for inspections and change previews
-    #[command(after_help = "\
-Requires terminal input and output. Choose protection, profiles, activity,
-exceptions, integrations, or maintenance, then select one inspection or preview.
-The selected direct command runs once with its usual output and exit status.
-The menu does not apply changes; each page links to explicit CLI workflows.
-Enter q or use Ctrl-C to quit; EOF cancels. No browser or extra runtime is needed.
-
-For scripts, CI, redirected input/output, and machine-readable results, use the
-direct commands instead. Start the menu explicitly with tirith menu.
-
-Examples:
-  tirith menu
-  tirith status --json
-  tirith audit recent --limit 25 --action block --json")]
-    Menu,
-
     /// Explicit read-only review of selected dependency, hook, AI and MCP files
     Review {
         /// Replace known-surface discovery with project-relative files
@@ -267,6 +331,20 @@ Examples:
     ExecutionReceiptInternal {
         #[command(subcommand)]
         action: ExecutionReceiptAction,
+    },
+    /// Internal: print a fresh random session ID for a newly loaded shell hook.
+    #[command(name = "__session-id", hide = true)]
+    SessionIdInternal,
+    /// Internal: record that a PowerShell or Nushell hook loaded in the calling
+    /// shell, for the hook-freshness readout of `status` and `doctor`. The
+    /// record carries no secret and grants nothing. Unix only.
+    #[command(name = "__hook-presence", hide = true)]
+    HookPresenceInternal {
+        #[arg(long, value_enum)]
+        family: HookPresenceFamilyArg,
+        /// Process ID of the calling shell (`$PID`, `$nu.pid`)
+        #[arg(long)]
+        shell_pid: u32,
     },
 
     /// Manage the tirith background daemon
@@ -569,13 +647,12 @@ Examples:
         sha256: Option<String>,
     },
 
-    /// Inspect Python packages and verify installed environments.
-    /// Contained package installation is currently disabled.
+    /// Inspect local npm and Python package artifacts and verify installed
+    /// Python environments. Contained package installation is currently disabled.
     #[command(after_help = "\
 Examples:
-  tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg install pip requests==2.31.0 --target .tirith-pkg
-  tirith pkg install pip flask --target .venv --yes
+  tirith pkg inspect package-1.0.0.tgz --format json
+  tirith pkg diff old.whl new.whl
   tirith pkg verify-env --target .venv requests flask
   tirith pkg receipt list
 
@@ -585,10 +662,11 @@ or package execution. --yes, --allow-degraded, sudo, and administrator access
 do not enable it. Immutable named inputs must be qualified for the complete
 target lifetime before contained package execution can be enabled.
 
-`tirith pkg approve` remains subject to its separate native authority and
-x86_64 Linux requirements; an approval cannot bypass the execution refusal.
-`pkg verify-env` remains a read-only verifier, and `tirith package inspect`
-remains available for local artifact inspection.")]
+`tirith pkg approve` first checks its native approval authority (x86_64 Linux
+only), then refuses with the same private_input_execution_unqualified reason:
+it records no approval, because nothing could redeem one. `pkg verify-env`
+remains a read-only verifier, and `tirith package inspect` remains available
+for local artifact inspection.")]
     Pkg {
         #[command(subcommand)]
         action: PkgAction,
@@ -842,15 +920,18 @@ Examples:
 Scans the current repo for the signals that should shape your tirith setup —
 shell, IDE configs (.cursor/.vscode), AI-config files (CLAUDE.md, .cursorrules,
 AGENTS.md, .claude/, .cursor/rules/), package managers on PATH, lockfiles, a
-.github/workflows CI pipeline, and MCP configs — then RECOMMENDS one of the
-shipping policy templates (individual / ci-strict / ai-agent-heavy) and the
-next steps to get protected.
+.github/workflows CI pipeline, and MCP configs — and lists them as an
+integration inventory. It then RECOMMENDS the personal Balanced protection
+profile (`tirith policy profile balanced`) and the next steps to get protected.
+The detected integrations do not change that recommendation.
 
 Detection is read-only and never materializes hooks. --apply performs the
-recommended SAFE steps (policy init, the init hook line) with per-step
-confirmation on stdin; it refuses to act when run non-interactively (piped /
-CI), printing what it WOULD do instead. The mode flags bias the recommendation:
---repo / --team / --ai-agent-heavy (mutually exclusive); omit them to auto-detect.
+recommended SAFE steps (the init hook line, then the recommended profile or
+template when no policy exists) with per-step confirmation on stdin; it refuses to act when run
+non-interactively (piped / CI), printing what it WOULD do instead. The mode
+flags are mutually exclusive: --repo gives the same recommendation as the
+default, while --team and --ai-agent-heavy select the legacy `startup` and
+`ai-agent-heavy` policy templates (`tirith policy init --template <name>`).
 
 Examples:
   tirith onboard
@@ -865,13 +946,13 @@ Examples:
             .required(false)
     )]
     Onboard {
-        /// Bias the recommendation toward a single-repo setup.
+        /// Single-repo setup (same recommendation as the default: Balanced).
         #[arg(long)]
         repo: bool,
-        /// Bias the recommendation toward a locked-down team / shared setup.
+        /// Recommend the legacy `startup` policy template for a shared setup.
         #[arg(long)]
         team: bool,
-        /// Bias the recommendation toward an AI-agent-heavy setup.
+        /// Recommend the legacy `ai-agent-heavy` policy template.
         #[arg(long = "ai-agent-heavy")]
         ai_agent_heavy: bool,
         /// Perform the recommended SAFE actions (with per-step stdin
@@ -1301,8 +1382,8 @@ Examples:
         #[arg(long, value_parser = ["comfortable", "balanced", "strict"])]
         profile: Option<String>,
 
-        /// Explicit agent selection for tool 'recommended'; uncertified hosts refuse before changes
-        #[arg(long = "agent", value_parser = ["claude-code", "codex", "cursor", "windsurf"])]
+        /// For tool 'recommended': also configure the Claude Code Bash hook in the same undoable plan
+        #[arg(long = "agent", value_parser = ["claude-code"])]
         agents: Vec<String>,
 
         /// Save a recommended setup review without applying it
@@ -3497,11 +3578,6 @@ enum DashboardAction {
     ControlServe {
         #[arg(long)]
         startup_id: String,
-    },
-    #[command(hide = true)]
-    LifecycleWorker {
-        #[arg(long)]
-        operation_id: String,
     },
     /// Write the HTML security report to a file
     #[command(after_help = "\
@@ -6028,15 +6104,16 @@ impl LocalArtifactEcosystem {
     }
 }
 
-/// The ecosystem `tirith pkg` enforces for. Only `pip` installs; `npm`/`cargo`
-/// resolve-and-inspect lives behind hidden experimental flags and cannot install.
+/// The ecosystem argument of `tirith pkg approve` / `install`. Contained
+/// installation is disabled for every ecosystem: `pip` requirements are
+/// accepted and the command then refuses; `npm` and `cargo` are not accepted.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum PkgEcosystem {
-    /// Python wheels (the only enforced ecosystem).
+    /// Python requirements (accepted; the command still refuses).
     Pip,
-    /// npm, not enforced in this version.
+    /// Not accepted.
     Npm,
-    /// cargo, not enforced in this version.
+    /// Not accepted.
     Cargo,
 }
 
@@ -6052,17 +6129,6 @@ impl PkgEcosystem {
 
 #[derive(Subcommand)]
 enum PkgAction {
-    /// Review and track a confined install of exact local npm leaf archives.
-    InstallNpm {
-        #[command(subcommand)]
-        action: cli::npm_install::Action,
-    },
-    /// Materialize reviewed local leaf archive data without running package code.
-    /// This Linux-only contract is separate from the disabled execution backend.
-    Materialize {
-        #[command(subcommand)]
-        action: cli::npm_materialize::Action,
-    },
     /// Inspect exact local npm tarballs or Python wheels without executing them.
     #[command(after_help = "\
 Examples:
@@ -6088,22 +6154,27 @@ contacts a registry, or issues installation approval.")]
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Resolve + inspect a requirement set and approve its install plan through
-    /// the x86_64 Linux native authority. Does NOT install.
+    /// Package-plan approval (currently disabled on every host). Checks the
+    /// native approval authority, then refuses; records no approval.
     #[command(after_help = "\
 Examples:
   tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
   tirith pkg approve pip flask --target .venv
 
-Native approval issuance is available only on x86_64 Linux. Unsupported
-platforms fail closed before publishing an approval record.")]
+Approvals existed only for contained `tirith pkg install`, which is disabled.
+Hosts without the native approval authority (it is available only on x86_64
+Linux) refuse at native_authority. Otherwise approve validates its arguments
+and refuses with private_input_execution_unqualified before resolver
+execution, network access, quarantine writes, or approval-record publication.")]
     Approve {
-        /// The ecosystem (only `pip` is enforced).
+        /// The ecosystem. Only `pip` requirements are accepted; contained
+        /// installation is disabled for every ecosystem.
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
         requirements: Vec<String>,
-        /// Required new dedicated install directory (pip `--target`).
+        /// Accepted for compatibility and ignored: installation is disabled, so
+        /// no install directory is created or used.
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -6137,12 +6208,14 @@ unchanged for the complete target lifetime against another process owned by
 the same user. `tirith package inspect` and `tirith pkg verify-env` remain
 available.")]
     Install {
-        /// The ecosystem (only `pip` is enforced).
+        /// The ecosystem. Only `pip` requirements are accepted; contained
+        /// installation is disabled for every ecosystem.
         #[arg(value_enum)]
         ecosystem: PkgEcosystem,
         /// Requirement specs (e.g. `requests==2.31.0`).
         requirements: Vec<String>,
-        /// Required new dedicated install directory (pip `--target`).
+        /// Accepted for compatibility and ignored: installation is disabled, so
+        /// no install directory is created or used.
         #[arg(long)]
         target: Option<std::path::PathBuf>,
         /// An approved index URL (repeatable); empty means lock-only / `--no-index`.
@@ -6184,8 +6257,10 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Enroll a fully static, native Linux uv executable by canonical path and
-    /// SHA-256. Python runtimes must remain root-managed.
+    /// Record a canonical-path + SHA-256 pin for a fully static, native Linux uv
+    /// executable (not yet enforced: nothing reads the pin while contained
+    /// package installation is disabled). Python runtimes must remain
+    /// root-managed.
     TrustTool {
         /// Absolute path to the static Linux uv executable to enroll.
         path: std::path::PathBuf,
@@ -6376,12 +6451,16 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// List or show the package-firewall tamper-evident receipts.
+    /// List or show stored tamper-evident artifact-scan receipts.
     #[command(after_help = "\
 Examples:
   tirith pkg receipt list
   tirith pkg receipt last
-  tirith pkg receipt show <receipt-id>")]
+  tirith pkg receipt show <receipt-id>
+
+These receipts were written by contained `tirith pkg install` runs. That
+command is disabled, so no new receipts are written; receipts recorded by
+earlier releases stay readable here.")]
     Receipt {
         #[command(subcommand)]
         query: PkgReceiptQuery,
@@ -7194,14 +7273,21 @@ Examples:
         #[arg(long)]
         apply: bool,
     },
-    /// Garbage-collect expired entries from trust stores
+    /// Garbage-collect trust stores: expired grants, old revocations, and the
+    /// oldest revocations of an oversized grant store
     #[command(after_help = "\
+What it collects:
+  In the grant store (trust-grants.json): expired grants and revocations older
+  than 30 days. If the store is still above 768 KiB, the oldest remaining
+  revocations are also pruned until it fits. Active grants and unreadable
+  records are kept. In the legacy trust.json stores: expired entries only.
+
 Examples:
   tirith trust gc --expired
   tirith trust gc --expired --scope user")]
     Gc {
-        /// Collect expired entries — currently the only collection mode, so
-        /// this flag is optional
+        /// Accepted for compatibility; has no effect (gc always collects what
+        /// "What it collects" lists)
         #[arg(long)]
         expired: bool,
         /// Scope: user, project, repo, or all (default)
@@ -7219,17 +7305,20 @@ Examples:
         #[arg(long, hide = true, conflicts_with = "format")]
         json: bool,
     },
-    /// Prune expired trust entries (alias for `gc`).
-    ///
-    /// `prune` is the spec-named CLI surface for the M6 garbage-collection
-    /// flow; `gc` is the shipping name kept as the canonical short form.
-    /// Both invoke the same backing function in `cli::trust::gc`.
+    /// Prune trust stores (alias for `gc`; both run the same collection).
     #[command(after_help = "\
+What it collects:
+  In the grant store (trust-grants.json): expired grants and revocations older
+  than 30 days. If the store is still above 768 KiB, the oldest remaining
+  revocations are also pruned until it fits. Active grants and unreadable
+  records are kept. In the legacy trust.json stores: expired entries only.
+
 Examples:
   tirith trust prune --expired
   tirith trust prune --expired --scope user")]
     Prune {
-        /// Collect expired entries — currently the only collection mode.
+        /// Accepted for compatibility; has no effect (prune always collects
+        /// what "What it collects" lists)
         #[arg(long)]
         expired: bool,
         /// Scope: user, project, repo, or all (default)
@@ -8142,63 +8231,10 @@ fn main() {
         cli::capsule_child::run_on_main_thread(&raw_args);
     }
 
-    // Automatic diagnostics have a fixed child-free ABI. Bound stdin, policy,
-    // capability and output work before any of it starts. Capsule containment
-    // must still run first, while there is no watchdog or worker thread.
-    let automatic = cli::automatic_deadline::match_zsh_automatic_diagnostic(&raw_args);
-    let coordinator = cli::automatic_deadline::match_zsh_automatic_coordinator(&raw_args);
-    if raw_args
-        .get(1)
-        .is_some_and(|arg| arg == "__setup-activation")
-        && !matches!(
-            automatic,
-            Some(
-                cli::automatic_deadline::DiagnosticInvocation::Probe(_)
-                    | cli::automatic_deadline::DiagnosticInvocation::Receipt(_)
-            )
-        )
-        && coordinator.is_none()
-    {
-        // No watchdog exists yet. Even an error write or buffered exit could
-        // wait on an unread pipe; the internal caller classifies this code.
-        unsafe { libc::_exit(2) }
-    }
-    let budget =
-        coordinator.or(automatic.map(|_| cli::automatic_deadline::DeadlineBudget::Diagnostic));
-    let _automatic_deadline = budget.map(|budget| {
-        cli::automatic_deadline::SelfDeadline::arm(budget).unwrap_or_else(|_| {
-            // Arming failed, so no operation or output may precede refusal.
-            unsafe { libc::_exit(125) }
-        })
-    });
-
     let handle = std::thread::Builder::new()
         .name("tirith-main".to_string())
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            // Thread-local: enter inside the worker, before automatic stdin,
-            // authentication or policy work. Ordinary/manual routes are unchanged.
-            let _automatic_policy_inputs =
-                budget.map(|_| tirith_core::policy::BoundedRuntimePolicyInputs::enter());
-            if coordinator.is_some() {
-                std::process::exit(cli::setup_activation::run_coordinator(&raw_args));
-            }
-            if let Some(cli::automatic_deadline::DiagnosticInvocation::Receipt(action)) = automatic
-            {
-                std::process::exit(cli::setup_activation::run_receipt(action));
-            }
-            if matches!(
-                automatic,
-                Some(cli::automatic_deadline::DiagnosticInvocation::Probe(_))
-            ) {
-                // The raw matcher already bounded and validated these fields.
-                // Avoid the manual adapter and canonical current-status path.
-                let action = raw_args[3].to_str().expect("validated probe action");
-                let id = raw_args[7].to_str().expect("validated probe identifier");
-                std::process::exit(cli::setup_activation::run_probe(action, id));
-            }
-            run();
-        })
+        .spawn(run)
         .expect("failed to spawn tirith main thread");
     if handle.join().is_err() {
         // `run` panicked (hook already reported it); exit 101 without re-panicking.
@@ -8217,23 +8253,7 @@ fn run() {
     cli::init_quiet(cli.quiet);
     cli::audit_health::install_sink();
 
-    let command = match cli.command {
-        Commands::Menu => match cli::menu::select_command() {
-            Ok(Some(command)) => command,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!(
-                    "tirith menu: {}",
-                    cli::sanitize_for_human_output(&error.to_string(), false)
-                );
-                std::process::exit(2);
-            }
-        },
-        command => command,
-    };
-    let exit_code = match command {
-        // The menu returns only the closed set of direct inspection actions.
-        Commands::Menu => unreachable!("menu selection cannot select the menu itself"),
+    let exit_code = match cli.command {
         Commands::Review { paths, json } => cli::project_review::run(paths, json),
         Commands::ShellVerificationInternal {
             action,
@@ -8241,7 +8261,9 @@ fn run() {
             channel,
         } => cli::shell_verification::run(&action, id.as_deref(), channel.into()),
         Commands::ExecutionReceiptInternal { action } => match action {
-            ExecutionReceiptAction::Capability => cli::check::receipt_capability(),
+            ExecutionReceiptAction::Capability { require_cwd: _ } => {
+                cli::check::receipt_capability()
+            }
             ExecutionReceiptAction::Register { family, shell_pid } => {
                 cli::check::register_receipt_instance(shell_pid, family.into())
             }
@@ -8255,19 +8277,26 @@ fn run() {
                 approval.map(tirith_core::execution_state::ShellApprovalOutcome::from),
                 warn_acknowledged,
             ),
-            ExecutionReceiptAction::Consume { channel } => {
-                cli::check::consume_receipt(channel.into())
+            ExecutionReceiptAction::Consume { channel, cwd } => {
+                cli::check::consume_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Reconcile { channel } => {
-                cli::check::reconcile_receipt(channel.into())
+            ExecutionReceiptAction::Reconcile { channel, cwd } => {
+                cli::check::reconcile_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Discard { channel } => {
-                cli::check::discard_receipt(channel.into())
+            ExecutionReceiptAction::Discard { channel, cwd } => {
+                cli::check::discard_receipt(channel.into(), cwd.as_deref())
             }
-            ExecutionReceiptAction::Acknowledge { channel } => {
-                cli::check::acknowledge_receipt(channel.into())
+            ExecutionReceiptAction::Acknowledge { channel: _ } => {
+                cli::check::acknowledge_receipt_compat()
             }
         },
+        Commands::SessionIdInternal => {
+            println!("{}", tirith_core::session::new_session_id());
+            0
+        }
+        Commands::HookPresenceInternal { family, shell_pid } => {
+            cli::hook_freshness::register_presence(family.into(), shell_pid)
+        }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { detach } => cli::daemon::start(detach),
             DaemonAction::Stop => cli::daemon::stop(),
@@ -8415,12 +8444,6 @@ fn run() {
         }
 
         Commands::Pkg {
-            action: PkgAction::InstallNpm { action },
-        } => cli::npm_install::run(action),
-        Commands::Pkg {
-            action: PkgAction::Materialize { action },
-        } => cli::npm_materialize::run(action),
-        Commands::Pkg {
             action:
                 PkgAction::Inspect {
                     artifacts,
@@ -8513,10 +8536,13 @@ fn run() {
         }
         Commands::Pkg { action } => {
             let pkg_action = match action {
+                // `--target` (and install's `--yes` / `--allow-degraded`) stay
+                // accepted for compatibility; both commands refuse before any
+                // target or confirmation is consulted.
                 PkgAction::Approve {
                     ecosystem,
                     requirements,
-                    target,
+                    target: _,
                     index_url,
                     artifact_origin,
                     format,
@@ -8526,7 +8552,6 @@ fn run() {
                     cli::pkg::PkgAction::Approve {
                         ecosystem: ecosystem.into_core(),
                         requirements,
-                        target,
                         index_url,
                         artifact_origin,
                         json,
@@ -8535,11 +8560,11 @@ fn run() {
                 PkgAction::Install {
                     ecosystem,
                     requirements,
-                    target,
+                    target: _,
                     index_url,
                     artifact_origin,
-                    yes,
-                    allow_degraded,
+                    yes: _,
+                    allow_degraded: _,
                     format,
                     json,
                 } => {
@@ -8547,11 +8572,8 @@ fn run() {
                     cli::pkg::PkgAction::Install {
                         ecosystem: ecosystem.into_core(),
                         requirements,
-                        target,
                         index_url,
                         artifact_origin,
-                        yes,
-                        allow_degraded,
                         json,
                     }
                 }
@@ -8603,8 +8625,6 @@ fn run() {
                 // match.
                 PkgAction::Graph { .. } => unreachable!("pkg graph handled above"),
                 PkgAction::Inspect { .. } => unreachable!("pkg inspect handled above"),
-                PkgAction::Materialize { .. } => unreachable!("pkg materialize handled above"),
-                PkgAction::InstallNpm { .. } => unreachable!("pkg install-npm handled above"),
                 // `Diff` is likewise handled by its own earlier arm (it returns the
                 // release-differential verdict's exit code through
                 // `cli::provenance::run_diff`), so it never reaches here.
@@ -9478,9 +9498,6 @@ fn run() {
                     }
                     Some(DashboardAction::ControlServe { startup_id }) => {
                         cli::control::serve(&startup_id)
-                    }
-                    Some(DashboardAction::LifecycleWorker { operation_id }) => {
-                        cli::control::lifecycle_worker::run(&operation_id)
                     }
                     Some(DashboardAction::Export { out, json }) => {
                         cli::dashboard::export(out.as_deref(), json)
@@ -10524,120 +10541,44 @@ fn run() {
 #[cfg(test)]
 mod help_category_tests {
     #[test]
-    fn npm_install_requires_review_and_rejects_execution_overrides() {
+    fn retired_local_leaf_npm_routes_are_not_commands() {
         with_large_cli_stack(|| {
             use clap::Parser;
-            for action in ["apply", "recover", "undo"] {
-                let base = [
-                    "tirith",
-                    "pkg",
-                    "install-npm",
-                    action,
-                    "11111111-1111-4111-8111-111111111111",
-                ];
-                assert!(super::Cli::try_parse_from(base).is_err());
-                let digest = "a".repeat(64);
-                let reviewed = base.into_iter().chain(["--reviewed", &digest, "--json"]);
-                assert!(matches!(
-                    super::Cli::try_parse_from(reviewed.clone())
-                        .unwrap()
-                        .command,
-                    super::Commands::Pkg {
-                        action: super::PkgAction::InstallNpm { .. }
-                    }
-                ));
-                for option in [
-                    "--yes",
-                    "--allow-degraded",
-                    "--online",
-                    "--script",
-                    "--index-url",
+            for route in ["install-npm", "materialize"] {
+                for action in [
+                    vec!["plan", "package.tgz"],
+                    vec!["apply", "11111111-1111-4111-8111-111111111111"],
+                    vec!["--help"],
                 ] {
-                    assert!(super::Cli::try_parse_from(reviewed.clone().chain([option])).is_err());
+                    let argv = ["tirith", "pkg", route].into_iter().chain(action);
+                    let error = match super::Cli::try_parse_from(argv) {
+                        Ok(_) => panic!("pkg {route} must not parse"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(
+                        error.kind(),
+                        clap::error::ErrorKind::InvalidSubcommand,
+                        "pkg {route}"
+                    );
                 }
             }
+            // The kept npm routes still parse.
             assert!(super::Cli::try_parse_from([
                 "tirith",
                 "pkg",
-                "install-npm",
-                "plan",
+                "inspect",
                 "package.tgz",
+                "--ecosystem",
+                "npm"
             ])
-            .is_err());
-        });
-    }
-
-    #[test]
-    fn materialize_cli_requires_explicit_review_for_apply_and_recovery() {
-        with_large_cli_stack(|| {
-            use clap::Parser;
-            for action in ["apply", "recover", "undo"] {
-                assert!(super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    action,
-                    "11111111-1111-4111-8111-111111111111"
-                ])
-                .is_err());
-                let parsed = super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    action,
-                    "11111111-1111-4111-8111-111111111111",
-                    "--reviewed",
-                    &"a".repeat(64),
-                    "--json",
-                ])
-                .unwrap();
-                assert!(matches!(
-                    parsed.command,
-                    super::Commands::Pkg {
-                        action: super::PkgAction::Materialize { .. }
-                    }
-                ));
-            }
-        });
-    }
-    #[test]
-    fn materialize_cli_does_not_accept_execution_or_resolver_overrides() {
-        with_large_cli_stack(|| {
-            use clap::Parser;
-            for option in [
-                "--yes",
-                "--allow-degraded",
-                "--online",
-                "--script",
-                "--index-url",
-            ] {
-                assert!(super::Cli::try_parse_from([
-                    "tirith",
-                    "pkg",
-                    "materialize",
-                    "plan",
-                    "demo.tgz",
-                    "--target",
-                    "fresh",
-                    option
-                ])
-                .is_err());
-            }
-            assert!(super::Cli::try_parse_from([
-                "tirith",
-                "pkg",
-                "materialize",
-                "plan",
-                "--target",
-                "fresh"
-            ])
-            .is_err());
+            .is_ok());
+            assert!(super::Cli::try_parse_from(["tirith", "pkg", "attest-npm"]).is_ok());
         });
     }
 
     use super::{
         Cli, Commands, PkgAction, TrustAction, TrustMutationScope, TrustQueryScope,
-        COMMANDS_BY_CATEGORY,
+        COMMANDS_BY_CATEGORY, LONG_AFTER_HELP, TASKS_HELP, TASKS_LIST,
     };
     use clap::{CommandFactory, Parser};
 
@@ -10744,6 +10685,180 @@ mod help_category_tests {
                     "command `{name}` is missing from COMMANDS_BY_CATEGORY — add it to a category"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn bare_tirith_prints_help_and_menu_is_not_a_command() {
+        with_large_cli_stack(|| {
+            // Bare `tirith` stays a clap usage error (exit 2) that shows help.
+            let bare = Cli::try_parse_from(["tirith"])
+                .err()
+                .expect("bare tirith must not parse");
+            assert_eq!(
+                bare.kind(),
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            assert_eq!(bare.exit_code(), 2);
+            // The removed interactive menu is no longer a subcommand.
+            let menu = Cli::try_parse_from(["tirith", "menu"])
+                .err()
+                .expect("tirith menu was removed");
+            assert_eq!(menu.kind(), clap::error::ErrorKind::InvalidSubcommand);
+            assert!(!COMMANDS_BY_CATEGORY
+                .split_whitespace()
+                .any(|tok| tok == "menu"));
+            assert!(matches!(
+                Cli::try_parse_from(["tirith", "status", "--json"])
+                    .unwrap()
+                    .command,
+                Commands::Status { json: true, .. }
+            ));
+        });
+    }
+
+    /// Every `tirith ...` command named in the task list must parse against
+    /// the real command tree, so the list cannot silently name a command that
+    /// was renamed or removed. A line may hold several commands separated by
+    /// `|`, `;` or parentheses; placeholders such as GRANT_ID stay literal
+    /// positional values, and a trailing `--help` must reach clap's help.
+    #[test]
+    fn tasks_help_commands_parse() {
+        with_large_cli_stack(|| {
+            let task_lines: Vec<&str> = TASKS_HELP
+                .lines()
+                .filter(|line| line.starts_with("  "))
+                .collect();
+            assert!(
+                (5..=15).contains(&task_lines.len()),
+                "keep the task list short: {} task lines",
+                task_lines.len()
+            );
+            let mut parsed = 0;
+            for line in task_lines {
+                let mut on_line = 0;
+                for segment in line.split(['|', ';', '(', ')']) {
+                    let Some(start) = segment.find("tirith ") else {
+                        continue;
+                    };
+                    let argv: Vec<&str> = segment[start..].split_whitespace().collect();
+                    match Cli::try_parse_from(&argv) {
+                        Ok(_) => {}
+                        Err(error)
+                            if argv.last() == Some(&"--help")
+                                && error.kind() == clap::error::ErrorKind::DisplayHelp => {}
+                        Err(error) => panic!("task list command {argv:?} does not parse: {error}"),
+                    }
+                    on_line += 1;
+                }
+                assert!(on_line > 0, "task line names no command: {line:?}");
+                parsed += on_line;
+            }
+            // The onboarding and dashboard entry points stay in the list.
+            assert!(TASKS_HELP.contains("tirith onboard"));
+            assert!(TASKS_HELP.contains("tirith dashboard"));
+            assert!(parsed >= 12, "only {parsed} task commands parsed");
+        });
+    }
+
+    fn help_text(argv: &[&str]) -> String {
+        let error = Cli::try_parse_from(argv).err().expect("--help shows help");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        error.to_string()
+    }
+
+    /// `tirith pkg --help` lists only examples that work: `pkg approve` and
+    /// `pkg install` refuse on every host, so they are not offered as
+    /// examples, and `pkg receipt` no longer names the removed package
+    /// firewall.
+    #[test]
+    fn pkg_help_examples_and_receipt_text_match_behaviour() {
+        with_large_cli_stack(|| {
+            let help = help_text(&["tirith", "pkg", "--help"]);
+            let examples: Vec<&str> = help
+                .lines()
+                .skip_while(|line| line.trim() != "Examples:")
+                .skip(1)
+                .take_while(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .collect();
+            assert!(examples.len() >= 3, "pkg examples: {examples:?}");
+            for example in &examples {
+                assert!(
+                    !example.starts_with("tirith pkg approve")
+                        && !example.starts_with("tirith pkg install"),
+                    "pkg --help offers a refusing example: {example}"
+                );
+                let argv: Vec<&str> = example.split_whitespace().collect();
+                Cli::try_parse_from(&argv)
+                    .unwrap_or_else(|error| panic!("example {argv:?} does not parse: {error}"));
+            }
+            // The refusal itself stays documented.
+            assert!(help.contains("private_input_execution_unqualified"));
+            assert!(!help.contains("package-firewall"));
+
+            let receipt = help_text(&["tirith", "pkg", "receipt", "--help"]);
+            assert!(!receipt.contains("package-firewall"), "{receipt}");
+            assert!(receipt.contains("artifact-scan receipts"), "{receipt}");
+            assert!(receipt.contains("no new receipts are written"), "{receipt}");
+        });
+    }
+
+    /// `tirith onboard --help` describes the real recommendation: the personal
+    /// Balanced profile by default and with --repo, a legacy template only for
+    /// --team / --ai-agent-heavy.
+    #[test]
+    fn onboard_help_describes_the_profile_recommendation() {
+        with_large_cli_stack(|| {
+            let help = help_text(&["tirith", "onboard", "--help"]);
+            assert!(!help.contains("shipping policy templates"), "{help}");
+            assert!(!help.contains("ci-strict"), "{help}");
+            assert!(help.contains("Balanced protection"), "{help}");
+            assert!(help.contains("tirith policy profile balanced"), "{help}");
+            assert!(help.contains("legacy `startup`"), "{help}");
+            for template in ["startup", "ai-agent-heavy"] {
+                Cli::try_parse_from(["tirith", "policy", "init", "--template", template])
+                    .unwrap_or_else(|error| panic!("template {template}: {error}"));
+            }
+        });
+    }
+
+    /// Bare `tirith`, `tirith -h` and `tirith --help` all show the task list;
+    /// the long help also keeps the categorized command overview.
+    #[test]
+    fn task_list_shows_on_bare_short_and_long_help() {
+        with_large_cli_stack(|| {
+            let bare = Cli::try_parse_from(["tirith"])
+                .err()
+                .expect("bare tirith must not parse");
+            assert_eq!(
+                bare.kind(),
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            assert!(bare.to_string().contains(TASKS_HELP));
+            assert!(!bare.to_string().contains("COMMANDS BY CATEGORY"));
+
+            let short = Cli::try_parse_from(["tirith", "-h"])
+                .err()
+                .expect("-h shows help");
+            assert_eq!(short.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(short.to_string().contains(TASKS_HELP));
+
+            let long = Cli::try_parse_from(["tirith", "--help"])
+                .err()
+                .expect("--help shows help");
+            assert_eq!(long.kind(), clap::error::ErrorKind::DisplayHelp);
+            let long = long.to_string();
+            assert!(long.contains(TASKS_LIST));
+            assert!(long.contains(COMMANDS_BY_CATEGORY));
+            // The long help already holds the categories, so it drops the
+            // short help's pointer to `--help`.
+            assert!(!long.contains("Run `tirith --help`"));
+            assert_eq!(
+                LONG_AFTER_HELP,
+                format!("{TASKS_LIST}\n\n{COMMANDS_BY_CATEGORY}")
+            );
+            assert!(TASKS_HELP.starts_with(TASKS_LIST));
         });
     }
 

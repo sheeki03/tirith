@@ -2421,6 +2421,7 @@ mod tests {
 
     #[test]
     fn copies_a_plain_tree_and_excludes_git_at_every_depth() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "README.md", "hello");
@@ -2447,6 +2448,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_copy_is_owner_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         // The held copy sits in a shared /tmp. A world-readable copy of an
@@ -2561,6 +2563,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn same_size_content_change_is_refused_without_retry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "same.bin", "AAAA");
@@ -2575,6 +2578,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn visible_root_replacement_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "sub/file", "data");
@@ -2592,6 +2596,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn directory_mode_changes_are_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt as _;
 
         let base = tempfile::tempdir().expect("tempdir");
@@ -2613,6 +2618,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn membership_add_remove_and_rename_are_all_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for mutation in ["add", "remove", "rename"] {
             let base = tempfile::tempdir().expect("tempdir");
             let source = base.path().join("project");
@@ -2640,6 +2646,7 @@ mod tests {
 
     #[test]
     fn receipt_exclusion_is_exact_not_a_basename_or_prefix_filter() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "receipts/run.json", "old receipt");
@@ -2657,6 +2664,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_var_alias_is_the_only_explicit_root_alias() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             trusted_project_root(Path::new("/var/folders/example")).expect("trusted alias"),
             Path::new("/private/var/folders/example")
@@ -2670,6 +2678,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlink_is_refused_not_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "real.txt", "data");
@@ -2683,6 +2692,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_escaping_symlinked_directory_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "keep.txt", "data");
@@ -2699,6 +2709,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hardlinked_file_is_refused_rather_than_copied() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The attacker-authored repository carries `assets/logo.png` as a second
         // name for the operator's private key. Nothing in a walk of the project
         // can see the other name, so the only safe answer is to refuse.
@@ -2727,6 +2738,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_walk_retains_descriptors_by_depth_not_by_width() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A vendored dependency tree is wide, not deep. Retaining a descriptor
         // pair per unvisited sibling exhausts RLIMIT_NOFILE on an ordinary
         // project, which an attacker can also force deliberately.
@@ -2795,6 +2807,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         std::fs::create_dir_all(&source).expect("source");
@@ -2813,6 +2826,7 @@ mod tests {
 
     #[test]
     fn a_case_collision_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "README.md", "one");
@@ -2873,6 +2887,7 @@ mod tests {
 
     #[test]
     fn the_destination_must_be_an_empty_directory_outside_the_project() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let source = base.path().join("project");
         write(&source, "a.txt", "a");

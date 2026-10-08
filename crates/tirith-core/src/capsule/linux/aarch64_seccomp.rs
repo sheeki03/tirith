@@ -252,23 +252,15 @@ fn policy_rules() -> Result<Rules, String> {
     // A separate ENOSYS rule below permits libc's fallback to inspectable clone.
     // Restrict clone to reviewed fork/vfork/thread flags, without CLONE_PARENT,
     // CLONE_UNTRACED or any namespace flags; child-exit signals are 0 or SIGCHLD.
-    let flags = (libc::CLONE_VM
-        | libc::CLONE_FS
-        | libc::CLONE_FILES
-        | libc::CLONE_SIGHAND
-        | libc::CLONE_VFORK
-        | libc::CLONE_THREAD
-        | libc::CLONE_SYSVSEM
-        | libc::CLONE_SETTLS
-        | libc::CLONE_PARENT_SETTID
-        | libc::CLONE_CHILD_CLEARTID
-        | libc::CLONE_CHILD_SETTID) as u64;
+    // The table is shared with the x86_64 policy.
     let mut clone = Vec::new();
-    for signal in [0, libc::SIGCHLD as u64] {
-        clone.push(rule(vec![
-            condition(0, SeccompCmpOp::MaskedEq(!(flags | 0xff)), 0)?,
-            condition(0, SeccompCmpOp::MaskedEq(0xff), signal)?,
-        ])?);
+    for conditions in super::clone_policy::clone_allow_rules() {
+        clone.push(rule(
+            conditions
+                .into_iter()
+                .map(|(mask, value)| condition(0, SeccompCmpOp::MaskedEq(mask), value))
+                .collect::<Result<_, _>>()?,
+        )?);
     }
     rules.insert(libc::SYS_clone, clone);
     Ok(rules)
@@ -276,15 +268,8 @@ fn policy_rules() -> Result<Rules, String> {
 
 pub(super) fn build_filters() -> Result<(BpfProgram, BpfProgram), String> {
     // Both filters validate AUDIT_ARCH_AARCH64 through the reviewed compiler.
-    let clone_fallback = SeccompFilter::new(
-        [(libc::SYS_clone3, Vec::new())].into_iter().collect(),
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::ENOSYS as u32),
-        TargetArch::aarch64,
-    )
-    .map_err(|error| error.to_string())?
-    .try_into()
-    .map_err(|error: seccompiler::BackendError| error.to_string())?;
+    let clone_fallback =
+        super::clone_policy::clone3_enosys_filter(TargetArch::aarch64, libc::SYS_clone3)?;
     let default_deny = SeccompFilter::new(
         policy_rules()?,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -295,42 +280,6 @@ pub(super) fn build_filters() -> Result<(BpfProgram, BpfProgram), String> {
     .try_into()
     .map_err(|error: seccompiler::BackendError| error.to_string())?;
     Ok((clone_fallback, default_deny))
-}
-
-/// The reviewed runtime policy with a narrower initial executable capability.
-/// Node's descriptor is CLOEXEC; pathname exec and memfd_create are denied.
-/// This numeric FD check is not a stateful one-exec guarantee: descriptor reuse
-/// remains possible. Landlock grants Execute only to the pinned ELF interpreter
-/// and never to writable directories. Ordinary capsules are unchanged.
-fn npm_filter(node_fd: i32) -> Result<BpfProgram, String> {
-    if !(3..256).contains(&node_fd) {
-        return Err("invalid npm Node descriptor".into());
-    }
-    let mut rules = policy_rules()?;
-    rules.remove(&libc::SYS_execve);
-    rules.insert(
-        libc::SYS_execveat,
-        vec![rule(vec![
-            eq(0, node_fd as u64)?,
-            eq(4, libc::AT_EMPTY_PATH as u64)?,
-        ])?],
-    );
-    SeccompFilter::new(
-        rules,
-        SeccompAction::Errno(libc::EPERM as u32),
-        SeccompAction::Allow,
-        TargetArch::aarch64,
-    )
-    .map_err(|e| e.to_string())?
-    .try_into()
-    .map_err(|e: seccompiler::BackendError| e.to_string())
-}
-
-pub(super) fn apply_npm(node_fd: i32) -> Result<(), String> {
-    let (fallback, _) = build_filters()?;
-    let filter = npm_filter(node_fd)?;
-    seccompiler::apply_filter(&fallback).map_err(|e| e.to_string())?;
-    seccompiler::apply_filter(&filter).map_err(|e| e.to_string())
 }
 
 /// Called only in the single-threaded Linux launcher after Landlock and NNP.
@@ -348,114 +297,18 @@ mod tests {
 
     // Evaluate the compiled, architecture-checking BPF, so argument-boundary
     // assertions test actual emitted branches rather than the input rule list.
-    fn evaluate(program: &BpfProgram, arch: u32, syscall: i64, args: [u64; 6]) -> u32 {
-        let mut data = [0u8; 64];
-        data[0..4].copy_from_slice(&(syscall as u32).to_le_bytes());
-        data[4..8].copy_from_slice(&arch.to_le_bytes());
-        for (index, arg) in args.into_iter().enumerate() {
-            data[16 + index * 8..24 + index * 8].copy_from_slice(&arg.to_le_bytes());
-        }
-        let mut accumulator = 0;
-        let mut pc = 0;
-        for _ in 0..4096 {
-            let instruction = &program[pc];
-            pc += 1;
-            match instruction.code {
-                0x20 => {
-                    let start = instruction.k as usize;
-                    accumulator = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
-                }
-                0x54 => accumulator &= instruction.k,
-                0x05 => pc += instruction.k as usize,
-                0x06 => return instruction.k,
-                0x15 | 0x25 | 0x35 | 0x45 => {
-                    let matches = match instruction.code {
-                        0x15 => accumulator == instruction.k,
-                        0x25 => accumulator > instruction.k,
-                        0x35 => accumulator >= instruction.k,
-                        0x45 => accumulator & instruction.k != 0,
-                        _ => unreachable!(),
-                    };
-                    pc += if matches {
-                        instruction.jt
-                    } else {
-                        instruction.jf
-                    } as usize;
-                }
-                code => panic!("unrecognized compiled BPF instruction {code:x}"),
-            }
-        }
-        panic!("BPF did not terminate within its instruction bound")
-    }
-
-    #[test]
-    fn npm_filter_restricts_initial_exec_without_expanding_ambient_authority() {
-        const ARM: u32 = 0xc00000b7;
-        const ALLOW: u32 = 0x7fff0000;
-        const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let filter = npm_filter(19).unwrap();
-        let decide = |call, args| evaluate(&filter, ARM, call, args);
-        assert_eq!(
-            decide(
-                libc::SYS_execveat,
-                [19, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
-            ),
-            ALLOW
-        );
-        assert_eq!(
-            decide(
-                libc::SYS_execveat,
-                [20, 1, 2, 3, libc::AT_EMPTY_PATH as u64, 0]
-            ),
-            DENY
-        );
-        assert_eq!(decide(libc::SYS_execveat, [19, 1, 2, 3, 0, 0]), DENY);
-        for call in [
-            libc::SYS_execve,
-            libc::SYS_memfd_create,
-            libc::SYS_socket,
-            libc::SYS_fchmod,
-            libc::SYS_setpgid,
-            libc::SYS_setsid,
-            libc::SYS_process_vm_readv,
-        ] {
-            assert_eq!(decide(call, [0; 6]), DENY);
-        }
-        assert_eq!(
-            decide(
-                libc::SYS_prctl,
-                [libc::PR_SET_DUMPABLE as u64, 1, 0, 0, 0, 0]
-            ),
-            DENY
-        );
-        assert_eq!(
-            decide(
-                libc::SYS_prctl,
-                [
-                    libc::PR_SET_PDEATHSIG as u64,
-                    libc::SIGKILL as u64,
-                    0,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            ALLOW
-        );
-        assert!(npm_filter(2).is_err());
-        assert!(npm_filter(256).is_err());
-    }
+    use super::super::clone_policy::evaluate_bpf as evaluate;
 
     #[test]
     fn compiled_filters_allow_only_stdio_nonblocking_mode_changes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let npm = npm_filter(19).unwrap();
         let (_, ordinary) = build_filters().unwrap();
         #[allow(clippy::unnecessary_cast)] // GNU and musl ioctl request types differ.
         let request = libc::FIONBIO as u64;
-        for filter in [&npm, &ordinary] {
+        for filter in [&ordinary] {
             for fd in 0..=2 {
                 assert_eq!(
                     evaluate(filter, ARM, libc::SYS_ioctl, [fd, request, 4096, 0, 0, 0]),
@@ -488,12 +341,12 @@ mod tests {
 
     #[test]
     fn compiled_filters_bound_stdio_status_restoration() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
-        let npm = npm_filter(19).unwrap();
         let (_, ordinary) = build_filters().unwrap();
-        for filter in [&npm, &ordinary] {
+        for filter in [&ordinary] {
             for fd in 0..=2 {
                 for access in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
                     for status in [0, libc::O_NONBLOCK as u64, 0o400000, STDIO_STATUS_WORD] {
@@ -548,6 +401,7 @@ mod tests {
 
     #[test]
     fn compiled_filter_binds_architecture_and_sensitive_arguments() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         const ARM: u32 = 0xc00000b7;
         const ALLOW: u32 = 0x7fff0000;
         const DENY: u32 = 0x50000 | libc::EPERM as u32;
@@ -711,7 +565,7 @@ mod tests {
             return;
         };
         assert!(kernel_support_observed());
-        if case == "npm-stdio" {
+        if case == "stdio" {
             // The parent supplies actual inherited pipes, not regular files
             // whose blocking-mode ioctl could fail independently of seccomp.
             for fd in 0..=2 {
@@ -724,7 +578,7 @@ mod tests {
             }
             let duplicate = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
             assert!(duplicate >= 3);
-            apply_npm(19).unwrap();
+            assert!(apply().unwrap());
             for fd in 0..=2 {
                 let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 assert!(original >= 0);
@@ -778,7 +632,7 @@ mod tests {
                 Some(libc::EPERM)
             );
             for fd in [1, 2] {
-                let marker = b"native-npm-stdio-pipe-ok\n";
+                let marker = b"native-stdio-pipe-ok\n";
                 assert_eq!(
                     unsafe { libc::write(fd, marker.as_ptr().cast(), marker.len()) },
                     marker.len() as isize
@@ -887,7 +741,7 @@ mod tests {
 
     #[test]
     fn native_filter_denies_network_escape_and_allows_reviewed_shell() {
-        for case in ["network", "escape", "exec", "unavailable", "npm-stdio"] {
+        for case in ["network", "escape", "exec", "unavailable", "stdio"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "native_filter_subprocess",
@@ -906,9 +760,9 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            if case == "npm-stdio" {
+            if case == "stdio" {
                 for bytes in [&output.stdout, &output.stderr] {
-                    assert!(String::from_utf8_lossy(bytes).contains("native-npm-stdio-pipe-ok"));
+                    assert!(String::from_utf8_lossy(bytes).contains("native-stdio-pipe-ok"));
                 }
             }
         }

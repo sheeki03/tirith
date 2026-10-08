@@ -24,8 +24,7 @@ impl AppendFailureNotice {
         self.schema_version == 1
             && self.observed_unix_ms > 0
             && self.observed_unix_ms <= now_unix_ms
-            && uuid::Uuid::parse_str(&self.observation_id)
-                .is_ok_and(|id| id.to_string() == self.observation_id)
+            && crate::util::is_uuid(&self.observation_id)
     }
 }
 
@@ -73,18 +72,11 @@ pub fn latest_process_failure(path: &Path) -> Option<ProcessFailureObservation> 
     PROCESS_NOTICES.get()?.lock().ok()?.latest(path)
 }
 
-pub fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
 pub(crate) fn record_append_failure(path: &Path) {
     let notice = AppendFailureNotice {
         schema_version: 1,
         observation_id: uuid::Uuid::new_v4().to_string(),
-        observed_unix_ms: now_unix_ms(),
+        observed_unix_ms: crate::util::now_ms().unwrap_or(0),
     };
     let durable_notice_recorded = NOTICE_SINK.get().is_some_and(|sink| sink(path, &notice));
     if let Ok(mut notices) = PROCESS_NOTICES.get_or_init(Default::default).lock() {
@@ -145,6 +137,7 @@ mod tests {
 
     #[test]
     fn held_native_append_lock_returns_within_its_deadline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let held = tempfile::NamedTempFile::new().unwrap();
         let contender = std::fs::OpenOptions::new()
             .read(true)

@@ -79,15 +79,24 @@ class Controls(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGTERM)
                 process.communicate(timeout=2)
 
-class CombinedControls(unittest.TestCase):
-    def test_combined_parser_retains_exact_shell_argument_identity(self):
-        parts = ["/safe/binary with ' quote", "/python3", "/home/$(touch nope)/.claude/hooks/tirith-check.py"]
-        self.assertEqual(h.combined_parts(h.combined_command(parts)), parts)
-        for command in [h.combined_command(parts) + " ; true", "TIRITH_BIN=/binary /python /hook || true", "TIRITH_BIN=relative /python /home/.claude/hooks/tirith-check.py || exit 2"]:
-            with self.assertRaises(ValueError):
-                h.combined_parts(command)
+class UserHookControls(unittest.TestCase):
+    """Explicit and recommended setup write this one command form."""
 
-    def test_combined_failure_controls_change_only_the_selected_input(self):
+    def test_user_hook_parser_retains_exact_interpreter_identity(self):
+        for interpreter in ["/usr/bin/python3", "/opt/py with ' quote/bin/python3"]:
+            for guarded in (True, False):
+                command = h.user_hook_command(interpreter, guarded)
+                self.assertEqual(h.user_hook_interpreter(command), (interpreter, guarded))
+        self.assertEqual(h.user_hook_command("/usr/bin/python3"),
+                         '/usr/bin/python3 "$HOME/.claude/hooks/tirith-check.py" || exit 2')
+        for command in [h.user_hook_command("/usr/bin/python3") + " ; true",
+                        'python3 "$HOME/.claude/hooks/tirith-check.py" || exit 2',
+                        '/usr/bin/env python3 "$HOME/.claude/hooks/tirith-check.py" || exit 2',
+                        "TIRITH_BIN=/binary /python -I -S /home/.claude/hooks/tirith-check.py || exit 2"]:
+            with self.assertRaises(ValueError):
+                h.user_hook_interpreter(command)
+
+    def test_failure_controls_change_only_the_selected_input(self):
         for case in ["interpreter-unavailable", "checker-unavailable", "checker-deadline"]:
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -96,34 +105,21 @@ class CombinedControls(unittest.TestCase):
                 hook = settings.parent / "hooks/tirith-check.py"
                 hook.parent.mkdir()
                 hook.write_text("unchanged")
-                parts = [str(root / "tirith"), "/usr/bin/python3", str(hook)]
-                settings.write_text(json.dumps({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":h.combined_command(parts)}]}]}}))
+                command = h.user_hook_command("/usr/bin/python3")
+                settings.write_text(json.dumps({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":command}]}]}}))
+                before_env = dict(env)
                 control = h.apply_control(root, env, settings, hook, case)
-                changed = h.combined_parts(json.loads(settings.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
-                index = 1 if case == "interpreter-unavailable" else 0
-                self.assertNotEqual(changed[index], parts[index])
-                self.assertEqual(changed[1-index], parts[1-index])
-                self.assertEqual(changed[2], parts[2])
+                changed = json.loads(settings.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
                 self.assertEqual(hook.read_text(), "unchanged")
-                self.assertTrue(control["configuration_mutated"])
-
-class PythonIsolation(unittest.TestCase):
-    @unittest.skipUnless(os.name == "posix" and Path("/usr/bin/python3").is_file(), "requires installed POSIX Python")
-    def test_fixed_runtime_flags_ignore_python_home_and_path_injection(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            injected = root / "injected"
-            injected.mkdir()
-            marker = root / "injection-marker"
-            (injected / "json.py").write_text(f"from pathlib import Path; Path({str(marker)!r}).write_text('executed')")
-            hook = root / ".claude/hooks/tirith-check.py"
-            hook.parent.mkdir(parents=True)
-            hook.write_text("import json; print('ISOLATED')")
-            command = h.combined_command(["/inert/tirith", "/usr/bin/python3", str(hook)])
-            result = subprocess.run(["/bin/sh", "-c", command], env={"PATH":"/usr/bin:/bin", "PYTHONHOME":str(root/"missing"), "PYTHONPATH":str(injected)}, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, b"ISOLATED\n")
-            self.assertFalse(marker.exists())
+                if case == "interpreter-unavailable":
+                    self.assertEqual(h.user_hook_interpreter(changed), (str(root / "missing-python"), True))
+                    self.assertTrue(control["configuration_mutated"])
+                    self.assertEqual(env, before_env)
+                else:
+                    # The command names no checker; only the host environment changes.
+                    self.assertEqual(changed, command)
+                    self.assertFalse(control["configuration_mutated"])
+                    self.assertNotEqual(env["TIRITH_BIN"], before_env["TIRITH_BIN"])
 
 @unittest.skipUnless(os.name == "posix", "bounded fixture process groups require POSIX")
 class BoundedExecution(unittest.TestCase):
@@ -493,12 +489,12 @@ else:complete()
                     hook.parent.mkdir()
                     hook.write_text("inert hook")
                     settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command":
-                        h.combined_command([str(binary), str(hook_python), str(hook)])}]}]}}))
+                        h.user_hook_command(hook_python)}]}]}}))
                     status = {"kind": "recommended-setup", "state": "completed", "steps": [{"activation": "claude-code", "state": "applied"}]}
                     return {"exit": 0, "timed_out": False, "cleanup": {"leader_reaped": True, "output_eof": True, "process_group_exited": True}}, json.dumps(status).encode(), b""
                 return real_execute(argv, cwd, env, timeout)
             with mock.patch.object(h, "execute", side_effect=execute):
-                result = h.run_reload(binary, host, hook_python, host, hook_python)
+                result = h.run_reload(binary, host, hook_python, host)
             self.assertTrue(result["passed"], result)
             self.assertEqual(setups, [1])
             self.assertNotEqual(result["policy_before_setup_sha256"], result["published_policy_sha256"])
@@ -552,10 +548,10 @@ print(json.dumps({'type':'result','is_error':False}),flush=True)
                     hook.parent.mkdir()
                     hook.write_text("inert hook")
                     settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command":
-                        h.combined_command([str(binary), str(python), str(hook)])}]}]}}))
+                        h.user_hook_command(python)}]}]}}))
                     return ok, b"{}", b""
                 with mock.patch.object(h, "execute", side_effect=execute):
-                    result = h.run_case(binary, host, "hook-disabled", "recommended", python, host, python,
+                    result = h.run_case(binary, host, "hook-disabled", "recommended", python, host,
                                         "default-user", mcp_only=True)
                 self.assertEqual(result["passed"], connected, result)
                 self.assertEqual(result["case"], "mcp-only-access")

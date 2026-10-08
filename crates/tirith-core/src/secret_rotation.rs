@@ -518,6 +518,7 @@ mod tests {
 
     #[test]
     fn lookup_is_case_insensitive_and_rejects_unknown() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(lookup("GitHub").map(|p| p.provider), Some("github"));
         assert_eq!(lookup("  aws ").map(|p| p.provider), Some("aws"));
         assert!(lookup("bogus-provider").is_none());
@@ -969,6 +970,7 @@ mod tests {
 
     #[test]
     fn next_step_points_at_revocation_url_or_generic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let with = TriageItem {
             rule_id: "credential_in_text".to_string(),
             timestamp: "t".to_string(),

@@ -67,7 +67,9 @@ if (-not $_tirithInteractive) { return }
 
 # Give each freshly loaded shell its own correlation session, even when its
 # parent exported an ID. The double-source guard above preserves this value in
-# the same live shell. PowerShell has no strict receipt channel.
+# the same live shell. PowerShell has no strict receipt channel. This value is
+# the fallback; once the executable is resolved below, `tirith __session-id`
+# replaces its time-based part with an unpredictable one.
 $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -89,6 +91,15 @@ if ($null -eq $tirithCommand -or [string]::IsNullOrWhiteSpace($tirithCommand.Sou
     return
 }
 $global:_TIRITH_BIN = [System.IO.Path]::GetFullPath($tirithCommand.Source)
+try {
+    $tirithSessionSuffix = [string](& $global:_TIRITH_BIN __session-id 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $tirithSessionSuffix -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+        $env:TIRITH_SESSION_ID = '{0:x}-{1}' -f $PID, $tirithSessionSuffix
+    }
+} catch {
+    # Keep the fallback ID; a session label must never break the shell.
+}
+Remove-Variable tirithSessionSuffix -ErrorAction SilentlyContinue
 
 # Check for PSReadLine
 $psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
@@ -484,6 +495,24 @@ $global:TIRITH_STATUS = 'blocks'
 $env:TIRITH_INTEGRATION_VERSION = 'unknown'
 if ($global:_TIRITH_INIT_VERSION) { $env:TIRITH_INTEGRATION_VERSION = $global:_TIRITH_INIT_VERSION }
 $env:TIRITH_INTEGRATION_SHELL = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
+
+# Record that this hook loaded, so `tirith status` and `tirith doctor` can say
+# whether this terminal runs the hook of the current Tirith executable. The
+# private record names this live process and that executable; it carries no
+# secret and grants nothing. Unix only: on Windows the readout keeps the
+# inherited, unverified integration version. Failure only leaves the readout
+# `unregistered`, and the previous native exit code is kept.
+if ($PSVersionTable.PSVersion.Major -ge 6 -and -not $IsWindows) {
+    $_tirithPresenceExit = $global:LASTEXITCODE
+    try {
+        & $global:_TIRITH_BIN __hook-presence --family powershell --shell-pid $PID 2>$null 1>$null
+    } catch {
+        # Best effort: a load record must never break the shell.
+    } finally {
+        $global:LASTEXITCODE = $_tirithPresenceExit
+    }
+    Remove-Variable _tirithPresenceExit -ErrorAction SilentlyContinue
+}
 
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded

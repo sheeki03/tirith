@@ -1408,6 +1408,7 @@ mod tests {
     // and a malformed line.
     #[test]
     fn test_read_log_streaming_matches_whole_file_parse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
 
         // Two good records, a blank line (skipped, not counted), and a malformed

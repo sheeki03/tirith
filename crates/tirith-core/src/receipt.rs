@@ -129,7 +129,7 @@ impl Receipt {
             |value: &str| crate::redact::sanitize_provenance_url_with_compiled(value, compiled);
         Self {
             url: url(&self.url),
-            final_url: self.final_url.as_deref().map(&url),
+            final_url: self.final_url.as_deref().map(url),
             redirects: self.redirects.iter().map(|value| url(value)).collect(),
             sha256: self.sha256.clone(),
             size: self.size,
@@ -226,7 +226,8 @@ pub struct PublicReceipt {
 }
 
 // ===========================================================================
-// D6: tamper-evident package-firewall scan receipt
+// D6: tamper-evident package-firewall scan receipt (written by the pip
+// package firewall in earlier releases; `pkg receipt` still reads them)
 // ===========================================================================
 
 /// The schema version of [`ArtifactScanReceipt`]. Bumped when a field is added or
@@ -235,8 +236,6 @@ pub struct PublicReceipt {
 /// [`Receipt`] above (which is unversioned and describes a single fetched script):
 /// the only thing the two share is the atomic-`0600` save mechanism.
 pub const ARTIFACT_SCAN_RECEIPT_SCHEMA: u32 = 2;
-/// Npm evidence is refused by old readers through distinct publication variants.
-pub const NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA: u32 = 3;
 
 /// The build-time engine SHA, sourced from the `TIRITH_BUILD_SHA` env var when the
 /// binary is built in CI (which sets it to the commit SHA), else `"unknown"`. There
@@ -331,30 +330,24 @@ pub enum ReceiptPublicationState {
     LegacyUnspecified,
     PrivateVerified,
     Committed,
-    NpmPrivateVerified,
-    NpmCommitted,
 }
 
 impl ReceiptPublicationState {
     fn is_private_verified(self) -> bool {
-        matches!(self, Self::PrivateVerified | Self::NpmPrivateVerified)
-    }
-    fn is_committed(self) -> bool {
-        matches!(self, Self::Committed | Self::NpmCommitted)
+        self == Self::PrivateVerified
     }
     fn committed(self) -> Self {
-        match self {
-            Self::NpmPrivateVerified => Self::NpmCommitted,
-            _ => Self::Committed,
-        }
+        Self::Committed
     }
     fn is_legacy_unspecified(&self) -> bool {
         *self == Self::LegacyUnspecified
     }
 }
 
-/// A **new versioned, tamper-evident** receipt for one package-firewall install
-/// (PR D6).
+/// A **versioned, tamper-evident** receipt for one package-firewall install
+/// (PR D6). Earlier releases wrote these from the now-removed pip package
+/// firewall. This release has no writer; `pkg receipt` reads, lists and verifies
+/// the receipts already on disk, and the format stays readable.
 ///
 /// It records exactly what the install ran: the tirith version + engine build SHA,
 /// a redacted policy-posture hash, the threat-DB sequence the approval bound to,
@@ -364,20 +357,17 @@ impl ReceiptPublicationState {
 ///
 /// # Tamper-evidence
 ///
-/// [`Self::record`] does two things: it saves the receipt JSON to
-/// `data_dir()/receipts/<receipt_id>.json` (atomic `0600`, reusing the [`Receipt`]
-/// save discipline via [`crate::util::write_file_atomic_0600`]), AND it anchors the
-/// receipt's own content hash in the audit hash-chain
-/// ([`crate::audit::log_artifact_scan_receipt`]). The chain line carries the
-/// receipt's `content_sha256`, so editing or deleting a saved receipt is detectable
-/// against the (optionally ed25519-signed) chain. When the audit log is signed the
-/// anchor is cryptographically SIGNED ("mandatory for `pkg install`"); otherwise it
-/// is "tamper-evident" (hash-chained). The `receipt_id` is the content hash, so the
-/// receipt is content-addressed: two byte-identical receipts share one file.
+/// The removed writer saved the receipt JSON to
+/// `data_dir()/receipts/<receipt_id>.json` (atomic `0600`) and anchored the
+/// receipt's own content hash in the audit hash-chain as an `artifact_receipt`
+/// line, so editing or deleting a saved receipt is detectable against the
+/// (optionally ed25519-signed) chain. The `receipt_id` is the content hash
+/// ([`Self::compute_content_hash`]), so the receipt is content-addressed and
+/// [`Self::content_hash_matches`] detects an edited file.
 ///
 /// # Redaction contract (cross-cutting invariant 7)
 ///
-/// Every field is constructed redacted by the CALLER: the resolver / package-manager
+/// Every field was constructed redacted by the writer: the resolver / package-manager
 /// command strings must already have had any index credential stripped, the policy is
 /// recorded only as [`crate::policy::Policy::security_projection_hash`] (never the
 /// raw policy), and no machine path is stored (artifacts are sha256 only, the verdict
@@ -415,10 +405,6 @@ pub struct ArtifactScanReceipt {
     /// completion; `None` when the install failed before extraction (nothing to
     /// verify).
     pub post_install_record: Option<PostInstallRecordSummary>,
-    /// Schema-v3 npm verification. Omitted for unchanged schema-v1/v2 hashes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub npm_verification:
-        Option<crate::artifact::npm_install::receipt_evidence::NpmVerificationSummary>,
     /// The finalised install verdict, summarised (no evidence text).
     pub verdict: VerdictSummary,
     /// Whether this receipt covers a still-private verified target or a target
@@ -437,297 +423,7 @@ pub struct ArtifactScanReceipt {
     pub timestamp: String,
 }
 
-/// Why anchoring/saving a receipt could not complete.
-#[derive(Debug)]
-pub enum ReceiptError {
-    /// The in-memory receipt is not a canonical, internally consistent record.
-    /// Validation happens before any directory creation, file write, or audit
-    /// append, so this error is always side-effect free.
-    InvalidReceipt(String),
-    /// `data_dir()` could not be resolved, so there is nowhere to save.
-    NoReceiptsDir,
-    /// Creating the receipts directory or writing the receipt file failed.
-    Io(std::io::Error),
-    /// A signed chain anchor was REQUIRED (the `pkg install` "Ed25519 mandatory"
-    /// rule) but the audit log is not signed, so the receipt cannot be anchored
-    /// with a signature. The file is NOT saved in this case (fail-closed): the
-    /// caller asked for a signed receipt and we cannot produce one.
-    SignatureRequiredButUnavailable,
-    /// The chain anchor append failed (the carried string is the reason). The
-    /// receipt file may have been saved, but it is not anchored.
-    AnchorFailed(String),
-}
-
-impl std::fmt::Display for ReceiptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReceiptError::InvalidReceipt(reason) => {
-                write!(f, "refusing invalid artifact receipt: {reason}")
-            }
-            ReceiptError::NoReceiptsDir => {
-                write!(
-                    f,
-                    "cannot determine the receipts directory (data_dir unset)"
-                )
-            }
-            ReceiptError::Io(e) => write!(f, "receipt I/O failed: {e}"),
-            ReceiptError::SignatureRequiredButUnavailable => write!(
-                f,
-                "a signed receipt is required for this install but audit signing is not \
-                 configured (no audit-signing.key); refusing to record an unsigned receipt"
-            ),
-            ReceiptError::AnchorFailed(r) => {
-                write!(f, "could not anchor the receipt in the audit chain: {r}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ReceiptError {}
-
-/// The successful outcome of [`ArtifactScanReceipt::record`].
-#[derive(Debug, Clone)]
-pub struct RecordedReceipt {
-    /// The path the receipt JSON was saved to.
-    pub path: PathBuf,
-    /// Whether the audit-chain anchor was ed25519-SIGNED. `true` => the receipt is
-    /// cryptographically signed; `false` => it is "tamper-evident" (hash-chained
-    /// only). A `pkg install` surface words its output from this.
-    pub signed: bool,
-    /// `Some(reason)` when the receipt was SAVED but its audit-chain anchor could NOT
-    /// be appended (a non-fatal degrade reached only for the unsigned case, e.g. the
-    /// audit-log lock is unavailable on Windows). The receipt exists on disk but is
-    /// NOT tamper-evident-chained, so a caller that cares about audit integrity should
-    /// surface this rather than treat the install as fully anchored. `None` on a
-    /// normally-anchored receipt or a deliberately-disabled chain (those are not a
-    /// failure, so they must not look like one).
-    pub anchor_warning: Option<String>,
-}
-
-/// Opaque proof that one canonical schema-v2 `PrivateVerified` receipt was
-/// durably saved and appended to the audit chain with an Ed25519 signature.
-///
-/// The fields are intentionally private and the type is neither serializable nor
-/// cloneable: callers can obtain it only from
-/// [`ArtifactScanReceipt::record_private_signed`]. A generic
-/// [`RecordedReceipt`] cannot be promoted back into this capability.
-#[derive(Debug)]
-pub struct RecordedPrivateReceipt {
-    receipt: ArtifactScanReceipt,
-    recorded: RecordedReceipt,
-}
-
-impl RecordedPrivateReceipt {
-    /// Content-addressed id of the signed private-verification receipt.
-    pub fn receipt_id(&self) -> &str {
-        &self.receipt.receipt_id
-    }
-
-    /// Ordinary reporting information for the saved/signed receipt.
-    pub fn recorded(&self) -> &RecordedReceipt {
-        &self.recorded
-    }
-
-    /// Discard the phase capability while retaining ordinary reporting data.
-    pub fn into_recorded(self) -> RecordedReceipt {
-        self.recorded
-    }
-
-    /// Consume the signed private capability and derive the only value that can
-    /// be recorded as the linked committed-publication phase.
-    pub fn prepare_committed(self) -> Result<PreparedCommittedReceipt, ReceiptError> {
-        let committed = self.receipt.committed_from_private()?;
-        Ok(PreparedCommittedReceipt {
-            private: self.receipt,
-            committed,
-        })
-    }
-}
-
-/// Opaque, one-shot committed receipt derived from a signed private receipt.
-/// It is not itself proof of durable commitment until [`Self::record_signed`]
-/// succeeds.
-#[derive(Debug)]
-pub struct PreparedCommittedReceipt {
-    private: ArtifactScanReceipt,
-    committed: ArtifactScanReceipt,
-}
-
-impl PreparedCommittedReceipt {
-    /// The canonical npm operation bound by this exact signed private-to-
-    /// committed derivation. Wheel receipts return None.
-    pub fn npm_operation_id(&self) -> Option<&str> {
-        self.committed
-            .npm_verification
-            .as_ref()
-            .map(|summary| summary.operation_id.as_str())
-    }
-
-    /// Content-addressed id the committed receipt will have when recorded.
-    pub fn receipt_id(&self) -> &str {
-        &self.committed.receipt_id
-    }
-
-    /// Id of the signed private receipt this committed phase links to.
-    pub fn private_receipt_id(&self) -> &str {
-        &self.private.receipt_id
-    }
-
-    /// Record and sign the linked committed receipt. The opaque private
-    /// capability is consumed, so no public `ArtifactScanReceipt` mutation or
-    /// deserialization path can invoke this sink.
-    pub fn record_signed(self) -> Result<RecordedCommittedReceipt, ReceiptError> {
-        self.committed.validate_for_record()?;
-        if !self.committed.is_committed_publication_for(&self.private) {
-            return Err(ReceiptError::InvalidReceipt(
-                "committed receipt is not the exact derivation of its signed private receipt"
-                    .to_string(),
-            ));
-        }
-        let recorded = self.committed.record_validated(true)?;
-        if !recorded.signed || recorded.anchor_warning.is_some() {
-            return Err(ReceiptError::AnchorFailed(
-                "committed receipt did not produce one signed audit anchor".to_string(),
-            ));
-        }
-        Ok(RecordedCommittedReceipt {
-            private_receipt_id: self.private.receipt_id,
-            receipt_id: self.committed.receipt_id,
-            recorded,
-        })
-    }
-}
-
-/// Opaque proof that the exact committed derivation of a signed private receipt
-/// was itself durably saved and signed in the audit chain.
-#[derive(Debug)]
-pub struct RecordedCommittedReceipt {
-    private_receipt_id: String,
-    receipt_id: String,
-    recorded: RecordedReceipt,
-}
-
-impl RecordedCommittedReceipt {
-    /// Content-addressed id of the committed receipt.
-    pub fn receipt_id(&self) -> &str {
-        &self.receipt_id
-    }
-
-    /// Content-addressed id of its signed private predecessor.
-    pub fn private_receipt_id(&self) -> &str {
-        &self.private_receipt_id
-    }
-
-    /// Ordinary reporting information for the committed receipt.
-    pub fn recorded(&self) -> &RecordedReceipt {
-        &self.recorded
-    }
-
-    /// Consume the phase proof after a checkpoint accepts it, retaining the
-    /// ordinary reporting result for user-facing output.
-    pub fn into_recorded(self) -> RecordedReceipt {
-        self.recorded
-    }
-}
-
-/// Mandatory package-install receipts are commit records, not best-effort UI
-/// state. Re-sync their containing directory with the strict helper after the
-/// atomic writer returns, because the general-purpose writer deliberately logs
-/// and swallows a trailing directory-fsync failure for compatibility callers.
-fn sync_mandatory_receipt_entry(path: &std::path::Path) -> std::io::Result<()> {
-    crate::util::fsync_parent_dir(path)
-}
-
 impl ArtifactScanReceipt {
-    /// Assemble a receipt from already-redacted inputs and stamp its content hash +
-    /// timestamp. The caller is responsible for redacting `resolver_command` /
-    /// `resolver_version` / `package_manager_version` (strip any index credential)
-    /// and for passing `policy_hash` from
-    /// [`crate::policy::Policy::security_projection_hash`]; this constructor sorts
-    /// the artifact hashes, fills the schema + timestamp, and computes the
-    /// content-addressed `receipt_id`. New receipts begin in
-    /// [`ReceiptPublicationState::PrivateVerified`]. Enforcing callers obtain a
-    /// signed [`RecordedPrivateReceipt`] and consume that capability through
-    /// [`RecordedPrivateReceipt::prepare_committed`] only after durable,
-    /// identity-verified target publication.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        tirith_version: String,
-        policy_hash: String,
-        threat_db_sequence: u64,
-        resolver_command: String,
-        resolver_version: String,
-        package_manager_version: String,
-        capsule: CapsuleReceipt,
-        artifact_sha256: Vec<String>,
-        post_install_record: Option<PostInstallRecordSummary>,
-        verdict: VerdictSummary,
-    ) -> Self {
-        let mut artifact_sha256 = artifact_sha256;
-        artifact_sha256.sort();
-        artifact_sha256.dedup();
-        let mut receipt = ArtifactScanReceipt {
-            schema: ARTIFACT_SCAN_RECEIPT_SCHEMA,
-            receipt_id: String::new(),
-            tirith_version,
-            engine_build_sha: engine_build_sha().to_string(),
-            policy_hash,
-            threat_db_sequence,
-            resolver_command,
-            resolver_version,
-            package_manager_version,
-            capsule,
-            artifact_sha256,
-            post_install_record,
-            npm_verification: None,
-            verdict,
-            publication_state: ReceiptPublicationState::PrivateVerified,
-            private_receipt_id: None,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
-        receipt.receipt_id = receipt.compute_content_hash();
-        receipt
-    }
-
-    /// Construct npm evidence only from a current retained tree witness. Node,
-    /// runtime pack, TGZ/manifest and exact output identities enter the same
-    /// signed private-to-committed chain. No wheel RECORD claim is synthesized.
-    pub fn new_npm(
-        policy_hash: String,
-        threat_db_sequence: u64,
-        capsule: CapsuleReceipt,
-        evidence: crate::artifact::npm_install::receipt_evidence::VerifiedNpmReceiptEvidence,
-        verdict: VerdictSummary,
-    ) -> Result<Self, ReceiptError> {
-        let summary = evidence.summary;
-        summary
-            .validate_stored()
-            .map_err(|error| ReceiptError::InvalidReceipt(error.into()))?;
-        let artifacts = summary
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.artifact_sha256.clone())
-            .collect();
-        let mut receipt = Self::new(
-            env!("CARGO_PKG_VERSION").into(),
-            policy_hash,
-            threat_db_sequence,
-            "local_npm_leaf_artifacts".into(),
-            "1".into(),
-            summary.npm_version.clone(),
-            capsule,
-            artifacts,
-            None,
-            verdict,
-        );
-        receipt.schema = NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA;
-        receipt.publication_state = ReceiptPublicationState::NpmPrivateVerified;
-        receipt.npm_verification = Some(summary);
-        receipt.receipt_id = receipt.compute_content_hash();
-        receipt.validate_for_record()?;
-        Ok(receipt)
-    }
-
     /// Publication phase carried by this persisted receipt.
     pub fn publication_state(&self) -> ReceiptPublicationState {
         self.publication_state
@@ -736,41 +432,6 @@ impl ArtifactScanReceipt {
     /// Signed private receipt linked by a committed receipt, when present.
     pub fn private_receipt_id(&self) -> Option<&str> {
         self.private_receipt_id.as_deref()
-    }
-
-    /// Derive the committed-publication receipt from an intact versioned private
-    /// receipt. The returned receipt has a fresh timestamp/content id and embeds
-    /// the private receipt id, so the two signed audit anchors form an explicit
-    /// prepare -> commit chain without mutating either content-addressed record.
-    /// This is deliberately private: only an opaque [`RecordedPrivateReceipt`]
-    /// may reach it.
-    fn committed_from_private(&self) -> Result<Self, ReceiptError> {
-        self.validate_for_record()?;
-        if !matches!(
-            self.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !self.publication_state.is_private_verified()
-            || self.private_receipt_id.is_some()
-        {
-            return Err(ReceiptError::InvalidReceipt(
-                "committed receipt requires one unlinked supported private-verification receipt"
-                    .to_string(),
-            ));
-        }
-        if !self.content_hash_matches() {
-            return Err(ReceiptError::InvalidReceipt(
-                "private_verified receipt content does not match its content-addressed id"
-                    .to_string(),
-            ));
-        }
-
-        let mut committed = self.clone();
-        committed.publication_state = self.publication_state.committed();
-        committed.private_receipt_id = Some(self.receipt_id.clone());
-        committed.timestamp = chrono::Utc::now().to_rfc3339();
-        committed.receipt_id.clear();
-        committed.receipt_id = committed.compute_content_hash();
-        Ok(committed)
     }
 
     /// Verify that this is the exact committed derivation of `private`. This
@@ -782,11 +443,9 @@ impl ArtifactScanReceipt {
     /// This proves the content linkage only. The caller must separately verify
     /// both receipts' mandatory signed audit anchors.
     pub fn is_committed_publication_for(&self, private: &Self) -> bool {
-        if !matches!(
-            private.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !private.publication_state.is_private_verified()
-            || private.validate_for_record().is_err()
+        if private.schema != ARTIFACT_SCAN_RECEIPT_SCHEMA
+            || !private.publication_state.is_private_verified()
+            || private.validate_structure().is_err()
             || private.private_receipt_id.is_some()
             || !private.content_hash_matches()
         {
@@ -835,278 +494,51 @@ impl ArtifactScanReceipt {
         self.receipt_id == self.compute_content_hash()
     }
 
-    /// Validate every invariant needed before a receipt can influence the
-    /// filesystem or signed audit chain. Deserialization intentionally remains
-    /// backward-compatible and permissive enough to inspect old/corrupt files;
-    /// this mutation boundary is strict and side-effect free.
-    fn validate_for_record(&self) -> Result<(), ReceiptError> {
-        validate_sha256(&self.receipt_id).map_err(ReceiptError::InvalidReceipt)?;
+    /// Validate every structural invariant a canonical receipt satisfies.
+    /// Deserialization intentionally remains backward-compatible and permissive
+    /// enough to inspect old/corrupt files; this check is strict and side-effect
+    /// free.
+    fn validate_structure(&self) -> Result<(), String> {
+        validate_sha256(&self.receipt_id)?;
         if !self.content_hash_matches() {
-            return Err(ReceiptError::InvalidReceipt(
-                "receipt_id does not match the canonical receipt content".to_string(),
-            ));
+            return Err("receipt_id does not match the canonical receipt content".to_string());
         }
 
-        self.validate_npm_evidence()?;
         match (self.schema, self.publication_state) {
             (1, ReceiptPublicationState::LegacyUnspecified) => {
                 if self.private_receipt_id.is_some() {
-                    return Err(ReceiptError::InvalidReceipt(
-                        "schema-v1 receipt cannot carry a private receipt link".to_string(),
-                    ));
+                    return Err("schema-v1 receipt cannot carry a private receipt link".to_string());
                 }
             }
-            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::PrivateVerified)
-            | (NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::NpmPrivateVerified) => {
+            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::PrivateVerified) => {
                 if self.private_receipt_id.is_some() {
-                    return Err(ReceiptError::InvalidReceipt(
-                        "private_verified receipt cannot carry a predecessor link".to_string(),
-                    ));
+                    return Err(
+                        "private_verified receipt cannot carry a predecessor link".to_string()
+                    );
                 }
             }
-            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::Committed)
-            | (NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::NpmCommitted) => {
+            (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::Committed) => {
                 let private_id = self.private_receipt_id.as_deref().ok_or_else(|| {
-                    ReceiptError::InvalidReceipt(
-                        "committed receipt is missing its signed private predecessor".to_string(),
-                    )
+                    "committed receipt is missing its signed private predecessor".to_string()
                 })?;
                 validate_sha256(private_id).map_err(|reason| {
-                    ReceiptError::InvalidReceipt(format!(
-                        "committed receipt has an invalid private receipt id: {reason}"
-                    ))
+                    format!("committed receipt has an invalid private receipt id: {reason}")
                 })?;
                 if private_id == self.receipt_id {
-                    return Err(ReceiptError::InvalidReceipt(
-                        "committed receipt cannot link to itself".to_string(),
-                    ));
+                    return Err("committed receipt cannot link to itself".to_string());
                 }
             }
             (ARTIFACT_SCAN_RECEIPT_SCHEMA, ReceiptPublicationState::LegacyUnspecified) => {
-                return Err(ReceiptError::InvalidReceipt(
-                    "schema-v2 receipt must declare private_verified or committed publication state"
-                        .to_string(),
-                ));
+                return Err("schema-v2 receipt must declare private_verified or committed publication state".to_string());
             }
             (1, _) => {
-                return Err(ReceiptError::InvalidReceipt(
-                    "schema-v1 receipt cannot claim a publication phase".to_string(),
-                ));
+                return Err("schema-v1 receipt cannot claim a publication phase".to_string());
             }
             (schema, _) => {
-                return Err(ReceiptError::InvalidReceipt(format!(
-                    "unsupported artifact receipt schema {schema}"
-                )));
+                return Err(format!("unsupported artifact receipt schema {schema}"));
             }
         }
         Ok(())
-    }
-
-    fn validate_npm_evidence(&self) -> Result<(), ReceiptError> {
-        let reject = |reason: &str| ReceiptError::InvalidReceipt(reason.into());
-        let Some(summary) = &self.npm_verification else {
-            if self.schema == NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-                || matches!(
-                    self.publication_state,
-                    ReceiptPublicationState::NpmPrivateVerified
-                        | ReceiptPublicationState::NpmCommitted
-                )
-            {
-                return Err(reject("npm receipt is missing its verified-tree evidence"));
-            }
-            return Ok(());
-        };
-        if self.schema != NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-            || !matches!(
-                self.publication_state,
-                ReceiptPublicationState::NpmPrivateVerified | ReceiptPublicationState::NpmCommitted
-            )
-            || self.post_install_record.is_some()
-        {
-            return Err(reject(
-                "npm and wheel receipt schemas or evidence cannot be mixed",
-            ));
-        }
-        summary.validate_stored().map_err(reject)?;
-        let hashes: Vec<_> = summary
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.artifact_sha256.clone())
-            .collect();
-        let coverage = self.capsule.coverage;
-        if hashes != self.artifact_sha256
-            || self.package_manager_version != summary.npm_version
-            || self.resolver_command != "local_npm_leaf_artifacts"
-            || self.resolver_version != "1"
-            || self.capsule.backend_id != "landlock-seccomp"
-            || !(coverage.fs_read_enforced
-                && coverage.fs_write_enforced
-                && coverage.exec_limited
-                && coverage.network_raw_denied
-                && coverage.resource_limits_enforced
-                && coverage.env_isolated
-                && coverage.handles_isolated)
-            || !matches!(self.verdict.action.as_str(), "Allow" | "Warn")
-        {
-            return Err(reject(
-                "npm receipt has inconsistent artifacts, runtime, verdict or containment",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Save the receipt to `data_dir()/receipts/<receipt_id>.json` (atomic `0600`)
-    /// AND anchor its content hash in the audit hash-chain.
-    ///
-    /// `require_signature` enforces the D6 "Ed25519 mandatory for `pkg install`"
-    /// rule: when `true` and audit signing is NOT available, this fails closed with
-    /// [`ReceiptError::SignatureRequiredButUnavailable`] and writes NOTHING. When
-    /// `false`, an unsigned (still hash-chained, "tamper-evident") anchor is
-    /// acceptable. On success it returns the saved path and whether the anchor was
-    /// signed.
-    ///
-    /// Order: the file is saved first, its directory entry is strictly synced when
-    /// a signature is mandatory, then the chain anchor is appended. A mandatory
-    /// sync failure is [`ReceiptError::Io`]; an anchor failure is
-    /// [`ReceiptError::AnchorFailed`] (the file exists but is unanchored). For the
-    /// unsigned case a failed anchor degrades to a saved-but-unanchored receipt
-    /// (`signed: false`), like a disabled chain, so a platform that cannot take the
-    /// audit-log lock (Windows) still produces a receipt rather than blocking install.
-    ///
-    /// When a signature is mandatory, "logging is off" (`TIRITH_LOG=0`, the anchor is
-    /// [`crate::audit::ReceiptAnchor::Skipped`]) is ALSO fail-closed: even with a
-    /// signing key present, a `pkg install` that asked for a signed, anchored receipt
-    /// must not accept a config that anchors and signs nothing. Only the
-    /// `require_signature = false` path treats `Skipped` as an acceptable
-    /// (unsigned/unanchored) outcome.
-    pub fn record(&self, require_signature: bool) -> Result<RecordedReceipt, ReceiptError> {
-        self.validate_for_record()?;
-        if self.publication_state.is_committed() {
-            return Err(ReceiptError::InvalidReceipt(
-                "committed receipts require a signed RecordedPrivateReceipt capability".to_string(),
-            ));
-        }
-        self.record_validated(require_signature)
-    }
-
-    /// Record this versioned private-verification receipt with a mandatory signed
-    /// audit anchor and return the opaque capability required for committed
-    /// publication. A generic [`Self::record`] result cannot be upgraded into this
-    /// proof.
-    pub fn record_private_signed(&self) -> Result<RecordedPrivateReceipt, ReceiptError> {
-        self.validate_for_record()?;
-        if !matches!(
-            self.schema,
-            ARTIFACT_SCAN_RECEIPT_SCHEMA | NPM_ARTIFACT_SCAN_RECEIPT_SCHEMA
-        ) || !self.publication_state.is_private_verified()
-            || self.private_receipt_id.is_some()
-        {
-            return Err(ReceiptError::InvalidReceipt(
-                "private recording proof requires one unlinked supported private-verification receipt"
-                    .to_string(),
-            ));
-        }
-        let recorded = self.record_validated(true)?;
-        if !recorded.signed || recorded.anchor_warning.is_some() {
-            return Err(ReceiptError::AnchorFailed(
-                "private receipt did not produce one signed audit anchor".to_string(),
-            ));
-        }
-        Ok(RecordedPrivateReceipt {
-            receipt: self.clone(),
-            recorded,
-        })
-    }
-
-    /// Side-effecting sink shared only by already-validated public/private and
-    /// opaque committed paths.
-    fn record_validated(&self, require_signature: bool) -> Result<RecordedReceipt, ReceiptError> {
-        // Fail closed BEFORE writing anything if a signature is mandatory but
-        // unavailable: a `pkg install` that asked for a signed receipt must not get
-        // a saved-but-unsigned one.
-        if require_signature && !crate::audit::audit_signing_available() {
-            return Err(ReceiptError::SignatureRequiredButUnavailable);
-        }
-
-        let dir = receipts_dir().ok_or(ReceiptError::NoReceiptsDir)?;
-        crate::util::create_dir_durable(&dir).map_err(ReceiptError::Io)?;
-        let path = dir.join(format!("{}.json", self.receipt_id));
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            ReceiptError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
-        crate::util::write_file_atomic_0600(&path, json.as_bytes()).map_err(ReceiptError::Io)?;
-        if require_signature {
-            sync_mandatory_receipt_entry(&path).map_err(ReceiptError::Io)?;
-        }
-
-        // Anchor the content hash in the chain. The chain line carries the verdict
-        // action + rule ids + the receipt id/hash; no secret is recorded.
-        match crate::audit::log_artifact_scan_receipt(
-            &self.receipt_id,
-            &self.receipt_id,
-            &self.verdict.action,
-            &self.verdict.rule_ids,
-        ) {
-            crate::audit::ReceiptAnchor::Recorded { signed: false } if require_signature => {
-                // The signing key can disappear or become unusable between the
-                // preflight above and the locked append. Never let that race turn
-                // a mandatory signed phase receipt into an accepted unsigned
-                // anchor. The saved file/unsigned chain entry remain forensic
-                // evidence, but the caller must fail closed.
-                Err(ReceiptError::AnchorFailed(
-                    "audit anchor was written without the required ed25519 signature".to_string(),
-                ))
-            }
-            crate::audit::ReceiptAnchor::Recorded { signed } => Ok(RecordedReceipt {
-                path,
-                signed,
-                anchor_warning: None,
-            }),
-            // No chain at all (logging off). When a SIGNED anchor is mandatory this is
-            // fatal: "logging is off" is not an acceptable reason to skip the chain a
-            // `pkg install` demanded. The signing key may be present (so the key-absence
-            // gate above passed), yet with `TIRITH_LOG=0` nothing is anchored or signed,
-            // and the caller would otherwise print "tamper-evident" + exit 0 over an
-            // unsigned, unanchored receipt. Fail closed instead, mirroring the
-            // key-absent refusal. (The file was already saved above; it is left on disk
-            // but the install does NOT succeed.)
-            crate::audit::ReceiptAnchor::Skipped if require_signature => {
-                Err(ReceiptError::SignatureRequiredButUnavailable)
-            }
-            // No chain at all (logging off) and a signature is NOT mandatory. The file is
-            // saved; report it as unsigned/unanchored so the caller does not over-claim
-            // tamper-evidence. This is a deliberate config choice, NOT a failure, so no
-            // anchor_warning.
-            crate::audit::ReceiptAnchor::Skipped => Ok(RecordedReceipt {
-                path,
-                signed: false,
-                anchor_warning: None,
-            }),
-            // The receipt file is saved but the chain anchor could not be appended.
-            // When a signature is mandatory this is fatal. Otherwise (unsigned /
-            // tamper-evident acceptable) it degrades like `Skipped`: report the
-            // saved-but-unanchored receipt rather than failing the whole install. This
-            // is the path a platform that cannot take the audit-log lock (Windows
-            // `fs2` denies locking an append handle) takes, so `tirith pkg install`
-            // still produces a receipt there instead of hard-failing.
-            crate::audit::ReceiptAnchor::Failed(reason) => {
-                if require_signature {
-                    Err(ReceiptError::AnchorFailed(reason))
-                } else {
-                    // Never SILENTLY swallow the anchor failure: log it AND record it
-                    // on the result, so the caller can surface the degraded (saved but
-                    // unanchored) state instead of reporting a fully-anchored install.
-                    eprintln!(
-                        "tirith: package receipt saved but could not be audit-anchored: {reason}"
-                    );
-                    Ok(RecordedReceipt {
-                        path,
-                        signed: false,
-                        anchor_warning: Some(reason),
-                    })
-                }
-            }
-        }
     }
 
     /// Load a bounded saved receipt whose embedded identity matches its file stem.
@@ -1529,11 +961,11 @@ mod tests {
         legacy.schema = 1;
         legacy.publication_state = ReceiptPublicationState::LegacyUnspecified;
         legacy.timestamp = "2026-01-01T00:00:00Z".into();
-        let mut npm = sample_npm_receipt();
-        npm.timestamp = "2026-01-03T00:00:00Z".into();
+        let mut committed = committed_from_private(&sample_receipt()).unwrap();
+        committed.timestamp = "2026-01-03T00:00:00Z".into();
         let mut wheel = sample_receipt();
         wheel.timestamp = "2026-01-02T00:00:00Z".into();
-        let mut artifacts = [legacy, npm, wheel];
+        let mut artifacts = [legacy, committed, wheel];
         for receipt in &mut artifacts {
             receipt.receipt_id = receipt.compute_content_hash();
             fs::write(
@@ -1585,7 +1017,7 @@ mod tests {
         let loaded = ArtifactScanReceipt::load(&receipt.receipt_id).unwrap();
         assert_eq!(loaded, receipt);
         assert!(!loaded.content_hash_matches());
-        assert!(loaded.validate_for_record().is_err());
+        assert!(loaded.validate_structure().is_err());
     }
 
     #[test]
@@ -1628,6 +1060,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_receipt_save_permissions_0600() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1717,73 +1150,79 @@ mod tests {
         assert!(!round_trip.coverage.resource_limits_enforced);
     }
 
-    /// A receipt assembled from already-redacted inputs.
+    /// A schema-v2 `private_verified` receipt as the removed install writer
+    /// produced it (sorted artifact hashes, stamped schema, content-addressed id).
     fn sample_receipt() -> ArtifactScanReceipt {
-        ArtifactScanReceipt::new(
-            "0.3.3".to_string(),
-            "deadbeef".repeat(8), // a stand-in policy hash
-            42,
-            "uv pip compile --generate-hashes --no-build".to_string(),
-            "uv 0.4.0".to_string(),
-            "pip 24.0".to_string(),
-            sample_capsule(),
-            vec!["b".repeat(64), "a".repeat(64)], // out of order -> sorted by new()
-            Some(PostInstallRecordSummary {
+        let mut receipt = ArtifactScanReceipt {
+            schema: ARTIFACT_SCAN_RECEIPT_SCHEMA,
+            receipt_id: String::new(),
+            tirith_version: "0.3.3".to_string(),
+            engine_build_sha: engine_build_sha().to_string(),
+            policy_hash: "deadbeef".repeat(8), // a stand-in policy hash
+            threat_db_sequence: 42,
+            resolver_command: "uv pip compile --generate-hashes --no-build".to_string(),
+            resolver_version: "uv 0.4.0".to_string(),
+            package_manager_version: "pip 24.0".to_string(),
+            capsule: sample_capsule(),
+            artifact_sha256: vec!["a".repeat(64), "b".repeat(64)],
+            post_install_record: Some(PostInstallRecordSummary {
                 blocked: false,
                 distributions_verified: 1,
                 distributions_not_found: 0,
                 records_missing: 0,
                 hash_mismatches: 0,
             }),
-            VerdictSummary {
+            verdict: VerdictSummary {
                 action: "Allow".to_string(),
                 rule_ids: vec![],
                 finding_count: 0,
             },
-        )
+            publication_state: ReceiptPublicationState::PrivateVerified,
+            private_receipt_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        receipt.receipt_id = receipt.compute_content_hash();
+        receipt
     }
 
-    fn sample_npm_receipt() -> ArtifactScanReceipt {
-        use crate::artifact::npm_install::{receipt_evidence::*, tools};
-        let summary = NpmVerificationSummary {
-            schema_version: 1,
-            contract: "LocalLeafNoScriptsV1".into(),
-            operation_id: "cd21c4d7-018e-4730-93c7-ef4bbba50c54".into(),
-            node_version: tools::NODE_VERSION.into(),
-            node_sha256: tools::NODE_SHA256.into(),
-            npm_version: tools::NPM_VERSION.into(),
-            npm_tree_sha256: tools::NPM_TREE_SHA256.into(),
-            runtime_pack_sha256: "c".repeat(64),
-            artifacts: vec![NpmArtifactVerification {
-                artifact_sha256: "a".repeat(64),
-                manifest_sha256: "b".repeat(64),
-            }],
-            output_tree_sha256: "d".repeat(64),
-            files_verified: 3,
-            directories_verified: 2,
-            bytes_verified: 512,
-            lifecycle_scripts: NpmLifecycleMode::Disabled,
-            dependency_graph: NpmDependencyGraph::LocalLeafOnly,
-            code_safety: NpmCodeSafety::NotEstablished,
-        };
-        ArtifactScanReceipt::new_npm(
-            "e".repeat(64),
-            42,
-            sample_capsule(),
-            VerifiedNpmReceiptEvidence { summary },
-            VerdictSummary {
-                action: "Allow".into(),
-                rule_ids: vec![],
-                finding_count: 0,
-            },
+    /// The committed-publication receipt the removed writer derived from an
+    /// intact private receipt: fresh timestamp and content id, linked by
+    /// `private_receipt_id`. Kept as a fixture so the reader-side linkage check
+    /// ([`ArtifactScanReceipt::is_committed_publication_for`]) stays covered.
+    fn committed_from_private(
+        private: &ArtifactScanReceipt,
+    ) -> Result<ArtifactScanReceipt, String> {
+        private.validate_structure()?;
+        if private.schema != ARTIFACT_SCAN_RECEIPT_SCHEMA
+            || private.publication_state != ReceiptPublicationState::PrivateVerified
+            || private.private_receipt_id.is_some()
+        {
+            return Err("committed receipt requires one unlinked private receipt".to_string());
+        }
+        let mut committed = private.clone();
+        committed.publication_state = ReceiptPublicationState::Committed;
+        committed.private_receipt_id = Some(private.receipt_id.clone());
+        committed.timestamp = chrono::Utc::now().to_rfc3339();
+        committed.receipt_id.clear();
+        committed.receipt_id = committed.compute_content_hash();
+        Ok(committed)
+    }
+
+    /// Save `receipt` where the removed writer put it, under the isolated data dir.
+    fn store_fixture(receipt: &ArtifactScanReceipt) {
+        let directory = receipts_dir().expect("isolated receipt directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::util::write_file_atomic_0600(
+            &directory.join(format!("{}.json", receipt.receipt_id)),
+            serde_json::to_string_pretty(receipt).unwrap().as_bytes(),
         )
-        .unwrap()
+        .unwrap();
     }
 
     #[test]
     fn wheel_v1_v2_canonical_hashes_remain_byte_compatible() {
-        // Fixed hashes predate the optional npm field and use the original
-        // wheel JSON shape. A newly serialized null field would break them.
+        // Fixed hashes pin the original wheel JSON shape. A newly serialized
+        // field would break them.
         for (schema, phase, expected) in [
             (
                 2,
@@ -1804,164 +1243,10 @@ mod tests {
             receipt.receipt_id = receipt.compute_content_hash();
             assert_eq!(receipt.receipt_id, expected);
             let value = serde_json::to_value(&receipt).unwrap();
-            assert!(value.get("npm_verification").is_none());
             let decoded: ArtifactScanReceipt = serde_json::from_value(value).unwrap();
             assert_eq!(decoded, receipt);
-            decoded.validate_for_record().unwrap();
+            decoded.validate_structure().unwrap();
         }
-    }
-
-    #[test]
-    fn npm_receipts_roundtrip_and_bind_all_runtime_and_output_identities() {
-        let private = sample_npm_receipt();
-        let encoded = serde_json::to_string(&private).unwrap();
-        let decoded: ArtifactScanReceipt = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(private, decoded);
-        assert!(decoded.content_hash_matches());
-        assert!(decoded.post_install_record.is_none());
-        let committed = decoded.committed_from_private().unwrap();
-        assert_eq!(
-            committed.publication_state(),
-            ReceiptPublicationState::NpmCommitted
-        );
-        assert!(committed.is_committed_publication_for(&private));
-        assert_eq!(committed.npm_verification, private.npm_verification);
-        for field in [
-            "node_sha256",
-            "npm_tree_sha256",
-            "runtime_pack_sha256",
-            "output_tree_sha256",
-        ] {
-            let mut changed = serde_json::to_value(&private).unwrap();
-            changed["npm_verification"][field] = serde_json::Value::String("f".repeat(64));
-            let changed: ArtifactScanReceipt = serde_json::from_value(changed).unwrap();
-            assert!(
-                !changed.content_hash_matches(),
-                "{field} must remain hash-bound"
-            );
-        }
-        let mut changed = committed.clone();
-        changed.npm_verification.as_mut().unwrap().artifacts[0].manifest_sha256 = "f".repeat(64);
-        changed.receipt_id = changed.compute_content_hash();
-        assert!(!changed.is_committed_publication_for(&private));
-    }
-
-    #[test]
-    fn old_publication_readers_refuse_both_npm_phases() {
-        // Exact pre-extension enum vocabulary; serde must not treat npm data as
-        // a wheel receipt even though old structs ignore unknown extra fields.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum OldPublicationState {
-            LegacyUnspecified,
-            PrivateVerified,
-            Committed,
-        }
-        for phase in [
-            ReceiptPublicationState::NpmPrivateVerified,
-            ReceiptPublicationState::NpmCommitted,
-        ] {
-            let encoded = serde_json::to_value(phase).unwrap();
-            assert!(serde_json::from_value::<OldPublicationState>(encoded).is_err());
-        }
-        assert!(
-            serde_json::from_value::<OldPublicationState>(serde_json::json!("private_verified"))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn prepared_commitment_exposes_only_its_exact_npm_operation_identity() {
-        let private = sample_npm_receipt();
-        let expected = private
-            .npm_verification
-            .as_ref()
-            .unwrap()
-            .operation_id
-            .clone();
-        let prepared = PreparedCommittedReceipt {
-            committed: private.committed_from_private().unwrap(),
-            private,
-        };
-        assert_eq!(prepared.npm_operation_id(), Some(expected.as_str()));
-        assert_ne!(prepared.receipt_id(), prepared.private_receipt_id());
-        let private = sample_receipt();
-        let wheel = PreparedCommittedReceipt {
-            committed: private.committed_from_private().unwrap(),
-            private,
-        };
-        assert_eq!(wheel.npm_operation_id(), None);
-    }
-
-    #[test]
-    fn npm_mixed_schema_phase_runtime_and_incomplete_claims_are_refused() {
-        let changes: &[fn(&mut ArtifactScanReceipt)] = &[
-            |r| r.schema = 2,
-            |r| r.schema = 1,
-            |r| r.npm_verification = None,
-            |r| r.publication_state = ReceiptPublicationState::PrivateVerified,
-            |r| r.publication_state = ReceiptPublicationState::Committed,
-            |r| r.publication_state = ReceiptPublicationState::NpmCommitted,
-            |r| r.post_install_record = sample_receipt().post_install_record,
-            |r| r.artifact_sha256[0] = "f".repeat(64),
-            |r| r.package_manager_version = "unbound".into(),
-            |r| r.resolver_command = "npm install".into(),
-            |r| r.resolver_version = "2".into(),
-            |r| r.capsule.backend_id = "noop".into(),
-            |r| r.capsule.coverage.fs_read_enforced = false,
-            |r| r.capsule.coverage.fs_write_enforced = false,
-            |r| r.capsule.coverage.exec_limited = false,
-            |r| r.capsule.coverage.network_raw_denied = false,
-            |r| r.capsule.coverage.resource_limits_enforced = false,
-            |r| r.capsule.coverage.env_isolated = false,
-            |r| r.capsule.coverage.handles_isolated = false,
-            |r| r.verdict.action = "Block".into(),
-            |r| r.npm_verification.as_mut().unwrap().node_sha256 = "f".repeat(64),
-            |r| r.npm_verification.as_mut().unwrap().runtime_pack_sha256 = "UPPERCASE".into(),
-            |r| r.npm_verification.as_mut().unwrap().files_verified = 0,
-            |r| r.npm_verification.as_mut().unwrap().bytes_verified = 0,
-            |r| {
-                let summary = r.npm_verification.as_mut().unwrap();
-                summary.files_verified = 20_000;
-                summary.directories_verified = 1;
-            },
-            |r| r.npm_verification.as_mut().unwrap().artifacts.clear(),
-        ];
-        for (index, change) in changes.iter().enumerate() {
-            let mut receipt = sample_npm_receipt();
-            change(&mut receipt);
-            receipt.receipt_id = receipt.compute_content_hash();
-            assert!(receipt.content_hash_matches());
-            assert!(receipt.validate_for_record().is_err(), "case {index}");
-            assert!(receipt.committed_from_private().is_err(), "case {index}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn npm_signed_chain_preserves_verified_summary_and_refuses_forged_commit() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "1");
-        plant_signing_key(&root.path().join("tirith"));
-        let private = sample_npm_receipt();
-        let forged = private.committed_from_private().unwrap();
-        assert!(matches!(
-            forged.record(false),
-            Err(ReceiptError::InvalidReceipt(_))
-        ));
-        assert!(!receipts_dir().unwrap().exists());
-        assert!(!crate::audit::audit_log_path().unwrap().exists());
-        let proof = private.record_private_signed().unwrap();
-        let committed = proof.prepare_committed().unwrap().record_signed().unwrap();
-        assert!(committed.recorded().signed);
-        let loaded = ArtifactScanReceipt::load(committed.receipt_id()).unwrap();
-        assert!(loaded.is_committed_publication_for(&private));
-        assert_eq!(loaded.npm_verification, private.npm_verification);
-        assert_eq!(
-            loaded.publication_state(),
-            ReceiptPublicationState::NpmCommitted
-        );
     }
 
     #[test]
@@ -1981,16 +1266,15 @@ mod tests {
         );
         assert!(r.private_receipt_id().is_none());
         assert!(!r.is_committed_publication_for(&r));
-        // Artifact hashes were sorted by new().
+        // Artifact hashes are stored sorted.
         assert_eq!(r.artifact_sha256, vec!["a".repeat(64), "b".repeat(64)]);
     }
 
     #[test]
     fn committed_receipt_links_exact_private_receipt() {
         let private = sample_receipt();
-        let committed = private
-            .committed_from_private()
-            .expect("derive linked committed publication receipt");
+        let committed =
+            committed_from_private(&private).expect("derive linked committed publication receipt");
 
         assert_eq!(
             committed.publication_state(),
@@ -2003,7 +1287,7 @@ mod tests {
         assert_ne!(committed.receipt_id, private.receipt_id);
         assert!(committed.content_hash_matches());
         assert!(committed.is_committed_publication_for(&private));
-        assert!(committed.committed_from_private().is_err());
+        assert!(committed_from_private(&committed).is_err());
 
         let mut unrelated = committed.clone();
         unrelated.private_receipt_id = Some("f".repeat(64));
@@ -2035,23 +1319,7 @@ mod tests {
         );
         assert!(loaded.content_hash_matches());
         assert!(!loaded.is_committed_publication_for(&sample_receipt()));
-        assert!(loaded.committed_from_private().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mandatory_receipt_directory_sync_is_strict() {
-        let root = tempfile::tempdir().unwrap();
-        let receipt = root.path().join("receipt.json");
-        std::fs::write(&receipt, b"fixture").unwrap();
-        sync_mandatory_receipt_entry(&receipt)
-            .expect("an existing receipt directory can be made durable");
-
-        let missing_parent = root.path().join("missing/receipt.json");
-        assert!(
-            sync_mandatory_receipt_entry(&missing_parent).is_err(),
-            "mandatory receipt durability must propagate a parent-sync failure"
-        );
+        assert!(committed_from_private(&loaded).is_err());
     }
 
     #[test]
@@ -2188,65 +1456,35 @@ mod tests {
     }
 
     #[test]
-    // Unix-only: the audit-chain anchor needs the audit-log lock, which fs2 cannot
-    // take on a Windows append handle, so the "anchor succeeds" assertions below
-    // cannot hold there. The Windows degrade (receipt saved, unanchored) is covered
-    // by the pkg_install receipt tests.
-    #[cfg(unix)]
-    fn record_saves_file_and_anchors_in_audit_chain() {
+    fn stored_artifact_receipt_loads_by_id() {
         let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        // Make sure logging is on for this test even if the ambient env set it off.
-        environment.set_env("TIRITH_LOG", "1");
+        let _environment = isolate_dirs(root.path());
 
         let r = sample_receipt();
-        // require_signature=false: an unsigned (tamper-evident) anchor is fine here.
-        let recorded = r.record(false).expect("record should save + anchor");
-        // The file is saved under the isolated data dir, named by the receipt id.
-        assert!(recorded.path.exists(), "receipt file must exist");
-        assert!(recorded
-            .path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(&r.receipt_id));
-        // No signing key configured in the isolated config dir -> unsigned anchor.
-        assert!(!recorded.signed);
-
-        // It is loadable back by id and still content-consistent.
+        store_fixture(&r);
         let loaded = ArtifactScanReceipt::load(&r.receipt_id).expect("load by id");
         assert_eq!(loaded, r);
         assert!(loaded.content_hash_matches());
 
-        // The audit chain has an `artifact_receipt` line carrying the content hash,
-        // and the chain verifies (tamper-evident).
-        let log_path = crate::audit::audit_log_path().expect("log path under isolated dir");
-        let body = std::fs::read_to_string(&log_path).expect("audit log written");
-        assert!(
-            body.contains("\"entry_type\":\"artifact_receipt\""),
-            "an artifact_receipt entry must be anchored: {body}"
+        let committed = committed_from_private(&r).unwrap();
+        store_fixture(&committed);
+        let loaded = ArtifactScanReceipt::load(&committed.receipt_id).expect("load committed");
+        assert_eq!(
+            loaded.publication_state(),
+            ReceiptPublicationState::Committed
         );
-        assert!(
-            body.contains(&r.receipt_id),
-            "the chain anchor must carry the receipt content hash"
-        );
-        let report = crate::audit::verify_audit_log(&log_path, None);
-        assert!(
-            report.ok,
-            "the audit chain must verify after anchoring: {:?}",
-            report.problems
-        );
+        assert_eq!(loaded.private_receipt_id(), Some(r.receipt_id.as_str()));
+        assert!(loaded.is_committed_publication_for(&r));
     }
 
     #[test]
-    fn record_lists_alongside_script_receipts_without_cross_parse() {
+    fn artifact_receipts_list_alongside_script_receipts_without_cross_parse() {
         let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "1");
+        let _environment = isolate_dirs(root.path());
 
         // Save one artifact-scan receipt.
         let r = sample_receipt();
-        r.record(false).unwrap();
+        store_fixture(&r);
 
         // Drop a legacy script Receipt JSON into the SAME receipts dir.
         let receipts = root.path().join("tirith").join("receipts");
@@ -2281,247 +1519,6 @@ mod tests {
         let scripts = Receipt::list().unwrap();
         assert_eq!(scripts.len(), 1, "only the one script receipt is listed");
         assert_eq!(scripts[0].sha256, "c".repeat(64));
-    }
-
-    #[test]
-    fn record_fails_closed_when_signature_required_but_unavailable() {
-        let root = tempfile::tempdir().unwrap();
-        // Isolate config so no real audit-signing.key is present -> signing
-        // unavailable.
-        let _environment = isolate_dirs(root.path());
-
-        let r = sample_receipt();
-        // require_signature=true with no signing key must fail closed and write
-        // nothing.
-        let err = r
-            .record(true)
-            .expect_err("a required-but-unavailable signature must fail closed");
-        assert!(matches!(err, ReceiptError::SignatureRequiredButUnavailable));
-        // Nothing was saved.
-        let receipts = root.path().join("tirith").join("receipts");
-        let saved = receipts.join(format!("{}.json", r.receipt_id));
-        assert!(
-            !saved.exists(),
-            "no receipt file may be saved when the mandatory signature is unavailable"
-        );
-    }
-
-    /// Write a 32-byte ed25519 signing key the way an operator must (0600,
-    /// owner-only) so `audit_signing_available()` accepts it under the isolated
-    /// config dir. A plain `fs::write` lands at the process umask (often 0644 =
-    /// group/other-readable), which the audit signing-key gate correctly refuses.
-    #[cfg(unix)]
-    fn plant_signing_key(config_dir: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(config_dir).unwrap();
-        let key = config_dir.join("audit-signing.key");
-        std::fs::write(&key, [7u8; 32]).unwrap();
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn forged_committed_receipt_is_rejected_before_write_or_anchor() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "1");
-
-        let private = sample_receipt();
-        let mut forged = private.clone();
-        forged.publication_state = ReceiptPublicationState::Committed;
-        forged.private_receipt_id = Some(private.receipt_id.clone());
-        forged.timestamp = chrono::Utc::now().to_rfc3339();
-        forged.receipt_id.clear();
-        forged.receipt_id = forged.compute_content_hash();
-        assert!(forged.content_hash_matches());
-
-        let receipt_path = receipts_dir()
-            .expect("isolated receipt directory")
-            .join(format!("{}.json", forged.receipt_id));
-        let audit_path = crate::audit::audit_log_path().expect("isolated audit path");
-        let error = forged
-            .record(false)
-            .expect_err("a public value cannot record the committed phase");
-        assert!(matches!(error, ReceiptError::InvalidReceipt(_)));
-        assert!(!receipt_path.exists(), "forged receipt must not be written");
-        assert!(!audit_path.exists(), "forged receipt must not be anchored");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unsafe_or_stale_receipt_id_is_rejected_before_write_or_anchor() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "1");
-
-        let mut forged = sample_receipt();
-        forged.receipt_id = "../../escape".to_string();
-        let audit_path = crate::audit::audit_log_path().expect("isolated audit path");
-        let error = forged
-            .record(false)
-            .expect_err("a non-canonical receipt id must fail before path construction");
-        assert!(matches!(error, ReceiptError::InvalidReceipt(_)));
-        assert!(
-            !root.path().join("escape.json").exists(),
-            "receipt id must never escape the receipt directory"
-        );
-        assert!(
-            !receipts_dir().expect("receipt path").exists(),
-            "invalid receipt must not create its storage directory"
-        );
-        assert!(!audit_path.exists(), "invalid receipt must not be anchored");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn signed_private_capability_is_required_for_committed_recording() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        let tirith_dir = root.path().join("tirith");
-        plant_signing_key(&tirith_dir);
-        environment.set_env("TIRITH_LOG", "1");
-
-        let private = sample_receipt();
-        let private_id = private.receipt_id.clone();
-        let private_proof = private
-            .record_private_signed()
-            .expect("private phase must be saved and signed");
-        assert_eq!(private_proof.receipt_id(), private_id);
-        assert!(private_proof.recorded().signed);
-
-        let committed = private_proof
-            .prepare_committed()
-            .expect("signed private proof can derive committed phase");
-        let committed_id = committed.receipt_id().to_string();
-        assert_eq!(committed.private_receipt_id(), private_id);
-        let committed_proof = committed
-            .record_signed()
-            .expect("linked committed phase must be saved and signed");
-        assert_eq!(committed_proof.private_receipt_id(), private_id);
-        assert_eq!(committed_proof.receipt_id(), committed_id);
-        assert!(committed_proof.recorded().signed);
-
-        let loaded = ArtifactScanReceipt::load(&committed_id).expect("load committed receipt");
-        assert_eq!(
-            loaded.publication_state(),
-            ReceiptPublicationState::Committed
-        );
-        assert_eq!(loaded.private_receipt_id(), Some(private_id.as_str()));
-        assert!(loaded.content_hash_matches());
-
-        let audit_path = crate::audit::audit_log_path().expect("isolated audit path");
-        let audit = std::fs::read_to_string(audit_path).expect("two signed receipt anchors");
-        assert!(audit.contains(&private_id));
-        assert!(audit.contains(&committed_id));
-        assert_eq!(
-            audit.matches("\"entry_type\":\"artifact_receipt\"").count(),
-            2,
-            "the typed two-phase flow must append exactly two receipt anchors"
-        );
-    }
-
-    /// IM1 (fail-open fix): a mandatory-signature install must NOT silently downgrade
-    /// to "unsigned, success" when `TIRITH_LOG=0`. With the signing KEY present (so
-    /// the key-absence gate passes) but logging OFF, the anchor is `Skipped` (nothing
-    /// is anchored OR signed); `record(true)` must therefore fail closed with
-    /// `SignatureRequiredButUnavailable`, exactly like the key-absent case, rather
-    /// than returning `Ok(signed: false)`.
-    #[cfg(unix)]
-    #[test]
-    fn record_fails_closed_when_signature_required_but_logging_off() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        // config_dir() == data_dir() == <root>/tirith under the isolated XDG vars.
-        let tirith_dir = root.path().join("tirith");
-        plant_signing_key(&tirith_dir);
-        // Logging OFF -> the receipt anchor is Skipped.
-        environment.set_env("TIRITH_LOG", "0");
-
-        // Sanity: the signing key IS available (so this is NOT the key-absent path).
-        assert!(
-            crate::audit::audit_signing_available(),
-            "the planted signing key must be accepted so we exercise the Skipped-under-mandatory \
-             path, not the key-absent path"
-        );
-
-        let r = sample_receipt();
-        let err = r.record(true).expect_err(
-            "a mandatory-signature install must fail closed when logging is off (anchor Skipped), \
-             never downgrade to an unsigned success",
-        );
-        assert!(
-            matches!(err, ReceiptError::SignatureRequiredButUnavailable),
-            "logging-off under a mandatory signature must map to SignatureRequiredButUnavailable, \
-             got {err:?}"
-        );
-    }
-
-    /// IM1 negative control: with the SAME logging-off config but
-    /// `require_signature = false`, `Skipped` stays an acceptable
-    /// unsigned/unanchored success (no behavior change for the non-mandatory path).
-    #[cfg(unix)]
-    #[test]
-    fn record_skipped_is_ok_unsigned_when_signature_not_required() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        environment.set_env("TIRITH_LOG", "0");
-
-        let r = sample_receipt();
-        let recorded = r
-            .record(false)
-            .expect("logging-off with no mandatory signature is an acceptable unsigned record");
-        assert!(recorded.path.exists(), "the receipt file is still saved");
-        assert!(!recorded.signed, "a skipped anchor is not signed");
-        assert!(
-            recorded.anchor_warning.is_none(),
-            "a deliberately-disabled chain is NOT a failure, so it carries no anchor_warning"
-        );
-    }
-
-    /// TG3: drive the `ReceiptAnchor::Failed -> anchor_warning: Some(_)` degrade that
-    /// the unsigned (Windows audit-log-lock) case relies on. We force a REAL append
-    /// failure by putting a DIRECTORY where the audit log file must be opened: the
-    /// append `open()` then fails (EISDIR), so the anchor is `Failed`. With
-    /// `require_signature = false` this degrades to a saved-but-unanchored receipt
-    /// (the file exists, `!signed`, and `anchor_warning` is set) instead of a hard
-    /// failure. Unix-only: the deterministic directory-at-path failure and the
-    /// audit-log lock semantics are a unix construction.
-    #[cfg(unix)]
-    #[test]
-    fn record_degrades_to_anchor_warning_when_chain_append_fails() {
-        let root = tempfile::tempdir().unwrap();
-        let mut environment = isolate_dirs(root.path());
-        // Keep logging ON so the anchor is attempted (not Skipped).
-        environment.set_env("TIRITH_LOG", "1");
-
-        // Put a DIRECTORY at the audit log path so the append open() fails (EISDIR)
-        // -> AuditWrite::Failed -> ReceiptAnchor::Failed.
-        let log_path = crate::audit::audit_log_path().expect("log path under isolated dir");
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::create_dir_all(&log_path).unwrap();
-        assert!(
-            log_path.is_dir(),
-            "the log path must be a directory to force the append failure"
-        );
-
-        let r = sample_receipt();
-        // require_signature=false: a failed anchor degrades (saved but unanchored)
-        // rather than failing the install.
-        let recorded = r
-            .record(false)
-            .expect("an unsigned receipt with a failed anchor must still save (degraded)");
-        assert!(
-            recorded.path.exists(),
-            "the receipt file must exist even when the chain anchor failed"
-        );
-        assert!(!recorded.signed, "a failed anchor is not signed");
-        assert!(
-            recorded.anchor_warning.is_some(),
-            "a failed (non-skipped) anchor must surface an anchor_warning so the caller does not \
-             over-claim tamper-evidence"
-        );
     }
 
     #[test]

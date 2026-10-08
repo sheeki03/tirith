@@ -113,15 +113,30 @@ pub fn run(action: &str) -> i32 {
 }
 
 fn enable() -> i32 {
-    let Some((shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: could not detect shell profile (set SHELL or run again with --shell)");
-        return 1;
+    let target = match detect_profile() {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("tirith output wrap: could not detect shell profile (set SHELL or run again with --shell)");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
+    let code = enable_at(target.shell, &target.profile);
+    if code == 0 {
+        if let Some(stale) = &target.stale {
+            // The wrapper now lives where the shell reads it; the old copy is
+            // only clutter, so a failure to remove it is reported, not fatal.
+            let _ = remove_stale_copy(target.shell, stale);
+        }
+    }
+    code
+}
 
+fn enable_at(shell: &str, profile: &std::path::Path) -> i32 {
     // repo-0224: only a MISSING file means "empty profile". Any other read
     // failure (invalid UTF-8, permissions, transient I/O) must abort rather
     // than replacing the real profile with just our snippet.
-    let (root, mut destination, current, _) = match read_profile_retained(&profile) {
+    let (root, mut destination, current, _) = match read_profile_retained(profile) {
         Ok(profile) => profile,
         Err(e) => {
             eprintln!(
@@ -170,7 +185,7 @@ fn enable() -> i32 {
             return 1;
         };
         let new_content = format!("{stripped}{expected}");
-        if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes())
+        if let Err(e) = publish_profile(&root, profile, destination.take(), new_content.as_bytes())
         {
             eprintln!(
                 "tirith output wrap: failed to repair {}: {e}",
@@ -194,7 +209,7 @@ fn enable() -> i32 {
     let new_content = format!("{current}{separator}{snippet}");
     // Atomic write: a crash mid read-modify-write of the user's rc file must
     // never truncate or corrupt their shell config.
-    if let Err(e) = publish_profile(&root, &profile, destination.take(), new_content.as_bytes()) {
+    if let Err(e) = publish_profile(&root, profile, destination.take(), new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -219,12 +234,58 @@ fn enable() -> i32 {
 }
 
 fn disable() -> i32 {
-    let Some((_shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: could not detect shell profile");
-        return 1;
+    let target = match detect_profile() {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("tirith output wrap: could not detect shell profile");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
+    let code = disable_at(&target.profile);
+    match &target.stale {
+        Some(stale) if !remove_stale_copy(target.shell, stale) => 1,
+        _ => code,
+    }
+}
 
-    let (root, destination, current, existed) = match read_profile_retained(&profile) {
+/// Remove an older release's wrapper block from a profile the shell does not
+/// read at startup. Prints the outcome; returns false when the block remains.
+fn remove_stale_copy(shell: &str, stale: &std::path::Path) -> bool {
+    let (root, destination, current, existed) = match read_profile_retained(stale) {
+        Ok(found) => found,
+        Err(error) => {
+            print_stale_left(shell, stale, &format!("cannot read it: {error}"));
+            return false;
+        }
+    };
+    if !existed || !current.contains(BEGIN_MARKER) {
+        return true;
+    }
+    let Some(new_content) = strip_block(&current) else {
+        print_stale_left(shell, stale, "its block is missing the END marker");
+        return false;
+    };
+    if let Err(error) = publish_profile(&root, stale, destination, new_content.as_bytes()) {
+        print_stale_left(shell, stale, &format!("write failed: {error}"));
+        return false;
+    }
+    eprintln!(
+        "tirith output wrap: removed the older copy from {} ({shell} does not read that file at startup)",
+        stale.display()
+    );
+    true
+}
+
+fn print_stale_left(shell: &str, stale: &std::path::Path, reason: &str) {
+    eprintln!(
+        "tirith output wrap: an older copy remains in {}, which {shell} does not read at startup; could not remove it ({reason}). Delete the lines from `{BEGIN_MARKER}` to `{END_MARKER}` there.",
+        stale.display()
+    );
+}
+
+fn disable_at(profile: &std::path::Path) -> i32 {
+    let (root, destination, current, existed) = match read_profile_retained(profile) {
         Ok(profile) => profile,
         Err(error) => {
             eprintln!(
@@ -260,7 +321,7 @@ fn disable() -> i32 {
         return 1;
     };
     // Atomic write (see `enable`): removing the block also rewrites the rc file.
-    if let Err(e) = publish_profile(&root, &profile, destination, new_content.as_bytes()) {
+    if let Err(e) = publish_profile(&root, profile, destination, new_content.as_bytes()) {
         eprintln!(
             "tirith output wrap: failed to write {}: {e}",
             profile.display()
@@ -273,9 +334,17 @@ fn disable() -> i32 {
 }
 
 fn status() -> i32 {
-    let Some((shell, profile)) = detect_profile() else {
-        eprintln!("tirith output wrap: status — could not detect shell profile");
-        return 1;
+    let ProfileTarget {
+        shell,
+        profile,
+        stale,
+    } = match detect_profile() {
+        Ok(found) => found,
+        Err(reason) => {
+            eprintln!("tirith output wrap: status — could not detect shell profile");
+            print_profile_reason(&reason);
+            return 1;
+        }
     };
     let current = fs::read_to_string(&profile).unwrap_or_default();
     let enabled = current.contains(BEGIN_MARKER);
@@ -286,6 +355,15 @@ fn status() -> i32 {
     if enabled {
         println!("  function:  tirith-output-guard-wrap");
         println!("  alias:     tirith-out");
+    }
+    if let Some(stale) = stale {
+        println!(
+            "  older copy: {} (not loaded: {shell} does not read that file at startup;",
+            stale.display()
+        );
+        println!(
+            "             `tirith output wrap on` moves it to the profile above, `off` removes it)"
+        );
     }
     println!("  scope:     wraps INDIVIDUAL commands invoked via `tirith-out <cmd>`;");
     println!("             does NOT intercept output from commands run outside the wrapper.");
@@ -356,36 +434,379 @@ fn build_snippet(shell: &str) -> String {
     }
 }
 
-fn detect_profile() -> Option<(&'static str, PathBuf)> {
-    let home = home::home_dir()?;
-    let shell = crate::cli::init::detect_shell();
-    let profile = match shell {
+/// The profile the wrapper is written to, from the shared shell-target
+/// resolution (honours ZDOTDIR and XDG_CONFIG_HOME, and the platform's native
+/// locations). Bash uses `.bashrc`, or an existing `.bash_profile` when there
+/// is no `.bashrc`. It never uses `.profile`: sh and dash login shells read
+/// that file too and reject the snippet's hyphenated function name.
+fn profile_for(
+    shell: &str,
+    inputs: &super::shell_target::TargetInputs,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> Result<Option<PathBuf>, String> {
+    if shell == "bash" {
+        let bashrc = inputs.home.join(".bashrc");
+        let bash_profile = inputs.home.join(".bash_profile");
+        return Ok(Some(if !exists(&bashrc) && exists(&bash_profile) {
+            bash_profile
+        } else {
+            bashrc
+        }));
+    }
+    let profiles = super::shell_target::profiles_for(shell, inputs, |path| Ok(exists(path)))?;
+    Ok(profiles.first().map(|profile| profile.path.clone()))
+}
+
+/// Where releases before the shared resolution put the wrapper: fixed paths
+/// under HOME that ignored ZDOTDIR and XDG_CONFIG_HOME.
+fn legacy_profile_for(
+    shell: &str,
+    home: &std::path::Path,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    Some(match shell {
         "zsh" => home.join(".zshrc"),
         "bash" => {
             let bashrc = home.join(".bashrc");
             let bash_profile = home.join(".bash_profile");
-            if bashrc.exists() {
-                bashrc
-            } else if bash_profile.exists() {
+            if !exists(&bashrc) && exists(&bash_profile) {
                 bash_profile
             } else {
                 bashrc
             }
         }
-        "fish" => home.join(".config").join("fish").join("config.fish"),
-        "nushell" => home.join(".config").join("nushell").join("config.nu"),
-        "powershell" | "pwsh" => home
-            .join(".config")
-            .join("powershell")
-            .join("Microsoft.PowerShell_profile.ps1"),
+        "fish" => home.join(".config/fish/config.fish"),
+        "nushell" => home.join(".config/nushell/config.nu"),
+        "powershell" | "pwsh" => home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
         _ => return None,
-    };
-    Some((shell, profile))
+    })
+}
+
+/// The profile the wrapper belongs in, and a copy an older release left at a
+/// path this shell does not read at startup.
+struct ProfileTarget {
+    shell: &'static str,
+    profile: PathBuf,
+    stale: Option<PathBuf>,
+}
+
+/// The old fixed path is only stale when it is a different file from the
+/// resolved profile (the one the shell reads); then a block there is never
+/// loaded, so it is reported and cleaned up rather than treated as the active
+/// wrapper. A symlink to the resolved profile (or a path reaching it through a
+/// symlinked directory) is the same file, not a stale copy.
+fn stale_legacy_copy(
+    resolved: &std::path::Path,
+    legacy: Option<PathBuf>,
+    has_block: impl Fn(&std::path::Path) -> bool,
+    same_file: impl Fn(&std::path::Path, &std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    legacy.filter(|legacy| legacy != resolved && !same_file(legacy, resolved) && has_block(legacy))
+}
+
+/// Pick the profile for `shell`. When the shared resolution has no native
+/// location for it here (zsh and Fish on Windows, PowerShell on Windows
+/// without a Documents directory), keep the fixed path older releases used,
+/// so an existing wrapper can still be found and removed. When the old path
+/// is the resolved profile under another name (ZDOTDIR reaching HOME through
+/// a symlinked directory), use whichever name reaches the file directly,
+/// since profile edits refuse to go through a symlink.
+fn resolve_target(
+    shell: &'static str,
+    inputs: &super::shell_target::TargetInputs,
+    files: &impl ProfileFiles,
+) -> Result<ProfileTarget, String> {
+    let legacy = legacy_profile_for(shell, &inputs.home, |path| files.exists(path));
+    match profile_for(shell, inputs, |path| files.exists(path)) {
+        Ok(Some(resolved)) => {
+            let profile = match &legacy {
+                Some(legacy)
+                    if legacy != &resolved
+                        && files.same_file(legacy, &resolved)
+                        && !files.direct(&resolved)
+                        && files.direct(legacy) =>
+                {
+                    legacy.clone()
+                }
+                _ => resolved.clone(),
+            };
+            Ok(ProfileTarget {
+                shell,
+                stale: stale_legacy_copy(
+                    &resolved,
+                    legacy,
+                    |path| files.has_block(path),
+                    |a, b| files.same_file(a, b),
+                ),
+                profile,
+            })
+        }
+        unresolved => legacy
+            .map(|profile| ProfileTarget {
+                shell,
+                profile,
+                stale: None,
+            })
+            .ok_or_else(|| unresolved.err().unwrap_or_default()),
+    }
+}
+
+/// The file-system questions profile selection asks, injectable for tests.
+trait ProfileFiles {
+    fn exists(&self, path: &std::path::Path) -> bool;
+    fn has_block(&self, path: &std::path::Path) -> bool;
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool;
+    /// Neither the file nor its directory is a symlink.
+    fn direct(&self, path: &std::path::Path) -> bool;
+}
+
+struct RealProfileFiles;
+
+impl ProfileFiles for RealProfileFiles {
+    fn exists(&self, path: &std::path::Path) -> bool {
+        path.exists()
+    }
+    fn has_block(&self, path: &std::path::Path) -> bool {
+        fs::read_to_string(path).is_ok_and(|content| content.contains(BEGIN_MARKER))
+    }
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> bool {
+        matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+    }
+    fn direct(&self, path: &std::path::Path) -> bool {
+        let not_link = |path: &std::path::Path| {
+            fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_symlink())
+        };
+        not_link(path) && path.parent().is_some_and(not_link)
+    }
+}
+
+/// `Err` carries an optional reason shown under the caller's message.
+fn detect_profile() -> Result<ProfileTarget, String> {
+    let home = home::home_dir().ok_or_else(String::new)?;
+    let shell = crate::cli::init::detect_shell();
+    // A malformed variable is ignored rather than fatal: it may be one this
+    // shell never reads, and `off` must still be able to remove the wrapper.
+    let inputs = super::shell_target::TargetInputs::current_ignoring_invalid(home);
+    resolve_target(shell, &inputs, &RealProfileFiles)
+}
+
+fn print_profile_reason(reason: &str) {
+    if !reason.is_empty() {
+        eprintln!("  {reason}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inputs(
+        platform: super::super::shell_target::Platform,
+        xdg: Option<&str>,
+        zdotdir: Option<&str>,
+    ) -> super::super::shell_target::TargetInputs {
+        super::super::shell_target::TargetInputs {
+            platform,
+            home: PathBuf::from("/home/op"),
+            xdg_config: xdg.map(PathBuf::from),
+            zdotdir: zdotdir.map(PathBuf::from),
+            appdata: None,
+            documents: None,
+        }
+    }
+
+    #[test]
+    fn profile_follows_zdotdir_and_xdg_config_home() {
+        use super::super::shell_target::Platform::Unix;
+        let none = |_: &std::path::Path| false;
+        let custom = inputs(Unix, Some("/cfg"), Some("/zdot"));
+        assert_eq!(
+            profile_for("zsh", &custom, none).unwrap(),
+            Some(PathBuf::from("/zdot/.zshrc"))
+        );
+        assert_eq!(
+            profile_for("fish", &custom, none).unwrap(),
+            Some(PathBuf::from("/cfg/fish/config.fish"))
+        );
+        assert_eq!(
+            profile_for("nushell", &custom, none).unwrap(),
+            Some(PathBuf::from("/cfg/nushell/config.nu"))
+        );
+        assert_eq!(
+            profile_for("pwsh", &custom, none).unwrap(),
+            Some(PathBuf::from(
+                "/cfg/powershell/Microsoft.PowerShell_profile.ps1"
+            ))
+        );
+        let plain = inputs(Unix, None, None);
+        assert_eq!(
+            profile_for("zsh", &plain, none).unwrap(),
+            Some(PathBuf::from("/home/op/.zshrc"))
+        );
+        assert_eq!(
+            profile_for("fish", &plain, none).unwrap(),
+            Some(PathBuf::from("/home/op/.config/fish/config.fish"))
+        );
+        assert_eq!(profile_for("unknown", &plain, none).unwrap(), None);
+    }
+
+    #[test]
+    fn a_legacy_copy_the_shell_does_not_read_is_stale_not_the_target() {
+        let resolved = PathBuf::from("/zdot/.zshrc");
+        let legacy = legacy_profile_for("zsh", std::path::Path::new("/home/op"), |_| false);
+        assert_eq!(legacy, Some(PathBuf::from("/home/op/.zshrc")));
+        let only =
+            |with: &'static str| move |path: &std::path::Path| path == std::path::Path::new(with);
+        let differ = |_: &std::path::Path, _: &std::path::Path| false;
+        // Left only at the old fixed path that zsh skips while ZDOTDIR is set:
+        // it is stale, and the wrapper still goes to the resolved profile.
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), only("/home/op/.zshrc"), differ),
+            Some(PathBuf::from("/home/op/.zshrc"))
+        );
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), |_| true, differ),
+            Some(PathBuf::from("/home/op/.zshrc"))
+        );
+        // Nothing at the old path: nothing stale.
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), only("/zdot/.zshrc"), differ),
+            None
+        );
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy.clone(), |_| false, differ),
+            None
+        );
+        // The old path names the resolved profile through a symlink: it is
+        // the live wrapper, not a stale copy.
+        assert_eq!(
+            stale_legacy_copy(&resolved, legacy, |_| true, |_, _| true),
+            None
+        );
+        // When the old path is the file the shell reads, it is the profile.
+        let home_zshrc = PathBuf::from("/home/op/.zshrc");
+        assert_eq!(
+            stale_legacy_copy(&home_zshrc, Some(home_zshrc.clone()), |_| true, differ),
+            None
+        );
+    }
+
+    #[test]
+    fn shells_without_a_native_location_keep_the_old_fixed_path() {
+        use super::super::shell_target::Platform::Windows;
+        let windows = inputs(Windows, None, None);
+        for (shell, expected) in [
+            ("zsh", "/home/op/.zshrc"),
+            ("fish", "/home/op/.config/fish/config.fish"),
+            // No native Documents directory.
+            (
+                "pwsh",
+                "/home/op/.config/powershell/Microsoft.PowerShell_profile.ps1",
+            ),
+        ] {
+            let target = resolve_target(shell, &windows, &FakeFiles::default())
+                .unwrap_or_else(|reason| panic!("{shell}: {reason}"));
+            assert_eq!(target.profile, PathBuf::from(expected), "{shell}");
+            assert_eq!(target.stale, None, "{shell}");
+        }
+        assert!(resolve_target("unknown", &windows, &FakeFiles::default()).is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeFiles {
+        with_block: Vec<&'static str>,
+        same: bool,
+        indirect: Vec<&'static str>,
+    }
+
+    impl ProfileFiles for FakeFiles {
+        fn exists(&self, path: &std::path::Path) -> bool {
+            self.with_block
+                .iter()
+                .any(|p| path == std::path::Path::new(p))
+        }
+        fn has_block(&self, path: &std::path::Path) -> bool {
+            self.exists(path)
+        }
+        fn same_file(&self, _: &std::path::Path, _: &std::path::Path) -> bool {
+            self.same
+        }
+        fn direct(&self, path: &std::path::Path) -> bool {
+            !self
+                .indirect
+                .iter()
+                .any(|p| path == std::path::Path::new(p))
+        }
+    }
+
+    #[test]
+    fn an_old_path_naming_the_resolved_file_is_never_stale() {
+        use super::super::shell_target::Platform::Unix;
+        let zdot = inputs(Unix, None, Some("/zdot"));
+        // ~/.zshrc is a symlink to $ZDOTDIR/.zshrc: edit the real file.
+        let linked_rc = FakeFiles {
+            with_block: vec!["/home/op/.zshrc", "/zdot/.zshrc"],
+            same: true,
+            indirect: vec!["/home/op/.zshrc"],
+        };
+        let target = resolve_target("zsh", &zdot, &linked_rc).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/zdot/.zshrc"));
+        assert_eq!(target.stale, None);
+        // ZDOTDIR is HOME through a symlinked directory: edit ~/.zshrc.
+        let linked_dir = FakeFiles {
+            with_block: vec!["/home/op/.zshrc", "/zdot/.zshrc"],
+            same: true,
+            indirect: vec!["/zdot/.zshrc"],
+        };
+        let target = resolve_target("zsh", &zdot, &linked_dir).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/home/op/.zshrc"));
+        assert_eq!(target.stale, None);
+        // Different files: the old copy is stale, the resolved path is used.
+        let separate = FakeFiles {
+            with_block: vec!["/home/op/.zshrc"],
+            ..FakeFiles::default()
+        };
+        let target = resolve_target("zsh", &zdot, &separate).unwrap();
+        assert_eq!(target.profile, PathBuf::from("/zdot/.zshrc"));
+        assert_eq!(target.stale, Some(PathBuf::from("/home/op/.zshrc")));
+    }
+
+    #[test]
+    fn bash_profile_is_bashrc_or_an_existing_bash_profile_never_a_posix_sh_file() {
+        use super::super::shell_target::Platform::Unix;
+        let plain = inputs(Unix, None, None);
+        let only = |name: &'static str| move |path: &std::path::Path| path.ends_with(name);
+        assert_eq!(
+            profile_for("bash", &plain, |_| false).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, |_| true).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, only(".bash_profile")).unwrap(),
+            Some(PathBuf::from("/home/op/.bash_profile"))
+        );
+        // `.profile` is also read by sh/dash login shells, which reject the
+        // snippet's hyphenated function name, and `.bash_login` was never a
+        // target: both fall back to creating `.bashrc`.
+        assert_eq!(
+            profile_for("bash", &plain, only(".profile")).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, only(".bash_login")).unwrap(),
+            Some(PathBuf::from("/home/op/.bashrc"))
+        );
+        assert_eq!(
+            profile_for("bash", &plain, |path: &std::path::Path| {
+                path.ends_with(".bash_profile") || path.ends_with(".profile")
+            })
+            .unwrap(),
+            Some(PathBuf::from("/home/op/.bash_profile"))
+        );
+    }
 
     #[test]
     fn strip_block_removes_inserted_section() {
@@ -426,6 +847,7 @@ mod tests {
 
     #[test]
     fn denied_profile_write_creates_neither_parent_nor_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("missing-profile-dir");
         let profile = parent.join("config.nu");

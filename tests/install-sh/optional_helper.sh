@@ -51,7 +51,36 @@ run_install_case fresh 0 > "$work/fresh.log"
 cmp "$work/payload/tirith" "$work/fresh/bin/tirith"
 test ! -e "$work/fresh/elevated"
 test ! -e "$work/fresh/helper-attempted"
-grep -q 'Native package approval is unavailable' "$work/fresh.log"
+grep -q 'Package approval is disabled in this release: tirith pkg approve issues no approvals' "$work/fresh.log"
+if grep -q 'TIRITH_INSTALL_APPROVAL_HELPER=1' "$work/fresh.log"; then
+  echo 'installer still suggests the approval helper opt-in' >&2
+  exit 1
+fi
+# An installation that keeps managing the helper (opted in, or an upgrade over
+# existing helper state) also says package approval is disabled.
+CASE_DIR="$work/managed" FIXTURE_DIR="$work/fixture" INSTALL_SH="$INSTALL_SH" sh -c '
+  set -eu
+  TIRITH_INSTALL_SH_LIB=1 . "$INSTALL_SH"
+  mkdir -p "$CASE_DIR/bin"
+  INSTALL_DIR="$CASE_DIR/bin"
+  PAIRED_HELPER_DEST="$CASE_DIR/helper"
+  detect_platform() { TARGET=x86_64-unknown-linux-gnu; ARCHIVE=release.tar.gz; }
+  select_package_approval_helper() { PAIRED_HELPER_MANAGED=1; }
+  resolve_version() { VERSION=v9.9.9; }
+  resolve_latest_version() { :; }
+  download_url() { printf "%s/%s\n" "$FIXTURE_DIR" "$1"; }
+  fetch() { cp "$1" "$2"; }
+  verify_cosign() { :; }
+  run_root() { "$@"; }
+  install_package_approval_helper() {
+    printf "helper\n" > "$PAIRED_HELPER_DEST"
+    PAIRED_HELPER_NEW_SHA256=fixture
+  }
+  main
+' > "$work/managed.log"
+test "$(cat "$work/managed/helper")" = helper
+grep -q 'Package approval is disabled in this release: tirith pkg approve issues no approvals' "$work/managed.log"
+
 if run_install_case failed 1 > "$work/failed.log" 2>&1; then
   echo 'failed installation unexpectedly succeeded' >&2
   exit 1
