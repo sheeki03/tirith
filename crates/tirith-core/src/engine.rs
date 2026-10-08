@@ -2231,8 +2231,11 @@ fn check_taint_hot_with_store(
                     &recorded,
                     &entry,
                 ));
+                continue;
             }
-            continue;
+            // No mark ends with the tail. A word typed under the placeholder
+            // itself (`/tirith-inherited-dir/../tmp/x.sh`) still gets the
+            // normalized-path lookup of Case 3.
         }
 
         // Case 3 — the effective leader itself is an executed file.
@@ -9132,6 +9135,41 @@ mod tests {
                     && finding.severity == crate::verdict::Severity::High),
                 fires,
                 "{input}: {findings:?}"
+            );
+        }
+        // A tail with an empty, `.` or `..` component gets no placeholder view
+        // (the word stays unresolved, so the line is blocked as incomplete).
+        for input in [
+            r#""$D/./x.sh""#,
+            r#""$D//x.sh""#,
+            r#""$D/downloads/../downloads/x.sh""#,
+            r#""$D"/./x.sh"#,
+            r#"cd downloads && "$PWD/./x.sh""#,
+        ] {
+            assert!(
+                crate::extract::posix_variable_command_literal_view(input, ShellType::Posix)
+                    .is_none_or(
+                        |view| !view.contains(crate::extract::INHERITED_DIRECTORY_PLACEHOLDER)
+                    ),
+                "{input}"
+            );
+        }
+        // A word typed under the placeholder directory itself is still looked
+        // up by its normalized path when no mark ends with its tail.
+        #[cfg(unix)]
+        {
+            let typed = format!(
+                "{}/..{}",
+                crate::extract::INHERITED_DIRECTORY_PLACEHOLDER,
+                cwd.join("downloads").join("x.sh").display()
+            );
+            let ctx = exec_ctx_in(&typed, cwd);
+            let findings = check_taint_hot_with_store(&ctx, &typed, &store);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == crate::verdict::RuleId::ExecOfTaintedFile),
+                "{typed}: {findings:?}"
             );
         }
     }

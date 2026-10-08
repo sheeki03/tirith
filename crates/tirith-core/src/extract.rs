@@ -7472,8 +7472,8 @@ pub(crate) const INHERITED_DIRECTORY_PLACEHOLDER: &str = "/tirith-inherited-dir"
 /// in the text. `None` for anything else: an unquoted or operator expansion
 /// (`$D/x`, `${D:-…}/x`, `"$@"/x`), a command substitution, a backslash or
 /// single quote, a glob or brace outside the quotes, an expansion after the
-/// last `/`, or a basename of `.`/`..`. Returns the tail and the expanded
-/// variable names.
+/// last `/`, or an empty, `.` or `..` component in the tail. Returns the tail
+/// and the expanded variable names.
 fn posix_inherited_directory_command_tail(command: &str) -> Option<(String, Vec<String>)> {
     let chars: Vec<char> = command.chars().collect();
     let mut in_double = false;
@@ -7533,8 +7533,14 @@ fn posix_inherited_directory_command_tail(command: &str) -> Option<(String, Vec<
     if in_double || names.is_empty() || !tail.starts_with('/') {
         return None;
     }
-    let basename = tail.rsplit('/').next().unwrap_or("");
-    if matches!(basename, "" | "." | "..") {
+    // Every component after the directory is a plain name. An empty, `.` or
+    // `..` component (`"$D//x.sh"`, `"$D/./x.sh"`, `"$D/a/../x.sh"`) spells the
+    // file differently from the normalized path a taint mark records, so the
+    // tail could not identify it; such a word stays unresolved.
+    if tail[1..]
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
         return None;
     }
     Some((tail, names))
@@ -20598,6 +20604,14 @@ mod tests {
             r#""$VAR/""#,
             r#""$VAR/..""#,
             r#""$VAR/.""#,
+            // Empty, `.` and `..` components: the tail is not the file's path.
+            r#""$VAR//x.sh""#,
+            r#""$VAR/./x.sh""#,
+            r#""$VAR"/./x.sh"#,
+            r#""$VAR/dl//x.sh""#,
+            r#""$VAR/dl/../dl/x.sh""#,
+            r#""$VAR/../x.sh""#,
+            r#""$VAR/"./x.sh"#,
             r#""$1/x.sh""#,
             r#""$@/x.sh""#,
             r#""${VAR:-/tmp}/x.sh""#,

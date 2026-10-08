@@ -366,8 +366,10 @@ else (`D=/tmp; "$D/x.sh"`, `read D` or `echo "$D"` keep the word unresolved),
 and when a tainted download's path ends with the same file path, the
 execution is still reported as `exec_of_tainted_file`. Unquoted
 (`$D/x.sh`), operator (`${D:-/tmp}/x`) and positional (`"$1/x"`) expansions,
-a substitution, or an expansion after the last `/` stay unresolved, as does
-such a word inside a nested body.
+a substitution, an expansion after the last `/`, or an empty, `.` or `..`
+component in the file path (`"$D//x.sh"`, `"$D/./x.sh"`, `"$D/a/../x.sh"`,
+which a taint mark's normalized path would not end with) stay unresolved, as
+does such a word inside a nested body.
 
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the

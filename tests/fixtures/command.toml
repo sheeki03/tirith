@@ -3148,6 +3148,32 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
 
+# An empty, `.` or `..` component after an inherited directory spells the file
+# differently from its taint mark, so the word stays unresolved.
+[[fixture]]
+name = "inherited_directory_dot_component_stays_incomplete"
+min_milestone = 1
+input = '"$D/./x.sh" https://x.example/a'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "inherited_directory_empty_component_stays_incomplete"
+min_milestone = 1
+input = '"$D//x.sh" https://x.example/a'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "inherited_directory_parent_component_stays_incomplete"
+min_milestone = 1
+input = '"$D/dl/../dl/x.sh" https://x.example/a'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
 [[fixture]]
 name = "hex_spelled_lan_address_stays_high"
 min_milestone = 1

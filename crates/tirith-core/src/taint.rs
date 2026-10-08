@@ -333,7 +333,8 @@ pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<Ta
 }
 
 /// The latest entry whose path ends with `tail` at a path-component boundary
-/// (`tail` starts with `/`; a stored Windows `\` counts as `/`). For an
+/// (`tail` starts with `/`; a stored Windows `\` counts as `/`). Stored paths
+/// are normalized, so `tail` must have no empty, `.` or `..` component. For an
 /// executed file whose directory is unknown, such as a command word with an
 /// inherited-variable directory: any tainted file of that name may be the one
 /// that runs. An incompletely read store answers "unknown" (fail safe), as
