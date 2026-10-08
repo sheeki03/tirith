@@ -2215,6 +2215,26 @@ fn check_taint_hot_with_store(
             continue;
         }
 
+        // Case 3a — an executed file whose directory comes from an inherited
+        // variable (the literal view spells it under a placeholder directory):
+        // any tainted file with that path tail may be the one that runs.
+        if let Some(tail) = leader
+            .strip_prefix(crate::extract::INHERITED_DIRECTORY_PLACEHOLDER)
+            .filter(|tail| tail.starts_with('/'))
+        {
+            if let Some(entry) = crate::taint::tainted_entry_with_path_suffix_at(store, tail) {
+                let recorded = entry.path.clone();
+                findings.push(taint_finding(
+                    RuleId::ExecOfTaintedFile,
+                    Severity::High,
+                    "Executing a file from a variable directory that may be a risky download",
+                    &recorded,
+                    &entry,
+                ));
+            }
+            continue;
+        }
+
         // Case 3 — the effective leader itself is an executed file.
         if taint_leader_is_pathlike(&leader) {
             if let Some(entry) =
@@ -9071,6 +9091,49 @@ mod tests {
             crate::verdict::Action::Block,
             "an earlier sourced-file warning must not hide a later tainted execution"
         );
+    }
+
+    /// A command word with an inherited-variable directory is analyzed under a
+    /// placeholder directory; a tainted file with the same path tail may be
+    /// the one that runs, so it still fires.
+    #[test]
+    fn taint_hot_fires_when_an_inherited_directory_may_hold_a_tainted_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let dir = tempfile::tempdir().unwrap();
+        let store = taint_store(dir.path());
+        let cwd = dir.path();
+        crate::taint::mark_tainted_at(
+            &store,
+            &cwd.join("downloads").join("x.sh"),
+            Some(cwd),
+            "fetch --save",
+            Some("https://untrusted.example/x.sh".to_string()),
+            None,
+        )
+        .unwrap();
+        let view_of = |input: &str| {
+            crate::extract::posix_variable_command_literal_view(input, ShellType::Posix)
+                .expect("inherited-directory view")
+        };
+        for (input, fires) in [
+            (r#""$D/x.sh" --yes"#, true),
+            (r#""$D/downloads/x.sh""#, true),
+            (r#"cd app && "$D/x.sh""#, true),
+            (r#""$D/y.sh""#, false),
+            (r#""$D/other/x.sh""#, false),
+            (r#""$D/xx.sh""#, false),
+        ] {
+            let ctx = exec_ctx_in(input, cwd);
+            let view = view_of(input);
+            let findings = check_taint_hot_with_store(&ctx, &view, &store);
+            assert_eq!(
+                findings.iter().any(|finding| finding.rule_id
+                    == crate::verdict::RuleId::ExecOfTaintedFile
+                    && finding.severity == crate::verdict::Severity::High),
+                fires,
+                "{input}: {findings:?}"
+            );
+        }
     }
 
     #[test]

@@ -208,6 +208,24 @@ pub fn is_rfc1918_ipv4_host(host: &str) -> bool {
     })
 }
 
+/// True when `raw` (a URL or a bare destination operand such as
+/// `10.0.0.5:9200/x`) spells its host exactly as `host` (ASCII
+/// case-insensitive). URL parsers normalize other spellings of an address
+/// (`0xC0A80114`, `3232235796`, `0300.0250.1.24` all become `192.168.1.20`),
+/// and those obfuscated spellings must not inherit the plain LAN treatment.
+pub fn raw_destination_spells_host(raw: &str, host: &str) -> bool {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, rest)| rest);
+    let spelled = match host_port.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
+        _ => host_port,
+    };
+    spelled.eq_ignore_ascii_case(host)
+}
+
 /// Canonical "critical" criticality labels for the M8 context/SSH/IaC/container
 /// rules; a label outside this set never fires. Centralised to avoid the
 /// four-copy drift hazard (PR-127 review #7). Case-insensitive, whitespace-trimmed.
@@ -356,6 +374,31 @@ mod tests {
             "lan.example",
         ] {
             assert!(!is_rfc1918_ipv4_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn raw_destination_spelling_must_match_the_host() {
+        for raw in [
+            "http://192.168.1.20/",
+            "http://192.168.1.20:8080/health",
+            "https://user@192.168.1.20/x?y#z",
+            "192.168.1.20",
+            "192.168.1.20:9200/_cat/indices",
+            "HTTP://192.168.1.20",
+        ] {
+            assert!(raw_destination_spells_host(raw, "192.168.1.20"), "{raw}");
+        }
+        for raw in [
+            "http://0xC0A80114/",
+            "http://3232235796/",
+            "http://0300.0250.1.24/",
+            "http://192.168.1.020/",
+            "http://192.168.1.20./",
+            "http://192.168.1.20.evil.example/",
+            "0xc0a80114/x",
+        ] {
+            assert!(!raw_destination_spells_host(raw, "192.168.1.20"), "{raw}");
         }
     }
 

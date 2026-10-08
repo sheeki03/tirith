@@ -361,9 +361,13 @@ that file name in a placeholder directory (`/tirith-inherited-dir/bin/python
 -m pytest`). The quotes keep it one word and the `/` makes the shell run that
 file directly, so only the directory is unknown, and every rule that keys on
 the program name (`bash -c`, `sh` at the end of a pipe, `sudo`) still applies.
-Unquoted (`$D/x.sh`), operator (`${D:-/tmp}/x`) and positional (`"$1/x"`)
-expansions, a substitution, or an expansion after the last `/` stay
-unresolved, as does such a word inside a nested body.
+This applies only to a variable the command line does not mention anywhere
+else (`D=/tmp; "$D/x.sh"`, `read D` or `echo "$D"` keep the word unresolved),
+and when a tainted download's path ends with the same file path, the
+execution is still reported as `exec_of_tainted_file`. Unquoted
+(`$D/x.sh`), operator (`${D:-/tmp}/x`) and positional (`"$1/x"`) expansions,
+a substitution, or an expansion after the last `/` stay unresolved, as does
+such a word inside a nested body.
 
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the

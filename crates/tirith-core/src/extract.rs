@@ -7472,11 +7472,12 @@ pub(crate) const INHERITED_DIRECTORY_PLACEHOLDER: &str = "/tirith-inherited-dir"
 /// in the text. `None` for anything else: an unquoted or operator expansion
 /// (`$D/x`, `${D:-…}/x`, `"$@"/x`), a command substitution, a backslash or
 /// single quote, a glob or brace outside the quotes, an expansion after the
-/// last `/`, or a basename of `.`/`..`.
-fn posix_inherited_directory_command_tail(command: &str) -> Option<String> {
+/// last `/`, or a basename of `.`/`..`. Returns the tail and the expanded
+/// variable names.
+fn posix_inherited_directory_command_tail(command: &str) -> Option<(String, Vec<String>)> {
     let chars: Vec<char> = command.chars().collect();
     let mut in_double = false;
-    let mut saw_expansion = false;
+    let mut names: Vec<String> = Vec::new();
     // Text after the last expansion, quotes removed.
     let mut tail = String::new();
     let mut index = 0usize;
@@ -7512,7 +7513,7 @@ fn posix_inherited_directory_command_tail(command: &str) -> Option<String> {
                 if !valid_name {
                     return None;
                 }
-                saw_expansion = true;
+                names.push(name);
                 tail.clear();
                 index = next;
             }
@@ -7529,14 +7530,33 @@ fn posix_inherited_directory_command_tail(command: &str) -> Option<String> {
             }
         }
     }
-    if in_double || !saw_expansion || !tail.starts_with('/') {
+    if in_double || names.is_empty() || !tail.starts_with('/') {
         return None;
     }
     let basename = tail.rsplit('/').next().unwrap_or("");
     if matches!(basename, "" | "." | "..") {
         return None;
     }
-    Some(tail)
+    Some((tail, names))
+}
+
+/// True when `name` occurs in `text` as a whole identifier (not as part of a
+/// longer name).
+fn mentions_shell_name(text: &str, name: &str) -> bool {
+    let is_name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while let Some(offset) = text[start..].find(name) {
+        let begin = start + offset;
+        let end = begin + name.len();
+        if (begin == 0 || !is_name_byte(bytes[begin - 1]))
+            && bytes.get(end).is_none_or(|byte| !is_name_byte(*byte))
+        {
+            return true;
+        }
+        start = end;
+    }
+    false
 }
 
 /// The input with each root command word that names a program through an
@@ -7547,6 +7567,12 @@ fn posix_inherited_directory_command_tail(command: &str) -> Option<String> {
 /// exactly as a literal `bash -c '…'` (its body is still analyzed). `None`
 /// when no root command word has that shape. Words inside nested bodies
 /// (`bash -c`, `$(…)`) are never rewritten: those stay incomplete.
+///
+/// Only a variable the input never mentions anywhere else is taken as
+/// inherited. `D=/tmp; "$D/x.sh"`, `read D`, `for D in …` or any other use of
+/// the name keeps the word unresolved, so a directory the line itself chooses
+/// (possibly where a tainted download lives) is never replaced by the
+/// placeholder.
 fn rewrite_inherited_directory_command_words(
     raw: &str,
     segments: &[tokenize::Segment],
@@ -7554,7 +7580,7 @@ fn rewrite_inherited_directory_command_words(
     if posix_input_has_word_start_comment(raw) {
         return None;
     }
-    let mut replacements = Vec::new();
+    let mut candidates = Vec::new();
     for segment in segments {
         let Some(command) = segment.command.as_deref() else {
             continue;
@@ -7565,11 +7591,29 @@ fn rewrite_inherited_directory_command_words(
         if raw.get(segment.byte_range.clone()) != Some(segment.raw.as_str()) {
             return None;
         }
-        let Some(tail) = posix_inherited_directory_command_tail(command) else {
+        let Some((tail, names)) = posix_inherited_directory_command_tail(command) else {
             continue;
         };
-        replacements.push((segment.byte_range.start, command.len(), tail));
+        candidates.push((segment.byte_range.start, command.len(), tail, names));
     }
+    if candidates.is_empty() {
+        return None;
+    }
+    // The input with every candidate word blanked: any other mention of a
+    // candidate's variable disqualifies it.
+    let mut rest = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    for (start, len, _, _) in &candidates {
+        rest.push_str(raw.get(cursor..*start)?);
+        rest.push(' ');
+        cursor = start + len;
+    }
+    rest.push_str(raw.get(cursor..)?);
+    let replacements: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, _, _, names)| !names.iter().any(|name| mentions_shell_name(&rest, name)))
+        .map(|(start, len, tail, _)| (start, len, tail))
+        .collect();
     if replacements.is_empty() {
         return None;
     }
@@ -20570,6 +20614,14 @@ mod tests {
             r#""$VAR\/x.sh""#,
             r#"FOO=1 "$D/x.sh""#,
             r#"bash -c '"$D/x.sh"'"#,
+            // The line itself names the variable: not an inherited directory.
+            r#"D=/tmp; "$D/x.sh""#,
+            r#"export D=/opt/x; "$D/run""#,
+            r#"read -r D; "$D/run""#,
+            r#"for D in a b; do "$D/run"; done"#,
+            r#"echo "$D"; "$D/run""#,
+            r#""$D/run"; D=/tmp"#,
+            r#""${D}/run" && : ${D:=/tmp}"#,
             r#"echo "$D/x.sh""#,
             "\"$D/x.sh\" <<EOF\nbody\nEOF",
         ] {
@@ -20579,6 +20631,12 @@ mod tests {
                 "{input}"
             );
         }
+        // A mentioned variable keeps only its own words unresolved.
+        assert_eq!(
+            posix_variable_command_literal_view(r#""$A/run"; "$B/x"; echo "$B""#, ShellType::Posix)
+                .as_deref(),
+            Some(format!(r#"{dir}/run; "$B/x"; echo "$B""#).as_str())
+        );
         // The body scan never resolves: nested, the word stays a gap.
         assert_eq!(
             executable_substitution_scan(r#""$VAR/x.sh""#, ShellType::Posix).gap,
