@@ -1977,6 +1977,47 @@ pub fn is_sensitive_path(path: &str) -> bool {
     classify_path(path).is_some()
 }
 
+/// Suffixes that mark a committed dotenv template (`.env.example`,
+/// `.env.local.sample`), which holds placeholders, not secrets.
+const DOTENV_TEMPLATE_PARTS: &[&str] = &[
+    "example", "sample", "template", "tpl", "dist", "default", "defaults", "schema",
+];
+
+/// Project-relative secret files, matched by basename wherever they live:
+/// `.env` and `.env.<name>` (not a template such as `.env.example`),
+/// `.envrc`, `credentials.json`, `secrets.{json,yaml,yml,toml}` and private
+/// SSH key files (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`).
+///
+/// Used only by the command upload / exfiltration dataflow (uploading one of
+/// these to a remote endpoint is the leak). It is deliberately NOT part of
+/// [`SENSITIVE_PATH_DEFINITIONS`]: reading, mounting or sandboxing a project
+/// `.env` is ordinary work and must not change the credential-sweep,
+/// container-bind or capsule rules that read that catalogue.
+pub fn is_project_secret_file(path: &str) -> bool {
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let lower = basename.to_ascii_lowercase();
+    if let Some(suffix) = lower.strip_prefix(".env.") {
+        return !suffix.is_empty()
+            && !suffix
+                .split('.')
+                .any(|part| DOTENV_TEMPLATE_PARTS.contains(&part));
+    }
+    matches!(
+        lower.as_str(),
+        ".env"
+            | ".envrc"
+            | "credentials.json"
+            | "secrets.json"
+            | "secrets.yaml"
+            | "secrets.yml"
+            | "secrets.toml"
+            | "id_rsa"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+    )
+}
+
 pub fn sensitive_path_match_count(text: &str) -> usize {
     let (normalized, flavor) = normalize_path_with_flavor(text);
     if classify_path(text).is_none() {
@@ -3135,6 +3176,56 @@ mod tests {
         let mut bytes = seed.to_vec();
         bytes.extend_from_slice(signing.verifying_key().as_bytes());
         serde_json::to_string(&bytes).unwrap()
+    }
+
+    #[test]
+    fn project_secret_files_match_by_basename_and_skip_templates() {
+        for path in [
+            ".env",
+            "./.env",
+            "app/config/.env",
+            "/srv/app/.env.production",
+            ".env.local",
+            ".env.development.local",
+            ".ENV",
+            r"C:\proj\.env",
+            ".envrc",
+            "credentials.json",
+            "deploy/secrets.yaml",
+            "secrets.yml",
+            "secrets.toml",
+            "secrets.json",
+            "keys/id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+        ] {
+            assert!(is_project_secret_file(path), "{path}");
+        }
+        for path in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            ".env.local.example",
+            ".env.defaults",
+            ".env.",
+            ".env/",
+            ".environment",
+            "env",
+            "dotenv.py",
+            "id_rsa.pub",
+            "secrets.md",
+            "credentials.example.json",
+            "",
+        ] {
+            assert!(!is_project_secret_file(path), "{path}");
+        }
+        // Deliberately not part of the shared catalogue: credential-sweep,
+        // container-bind and capsule rules keep their meaning for a project
+        // `.env`.
+        assert!(!is_sensitive_path(".env"));
+        assert!(!is_sensitive_bind_path("./.env"));
     }
 
     #[test]

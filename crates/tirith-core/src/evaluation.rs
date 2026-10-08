@@ -301,7 +301,10 @@ fn incomplete_finding() -> Finding {
 fn incomplete(rule: RuleId) -> bool {
     matches!(
         rule,
-        RuleId::AnalysisIncomplete | RuleId::OutputAnalysisOverflow | RuleId::WrapperChainTooDeep
+        RuleId::AnalysisIncomplete
+            | RuleId::PackageLookupIncomplete
+            | RuleId::OutputAnalysisOverflow
+            | RuleId::WrapperChainTooDeep
     )
 }
 
@@ -487,7 +490,7 @@ mod tests {
 
     #[test]
     fn cache_miss_and_safe_browsing_offline_keep_enrichment_gap() {
-        for (command, config) in [
+        for (command, config, gap_rule) in [
             (
                 "pip install tirith-preview-no-cache==1.0.0",
                 crate::policy::ThreatIntelConfig {
@@ -496,6 +499,7 @@ mod tests {
                     google_safe_browsing_key: None,
                     ..crate::policy::ThreatIntelConfig::default()
                 },
+                RuleId::PackageLookupIncomplete,
             ),
             (
                 "curl https://example.com/",
@@ -505,6 +509,7 @@ mod tests {
                     google_safe_browsing_key: Some("controlled-fixture".into()),
                     ..crate::policy::ThreatIntelConfig::default()
                 },
+                RuleId::AnalysisIncomplete,
             ),
         ] {
             let policy = Policy {
@@ -521,7 +526,11 @@ mod tests {
                 .verdict
                 .findings
                 .iter()
-                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete));
+                .any(|finding| finding.rule_id == gap_rule));
+            assert!(result
+                .explanation
+                .gaps
+                .contains(&EvidenceGap::AnalysisIncomplete));
             assert!(!result.explanation.evidence_complete);
         }
     }

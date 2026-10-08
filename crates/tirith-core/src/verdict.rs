@@ -184,6 +184,16 @@ pub enum RuleId {
     ThreatCisaKev,
     ThreatSuspiciousPackage,
     ThreatSafeBrowsing,
+    /// A runtime package lookup (OSV.dev, deps.dev) for a package the command
+    /// installs could not be completed: skipped by offline mode with no cached
+    /// answer, out of time, or the registry/API was unreachable or answered
+    /// badly. Incomplete verification of one package, not evidence that it is
+    /// malicious, so it is Medium (a warning, never a block by default) and has
+    /// its own id: `analysis_incomplete` stays the High "this command's
+    /// structure could not be analyzed" finding, and a policy can treat the two
+    /// differently (the strict profile blocks both). Emitted by
+    /// `threatdb_api` after the engine, so it has no PATTERN_TABLE entry.
+    PackageLookupIncomplete,
 
     // Package reputation rules (M6 ch6) — emitted by package_risk /
     // install_txn / ecosystem_scan from the registry-API path. Tier-1 attaches
@@ -2248,7 +2258,10 @@ pub fn retained_finding_indices_for_output(findings: &[Finding]) -> Vec<usize> {
                 0 => finding.severity == Severity::Critical,
                 _ => {
                     finding.severity == Severity::High
-                        || finding.rule_id == RuleId::AnalysisIncomplete
+                        || matches!(
+                            finding.rule_id,
+                            RuleId::AnalysisIncomplete | RuleId::PackageLookupIncomplete
+                        )
                 }
             };
             if matches_priority && !selected[index] {

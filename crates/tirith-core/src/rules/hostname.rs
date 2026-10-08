@@ -159,6 +159,30 @@ mod tests {
             "{descriptions:?}"
         );
     }
+
+    #[test]
+    fn lookalike_tld_flags_file_name_tlds_but_not_developer_tlds() {
+        let flagged = |host: &str| {
+            let mut findings = Vec::new();
+            check_lookalike_tld(host, &mut findings);
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::LookalikeTld)
+        };
+        for host in ["update.zip", "video.MOV", "payload.run", "a.b.zip"] {
+            assert!(flagged(host), "{host} must stay a lookalike TLD");
+        }
+        for host in [
+            "web.dev",
+            "pkg.go.dev",
+            "staging.example.dev",
+            "myapp.app",
+            "EXAMPLE.APP",
+            "example.com",
+        ] {
+            assert!(!flagged(host), "{host} must not be flagged");
+        }
+    }
 }
 
 fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
@@ -447,10 +471,16 @@ fn check_trailing_dot_whitespace(raw_host: &str, findings: &mut Vec<Finding>) {
     }
 }
 
+/// TLDs that read as a file name (`update.zip`, `video.mov`, `installer.run`).
+/// `.app` and `.dev` are not listed: they are ordinary HSTS-preloaded developer
+/// TLDs (`web.dev`, `pkg.go.dev`, `*.app` hosting), and flagging every request
+/// to them taught people to ignore the warning. A deceptive `.app`/`.dev` host
+/// is still judged by the confusable, punycode and threat-intelligence rules.
+const LOOKALIKE_TLDS: [&str; 3] = ["zip", "mov", "run"];
+
 fn check_lookalike_tld(host: &str, findings: &mut Vec<Finding>) {
-    let lookalike_tlds = ["zip", "mov", "app", "dev", "run"];
     if let Some(tld) = host.rsplit('.').next() {
-        if lookalike_tlds.contains(&tld.to_lowercase().as_str()) {
+        if LOOKALIKE_TLDS.contains(&tld.to_lowercase().as_str()) {
             findings.push(Finding {
                 rule_id: RuleId::LookalikeTld,
                 severity: Severity::Medium,

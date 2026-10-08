@@ -315,8 +315,13 @@ hook cannot enforce acknowledgement. These labels describe the decision and
 supplied integration capability, not independently observed interception or
 execution.
 
-Existing `analysis_incomplete`, `output_analysis_overflow`, and
-`wrapper_chain_too_deep` findings add an explicit ANALYSIS INCOMPLETE note. The
+Existing `analysis_incomplete`, `package_lookup_incomplete`,
+`output_analysis_overflow`, and `wrapper_chain_too_deep` findings add an
+explicit ANALYSIS INCOMPLETE note. `package_lookup_incomplete` (Medium) means a
+live package lookup (OSV.dev, deps.dev) for a package being installed did not
+complete, for example offline with no cached answer; `analysis_incomplete` is
+kept for command structure tirith could not analyze, so a policy can treat the
+two differently. The
 note does not replace the final action or reinterpret incomplete coverage as
 proof of malicious content. Findings continue to provide the specific gap and
 reason.
@@ -348,6 +353,23 @@ the expansion cannot run with the inherited value. State the command cannot
 show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
+
+A command word whose directory is a double-quoted parameter expansion and
+whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,
+`"$REPO_ROOT/scripts/test.sh"`, `"${PROJECT_DIR}"/bin/run`) is analyzed as
+that file name in a placeholder directory (`/tirith-inherited-dir/bin/python
+-m pytest`). The quotes keep it one word and the `/` makes the shell run that
+file directly, so only the directory is unknown, and every rule that keys on
+the program name (`bash -c`, `sh` at the end of a pipe, `sudo`) still applies.
+This applies only to a variable the command line does not mention anywhere
+else (`D=/tmp; "$D/x.sh"`, `read D` or `echo "$D"` keep the word unresolved),
+and when a tainted download's path ends with the same file path, the
+execution is still reported as `exec_of_tainted_file`. Unquoted
+(`$D/x.sh`), operator (`${D:-/tmp}/x`) and positional (`"$1/x"`) expansions,
+a substitution, an expansion after the last `/`, or an empty, `.` or `..`
+component in the file path (`"$D//x.sh"`, `"$D/./x.sh"`, `"$D/a/../x.sh"`,
+which a taint mark's normalized path would not end with) stay unresolved, as
+does such a word inside a nested body.
 
 JSON clients can distinguish this limitation through
 `findings[].rule_id == "analysis_incomplete"` while continuing to honor the

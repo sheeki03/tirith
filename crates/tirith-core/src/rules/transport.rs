@@ -1,5 +1,5 @@
 use crate::parse::UrlLike;
-use crate::rules::shared::is_loopback_host;
+use crate::rules::shared::{is_loopback_host, is_rfc1918_ipv4_host};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run transport rules against a parsed URL.
@@ -69,9 +69,28 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
                     return;
                 }
             }
+            // A LAN address (RFC 1918), spelled as one, is reachable only from
+            // the local network, so tampering needs a foothold on that network
+            // (`0xC0A80114` and other spellings stay High). Medium
+            // keeps plain-HTTP homelab and dev-box requests visible without
+            // blocking them; content piped from such a host into an
+            // interpreter is still blocked by the pipe-to-interpreter rules,
+            // and every other host (link-local included) stays High.
+            // `raw_host` is the host as typed; `host` is normalized, which
+            // turns `0xC0A80114` into `192.168.1.20`.
+            let severity = if url.host().is_some_and(|host| {
+                is_rfc1918_ipv4_host(host)
+                    && url
+                        .raw_host()
+                        .is_some_and(|raw| raw.eq_ignore_ascii_case(host))
+            }) {
+                Severity::Medium
+            } else {
+                Severity::High
+            };
             findings.push(Finding {
                 rule_id: RuleId::PlainHttpToSink,
-                severity: Severity::High,
+                severity,
                 title: "Plain HTTP URL in execution context".to_string(),
                 description: format!(
                     "URL '{}' uses unencrypted HTTP and is being passed to a command that downloads or executes content. An attacker on the network could modify the content.",
@@ -408,6 +427,39 @@ mod tests {
                     .any(|finding| finding.rule_id == RuleId::InsecureTlsFlags),
                 "resolved curl cluster should be blocked: {command}: {findings:?}"
             );
+        }
+    }
+
+    /// Plain HTTP to a LAN address spelled as a dotted quad is Medium; any
+    /// other spelling of the same address, and every non-RFC 1918 host,
+    /// stays High.
+    #[test]
+    fn plain_http_is_medium_only_for_a_dotted_quad_lan_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let severity = |raw: &str| {
+            check(&crate::parse::parse_url(raw), true)
+                .into_iter()
+                .find(|finding| finding.rule_id == RuleId::PlainHttpToSink)
+                .map(|finding| finding.severity)
+        };
+        for raw in [
+            "http://192.168.1.20/",
+            "http://10.0.0.5:8080/health",
+            "http://user@172.16.0.1/x",
+        ] {
+            assert_eq!(severity(raw), Some(Severity::Medium), "{raw}");
+        }
+        for raw in [
+            "http://0xC0A80114/",
+            "http://3232235796/",
+            "http://0300.0250.1.24/",
+            "http://192.168.1.020/",
+            "http://169.254.169.254/",
+            "http://[fd00:ec2::254]/",
+            "http://203.0.113.7/",
+            "http://lan.example/",
+        ] {
+            assert_eq!(severity(raw), Some(Severity::High), "{raw}");
         }
     }
 

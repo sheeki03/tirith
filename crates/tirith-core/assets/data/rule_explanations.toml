@@ -117,11 +117,11 @@ remediation = "Remove the trailing dot or whitespace from the hostname."
 id = "lookalike_tld"
 title = "File-extension lookalike TLD"
 category = "hostname"
-severity_rationale = "Medium — TLDs like .zip, .mov, and .app look like file extensions, enabling social engineering attacks."
-description = "The URL uses a TLD that resembles a common file extension (.zip, .mov, .app, .dev, .run). Attackers register these domains to trick users into thinking a URL is a file download."
+severity_rationale = "Medium — TLDs like .zip, .mov, and .run look like file names, enabling social engineering attacks."
+description = "The URL uses a TLD that resembles a common file extension (.zip, .mov, .run). Attackers register these domains to trick users into thinking a URL is a file download. The developer TLDs .app and .dev are not flagged."
 examples_bad = ["curl https://update.zip/latest"]
 examples_good = ["curl https://example-cli.dev/install.sh"]
-false_positive_guidance = "Some legitimate services use .dev, .app, or .run TLDs. Add trusted domains to your allowlist."
+false_positive_guidance = "Some legitimate services use .zip, .mov, or .run domains (for example a .run installer host). Add trusted domains to your allowlist."
 remediation = "Verify the domain is legitimate and not impersonating a file download."
 
 # ── Path rules ──────────────────────────────────────────────────────────
@@ -1520,6 +1520,17 @@ examples_bad = ["curl http://flagged-by-safebrowsing-example.com/malware"]
 examples_good = ["curl https://github.com/user/repo/install.sh"]
 false_positive_guidance = "Google Safe Browsing has a low false positive rate. If a legitimate URL is flagged, it may have been temporarily compromised. Check the Safe Browsing transparency report."
 remediation = "Do not fetch content from the flagged URL. If the URL is expected, verify it has not been compromised."
+
+[[rule]]
+id = "package_lookup_incomplete"
+title = "Package threat intelligence could not be completed"
+category = "threatintel"
+severity_rationale = "Medium: a live package lookup (OSV.dev, deps.dev) that did not finish is incomplete verification of one package, not evidence of malice, so it warns and never blocks by default. The strict protection profile blocks it with analysis_incomplete. It is a separate id from analysis_incomplete so that a missed lookup (offline, slow or unreachable registry) and an unanalyzable command structure can be handled differently by policy."
+description = "Tirith looks up packages a command installs (pip, npm, cargo and other installers) against live vulnerability and package-health services after the local checks. This finding means at least one of those lookups did not complete: offline mode (--offline or TIRITH_OFFLINE) with no cached answer, the lookup ran out of its time budget, or the service was unreachable or returned an error or an invalid response. The local threat database checks (known malicious packages, typosquats) still ran. Emitted after the engine by the runtime lookup, so it has no tier-1 PATTERN_TABLE entry."
+examples_bad = ["tirith check --offline -- 'pip install requests' on a machine whose package lookup cache has no answer for requests"]
+examples_good = ["pip install requests after an online lookup has cached its result", "npm install with no package names (installs the lockfile)"]
+false_positive_guidance = "Expected when working offline or behind a proxy that blocks OSV.dev or deps.dev. Run the command online once so the result is cached, or, if you accept installing without the live lookup, lower this rule in policy (severity_overrides or action_overrides for package_lookup_incomplete). Do not silence analysis_incomplete for this: that id covers commands tirith could not analyze."
+remediation = "Re-run online so the lookup can complete, or verify the package by other means (pinned version, lockfile, provenance) before installing."
 
 # ── Package reputation rules (M6 ch6 — 7 new signals) ──────────────────
 

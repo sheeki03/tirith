@@ -415,7 +415,7 @@ Applied to every URL found in a command or paste:
 | Raw IP address | WARN | `http://185.234.xx.xx/install.sh`. No legitimate installer uses a raw IP. |
 | Non-standard port | WARN | Known domain with unexpected port: `https://github.com:8443/...`. |
 | Trailing dot / whitespace | WARN | `github.com.` or `github.com\t` — resolves differently than expected. |
-| Lookalike TLD | WARN | `.zip`, `.mov` and other new TLDs that resemble file extensions (social engineering vector). |
+| Lookalike TLD | WARN | `.zip`, `.mov` and `.run`, TLDs that read as file names (social engineering vector). The developer TLDs `.app` and `.dev` are not flagged. |
 
 **Path/query checks (separate from hostname, different defaults):**
 

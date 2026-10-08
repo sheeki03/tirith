@@ -345,6 +345,8 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::MassFileDeletion
         // A2: scan-coverage incompleteness, not a threat-DB indicator.
         | RuleId::AnalysisIncomplete
+        // A runtime package lookup that did not complete is not an indicator.
+        | RuleId::PackageLookupIncomplete
         // B5: installed-distribution integrity, correlated from artifact signals,
         // not a threat-DB indicator.
         | RuleId::PythonInstalledIntegrityViolation
