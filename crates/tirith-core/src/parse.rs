@@ -205,23 +205,12 @@ fn leading_scheme_separator(raw: &str) -> Option<usize> {
 /// Split userinfo from authority on the LAST unencoded `@` (so `user%40name@host`
 /// resolves to `host` — `%40` is userinfo, not a separator).
 fn split_userinfo(authority: &str) -> &str {
-    let bytes = authority.as_bytes();
-    let mut last_at = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            i += 3;
-            continue;
-        }
-        if bytes[i] == b'@' {
-            last_at = Some(i);
-        }
-        i += 1;
-    }
-    match last_at {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    }
+    // Percent-encoded @ is spelled %40 and contains no literal separator.
+    // Even malformed escapes must not hide a following literal @, which the
+    // URL parser still treats as the userinfo boundary.
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 /// Extract host from a host:port string, handling IPv6 brackets.
@@ -408,6 +397,24 @@ mod tests {
         let raw = "http://user%40name@host.com/path";
         let host = extract_raw_host(raw);
         assert_eq!(host, Some("host.com".to_string()));
+    }
+
+    #[test]
+    fn test_raw_host_malformed_percent_cannot_hide_userinfo_separator() {
+        for userinfo in [
+            "user:q7z9canary%",
+            "user:q7z9canary%x",
+            "user:q7z9canary%%",
+            "user%40name:q7z9canary",
+        ] {
+            for host in ["0x08080808", "8.8.8.8", "[2001:db8::1]"] {
+                let raw = format!("https://{userinfo}@{host}:8080/path");
+                assert_eq!(extract_raw_host(&raw).as_deref(), Some(host), "{raw}");
+                let parsed = parse_url(&raw);
+                assert!(matches!(&parsed, UrlLike::Standard { .. }), "{parsed:?}");
+                assert_eq!(parsed.raw_host(), Some(host), "{raw}");
+            }
+        }
     }
 
     #[test]

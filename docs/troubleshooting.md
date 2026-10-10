@@ -399,6 +399,22 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
 
+## Numeric curl destinations and ports
+
+`curl HOST PORT` supplies two URL operands. For example, curl interprets the
+second operand in `curl -sv 203.0.113.10 8080` as the numeric IPv4 host
+`0.0.31.144`. A destination port belongs in the URL:
+`curl -sv http://203.0.113.10:8080/`.
+
+Curl also accepts decimal, hexadecimal, octal and shortened dotted IPv4 hosts.
+Tirith preserves those destinations in analysis and shows both the original host
+and its canonical address when they differ. Values consumed by options such as
+`--local-port 8080` or `--output 8080` are not additional destinations. Netcat's
+separate `HOST PORT` grammar is different.
+
+See curl's [URL operand rules](https://curl.se/docs/manpage.html#URL) and
+[numeric address syntax](https://curl.se/docs/url-syntax.html#numerical-ipv4-addresses).
+
 ## False positives
 
 If a command is incorrectly blocked or warned:
