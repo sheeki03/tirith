@@ -128,6 +128,18 @@ for (const check of checks) {
 process.stdout.write(JSON.stringify(result === undefined ? null : result));
 "#;
 
+/// Isolated state with the threat-DB update deferred: these checks run online,
+/// and a due schedule would leave a detached download running after the guard
+/// removes its temporary root.
+fn isolated_state() -> GlobalStateGuard {
+    let mut state = GlobalStateGuard::new().unwrap();
+    state.remove_env("TIRITH_POLICY_ROOT");
+    let schedule = state.roots().xdg_state.join("tirith");
+    std::fs::create_dir_all(&schedule).unwrap();
+    std::fs::write(schedule.join("threatdb-next-check-at"), "99999999999").unwrap();
+    state
+}
+
 fn node_available(state: &GlobalStateGuard) -> bool {
     let mut command = Command::new("node");
     state.apply_to_command(&mut command);
@@ -291,8 +303,7 @@ fn assert_blocked(host: &str, result: Value) {
 // completed response. The CLI still discovers the real isolated user policy;
 // only subprocess scheduling is removed from this decision-contract matrix.
 fn exercise_host(host: &str) {
-    let mut state = GlobalStateGuard::new().unwrap();
-    state.remove_env("TIRITH_POLICY_ROOT");
+    let state = isolated_state();
     if !node_available(&state) {
         return;
     }
@@ -576,8 +587,7 @@ fn openclaw_callbacks_enforce_real_user_approval_gates() {
 
 #[test]
 fn typed_callbacks_complete_real_checks_with_shipped_deadlines() {
-    let mut state = GlobalStateGuard::new().unwrap();
-    state.remove_env("TIRITH_POLICY_ROOT");
+    let state = isolated_state();
     if !node_available(&state) {
         return;
     }

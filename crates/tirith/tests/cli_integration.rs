@@ -42,6 +42,15 @@ fn fresh_command_environment() -> PathBuf {
     ] {
         fs::create_dir_all(root.join(relative)).expect("create hermetic command directory");
     }
+    // A due schedule makes every online `check` spawn a detached 12 MB threat-DB
+    // download that outlives the test and repopulates the removed root. Tests of
+    // the schedule itself point XDG_STATE_HOME at their own directory.
+    fs::create_dir_all(root.join("state/tirith")).expect("create hermetic state directory");
+    fs::write(
+        root.join("state/tirith/threatdb-next-check-at"),
+        "99999999999",
+    )
+    .expect("defer threat-DB update");
     root
 }
 
@@ -80,6 +89,23 @@ fn tirith() -> Command {
     ] {
         cmd.env_remove(key);
     }
+    cmd
+}
+
+/// A shell or `expect` child with the same private HOME and XDG roots as
+/// [`tirith`], so a sourced hook, the binary it calls, and an interactive
+/// shell's history never write the developer's real home directory. Tests
+/// that need a specific root still override these afterwards.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn shell_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    let root = fresh_command_environment();
+    cmd.env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("HISTFILE", "");
     cmd
 }
 
@@ -170,7 +196,7 @@ fn output_wrap_zsh(
         Some(dir) => hermetic.env("ZDOTDIR", dir),
         None => hermetic.env_remove("ZDOTDIR"),
     };
-    let mut cmd = Command::new("zsh");
+    let mut cmd = shell_command("zsh");
     for (key, value) in hermetic.get_envs() {
         match value {
             Some(value) => cmd.env(key, value),
@@ -3991,7 +4017,7 @@ print -r -- "$_TIRITH_MKTEMP_BIN|$_TIRITH_RM_BIN|$_TIRITH_WC_BIN|$_TIRITH_ENV_BI
         zsh_hook.display(),
         fake_bin.display(),
     );
-    match Command::new("zsh")
+    match shell_command("zsh")
         .args(["-dfc", &zsh_script])
         .env("PATH", &initial_path)
         .env("HOME", home.path())
@@ -4029,7 +4055,7 @@ builtin printf '%s|%s|%s|%s|%s|%s\n' "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_
         fish_hook.display(),
         fake_bin.display(),
     );
-    match Command::new("fish")
+    match shell_command("fish")
         .args(["--no-config", "-c", &fish_script])
         .env("PATH", &initial_path)
         .env("HOME", home.path())
@@ -4173,7 +4199,7 @@ fn bash_hook_defaults_to_preexec_in_ssh_sessions() {
     let script = format!(
         "unset TIRITH_BASH_MODE; export SSH_CONNECTION=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env_remove("_TIRITH_BASH_LOADED")
         .output()
@@ -4196,7 +4222,7 @@ fn bash_hook_respects_explicit_mode_override_in_ssh_sessions() {
     let script = format!(
         "export TIRITH_BASH_MODE=enter; export SSH_CONNECTION=1; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env_remove("_TIRITH_BASH_LOADED")
         .output()
@@ -4746,7 +4772,7 @@ fn bash_hook_preexec_default_outside_ssh_without_capability_cache() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -4781,7 +4807,7 @@ fn bash_hook_enter_default_outside_ssh_with_works_capability() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -4810,7 +4836,7 @@ fn bash_hook_honors_persistent_safe_mode() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -4839,7 +4865,7 @@ fn bash_hook_explicit_override_trumps_safe_mode() {
     let script = format!(
         "export TIRITH_BASH_MODE=enter; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -4865,7 +4891,7 @@ fn bash_hook_prompt_hook_reattaches() {
     let script = format!(
         "source '{hook}'; PROMPT_COMMAND='other_fn'; _tirith_ensure_prompt_hook; [[ \"$PROMPT_COMMAND\" == *_tirith_prompt_hook* ]] && printf 'reattached' || printf 'missing'"
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env_remove("_TIRITH_BASH_LOADED")
         .output()
@@ -4880,7 +4906,7 @@ fn bash_hook_prompt_hook_reattaches() {
 
 #[cfg(unix)]
 fn expect_available() -> bool {
-    Command::new("sh")
+    shell_command("sh")
         .args(["-c", "command -v expect >/dev/null 2>&1"])
         .status()
         .map(|s| s.success())
@@ -4889,7 +4915,7 @@ fn expect_available() -> bool {
 
 #[cfg(unix)]
 fn bash_major_version() -> Option<u32> {
-    let out = Command::new("bash").arg("--version").output().ok()?;
+    let out = shell_command("bash").arg("--version").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -4906,11 +4932,11 @@ fn bash_major_version() -> Option<u32> {
 }
 
 /// Body of a schema-1 bash enter-mode capability cache (issue #111) seeded with `verdict`, keyed
-/// to the `$BASH_VERSION` and `$BASH` a bare `Command::new("bash")` reports — the same bash these
+/// to the `$BASH_VERSION` and `$BASH` a bare `shell_command("bash")` reports — the same bash these
 /// tests spawn.
 #[cfg(unix)]
 fn capability_cache_body(verdict: &str) -> String {
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["-c", "printf '%s\\n%s' \"$BASH_VERSION\" \"$BASH\""])
         .output()
         .expect("query bash identity");
@@ -4981,7 +5007,7 @@ fn bash_hook_startup_gate_degrade_persists() {
         }
         None => bin_dir.as_os_str().to_os_string(),
     };
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env("PATH", &path_with_bin)
         .env("XDG_STATE_HOME", tmpdir.path())
@@ -5009,7 +5035,7 @@ fn bash_hook_startup_gate_degrade_persists() {
     let script2 = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out2 = Command::new("bash")
+    let out2 = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script2])
         .env("PATH", &path_with_bin)
         .env("XDG_STATE_HOME", tmpdir.path())
@@ -5100,7 +5126,7 @@ expect eof
         entries.extend(std::env::split_paths(&existing));
     }
     let path_with_bin = std::env::join_paths(entries).expect("PATH with the built binary");
-    let out = Command::new("expect")
+    let out = shell_command("expect")
         .args(["-c", expect_script])
         .env("PATH", path_with_bin)
         .env("PROMPT_NONCE", uuid::Uuid::new_v4().to_string())
@@ -5141,7 +5167,7 @@ fn bash_hook_noninteractive_no_safe_mode_flag() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'"
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -5165,7 +5191,7 @@ fn bash_hook_noninteractive_no_debug_trap() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; trap -p DEBUG"
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env_remove("_TIRITH_BASH_LOADED")
         .output()
@@ -5193,7 +5219,7 @@ fn bash_hook_noninteractive_mode_resolution() {
     let script = format!(
         "unset TIRITH_BASH_MODE; unset SSH_CONNECTION; unset SSH_TTY; unset SSH_CLIENT; source '{hook}'; printf '%s' \"$_TIRITH_BASH_MODE\""
     );
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -5215,7 +5241,7 @@ fn bash_hook_noninteractive_mode_resolution() {
         capability_cache_body("works"),
     )
     .unwrap();
-    let out2 = Command::new("bash")
+    let out2 = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", &script])
         .env("XDG_STATE_HOME", tmpdir2.path())
         .env_remove("_TIRITH_BASH_LOADED")
@@ -5527,7 +5553,7 @@ for rc in 0 1 2 137; do
   fi
 done
 "#;
-    let out = Command::new("bash")
+    let out = shell_command("bash")
         .args(["--norc", "--noprofile", "-c", script])
         .output()
         .expect("failed to run bash");
@@ -5553,7 +5579,7 @@ else echo UNEXPECTED; fi
 "#;
     // `-f` (NO_RCS): skip the machine's `~/.zshenv` so a broken user startup
     // file can't make `zsh -c` exit before our script runs (keeps it hermetic).
-    let out = Command::new("zsh").args(["-f", "-c", script]).output();
+    let out = shell_command("zsh").args(["-f", "-c", script]).output();
     match out {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5576,7 +5602,7 @@ if test $rc -eq 0; echo ALLOW
 else if test $rc -eq 2; echo WARN
 else if test $rc -eq 1; echo BLOCK
 else; echo UNEXPECTED; end"#;
-    let out = Command::new("fish").args(["-c", script]).output();
+    let out = shell_command("fish").args(["-c", script]).output();
     match out {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5653,7 +5679,7 @@ expect eof
 "#
     );
 
-    let out = Command::new("expect")
+    let out = shell_command("expect")
         .args(["-c", &expect_script])
         .env("XDG_STATE_HOME", tmpdir.path().join("state"))
         .env_remove("TIRITH_BASH_MODE")
@@ -5804,7 +5830,7 @@ builtin print -r -- "protocol=$_TIRITH_RECEIPT_PROTOCOL status=$TIRITH_STATUS"
         hooks.join("zsh-hook.zsh").display(),
         old_bin.display()
     );
-    match Command::new("zsh")
+    match shell_command("zsh")
         .args(["-d", "-f", "-i", "-c", &zsh_script])
         .env("PATH", path)
         .env("HOME", home.path())
@@ -5838,7 +5864,7 @@ builtin printf 'protocol=%s status=%s\n' "$_TIRITH_RECEIPT_PROTOCOL" "$TIRITH_ST
         hooks.join("fish-hook.fish").display(),
         old_bin.display()
     );
-    match Command::new("fish")
+    match shell_command("fish")
         .args(["--no-config", "-i", "-c", &fish_script])
         .env("PATH", path)
         .env("HOME", home.path())

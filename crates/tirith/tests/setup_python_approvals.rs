@@ -171,6 +171,9 @@ fn state() -> GlobalStateGuard {
     state.remove_env("TIRITH_POLICY_ROOT");
     state.set_env("TIRITH_OFFLINE", "1");
     state.set_env("TIRITH_LOG", "0");
+    // macOS's system Python caches bytecode under $HOME/Library/Caches; a
+    // late-exiting telemetry child would recreate the removed temp root.
+    state.set_env("PYTHONDONTWRITEBYTECODE", "1");
     // Match existing setup integration fixtures: prefer the root-managed Unix
     // interpreter, not a developer package-manager prefix with writable groups.
     let path = format!(
