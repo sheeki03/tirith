@@ -4,6 +4,9 @@
 Reads JSON from stdin (Claude Code hook protocol), extracts the command,
 and delegates to `tirith check --json` for security analysis.
 
+Approvals and mandatory acknowledgements are denied: this hook has no
+confirmation channel. Warn-allow and TIRITH_FAIL_OPEN never bypass either gate.
+
 Exit codes:
   0 — hook completed successfully (decision in stdout JSON)
   Non-zero — hook error (fail-closed by default; set TIRITH_FAIL_OPEN=1 for fail-open)
@@ -96,17 +99,52 @@ def _build_warning_text(stdout):
     if stdout and stdout.strip():
         try:
             verdict = json.loads(stdout)
-            findings = verdict.get("findings", [])
-            if findings:
+            findings = verdict.get("findings", []) if isinstance(verdict, dict) else []
+            if isinstance(findings, list):
                 parts = []
                 for f in findings:
-                    title = f.get("title", f.get("rule_id", "unknown"))
+                    if not isinstance(f, dict):
+                        continue
+                    title = f.get("title") or f.get("rule_id", "unknown")
                     severity = f.get("severity", "")
-                    parts.append(f"[{severity}] {title}" if severity else title)
-                text = "Tirith: " + "; ".join(parts)
-        except json.JSONDecodeError:
+                    if not isinstance(title, str):
+                        continue
+                    parts.append(f"[{severity}] {title}" if isinstance(severity, str) and severity else title)
+                if parts:
+                    text = "Tirith: " + "; ".join(parts)
+        except (ValueError, RecursionError):
             text = stdout.strip()[:500]
     return text
+
+
+def _check_verdict(stdout):
+    """Validate the approval contract before permitting analyzed execution."""
+    try:
+        verdict = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("check returned invalid JSON") from error
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("requires_approval"), bool):
+        raise ValueError(
+            "check response is missing a boolean requires_approval; update tirith and re-run setup"
+        )
+    return verdict
+
+
+def _approval_reason(verdict, stdout):
+    """Use checker-redacted context, never the original secret-bearing command."""
+    reason = "Tirith: approval or acknowledgement required"
+    rule = verdict.get("approval_rule")
+    if isinstance(rule, str) and rule:
+        reason += f" ({rule})"
+    reason += ". " + _build_warning_text(stdout)
+    description = verdict.get("approval_description")
+    if isinstance(description, str) and description:
+        reason += ". " + description
+    return (
+        reason
+        + " — blocked; this host hook cannot collect approval or acknowledgement. "
+        "Review the command and retry from a Tirith-protected interactive shell to confirm it."
+    )
 
 
 def main():
@@ -164,6 +202,8 @@ def main():
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             env=env,
         )
@@ -180,14 +220,30 @@ def main():
         return
 
     # Unexpected exit code — fail-closed
-    if result.returncode not in (0, 1, 2):
+    if result.returncode not in (0, 1, 2, 3):
         _hook_event("unexpected_exit", f"exit code {result.returncode}")
         fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
         return
+    if result.returncode == 3:
+        _hook_event("check_block")
+        deny(_approval_reason({}, result.stdout))
     if result.returncode != 0 and not result.stdout.strip():
         _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
         fail_closed("tirith: check returned non-zero with no output — blocked for safety")
         return
+
+    if result.returncode == 1:
+        _hook_event("check_block")
+        deny(_build_warning_text(result.stdout))
+    try:
+        verdict = _check_verdict(result.stdout)
+    except ValueError as error:
+        _hook_event("unexpected_exit", "invalid approval metadata")
+        fail_closed(f"tirith: {error} — blocked for safety")
+        return
+    if verdict["requires_approval"]:
+        _hook_event("check_block")
+        deny(_approval_reason(verdict, result.stdout))
 
     # Exit 0 = clean, allow
     if result.returncode == 0:
@@ -220,11 +276,8 @@ def main():
             )
             sys.exit(0)
 
-    # Exit 1 = block, Exit 2 + deny = block
-    if result.returncode == 1:
-        _hook_event("check_block")
-    else:
-        _hook_event("warn_denied")
+    # Exit 2 + deny = block.
+    _hook_event("warn_denied")
     reason = _build_warning_text(result.stdout)
     deny(reason)
 

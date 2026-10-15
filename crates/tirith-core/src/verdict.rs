@@ -2309,6 +2309,11 @@ pub fn bound_json_value_for_output(value: serde_json::Value) -> serde_json::Valu
     if let Some(object) = value.as_object() {
         for key in [
             "action",
+            "requires_approval",
+            "approval_timeout_secs",
+            "approval_fallback",
+            "approval_rule",
+            "approval_description",
             "status",
             "kind",
             "event",

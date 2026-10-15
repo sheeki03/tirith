@@ -3808,8 +3808,23 @@ pub fn classify_trust_pattern(pattern: &str) -> TrustScopeKind {
 }
 
 fn extract_host_for_match(url: &str) -> Option<String> {
-    if let Some(host) = crate::parse::parse_url(url).host() {
-        return Some(host.trim_end_matches('.').to_lowercase());
+    // A tag/digest colon after the first slash is not an SCP authority
+    // separator. Prefer the validated registry authority for these references.
+    let registry_reference = url.split_once('/').is_some_and(|(registry, image)| {
+        registry.contains('.')
+            && !registry.contains(['@', '?', '#', '%', '\\'])
+            && !registry
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+            && image.contains(':')
+            && registry.rsplit_once(':').is_none_or(|(_, port)| {
+                !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit())
+            })
+    });
+    if !registry_reference {
+        if let Some(host) = crate::parse::parse_url(url).host() {
+            return Some(host.trim_end_matches('.').to_lowercase());
+        }
     }
     // Fallback for schemeless host/path (e.g., example.com/path)
     let candidate = url.split('/').next().unwrap_or(url).trim();
@@ -5503,6 +5518,39 @@ custom_rules:
             ..Default::default()
         };
         assert!(p.is_allowlisted("example.com:8080/path"));
+    }
+
+    #[test]
+    fn registry_trust_preserves_host_scope_for_tags_and_digests() {
+        let policy = Policy {
+            allowlist: vec!["registry.example.com".into()],
+            ..Default::default()
+        };
+        for reference in [
+            "registry.example.com/team/image:latest",
+            "registry.example.com/team/image:1.2.3",
+            "REGISTRY.EXAMPLE.COM/team/image:latest",
+            "registry.example.com:5000/team/image:latest",
+            "registry.example.com/team/image@sha256:0123456789abcdef",
+            "registry.example.com/team/image:latest@sha256:0123456789abcdef",
+            "git@registry.example.com:team/repo.git",
+            "registry.example.com:team/repo.git",
+        ] {
+            assert!(policy.is_allowlisted(reference), "{reference}");
+        }
+        for reference in [
+            "evil-registry.example.com/team/image:latest",
+            "registry.example.com.evil.test/team/image:latest",
+            "other.example.com/registry.example.com/image:latest",
+            "registry.example.com@other.example.com/team/image:latest",
+            "git@other.example.com:registry.example.com/repo.git",
+        ] {
+            assert!(!policy.is_allowlisted(reference), "{reference}");
+        }
+        assert!(!allowlist_pattern_matches(
+            "registry.example.com/team/image:latest",
+            "registry.example.com/team/image:other"
+        ));
     }
 
     #[test]

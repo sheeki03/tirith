@@ -3045,6 +3045,133 @@ fn check_json_clean_output() {
 }
 
 #[test]
+fn check_stdin_json_preserves_pending_approval_under_user_policy_and_custom_dlp() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let approval_policy = "approval_rules:\n  - rule_ids: [lookalike_tld]\n    timeout_secs: 0\n    fallback: block\n";
+    let broad_dlp_policy = format!("{approval_policy}dlp_custom_patterns:\n  - '(?s).+'\n");
+    let warning_command = "curl -sI https://release.zip/x";
+    for (label, command, policy, action, exit_code, requires_approval) in [
+        (
+            "unconfigured warning",
+            warning_command,
+            "",
+            "warn",
+            2,
+            false,
+        ),
+        (
+            "unmatched clean command",
+            "echo hello",
+            approval_policy,
+            "allow",
+            0,
+            false,
+        ),
+        (
+            "pending approval",
+            warning_command,
+            approval_policy,
+            "warn",
+            2,
+            true,
+        ),
+        (
+            "pending approval under broad DLP",
+            warning_command,
+            broad_dlp_policy.as_str(),
+            "warn",
+            2,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("isolated approval policy root");
+        fs::create_dir(root.path().join(".git")).expect("bound repository policy discovery");
+        let config = root.path().join("config");
+        fs::create_dir_all(config.join("tirith")).expect("create user policy directory");
+        if !policy.is_empty() {
+            fs::write(config.join("tirith/policy.yaml"), policy).expect("write user policy");
+        }
+        // Standard check accepts command bytes on stdin. Approval-check's
+        // legacy argv/temp-file protocol is intentionally not used here.
+        let mut child = tirith()
+            .current_dir(root.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("APPDATA", &config)
+            .env("LOCALAPPDATA", &config)
+            .args([
+                "check",
+                "--offline",
+                "--no-daemon",
+                "--non-interactive",
+                "--shell",
+                "posix",
+                "--json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stdin JSON check");
+        child
+            .stdin
+            .take()
+            .expect("command stdin")
+            .write_all(command.as_bytes())
+            .expect("write command bytes");
+        let out = child.wait_with_output().expect("wait for stdin JSON check");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(exit_code),
+            "{label}: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("check emits valid JSON");
+        assert_eq!(json["schema_version"], 3, "{label}: {json}");
+        assert_eq!(json["action"], action, "{label}: {json}");
+        assert_eq!(
+            json["requires_approval"].as_bool(),
+            Some(requires_approval),
+            "{label}: {json}"
+        );
+        if action == "warn" {
+            assert!(
+                json["findings"]
+                    .as_array()
+                    .expect("findings array")
+                    .iter()
+                    .any(|finding| finding["rule_id"] == "lookalike_tld"),
+                "{label}: the real warning finding must survive projection: {json}"
+            );
+        }
+        if requires_approval {
+            assert_eq!(json["approval_timeout_secs"], 0, "{label}: {json}");
+            assert_eq!(json["approval_fallback"], "block", "{label}: {json}");
+            assert_eq!(json["approval_rule"], "lookalike_tld", "{label}: {json}");
+            assert!(json["approval_description"].is_string(), "{label}: {json}");
+        } else {
+            for key in [
+                "approval_timeout_secs",
+                "approval_fallback",
+                "approval_rule",
+                "approval_description",
+            ] {
+                assert!(json.get(key).is_none(), "{label}: unexpected {key}: {json}");
+            }
+        }
+        if policy == broad_dlp_policy {
+            assert!(
+                !stdout.contains("release.zip"),
+                "DLP must redact content without erasing approval authority: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn check_powershell_iwr_iex_blocks() {
     let out = tirith()
         .args([

@@ -514,6 +514,9 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         // anchored so they match code syntax, not a bare shell word (`eval x`,
         // `systemctl` do not match).
         tier1_exec_fragments: &[
+            // The other inline download sources have source-command entries.
+            // BSD fetch can use a schemeless operand, so no :// marker is required.
+            r"\bfetch['\x22]?\s",
             r"\bexec\s*\(",
             r"\beval\s*\(",
             r"\bsystem\s*\(",

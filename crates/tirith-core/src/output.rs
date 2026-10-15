@@ -157,6 +157,18 @@ impl<'a> FindingView<'a> {
 pub struct JsonOutput<'a> {
     pub schema_version: u32,
     pub action: Action,
+    /// True for an active policy approval gate or mandatory warning acknowledgement.
+    /// Always serialized so consumers can distinguish an unsupported contract
+    /// from a supported response with no pending approval.
+    pub requires_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_fallback: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_rule: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_description: Option<&'a str>,
     pub findings: Vec<FindingView<'a>>,
     pub tier_reached: u8,
     pub bypass_requested: bool,
@@ -244,17 +256,20 @@ pub fn write_json_with_suggestions(
     suggestions: Option<&[SafeSuggestion]>,
     w: impl Write,
 ) -> std::io::Result<()> {
-    write_json_with_recovery(verdict, custom_patterns, suggestions, None, w)
+    write_json_with_recovery(verdict, custom_patterns, suggestions, None, false, w)
 }
 
 /// Recovery contains only closed enums, rule IDs and compiler-owned strings;
 /// its original command is used for eligibility and never serialized.
 /// Supplying advice selects schema 4; None preserves the schema-3 contract.
+/// `requires_warning_acknowledgement` carries CLI policy/flag context without
+/// changing the verdict's action or the standalone command's exit semantics.
 pub fn write_json_with_recovery(
     verdict: &Verdict,
     custom_patterns: &[String],
     suggestions: Option<&[SafeSuggestion]>,
     recovery: Option<&crate::recovery::RecoveryAdvice>,
+    requires_warning_acknowledgement: bool,
     mut w: impl Write,
 ) -> std::io::Result<()> {
     // Redact before applying presentation bounds: truncating first can split a
@@ -277,9 +292,23 @@ pub fn write_json_with_recovery(
             .map(|s| redact_suggestion(s, &compiled))
             .collect::<Vec<_>>()
     });
+    let approval_gate = verdict.requires_approval == Some(true);
+    let requires_approval =
+        approval_gate || verdict.action == Action::WarnAck || requires_warning_acknowledgement;
     let output = JsonOutput {
         schema_version: SCHEMA_VERSION,
         action: display.action,
+        requires_approval,
+        approval_timeout_secs: display.approval_timeout_secs.filter(|_| approval_gate),
+        approval_fallback: display
+            .approval_fallback
+            .as_deref()
+            .filter(|_| approval_gate),
+        approval_rule: display.approval_rule.as_deref().filter(|_| approval_gate),
+        approval_description: display
+            .approval_description
+            .as_deref()
+            .filter(|_| approval_gate),
         findings,
         tier_reached: display.tier_reached,
         bypass_requested: display.bypass_requested,
@@ -1084,6 +1113,7 @@ mod tests {
             &["(?s).+".into()],
             None,
             Some(&advice),
+            false,
             &mut bytes,
         )
         .unwrap();
@@ -1096,6 +1126,76 @@ mod tests {
         assert!(!String::from_utf8(bytes)
             .unwrap()
             .contains("recovery-private"));
+    }
+
+    fn warn_verdict_with_approval(description: &str) -> Verdict {
+        let mut verdict = block_verdict_with_bypass();
+        verdict.findings[0].rule_id = RuleId::LookalikeTld;
+        verdict.findings[0].severity = Severity::Medium;
+        verdict.action = Action::Warn;
+        crate::approval::apply_approval(
+            &mut verdict,
+            &crate::approval::ApprovalMetadata {
+                requires_approval: true,
+                timeout_secs: 0,
+                fallback: "block".to_string(),
+                rule_id: "lookalike_tld".to_string(),
+                description: description.to_string(),
+            },
+        );
+        verdict
+    }
+
+    #[test]
+    fn json_approval_metadata_follows_the_active_gate_and_projects_its_description() {
+        let custom = "APPROVAL_CUSTOM_SECRET";
+        let credential = format!("ghp_{}", "Q".repeat(36));
+        let mut verdict = warn_verdict_with_approval(&format!(
+            "Review {custom} {credential} at /Users/alice/project/private \u{1b}[31m"
+        ));
+        for requires_approval in [None, Some(false), Some(true)] {
+            verdict.requires_approval = requires_approval;
+            let mut bytes = Vec::new();
+            write_json(&verdict, &[regex::escape(custom)], &mut bytes).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["action"], "warn");
+            assert_eq!(value["requires_approval"], requires_approval == Some(true));
+            if requires_approval == Some(true) {
+                assert_eq!(value["approval_timeout_secs"], 0);
+                assert_eq!(value["approval_fallback"], "block");
+                assert_eq!(value["approval_rule"], "lookalike_tld");
+                let description = value["approval_description"].as_str().unwrap();
+                assert!(description.contains("REDACTED"), "{description}");
+                assert!(!description.contains('\u{1b}'), "{description}");
+            } else {
+                for key in [
+                    "approval_timeout_secs",
+                    "approval_fallback",
+                    "approval_rule",
+                    "approval_description",
+                ] {
+                    assert!(value.get(key).is_none(), "inactive {key}: {value}");
+                }
+            }
+            let output = String::from_utf8(bytes).unwrap();
+            assert!(!output.contains(custom), "{output}");
+            assert!(!output.contains(&credential), "{output}");
+            assert!(!output.contains("/Users/alice"), "{output}");
+        }
+    }
+
+    #[test]
+    fn json_warning_acknowledgement_remains_required_without_an_approval_rule() {
+        let mut verdict = warn_verdict_with_approval("stale approval metadata");
+        verdict.action = Action::WarnAck;
+        verdict.requires_approval = None;
+        let mut bytes = Vec::new();
+        write_json(&verdict, &[], &mut bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["action"], "warn_ack");
+        assert_eq!(value["requires_approval"], true);
+        assert!(value.get("approval_rule").is_none());
+        assert!(value.get("approval_fallback").is_none());
     }
 
     fn block_verdict_with_bypass() -> Verdict {
@@ -1237,9 +1337,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_json_writer_redacts_then_caps_pathological_output() {
-        let verdict = block_verdict_with_bypass();
+    fn shared_json_writer_redacts_then_caps_without_clearing_pending_approval() {
         let canary = "C02_WRITER_SECRET_CANARY";
+        let verdict = warn_verdict_with_approval(&format!("Review {canary}"));
         let suggestions = vec![SafeSuggestion {
             rule_id: "plain_http_to_sink".to_string(),
             safe_command: None,
@@ -1257,7 +1357,16 @@ mod tests {
 
         assert!(buf.len() <= crate::verdict::MAX_PRESENTATION_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(value["action"], "block");
+        assert_eq!(value["action"], "warn");
+        assert_eq!(value["requires_approval"], true);
+        assert_eq!(value["summary"]["requires_approval"], true);
+        assert_eq!(value["approval_timeout_secs"], 0);
+        assert_eq!(value["approval_fallback"], "block");
+        assert_eq!(value["approval_rule"], "lookalike_tld");
+        assert!(value["approval_description"]
+            .as_str()
+            .unwrap()
+            .contains("REDACTED"));
         assert_eq!(value["presentation_truncated"], true);
         assert!(!String::from_utf8(buf).unwrap().contains(canary));
     }

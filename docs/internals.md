@@ -211,11 +211,32 @@ receipts already require redacted inputs before hashing/signing.
 
 ### Compatibility decision
 
-Command-check JSON defaults to the frozen schema-3 contract. Callers explicitly
+Command-check JSON defaults to schema 3. Callers explicitly
 select `tirith check --format json --json-schema 4` to include typed recovery
 advice. Both versions retain the same action and exit code. Schema selection is
 rejected without JSON output and cannot be combined with approval checks or
 execution receipts. `tirith commands check` keeps its existing schema-3 output.
+
+The 0.5.0 execution contract adds an always-present `requires_approval` boolean
+to both versions. It is true for an active approval-rule gate, `WarnAck`, or a
+strict-warning acknowledgement required by the CLI flag/effective policy.
+`strict_warn` does not rewrite a standalone non-interactive Warn or its exit 2;
+the metadata tells execution consumers that confirmation is required. Optional
+`approval_timeout_secs`, `approval_fallback`, `approval_rule` and redacted
+`approval_description` are emitted only for the active approval-rule gate.
+
+Execution adapters must test confirmation before ordinary warning filtering or
+warning-allow handling. Hermes asks through its native gate; installed hosts
+without an approval contract deny. Known `WarnAck`/exit 3 cannot fall through
+checker fail-open even when JSON is damaged. The new adapters refuse or report a
+checker failure for absent/non-boolean approval metadata, rather than treating an
+older unsupported response as false. Report-only older schema readers can ignore
+the additive fields. Action and process-exit semantics remain unchanged.
+
+The writer's contextual acknowledgement argument avoids cloning/mutating the
+enforcement verdict. Confirmation survives content redaction and oversized
+fallback envelopes; canonical rule/fallback values remain machine metadata,
+while the description receives normal content projection.
 
 This correction preserves current field names, serialized enum spellings,
 optional fields, stdout/stderr routing and process exits. It repairs corruption

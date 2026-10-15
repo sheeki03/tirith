@@ -771,6 +771,7 @@ pub fn run(
             &policy.dlp_custom_patterns,
             suggestions_opt,
             recovery.as_ref(),
+            effective.action == Action::Warn && (strict_warn || policy.strict_warn),
             std::io::stdout().lock(),
         )
         .is_err()

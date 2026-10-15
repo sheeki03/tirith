@@ -320,3 +320,62 @@ fn curl_empty_hex_numeric_reading_reports_raw_ip() {
             .all(|f| f.rule_id != RuleId::RawIpUrl)
     );
 }
+
+#[test]
+fn curl_slash_variants_keep_dns_numeric_dual_reading_and_network_deny() {
+    for slashes in ["/", "//", "///"] {
+        let raw = format!("http:{slashes}user:password@0xa.0x.0x.0x5:8080/path?q=1#part");
+        for input in [
+            format!("curl '{raw}'"),
+            format!("env curl --url='{raw}'"),
+            format!("sh -c 'curl {raw}'"),
+        ] {
+            let urls = extract::extract_urls(&input, ShellType::Posix);
+            assert!(
+                urls.iter().any(|url| {
+                    url.parsed.host() == Some("0xa.0x.0x.0x5")
+                        && url.parsed.scheme() == Some("http")
+                        && url.parsed.port() == Some(8080)
+                        && url.parsed.userinfo() == Some("user")
+                        && url.parsed.path() == Some("/path")
+                }),
+                "{input}: {urls:?}"
+            );
+            assert!(
+                urls.iter().all(|url| url.parsed.host() != Some("10.0.0.5")),
+                "{input}: {urls:?}"
+            );
+        }
+        let input = format!("env curl --url='{raw}'");
+        for deny in ["10.0.0.0/8", "10.0.0.5", "0xa.0x.0x.0x5"] {
+            let findings =
+                rules::command::check_network_policy(&input, ShellType::Posix, &[deny.into()], &[]);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+                "{input}: {deny}: {findings:?}"
+            );
+        }
+        let allowed = rules::command::check_network_policy(
+            &input,
+            ShellType::Posix,
+            &["10.0.0.0/8".into()],
+            &["0xa.0x.0x.0x5".into()],
+        );
+        assert!(allowed.is_empty(), "{input}: {allowed:?}");
+        let metadata = format!("curl http:{slashes}169.254.169.254/latest/meta-data/");
+        let denied = rules::command::check_network_policy(
+            &metadata,
+            ShellType::Posix,
+            &["169.254.0.0/16".into()],
+            &[],
+        );
+        assert!(
+            denied
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CommandNetworkDeny),
+            "{metadata}: {denied:?}"
+        );
+    }
+}

@@ -5958,7 +5958,7 @@ mod tests {
         std::fs::write(&hook, crate::assets::TIRITH_CHECK_PY).unwrap();
         std::fs::write(
             &tirith,
-            "#!/bin/sh\nprintf '%s\\n' '{\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'\nexit 1\n",
+            "#!/bin/sh\nprintf '%s\\n' '{\"action\":\"block\",\"requires_approval\":false,\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&tirith, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -6005,7 +6005,7 @@ mod tests {
         std::fs::write(&hook, crate::assets::TIRITH_CHECK_PY).unwrap();
         std::fs::write(
             &tirith,
-            "#!/bin/sh\nprintf '%s\\n' '{\"findings\":[{\"title\":\"Shortened URL\",\"severity\":\"medium\"}]}'\nexit 2\n",
+            "#!/bin/sh\nprintf '%s\\n' '{\"action\":\"warn\",\"requires_approval\":false,\"findings\":[{\"title\":\"Shortened URL\",\"severity\":\"medium\"}]}'\nexit 2\n",
         )
         .unwrap();
         std::fs::set_permissions(&tirith, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -6209,7 +6209,7 @@ mod tests {
             let fake = home.join("fake-tirith");
             std::fs::write(
                 &fake,
-                "#!/bin/sh\nprintf '%s\\n' '{\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'\nexit 1\n",
+                "#!/bin/sh\nprintf '%s\\n' '{\"action\":\"block\",\"requires_approval\":false,\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'\nexit 1\n",
             )
             .unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -6293,10 +6293,18 @@ mod tests {
     fn fake_tirith(dir: &Path, exit_code: i32, title: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let fake = dir.join("fake-tirith");
+        let action = match exit_code {
+            0 => "allow",
+            1 => "block",
+            2 => "warn",
+            3 => "warn_ack",
+            _ => "error",
+        };
+        let requires_approval = exit_code == 3;
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"findings\":[{{\"title\":\"{title}\",\"severity\":\"High\"}}]}}'\nexit {exit_code}\n"
+                "#!/bin/sh\nprintf '%s\\n' '{{\"action\":\"{action}\",\"requires_approval\":{requires_approval},\"findings\":[{{\"title\":\"{title}\",\"severity\":\"High\"}}]}}'\nexit {exit_code}\n"
             ),
         )
         .unwrap();
@@ -6706,7 +6714,7 @@ mod tests {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *BLOCK_SECOND*) printf '%s\\n' '{{\"findings\":[{{\"title\":\"blocked second command\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\ncase \"$*\" in *--shell\\ powershell*POWERSHELL_ONLY*) printf '%s\\n' '{{\"findings\":[{{\"title\":\"blocked PowerShell\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *BLOCK_SECOND*) printf '%s\\n' '{{\"action\":\"block\",\"requires_approval\":false,\"findings\":[{{\"title\":\"blocked second command\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\ncase \"$*\" in *--shell\\ powershell*POWERSHELL_ONLY*) printf '%s\\n' '{{\"action\":\"block\",\"requires_approval\":false,\"findings\":[{{\"title\":\"blocked PowerShell\",\"severity\":\"High\"}}]}}'; exit 1 ;; esac\nprintf '%s\\n' '{{\"action\":\"allow\",\"requires_approval\":false,\"findings\":[]}}'\nexit 0\n",
                 log.display()
             ),
         )
@@ -6860,7 +6868,7 @@ mod tests {
         let fake = dir.path().join("fake-tirith");
         std::fs::write(
             &fake,
-            "#!/bin/sh\ncase \"$*\" in *BLOCK_TOKEN*) printf '%s\\n' '{\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'; exit 1 ;; esac\nexit 0\n",
+            "#!/bin/sh\ncase \"$*\" in *BLOCK_TOKEN*) printf '%s\\n' '{\"action\":\"block\",\"requires_approval\":false,\"findings\":[{\"title\":\"blocked\",\"severity\":\"High\"}]}'; exit 1 ;; esac\nprintf '%s\\n' '{\"action\":\"allow\",\"requires_approval\":false,\"findings\":[]}'\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();

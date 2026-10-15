@@ -1318,6 +1318,67 @@ fn fish_allowed_command_executes_exactly_once() {
     );
 }
 
+#[test]
+fn fish_multiline_commands_and_loops_execute_once() {
+    let mut env = IsolatedEnv::new();
+    let lines = env.workdir.join("fish_multiline.txt");
+    let loop_marker = env.workdir.join("fish_loop.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let commands = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'SECOND\\n' >> '{}'",
+        lines.display(),
+        lines.display()
+    );
+    session.send_raw(format!("\x1b[200~{commands}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&lines, "SECOND", MARKER_MAX);
+    assert_eq!(body, "FIRST\nSECOND\n");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+
+    let loop_command = format!(
+        "for item in one two\nprintf '%s\\n' $item >> '{}'\nend",
+        loop_marker.display()
+    );
+    session.send_raw(format!("\x1b[200~{loop_command}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&loop_marker, "two", MARKER_MAX);
+    assert_eq!(body, "one\ntwo\n");
+    assert_consumed_receipts_are_retired(&env, "fish multiline");
+    session.close();
+}
+
+#[test]
+fn fish_multiline_block_checks_entire_buffer_before_execution() {
+    let mut env = IsolatedEnv::new();
+    let first = env.workdir.join("fish_multiline_first.txt");
+    let blocked = env.workdir.join("fish_multiline_blocked.txt");
+    let control = env.workdir.join("fish_multiline_control.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let command = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'true' | bash; and touch '{}'",
+        first.display(),
+        blocked.display()
+    );
+    session.send_raw(format!("\x1b[200~{command}\x1b[201~\r").as_bytes());
+    session.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    session.send_line(&format!("printf 'AFTER\\n' >> '{}'", control.display()));
+    assert_eq!(wait_for_marker(&control, "AFTER", MARKER_MAX), "AFTER\n");
+    session.close();
+    assert!(
+        !first.exists(),
+        "no prefix of a blocked multiline buffer may run"
+    );
+    assert!(!blocked.exists(), "blocked second line must not run");
+}
+
 /// Issue #188: Fish completion must remain an editor-only action. Completing an
 /// `rm` operand may inspect several matching names, but it must not commit a
 /// shell execution receipt (and therefore must not persist deletion events that
