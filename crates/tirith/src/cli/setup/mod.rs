@@ -30,7 +30,8 @@ mod tools;
 mod yaml_edit;
 pub(crate) use shell_profile::shell_quote;
 pub(crate) use tools::{
-    cline_hooks_dir, omp_user_guard_path, pi_cli_user_guard_path, prime_agent_user_guard_path,
+    cline_hooks_dir, omp_user_guard_path, openclaw_state_dir_override, pi_cli_user_guard_path,
+    prime_agent_user_guard_path,
 };
 
 #[cfg(unix)]
