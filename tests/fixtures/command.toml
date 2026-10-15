@@ -1674,6 +1674,303 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
 
+# Inline source after options the role parser must read past, redirections,
+# clustered short options, wrappers, and a word list the dataflow splitter
+# rejects (a trailing backslash). None of these may hide the payload.
+
+[[fixture]]
+name = "inline_node_title_value"
+min_milestone = 1
+input = "node --title x -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_conditions_short_value"
+min_milestone = 1
+input = "node -C development -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_input_type_value"
+min_milestone = 1
+input = "node --input-type module -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_loader_value"
+min_milestone = 1
+input = "node --experimental-loader ./loader.mjs -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_inspect_port_value"
+min_milestone = 1
+input = "node --inspect-port 9230 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_v8_stack_size_value"
+min_milestone = 1
+input = "node --stack-size 2000 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_unknown_option_value"
+min_milestone = 1
+input = "node --unlisted-option value -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_chdir_value"
+min_milestone = 1
+input = "ruby -C /tmp -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_encoding_short_value"
+min_milestone = 1
+input = "ruby -E UTF-8 -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_encoding_long_value"
+min_milestone = 1
+input = "ruby --encoding UTF-8 -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_bun_cwd_value"
+min_milestone = 1
+input = "bun --cwd /tmp -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_before_flag"
+min_milestone = 1
+input = "python3 2>/dev/null -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_fd_dup_before_flag"
+min_milestone = 1
+input = "node 2>&1 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_before_command"
+min_milestone = 1
+input = "2>/dev/null python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_joined_to_command"
+min_milestone = 1
+input = "python3>/dev/null -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_separate_redirect_target"
+min_milestone = 1
+input = "python3 2> /tmp/err -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash"
+min_milestone = 1
+input = "python3 -c \"import os; os.system('id')\" \\"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash_second_segment"
+min_milestone = 1
+input = "echo hi; python3 -c \"import os; os.system('id')\" \\"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_clustered_safe_path_flag"
+min_milestone = 1
+input = "python3 -Pc \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_clustered_warning_value"
+min_milestone = 1
+input = "python3 -uW ignore -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_line_flag"
+min_milestone = 1
+input = "perl -le 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_loop_flags"
+min_milestone = 1
+input = "perl -lne 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_clustered_warning_flag"
+min_milestone = 1
+input = "ruby -we 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_disable_value"
+min_milestone = 1
+input = "ruby --disable gems -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_sudo_user_wrapper"
+min_milestone = 1
+input = "sudo -u nobody python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_env_wrapper"
+min_milestone = 1
+input = "env LANG=C python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_nice_wrapper"
+min_milestone = 1
+input = "nice -n 5 python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_timeout_wrapper"
+min_milestone = 1
+input = "timeout 10 python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_command_wrapper"
+min_milestone = 1
+input = "command python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_exec_wrapper"
+min_milestone = 1
+input = "exec python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_nohup_wrapper"
+min_milestone = 1
+input = "nohup python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_title_value_benign_no_fire"
+min_milestone = 1
+input = "node --title x -e 'console.log(1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_benign_no_fire"
+min_milestone = 1
+input = "python3 2>/dev/null -c 'print(1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash_benign_no_fire"
+min_milestone = 1
+input = "python3 -c 'print(1)' \\"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_benign_no_fire"
+min_milestone = 1
+input = "perl -lne 'print' file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_in_place_extension_no_fire"
+min_milestone = 1
+input = "perl -pie 'print' file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
 # ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
 
 [[fixture]]

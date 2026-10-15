@@ -1986,7 +1986,7 @@ fn push_segment_impl(
 /// arguments still see it; rules that read argv by position see the shell's
 /// argv, as for a trailing redirection. Inside `[[ ... ]]` and `(( ... ))`
 /// `<` and `>` compare, so those words are left as they are.
-fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+pub(crate) fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
 
     let Some(first) = words.iter().position(|word| !is_env_assignment(word)) else {
