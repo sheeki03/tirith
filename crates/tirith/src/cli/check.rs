@@ -407,6 +407,26 @@ pub fn run(
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
+        // Machine callers (agent adapters, the Hermes plugin) require the
+        // ordinary envelope; an honored bypass is `action: allow` with
+        // `bypass_honored: true` and no approval requirement.
+        if json {
+            let empty: [tirith_core::safe_command::SafeSuggestion; 0] = [];
+            let recovery = (json_schema == 4)
+                .then(|| tirith_core::recovery::for_command(&raw_verdict, cmd, shell_type));
+            if output::write_json_with_recovery(
+                &raw_verdict,
+                &policy.dlp_custom_patterns,
+                suggest_safe_command.then_some(empty.as_slice()),
+                recovery.as_ref(),
+                false,
+                std::io::stdout().lock(),
+            )
+            .is_err()
+            {
+                eprintln!("tirith: failed to write JSON output");
+            }
+        }
         return 0;
     }
 
