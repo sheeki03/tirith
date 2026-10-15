@@ -12,6 +12,9 @@ const STRICT_WARN_POLICY: &str = "paranoia: 4\nstrict_warn: true\n";
 const APPROVAL_POLICY: &str = "paranoia: 4\napproval_rules:\n  - rule_ids: [web3_address_in_url]\n    timeout_secs: 1\n    fallback: allow\n";
 const INFO_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: info\n";
 const INFO_APPROVAL_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: info\napproval_rules:\n  - rule_ids: [web3_address_in_url]\n    timeout_secs: 1\n    fallback: allow\n";
+const HIGH_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: high\n";
+const BYPASS_POLICY: &str =
+    "paranoia: 4\nallow_bypass_env: true\nallow_bypass_env_noninteractive: true\n";
 
 // Like the existing JS conformance suites, import the exact asset bytes as an
 // ES module. The .ts assets deliberately contain valid JavaScript; no type
@@ -155,8 +158,17 @@ struct CheckedCommand {
 }
 
 fn check(state: &GlobalStateGuard, command: &str) -> (CheckedCommand, Value) {
+    check_with_env(state, command, &[])
+}
+
+fn check_with_env(
+    state: &GlobalStateGuard,
+    command: &str,
+    env: &[(&str, &str)],
+) -> (CheckedCommand, Value) {
     let mut binary = Command::new(env!("CARGO_BIN_EXE_tirith"));
     state.apply_to_command(&mut binary);
+    binary.envs(env.iter().copied());
     let mut child = binary
         .args(["check", "--json", "--non-interactive", "--shell", "posix"])
         .stdin(Stdio::piped())
@@ -476,6 +488,44 @@ fn exercise_host(host: &str) {
             ),
         );
     }
+
+    // A deferred block (TIRITH_DEFER=1, exit 4 pending review) is a verdict,
+    // never a checker error: fail-open and damaged JSON cannot allow it.
+    write_user_policy(HIGH_POLICY);
+    let (deferred_response, deferred) =
+        check_with_env(&state, WARNING_COMMAND, &[("TIRITH_DEFER", "1")]);
+    assert_eq!(deferred_response.status, 4, "{deferred}");
+    assert_eq!(deferred["action"], "block", "{deferred}");
+    for tool in tools {
+        for fail_open in [false, true] {
+            for mutation in ["none", "invalid_json"] {
+                assert_blocked(
+                    host,
+                    callback(
+                        &state,
+                        host,
+                        tool,
+                        &deferred_response,
+                        "allow",
+                        fail_open,
+                        mutation,
+                    ),
+                );
+            }
+        }
+    }
+
+    // A policy-honored TIRITH=0 bypass returns the allow envelope.
+    write_user_policy(BYPASS_POLICY);
+    let (bypass_response, bypass) = check_with_env(&state, CRITICAL_COMMAND, &[("TIRITH", "0")]);
+    assert_eq!(bypass_response.status, 0, "{bypass}");
+    assert_eq!(bypass["action"], "allow", "{bypass}");
+    assert_eq!(bypass["bypass_honored"], true, "{bypass}");
+    assert_eq!(bypass["requires_approval"], false, "{bypass}");
+    for tool in tools {
+        assert!(callback(&state, host, tool, &bypass_response, "allow", false, "none").is_null());
+    }
+    write_user_policy(BASE_POLICY);
 
     // Project a real engine warning onto the explicit WarnAck/rc3 contract.
     // The exit status must retain the gate even when its JSON cannot express it.

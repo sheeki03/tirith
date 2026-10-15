@@ -48,7 +48,7 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo "tirith: configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1" >&2; exit 2
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('tool_info',{}).get('command_line',''))" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
+COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('tool_info',{}).get('command_line',''))" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
 if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
   _tirith_hook_event parse_error
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
@@ -88,7 +88,7 @@ if [ "$RC" -eq 0 ]; then _tirith_hook_event check_ok; exit 0; fi
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -107,8 +107,9 @@ except Exception:
 " <<< "$RESULT" 2>/dev/null || echo "Tirith: security check failed"
 }
 
-# Exit 1 = block (High/Critical findings)
-if [ "$RC" -eq 1 ]; then
+# Exit 1 = block (High/Critical findings); exit 4 = deferred block (pending
+# review), never a checker error eligible for fail-open.
+if [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
   _tirith_hook_event check_block
   _findings_summary >&2
   exit 2

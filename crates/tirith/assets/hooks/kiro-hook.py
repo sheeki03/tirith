@@ -7,6 +7,7 @@ analysis.
 
 Approvals and mandatory acknowledgements are denied: this hook has no
 confirmation channel. Warn-allow and TIRITH_FAIL_OPEN never bypass either gate.
+Blocks (check exit 1) and deferred blocks (exit 4) are always denied.
 
 Exit codes (Kiro contract):
   0 — allow (warnings retain their findings on stderr)
@@ -113,6 +114,37 @@ def _build_reason(stdout):
         except (ValueError, RecursionError):
             text = stdout.strip()[:500]
     return text
+
+
+def warn_action():
+    """Return the validated TIRITH_HOOK_WARN_ACTION: "allow" (default) or "deny"."""
+    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
+    if value in ("allow", "deny"):
+        return value
+    print(
+        f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{value}', defaulting to 'allow'",
+        file=sys.stderr,
+    )
+    return "allow"
+
+
+def checker_error(returncode, reason):
+    """Fail closed (or open) on a damaged response, never past an intact verdict.
+
+    A warning the operator configured to deny stays denied when its response is
+    damaged, so TIRITH_FAIL_OPEN cannot turn a denied warning into an allow.
+    """
+    if returncode == 2 and warn_action() == "deny":
+        deny(reason)
+    fail_closed(reason)
+
+
+def _block_reason(returncode, stdout):
+    """Describe a block; exit 4 is a deferred block awaiting `tirith pending` review."""
+    reason = _build_reason(stdout)
+    if returncode == 4:
+        reason += " — blocked, pending review (deferred). Resolve with `tirith pending`."
+    return reason
 
 
 def _check_verdict(stdout):
@@ -240,26 +272,27 @@ def main():
         fail_closed(f"tirith: OS error running check — {e}")
         return
 
-    if result.returncode not in (0, 1, 2, 3):
+    if result.returncode not in (0, 1, 2, 3, 4):
         _hook_event("unexpected_exit", f"exit code {result.returncode}")
         fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
         return
     if result.returncode == 3:
         _hook_event("check_block")
         deny(_approval_reason({}, result.stdout))
-    if result.returncode != 0 and not result.stdout.strip():
-        _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
-        fail_closed("tirith: check returned non-zero with no output — blocked for safety")
-        return
-
-    if result.returncode == 1:
+    if result.returncode in (1, 4):
+        # A block is a verdict, not a checker error, even with damaged output.
+        # Exit 4 is a deferred block (pending review).
         _hook_event("check_block")
-        deny(_build_reason(result.stdout))
+        deny(_block_reason(result.returncode, result.stdout))
+    if not result.stdout.strip():
+        _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
+        checker_error(result.returncode, "tirith: check returned no output — blocked for safety")
+        return
     try:
         verdict = _check_verdict(result.stdout)
     except ValueError as error:
         _hook_event("unexpected_exit", "invalid approval metadata")
-        fail_closed(f"tirith: {error} — blocked for safety")
+        checker_error(result.returncode, f"tirith: {error} — blocked for safety")
         return
     if verdict["requires_approval"]:
         _hook_event("check_block")
@@ -270,10 +303,7 @@ def main():
         sys.exit(0)
 
     if result.returncode == 2:
-        warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-        if warn_action not in ("allow", "deny"):
-            warn_action = "allow"
-        if warn_action != "deny":
+        if warn_action() != "deny":
             _hook_event("warn_allowed")
             print(_build_reason(result.stdout), file=sys.stderr)
             sys.exit(0)

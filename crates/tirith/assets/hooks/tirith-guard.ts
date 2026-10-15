@@ -1258,6 +1258,23 @@ export default function (pi) {
             reason: "tirith: warning acknowledgement required — blocked; this integration cannot collect acknowledgement. Use a Tirith-protected interactive shell to acknowledge the warning.",
           };
         }
+        if (err.status === 4) {
+          // A deferred block (TIRITH_DEFER=1 / --defer, pending review) is a
+          // verdict, not a checker error covered by TIRITH_FAIL_OPEN.
+          recordHookEvent("check_block");
+          const deferredStdout = typeof err.stdout === "string" ? err.stdout : "";
+          let deferred;
+          try {
+            deferred = JSON.parse(deferredStdout);
+          } catch {
+            deferred = undefined;
+          }
+          return {
+            block: true,
+            reason: describeFindings(deferred, deferredStdout, "Tirith security check failed")
+              + " — blocked, pending review (deferred). Resolve with `tirith pending`.",
+          };
+        }
         if (err.code === "ENOENT") {
           if (failOpen()) return undefined;
           return {
