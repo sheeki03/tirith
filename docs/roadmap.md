@@ -174,9 +174,10 @@ The plugin lives in
 [`sheeki03/hermes-plugin-tirith`](https://github.com/sheeki03/hermes-plugin-tirith),
 is released from that repository, requires the 0.5.0 check contract (it refuses
 older Tirith builds), and does not install Tirith. Its CI covers Hermes 0.21.5,
-0.21.7 and 0.22.2. A Hermes plugin-catalog entry pins the merged plugin commit
-and is submitted after this release; do not promise automatic migration. The
-[latest maintainer direction](https://github.com/sheeki03/tirith/issues/272#issuecomment-6057907776)
+0.21.7 and 0.22.2. A Hermes plugin-catalog entry is submitted after this
+release; once the plugin implementation merges, the entry's pin is set to the
+resulting commit on the plugin's `main`. Do not promise automatic migration.
+The [latest maintainer direction](https://github.com/sheeki03/tirith/issues/272#issuecomment-6057907776)
 withdraws the v50 migration pointer and asks for catalog-based discovery.
 
 ### Still open after 0.5.0
