@@ -3762,9 +3762,10 @@ impl TrustScopeKind {
     }
 }
 
-/// Reject values that would be rewritten by the terminal display scrub.  This
-/// is used when importing trust-store patterns as enforcement rules, so a
-/// hand-edited store cannot introduce a value that the CLI itself refuses.
+/// Reject values that would be rewritten by the terminal display scrub, and
+/// patterns with a `*` that can never match.  This is used when importing
+/// trust-store patterns as enforcement rules, so a hand-edited store cannot
+/// introduce a value that the CLI itself refuses.
 pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
     if pattern.trim().is_empty() {
         return Err("pattern must not be empty".to_string());
@@ -3776,6 +3777,27 @@ pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
         || crate::mcp::output_filter::sanitize_for_display(pattern) != pattern
     {
         return Err("pattern contains terminal-control or deceptive Unicode characters".into());
+    }
+    // `*` is a wildcard only as a leading `*.` label. Anywhere else it is a
+    // literal byte that no host, URL or image reference carries, so the entry
+    // would be recorded as effective without ever matching (#271).
+    if pattern.strip_prefix("*.").unwrap_or(pattern).contains('*') {
+        let host = pattern
+            .split_once("://")
+            .map_or(pattern, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .filter(|host| !host.is_empty() && !host.contains('*'));
+        return Err(match host {
+            Some(host) => format!(
+                "'*' is a wildcard only as a leading '*.' label; to trust everything \
+                 under {host}, trust the host itself ('{host}' with --broad), or name \
+                 the exact URL or image"
+            ),
+            None => "'*' is a wildcard only as a leading '*.' label (for example \
+                     '*.example.com'); name the host (with --broad) or the exact URL instead"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -5551,6 +5573,40 @@ custom_rules:
             "registry.example.com/team/image:latest",
             "registry.example.com/team/image:other"
         ));
+    }
+
+    /// #271: `*` is a wildcard only as a leading `*.` label. A pattern with a
+    /// `*` anywhere else is refused (it could never match), with the host
+    /// grant named when the pattern has one.
+    #[test]
+    fn trust_patterns_with_a_non_leading_star_are_refused_with_the_host_grant() {
+        for pattern in [
+            "registry.example.com/*",
+            "https://registry.example.com/*",
+            "registry.example.com/team/*",
+        ] {
+            let error = validate_trust_pattern(pattern).unwrap_err();
+            assert!(
+                error.contains("'registry.example.com' with --broad"),
+                "{pattern}: {error}"
+            );
+            assert!(!allowlist_pattern_matches(
+                pattern,
+                "registry.example.com/team/image:latest"
+            ));
+        }
+        for pattern in ["*registry.example.com", "registry.*.com", "*.example.com/*"] {
+            let error = validate_trust_pattern(pattern).unwrap_err();
+            assert!(error.contains("leading '*.' label"), "{pattern}: {error}");
+        }
+        for pattern in [
+            "*.example.com",
+            "registry.example.com",
+            "registry.example.com/team/image:latest",
+            "https://example.com/install.sh",
+        ] {
+            assert!(validate_trust_pattern(pattern).is_ok(), "{pattern}");
+        }
     }
 
     #[test]
