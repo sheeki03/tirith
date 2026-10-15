@@ -2,10 +2,46 @@
 //! flag conflicts are enforced, JSON envelopes are stable, and error messages
 //! include corrective suggestions.
 
+use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// One private HOME and XDG tree per test process, removed at exit, so these
+/// CLI runs never write the developer's audit log, state, or threat DB. The
+/// threat-DB update schedule is pushed into the future so a `check` here never
+/// leaves a detached download running.
+fn hermetic_root() -> &'static Path {
+    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("tirith-help-snapshots-")
+            .tempdir()
+            .expect("create hermetic root");
+        tirith_test_support::remove_at_exit(root.path());
+        for relative in ["config", "data", "state/tirith", "cache"] {
+            std::fs::create_dir_all(root.path().join(relative)).expect("create hermetic dir");
+        }
+        std::fs::write(
+            root.path().join("state/tirith/threatdb-next-check-at"),
+            "99999999999",
+        )
+        .expect("defer threat-DB update");
+        root
+    })
+    .path()
+}
 
 fn tirith() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let root = hermetic_root();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TIRITH_LOG", "0");
+    cmd
 }
 
 /// Verify a subcommand's --help contains an "Examples:" section with expected

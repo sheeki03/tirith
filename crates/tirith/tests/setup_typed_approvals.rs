@@ -12,6 +12,9 @@ const STRICT_WARN_POLICY: &str = "paranoia: 4\nstrict_warn: true\n";
 const APPROVAL_POLICY: &str = "paranoia: 4\napproval_rules:\n  - rule_ids: [web3_address_in_url]\n    timeout_secs: 1\n    fallback: allow\n";
 const INFO_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: info\n";
 const INFO_APPROVAL_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: info\napproval_rules:\n  - rule_ids: [web3_address_in_url]\n    timeout_secs: 1\n    fallback: allow\n";
+const HIGH_POLICY: &str = "paranoia: 4\nseverity_overrides:\n  web3_address_in_url: high\n";
+const BYPASS_POLICY: &str =
+    "paranoia: 4\nallow_bypass_env: true\nallow_bypass_env_noninteractive: true\n";
 
 // Like the existing JS conformance suites, import the exact asset bytes as an
 // ES module. The .ts assets deliberately contain valid JavaScript; no type
@@ -125,6 +128,18 @@ for (const check of checks) {
 process.stdout.write(JSON.stringify(result === undefined ? null : result));
 "#;
 
+/// Isolated state with the threat-DB update deferred: these checks run online,
+/// and a due schedule would leave a detached download running after the guard
+/// removes its temporary root.
+fn isolated_state() -> GlobalStateGuard {
+    let mut state = GlobalStateGuard::new().unwrap();
+    state.remove_env("TIRITH_POLICY_ROOT");
+    let schedule = state.roots().xdg_state.join("tirith");
+    std::fs::create_dir_all(&schedule).unwrap();
+    std::fs::write(schedule.join("threatdb-next-check-at"), "99999999999").unwrap();
+    state
+}
+
 fn node_available(state: &GlobalStateGuard) -> bool {
     let mut command = Command::new("node");
     state.apply_to_command(&mut command);
@@ -155,8 +170,17 @@ struct CheckedCommand {
 }
 
 fn check(state: &GlobalStateGuard, command: &str) -> (CheckedCommand, Value) {
+    check_with_env(state, command, &[])
+}
+
+fn check_with_env(
+    state: &GlobalStateGuard,
+    command: &str,
+    env: &[(&str, &str)],
+) -> (CheckedCommand, Value) {
     let mut binary = Command::new(env!("CARGO_BIN_EXE_tirith"));
     state.apply_to_command(&mut binary);
+    binary.envs(env.iter().copied());
     let mut child = binary
         .args(["check", "--json", "--non-interactive", "--shell", "posix"])
         .stdin(Stdio::piped())
@@ -279,8 +303,7 @@ fn assert_blocked(host: &str, result: Value) {
 // completed response. The CLI still discovers the real isolated user policy;
 // only subprocess scheduling is removed from this decision-contract matrix.
 fn exercise_host(host: &str) {
-    let mut state = GlobalStateGuard::new().unwrap();
-    state.remove_env("TIRITH_POLICY_ROOT");
+    let state = isolated_state();
     if !node_available(&state) {
         return;
     }
@@ -477,6 +500,44 @@ fn exercise_host(host: &str) {
         );
     }
 
+    // A deferred block (TIRITH_DEFER=1, exit 4 pending review) is a verdict,
+    // never a checker error: fail-open and damaged JSON cannot allow it.
+    write_user_policy(HIGH_POLICY);
+    let (deferred_response, deferred) =
+        check_with_env(&state, WARNING_COMMAND, &[("TIRITH_DEFER", "1")]);
+    assert_eq!(deferred_response.status, 4, "{deferred}");
+    assert_eq!(deferred["action"], "block", "{deferred}");
+    for tool in tools {
+        for fail_open in [false, true] {
+            for mutation in ["none", "invalid_json"] {
+                assert_blocked(
+                    host,
+                    callback(
+                        &state,
+                        host,
+                        tool,
+                        &deferred_response,
+                        "allow",
+                        fail_open,
+                        mutation,
+                    ),
+                );
+            }
+        }
+    }
+
+    // A policy-honored TIRITH=0 bypass returns the allow envelope.
+    write_user_policy(BYPASS_POLICY);
+    let (bypass_response, bypass) = check_with_env(&state, CRITICAL_COMMAND, &[("TIRITH", "0")]);
+    assert_eq!(bypass_response.status, 0, "{bypass}");
+    assert_eq!(bypass["action"], "allow", "{bypass}");
+    assert_eq!(bypass["bypass_honored"], true, "{bypass}");
+    assert_eq!(bypass["requires_approval"], false, "{bypass}");
+    for tool in tools {
+        assert!(callback(&state, host, tool, &bypass_response, "allow", false, "none").is_null());
+    }
+    write_user_policy(BASE_POLICY);
+
     // Project a real engine warning onto the explicit WarnAck/rc3 contract.
     // The exit status must retain the gate even when its JSON cannot express it.
     for mutation in [
@@ -526,8 +587,7 @@ fn openclaw_callbacks_enforce_real_user_approval_gates() {
 
 #[test]
 fn typed_callbacks_complete_real_checks_with_shipped_deadlines() {
-    let mut state = GlobalStateGuard::new().unwrap();
-    state.remove_env("TIRITH_POLICY_ROOT");
+    let state = isolated_state();
     if !node_available(&state) {
         return;
     }

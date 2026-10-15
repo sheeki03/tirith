@@ -3206,6 +3206,28 @@ pub fn setup_openhands(opts: &SetupOpts) -> Result<(), String> {
     Ok(())
 }
 
+/// The OpenClaw user state directory named by `OPENCLAW_STATE_DIR` (or the
+/// legacy `CLAWDBOT_STATE_DIR`), with `~` expanded and a relative path resolved
+/// against the cwd. `None` means the default `~/.openclaw`.
+pub(crate) fn openclaw_state_dir_override(home: &Path) -> Option<PathBuf> {
+    let state_dir = std::env::var_os("OPENCLAW_STATE_DIR")
+        .or_else(|| std::env::var_os("CLAWDBOT_STATE_DIR"))?;
+    let mut p = std::path::PathBuf::from(&state_dir);
+    if let Some(s) = state_dir.to_str() {
+        if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+            p = home.join(rest);
+        } else if s == "~" {
+            p = home.to_path_buf();
+        }
+    }
+    if p.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            p = cwd.join(p);
+        }
+    }
+    Some(p)
+}
+
 pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
     let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
 
@@ -3215,22 +3237,7 @@ pub fn setup_openclaw(opts: &SetupOpts) -> Result<(), String> {
             (cwd.join(".openclaw"), Some(cwd.clone()), cwd)
         }
         Scope::User => {
-            if let Some(state_dir) = std::env::var_os("OPENCLAW_STATE_DIR")
-                .or_else(|| std::env::var_os("CLAWDBOT_STATE_DIR"))
-            {
-                let mut p = std::path::PathBuf::from(&state_dir);
-                if let Some(s) = state_dir.to_str() {
-                    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-                        p = home.join(rest);
-                    } else if s == "~" {
-                        p = home.clone();
-                    }
-                }
-                if p.is_relative() {
-                    if let Ok(cwd) = std::env::current_dir() {
-                        p = cwd.join(p);
-                    }
-                }
+            if let Some(p) = openclaw_state_dir_override(&home) {
                 (p.clone(), None, p)
             } else {
                 (home.join(".openclaw"), Some(home.clone()), home.clone())

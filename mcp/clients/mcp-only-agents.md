@@ -27,6 +27,44 @@ binary. Existing unrelated configuration is preserved, writes are contained
 and transactional, changed files receive a backup, user-level files are kept
 private, and `--dry-run`, `--force`, and repeat runs are supported.
 
+## Hook and plugin decision contract
+
+Every installed hook or plugin passes the command to `tirith check --json` and
+applies the same rules; only the host's deny shape differs (a JSON decision, a
+`{block: true}` return, or exit 2):
+
+- Exit 0 from tirith: allow, unless the JSON has `requires_approval: true`,
+  then deny.
+- Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
+- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`), with
+  the findings passed to the host where it has a channel for them. Set
+  `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
+  or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
+  `TIRITH_FAIL_OPEN`. Agent hooks have no channel to collect approval or
+  acknowledgement; retry the command from a Tirith-protected interactive shell.
+- Exit 3 (mandatory warning acknowledgement): always deny.
+- Exit 4 (deferred block from `TIRITH_DEFER=1` / `tirith check --defer`,
+  recorded for `tirith pending`): always deny, regardless of
+  `TIRITH_FAIL_OPEN`.
+- Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
+  2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
+  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+- Any other exit code, timeout, or missing binary: deny unless
+  `TIRITH_FAIL_OPEN=1`.
+
+`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
+deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
+hooks run non-interactively) exits 0 with `"action": "allow"`,
+`"bypass_honored": true` and `"requires_approval": false`, so the hook allows
+it.
+
+After upgrading the tirith binary, re-run `tirith setup <tool> --force` with
+the same `--scope` you used originally, so installed hooks and plugins pick up
+the new checks. `tirith doctor` flags an installed adapter that differs from
+the current embedded asset.
+
 ## Supported clients
 
 | Client | Enforcement | Setup command | Supported scope and config | Verification |

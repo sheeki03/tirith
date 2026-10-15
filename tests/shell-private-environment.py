@@ -38,6 +38,10 @@ PLACEHOLDERS = ("buf", "scan_target", "pending_eval", "pending_command", "pendin
                 "_user_bash_command", "_TIRITH_RECEIPT_INSTANCE", "_TIRITH_CAPTURE_LINE",
                 "_TIRITH_PARSED_RECEIPT", "_TIRITH_PENDING_RECEIPT", "_TIRITH_PENDING_COMMAND")
 CLEANUP = {"leader_reaped", "group_signaled_or_absent", "group_members_exited", "output_eof"}
+# Seconds each native shell may run. A loaded runner can need far more than a
+# fixed few seconds to start a shell; override with TIRITH_NATIVE_TIMEOUT or
+# --native-timeout.
+NATIVE_TIMEOUT = float(os.environ.get("TIRITH_NATIVE_TIMEOUT", "30"))
 
 
 class Fixture:
@@ -128,7 +132,8 @@ elif role!='ordinary':raise SystemExit(75)
                             for kind in ("CONFIG", "STATE", "DATA", "CACHE")})
         environment.update({name: "inert-exported-placeholder" for name in PLACEHOLDERS})
         script = f"umask {self.incoming_umask:03o}\n" + script
-        trace.run_native(name, [self.shell, *options, "-c", script], self.root, environment, 8)
+        trace.run_native(name, [self.shell, *options, "-c", script], self.root, environment,
+                         NATIVE_TIMEOUT)
         row = trace.NATIVE_ROWS[-1]
         owned.require(set(row.get("cleanup", {})) == CLEANUP and
                       all(value is True for value in row["cleanup"].values()), "owned cleanup incomplete")
@@ -349,10 +354,16 @@ def prompt(fixture, initial, choice):
 
 
 def main():
+    global NATIVE_TIMEOUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--require-shell", action="append", choices=trace.FILES, default=[])
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--native-timeout", type=float, default=NATIVE_TIMEOUT,
+                        help="seconds each native shell may run (default: %(default)s)")
     args = parser.parse_args()
+    if not args.native_timeout > 0:
+        parser.error("--native-timeout must be positive")
+    NATIVE_TIMEOUT = args.native_timeout
     available = trace.shells()
     missing = set(args.require_shell) - {family for family, _ in available}
     if not available or missing:

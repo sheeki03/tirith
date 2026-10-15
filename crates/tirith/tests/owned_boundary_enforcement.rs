@@ -44,6 +44,11 @@ impl Workspace {
             fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
         }
         fs::create_dir_all(dir.path().join("home")).expect("create home");
+        // Online runs must not leave a detached threat-DB download that
+        // outlives this temporary directory.
+        let state = dir.path().join("home/state/tirith");
+        fs::create_dir_all(&state).expect("create state");
+        fs::write(state.join("threatdb-next-check-at"), "99999999999").expect("defer update");
         Self { dir }
     }
 

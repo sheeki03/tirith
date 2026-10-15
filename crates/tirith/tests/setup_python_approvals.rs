@@ -171,6 +171,9 @@ fn state() -> GlobalStateGuard {
     state.remove_env("TIRITH_POLICY_ROOT");
     state.set_env("TIRITH_OFFLINE", "1");
     state.set_env("TIRITH_LOG", "0");
+    // macOS's system Python caches bytecode under $HOME/Library/Caches; a
+    // late-exiting telemetry child would recreate the removed temp root.
+    state.set_env("PYTHONDONTWRITEBYTECODE", "1");
     // Match existing setup integration fixtures: prefer the root-managed Unix
     // interpreter, not a developer package-manager prefix with writable groups.
     let path = format!(
@@ -278,8 +281,17 @@ fn user_policy(severity: &str, approvals: bool) {
 }
 
 fn check(state: &GlobalStateGuard, command: &str) -> (Output, Value) {
+    check_with_env(state, command, &[])
+}
+
+fn check_with_env(
+    state: &GlobalStateGuard,
+    command: &str,
+    env: &[(&str, &str)],
+) -> (Output, Value) {
     let mut check = Command::new(env!("CARGO_BIN_EXE_tirith"));
     state.apply_to_command(&mut check);
+    check.envs(env.iter().copied());
     let output = check
         .args([
             "check",
@@ -515,6 +527,133 @@ fn damaged_python_checker_contract_uses_only_explicit_checker_error_fail_open() 
                 }
             }
         }
+    }
+}
+
+#[test]
+fn damaged_python_checker_output_cannot_relax_a_denying_verdict() {
+    let state = state();
+    let adapters = adapters(&state);
+    user_policy("LOW", false);
+    let (output, value) = check(&state, WARNING_COMMAND);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(value["requires_approval"], false);
+    let checker = damaged_checker(&state, WARNING_COMMAND, &output);
+    // The operator denies warnings, so a damaged warning response stays denied
+    // even with TIRITH_FAIL_OPEN=1, as the shell and TypeScript adapters do.
+    for mutation in [
+        "absent",
+        "string",
+        "integer",
+        "null",
+        "nonobject",
+        "invalid-json",
+        "empty",
+    ] {
+        for adapter in &adapters {
+            for warn_action in ["deny", "DENY"] {
+                adapter.assert_denied(
+                    &adapter.run(
+                        &state,
+                        &checker,
+                        WARNING_COMMAND,
+                        true,
+                        warn_action,
+                        Some(mutation),
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+
+    // A block is a verdict, not a checker error, even when its output is lost.
+    let (output, value) = check(&state, CRITICAL_COMMAND);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(value["action"], "block");
+    let checker = damaged_checker(&state, CRITICAL_COMMAND, &output);
+    for mutation in ["intact", "empty", "invalid-json", "nonobject"] {
+        for adapter in &adapters {
+            adapter.assert_denied(
+                &adapter.run(
+                    &state,
+                    &checker,
+                    CRITICAL_COMMAND,
+                    true,
+                    "allow",
+                    Some(mutation),
+                ),
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn python_adapters_deny_deferred_blocks_even_with_fail_open() {
+    let state = state();
+    let adapters = adapters(&state);
+    user_policy("HIGH", false);
+    let (output, value) = check_with_env(&state, WARNING_COMMAND, &[("TIRITH_DEFER", "1")]);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert_eq!(value["action"], "block");
+    assert!(value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["rule_id"] == "shortened_url" && finding["severity"] == "HIGH"));
+    let checker = damaged_checker(&state, WARNING_COMMAND, &output);
+    for mutation in ["intact", "empty", "invalid-json"] {
+        for adapter in &adapters {
+            for fail_open in [false, true] {
+                adapter.assert_denied(
+                    &adapter.run(
+                        &state,
+                        &checker,
+                        WARNING_COMMAND,
+                        fail_open,
+                        "allow",
+                        Some(mutation),
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn python_adapters_allow_a_policy_honored_bypass() {
+    let state = state();
+    let adapters = adapters(&state);
+    let config = tirith_core::policy::config_dir().unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.yaml"),
+        "allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n",
+    )
+    .unwrap();
+    // Replay the real honored-bypass response (as 0.4.x adapters saw exit 0)
+    // so the host deadline cannot turn a cold checker into a timeout denial.
+    let (output, value) = check_with_env(&state, CRITICAL_COMMAND, &[("TIRITH", "0")]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(value["action"], "allow");
+    assert_eq!(value["bypass_requested"], true);
+    assert_eq!(value["bypass_honored"], true);
+    assert_eq!(value["requires_approval"], false);
+    let checker = damaged_checker(&state, CRITICAL_COMMAND, &output);
+    for adapter in &adapters {
+        adapter.assert_denied(
+            &adapter.run(
+                &state,
+                &checker,
+                CRITICAL_COMMAND,
+                false,
+                "allow",
+                Some("intact"),
+            ),
+            false,
+        );
     }
 }
 

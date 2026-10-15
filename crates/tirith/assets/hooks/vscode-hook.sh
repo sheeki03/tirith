@@ -45,7 +45,7 @@ PY_TELEMETRY
 SHELL_TOOL_PATTERN="^(Bash|bash|shell|sh|zsh|terminal|Terminal|terminal_exec|terminalExec)$"
 
 deny() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}))
@@ -68,7 +68,7 @@ fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
 
 # Extract event, tool name, and command from stdin JSON
-PARSED=$("$TIRITH_PYTHON" -c "
+PARSED=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -113,7 +113,7 @@ RC=$?  # No || true: we need the actual exit code. Without set -e, script contin
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -165,8 +165,9 @@ fi
 if [ "$RC" -eq 0 ]; then
   _tirith_hook_event check_ok
   exit 0
-elif [ "$RC" -eq 1 ]; then
-  # Block — always deny
+elif [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
+  # Block — always deny. Exit 4 is a deferred block (pending review), never a
+  # checker error eligible for fail-open.
   _tirith_hook_event check_block
   REASON=$(_findings_summary)
   deny "$REASON"
@@ -180,7 +181,7 @@ elif [ "$RC" -eq 2 ]; then
     # Warn-allow: emit allow with additionalContext so findings reach the model
     _tirith_hook_event warn_allowed
     REASON=$(_findings_summary)
-    ALLOW_JSON=$("$TIRITH_PYTHON" -c "
+    ALLOW_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 msg = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'permissionDecisionReason': msg, 'additionalContext': msg}}))

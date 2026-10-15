@@ -437,6 +437,101 @@ fn installed_shell_hooks_deny_warning_acknowledgement_even_with_fail_open_or_cor
 }
 
 #[test]
+fn installed_shell_hooks_deny_deferred_blocks_and_allow_an_honored_bypass() {
+    for host in HOSTS {
+        let workspace = Workspace::new();
+        workspace.policy("HIGH", false);
+        let hook = workspace.setup(host, false);
+        // TIRITH_DEFER=1 records a non-critical block for review and exits 4.
+        let output = with_stdin(
+            workspace.command(TIRITH).env("TIRITH_DEFER", "1").args([
+                "check",
+                "--json",
+                "--no-daemon",
+                "--non-interactive",
+                "--shell",
+                "posix",
+            ]),
+            WARNING_COMMAND.as_bytes(),
+        );
+        assert_eq!(output.status.code(), Some(4), "{}: {output:?}", host.name());
+        for fail_open in [false, true] {
+            let mut process = workspace.command(&workspace.bash);
+            process.arg(&hook).env("TIRITH_DEFER", "1");
+            if fail_open {
+                process.env("TIRITH_FAIL_OPEN", "1");
+            }
+            host.assert_permission(
+                &with_stdin(
+                    &mut process,
+                    &serde_json::to_vec(&host.input(WARNING_COMMAND)).unwrap(),
+                ),
+                false,
+            );
+        }
+
+        // A policy-honored TIRITH=0 bypass emits the allow envelope, as 0.4.x
+        // adapters relied on; without the request the block still stands.
+        workspace.policy("CRITICAL", false);
+        let policy_path = workspace.home.join("config/tirith/policy.yaml");
+        let policy = fs::read_to_string(&policy_path).unwrap();
+        fs::write(
+            &policy_path,
+            format!("{policy}allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n"),
+        )
+        .unwrap();
+        let mut process = workspace.command(&workspace.bash);
+        process.arg(&hook).env("TIRITH", "0");
+        host.assert_permission(
+            &with_stdin(
+                &mut process,
+                &serde_json::to_vec(&host.input(WARNING_COMMAND)).unwrap(),
+            ),
+            true,
+        );
+        host.assert_permission(
+            &workspace.hook(host, &hook, WARNING_COMMAND, true, "allow"),
+            false,
+        );
+    }
+}
+
+#[test]
+fn installed_shell_hooks_never_import_python_modules_from_the_working_directory() {
+    for host in HOSTS {
+        let workspace = Workspace::new();
+        workspace.policy("LOW", false);
+        let hook = workspace.setup(host, false);
+        let marker = workspace.root.path().join("planted-json-imported");
+        // The hook runs with the agent's project as its working directory. A
+        // json.py planted there must never shadow the standard library module.
+        fs::write(
+            workspace.work.join("json.py"),
+            format!(
+                "import pathlib\npathlib.Path({}).touch()\n",
+                serde_json::to_string(marker.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        for (command, warn_action, allowed) in [
+            (CLEAN_COMMAND, "allow", true),
+            (WARNING_COMMAND, "allow", true),
+            (WARNING_COMMAND, "deny", false),
+        ] {
+            host.assert_permission(
+                &workspace.hook(host, &hook, command, false, warn_action),
+                allowed,
+            );
+            assert!(
+                !marker.exists(),
+                "{}: planted json.py was imported for {command:?}/{warn_action}",
+                host.name()
+            );
+        }
+    }
+}
+
+#[test]
 fn installed_zshenv_allows_false_warning_but_denies_pending_approval_and_critical() {
     let Some(zsh) = system_binary("zsh") else {
         eprintln!("skipping non-interactive zsh guard: zsh is unavailable");
