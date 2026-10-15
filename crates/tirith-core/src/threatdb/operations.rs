@@ -25,9 +25,32 @@ pub struct UpstreamObservation {
     pub pinned_commit: String,
     pub candidate_commit: String,
     pub candidate_timestamp: String,
-    pub ahead_by: u64,
+    /// `None` when GitHub could not compare the pin with the candidate; the
+    /// commit timestamps still give the lag.
+    pub ahead_by: Option<u64>,
+    /// Why GitHub could not compare them, e.g. `github_http_422`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_unavailable: Option<String>,
     pub max_lag_hours: u64,
     pub review_required: bool,
+}
+
+impl UpstreamObservation {
+    /// An unchanged pin is zero commits behind; a moved one is either counted
+    /// or explains why GitHub could not count it.
+    fn comparison_consistent(&self) -> bool {
+        match (self.ahead_by, self.comparison_unavailable.as_deref()) {
+            (Some(ahead), None) => (ahead != 0) == self.review_required,
+            (None, Some(reason)) => {
+                self.review_required
+                    && (1..=64).contains(&reason.len())
+                    && reason.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +88,7 @@ impl UpstreamObservations {
                 || timestamp(&item.candidate_timestamp)? > checked
                 || !(1..=8760).contains(&item.max_lag_hours)
                 || item.review_required != (item.pinned_commit != item.candidate_commit)
-                || (item.ahead_by != 0) != item.review_required
+                || !item.comparison_consistent()
             {
                 return Err(format!("inconsistent upstream observation for {source}"));
             }
@@ -261,7 +284,7 @@ pub fn source_freshness(document: &Value, built: u64, now: u64) -> Result<Freshn
                 let lag = upstream.saturating_sub(revised);
                 row.observation_age_seconds = now.checked_sub(checked);
                 row.known_upstream_lag_seconds = Some(lag);
-                row.upstream_commits_ahead = Some(observation.ahead_by);
+                row.upstream_commits_ahead = observation.ahead_by;
                 row.reviewed_pin_adoption_required = Some(observation.review_required);
                 row.lag_exceeds_reviewed_budget = Some(lag > observation.max_lag_hours * 3600);
                 report.clock_skew |= checked > now;
@@ -424,7 +447,8 @@ mod tests {
                     pinned_commit: "a".repeat(40),
                     candidate_commit: "a".repeat(40),
                     candidate_timestamp: "2020-01-01T00:00:00Z".into(),
-                    ahead_by: 0,
+                    ahead_by: Some(0),
+                    comparison_unavailable: None,
                     max_lag_hours: 48,
                     review_required: false,
                 },
@@ -450,7 +474,7 @@ mod tests {
         let row = observations.sources.get_mut(SOURCE_IDS[0]).unwrap();
         row.candidate_commit = "b".repeat(40);
         row.candidate_timestamp = "2025-12-31T00:00:00Z".into();
-        row.ahead_by = 3;
+        row.ahead_by = Some(3);
         row.review_required = true;
         document["compiler_parse"]["upstream_observations"] =
             serde_json::to_value(observations).unwrap();
@@ -473,6 +497,53 @@ mod tests {
         assert_eq!(pending.reviewed_pin_adoption_required, Some(true));
         assert_eq!(pending.lag_exceeds_reviewed_budget, Some(true));
         assert_eq!(pending.observation_age_seconds, Some(86400));
+    }
+
+    #[test]
+    fn uncomparable_upstream_still_reports_timestamp_lag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let (mut document, observations) = fixture();
+        // The shape threatdb_source_pins.py writes when GitHub answers 422.
+        let mut value = serde_json::to_value(observations).unwrap();
+        value["sources"][SOURCE_IDS[1]] = json!({
+            "pinned_commit": "a".repeat(40),
+            "candidate_commit": "c".repeat(40),
+            "candidate_timestamp": "2020-01-04T00:00:00Z",
+            "ahead_by": null,
+            "comparison_unavailable": "github_http_422",
+            "max_lag_hours": 48,
+            "review_required": true,
+        });
+        document["compiler_parse"]["upstream_observations"] = value.clone();
+        let now = timestamp("2026-01-02T00:00:00Z").unwrap();
+        let report = source_freshness(&document, now - 3600, now).unwrap();
+        let row = report
+            .sources
+            .iter()
+            .find(|row| row.source == SOURCE_IDS[1])
+            .unwrap();
+        assert_eq!(row.known_upstream_lag_seconds, Some(3 * 86400));
+        assert_eq!(row.upstream_commits_ahead, None);
+        assert_eq!(row.reviewed_pin_adoption_required, Some(true));
+        assert_eq!(row.lag_exceeds_reviewed_budget, Some(true));
+        let reparsed: UpstreamObservations = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reparsed).unwrap(), value);
+
+        for (field, bad) in [
+            ("comparison_unavailable", Value::Null),
+            ("ahead_by", json!(2)),
+            ("comparison_unavailable", json!("GitHub said: no")),
+            ("comparison_unavailable", json!("")),
+        ] {
+            let mut broken = value.clone();
+            broken["sources"][SOURCE_IDS[1]][field] = bad;
+            let parsed: UpstreamObservations = serde_json::from_value(broken).unwrap();
+            assert!(parsed.validate().is_err(), "{field} accepted");
+        }
+        let mut unchanged = value;
+        unchanged["sources"][SOURCE_IDS[0]]["comparison_unavailable"] = json!("github_http_422");
+        let parsed: UpstreamObservations = serde_json::from_value(unchanged).unwrap();
+        assert!(parsed.validate().is_err());
     }
 
     #[test]
