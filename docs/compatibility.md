@@ -37,7 +37,7 @@ what an experimental command must satisfy to move to stable.
 | `fetch` | Experimental | Server-side cloaking detection (Unix only). |
 | `checkpoint` | Experimental | File checkpoint and rollback. |
 | `gateway` | Experimental | MCP gateway proxy for AI-agent security. Request analysis and output filtering are bounded and fail closed, but enforcement covers only calls actually routed through the gateway. |
-| `setup` | Experimental | Configure 19 named AI-agent hosts, plus `setup recommended` and `setup shell` (reviewed, undoable shell startup plans). A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. An upgrade does not rewrite installed agent adapters: `tirith doctor` marks outdated ones and `tirith setup <host> --force` refreshes them. |
+| `setup` | Experimental | Configure 19 named AI-agent hosts, plus `setup recommended` and `setup shell` (reviewed, undoable shell startup plans). A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. An upgrade does not rewrite installed agent adapters: `tirith doctor` marks outdated user-scope adapters and those of the project in the current directory, and `tirith setup <host> --force` refreshes them. |
 | `policy` | Experimental | Policy `init` / `validate` / `effective` / `test` / `tune`, personal `profile` and `setting` changes saved as undoable `operation`s, `rollout` and `simulate`, and the optional `team` client. |
 | `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`, plus `expiry` / `revoke` / `migrate`. `add` needs `--rule` or `--all-rules` and writes scoped, expiring grants to `trust-grants.json`; scope visualization, per-entry `explain`, and a `diff` trail. |
 | `dashboard` | Experimental | Authenticated loopback dashboard (`open`, `serve`, `export`). Not required for protection. |
@@ -134,10 +134,17 @@ Exit codes are stable:
 | 1    | Block (high/critical severity findings) |
 | 2    | Warn (medium/low severity findings) |
 | 3    | WarnAck — acknowledgement required (warn-ack hook protocol) |
+| 4    | Deferred block — a non-critical block held for review (opt-in: `--defer` or `TIRITH_DEFER=1`, without a TTY) |
 
 Exit code 3 is the warn-ack hook protocol path used by shell hooks under strict
 warn mode, not the normal direct-CLI contract. Non-hook callers should not
-normally see exit code 3.
+normally see exit code 3. Exit code 4 appears only when the caller opts in to
+deferral; a Critical finding still exits 1.
+
+A usage error also exits 2: since 0.5.0, an option `tirith check` does not
+know before the command (`tirith check --json --bogus -- cmd`) prints clap's
+error on stderr and nothing on stdout. A caller that reads JSON should treat
+exit 2 with empty stdout as an error, not a warning.
 
 ### Per-command exit codes are deliberately distinct
 
