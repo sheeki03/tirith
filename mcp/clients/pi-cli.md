@@ -14,7 +14,8 @@ calls, runs `tirith check --json` synchronously, and returns either `undefined`
 **Output contract:**
 - Allow: returns `undefined` (invisible to the agent)
 - Deny: returns `{block: true, reason: "..."}` (reason shown to agent)
-- Warn-allow: returns `undefined`, findings written to `process.stderr`
+- Warn-allow: returns `undefined`, findings written to `process.stderr`,
+  except when the check JSON has `requires_approval: true` (always deny)
 
 **Protocol limitation:** The Pi CLI extension API has no "allow with message"
 return shape. On the warn-allow path, findings are written to stderr as a
@@ -83,13 +84,40 @@ The extension intercepts `tool_call` events for `bash` tool calls. It extracts
 `event.input.command`, passes it to `tirith check --json` via `execFileSync`,
 and:
 
-- Exit 0 from tirith: allow (returns `undefined`)
-- Exit 1: deny (returns `{block: true, reason: "..."}`)
+- Exit 0 from tirith: allow (returns `undefined`), unless the JSON has
+  `requires_approval: true`, then deny.
+- Exit 1: deny (returns `{block: true, reason: "..."}`). `TIRITH_FAIL_OPEN`
+  does not apply.
 - Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`),
   findings written to stderr, returns `undefined`. Set
   `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
+  or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
+  `TIRITH_FAIL_OPEN`. The extension has no channel to collect approval or
+  acknowledgement; retry the command from a Tirith-protected interactive shell.
+- Exit 3 (mandatory warning acknowledgement): always deny.
+- Exit 4 (deferred block from `TIRITH_DEFER=1` / `tirith check --defer`,
+  recorded for `tirith pending`): always deny, regardless of
+  `TIRITH_FAIL_OPEN`.
+- Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
+  2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
+  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
 - ENOENT (binary not found) / timeout / unexpected exit: **deny** (fail-closed
   by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
+
+`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
+deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
+the extension runs non-interactively) exits 0 with `"action": "allow"`,
+`"bypass_honored": true` and `"requires_approval": false`, so the extension
+allows it.
+
+## Upgrading
+
+After upgrading the tirith binary, re-run `tirith setup pi-cli --force` with
+the same `--scope` you used originally, so the installed extension picks up the
+new checks. `tirith doctor` flags an installed extension that differs from the
+current embedded adapter.
 
 ## Notes
 
