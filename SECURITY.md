@@ -89,5 +89,5 @@ lines receive best-effort support only; upgrade before reporting a result as a
 current-version vulnerability. Code on an unreleased branch or integration
 stack is not a supported release until its protected tag and artifacts exist.
 
-Beginning with v0.4.0, 0.4.x is the supported release line, and v0.4.2 is the
-current published patch. The 0.3.x line now receives best-effort support only.
+Beginning with v0.5.0, 0.5.x is the supported release line, and v0.5.0 is the
+current published release. The 0.4.x line now receives best-effort support only.
