@@ -3740,6 +3740,58 @@ fn init_zsh_output() {
     );
 }
 
+/// Many shells starting at once on a fresh install each run `tirith init`, and
+/// each must get its hook: losing the materialization race to another process
+/// publishing the same bytes is success, not an empty `eval "$(tirith init)"`.
+#[cfg(unix)]
+#[test]
+fn init_concurrent_first_run_materializes_hooks_for_every_shell() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // A binary outside the build tree, so no development hook directory is
+    // found beside it and every process must materialize into the data dir.
+    let bin_dir = root.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let binary = bin_dir.join("tirith");
+    if fs::hard_link(env!("CARGO_BIN_EXE_tirith"), &binary).is_err() {
+        fs::copy(env!("CARGO_BIN_EXE_tirith"), &binary).expect("copy tirith");
+    }
+    let data_dir = root.path().join("data");
+    let template = tirith();
+    let children: Vec<_> = (0..20)
+        .map(|_| {
+            let mut command = Command::new(&binary);
+            for (key, value) in template.get_envs() {
+                match value {
+                    Some(value) => command.env(key, value),
+                    None => command.env_remove(key),
+                };
+            }
+            command
+                .env("XDG_DATA_HOME", &data_dir)
+                .env_remove("TIRITH_SHELL_DIR")
+                .args(["init", "--shell", "zsh"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn tirith init")
+        })
+        .collect();
+    let shell_dir = data_dir.join("tirith/shell");
+    for child in children {
+        let out = child.wait_with_output().expect("wait for tirith init");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(shell_dir.to_str().unwrap()),
+            "every concurrent init must load the hook: {out:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(shell_dir.join("lib/zsh-hook.zsh")).unwrap(),
+        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib/zsh-hook.zsh"))
+            .unwrap()
+    );
+}
+
 #[test]
 fn init_bash_output() {
     let out = tirith()
