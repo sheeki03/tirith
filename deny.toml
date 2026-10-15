@@ -26,6 +26,14 @@ ignore = [
     # command text; it does not re-encode untrusted DNS messages. Remove
     # this ignore when the resolver can move to >=0.26.1.
     "RUSTSEC-2026-0119",
+    # unsafe-libyaml 0.2.11 is unmaintained (an informational advisory; no
+    # vulnerability is reported). It comes in only through serde_yaml 0.9,
+    # which is itself deprecated and has no maintained release to move to.
+    # serde_yaml parses policy, setup config and repository YAML (CI
+    # workflows, tool configs) in about 30 modules, so replacing it is a
+    # parser migration tracked separately from this release. Remove this
+    # ignore (and the .cargo/audit.toml twin) once serde_yaml is replaced.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
