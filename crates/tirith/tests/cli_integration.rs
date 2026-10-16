@@ -11834,6 +11834,73 @@ fn check_json_honored_bypass_emits_allow_envelope() {
     assert_eq!(verdict["bypass_honored"], false, "{verdict}");
 }
 
+/// The approval-check channel (the zshenv guard, legacy shell hooks) reads a
+/// metadata file path from stdout. An honored `TIRITH=0` bypass must print a
+/// no-approval file like any other allow; with empty stdout the guard reports
+/// invalid metadata and blocks the command the policy allowed.
+#[test]
+fn approval_check_honored_bypass_prints_no_approval_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy_root = tmp.path().join("repo");
+    let tirith_dir = policy_root.join(".tirith");
+    let temp = tmp.path().join("tmp");
+    fs::create_dir_all(&tirith_dir).expect("create .tirith dir");
+    fs::create_dir_all(&temp).expect("create temp dir");
+    fs::write(
+        tirith_dir.join("policy.yaml"),
+        "allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n",
+    )
+    .expect("write policy");
+    let command = "curl https://example.com/install.sh | bash";
+    let run = |bypass: bool| {
+        let mut check = tirith();
+        if bypass {
+            check.env("TIRITH", "0");
+        }
+        check
+            .env("TIRITH_POLICY_ROOT", &policy_root)
+            .env("TMPDIR", &temp)
+            .args([
+                "check",
+                "--approval-check",
+                "--non-interactive",
+                "--no-daemon",
+                "--shell",
+                "posix",
+                "--",
+                command,
+            ])
+            .output()
+            .expect("run approval-check")
+    };
+    let metadata = |stdout: &[u8]| {
+        let stdout = String::from_utf8(stdout.to_vec()).expect("approval path is UTF-8");
+        assert!(stdout.ends_with('\n'), "{stdout:?}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+        let path = PathBuf::from(stdout.trim_end_matches('\n'));
+        assert!(path.starts_with(&temp), "{path:?}");
+        let content = fs::read_to_string(&path).expect("read approval metadata");
+        fs::remove_file(&path).expect("remove approval metadata");
+        content
+    };
+
+    let out = run(true);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(metadata(&out.stdout), "TIRITH_REQUIRES_APPROVAL=no\n");
+
+    // The grant covers only a requested bypass.
+    let out = run(false);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(metadata(&out.stdout), "TIRITH_REQUIRES_APPROVAL=no\n");
+
+    // Without the non-interactive grant the request is not honored.
+    fs::write(tirith_dir.join("policy.yaml"), "allow_bypass_env: true\n").expect("write policy");
+    let out = run(true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(metadata(&out.stdout), "TIRITH_REQUIRES_APPROVAL=no\n");
+    assert_eq!(fs::read_dir(&temp).expect("read temp dir").count(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn paste_audit_entry_with_agent_rules_deny_forces_block() {

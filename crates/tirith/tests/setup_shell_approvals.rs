@@ -497,6 +497,72 @@ fn installed_shell_hooks_deny_deferred_blocks_and_allow_an_honored_bypass() {
 }
 
 #[test]
+fn installed_zshenv_allows_an_honored_bypass_and_refuses_an_unhonored_one() {
+    let Some(zsh) = system_binary("zsh") else {
+        eprintln!("skipping non-interactive zsh guard: zsh is unavailable");
+        return;
+    };
+    let workspace = Workspace::new();
+    workspace.policy("CRITICAL", false);
+    workspace.setup(Host::Cursor, true);
+    let marker = workspace.root.path().join("command-output");
+    let command = format!("{WARNING_COMMAND} > {}", quote(&marker));
+    let run = |bypass: bool| {
+        let mut process = workspace.command(&zsh);
+        process
+            .args(["-lc", &command])
+            .env("ZDOTDIR", &workspace.home);
+        if bypass {
+            process.env("TIRITH", "0");
+        }
+        with_stdin(&mut process, b"printf clean-stdin\n")
+    };
+    let temp_entries = || {
+        fs::read_dir(workspace.root.path().join("tmp"))
+            .unwrap()
+            .count()
+    };
+    let policy_path = workspace.home.join("config/tirith/policy.yaml");
+    let blocking_policy = fs::read_to_string(&policy_path).unwrap();
+
+    let output = run(false);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!marker.exists());
+
+    // The policy honors TIRITH=0 for non-interactive callers, so the guard must
+    // read the checker's no-approval metadata and run the command.
+    fs::write(
+        &policy_path,
+        format!("{blocking_policy}allow_bypass_env: true\nallow_bypass_env_noninteractive: true\n"),
+    )
+    .unwrap();
+    let output = run(true);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("invalid approval metadata"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"https://github.com:8443/api\n");
+    fs::remove_file(&marker).unwrap();
+    assert_eq!(temp_entries(), 0, "approval metadata must be cleaned up");
+    // The grant covers only a requested bypass.
+    let output = run(false);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!marker.exists());
+
+    // Without the non-interactive grant, the requested bypass is refused.
+    fs::write(
+        &policy_path,
+        format!("{blocking_policy}allow_bypass_env: true\n"),
+    )
+    .unwrap();
+    let output = run(true);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!marker.exists());
+    assert_eq!(temp_entries(), 0, "approval metadata must be cleaned up");
+}
+
+#[test]
 fn installed_shell_hooks_never_import_python_modules_from_the_working_directory() {
     for host in HOSTS {
         let workspace = Workspace::new();
