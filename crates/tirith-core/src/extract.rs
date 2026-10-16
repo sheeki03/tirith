@@ -3997,6 +3997,7 @@ fn capture_executable_body(
                 bodies.push(ExecutableBody::without_origin(format!(": {body}"), shell));
             } else {
                 bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell,
                     origin: Some(ExecutableBodyOrigin {
@@ -4012,6 +4013,7 @@ fn capture_executable_body(
     if let Some(suffix) = raw.get(open + 1..) {
         if !suffix.trim().is_empty() {
             bodies.push(ExecutableBody {
+                best_effort: false,
                 input: suffix.to_string(),
                 shell,
                 origin: Some(ExecutableBodyOrigin {
@@ -4392,6 +4394,13 @@ pub(crate) struct ExecutableBody {
     /// occurrence and execution role selected by the parser branch that found
     /// them.
     pub origin: Option<ExecutableBodyOrigin>,
+    /// The body was recovered only to add findings, never to prove coverage:
+    /// the child command of a fish external wrapper (`nice`, `timeout`, ...),
+    /// which the released fish analysis did not read. A gap, work budget, or
+    /// depth limit inside it (or inside anything nested in it) must not make
+    /// the enclosing input incomplete; a finding its own analysis proves still
+    /// applies. Consumers that recurse carry the flag to every descendant body.
+    pub best_effort: bool,
 }
 
 impl ExecutableBody {
@@ -4400,8 +4409,19 @@ impl ExecutableBody {
             input,
             shell,
             origin: None,
+            best_effort: false,
         }
     }
+}
+
+/// Whether a finding only reports that analysis could not finish (as opposed
+/// to proving a risk). A best-effort body may add proven findings, never these.
+pub(crate) fn is_incompleteness_finding(finding: &crate::verdict::Finding) -> bool {
+    matches!(
+        finding.rule_id,
+        crate::verdict::RuleId::AnalysisIncomplete
+            | crate::verdict::RuleId::PackageLookupIncomplete
+    )
 }
 
 #[derive(Debug, Default)]
@@ -4956,6 +4976,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 Some(next) => {
                     scan.bodies
                         .extend(recovered.into_iter().map(|input| ExecutableBody {
+                            best_effort: false,
                             input,
                             shell: ShellType::Posix,
                             origin: None,
@@ -4979,6 +5000,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 .filter(|input| !input.trim().is_empty())
             {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: input.to_string(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -6609,27 +6631,35 @@ fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
 }
 
 fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
-    let mut keep = Vec::with_capacity(scan.bodies.len());
+    let mut keep = vec![false; scan.bodies.len()];
     let mut retained_bodies = 0usize;
     let mut retained_bytes = 0usize;
     let mut exhausted = false;
 
-    for body in &scan.bodies {
-        // Preserve occurrences. Equal source strings at different byte ranges
-        // are distinct execution events and can have different pipe,
-        // redirection, and control-flow parents. Callers that only need unique
-        // strings may deduplicate after analysis; enforcement callers must not.
-        let next_bytes = retained_bytes.saturating_add(body.input.len());
-        if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
-            || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
-        {
-            exhausted = true;
-            keep.push(false);
-            continue;
+    // Best-effort bodies get only the budget the required bodies leave, and
+    // one that does not fit is dropped without a gap: it never proves
+    // coverage, so it must neither crowd out a required body nor report one.
+    for best_effort in [false, true] {
+        for (index, body) in scan.bodies.iter().enumerate() {
+            if body.best_effort != best_effort {
+                continue;
+            }
+            // Preserve occurrences. Equal source strings at different byte
+            // ranges are distinct execution events and can have different
+            // pipe, redirection, and control-flow parents. Callers that only
+            // need unique strings may deduplicate after analysis; enforcement
+            // callers must not.
+            let next_bytes = retained_bytes.saturating_add(body.input.len());
+            if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
+                || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
+            {
+                exhausted |= !best_effort;
+                continue;
+            }
+            retained_bodies += 1;
+            retained_bytes = next_bytes;
+            keep[index] = true;
         }
-        retained_bodies += 1;
-        retained_bytes = next_bytes;
-        keep.push(true);
     }
 
     let mut keep = keep.into_iter();
@@ -8270,6 +8300,7 @@ fn push_literal_wrapper_body(
     match join_static_wrapper_words(args, shell) {
         Some(input) if !input.trim().is_empty() => {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input,
                 shell: child_shell,
                 origin: None,
@@ -8641,6 +8672,7 @@ fn scan_cmd_for_f_command(args: &[String], scan: &mut ExecutableSubstitutionScan
             record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
         } else {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::Cmd,
                 origin: None,
@@ -8683,6 +8715,7 @@ fn scan_cmd_cli_body(
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             } else {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input,
                     shell: ShellType::Cmd,
                     origin: None,
@@ -8727,6 +8760,7 @@ fn scan_cmd_cli_body(
                 });
             if let Some(input) = for_body {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input,
                     shell: ShellType::Cmd,
                     origin: None,
@@ -8802,6 +8836,235 @@ fn push_static_child_from(
     }
 }
 
+/// External programs that run a child command, read in fish with the same
+/// option grammar as POSIX (`scan_posix_delegation_utility`).
+const FISH_EXTERNAL_WRAPPERS: &[&str] = &[
+    "nice", "timeout", "setsid", "stdbuf", "taskset", "ionice", "flock",
+];
+
+/// How many directly nested fish wrappers one pass flattens. A longer chain
+/// continues in the next body, so this bounds work, not coverage.
+const MAX_FISH_WRAPPER_CHAIN: usize = 32;
+
+/// fish runs an external wrapper's child command like any shell does, but the
+/// released fish analysis never read it. A child the wrapper grammar proves is
+/// analyzed as a best-effort body: it may add findings its own analysis proves
+/// (an inline payload, `curl … | sh`), never an analysis gap, so a command fish
+/// allowed in 0.4.2 cannot become an incomplete-analysis block. An unproven
+/// child (`timeout $T …`) keeps the released verdict. A chain of wrappers
+/// (`nice nice … sh -c …`) is flattened to its innermost child so a long prefix
+/// cannot push the payload past the nested-body depth limit.
+fn push_fish_wrapper_child(
+    wrapper: &str,
+    args: &[String],
+    segment: &tokenize::Segment,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    let shell = ShellType::Fish;
+    let mut child = ExecutableSubstitutionScan::default();
+    scan_posix_delegation_utility(wrapper, args, shell, &mut child);
+    if child.gap.is_some() {
+        return;
+    }
+    for _ in 0..MAX_FISH_WRAPPER_CHAIN {
+        let [body] = child.bodies.as_slice() else {
+            break;
+        };
+        let segments = tokenize::tokenize(&body.input, shell);
+        let [inner_segment] = segments.as_slice() else {
+            break;
+        };
+        // Flatten only a bare wrapper word. A peeled `sudo`/`env` layer stays
+        // in the body so the rules for that layer still see it.
+        let Some(leader) = inner_segment
+            .command
+            .as_deref()
+            .map(|leader| crate::rules::command::normalize_cmd_base(leader, shell))
+            .filter(|leader| FISH_EXTERNAL_WRAPPERS.contains(&leader.as_str()))
+        else {
+            break;
+        };
+        let mut next = ExecutableSubstitutionScan::default();
+        scan_posix_delegation_utility(&leader, &inner_segment.args, shell, &mut next);
+        if next.gap.is_some() || next.bodies.is_empty() {
+            break;
+        }
+        child = next;
+    }
+    for mut body in child.bodies {
+        body.best_effort = true;
+        // The wrapper hands the child its own stdin/stdout/stderr, exactly as
+        // a shell wrapper hands them to its `-c` body.
+        body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+            parent_range: segment.byte_range.clone(),
+            relation: ExecutableRelation::WrapperReplacement,
+        });
+        scan.bodies.push(body);
+    }
+}
+
+/// One option word of a delegation utility, as parsed by GNU `getopt`.
+struct StaticWrapperOption {
+    /// Argv words consumed (2 when the value is the following word).
+    words: usize,
+    /// The long option name, or every letter of a short-option cluster.
+    long: Option<&'static str>,
+    letters: Vec<char>,
+}
+
+impl StaticWrapperOption {
+    fn names(&self, long: &[&str], short: &[char]) -> bool {
+        self.long.is_some_and(|name| long.contains(&name))
+            || self.letters.iter().any(|letter| short.contains(letter))
+    }
+
+    /// `--help`/`--version` style options print and exit: no child runs.
+    fn terminal(&self, long: &[&str], short: &[char]) -> bool {
+        self.names(long, short)
+    }
+}
+
+/// One GNU `getopt` short-option cluster (`-fw`, `-k1`, `-sKILL`, `-c 0`).
+/// `None` for a letter outside `flags`/`valued`, or a value option whose value
+/// is missing or not static: the child position is then unknown.
+fn static_short_option_cluster(
+    option: &str,
+    next: Option<&String>,
+    flags: &[char],
+    valued: &[char],
+    shell: ShellType,
+) -> Option<StaticWrapperOption> {
+    let letters = option
+        .strip_prefix('-')
+        .filter(|letters| !letters.is_empty() && !letters.starts_with('-'))?;
+    let mut seen = Vec::new();
+    for (offset, letter) in letters.char_indices() {
+        seen.push(letter);
+        if flags.contains(&letter) {
+            continue;
+        }
+        if !valued.contains(&letter) {
+            return None;
+        }
+        // The rest of the cluster is the value; otherwise the next word is.
+        let words = if offset + letter.len_utf8() < letters.len() {
+            1
+        } else {
+            next.and_then(|arg| static_wrapper_word(arg, shell))?;
+            2
+        };
+        return Some(StaticWrapperOption {
+            words,
+            long: None,
+            letters: seen,
+        });
+    }
+    Some(StaticWrapperOption {
+        words: 1,
+        long: None,
+        letters: seen,
+    })
+}
+
+/// A GNU long option spelled in full (`--signal=KILL`, `--signal KILL`,
+/// `--fork`). `None` for an unknown or abbreviated name, a value on a flag, or
+/// a value option without a static value.
+fn static_long_option(
+    option: &str,
+    next: Option<&String>,
+    flags: &[&'static str],
+    valued: &[&'static str],
+    shell: ShellType,
+) -> Option<StaticWrapperOption> {
+    let (name, attached) = option
+        .split_once('=')
+        .map_or((option, None), |(name, value)| (name, Some(value)));
+    if let Some(flag) = flags.iter().find(|flag| **flag == name) {
+        return attached.is_none().then(|| StaticWrapperOption {
+            words: 1,
+            long: Some(flag),
+            letters: Vec::new(),
+        });
+    }
+    let valued = valued.iter().find(|valued| **valued == name)?;
+    let words = match attached {
+        Some(value) if !value.is_empty() => 1,
+        Some(_) => return None,
+        None => {
+            next.and_then(|arg| static_wrapper_word(arg, shell))?;
+            2
+        }
+    };
+    Some(StaticWrapperOption {
+        words,
+        long: Some(valued),
+        letters: Vec::new(),
+    })
+}
+
+/// Whether a wrapper operand is exactly one positional argv word after
+/// expansion even if its value is not static: a literal, a literal under a
+/// leading `~/`, or one double-quoted string that starts with a literal path
+/// byte (`"/run/$USER.lock"`). An unquoted variable, glob, brace list, or
+/// command substitution can expand to any number of words, and a word that
+/// may expand to a leading `-` (`"$LOCK"`) may be read as an option.
+fn wrapper_operand_is_one_word(raw: &str, shell: ShellType) -> bool {
+    if let Some(word) = static_wrapper_word(raw, shell) {
+        return !word.starts_with('-');
+    }
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return false;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return rest.is_empty() || static_wrapper_word(rest, shell).is_some();
+    }
+    let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return false;
+    };
+    // Only literal path bytes and plain `$NAME` / `${NAME}` references: a
+    // quoted `"$@"` or `"${arr[@]}"` still expands to many words, and a
+    // nested substitution or quote stays unproven.
+    let bytes = inner.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"/._".contains(byte))
+    {
+        return false;
+    }
+    let name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'$' if shell == ShellType::Posix && bytes.get(index + 1) == Some(&b'{') => {
+                let name_len = bytes[index + 2..]
+                    .iter()
+                    .take_while(|byte| name_byte(**byte))
+                    .count();
+                if name_len == 0 || bytes.get(index + 2 + name_len) != Some(&b'}') {
+                    return false;
+                }
+                index += name_len + 3;
+            }
+            b'$' => {
+                let name_len = bytes[index + 1..]
+                    .iter()
+                    .take_while(|byte| name_byte(**byte))
+                    .count();
+                if name_len == 0 {
+                    return false;
+                }
+                index += name_len + 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || b"/._-+:,%~".contains(&byte) => index += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn scan_posix_delegation_utility(
     command: &str,
     args: &[String],
@@ -8825,6 +9088,8 @@ fn scan_posix_delegation_utility(
             push_static_child_from(args, 1, shell, scan);
         }
         "nice" => {
+            // GNU `+n:` plus the historical `-N` / `--N` / `-+N` adjustment;
+            // BSD accepts the same spellings.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
                     record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
@@ -8834,112 +9099,134 @@ fn scan_posix_delegation_utility(
                     index += 1;
                     break;
                 }
-                if option == "-n" || option == "--adjustment" {
-                    if args
-                        .get(index + 1)
-                        .and_then(|arg| static_wrapper_word(arg, shell))
-                        .is_none()
-                    {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
-                    }
-                    index += 2;
-                    continue;
-                }
-                if option.starts_with("--adjustment=")
-                    || option
-                        .strip_prefix('-')
-                        .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
+                if option
+                    .strip_prefix('-')
+                    .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
                 {
                     index += 1;
                     continue;
                 }
-                if matches!(option.as_str(), "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
-            }
-            push_static_child_from(args, index, shell, scan);
-        }
-        "setsid" => {
-            while index < args.len() {
-                let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                };
-                if option == "--" {
-                    index += 1;
+                if !option.starts_with('-') {
                     break;
                 }
-                if matches!(
-                    option.as_str(),
-                    "-c" | "-f" | "-w" | "--ctty" | "--fork" | "--wait"
-                ) {
-                    index += 1;
-                    continue;
-                }
-                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
-            }
-            push_static_child_from(args, index, shell, scan);
-        }
-        "timeout" => {
-            while index < args.len() {
-                let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--help", "--version"],
+                        &["--adjustment"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(&option, next, &[], &['n'], shell)
                 };
-                if option == "--" {
-                    index += 1;
-                    break;
-                }
-                if matches!(option.as_str(), "-k" | "--kill-after" | "-s" | "--signal") {
-                    if args
-                        .get(index + 1)
-                        .and_then(|arg| static_wrapper_word(arg, shell))
-                        .is_none()
-                    {
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => return,
+                    Some(parsed) => index += parsed.words,
+                    None => {
                         record_shell_execution_gap(
                             scan,
                             ShellExecutionGap::AmbiguousExecutableBody,
                         );
                         return;
                     }
-                    index += 2;
-                    continue;
                 }
-                if option.starts_with("--kill-after=") || option.starts_with("--signal=") {
-                    index += 1;
-                    continue;
-                }
-                if matches!(
-                    option.as_str(),
-                    "--preserve-status" | "--foreground" | "-v" | "--verbose"
-                ) {
-                    index += 1;
-                    continue;
-                }
-                if matches!(option.as_str(), "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "setsid" => {
+            // util-linux `+Vhcfw`.
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
                     record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
                     return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
                 }
-                break;
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--ctty", "--fork", "--wait", "--help", "--version"],
+                        &[],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['c', 'f', 'w', 'h', 'V'],
+                        &[],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return
+                    }
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                }
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "timeout" => {
+            // GNU `+k:s:v`; `-f`/`-p` are `--foreground`/`--preserve-status`
+            // (coreutils 9.6+ and BSD). The duration operand precedes the child.
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--preserve-status",
+                            "--foreground",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--kill-after", "--signal"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(&option, next, &['v', 'f', 'p'], &['k', 's'], shell)
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => return,
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                }
             }
             if args
                 .get(index)
@@ -8999,6 +9286,7 @@ fn scan_posix_delegation_utility(
             push_static_child_from(args, index, shell, scan);
         }
         "taskset" => {
+            // util-linux `+apchV`. `-p` operates on an existing pid: no child.
             let mut pid_mode = false;
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
@@ -9009,23 +9297,43 @@ fn scan_posix_delegation_utility(
                     index += 1;
                     break;
                 }
-                if matches!(option.as_str(), "-a" | "--all-tasks" | "-c" | "--cpu-list") {
-                    index += 1;
-                    continue;
+                if !option.starts_with('-') {
+                    break;
                 }
-                if matches!(option.as_str(), "-p" | "--pid") {
-                    pid_mode = true;
-                    index += 1;
-                    continue;
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--all-tasks", "--pid", "--cpu-list", "--help", "--version"],
+                        &[],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['a', 'p', 'c', 'h', 'V'],
+                        &[],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return
+                    }
+                    Some(parsed) => {
+                        pid_mode |= parsed.names(&["--pid"], &['p']);
+                        index += parsed.words;
+                    }
+                    None => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
                 }
-                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
             }
             if pid_mode {
                 return;
@@ -9035,11 +9343,147 @@ fn scan_posix_delegation_utility(
             }
             push_static_child_from(args, index, shell, scan);
         }
-        "ionice" | "flock" if !args.is_empty() => {
-            // Both utilities have overlapping query/modify/execute modes and
-            // platform-specific option grammars. Preserve a typed block until
-            // their mode can be proven instead of guessing a child index.
-            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        "ionice" => {
+            // util-linux `+n:c:p:P:u:tVh`. `-p`/`-P`/`-u` change existing
+            // processes (their operands are more ids): no child. Without them
+            // the operands are the child command, or none (print the class).
+            let mut process_mode = false;
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--ignore", "--help", "--version"],
+                        &["--classdata", "--class", "--pid", "--pgid", "--uid"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['t', 'h', 'V'],
+                        &['n', 'c', 'p', 'P', 'u'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return
+                    }
+                    Some(parsed) => {
+                        process_mode |=
+                            parsed.names(&["--pid", "--pgid", "--uid"], &['p', 'P', 'u']);
+                        index += parsed.words;
+                    }
+                    None => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                }
+            }
+            if process_mode {
+                return;
+            }
+            push_static_child_from(args, index, shell, scan);
+        }
+        "flock" => {
+            // util-linux `+sexnoFuw:E:hV`, then `FILE COMMAND [ARG...]`,
+            // `FILE -c COMMAND` (run by `$SHELL -c`), or a lone file
+            // descriptor number (no child).
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    if wrapper_operand_is_one_word(&args[index], shell) {
+                        break; // the lock file
+                    }
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                    return;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--shared",
+                            "--exclusive",
+                            "--unlock",
+                            "--nonblock",
+                            "--nb",
+                            "--close",
+                            "--no-fork",
+                            "--verbose",
+                            "--fcntl",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--timeout", "--wait", "--conflict-exit-code"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['s', 'e', 'x', 'n', 'o', 'F', 'u', 'h', 'V'],
+                        &['w', 'E'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return
+                    }
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        record_shell_execution_gap(
+                            scan,
+                            ShellExecutionGap::AmbiguousExecutableBody,
+                        );
+                        return;
+                    }
+                }
+            }
+            let operands = args.get(index..).unwrap_or_default();
+            if operands.len() < 2 {
+                // A lone file descriptor, or a usage error: nothing runs.
+                return;
+            }
+            if !wrapper_operand_is_one_word(&operands[0], shell) {
+                // `$LOCK` may expand to any number of words, so the child
+                // position is unknown.
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                return;
+            }
+            match static_wrapper_word(&operands[1], shell).as_deref() {
+                Some("-c" | "--command") => {
+                    // flock refuses anything but exactly one command string.
+                    if operands.len() == 3 {
+                        push_required_literal_wrapper_body(&operands[2..], shell, shell, scan);
+                    }
+                }
+                _ => push_static_child_from(args, index + 1, shell, scan),
+            }
         }
         _ => {}
     }
@@ -9329,6 +9773,7 @@ fn recover_posix_parent_dispatch_body(
                     };
                     if !input.trim().is_empty() {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input,
                             shell: ShellType::Posix,
                             origin: None,
@@ -9351,6 +9796,7 @@ fn recover_posix_parent_dispatch_body(
         if let Some(command) = posix_function_command_word(&segment) {
             if let Some(binding) = functions.get(&command) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -9695,6 +10141,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
         if command_function_shadowed && !command_alias_shadowed {
             if let Some(binding) = function_bindings.get(&command) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -10050,6 +10497,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
         expanded.replace_range(range, &replacement);
     }
     scan.bodies.push(ExecutableBody {
+        best_effort: false,
         input: expanded,
         shell,
         origin: None,
@@ -10291,6 +10739,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                         match decode_powershell_encoded_command(operand, shell) {
                             Some(input) if !input.trim().is_empty() => {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input,
                                     shell: ShellType::PowerShell,
                                     origin: None,
@@ -10335,6 +10784,9 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 if shell == ShellType::Posix =>
             {
                 scan_posix_delegation_utility(&command, &args, shell, scan)
+            }
+            wrapper if shell == ShellType::Fish && FISH_EXTERNAL_WRAPPERS.contains(&wrapper) => {
+                push_fish_wrapper_child(wrapper, &args, &segment, scan);
             }
             "iex" | "invoke-expression" if shell == ShellType::PowerShell => {
                 push_literal_powershell_expression(&args, scan);
@@ -11597,6 +12049,7 @@ fn lexical_executable_substitutions_bounded(
                         if let Some(binding) = functions.get(&command) {
                             let body_index = bodies.len();
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: binding.definition.body.clone(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -11671,6 +12124,7 @@ fn lexical_executable_substitutions_bounded(
                         if let Some(suffix) = raw.get(i + 1..) {
                             if !suffix.trim().is_empty() {
                                 bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: suffix.to_string(),
                                     shell,
                                     origin: Some(ExecutableBodyOrigin {
@@ -11688,6 +12142,7 @@ fn lexical_executable_substitutions_bounded(
                             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
                         }
                         bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell,
                             origin: Some(ExecutableBodyOrigin {
@@ -11815,6 +12270,7 @@ fn lexical_executable_substitutions_bounded(
                             let definition = &binding.definition;
                             let body_index = bodies.len();
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: definition.body.clone(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -11919,6 +12375,7 @@ fn lexical_executable_substitutions_bounded(
                     if let Some(suffix) = raw.get(body_start..) {
                         if !suffix.trim().is_empty() {
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: suffix.to_string(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -12118,6 +12575,7 @@ fn lexical_executable_substitutions_bounded(
                 if let Some(suffix) = raw.get(i + 1..) {
                     if !suffix.trim().is_empty() {
                         bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: suffix.to_string(),
                             shell,
                             origin: Some(ExecutableBodyOrigin {
@@ -12138,6 +12596,7 @@ fn lexical_executable_substitutions_bounded(
                     gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
                 }
                 bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell,
                     origin: Some(ExecutableBodyOrigin {
@@ -12203,6 +12662,7 @@ fn lexical_executable_substitutions_bounded(
                                 let definition = &binding.definition;
                                 let body_index = bodies.len();
                                 bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: definition.body.clone(),
                                     shell,
                                     origin: Some(ExecutableBodyOrigin {
@@ -12558,6 +13018,7 @@ fn push_powershell_named_function_blocks(raw: &str, scan: &mut ExecutableSubstit
         });
         if let Some(body) = body {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -12800,6 +13261,7 @@ fn capture_powershell_executable_body(
             .filter(|body| !body.trim().is_empty())
         {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -12814,6 +13276,7 @@ fn capture_powershell_executable_body(
     if let Some(suffix) = raw.get(open + 1..) {
         if !suffix.trim().is_empty() {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: suffix.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -13658,6 +14121,7 @@ fn push_powershell_switch_clause_bodies(raw: &str, scan: &mut ExecutableSubstitu
             };
             if let Some(body) = raw.get(index + 1..close) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -13992,6 +14456,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 Some(PowerShellCollectionScriptblockArgument::Static { open, close }) => {
                     if let Some(body) = raw.get(open + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -14043,12 +14508,14 @@ fn scan_powershell_fragment_at_hashtable_depth(
                             // choose the invoked command dynamically.
                             if let Some(scriptblock) = complete_brace_body(body) {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: scriptblock.to_string(),
                                     shell: ShellType::PowerShell,
                                     origin: None,
                                 });
                             } else {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: body.to_string(),
                                     shell: ShellType::PowerShell,
                                     origin: None,
@@ -14113,12 +14580,14 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
                     if let Some(scriptblock) = raw.get(i + 1..close).and_then(complete_brace_body) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: scriptblock.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
                         });
                     } else if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -14167,6 +14636,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
                     if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -15314,6 +15784,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                         .find(|definition| definition.name.eq_ignore_ascii_case(&target))
                     {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: definition.body.clone(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -15347,6 +15818,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                     body.push_str(&segment.args.join(" "));
                 }
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body,
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -15361,6 +15833,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
             {
                 let body_start = scan.bodies.len();
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: definition.body.clone(),
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -21257,6 +21730,171 @@ mod tests {
                 finalize.truncated_escape,
                 "finalize must report the wedged terminal for {introducer:?}"
             );
+        }
+    }
+
+    #[test]
+    fn fish_wrapper_child_is_a_best_effort_replacement_body() {
+        for (input, child) in [
+            ("nice -n 5 perl -e 'system(1)'", "perl -e 'system(1)'"),
+            ("timeout -k 1 -s KILL 5 sh -c 'id'", "sh -c 'id'"),
+            ("setsid -fw sh -c 'id'", "sh -c 'id'"),
+            ("taskset -ac 0 sh -c 'id'", "sh -c 'id'"),
+            ("ionice -c3 sh -c 'id'", "sh -c 'id'"),
+            ("flock -x /tmp/lock sh -c 'id'", "sh -c 'id'"),
+            // A chain of wrappers flattens to its innermost child.
+            ("nice nice timeout 5 nice -n5 sh -c 'id'", "sh -c 'id'"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Fish);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            let [body] = scan.bodies.as_slice() else {
+                panic!("{input:?} must yield exactly its child: {scan:?}");
+            };
+            assert_eq!(body.input, child, "{input:?}");
+            assert_eq!(body.shell, ShellType::Fish);
+            assert!(body.best_effort, "{input:?} child must be best-effort");
+            assert_eq!(
+                body.origin.as_ref().map(|origin| origin.relation),
+                Some(ExecutableRelation::WrapperReplacement),
+                "{input:?}"
+            );
+        }
+        // POSIX keeps required (non-best-effort) delegation children.
+        let scan = executable_substitution_scan("nice -n5 sh -c 'id'", ShellType::Posix);
+        assert!(scan.gap.is_none(), "{scan:?}");
+        assert!(scan.bodies.iter().all(|body| !body.best_effort), "{scan:?}");
+    }
+
+    #[test]
+    fn fish_unproven_wrapper_child_is_dropped_without_a_gap() {
+        for input in [
+            "timeout $T npm test",
+            "nice -n $N make",
+            "flock $LOCK make",
+            "ionice -c $C make",
+            "nice --adj=5 make",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Fish);
+            assert!(
+                scan.gap.is_none() && scan.bodies.is_empty(),
+                "{input:?} must keep the released fish verdict: {scan:?}"
+            );
+            // The same spelling still fails closed in POSIX.
+            let posix = executable_substitution_scan(input, ShellType::Posix);
+            assert!(posix.gap.is_some(), "{input:?} -> {posix:?}");
+        }
+    }
+
+    #[test]
+    fn best_effort_bodies_never_exhaust_the_body_budget() {
+        let mut scan = ExecutableSubstitutionScan::default();
+        for index in 0..MAX_EXECUTABLE_SCAN_BODIES {
+            let mut best_effort =
+                ExecutableBody::without_origin(format!("id {index}"), ShellType::Fish);
+            best_effort.best_effort = true;
+            scan.bodies.push(best_effort);
+        }
+        scan.bodies.push(ExecutableBody::without_origin(
+            "id required".to_string(),
+            ShellType::Fish,
+        ));
+        assert!(
+            !bound_executable_bodies(&mut scan),
+            "a best-effort body must not crowd out or report a required one"
+        );
+        assert!(scan
+            .bodies
+            .iter()
+            .any(|body| !body.best_effort && body.input == "id required"));
+        assert_eq!(scan.bodies.len(), MAX_EXECUTABLE_SCAN_BODIES);
+    }
+
+    #[test]
+    fn delegation_utility_option_grammar_finds_the_child() {
+        for (input, child) in [
+            ("nice -n5 make", Some("make")),
+            ("nice -5 make", Some("make")),
+            ("nice --5 make", Some("make")),
+            ("nice -+5 make", Some("make")),
+            ("nice --adjustment=5 make", Some("make")),
+            ("nice --adjustment 5 make", Some("make")),
+            ("nice -n -5 make", Some("make")),
+            ("nice --help", None),
+            ("timeout -k1 5 make", Some("make")),
+            ("timeout -sKILL 5 make", Some("make")),
+            ("timeout -vk 1 5 make", Some("make")),
+            ("timeout -vsKILL 5 make", Some("make")),
+            ("timeout --signal=KILL --kill-after 1 5s make", Some("make")),
+            ("timeout -f -p 5 make", Some("make")),
+            ("setsid -fw make", Some("make")),
+            ("setsid -cfw make", Some("make")),
+            ("setsid -fV make", None),
+            ("taskset -ac 0 make", Some("make")),
+            ("taskset --cpu-list 0-3 make", Some("make")),
+            ("taskset -pc 0 1234", None),
+            ("taskset -p 1234", None),
+            ("ionice -c3 make", Some("make")),
+            ("ionice -c 2 -n 7 make", Some("make")),
+            ("ionice -tc3 make", Some("make")),
+            ("ionice --class=idle make", Some("make")),
+            ("ionice -p 1234", None),
+            ("ionice -c3 -p 1234 5678", None),
+            ("ionice -P 99", None),
+            ("ionice --uid 1000", None),
+            ("ionice", None),
+            ("flock /tmp/lock make", Some("make")),
+            ("flock -xn -w 10 /tmp/lock make", Some("make")),
+            ("flock --timeout=10 -E 3 /tmp/lock make", Some("make")),
+            ("flock ~/.cache/build.lock make", Some("make")),
+            ("flock \"/run/$USER.lock\" make", Some("make")),
+            ("flock /tmp/lock -c 'make install'", Some("make install")),
+            (
+                "flock /tmp/lock --command 'make install'",
+                Some("make install"),
+            ),
+            ("flock /tmp/lock -c", None),
+            ("flock /tmp/lock -c 'make' extra", None),
+            ("flock 9", None),
+            ("flock -u 9", None),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            let bodies = scan
+                .bodies
+                .iter()
+                .map(|body| body.input.as_str())
+                .collect::<Vec<_>>();
+            match child {
+                Some(child) => assert_eq!(bodies, vec![child], "{input:?}"),
+                None => assert!(bodies.is_empty(), "{input:?} has no child: {bodies:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_utility_ambiguous_options_fail_closed() {
+        for input in [
+            "nice --adj=5 make",
+            "nice -x make",
+            "nice -n",
+            "timeout --sig=KILL 5 make",
+            "timeout -s $SIG 5 make",
+            "timeout --signal= 5 make",
+            "setsid --fork=1 make",
+            "taskset -Z 0 make",
+            "ionice -X make",
+            "ionice -c $C make",
+            "ionice $OPTS make",
+            "flock $LOCK make",
+            "flock \"$LOCK\" make",
+            "flock \"$@\" make",
+            "flock /tmp/*.lock make",
+            "flock -w $T /tmp/lock make",
+            "flock -c make /tmp/lock",
+            "flock /tmp/lock -c \"$CMD\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} must fail closed: {scan:?}");
         }
     }
 }

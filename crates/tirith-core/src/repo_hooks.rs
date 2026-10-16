@@ -3588,7 +3588,7 @@ fn hook_command_facts(body: &str) -> HookCommandFacts {
     let mut facts = HookCommandFacts::default();
     let (shell, unsupported_runtime) = hook_body_shell(body);
     facts.analysis_incomplete |= unsupported_runtime;
-    collect_hook_command_facts(body, shell, &mut facts, 0);
+    collect_hook_command_facts(body, shell, &mut facts, 0, false);
     facts
 }
 
@@ -3617,14 +3617,18 @@ fn hook_body_shell(body: &str) -> (crate::tokenize::ShellType, bool) {
     (crate::tokenize::ShellType::Posix, true)
 }
 
+/// `best_effort`: `body` is (inside) a fish wrapper child, see
+/// [`crate::extract::ExecutableBody::best_effort`]. Its commands count; its
+/// analysis gaps do not.
 fn collect_hook_command_facts(
     body: &str,
     shell: crate::tokenize::ShellType,
     facts: &mut HookCommandFacts,
     depth: usize,
+    best_effort: bool,
 ) {
     if body.len() > MAX_HOOK_BODY_SIZE as usize {
-        facts.analysis_incomplete = true;
+        facts.analysis_incomplete |= !best_effort;
         return;
     }
     let execution_view = crate::extract::shell_execution_view(body, shell);
@@ -3640,7 +3644,7 @@ fn collect_hook_command_facts(
             match crate::rules::command::resolve_effective_command(&segment, shell) {
                 Ok(effective) => (effective.segment, effective.saw_sudo),
                 Err(_) => {
-                    if segment.command.is_some() {
+                    if segment.command.is_some() && !best_effort {
                         facts.analysis_incomplete = true;
                     }
                     (segment.clone(), direct == "sudo")
@@ -3683,13 +3687,20 @@ fn collect_hook_command_facts(
     }
 
     let scan = crate::extract::executable_substitution_scan(body, shell);
-    facts.analysis_incomplete |= scan.gap.is_some();
+    facts.analysis_incomplete |= !best_effort && scan.gap.is_some();
     if depth >= 8 {
-        facts.analysis_incomplete |= !scan.bodies.is_empty();
+        facts.analysis_incomplete |=
+            !best_effort && scan.bodies.iter().any(|nested| !nested.best_effort);
         return;
     }
     for nested in scan.bodies {
-        collect_hook_command_facts(&nested.input, nested.shell, facts, depth + 1);
+        collect_hook_command_facts(
+            &nested.input,
+            nested.shell,
+            facts,
+            depth + 1,
+            best_effort || nested.best_effort,
+        );
     }
 }
 

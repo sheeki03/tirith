@@ -1064,7 +1064,10 @@ fn check_depth(
         });
     }
     let nested = nested_scan.bodies;
-    if depth >= 8 && !nested.is_empty() {
+    // A best-effort body (a fish wrapper child) never proves coverage, so it
+    // alone does not trip the depth limit and its own analysis adds only the
+    // findings that prove a risk.
+    if depth >= 8 && nested.iter().any(|body| !body.best_effort) {
         findings.push(Finding {
             rule_id: RuleId::AnalysisIncomplete,
             severity: Severity::High,
@@ -1082,12 +1085,12 @@ fn check_depth(
             mitre_id: None,
             custom_rule_id: None,
         });
-    } else if !nested.is_empty() {
+    } else if depth < 8 && !nested.is_empty() {
         // A nested body runs with the environment the enclosing command set up
         // (`export PYTHONINSPECT=1; (… | python3 -c …)`).
         let nested_inspect = inherited_inspect.extend(&segments, shell);
         for body in nested {
-            findings.extend(check_depth(
+            let body_findings = check_depth(
                 &body.input,
                 body.shell,
                 cwd,
@@ -1095,7 +1098,16 @@ fn check_depth(
                 depth + 1,
                 false,
                 nested_inspect,
-            ));
+            );
+            if body.best_effort {
+                findings.extend(
+                    body_findings
+                        .into_iter()
+                        .filter(|finding| !crate::extract::is_incompleteness_finding(finding)),
+                );
+            } else {
+                findings.extend(body_findings);
+            }
         }
     }
 
@@ -1475,10 +1487,12 @@ fn wrapper_disposition(
                 &[],
                 idx + 1 < args.len(),
             )?,
+            // GNU `+af:o:pqvV` plus BSD/macOS `-l` (rusage) and `-h` (human
+            // output); GNU rejects those two, so nothing runs there.
             "time" => parse_short_wrapper_option(
                 &normalized,
                 &['f', 'o'],
-                &['a', 'p', 'q', 'v'],
+                &['a', 'p', 'q', 'v', 'l', 'h'],
                 &[],
                 idx + 1 < args.len(),
             )?,
@@ -12845,28 +12859,39 @@ fn check_data_exfiltration_depth(
         let mut argument_flows = BTreeMap::<usize, FlowProof>::new();
         let mut has_replacement = false;
         let mut nested_complete = nested_gap.is_none();
-        if depth >= 8 && !occurrences.is_empty() {
+        if depth >= 8
+            && occurrences
+                .iter()
+                .any(|occurrence| !occurrence.body.best_effort)
+        {
             argument_flows.insert(usize::MAX, FlowProof::Incomplete);
             nested_complete = false;
-        } else {
+        } else if depth < 8 {
             for occurrence in occurrences {
                 use crate::extract::ExecutableRelation;
+                let best_effort = occurrence.body.best_effort;
                 let child_segments =
                     tokenize::tokenize(&occurrence.body.input, occurrence.body.shell);
                 let mut isolated_staged;
-                let child_staged = if matches!(
-                    occurrence.relation,
-                    ExecutableRelation::Concurrent | ExecutableRelation::Unknown
-                ) {
+                let child_staged = if best_effort
+                    || matches!(
+                        occurrence.relation,
+                        ExecutableRelation::Concurrent | ExecutableRelation::Unknown
+                    ) {
                     isolated_staged = staged.clone();
                     &mut isolated_staged
                 } else {
                     &mut *staged
                 };
+                let mut best_effort_findings = Vec::new();
                 let child = check_data_exfiltration_depth(
                     &child_segments,
                     occurrence.body.shell,
-                    findings,
+                    if best_effort {
+                        &mut best_effort_findings
+                    } else {
+                        &mut *findings
+                    },
                     routing.stdin,
                     child_staged,
                     depth + 1,
@@ -12874,6 +12899,30 @@ fn check_data_exfiltration_depth(
                 let child_stdout: FlowProof = child.stdout.into();
                 let child_stderr: FlowProof = child.stderr.into();
                 debug_assert_eq!(child.stdin, FlowValue::from(routing.stdin));
+                if best_effort {
+                    // A fish wrapper child adds only what its own analysis
+                    // proves: findings that prove a risk and a sensitive
+                    // output the wrapper passes on. Anything it could not
+                    // resolve keeps the released reading of the wrapper.
+                    findings.extend(
+                        best_effort_findings
+                            .into_iter()
+                            .filter(|finding| !crate::extract::is_incompleteness_finding(finding)),
+                    );
+                    if occurrence.relation == ExecutableRelation::WrapperReplacement {
+                        if child_stdout == FlowProof::Sensitive {
+                            has_replacement = true;
+                            replacement_stdout =
+                                merge_flow_proof(replacement_stdout, FlowProof::Sensitive);
+                        }
+                        if child_stderr == FlowProof::Sensitive {
+                            has_replacement = true;
+                            replacement_stderr =
+                                merge_flow_proof(replacement_stderr, FlowProof::Sensitive);
+                        }
+                    }
+                    continue;
+                }
                 nested_complete &= child.redirection_complete && child.pipe_complete;
                 match occurrence.relation {
                     ExecutableRelation::WrapperReplacement => {

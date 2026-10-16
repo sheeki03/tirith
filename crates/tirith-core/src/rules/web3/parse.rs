@@ -6899,7 +6899,9 @@ fn environment_body_may_mutate(
         if scan.gap.is_some() {
             return true;
         }
-        for body in scan.bodies {
+        // A best-effort body is a fish wrapper child: a separate process that
+        // cannot change this shell's environment.
+        for body in scan.bodies.into_iter().filter(|body| !body.best_effort) {
             if *remaining_bodies == 0 {
                 return true;
             }

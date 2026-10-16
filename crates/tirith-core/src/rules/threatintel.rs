@@ -201,23 +201,35 @@ fn segment_has_original_shell_arguments(segment: &Segment, shell: ShellType) -> 
 
 const MAX_EXECUTABLE_PACKAGE_DEPTH: usize = 8;
 
+/// `(segment, shell, best_effort)`: a segment of a best-effort body (a fish
+/// wrapper child, see `crate::extract::ExecutableBody::best_effort`) adds its
+/// packages but never an analysis gap.
+type PackageSegment = (Segment, ShellType, bool);
+
 fn collect_executable_segments(
     input: &str,
     shell: ShellType,
     depth: usize,
-    segments: &mut Vec<(Segment, ShellType)>,
+    best_effort: bool,
+    segments: &mut Vec<PackageSegment>,
 ) {
     let execution_view = crate::extract::shell_execution_view(input, shell);
     segments.extend(
         crate::tokenize::tokenize(execution_view.as_ref(), shell)
             .into_iter()
-            .map(|segment| (segment, shell)),
+            .map(|segment| (segment, shell, best_effort)),
     );
     if depth >= MAX_EXECUTABLE_PACKAGE_DEPTH {
         return;
     }
     for body in crate::extract::executable_substitution_scan(input, shell).bodies {
-        collect_executable_segments(&body.input, body.shell, depth + 1, segments);
+        collect_executable_segments(
+            &body.input,
+            body.shell,
+            depth + 1,
+            best_effort || body.best_effort,
+            segments,
+        );
     }
 }
 
@@ -225,9 +237,9 @@ fn collect_executable_segments(
 /// preserving each child wrapper's effective shell.
 pub(crate) fn extract_packages_from_input(input: &str, shell: ShellType) -> Vec<PackageRef> {
     let mut segments = Vec::new();
-    collect_executable_segments(input, shell, 0, &mut segments);
+    collect_executable_segments(input, shell, 0, false, &mut segments);
     let mut packages = Vec::new();
-    for (segment, segment_shell) in segments {
+    for (segment, segment_shell, _) in segments {
         packages.extend(extract_packages_for_shell(&[segment], segment_shell));
     }
     packages
@@ -895,13 +907,13 @@ pub fn check(
     let mut findings = Vec::new();
 
     let mut executable_segments = Vec::new();
-    collect_executable_segments(input, shell, 0, &mut executable_segments);
+    collect_executable_segments(input, shell, 0, false, &mut executable_segments);
     let mut packages = Vec::new();
     let mut truncated = false;
-    for (segment, segment_shell) in &executable_segments {
+    for (segment, segment_shell, best_effort) in &executable_segments {
         let extracted =
             extract_packages_detail_for_shell(std::slice::from_ref(segment), *segment_shell);
-        truncated |= extracted.truncated;
+        truncated |= extracted.truncated && !best_effort;
         packages.extend(extracted.packages);
     }
     // A partial package list must not read as a complete assessment. Emitted
@@ -1131,7 +1143,7 @@ pub fn check(
     }
 
     // IP literals in command tokens (ssh/scp/nc and friends).
-    for (seg, segment_shell) in &executable_segments {
+    for (seg, segment_shell, _) in &executable_segments {
         for arg in &seg.args {
             if let Some(ip) = extract_ipv4_from_token_for_shell(arg, *segment_shell) {
                 if checked_ips.insert(ip) {

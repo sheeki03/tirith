@@ -148,41 +148,50 @@ pub fn env_snapshot() -> HashMap<String, String> {
 
 const MAX_NESTED_COMMAND_DEPTH: usize = 8;
 
+/// `(segment, shell, best_effort)`. A segment of a best-effort body (a fish
+/// wrapper child, see [`crate::extract::ExecutableBody::best_effort`]) may add
+/// findings, never an analysis gap.
+type ExecutableSegment = (tokenize::Segment, ShellType, bool);
+
 fn collect_executable_segments(
     input: &str,
     shell: ShellType,
     depth: usize,
-    out: &mut Vec<(tokenize::Segment, ShellType)>,
+    best_effort: bool,
+    out: &mut Vec<ExecutableSegment>,
 ) -> bool {
     let execution_view = crate::extract::shell_execution_view(input, shell);
     out.extend(
         tokenize::tokenize(execution_view.as_ref(), shell)
             .into_iter()
-            .map(|segment| (segment, shell)),
+            .map(|segment| (segment, shell, best_effort)),
     );
     let nested_scan = crate::extract::executable_substitution_scan(input, shell);
-    let mut incomplete = nested_scan.gap.is_some();
+    let mut incomplete = !best_effort && nested_scan.gap.is_some();
     let nested = nested_scan.bodies;
     if nested.is_empty() {
         return incomplete;
     }
     if depth >= MAX_NESTED_COMMAND_DEPTH {
-        return true;
+        return !best_effort && nested.iter().any(|body| !body.best_effort);
     }
     for body in nested {
         // Do not use `Iterator::any`: traversing every sibling is required to
         // collect all executable segments even after an earlier depth gap.
-        incomplete |= collect_executable_segments(&body.input, body.shell, depth + 1, out);
+        incomplete |= collect_executable_segments(
+            &body.input,
+            body.shell,
+            depth + 1,
+            best_effort || body.best_effort,
+            out,
+        );
     }
     incomplete
 }
 
-fn executable_segments(
-    input: &str,
-    shell: ShellType,
-) -> (Vec<(tokenize::Segment, ShellType)>, bool) {
+fn executable_segments(input: &str, shell: ShellType) -> (Vec<ExecutableSegment>, bool) {
     let mut segments = Vec::new();
-    let incomplete = collect_executable_segments(input, shell, 0, &mut segments);
+    let incomplete = collect_executable_segments(input, shell, 0, false, &mut segments);
     (segments, incomplete)
 }
 
@@ -213,7 +222,16 @@ pub fn cheap_check(
         ));
     }
 
-    for (seg, segment_shell) in &segments {
+    // Findings of a best-effort segment from this index on keep only those
+    // that prove a risk (see `ExecutableSegment`).
+    let mut best_effort_start: Option<usize> = None;
+    for (seg, segment_shell, best_effort) in &segments {
+        if let Some(start) = best_effort_start.take() {
+            retain_proven_from(&mut findings, start);
+        }
+        if *best_effort {
+            best_effort_start = Some(findings.len());
+        }
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
@@ -395,8 +413,21 @@ pub fn cheap_check(
             }
         }
     }
+    if let Some(start) = best_effort_start {
+        retain_proven_from(&mut findings, start);
+    }
 
     dedup_findings(findings)
+}
+
+/// Drop the analysis-gap findings at `start..`, keeping the proven ones.
+fn retain_proven_from(findings: &mut Vec<Finding>, start: usize) {
+    let mut index = 0usize;
+    findings.retain(|finding| {
+        let keep = index < start || !crate::extract::is_incompleteness_finding(finding);
+        index += 1;
+        keep
+    });
 }
 
 /// Full filesystem simulation for `tirith preview`: walks cwd-relative targets
@@ -436,10 +467,11 @@ fn simulate_with_work_limit(
         report.classification_incomplete = true;
     }
 
-    for (seg, segment_shell) in &segments {
+    for (seg, segment_shell, best_effort) in &segments {
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(_) if *best_effort => continue,
             Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
                 report.walk_errors += 1;
                 report.walk_truncated = true;
