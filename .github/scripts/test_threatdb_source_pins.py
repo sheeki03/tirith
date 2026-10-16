@@ -249,7 +249,10 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
 
     def test_observe_records_a_compare_github_cannot_generate_and_exits_zero(self) -> None:
         self.datadog_compare_answers(422)
-        with tempfile.TemporaryDirectory() as temporary:
+        # CI itself runs under Actions; outside it no annotation is printed.
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            PINS.os.environ, {"GITHUB_ACTIONS": "false"}
+        ):
             directory = Path(temporary)
             result = directory / "observations.json"
             code, stderr = self.run_cli(
