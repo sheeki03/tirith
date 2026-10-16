@@ -11857,9 +11857,13 @@ fn approval_check_honored_bypass_prints_no_approval_file() {
         if bypass {
             check.env("TIRITH", "0");
         }
+        // The metadata file goes to the platform temp directory: TMPDIR on
+        // Unix, TMP or TEMP on Windows.
         check
             .env("TIRITH_POLICY_ROOT", &policy_root)
             .env("TMPDIR", &temp)
+            .env("TMP", &temp)
+            .env("TEMP", &temp)
             .args([
                 "check",
                 "--approval-check",
