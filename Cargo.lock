@@ -3157,7 +3157,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tirith"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3196,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "tirith-core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "base64",
@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "tirith-license-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "tirith-policy-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "axum",
  "clap",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "tirith-sign"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "tirith-test-support"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "tempfile",
 ]
