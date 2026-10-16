@@ -16,6 +16,10 @@
 
 import { execFileSync } from "node:child_process";
 
+// Upper bound on the checker's JSON response. Node's 1 MiB default is smaller
+// than a block verdict for a large command can be. A response past this limit
+// makes Node stop the checker and discard its exit status, so it is denied.
+const MAX_CHECK_RESPONSE_BYTES = 16 * 1024 * 1024;
 const VALID_SHELLS = new Set(["posix", "fish", "powershell", "cmd"]);
 const VALID_EXEC_HOSTS = new Set(["auto", "sandbox", "gateway", "node"]);
 const POSIX_GATEWAY_SHELLS = new Set([
@@ -346,7 +350,13 @@ export default {
       const recordHookEvent = (event, detail) => hookEvent(event, detail, telemetryDeadline);
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
       const command = event.params?.command;
-      if (typeof command !== "string" || !command.trim()) return;
+      if (typeof command !== "string" || !command.trim()) {
+        // A shell tool call without a string command cannot be checked; it is
+        // not a no-op this guard may silently allow.
+        recordHookEvent("parse_error", "no command in shell tool params");
+        if (process.env.TIRITH_FAIL_OPEN === "1") return;
+        return { block: true, blockReason: "tirith: no command found in hook input — blocked for safety" };
+      }
 
       const tirithBin = process.env.TIRITH_BIN || "tirith";
       const shellResolution = resolveShellTokenizer(
@@ -369,10 +379,28 @@ export default {
         stdout = execFileSync(
           tirithBin,
           ["check", "--json", "--non-interactive", "--shell", shell, "--", command],
-          { timeout: 10_000, encoding: "utf-8", env: { ...process.env, TIRITH_INTEGRATION: "openclaw" } },
+          {
+            timeout: 10_000,
+            maxBuffer: MAX_CHECK_RESPONSE_BYTES,
+            encoding: "utf-8",
+            env: { ...process.env, TIRITH_INTEGRATION: "openclaw" },
+          },
         );
       } catch (err) {
         const execError = /** @type {any} */ (err);
+        if (execError.code === "ENOBUFS") {
+          // Node stops the checker once the response passes maxBuffer (with
+          // SIGTERM, so this must precede the timeout test), and the exit
+          // status is usually lost. A response that large comes from a verdict
+          // with many findings, not a checker failure. Deny it whatever the
+          // status (a block, deferred block, or acknowledgement gate must
+          // never become an allow); TIRITH_FAIL_OPEN does not apply.
+          recordHookEvent("check_block", "oversized checker response");
+          return {
+            block: true,
+            blockReason: `tirith: check response exceeded the ${MAX_CHECK_RESPONSE_BYTES}-byte limit — blocked for safety`,
+          };
+        }
         if (execError.status === 3) {
           // Required acknowledgement is authoritative even without valid JSON,
           // and is not a checker failure covered by TIRITH_FAIL_OPEN.

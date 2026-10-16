@@ -67,7 +67,10 @@ fi
 
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
 
-# Extract event, tool name, and command from stdin JSON
+# Extract event, tool name, command state, and command from stdin JSON. The
+# state line is "ok" only for a non-empty string command; anything else (a
+# missing, null, non-string, or blank command, or a non-object tool_input) is
+# "invalid" and a matched shell tool is denied below without a check.
 PARSED=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
@@ -75,11 +78,15 @@ try:
     event = d.get('hook_event_name', d.get('hookEventName', ''))
     tool = d.get('tool_name', d.get('toolName', ''))
     ti = d.get('tool_input', d.get('toolInput', {}))
-    cmd = ti.get('command', '') if isinstance(ti, dict) else ''
-    print(event)
-    print(tool)
-    print(cmd)
+    cmd = ti.get('command') if isinstance(ti, dict) else None
+    ok = isinstance(cmd, str) and cmd.strip() != ''
+    # One line each, so a newline in a name cannot shift the fields below.
+    print(str(event).replace('\r', ' ').replace('\n', ' '))
+    print(str(tool).replace('\r', ' ').replace('\n', ' '))
+    print('ok' if ok else 'invalid')
+    print(cmd if ok else '')
 except Exception:
+    print('')
     print('')
     print('')
     print('')
@@ -92,10 +99,11 @@ if [ "$PARSE_RC" -ne 0 ] || [ -z "$PARSED" ]; then
   deny "tirith: failed to parse hook input — blocked for safety"
 fi
 
-# Read the three lines from PARSED
+# Read the event, tool, and command-state lines; the command is the rest.
 EVENT=$(echo "$PARSED" | head -n 1)
 TOOL=$(echo "$PARSED" | sed -n '2p')
-COMMAND=$(echo "$PARSED" | tail -n +3)
+COMMAND_STATE=$(echo "$PARSED" | sed -n '3p')
+COMMAND=$(echo "$PARSED" | tail -n +4)
 
 # Only intercept PreToolUse + shell tools
 if [ "$EVENT" != "PreToolUse" ]; then
@@ -104,8 +112,12 @@ fi
 if ! echo "$TOOL" | grep -qE "$SHELL_TOOL_PATTERN"; then
   exit 0
 fi
-if [ -z "$COMMAND" ]; then
-  exit 0
+# A shell tool call without a string command cannot be checked; it is not a
+# no-op the hook may silently allow.
+if [ "$COMMAND_STATE" != "ok" ] || [ -z "$COMMAND" ]; then
+  _tirith_hook_event parse_error "no command in shell tool input"
+  if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
+  deny "tirith: no command found in hook input — blocked for safety"
 fi
 
 RESULT=$(TIRITH_INTEGRATION=vscode "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)

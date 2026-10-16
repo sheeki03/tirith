@@ -407,7 +407,22 @@ pub fn run(
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
-        // Machine callers (agent adapters, the Hermes plugin) require the
+        // Machine callers require the ordinary channel output for an honored
+        // bypass. The approval-check channel (the zshenv guard, legacy shell
+        // hooks) expects a no-approval metadata file path on stdout, exactly
+        // as for any other non-approval verdict; without it the caller sees
+        // missing metadata and blocks the command it was told to allow.
+        if approval_check {
+            match tirith_core::approval::write_no_approval_file() {
+                Ok(path) => println!("{}", path.display()),
+                Err(e) => {
+                    eprintln!("tirith: failed to write approval file: {e}");
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        // JSON callers (agent adapters, the Hermes plugin) require the
         // ordinary envelope; an honored bypass is `action: allow` with
         // `bypass_honored: true` and no approval requirement.
         if json {

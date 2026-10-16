@@ -215,6 +215,17 @@ fn check_with_env(
     )
 }
 
+fn asset_path(host: &str) -> std::path::PathBuf {
+    let asset = if host == "openclaw" {
+        "openclaw-tirith-guard.ts"
+    } else {
+        "tirith-guard.ts"
+    };
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/hooks")
+        .join(asset)
+}
+
 fn callback_command(
     state: &GlobalStateGuard,
     host: &str,
@@ -223,11 +234,6 @@ fn callback_command(
     warn_action: &str,
     fail_open: bool,
 ) -> Command {
-    let asset = if host == "openclaw" {
-        "openclaw-tirith-guard.ts"
-    } else {
-        "tirith-guard.ts"
-    };
     let mut node = Command::new("node");
     state.apply_to_command(&mut node);
     node.args(["--input-type=module", "-e", HOST_CALLBACK_RUNNER])
@@ -250,12 +256,7 @@ fn callback_command(
             })
             .to_string(),
         )
-        .env(
-            "TIRITH_TEST_ASSET",
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/hooks")
-                .join(asset),
-        )
+        .env("TIRITH_TEST_ASSET", asset_path(host))
         .stdin(Stdio::null());
     node
 }
@@ -620,6 +621,220 @@ fn typed_callbacks_complete_real_checks_with_shipped_deadlines() {
             } else {
                 assert!(result.is_null(), "{host}/{tool}: {result}");
             }
+        }
+    }
+}
+
+// Drive one shipped callback with an exact host event through the real
+// execFileSync, so the checker process and Node's response buffer take part in
+// the decision. Reports how many checks the callback started.
+const LIVE_EVENT_RUNNER: &str = r#"
+import { readFile } from "node:fs/promises";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+
+const realExecFileSync = childProcess.execFileSync;
+let checks = 0;
+childProcess.execFileSync = (file, args, options) => {
+  if (args[0] === "check") checks += 1;
+  return realExecFileSync(file, args, options);
+};
+syncBuiltinESMExports();
+
+const host = process.env.TIRITH_TEST_HOST;
+let source = await readFile(process.env.TIRITH_TEST_ASSET, "utf8");
+if (host !== "openclaw") {
+  source = source
+    .replace('"__TIRITH_BIN__"', JSON.stringify(process.env.TIRITH_BIN))
+    .replace('"__TIRITH_INTEGRATION__"', JSON.stringify(host));
+}
+const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+const guard = (await import(moduleUrl)).default;
+let callback;
+const api = {
+  on(name, handler) {
+    if (name === (host === "openclaw" ? "before_tool_call" : "tool_call")) {
+      callback = handler;
+    }
+  },
+};
+if (host === "openclaw") guard.register(api); else guard(api);
+const result = await callback(JSON.parse(process.env.TIRITH_TEST_EVENT), {});
+process.stdout.write(JSON.stringify({ checks, result: result === undefined ? null : result }));
+"#;
+
+fn live_event(
+    state: &GlobalStateGuard,
+    host: &str,
+    tirith_bin: &std::path::Path,
+    event: &Value,
+    fail_open: bool,
+) -> Value {
+    let mut node = Command::new("node");
+    state.apply_to_command(&mut node);
+    let output = node
+        .args(["--input-type=module", "-e", LIVE_EVENT_RUNNER])
+        .env("TIRITH_BIN", tirith_bin)
+        .env("TIRITH_SHELL", "posix")
+        .env("TIRITH_BASH_SHELL", "posix")
+        .env("TIRITH_HOOK_WARN_ACTION", "allow")
+        .env("TIRITH_FAIL_OPEN", if fail_open { "1" } else { "0" })
+        .env("TIRITH_TEST_HOST", host)
+        .env("TIRITH_TEST_EVENT", event.to_string())
+        .env("TIRITH_TEST_ASSET", asset_path(host))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{host}: {event}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{host}: {event}: invalid runner output: {error}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+#[test]
+fn openclaw_callback_denies_a_shell_call_without_a_string_command() {
+    let state = isolated_state();
+    if !node_available(&state) {
+        return;
+    }
+    write_user_policy(BASE_POLICY);
+    let tirith = std::path::Path::new(env!("CARGO_BIN_EXE_tirith"));
+    let denied = serde_json::json!({
+        "block": true,
+        "blockReason": "tirith: no command found in hook input — blocked for safety",
+    });
+    for tool in ["exec", "bash"] {
+        let mut events: Vec<Value> = [
+            serde_json::json!({}),
+            serde_json::json!({"host": "sandbox"}),
+            serde_json::json!({"command": ["rm", "-rf", "/"]}),
+            serde_json::json!({"command": null}),
+            serde_json::json!({"command": 7}),
+            serde_json::json!({"command": " \n "}),
+            serde_json::json!("printf clean"),
+        ]
+        .into_iter()
+        .map(|params| serde_json::json!({"toolName": tool, "params": params}))
+        .collect();
+        events.push(serde_json::json!({"toolName": tool}));
+        for event in &events {
+            let outcome = live_event(&state, "openclaw", tirith, event, false);
+            assert_eq!(outcome["checks"], 0, "{event}: {outcome}");
+            assert_eq!(outcome["result"], denied, "{event}: {outcome}");
+            // Like an unparseable payload in every other adapter, an operator's
+            // fail-open allows it; it is still never sent to the checker.
+            let outcome = live_event(&state, "openclaw", tirith, event, true);
+            assert_eq!(outcome["checks"], 0, "{event}: {outcome}");
+            assert!(outcome["result"].is_null(), "{event}: {outcome}");
+        }
+    }
+    // Tools the guard does not inspect are unaffected.
+    for event in [
+        serde_json::json!({"toolName": "read", "params": {}}),
+        serde_json::json!({"toolName": "read"}),
+    ] {
+        let outcome = live_event(&state, "openclaw", tirith, &event, false);
+        assert_eq!(outcome["checks"], 0, "{event}: {outcome}");
+        assert!(outcome["result"].is_null(), "{event}: {outcome}");
+    }
+    // A real command is still checked.
+    let event = serde_json::json!({"toolName": "exec", "params": {"command": CLEAN_COMMAND}});
+    let outcome = live_event(&state, "openclaw", tirith, &event, false);
+    assert_eq!(outcome["checks"], 1, "{outcome}");
+    assert!(outcome["result"].is_null(), "{outcome}");
+}
+
+/// A real block response padded with copies of its own finding to at least
+/// `bytes`, served with the real exit status by a transport that runs nothing.
+#[cfg(unix)]
+fn oversized_block_checker(
+    directory: &std::path::Path,
+    response: &CheckedCommand,
+    bytes: usize,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut verdict: Value = serde_json::from_str(&response.stdout).unwrap();
+    let finding = verdict["findings"][0].clone();
+    let copies = bytes / finding.to_string().len() + 1;
+    verdict["findings"] = Value::Array(vec![finding; copies]);
+    let body = directory.join(format!("response-{bytes}.json"));
+    std::fs::write(&body, verdict.to_string()).unwrap();
+    let checker = directory.join(format!("checker-{bytes}"));
+    std::fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = check ] || exit 0\ncat '{}'\nexit {}\n",
+            body.display(),
+            response.status
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&checker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    checker
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_callbacks_deny_an_oversized_block_response_even_when_failing_open() {
+    let state = isolated_state();
+    if !node_available(&state) {
+        return;
+    }
+    write_user_policy(BASE_POLICY);
+    let (critical_response, critical) = check(&state, CRITICAL_COMMAND);
+    assert_eq!(critical_response.status, 1, "{critical}");
+    let fixture = tempfile::tempdir().unwrap();
+    // ~1.3 MB exceeds Node's 1 MiB default buffer but fits the adapters'
+    // limit, so the verdict is read. Past 16 MiB Node stops the checker and
+    // its exit status is lost; the response is still a block.
+    for (bytes, expected) in [
+        (1_300_000, "[CRITICAL]"),
+        (17 * 1024 * 1024, "exceeded the 16777216-byte limit"),
+    ] {
+        let checker = oversized_block_checker(fixture.path(), &critical_response, bytes);
+        let mut direct = Command::new(&checker);
+        state.apply_to_command(&mut direct);
+        let output = direct
+            .args(["check", "--json", "--non-interactive", "--shell", "posix"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.len() >= bytes, "{}", output.stdout.len());
+        for (host, tool) in [
+            ("pi-cli", "bash"),
+            ("openclaw", "exec"),
+            ("openclaw", "bash"),
+        ] {
+            let event = if host == "openclaw" {
+                serde_json::json!({"toolName": tool, "params": {"command": CRITICAL_COMMAND}})
+            } else {
+                serde_json::json!({"toolName": tool, "input": {"command": CRITICAL_COMMAND}})
+            };
+            let outcome = live_event(&state, host, &checker, &event, true);
+            assert_eq!(outcome["checks"], 1, "{host}/{tool}/{bytes}");
+            let result = outcome["result"].clone();
+            let reason = result[if host == "openclaw" {
+                "blockReason"
+            } else {
+                "reason"
+            }]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+            assert_blocked(host, result);
+            assert!(
+                reason.contains(expected),
+                "{host}/{tool}/{bytes}: {}",
+                reason.chars().take(300).collect::<String>()
+            );
         }
     }
 }

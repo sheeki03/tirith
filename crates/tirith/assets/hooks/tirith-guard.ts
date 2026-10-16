@@ -51,6 +51,12 @@ const OMP_DEBUG_READONLY_ACTIONS = new Set([
  * limit instead of by the platform's argument-length ceiling.
  */
 const MAX_CHECK_SCRIPT_BYTES = 1024 * 1024;
+/**
+ * Upper bound on the checker's JSON response. Node's 1 MiB default is smaller
+ * than a block verdict for a large script can be. A response past this limit
+ * makes Node stop the checker and discard its exit status, so it is denied.
+ */
+const MAX_CHECK_RESPONSE_BYTES = 16 * 1024 * 1024;
 /** Prevent adversarial tool payloads from making argv rendering itself unbounded. */
 const MAX_EXEC_ARGUMENTS = 4096;
 
@@ -1243,12 +1249,25 @@ export default function (pi) {
           {
             input: script,
             timeout: 10000,
+            maxBuffer: MAX_CHECK_RESPONSE_BYTES,
             encoding: "utf-8",
             env: { ...process.env, TIRITH_INTEGRATION },
           },
         );
       } catch (err) {
         // execFileSync throws on a non-zero exit as well as on spawn failure.
+        if (err.code === "ENOBUFS") {
+          // Node stops the checker once the response passes maxBuffer, so the
+          // exit status is usually lost, and a response that large comes from
+          // a verdict with many findings, not a checker failure. Deny it
+          // whatever the status (a block, deferred block, or acknowledgement
+          // gate must never become an allow); TIRITH_FAIL_OPEN does not apply.
+          recordHookEvent("check_block", "oversized checker response");
+          return {
+            block: true,
+            reason: `tirith: check response exceeded the ${MAX_CHECK_RESPONSE_BYTES}-byte limit — blocked for safety`,
+          };
+        }
         if (err.status === 3) {
           // Required acknowledgement is a policy gate, even if its JSON is
           // malformed; it cannot become an operator checker-error fail-open.
