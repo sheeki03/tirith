@@ -346,7 +346,13 @@ export default {
       const recordHookEvent = (event, detail) => hookEvent(event, detail, telemetryDeadline);
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
       const command = event.params?.command;
-      if (typeof command !== "string" || !command.trim()) return;
+      if (typeof command !== "string" || !command.trim()) {
+        // A shell tool call without a string command cannot be checked; it is
+        // not a no-op this guard may silently allow.
+        recordHookEvent("parse_error", "no command in shell tool params");
+        if (process.env.TIRITH_FAIL_OPEN === "1") return;
+        return { block: true, blockReason: "tirith: no command found in hook input — blocked for safety" };
+      }
 
       const tirithBin = process.env.TIRITH_BIN || "tirith";
       const shellResolution = resolveShellTokenizer(

@@ -497,6 +497,82 @@ fn installed_shell_hooks_deny_deferred_blocks_and_allow_an_honored_bypass() {
 }
 
 #[test]
+fn installed_vscode_hook_denies_a_shell_tool_call_without_a_string_command() {
+    let workspace = Workspace::new();
+    workspace.policy("LOW", false);
+    let hook = workspace.setup(Host::Vscode, false);
+    // Telemetry may still call the binary; only a `check` marks the run, and
+    // answers with a clean verdict.
+    let marker = workspace.root.path().join("checker-ran");
+    let recorder = workspace.root.path().join("recording-checker");
+    fs::write(
+        &recorder,
+        format!(
+            "#!{}\nif [ \"$1\" = check ]; then\n  : > {}\n  printf '%s\\n' '{}'\nfi\nexit 0\n",
+            workspace.bash.display(),
+            quote(&marker),
+            json!({"action": "allow", "requires_approval": false, "findings": []}),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |payload: &Value, fail_open: bool| {
+        let mut process = workspace.command(&workspace.bash);
+        process.arg(&hook).env("TIRITH_BIN", &recorder);
+        if fail_open {
+            process.env("TIRITH_FAIL_OPEN", "1");
+        }
+        with_stdin(&mut process, &serde_json::to_vec(payload).unwrap())
+    };
+
+    let shell_call = |tool_input: Value| json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": tool_input});
+    let mut payloads = [
+        json!({}),
+        json!("printf safe"),
+        json!(null),
+        json!({"command": ["printf", "safe"]}),
+        json!({"command": null}),
+        json!({"command": 7}),
+        json!({"command": " \n "}),
+        json!({"commandLine": "printf safe"}),
+    ]
+    .map(shell_call)
+    .to_vec();
+    payloads.push(json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"}));
+    for payload in &payloads {
+        let output = run(payload, false);
+        Host::Vscode.assert_permission(&output, false);
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecisionReason"],
+            "tirith: no command found in hook input — blocked for safety",
+            "{payload}"
+        );
+        // Like an unparseable payload, an operator's fail-open allows it.
+        Host::Vscode.assert_permission(&run(payload, true), true);
+        assert!(!marker.exists(), "{payload}: no command to check");
+    }
+
+    // Calls the hook does not guard stay silent allows.
+    for payload in [
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}),
+        json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {}}),
+    ] {
+        let output = run(&payload, false);
+        assert!(output.status.success(), "{payload}: {output:?}");
+        assert!(output.stdout.is_empty(), "{payload}: {output:?}");
+    }
+    assert!(!marker.exists());
+
+    // A real command is still checked.
+    Host::Vscode.assert_permission(
+        &run(&shell_call(json!({"command": CLEAN_COMMAND})), false),
+        true,
+    );
+    assert!(marker.exists());
+}
+
+#[test]
 fn installed_zshenv_allows_an_honored_bypass_and_refuses_an_unhonored_one() {
     let Some(zsh) = system_binary("zsh") else {
         eprintln!("skipping non-interactive zsh guard: zsh is unavailable");
