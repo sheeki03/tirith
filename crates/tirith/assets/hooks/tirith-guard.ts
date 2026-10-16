@@ -1320,7 +1320,10 @@ export default function (pi) {
             reason: `tirith: ${TIRITH_BIN} not found — reinstall the integration or set TIRITH_FAIL_OPEN=1`,
           };
         }
-        if (err.killed) {
+        // execFileSync reports its own timeout as code ETIMEDOUT with the kill
+        // signal set (it never sets `killed`, which only asynchronous exec
+        // does). A checker ended by any signal produced no verdict either.
+        if (err.code === "ETIMEDOUT" || (err.signal && err.status == null)) {
           recordHookEvent("timeout");
           if (failOpen()) return undefined;
           return { block: true, reason: "tirith: check timed out — blocked for safety" };

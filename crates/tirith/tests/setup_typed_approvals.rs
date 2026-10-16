@@ -56,6 +56,11 @@ childProcess.execFileSync = (file, args, options) => {
     integration: options.env?.TIRITH_INTEGRATION,
   };
   checks.push(observed);
+  if (mutation === "timeout") {
+    // A real Node timeout: the shipped invocation with a deadline the real
+    // checker cannot meet, so the guard sees exactly what Node reports.
+    return realExecFileSync(file, args, { ...options, timeout: 1 });
+  }
   if (live) {
     try {
       const stdout = realExecFileSync(file, args, options);
@@ -522,6 +527,25 @@ fn exercise_host(host: &str) {
         assert!(callback(&state, host, tool, &warning_response, "", false, "none").is_null());
     }
 
+    // A checker that timed out produced no verdict: it is denied unless the
+    // operator fails open, and reported as a timeout.
+    for fail_open in [false, true] {
+        let result = callback(
+            &state,
+            host,
+            tools[0],
+            &warning_response,
+            "allow",
+            fail_open,
+            "timeout",
+        );
+        if fail_open {
+            assert!(result.is_null(), "{host}: {result}");
+        } else {
+            let reason = blocked_reason(host, result);
+            assert!(reason.contains("timed out"), "{host}: {reason}");
+        }
+    }
     for mutation in ["absent", "non_boolean", "invalid_json"] {
         for response in [&clean_response, &warning_response] {
             assert_blocked(
