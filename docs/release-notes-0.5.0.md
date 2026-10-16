@@ -90,8 +90,10 @@ every change in detail.
   - `if` and `while` bracket conditions over a substitution, and arithmetic
     over `$(date +%s)` or `$(printf N)`
     ([#260](https://github.com/sheeki03/tirith/issues/260)).
-  - A command named through a variable (`BIN=/bin/echo; "$BIN" --help`) and
-    `echo … | python3 -c '…'` data pipelines
+  - In POSIX shells, a command named through a variable
+    (`BIN=/bin/echo; "$BIN" --help`), and `echo … | python3 -c '…'` pipelines
+    whose program only passes its input to `print` or prints an unsigned
+    integer (`print(sys.stdin.read())`, `print(1)`)
     ([#264](https://github.com/sheeki03/tirith/issues/264)).
   - Redirections after a package command (`npm install express 2>&1`) are no
     longer looked up as package names
@@ -105,8 +107,8 @@ every change in detail.
   instead of blocking.
 - **Numeric hosts ([#255](https://github.com/sheeki03/tirith/issues/255),
   still open).** A curl finding for a bare number now names the number you
-  typed (`8080`) instead of a converted address (`0.0.31.144`). The warning
-  itself remains; see Known gaps.
+  typed (`8080`) as well as the address it converts to (`0.0.31.144`). The
+  warning itself remains; see Known gaps.
 
 ## New detections
 
@@ -118,6 +120,11 @@ every change in detail.
 - Inline programs after clustered options (`python3 -Pc`, `perl -lne`,
   `ruby -we`) or after a leading redirection (`2>/dev/null python3 -c`) are
   analyzed.
+- When node, bun, perl or ruby gets several inline programs, every one is
+  checked, so a harmless first program no longer hides a later payload:
+  0.4.2 checked only the first `-e` word and missed `node -e 1 -e …`,
+  `bun -e 1 -e …`, `perl -e 1 -e …` and `ruby -e 1 -e …`. Downloaded source
+  in a later program (`node -p 1 -e "$(curl …)"`) is caught too.
 - fish blocks `curl … | sh>/dev/null` like `| sh >/dev/null`.
 - curl URLs with one to three slashes after the scheme, curl URL globs
   (`http://169.254.169.[254-254]/`), and URLs run through `sudo`, `env`,
@@ -200,7 +207,8 @@ every change in detail.
 
 - Some common agent commands still block, as in 0.4.2:
   - piping into `python3 -m json.tool`, or into a `python3 -c` program that
-    calls `json.dumps`;
+    transforms its input or prints a string (`json.dumps`, `.upper()`,
+    `.readlines()`, `print("done")`);
   - downloaded JSON piped into Python, even into a data parser
     (`curl … | python3 -m json.tool`);
   - here-strings (`jq -r .name <<< "$OUT"`);
@@ -213,14 +221,26 @@ every change in detail.
   pass.
 - Bare numbers still read as hosts
   ([#255](https://github.com/sheeki03/tirith/issues/255)): a curl port operand
-  (`curl -sv 203.0.113.10 8080`), git's `--depth 1` and wget's `-t 3` warn
+  (`curl -sv example.com 8080`), git's `--depth 1` and wget's `-t 3` warn
   `raw_ip_url`.
+- In fish, a `python3 -c` data pipeline
+  (`echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'`)
+  now blocks with `pipe_to_interpreter`, where 0.4.2 allowed it: the
+  data-pipeline exemption applies only in POSIX shells, where Tirith can
+  rule out Python inspect mode.
 - A downloaded script piped into `source` or `.`
   (`curl … | source /dev/stdin`, fish's `curl … | source`) or into
   `busybox sh` is not flagged, as in 0.4.2.
 - Downloaded inline source (`python -c "$(curl …)"`) is detected in POSIX
   shells only, not in fish's `python3 -c (curl …)`. php's `-B`, `-R` and `-E`
   code options are not treated as inline source (`-r` is).
+- A perl or ruby program split across several `-e` words, or an inline
+  flag joined to its program inside quotes (`perl '-e…'`), is not analyzed,
+  as in 0.4.2.
+- In fish, the command run by `nice`, `timeout`, `setsid`, `taskset`,
+  `ionice` or `flock` (`nice perl -e …`, `timeout 30 sh -c '…'`) is not
+  analyzed, as in 0.4.2. POSIX shells analyze it, or block it as incomplete
+  analysis.
 - A heredoc fed to a remote or nested reader (`ssh host sh <<EOF`,
   `x=$(sh) <<EOF`) is not analyzed as code, and curl's
   `--variable`/`--expand-url` templates are read as unknown values.
