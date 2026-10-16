@@ -2087,9 +2087,34 @@ expected_action = "block"
 expected_rules = ["interpreter_suspicious_inline_exec"]
 
 [[fixture]]
+name = "inline_node_experimental_default_type_then_repeated_eval_payload"
+min_milestone = 1
+input = "node --experimental-default-type module -e 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_test_isolation_then_print_eval_payload"
+min_milestone = 1
+input = "node --experimental-test-isolation none -p 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
 name = "inline_node_print_then_eval_benign_no_fire"
 min_milestone = 1
 input = "node -p 1 -e \"console.log(2)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_default_type_repeated_eval_benign_no_fire"
+min_milestone = 1
+input = "node --experimental-default-type module -e 'console.log(1)' -e 'console.log(2)'"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
