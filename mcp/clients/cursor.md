@@ -152,7 +152,10 @@ deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
-it.
+it. Because the hook runs on the agent's behalf, that grant extends to the
+agent itself: it can prefix `TIRITH=0` to any command and skip every check,
+including blocks, `approval_rules` and `strict_warn`. Enable
+`allow_bypass_env_noninteractive` only for trusted automation.
 
 ## Upgrading
 

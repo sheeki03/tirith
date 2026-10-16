@@ -89,11 +89,11 @@ and:
 - Exit 1: deny (returns `{block: true, reason: "..."}`). `TIRITH_FAIL_OPEN`
   does not apply.
 - Exit 2: warn. By default (`TIRITH_HOOK_WARN_ACTION=allow`) the command is
-  answered exactly like a clean one (returns `undefined`, findings on stderr); a warning never
-  approves anything. `deny` blocks. `ask` is denied with guidance to confirm
-  from a Tirith-protected interactive shell, because the Pi-family host has no
-  confirmation prompt this integration can request. Any other value blocks
-  and names the valid values (`allow`, `ask`, `deny`).
+  answered exactly like a clean one (returns `undefined`, findings on stderr);
+  a warning never approves anything. `deny` blocks. `ask` is denied with
+  guidance to confirm from a Tirith-protected interactive shell, because the
+  Pi-family host has no confirmation prompt this integration can request. Any
+  other value blocks and names the valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The extension has no channel to collect approval or
@@ -113,7 +113,10 @@ deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the extension runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the extension
-allows it.
+allows it. Because the hook runs on the agent's behalf, that grant extends to
+the agent itself: it can prefix `TIRITH=0` to any command and skip every
+check, including blocks, `approval_rules` and `strict_warn`. Enable
+`allow_bypass_env_noninteractive` only for trusted automation.
 
 ## Upgrading
 
