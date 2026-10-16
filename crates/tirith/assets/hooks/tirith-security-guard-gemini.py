@@ -4,6 +4,10 @@
 Reads JSON from stdin (Gemini CLI hook protocol), extracts the command,
 and delegates to `tirith check --json` for security analysis.
 
+Approvals and mandatory acknowledgements are denied: this hook has no
+confirmation channel. Warn-allow and TIRITH_FAIL_OPEN never bypass either gate.
+Blocks (check exit 1) and deferred blocks (exit 4) are always denied.
+
 Exit codes:
   0 — hook completed successfully (decision in stdout JSON)
   Non-zero — hook error (fail-closed by default; set TIRITH_FAIL_OPEN=1 for fail-open)
@@ -97,17 +101,83 @@ def _build_warning_text(stdout):
     if stdout and stdout.strip():
         try:
             verdict = json.loads(stdout)
-            findings = verdict.get("findings", [])
-            if findings:
+            findings = verdict.get("findings", []) if isinstance(verdict, dict) else []
+            if isinstance(findings, list):
                 parts = []
                 for f in findings:
-                    title = f.get("title", f.get("rule_id", "unknown"))
+                    if not isinstance(f, dict):
+                        continue
+                    title = f.get("title") or f.get("rule_id", "unknown")
                     severity = f.get("severity", "")
-                    parts.append(f"[{severity}] {title}" if severity else title)
-                text = "Tirith: " + "; ".join(parts)
-        except json.JSONDecodeError:
+                    if not isinstance(title, str):
+                        continue
+                    parts.append(f"[{severity}] {title}" if isinstance(severity, str) and severity else title)
+                if parts:
+                    text = "Tirith: " + "; ".join(parts)
+        except (ValueError, RecursionError):
             text = stdout.strip()[:500]
     return text
+
+
+def warn_action():
+    """Return the validated TIRITH_HOOK_WARN_ACTION: "allow" (default) or "deny"."""
+    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
+    if value in ("allow", "deny"):
+        return value
+    print(
+        f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{value}', defaulting to 'allow'",
+        file=sys.stderr,
+    )
+    return "allow"
+
+
+def checker_error(returncode, reason):
+    """Fail closed (or open) on a damaged response, never past an intact verdict.
+
+    A warning the operator configured to deny stays denied when its response is
+    damaged, so TIRITH_FAIL_OPEN cannot turn a denied warning into an allow.
+    """
+    if returncode == 2 and warn_action() == "deny":
+        deny(reason)
+    fail_closed(reason)
+
+
+def _block_reason(returncode, stdout):
+    """Describe a block; exit 4 is a deferred block awaiting `tirith pending` review."""
+    reason = _build_warning_text(stdout)
+    if returncode == 4:
+        reason += " — blocked, pending review (deferred). Resolve with `tirith pending`."
+    return reason
+
+
+def _check_verdict(stdout):
+    """Validate the approval contract before permitting analyzed execution."""
+    try:
+        verdict = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("check returned invalid JSON") from error
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("requires_approval"), bool):
+        raise ValueError(
+            "check response is missing a boolean requires_approval; update tirith and re-run setup"
+        )
+    return verdict
+
+
+def _approval_reason(verdict, stdout):
+    """Use checker-redacted context, never the original secret-bearing command."""
+    reason = "Tirith: approval or acknowledgement required"
+    rule = verdict.get("approval_rule")
+    if isinstance(rule, str) and rule:
+        reason += f" ({rule})"
+    reason += ". " + _build_warning_text(stdout)
+    description = verdict.get("approval_description")
+    if isinstance(description, str) and description:
+        reason += ". " + description
+    return (
+        reason
+        + " — blocked; this host hook cannot collect approval or acknowledgement. "
+        "Review the command and retry from a Tirith-protected interactive shell to confirm it."
+    )
 
 
 def fail_closed(reason):
@@ -176,6 +246,8 @@ def main():
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             env=env,
         )
@@ -192,14 +264,31 @@ def main():
         return
 
     # Unexpected exit code — fail-closed
-    if result.returncode not in (0, 1, 2):
+    if result.returncode not in (0, 1, 2, 3, 4):
         _hook_event("unexpected_exit", f"exit code {result.returncode}")
         fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
         return
-    if result.returncode != 0 and not result.stdout.strip():
+    if result.returncode == 3:
+        _hook_event("check_block")
+        deny(_approval_reason({}, result.stdout))
+    if result.returncode in (1, 4):
+        # A block is a verdict, not a checker error, even with damaged output.
+        # Exit 4 is a deferred block (pending review).
+        _hook_event("check_block")
+        deny(_block_reason(result.returncode, result.stdout))
+    if not result.stdout.strip():
         _hook_event("unexpected_exit", f"exit code {result.returncode} with no output")
-        fail_closed("tirith: check returned non-zero with no output — blocked for safety")
+        checker_error(result.returncode, "tirith: check returned no output — blocked for safety")
         return
+    try:
+        verdict = _check_verdict(result.stdout)
+    except ValueError as error:
+        _hook_event("unexpected_exit", "invalid approval metadata")
+        checker_error(result.returncode, f"tirith: {error} — blocked for safety")
+        return
+    if verdict["requires_approval"]:
+        _hook_event("check_block")
+        deny(_approval_reason(verdict, result.stdout))
 
     # Exit 0 = clean, allow
     if result.returncode == 0:
@@ -208,24 +297,14 @@ def main():
 
     # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION
     if result.returncode == 2:
-        warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-        if warn_action not in ("allow", "deny"):
-            print(
-                f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{warn_action}', defaulting to 'allow'",
-                file=sys.stderr,
-            )
-            warn_action = "allow"
-        if warn_action != "deny":
+        if warn_action() != "deny":
             _hook_event("warn_allowed")
             warning_text = _build_warning_text(result.stdout)
             print(warning_text, file=sys.stderr)
             sys.exit(0)
 
-    # Exit 1 = block, Exit 2 + deny = block
-    if result.returncode == 1:
-        _hook_event("check_block")
-    else:
-        _hook_event("warn_denied")
+    # Exit 2 + deny = block.
+    _hook_event("warn_denied")
     reason = _build_warning_text(result.stdout)
     deny(reason)
 

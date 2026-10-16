@@ -48,7 +48,7 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo "tirith: configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1" >&2; exit 2
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('tool_info',{}).get('command_line',''))" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
+COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('tool_info',{}).get('command_line',''))" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
 if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
   _tirith_hook_event parse_error
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
@@ -56,11 +56,39 @@ if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
 fi
 RESULT=$(TIRITH_INTEGRATION=windsurf "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
 RC=$?  # No || true: we need the actual exit code. Without set -e, script continues safely.
+
+if [ "$RC" -eq 2 ]; then
+  WARN_ACTION=$(echo "${TIRITH_HOOK_WARN_ACTION:-allow}" | tr '[:upper:]' '[:lower:]')
+  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
+    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
+    WARN_ACTION="allow"
+  fi
+fi
+
+# Validate the machine contract before either execution-permitting exit.
+if [ "$RC" -eq 0 ] || [ "$RC" -eq 2 ]; then
+  APPROVAL_STATE=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+v = json.loads(sys.stdin.read())
+if not isinstance(v, dict) or type(v.get('requires_approval')) is not bool:
+    sys.exit(1)
+print('required' if v['requires_approval'] else 'none')
+" <<< "$RESULT" 2>/dev/null)
+  if [ "$?" -ne 0 ]; then
+    _tirith_hook_event parse_error "invalid check approval metadata"
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then exit 0; fi
+    echo "Tirith: invalid approval metadata from security check — blocked for safety" >&2; exit 2
+  fi
+  if [ "$APPROVAL_STATE" = "required" ]; then
+    _tirith_hook_event approval_required
+    echo "Tirith: command requires policy approval. This hook cannot request approval; ask your operator to review the command in an approval-capable Tirith integration." >&2; exit 2
+  fi
+fi
 if [ "$RC" -eq 0 ]; then _tirith_hook_event check_ok; exit 0; fi
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -79,8 +107,9 @@ except Exception:
 " <<< "$RESULT" 2>/dev/null || echo "Tirith: security check failed"
 }
 
-# Exit 1 = block (High/Critical findings)
-if [ "$RC" -eq 1 ]; then
+# Exit 1 = block (High/Critical findings); exit 4 = deferred block (pending
+# review), never a checker error eligible for fail-open.
+if [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
   _tirith_hook_event check_block
   _findings_summary >&2
   exit 2
@@ -88,11 +117,6 @@ fi
 
 # Exit 2 = warn (Medium/Low findings) — check TIRITH_HOOK_WARN_ACTION
 if [ "$RC" -eq 2 ]; then
-  WARN_ACTION=$(echo "${TIRITH_HOOK_WARN_ACTION:-allow}" | tr '[:upper:]' '[:lower:]')
-  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
-    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
-    WARN_ACTION="allow"
-  fi
   if [ "$WARN_ACTION" = "deny" ]; then
     _tirith_hook_event warn_denied
     _findings_summary >&2
@@ -102,6 +126,12 @@ if [ "$RC" -eq 2 ]; then
   _tirith_hook_event warn_allowed
   _findings_summary >&2
   exit 0
+fi
+if [ "$RC" -eq 3 ]; then
+  # WarnAck is an execution gate, not a checker failure eligible for fail-open.
+  _tirith_hook_event warn_denied "warning acknowledgement required"
+  echo "Tirith: command requires warning acknowledgement. This hook cannot collect it; review the command in an acknowledgement-capable Tirith integration." >&2
+  exit 2
 fi
 _tirith_hook_event unexpected_exit "exit code $RC"
 if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi

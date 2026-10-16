@@ -1532,6 +1532,28 @@ pub(crate) fn args_without_redirections(args: &[String]) -> Vec<String> {
 /// word. Returns the argv prefix plus whether the operator consumes the next
 /// shell word. Process substitutions stay part of the word.
 pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    redirection_suffix(word, false)
+}
+
+/// [`shell_redirection_suffix`] for fish words: a single-quoted string accepts
+/// `\'` and `\\`, backticks are ordinary bytes, `(` opens a command
+/// substitution with or without `$`, and fish has no process substitution, so
+/// `>(cmd)` redirects to the file the substitution names.
+pub(crate) fn fish_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    redirection_suffix(word, true)
+}
+
+/// [`shell_redirection_token`] for fish, where `>(cmd)` is a redirection to the
+/// file the command substitution names.
+pub(crate) fn fish_redirection_token(word: &str) -> Option<bool> {
+    let rest = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if rest.starts_with(">(") || rest.starts_with("<(") {
+        return Some(false);
+    }
+    shell_redirection_token(word)
+}
+
+fn redirection_suffix(word: &str, fish: bool) -> Option<(&str, bool)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -1552,7 +1574,9 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
         }
         match quote {
             Quote::Single => {
-                if ch == '\'' {
+                if fish && ch == '\\' {
+                    escaped = true;
+                } else if ch == '\'' {
                     quote = Quote::None;
                 }
                 continue;
@@ -1586,7 +1610,7 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
                     quote = Quote::Double;
                     continue;
                 }
-                '`' => {
+                '`' if !fish => {
                     quote = Quote::Backtick;
                     continue;
                 }
@@ -1615,7 +1639,14 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
         // Operators inside command/process substitutions belong to that
         // nested command, not the outer delete command. Consume the opening
         // parenthesis here so it is counted exactly once.
-        if matches!(ch, '$' | '<' | '>') && chars.peek().is_some_and(|(_, next)| *next == '(') {
+        if fish && ch == '(' {
+            substitution_depth = 1;
+            continue;
+        }
+        if matches!(ch, '$' | '<' | '>')
+            && !(fish && ch != '$')
+            && chars.peek().is_some_and(|(_, next)| *next == '(')
+        {
             let _ = chars.next();
             substitution_depth = 1;
             continue;
@@ -1623,7 +1654,7 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
 
         // A `>` or `<` inside `${parameter expansion}` is word content (for
         // example `${x:-a>b}`), not an outer redirection operator.
-        if ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
+        if !fish && ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
             let _ = chars.next();
             parameter_depth = 1;
             continue;
@@ -1639,7 +1670,12 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
             return None;
         }
         let candidate = &word[candidate_index..];
-        if let Some(target_is_separate) = shell_redirection_token(candidate) {
+        let token = if fish {
+            fish_redirection_token(candidate)
+        } else {
+            shell_redirection_token(candidate)
+        };
+        if let Some(target_is_separate) = token {
             return Some((&word[..candidate_index], target_is_separate));
         }
     }

@@ -884,8 +884,8 @@ fn emit(
                 eprintln!("  {}", safe(reason));
             }
             eprintln!(
-                "  The untrusted-project preset is enforceable only on x86_64 Linux with a usable \
-                 Landlock ABI. It never falls back to a degraded or uncontained run."
+                "  The untrusted-project preset is enforceable only on native x86_64 or AArch64 \
+                 Linux with usable Landlock and seccomp. It never falls back to a degraded or uncontained run."
             );
         }
         CapsuleRunStatus::Partial => {

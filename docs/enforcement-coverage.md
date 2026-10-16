@@ -481,8 +481,8 @@ Linux architectures; macOS cannot enforce a
 per-process memory ceiling or a process-count ceiling at all; and the
 parent-owned wall-clock and combined-output supervisor is Linux-only.
 
-Verified live on the macOS development host (before the 0.5.0 cycle cleanup; not
-re-run since): the command
+Verified live on the macOS development host against the current integration
+candidate: the command
 refuses before anything is copied or spawned, exits 1, writes a refusal receipt,
 reports `project_copy_materialized: false`, and names the exact missing control
 ("missing: resource_limits ... the parent-owned wall-clock and combined-output

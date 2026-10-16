@@ -419,7 +419,7 @@ end
 
 function _tirith_check_command
     set -l fish_trace
-    set -l cmd (commandline)
+    set -l cmd (commandline | string collect)
 
     # Never create or deliver a second receipt while recovery of an older one is
     # unresolved. Reconciliation/discard runs in the original working directory.

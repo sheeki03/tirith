@@ -1974,7 +1974,7 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                 let first = results.len();
                 push_urls_from_source(&clean, shell, seg_idx, sink_context, &mut results);
                 for (index, candidate) in results.iter().enumerate().skip(first) {
-                    if curl_dns_body_owns_fallback(
+                    if nested_body_owns_url_fallback(
                         candidate,
                         &clean,
                         segment,
@@ -1998,7 +1998,7 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                 &mut results,
             );
             for (index, candidate) in results.iter().enumerate().skip(first) {
-                if curl_dns_body_owns_fallback(
+                if nested_body_owns_url_fallback(
                     candidate,
                     source,
                     segment,
@@ -2030,7 +2030,9 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                     _ => Vec::new(),
                 };
                 for raw in std::iter::once(&operand.text).chain(&expanded) {
-                    let parsed = if has_leading_uri_scheme(raw) {
+                    let parsed = if parse::curl_scheme_separator(raw).is_some()
+                        || has_leading_uri_scheme(raw)
+                    {
                         // curl also accepts schemes outside URL_REGEX's generic
                         // shortlist, including explicit scp:// and sftp:// URLs.
                         parse_curl_destination(raw)
@@ -2093,6 +2095,15 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                         }
                     }
                     let clean = crate::rules::command::normalize_shell_token(arg, shell);
+                    if cmd.name == "npm"
+                        && shell == ShellType::Posix
+                        && literal_posix_npm_metadata_operand(&cmd.args) == Some(arg_idx)
+                    {
+                        if let Some(selector) = npm_named_url_selector(&clean) {
+                            push_urls_from_source(selector, shell, seg_idx, true, &mut results);
+                            continue;
+                        }
+                    }
                     if is_remote_copy {
                         // Validate the spec shape (for downstream policy) but
                         // never emit schemeless for remote specs or local files.
@@ -2219,11 +2230,11 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
     results
 }
 
-/// A raw wrapper/substitution scan can misread curl's DNS authority as an IP.
-/// Defer only that fallback to a recovered client occurrence. Equality of URL
-/// text alone is insufficient: a sibling wget or quoted data can legitimately
-/// retain generic parser semantics for exactly the same spelling.
-fn curl_dns_body_owns_fallback(
+/// Reconcile a raw wrapper/substitution fallback with its recovered occurrence.
+/// It may misread curl's DNS authority as an IP, or promote URI-looking remote
+/// path text into a new destination. Equal text in a sibling wget or data word
+/// does not establish ownership and keeps its independent reading.
+fn nested_body_owns_url_fallback(
     candidate: &ExtractedUrl,
     source: &str,
     segment: &Segment,
@@ -2231,14 +2242,9 @@ fn curl_dns_body_owns_fallback(
     shell: ShellType,
     nested_bodies: &[(ExecutableBody, Vec<ExtractedUrl>)],
 ) -> bool {
-    let UrlLike::Standard { parsed, .. } = &candidate.parsed else {
-        return false;
-    };
-    if !matches!(parsed.host(), Some(url::Host::Ipv4(_)))
-        || parse::curl_empty_hex_dns_url_host(&candidate.raw).is_none()
-    {
-        return false;
-    }
+    let dns_mismatch = matches!(&candidate.parsed, UrlLike::Standard { parsed, .. }
+        if matches!(parsed.host(), Some(url::Host::Ipv4(_)))
+            && parse::curl_empty_hex_dns_url_host(&candidate.raw).is_some());
     nested_bodies.iter().any(|(body, urls)| {
         let Some(origin) = &body.origin else {
             return false;
@@ -2262,7 +2268,23 @@ fn curl_dns_body_owns_fallback(
             let Some(host) = url.parsed.host() else {
                 return false;
             };
-            if parse::curl_empty_hex_dns_host(host).is_none() {
+            if let Some(offset) = url.raw.len().checked_sub(comparable_raw.len()) {
+                let tail_start = match &url.parsed {
+                    UrlLike::Scp { .. } => url.raw.find(':').map(|colon| colon + 1),
+                    _ => parse::curl_scheme_separator(&url.raw).and_then(|(colon, slashes)| {
+                        let authority_start = colon + 1 + slashes;
+                        url.raw[authority_start..]
+                            .find(['/', '?', '#'])
+                            .map(|end| authority_start + end)
+                    }),
+                };
+                if tail_start.is_some_and(|start| offset >= start)
+                    && url.raw.get(offset..) == Some(comparable_raw)
+                {
+                    return true;
+                }
+            }
+            if !dns_mismatch || parse::curl_empty_hex_dns_host(host).is_none() {
                 return false;
             }
             if url.raw == comparable_raw {
@@ -2554,6 +2576,14 @@ fn push_urls_from_source(
 /// including one host-unescape pass. Other encoded/trailing-dot numeric forms
 /// have version-dependent behavior and remain outside this correction.
 pub(crate) fn parse_curl_destination(raw: &str) -> parse::UrlLike {
+    let Some(normalized) = parse::normalize_curl_url(raw) else {
+        return parse::UrlLike::Unparsed {
+            raw: raw.to_string(),
+            raw_host: None,
+            raw_path: None,
+        };
+    };
+    let raw = normalized.as_ref();
     let mut value = parse::parse_url(raw);
     if let parse::UrlLike::Standard { parsed, .. } = &mut value {
         if let Some(host) = parse::curl_empty_hex_dns_url_host(raw) {
@@ -2610,7 +2640,7 @@ fn parse_curl_schemeless_destination(raw: &str, noise_heuristic: bool) -> Option
 /// Shared host view for operands already selected by curl's option grammar.
 /// Other clients keep their existing parser and policy normalization.
 pub(crate) fn curl_destination_host(raw: &str) -> Option<String> {
-    let value = if has_leading_uri_scheme(raw) {
+    let value = if parse::curl_scheme_separator(raw).is_some() || has_leading_uri_scheme(raw) {
         parse_curl_destination(raw)
     } else {
         parse_curl_schemeless_destination(raw, false)?
@@ -3163,22 +3193,19 @@ fn push_urls_from_source_with_curl_operands(
             if !has_leading_uri_scheme(&raw) {
                 continue;
             }
-            // A selected sftp:// operand also matches the generic regex at
-            // ftp://. The complete operand below is authoritative; suppress
-            // only a proven suffix of that same spelling, including attached
-            // --url= / -x values. Other embedded URL text keeps its old scan.
-            let starts_inside_operand_scheme = operands.iter().any(|operand| {
+            // A complete selected operand owns its URI-looking path text and
+            // any scheme suffix (`sftp://` also matches at `ftp://`). Attached
+            // --url= / -x values are included; independent data URLs stay visible.
+            let inside_complete_operand = operands.iter().any(|operand| {
                 let operand = &operand.text;
-                if !has_leading_uri_scheme(operand) || operand.len() <= raw.len() {
+                if parse::curl_scheme_separator(operand).is_none() || operand.len() <= raw.len() {
                     return false;
                 }
                 let suffix_start = operand.len() - raw.len();
-                let scheme_end = operand.find("://").unwrap();
-                suffix_start < scheme_end
-                    && operand.get(suffix_start..) == Some(raw.as_str())
+                operand.get(suffix_start..) == Some(raw.as_str())
                     && normalized[..mat.start()].ends_with(&operand[..suffix_start])
             });
-            if starts_inside_operand_scheme {
+            if inside_complete_operand {
                 continue;
             }
         }
@@ -15651,6 +15678,100 @@ fn first_package_runner_operand(args: &[String], start: usize, shell: ShellType)
     None
 }
 
+/// The one package operand in a literal POSIX npm metadata query. Options
+/// are consumed by role; later positionals are field names, not more packages.
+/// Unknown option grammar or shell expansion cannot establish this role.
+fn literal_posix_npm_metadata_operand(args: &[String]) -> Option<usize> {
+    let mut subcommand_seen = false;
+    let mut options_terminated = false;
+    let mut index = 0;
+    while index < args.len() {
+        let word = static_wrapper_word(&args[index], ShellType::Posix)?;
+        if !options_terminated && word == "--" {
+            options_terminated = true;
+            index += 1;
+            continue;
+        }
+        if !options_terminated && word.starts_with('-') {
+            let (option, attached) = word
+                .split_once('=')
+                .map_or((word.as_str(), None), |(name, value)| (name, Some(value)));
+            let takes_value = matches!(
+                option,
+                "--registry"
+                    | "--workspace"
+                    | "-w"
+                    | "--prefix"
+                    | "--cache"
+                    | "--userconfig"
+                    | "--globalconfig"
+                    | "--tag"
+                    | "--fetch-retries"
+                    | "--fetch-retry-factor"
+                    | "--fetch-retry-mintimeout"
+                    | "--fetch-retry-maxtimeout"
+                    | "--fetch-timeout"
+                    | "--loglevel"
+            );
+            let boolean = matches!(
+                option,
+                "--json"
+                    | "--parseable"
+                    | "--long"
+                    | "--global"
+                    | "-g"
+                    | "--silent"
+                    | "-s"
+                    | "--quiet"
+                    | "-q"
+                    | "--ignore-scripts"
+                    | "--audit"
+                    | "--no-audit"
+                    | "--fund"
+                    | "--no-fund"
+                    | "--offline"
+                    | "--prefer-offline"
+                    | "--prefer-online"
+                    | "--workspaces"
+                    | "--include-workspace-root"
+            );
+            if takes_value && attached.is_none() {
+                static_wrapper_word(args.get(index + 1)?, ShellType::Posix)?;
+                index += 2;
+            } else if takes_value || boolean {
+                index += 1;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        if !subcommand_seen {
+            if !matches!(word.as_str(), "view" | "info" | "show" | "v") {
+                return None;
+            }
+            subcommand_seen = true;
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// A named npm metadata operand can point at a real URL instead of a registry
+/// version (`tool@https://host/archive.tgz`). Split only after a valid package
+/// name, never at a colon in an SCP remote's path.
+fn npm_named_url_selector(raw: &str) -> Option<&str> {
+    let name_end = if let Some(scoped) = raw.strip_prefix('@') {
+        scoped.find('@')? + 1
+    } else {
+        raw.find('@')?
+    };
+    let selector = &raw[name_end + 1..];
+    (registry_package_name(&raw[..name_end]) && has_leading_uri_scheme(selector))
+        .then_some(selector)
+}
+
 /// Package-manager registry specs such as `eslint.config@^1` contain dots but
 /// are not schemeless network destinations. This classifier is deliberately
 /// positional and grammar-bounded: URL/tarball operands that contain a host
@@ -15672,6 +15793,12 @@ fn is_registry_package_operand(
     }
     if has_leading_uri_scheme(&raw) || raw.starts_with("//") || !registry_package_name(&raw) {
         return false;
+    }
+    if command == "npm"
+        && shell == ShellType::Posix
+        && literal_posix_npm_metadata_operand(args) == Some(index)
+    {
+        return true;
     }
 
     let normalized: Vec<String> = args
@@ -17439,6 +17566,81 @@ mod tests {
             assert!(
                 urls.iter().any(|url| url.parsed.host() == Some(host)),
                 "artifact URL disappeared: {input} -> {urls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_posix_npm_metadata_selectors_are_registry_specs_not_destinations() {
+        for query in ["view", "info", "show", "v"] {
+            for selector in [
+                "vitest@4.1.11",
+                "'vitest@4.1.11'",
+                "\"vitest@4.1.11\"",
+                "'@scope/tool@^4.1.11'",
+            ] {
+                let input = format!("npm {query} {selector} version");
+                let urls = extract_urls(&input, ShellType::Posix);
+                assert!(urls.is_empty(), "{input}: {urls:?}");
+            }
+        }
+        for input in [
+            "npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/ --userconfig=/qualification/empty.npmrc --globalconfig=/qualification/empty.npmrc --cache=/qualification/npm-cache --fetch-retries=1 --ignore-scripts --no-audit --no-fund",
+            "npm --registry https://registry.npmjs.org/ view vitest@4.1.11 version",
+            "npm view --userconfig /qualification/empty.npmrc --fetch-retries 1 --registry https://registry.npmjs.org/ vitest@4.1.11 version",
+            "npm view -- vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "command npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "env LANG=C npm info vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "env -S 'npm show vitest@4.1.11 version --registry=https://registry.npmjs.org/'",
+            "sh -c 'npm v vitest@4.1.11 version --registry=https://registry.npmjs.org/'",
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(urls.iter().any(|url| url.parsed.host() == Some("registry.npmjs.org")), "{input}: {urls:?}");
+            assert!(urls.iter().all(|url| url.parsed.host() != Some("4.1.0.11")), "{input}: {urls:?}");
+        }
+    }
+
+    #[test]
+    fn npm_metadata_exemption_does_not_hide_urls_registry_values_or_unknown_roles() {
+        for (input, host) in [
+            ("npm view https://4.1.0.11/package.tgz version", "4.1.0.11"),
+            (
+                "npm info vitest@https://4.1.0.11/package.tgz version",
+                "4.1.0.11",
+            ),
+            ("npm show git@4.1.0.11:repo.git version", "4.1.0.11"),
+            ("npm v 4.1.0.11/package.tgz version", "4.1.0.11"),
+            (
+                "npm view vitest@4.1.11 version --registry=https://4.1.0.11/",
+                "4.1.0.11",
+            ),
+            ("npm view --registry vitest@4.1.11 version", "4.1.0.11"),
+            ("npm view --unknown vitest@4.1.11 version", "4.1.0.11"),
+            ("npm install https://4.1.0.11/package.tgz", "4.1.0.11"),
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some(host)),
+                "{input}: {urls:?}"
+            );
+        }
+        for selector in [
+            "vitest@$VERSION",
+            "\"vitest@$VERSION\"",
+            "vitest@$(printf 4.1.11)",
+            "vitest@${VERSION:-4.1.11}",
+        ] {
+            let args = vec!["view".into(), selector.into(), "version".into()];
+            assert!(
+                !is_registry_package_operand("npm", &args, 1, ShellType::Posix),
+                "{selector}"
+            );
+        }
+        for shell in [ShellType::Fish, ShellType::PowerShell, ShellType::Cmd] {
+            let urls = extract_urls("npm view vitest@4.1.11 version", shell);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some("4.1.0.11")),
+                "{shell:?}: {urls:?}"
             );
         }
     }

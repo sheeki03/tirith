@@ -3762,9 +3762,10 @@ impl TrustScopeKind {
     }
 }
 
-/// Reject values that would be rewritten by the terminal display scrub.  This
-/// is used when importing trust-store patterns as enforcement rules, so a
-/// hand-edited store cannot introduce a value that the CLI itself refuses.
+/// Reject values that would be rewritten by the terminal display scrub, and
+/// patterns with a `*` that can never match.  This is used when importing
+/// trust-store patterns as enforcement rules, so a hand-edited store cannot
+/// introduce a value that the CLI itself refuses.
 pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
     if pattern.trim().is_empty() {
         return Err("pattern must not be empty".to_string());
@@ -3776,6 +3777,27 @@ pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
         || crate::mcp::output_filter::sanitize_for_display(pattern) != pattern
     {
         return Err("pattern contains terminal-control or deceptive Unicode characters".into());
+    }
+    // `*` is a wildcard only as a leading `*.` label. Anywhere else it is a
+    // literal byte that no host, URL or image reference carries, so the entry
+    // would be recorded as effective without ever matching (#271).
+    if pattern.strip_prefix("*.").unwrap_or(pattern).contains('*') {
+        let host = pattern
+            .split_once("://")
+            .map_or(pattern, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .filter(|host| !host.is_empty() && !host.contains('*'));
+        return Err(match host {
+            Some(host) => format!(
+                "'*' is a wildcard only as a leading '*.' label; to trust everything \
+                 under {host}, trust the host itself ('{host}' with --broad), or name \
+                 the exact URL or image"
+            ),
+            None => "'*' is a wildcard only as a leading '*.' label (for example \
+                     '*.example.com'); name the host (with --broad) or the exact URL instead"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -3808,8 +3830,23 @@ pub fn classify_trust_pattern(pattern: &str) -> TrustScopeKind {
 }
 
 fn extract_host_for_match(url: &str) -> Option<String> {
-    if let Some(host) = crate::parse::parse_url(url).host() {
-        return Some(host.trim_end_matches('.').to_lowercase());
+    // A tag/digest colon after the first slash is not an SCP authority
+    // separator. Prefer the validated registry authority for these references.
+    let registry_reference = url.split_once('/').is_some_and(|(registry, image)| {
+        registry.contains('.')
+            && !registry.contains(['@', '?', '#', '%', '\\'])
+            && !registry
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+            && image.contains(':')
+            && registry.rsplit_once(':').is_none_or(|(_, port)| {
+                !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit())
+            })
+    });
+    if !registry_reference {
+        if let Some(host) = crate::parse::parse_url(url).host() {
+            return Some(host.trim_end_matches('.').to_lowercase());
+        }
     }
     // Fallback for schemeless host/path (e.g., example.com/path)
     let candidate = url.split('/').next().unwrap_or(url).trim();
@@ -5503,6 +5540,73 @@ custom_rules:
             ..Default::default()
         };
         assert!(p.is_allowlisted("example.com:8080/path"));
+    }
+
+    #[test]
+    fn registry_trust_preserves_host_scope_for_tags_and_digests() {
+        let policy = Policy {
+            allowlist: vec!["registry.example.com".into()],
+            ..Default::default()
+        };
+        for reference in [
+            "registry.example.com/team/image:latest",
+            "registry.example.com/team/image:1.2.3",
+            "REGISTRY.EXAMPLE.COM/team/image:latest",
+            "registry.example.com:5000/team/image:latest",
+            "registry.example.com/team/image@sha256:0123456789abcdef",
+            "registry.example.com/team/image:latest@sha256:0123456789abcdef",
+            "git@registry.example.com:team/repo.git",
+            "registry.example.com:team/repo.git",
+        ] {
+            assert!(policy.is_allowlisted(reference), "{reference}");
+        }
+        for reference in [
+            "evil-registry.example.com/team/image:latest",
+            "registry.example.com.evil.test/team/image:latest",
+            "other.example.com/registry.example.com/image:latest",
+            "registry.example.com@other.example.com/team/image:latest",
+            "git@other.example.com:registry.example.com/repo.git",
+        ] {
+            assert!(!policy.is_allowlisted(reference), "{reference}");
+        }
+        assert!(!allowlist_pattern_matches(
+            "registry.example.com/team/image:latest",
+            "registry.example.com/team/image:other"
+        ));
+    }
+
+    /// #271: `*` is a wildcard only as a leading `*.` label. A pattern with a
+    /// `*` anywhere else is refused (it could never match), with the host
+    /// grant named when the pattern has one.
+    #[test]
+    fn trust_patterns_with_a_non_leading_star_are_refused_with_the_host_grant() {
+        for pattern in [
+            "registry.example.com/*",
+            "https://registry.example.com/*",
+            "registry.example.com/team/*",
+        ] {
+            let error = validate_trust_pattern(pattern).unwrap_err();
+            assert!(
+                error.contains("'registry.example.com' with --broad"),
+                "{pattern}: {error}"
+            );
+            assert!(!allowlist_pattern_matches(
+                pattern,
+                "registry.example.com/team/image:latest"
+            ));
+        }
+        for pattern in ["*registry.example.com", "registry.*.com", "*.example.com/*"] {
+            let error = validate_trust_pattern(pattern).unwrap_err();
+            assert!(error.contains("leading '*.' label"), "{pattern}: {error}");
+        }
+        for pattern in [
+            "*.example.com",
+            "registry.example.com",
+            "registry.example.com/team/image:latest",
+            "https://example.com/install.sh",
+        ] {
+            assert!(validate_trust_pattern(pattern).is_ok(), "{pattern}");
+        }
     }
 
     #[test]

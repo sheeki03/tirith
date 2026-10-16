@@ -1184,6 +1184,32 @@ mod tests {
     }
 
     #[test]
+    fn issue_270_redirections_do_not_become_npm_packages() {
+        for input in [
+            "npm install express 2>/dev/null",
+            "npm install 2>/dev/null express",
+            "npm install express 2> /dev/null",
+            "npm install express >/dev/null 2>&1",
+            "env npm install express 2>/dev/null",
+            "sudo npm install express 2>/dev/null",
+        ] {
+            let packages = tokenize_and_extract(input);
+            let names: Vec<_> = packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect();
+            assert_eq!(names, ["express"], "{input}");
+        }
+        for input in [
+            "git add . 2>/dev/null",
+            "npm install 2>/dev/null",
+            "npm view express version 2>/dev/null",
+        ] {
+            assert!(tokenize_and_extract(input).is_empty(), "{input}");
+        }
+    }
+
+    #[test]
     fn issue_264_package_redirections_are_not_registry_operands() {
         for input in [
             "pip install pytest 2>&1 | tail -10",

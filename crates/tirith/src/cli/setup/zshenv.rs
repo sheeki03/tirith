@@ -800,10 +800,23 @@ mod tests {
             }
             with_fake_home(|home| {
                 use std::os::unix::fs::PermissionsExt;
-                // Real (no-op) tirith binary that PATH below won't reach.
+                // Contract-faithful stub at a path the stripped PATH cannot reach.
                 let dir = tempfile::tempdir().unwrap();
                 let tirith = dir.path().join("tirith");
-                std::fs::write(&tirith, "#!/bin/sh\nexit 0\n").unwrap();
+                let metadata = dir.path().join("tirith-approval-baked.env");
+                std::fs::write(&metadata, "TIRITH_REQUIRES_APPROVAL=no\n").unwrap();
+                std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                // The guard uses the private-file approval-check transport.
+                // Ordinary JSON checks retain the same explicit false boolean.
+                std::fs::write(
+                    &tirith,
+                    format!(
+                        "#!/bin/sh\nif [ \"$2\" = '--approval-check' ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{{\"action\":\"allow\",\"requires_approval\":false,\"findings\":[]}}'; fi\nexit 0\n",
+                        metadata.display()
+                    ),
+                )
+                .unwrap();
                 let mut perms = std::fs::metadata(&tirith).unwrap().permissions();
                 perms.set_mode(0o755);
                 std::fs::set_permissions(&tirith, perms).unwrap();

@@ -45,7 +45,7 @@ PY_TELEMETRY
 SHELL_TOOL_PATTERN="^(Bash|bash|shell|sh|zsh|terminal|Terminal|terminal_exec|terminalExec)$"
 
 deny() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}))
@@ -67,19 +67,26 @@ fi
 
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
 
-# Extract event, tool name, and command from stdin JSON
-PARSED=$("$TIRITH_PYTHON" -c "
+# Extract event, tool name, command state, and command from stdin JSON. The
+# state line is "ok" only for a non-empty string command; anything else (a
+# missing, null, non-string, or blank command, or a non-object tool_input) is
+# "invalid" and a matched shell tool is denied below without a check.
+PARSED=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
     event = d.get('hook_event_name', d.get('hookEventName', ''))
     tool = d.get('tool_name', d.get('toolName', ''))
     ti = d.get('tool_input', d.get('toolInput', {}))
-    cmd = ti.get('command', '') if isinstance(ti, dict) else ''
-    print(event)
-    print(tool)
-    print(cmd)
+    cmd = ti.get('command') if isinstance(ti, dict) else None
+    ok = isinstance(cmd, str) and cmd.strip() != ''
+    # One line each, so a newline in a name cannot shift the fields below.
+    print(str(event).replace('\r', ' ').replace('\n', ' '))
+    print(str(tool).replace('\r', ' ').replace('\n', ' '))
+    print('ok' if ok else 'invalid')
+    print(cmd if ok else '')
 except Exception:
+    print('')
     print('')
     print('')
     print('')
@@ -92,10 +99,11 @@ if [ "$PARSE_RC" -ne 0 ] || [ -z "$PARSED" ]; then
   deny "tirith: failed to parse hook input — blocked for safety"
 fi
 
-# Read the three lines from PARSED
+# Read the event, tool, and command-state lines; the command is the rest.
 EVENT=$(echo "$PARSED" | head -n 1)
 TOOL=$(echo "$PARSED" | sed -n '2p')
-COMMAND=$(echo "$PARSED" | tail -n +3)
+COMMAND_STATE=$(echo "$PARSED" | sed -n '3p')
+COMMAND=$(echo "$PARSED" | tail -n +4)
 
 # Only intercept PreToolUse + shell tools
 if [ "$EVENT" != "PreToolUse" ]; then
@@ -104,8 +112,12 @@ fi
 if ! echo "$TOOL" | grep -qE "$SHELL_TOOL_PATTERN"; then
   exit 0
 fi
-if [ -z "$COMMAND" ]; then
-  exit 0
+# A shell tool call without a string command cannot be checked; it is not a
+# no-op the hook may silently allow.
+if [ "$COMMAND_STATE" != "ok" ] || [ -z "$COMMAND" ]; then
+  _tirith_hook_event parse_error "no command in shell tool input"
+  if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
+  deny "tirith: no command found in hook input — blocked for safety"
 fi
 
 RESULT=$(TIRITH_INTEGRATION=vscode "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
@@ -113,7 +125,7 @@ RC=$?  # No || true: we need the actual exit code. Without set -e, script contin
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -132,22 +144,46 @@ except Exception:
 " <<< "$RESULT" 2>/dev/null || echo "Tirith: security check failed"
 }
 
-if [ "$RC" -eq 0 ]; then
-  _tirith_hook_event check_ok
-  exit 0
-elif [ "$RC" -eq 1 ]; then
-  # Block — always deny
-  _tirith_hook_event check_block
-  REASON=$(_findings_summary)
-  deny "$REASON"
-elif [ "$RC" -eq 2 ]; then
-  # Warn — check TIRITH_HOOK_WARN_ACTION (default: allow)
+if [ "$RC" -eq 2 ]; then
   WARN_ACTION="${TIRITH_HOOK_WARN_ACTION:-allow}"
   WARN_ACTION=$(echo "$WARN_ACTION" | tr '[:upper:]' '[:lower:]')
   if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
     echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
     WARN_ACTION="allow"
   fi
+fi
+
+# A successful/warning exit is not execution permission while a policy approval
+# is pending. Malformed metadata is a checker error, not an ordinary warning.
+if [ "$RC" -eq 0 ] || [ "$RC" -eq 2 ]; then
+  APPROVAL_STATE=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+v = json.loads(sys.stdin.read())
+if not isinstance(v, dict) or type(v.get('requires_approval')) is not bool:
+    sys.exit(1)
+print('required' if v['requires_approval'] else 'none')
+" <<< "$RESULT" 2>/dev/null)
+  if [ "$?" -ne 0 ]; then
+    _tirith_hook_event parse_error "invalid check approval metadata"
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then exit 0; fi
+    deny "Tirith: invalid approval metadata from security check — blocked for safety"
+  fi
+  if [ "$APPROVAL_STATE" = "required" ]; then
+    _tirith_hook_event approval_required
+    deny "Tirith: command requires policy approval. This hook cannot request approval; ask your operator to review the command in an approval-capable Tirith integration."
+  fi
+fi
+
+if [ "$RC" -eq 0 ]; then
+  _tirith_hook_event check_ok
+  exit 0
+elif [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
+  # Block — always deny. Exit 4 is a deferred block (pending review), never a
+  # checker error eligible for fail-open.
+  _tirith_hook_event check_block
+  REASON=$(_findings_summary)
+  deny "$REASON"
+elif [ "$RC" -eq 2 ]; then
   if [ "$WARN_ACTION" = "deny" ]; then
     # Treat warn as deny
     _tirith_hook_event warn_denied
@@ -157,7 +193,7 @@ elif [ "$RC" -eq 2 ]; then
     # Warn-allow: emit allow with additionalContext so findings reach the model
     _tirith_hook_event warn_allowed
     REASON=$(_findings_summary)
-    ALLOW_JSON=$("$TIRITH_PYTHON" -c "
+    ALLOW_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 msg = sys.argv[1]
 print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'permissionDecisionReason': msg, 'additionalContext': msg}}))
@@ -169,6 +205,10 @@ print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permiss
     fi
     exit 0
   fi
+elif [ "$RC" -eq 3 ]; then
+  # WarnAck is an execution gate, not a checker failure eligible for fail-open.
+  _tirith_hook_event warn_denied "warning acknowledgement required"
+  deny "Tirith: command requires warning acknowledgement. This hook cannot collect it; review the command in an acknowledgement-capable Tirith integration."
 else
   _tirith_hook_event unexpected_exit "exit code $RC"
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi

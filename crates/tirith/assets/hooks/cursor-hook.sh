@@ -53,7 +53,7 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo '{"permission":"deny","user_message":"configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1"}'; exit 0
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
+COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
 PARSE_RC=$?
 if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
   _tirith_hook_event parse_error
@@ -67,7 +67,7 @@ RC=$?  # No || true here: we need the actual exit code. Without set -e, script c
 
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
-  "$TIRITH_PYTHON" -c "
+  "$TIRITH_PYTHON" -I -S -c "
 import sys, json
 try:
     v = json.loads(sys.stdin.read())
@@ -86,14 +86,47 @@ except Exception:
 " <<< "$RESULT" 2>/dev/null || echo "Tirith: security check failed"
 }
 
+if [ "$RC" -eq 2 ]; then
+  WARN_ACTION="${TIRITH_HOOK_WARN_ACTION:-allow}"
+  WARN_ACTION=$(echo "$WARN_ACTION" | tr '[:upper:]' '[:lower:]')
+  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
+    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
+    WARN_ACTION="allow"
+  fi
+fi
+
+# A successful/warning exit is not execution permission while a policy approval
+# is pending. Malformed metadata is a checker error, not an ordinary warning.
+if [ "$RC" -eq 0 ] || [ "$RC" -eq 2 ]; then
+  APPROVAL_STATE=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+v = json.loads(sys.stdin.read())
+if not isinstance(v, dict) or type(v.get('requires_approval')) is not bool:
+    sys.exit(1)
+print('required' if v['requires_approval'] else 'none')
+" <<< "$RESULT" 2>/dev/null)
+  if [ "$?" -ne 0 ]; then
+    _tirith_hook_event parse_error "invalid check approval metadata"
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then
+      echo '{"permission":"allow"}'; exit 0
+    fi
+    echo '{"permission":"deny","user_message":"Tirith: invalid approval metadata from security check — blocked for safety"}'; exit 0
+  fi
+  if [ "$APPROVAL_STATE" = "required" ]; then
+    _tirith_hook_event approval_required
+    echo '{"permission":"deny","user_message":"Tirith: command requires policy approval. This hook cannot request approval; ask your operator to review the command in an approval-capable Tirith integration."}'; exit 0
+  fi
+fi
+
 if [ "$RC" -eq 0 ]; then
   _tirith_hook_event check_ok
   echo '{"permission":"allow"}'
-elif [ "$RC" -eq 1 ]; then
-  # Block — always deny
+elif [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
+  # Block — always deny. Exit 4 is a deferred block (pending review), never a
+  # checker error eligible for fail-open.
   _tirith_hook_event check_block
   REASON=$(_findings_summary)
-  DENY_JSON=$("$TIRITH_PYTHON" -c "
+  DENY_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message': 'Command blocked by Tirith: ' + reason}))
@@ -104,18 +137,11 @@ print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message':
     echo "$DENY_JSON"
   fi
 elif [ "$RC" -eq 2 ]; then
-  # Warn — check TIRITH_HOOK_WARN_ACTION (default: allow)
-  WARN_ACTION="${TIRITH_HOOK_WARN_ACTION:-allow}"
-  WARN_ACTION=$(echo "$WARN_ACTION" | tr '[:upper:]' '[:lower:]')
-  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
-    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
-    WARN_ACTION="allow"
-  fi
   if [ "$WARN_ACTION" = "deny" ]; then
     # Treat warn as deny
     _tirith_hook_event warn_denied
     REASON=$(_findings_summary)
-    DENY_JSON=$("$TIRITH_PYTHON" -c "
+    DENY_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 reason = sys.argv[1]
 print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message': 'Command blocked by Tirith: ' + reason}))
@@ -130,7 +156,7 @@ print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message':
     _tirith_hook_event warn_allowed
     REASON=$(_findings_summary)
     echo "$REASON" >&2
-    ALLOW_JSON=$("$TIRITH_PYTHON" -c "
+    ALLOW_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 msg = sys.argv[1]
 print(json.dumps({'permission': 'allow', 'user_message': msg}))
@@ -141,6 +167,10 @@ print(json.dumps({'permission': 'allow', 'user_message': msg}))
       echo "$ALLOW_JSON"
     fi
   fi
+elif [ "$RC" -eq 3 ]; then
+  # WarnAck is an execution gate, not a checker failure eligible for fail-open.
+  _tirith_hook_event warn_denied "warning acknowledgement required"
+  echo '{"permission":"deny","user_message":"Tirith: command requires warning acknowledgement. This hook cannot collect it; review the command in an acknowledgement-capable Tirith integration."}'
 else
   _tirith_hook_event unexpected_exit "exit code $RC"
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then

@@ -16,6 +16,10 @@
 
 import { execFileSync } from "node:child_process";
 
+// Upper bound on the checker's JSON response. Node's 1 MiB default is smaller
+// than a block verdict for a large command can be. A response past this limit
+// makes Node stop the checker and discard its exit status, so it is denied.
+const MAX_CHECK_RESPONSE_BYTES = 16 * 1024 * 1024;
 const VALID_SHELLS = new Set(["posix", "fish", "powershell", "cmd"]);
 const VALID_EXEC_HOSTS = new Set(["auto", "sandbox", "gateway", "node"]);
 const POSIX_GATEWAY_SHELLS = new Set([
@@ -324,6 +328,18 @@ function hookEvent(event, detail, deadline = Infinity) {
   } catch {}
 }
 
+function describeFindings(verdict, stdout, fallback, prefix = "tirith: ") {
+  if (!stdout || !stdout.trim()) return fallback;
+  if (verdict === undefined) return stdout.trim().slice(0, 500);
+  const findings = Array.isArray(verdict?.findings) ? verdict.findings : [];
+  if (findings.length === 0) return fallback;
+  return prefix + findings.map((f) => {
+    const title = f?.title || f?.rule_id || "unknown";
+    const severity = f?.severity || "";
+    return severity ? `[${severity}] ${title}` : title;
+  }).join("; ");
+}
+
 export default {
   id: "tirith-security",
   name: "tirith Security Scanner",
@@ -334,7 +350,13 @@ export default {
       const recordHookEvent = (event, detail) => hookEvent(event, detail, telemetryDeadline);
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
       const command = event.params?.command;
-      if (typeof command !== "string" || !command.trim()) return;
+      if (typeof command !== "string" || !command.trim()) {
+        // A shell tool call without a string command cannot be checked; it is
+        // not a no-op this guard may silently allow.
+        recordHookEvent("parse_error", "no command in shell tool params");
+        if (process.env.TIRITH_FAIL_OPEN === "1") return;
+        return { block: true, blockReason: "tirith: no command found in hook input — blocked for safety" };
+      }
 
       const tirithBin = process.env.TIRITH_BIN || "tirith";
       const shellResolution = resolveShellTokenizer(
@@ -351,16 +373,60 @@ export default {
         return { block: true, blockReason: shellResolution.reason };
       }
       const shell = shellResolution.shell;
+      let stdout;
+      let exitCode = 0;
       try {
-        execFileSync(
+        stdout = execFileSync(
           tirithBin,
           ["check", "--json", "--non-interactive", "--shell", shell, "--", command],
-          { timeout: 10_000, encoding: "utf-8", env: { ...process.env, TIRITH_INTEGRATION: "openclaw" } },
+          {
+            timeout: 10_000,
+            maxBuffer: MAX_CHECK_RESPONSE_BYTES,
+            encoding: "utf-8",
+            env: { ...process.env, TIRITH_INTEGRATION: "openclaw" },
+          },
         );
-        recordHookEvent("check_ok");
-        return; // Exit 0 = allow
       } catch (err) {
         const execError = /** @type {any} */ (err);
+        if (execError.code === "ENOBUFS") {
+          // Node stops the checker once the response passes maxBuffer (with
+          // SIGTERM, so this must precede the timeout test), and the exit
+          // status is usually lost. A response that large comes from a verdict
+          // with many findings, not a checker failure. Deny it whatever the
+          // status (a block, deferred block, or acknowledgement gate must
+          // never become an allow); TIRITH_FAIL_OPEN does not apply.
+          recordHookEvent("check_block", "oversized checker response");
+          return {
+            block: true,
+            blockReason: `tirith: check response exceeded the ${MAX_CHECK_RESPONSE_BYTES}-byte limit — blocked for safety`,
+          };
+        }
+        if (execError.status === 3) {
+          // Required acknowledgement is authoritative even without valid JSON,
+          // and is not a checker failure covered by TIRITH_FAIL_OPEN.
+          recordHookEvent("check_block");
+          return {
+            block: true,
+            blockReason: "tirith: warning acknowledgement required — blocked; this integration cannot collect acknowledgement. Use a Tirith-protected interactive shell to acknowledge the warning.",
+          };
+        }
+        if (execError.status === 4) {
+          // A deferred block (TIRITH_DEFER=1 / --defer, pending review) is a
+          // verdict, not a checker error covered by TIRITH_FAIL_OPEN.
+          recordHookEvent("check_block");
+          const deferredStdout = typeof execError.stdout === "string" ? execError.stdout : "";
+          let deferred;
+          try {
+            deferred = JSON.parse(deferredStdout);
+          } catch {
+            deferred = undefined;
+          }
+          return {
+            block: true,
+            blockReason: describeFindings(deferred, deferredStdout, "tirith security check failed")
+              + " — blocked, pending review (deferred). Resolve with `tirith pending`.",
+          };
+        }
         if (execError.code === "ENOENT") {
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: `tirith not found -- install or set TIRITH_FAIL_OPEN=1` };
@@ -371,59 +437,74 @@ export default {
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: "tirith: check timed out" };
         }
-        const exitCode = execError.status; // execFileSync uses .status
+        exitCode = execError.status; // execFileSync uses .status
         if (exitCode == null || (exitCode !== 1 && exitCode !== 2)) {
           recordHookEvent("unexpected_exit", `exit code ${exitCode}`);
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: `tirith: unexpected exit ${exitCode}` };
         }
-        if (exitCode === 2) {
-          let warnAction = (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase();
-          if (warnAction !== "allow" && warnAction !== "deny") {
-            process.stderr.write(`tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='${warnAction}', defaulting to 'allow'\n`);
-            warnAction = "allow";
-          }
-          if (warnAction !== "deny") {
-            // Parse findings from stdout for stderr warning
-            let warningText = "Tirith: security warnings detected (non-blocking)";
-            const stdout = execError.stdout || "";
-            if (stdout.trim()) {
-              try {
-                const verdict = JSON.parse(stdout);
-                const findings = verdict.findings || [];
-                if (findings.length > 0) {
-                  warningText = "Tirith warnings (non-blocking): " + findings.map((f) => {
-                    const title = f.title || f.rule_id || "unknown";
-                    const sev = f.severity || "";
-                    return sev ? `[${sev}] ${title}` : title;
-                  }).join("; ");
-                }
-              } catch { /* ignore parse errors */ }
-            }
-            recordHookEvent("warn_allowed");
-            process.stderr.write(warningText + "\n");
-            return;
-          }
-        }
-        recordHookEvent(exitCode === 1 ? "check_block" : "warn_denied");
-        // Parse findings from stdout
-        let reason = "tirith security check failed";
-        const stdout = execError.stdout || "";
-        if (stdout.trim()) {
-          try {
-            const verdict = JSON.parse(stdout);
-            const findings = verdict.findings || [];
-            if (findings.length > 0) {
-              reason = "tirith: " + findings.map((f) => {
-                const title = f.title || f.rule_id || "unknown";
-                const sev = f.severity || "";
-                return sev ? `[${sev}] ${title}` : title;
-              }).join("; ");
-            }
-          } catch { reason = stdout.trim().slice(0, 500); }
-        }
-        return { block: true, blockReason: reason };
+        stdout = execError.stdout || "";
       }
+
+      let verdict;
+      try {
+        verdict = JSON.parse(stdout);
+        // Execution-permitting responses must explicitly carry the policy gate.
+        if (exitCode !== 1 && (
+          verdict === null || typeof verdict !== "object"
+          || !Object.prototype.hasOwnProperty.call(verdict, "requires_approval")
+          || typeof verdict.requires_approval !== "boolean"
+        )) {
+          throw new Error("requires_approval must be a boolean");
+        }
+      } catch {
+        if (exitCode !== 1) {
+          recordHookEvent("unexpected_exit", "invalid checker JSON or requires_approval");
+          if (process.env.TIRITH_FAIL_OPEN === "1" && (
+            exitCode !== 2 || (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase() !== "deny"
+          )) return;
+          return {
+            block: true,
+            blockReason: "tirith: invalid check response — expected JSON with a boolean requires_approval; update Tirith and reinstall the integration",
+          };
+        }
+      }
+
+      if (exitCode === 1) {
+        recordHookEvent("check_block");
+        return { block: true, blockReason: describeFindings(verdict, stdout, "tirith security check failed") };
+      }
+      if (verdict.requires_approval) {
+        // before_tool_call has no approval result; this is not a checker error
+        // that the operator's TIRITH_FAIL_OPEN setting can bypass.
+        recordHookEvent("check_block");
+        return {
+          block: true,
+          blockReason: "tirith: human approval required by policy — blocked; this integration cannot collect approval. Use a Tirith-protected interactive shell to request approval.",
+        };
+      }
+      if (exitCode === 0) {
+        recordHookEvent("check_ok");
+        return;
+      }
+
+      let warnAction = (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase();
+      if (warnAction !== "allow" && warnAction !== "deny") {
+        process.stderr.write(`tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='${warnAction}', defaulting to 'allow'\n`);
+        warnAction = "allow";
+      }
+      if (warnAction !== "deny") {
+        recordHookEvent("warn_allowed");
+        process.stderr.write(
+          describeFindings(
+            verdict, stdout, "Tirith: security warnings detected (non-blocking)",
+            "Tirith warnings (non-blocking): ",
+          ) + "\n",
+        );
+        return;
+      }
+      recordHookEvent("warn_denied");
+      return { block: true, blockReason: describeFindings(verdict, stdout, "tirith security check failed") };
     });
   },
 };

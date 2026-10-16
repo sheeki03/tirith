@@ -1194,6 +1194,16 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
             bounded |= reading_bounded;
         }
     }
+    // dash drops NUL bytes while it reads a script (bash refuses the file and
+    // zsh ends the word there), so `cu\0rl … | sh` runs curl under a dash
+    // `/bin/sh`. Where the text holds a NUL, it is also read that way.
+    if !found && text.contains('\0') {
+        let reading = text.replace('\0', "");
+        let (reading_found, reading_bounded) =
+            descend_all(&reading, &inert_heredoc::analyze(&reading));
+        found = reading_found;
+        bounded |= reading_bounded;
+    }
     if bounded {
         inspection.issue(NpmIssueKind::CodeLimit, Some(member),
             "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");

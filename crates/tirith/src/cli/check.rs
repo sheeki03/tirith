@@ -407,6 +407,41 @@ pub fn run(
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
+        // Machine callers require the ordinary channel output for an honored
+        // bypass. The approval-check channel (the zshenv guard, legacy shell
+        // hooks) expects a no-approval metadata file path on stdout, exactly
+        // as for any other non-approval verdict; without it the caller sees
+        // missing metadata and blocks the command it was told to allow.
+        if approval_check {
+            match tirith_core::approval::write_no_approval_file() {
+                Ok(path) => println!("{}", path.display()),
+                Err(e) => {
+                    eprintln!("tirith: failed to write approval file: {e}");
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        // JSON callers (agent adapters, the Hermes plugin) require the
+        // ordinary envelope; an honored bypass is `action: allow` with
+        // `bypass_honored: true` and no approval requirement.
+        if json {
+            let empty: [tirith_core::safe_command::SafeSuggestion; 0] = [];
+            let recovery = (json_schema == 4)
+                .then(|| tirith_core::recovery::for_command(&raw_verdict, cmd, shell_type));
+            if output::write_json_with_recovery(
+                &raw_verdict,
+                &policy.dlp_custom_patterns,
+                suggest_safe_command.then_some(empty.as_slice()),
+                recovery.as_ref(),
+                false,
+                std::io::stdout().lock(),
+            )
+            .is_err()
+            {
+                eprintln!("tirith: failed to write JSON output");
+            }
+        }
         return 0;
     }
 
@@ -771,6 +806,7 @@ pub fn run(
             &policy.dlp_custom_patterns,
             suggestions_opt,
             recovery.as_ref(),
+            effective.action == Action::Warn && (strict_warn || policy.strict_warn),
             std::io::stdout().lock(),
         )
         .is_err()

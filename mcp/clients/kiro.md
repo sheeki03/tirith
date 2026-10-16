@@ -15,7 +15,8 @@ LLM as the block reason).
 **Output contract:**
 - Allow: silent exit 0
 - Deny: stderr reason, exit 2 (Kiro: "Block tool execution, return STDERR to LLM")
-- Warn-allow (`TIRITH_HOOK_WARN_ACTION=allow`, default): silent exit 0
+- Warn-allow (`TIRITH_HOOK_WARN_ACTION=allow`, default): findings on stderr,
+  exit 0, except when the check JSON has `requires_approval: true` (always deny)
 
 ## Quick Setup (Recommended)
 
@@ -172,12 +173,40 @@ The hook intercepts the Kiro CLI `preToolUse` event for `execute_bash` (or
 the `shell` alias) tool calls. It extracts the command from `tool_input`,
 passes it to `tirith check --json`, and:
 
-- Exit 0 from tirith: silent allow (exit 0)
-- Exit 1: deny — stderr reason, exit 2 (Kiro blocks)
-- Exit 2: warn-allow by default; set `TIRITH_HOOK_WARN_ACTION=deny` to
-  block
+- Exit 0 from tirith: silent allow (exit 0), unless the JSON has
+  `requires_approval: true`, then deny.
+- Exit 1: deny — stderr reason, exit 2 (Kiro blocks). `TIRITH_FAIL_OPEN`
+  does not apply.
+- Exit 2: warn-allow by default (findings on stderr, exit 0); set
+  `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
+  or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
+  `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
+  acknowledgement; retry the command from a Tirith-protected interactive shell.
+- Exit 3 (mandatory warning acknowledgement): always deny.
+- Exit 4 (deferred block from `TIRITH_DEFER=1` / `tirith check --defer`,
+  recorded for `tirith pending`): always deny, regardless of
+  `TIRITH_FAIL_OPEN`.
+- Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
+  2: checker error — deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
+  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
 - Any other exit / timeout / missing binary: **deny** (fail-closed by
   default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
+
+Every deny is a stderr reason with hook exit 2, which Kiro relays to the LLM.
+`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block,
+a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
+bypass that user or org policy honors (`allow_bypass_env_noninteractive: true`,
+since the hook runs non-interactively) exits 0 with `"action": "allow"`,
+`"bypass_honored": true` and `"requires_approval": false`, so the hook allows
+it.
+
+## Upgrading
+
+After upgrading the tirith binary, re-run `tirith setup kiro --force`
+with the same `--scope` you used originally, so the installed hook picks up
+the new checks. `tirith doctor` flags an installed hook that differs from the
+current embedded adapter.
 
 ## Notes
 
