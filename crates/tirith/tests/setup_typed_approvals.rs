@@ -750,3 +750,91 @@ fn openclaw_callback_denies_a_shell_call_without_a_string_command() {
     assert_eq!(outcome["checks"], 1, "{outcome}");
     assert!(outcome["result"].is_null(), "{outcome}");
 }
+
+/// A real block response padded with copies of its own finding to at least
+/// `bytes`, served with the real exit status by a transport that runs nothing.
+#[cfg(unix)]
+fn oversized_block_checker(
+    directory: &std::path::Path,
+    response: &CheckedCommand,
+    bytes: usize,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut verdict: Value = serde_json::from_str(&response.stdout).unwrap();
+    let finding = verdict["findings"][0].clone();
+    let copies = bytes / finding.to_string().len() + 1;
+    verdict["findings"] = Value::Array(vec![finding; copies]);
+    let body = directory.join(format!("response-{bytes}.json"));
+    std::fs::write(&body, verdict.to_string()).unwrap();
+    let checker = directory.join(format!("checker-{bytes}"));
+    std::fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = check ] || exit 0\ncat '{}'\nexit {}\n",
+            body.display(),
+            response.status
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&checker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    checker
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_callbacks_deny_an_oversized_block_response_even_when_failing_open() {
+    let state = isolated_state();
+    if !node_available(&state) {
+        return;
+    }
+    write_user_policy(BASE_POLICY);
+    let (critical_response, critical) = check(&state, CRITICAL_COMMAND);
+    assert_eq!(critical_response.status, 1, "{critical}");
+    let fixture = tempfile::tempdir().unwrap();
+    // ~1.3 MB exceeds Node's 1 MiB default buffer but fits the adapters'
+    // limit, so the verdict is read. Past 16 MiB Node stops the checker and
+    // its exit status is lost; the response is still a block.
+    for (bytes, expected) in [
+        (1_300_000, "[CRITICAL]"),
+        (17 * 1024 * 1024, "exceeded the 16777216-byte limit"),
+    ] {
+        let checker = oversized_block_checker(fixture.path(), &critical_response, bytes);
+        let mut direct = Command::new(&checker);
+        state.apply_to_command(&mut direct);
+        let output = direct
+            .args(["check", "--json", "--non-interactive", "--shell", "posix"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.len() >= bytes, "{}", output.stdout.len());
+        for (host, tool) in [
+            ("pi-cli", "bash"),
+            ("openclaw", "exec"),
+            ("openclaw", "bash"),
+        ] {
+            let event = if host == "openclaw" {
+                serde_json::json!({"toolName": tool, "params": {"command": CRITICAL_COMMAND}})
+            } else {
+                serde_json::json!({"toolName": tool, "input": {"command": CRITICAL_COMMAND}})
+            };
+            let outcome = live_event(&state, host, &checker, &event, true);
+            assert_eq!(outcome["checks"], 1, "{host}/{tool}/{bytes}");
+            let result = outcome["result"].clone();
+            let reason = result[if host == "openclaw" {
+                "blockReason"
+            } else {
+                "reason"
+            }]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+            assert_blocked(host, result);
+            assert!(
+                reason.contains(expected),
+                "{host}/{tool}/{bytes}: {}",
+                reason.chars().take(300).collect::<String>()
+            );
+        }
+    }
+}
