@@ -8826,6 +8826,63 @@ mod tests {
     }
 
     #[test]
+    fn upstream_observations_bind_a_source_github_could_not_compare() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut provenance = serde_json::json!({});
+        let mut sources = serde_json::json!({});
+        for (index, source) in tirith_core::threatdb::operations::SOURCE_IDS
+            .iter()
+            .enumerate()
+        {
+            let pinned = format!("{index}").repeat(40);
+            provenance[source] =
+                serde_json::json!({"commit": pinned, "commit_timestamp": "2026-01-01T00:00:00Z"});
+            sources[source] = serde_json::json!({
+                "pinned_commit": pinned,
+                "candidate_commit": pinned,
+                "candidate_timestamp": "2026-01-01T00:00:00Z",
+                "ahead_by": 0,
+                "max_lag_hours": 168,
+                "review_required": false,
+            });
+        }
+        // What `threatdb_source_pins.py observe` writes after a compare 422.
+        sources["datadog_malicious_software_packages"] = serde_json::json!({
+            "pinned_commit": "1".repeat(40),
+            "candidate_commit": "f".repeat(40),
+            "candidate_timestamp": "2026-01-09T00:00:00Z",
+            "ahead_by": null,
+            "comparison_unavailable": "github_http_422",
+            "max_lag_hours": 168,
+            "review_required": true,
+        });
+        let observations_path = directory.path().join("observations.json");
+        let provenance_path = directory.path().join("provenance.json");
+        std::fs::write(
+            &observations_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "checked_at": "2026-01-10T00:00:00Z",
+                "sources": sources,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&provenance_path, serde_json::to_vec(&provenance).unwrap()).unwrap();
+
+        let observations =
+            load_upstream_observations(&observations_path, &provenance_path).unwrap();
+        let value = serde_json::to_value(&observations).unwrap();
+        let datadog = &value["sources"]["datadog_malicious_software_packages"];
+        assert!(datadog["ahead_by"].is_null());
+        assert_eq!(datadog["comparison_unavailable"], "github_http_422");
+        assert_eq!(datadog["candidate_timestamp"], "2026-01-09T00:00:00Z");
+        assert!(value["sources"]["ossf_malicious_packages"]
+            .get("comparison_unavailable")
+            .is_none());
+    }
+
+    #[test]
     fn generation_manifest_signature_covers_manifest_version() {
         let dir = tempfile::tempdir().unwrap();
         let key = SigningKey::from_bytes(&[37u8; 32]);
