@@ -82,9 +82,10 @@ binary tag. Its implementation branch and green checks do not make the
 default-branch install or catalog entry available.
 
 1. Publish a qualified Tirith `0.5.0` artifact first. Pipe a command into
-   `tirith check --format json --non-interactive` (no command argument, the
-   form the plugin uses) and check the response, including the always-present
-   boolean `requires_approval`; a version string alone is insufficient.
+   `tirith check --json --non-interactive --shell posix` (no command argument;
+   the plugin's exact argv) and check the response, including the
+   always-present boolean `requires_approval`; a version string alone is
+   insufficient.
    Confirm that released `0.4.2` is refused rather than scanned with an
    incompatible contract.
 2. Run the plugin's Linux, macOS and Windows unit matrix and its real-binary
