@@ -266,9 +266,10 @@ contains, and attests.
   presence of a config file.
 - **Host-hook failure behavior:** Grok Build, Cline, and OpenHands allow the
   tool when their hook process crashes or times out. Tirith's adapter denies on
-  its own errors by default, but it cannot make a host honor a process that did
-  not return. Re-run setup if a pinned interpreter moves and test the real host
-  after every upgrade.
+  its own errors by default, and the generated hooks deny when their pinned
+  Python interpreter has moved (unless `TIRITH_FAIL_OPEN=1`), but Tirith cannot
+  make a host honor a process that did not return. Re-run setup if a pinned
+  interpreter moves and test the real host after every upgrade.
 - **Prime Agent IPython is source-level extraction:** the guard covers shell
   escapes/magics and common `os`, `subprocess`, and `pty.spawn` forms, but it is
   not a Python runtime sandbox. A wrapper defined in an earlier cell,

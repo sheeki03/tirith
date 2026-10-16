@@ -147,7 +147,7 @@ command via the agent.
 | OpenHands | | Binary missing, TIRITH_FAIL_OPEN=1 | Allowed (fail-open) | |
 | Grok Build | | Binary missing, TIRITH_FAIL_OPEN=1 | Allowed (fail-open) | |
 | Cline | | Binary missing, TIRITH_FAIL_OPEN unset | Cline runs the tool anyway: its runner treats a failed hook as no decision. Record this as the host's fail-open, not as a Tirith pass | |
-| OpenHands | | Binary missing, TIRITH_FAIL_OPEN unset | Hook exits 2 and the tool is blocked; but if the pinned Python disappears and the wrapper cannot start, OpenHands logs an error and runs the tool | |
+| OpenHands | | Binary missing, TIRITH_FAIL_OPEN unset | Hook exits 2 and the tool is blocked; with the pinned Python moved away, the wrapper also exits 2 with a deny | |
 
 ### Malformed JSON input
 

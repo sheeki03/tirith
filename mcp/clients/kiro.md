@@ -17,6 +17,8 @@ LLM as the block reason).
 - Deny: stderr reason, exit 2 (Kiro: "Block tool execution, return STDERR to LLM")
 - Warn-allow (`TIRITH_HOOK_WARN_ACTION=allow`, default): findings on stderr,
   exit 0, except when the check JSON has `requires_approval: true` (always deny)
+- Pinned Python interpreter missing: stderr reason, exit 2, unless
+  `TIRITH_FAIL_OPEN=1`
 
 ## Quick Setup (Recommended)
 

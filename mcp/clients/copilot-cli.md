@@ -14,8 +14,12 @@ deny decision if a finding fires.
 **Output contract:**
 - Allow: silent exit 0
 - Deny: stdout JSON `{"permissionDecision":"deny","permissionDecisionReason":"..."}`, exit 0
-- Warn-allow (`TIRITH_HOOK_WARN_ACTION=allow`, default): silent exit 0,
-  except when the check JSON has `requires_approval: true` (always deny)
+- Warning (`TIRITH_HOOK_WARN_ACTION=allow`, default): silent exit 0, so
+  Copilot applies its default behavior exactly as for a clean command, except
+  when the check JSON has `requires_approval: true` (always deny)
+- Warning with `TIRITH_HOOK_WARN_ACTION=ask`: stdout JSON
+  `{"permissionDecision":"ask","permissionDecisionReason":"..."}`
+- Pinned Python interpreter missing: deny JSON unless `TIRITH_FAIL_OPEN=1`
 
 ## IMPORTANT: launch from repo root
 

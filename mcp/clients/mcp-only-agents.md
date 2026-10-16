@@ -19,7 +19,11 @@ host has loaded the artifact and honors its documented refusal contract.
 Three of these hosts fail **open** on their own side: Grok Build, Cline, and
 OpenHands all let the tool run when a hook errors or times out. Tirith's adapter
 is fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
-cannot compensate for a host that ignores a crashed hook. Prime Agent and OMP
+cannot compensate for a host that ignores a crashed hook. The Cline and
+OpenHands wrappers, and the Gemini CLI, Kiro and Copilot CLI hook commands,
+check that the pinned Python interpreter still exists and answer with the
+host's deny when it does not (unless `TIRITH_FAIL_OPEN=1`), so a moved
+interpreter does not silently switch the guard off. Prime Agent and OMP
 block when a handler throws, so a guard crash fails closed there.
 
 Every setup command stores the validated absolute path of the running `tirith`

@@ -16,6 +16,8 @@ intercepts `run_shell_command` tool calls, passes the command to
 - Allow: silent exit 0 (no stdout output)
 - Warn-allow: findings printed to stderr, silent exit 0, except when the
   check JSON has `requires_approval: true` (always deny)
+- Pinned Python interpreter missing: stderr reason, exit 2 (blocks), unless
+  `TIRITH_FAIL_OPEN=1`
 
 ## Quick Setup (Recommended)
 
