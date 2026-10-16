@@ -14,15 +14,22 @@ Exit codes:
   Non-zero — never. Copilot ignores hook exit codes; the deny decision is
               communicated via stdout JSON.
 
-Output (stdout, only for deny):
-  {"permissionDecision": "deny", "permissionDecisionReason": "..."}
+Output (stdout):
+  For deny:
+    {"permissionDecision": "deny", "permissionDecisionReason": "..."}
+  For a warning with TIRITH_HOOK_WARN_ACTION=ask:
+    {"permissionDecision": "ask", "permissionDecisionReason": "..."}
 
-For allow / warn-allow, no stdout output is emitted (Copilot's docs do not
-document a stderr-findings path for preToolUse, so we don't rely on it).
+For allow and a default warning, no stdout output is emitted: Copilot treats
+empty output as no decision and applies its default behavior, so a warning is
+never an approval. (Copilot's docs do not document a stderr-findings path for
+preToolUse, so we don't rely on it.)
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
-  TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
+  TIRITH_HOOK_WARN_ACTION — "allow" (default: no decision), "ask" (Copilot asks
+                            the user to confirm), or "deny". Any other value
+                            denies.
   TIRITH_FAIL_OPEN        — set to "1" to allow on missing binary / errors
 """
 
@@ -129,24 +136,33 @@ def _build_reason(stdout):
 
 
 def warn_action():
-    """Return the validated TIRITH_HOOK_WARN_ACTION: "allow" (default) or "deny"."""
-    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-    if value in ("allow", "deny"):
-        return value
-    print(
-        f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{value}', defaulting to 'allow'",
-        file=sys.stderr,
+    """Return TIRITH_HOOK_WARN_ACTION: "allow" (default), "ask", "deny" or "invalid".
+
+    An unrecognized value is "invalid", which is denied: a security setting
+    that cannot be parsed fails closed rather than passing warnings.
+    """
+    value = (os.environ.get("TIRITH_HOOK_WARN_ACTION") or "allow").lower()
+    return value if value in ("allow", "ask", "deny") else "invalid"
+
+
+def invalid_warn_action_reason(warning_text):
+    """Explain a denial caused by an unrecognized TIRITH_HOOK_WARN_ACTION."""
+    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "")
+    return (
+        f"tirith: unrecognized TIRITH_HOOK_WARN_ACTION={value!r} "
+        "(valid values: allow, ask, deny) — warning blocked for safety. "
+        + warning_text
     )
-    return "allow"
 
 
 def checker_error(returncode, reason):
     """Fail closed (or open) on a damaged response, never past an intact verdict.
 
-    A warning the operator configured to deny stays denied when its response is
-    damaged, so TIRITH_FAIL_OPEN cannot turn a denied warning into an allow.
+    A warning the operator configured to gate (ask, deny, or an unrecognized
+    value) stays denied when its response is damaged, so TIRITH_FAIL_OPEN
+    cannot turn a gated warning into an allow.
     """
-    if returncode == 2 and warn_action() == "deny":
+    if returncode == 2 and warn_action() != "allow":
         deny(reason)
     fail_closed(reason)
 
@@ -320,10 +336,22 @@ def main():
         sys.exit(0)
 
     if result.returncode == 2:
-        if warn_action() != "deny":
+        action = warn_action()
+        if action == "allow":
+            # No decision: Copilot applies its default behavior, exactly as for
+            # a clean command.
             _hook_event("warn_allowed")
             sys.exit(0)
+        if action == "ask":
+            _hook_event("warn_ask")
+            print(json.dumps({
+                "permissionDecision": "ask",
+                "permissionDecisionReason": _build_reason(result.stdout),
+            }))
+            sys.exit(0)
         _hook_event("warn_denied")
+        if action == "invalid":
+            deny(invalid_warn_action_reason(_build_reason(result.stdout)))
 
     deny(_build_reason(result.stdout))
 

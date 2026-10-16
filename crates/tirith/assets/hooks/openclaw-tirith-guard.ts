@@ -11,7 +11,8 @@
 //   TIRITH_BIN              -- path to tirith binary (default: "tirith")
 //   TIRITH_SHELL            -- explicit exec-tool shell assertion: posix, fish, powershell, cmd
 //   TIRITH_BASH_SHELL       -- explicit legacy Bash-tool shell assertion (same values)
-//   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"
+//   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"; "ask" denies with
+//                              guidance (see warnDenial), any other value denies
 //   TIRITH_FAIL_OPEN        -- "1" to allow on error (default: deny)
 
 import { execFileSync } from "node:child_process";
@@ -328,6 +329,34 @@ function hookEvent(event, detail, deadline = Infinity) {
   } catch {}
 }
 
+/**
+ * `TIRITH_HOOK_WARN_ACTION`: "allow" (default), "ask", "deny", or "invalid"
+ * for any other value. An unparseable security setting fails closed, so
+ * callers deny "invalid" as they deny "deny".
+ */
+function warnAction() {
+  const value = (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase();
+  return value === "allow" || value === "ask" || value === "deny" ? value : "invalid";
+}
+
+/**
+ * Explain a warning denied by a non-allow warn action. "ask" is denied with
+ * guidance: OpenClaw's newer `requireApproval` result is not used, because a
+ * host that predates it would ignore it and run the command, and its outcome
+ * with no one to answer is undocumented.
+ */
+function warnDenial(action, findings) {
+  if (action === "invalid") {
+    return `tirith: unrecognized TIRITH_HOOK_WARN_ACTION=${JSON.stringify(process.env.TIRITH_HOOK_WARN_ACTION ?? "")} `
+      + `(valid values: allow, ask, deny) — warning blocked for safety. ${findings}`;
+  }
+  if (action === "ask") {
+    return `${findings} — blocked; TIRITH_HOOK_WARN_ACTION=ask needs a confirmation prompt this host `
+      + "integration does not have. Review the command and retry from a Tirith-protected interactive shell to confirm it.";
+  }
+  return findings;
+}
+
 function describeFindings(verdict, stdout, fallback, prefix = "tirith: ") {
   if (!stdout || !stdout.trim()) return fallback;
   if (verdict === undefined) return stdout.trim().slice(0, 500);
@@ -460,9 +489,7 @@ export default {
       } catch {
         if (exitCode !== 1) {
           recordHookEvent("unexpected_exit", "invalid checker JSON or requires_approval");
-          if (process.env.TIRITH_FAIL_OPEN === "1" && (
-            exitCode !== 2 || (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase() !== "deny"
-          )) return;
+          if (process.env.TIRITH_FAIL_OPEN === "1" && (exitCode !== 2 || warnAction() === "allow")) return;
           return {
             block: true,
             blockReason: "tirith: invalid check response — expected JSON with a boolean requires_approval; update Tirith and reinstall the integration",
@@ -488,12 +515,8 @@ export default {
         return;
       }
 
-      let warnAction = (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase();
-      if (warnAction !== "allow" && warnAction !== "deny") {
-        process.stderr.write(`tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='${warnAction}', defaulting to 'allow'\n`);
-        warnAction = "allow";
-      }
-      if (warnAction !== "deny") {
+      const action = warnAction();
+      if (action === "allow") {
         recordHookEvent("warn_allowed");
         process.stderr.write(
           describeFindings(
@@ -504,7 +527,10 @@ export default {
         return;
       }
       recordHookEvent("warn_denied");
-      return { block: true, blockReason: describeFindings(verdict, stdout, "tirith security check failed") };
+      return {
+        block: true,
+        blockReason: warnDenial(action, describeFindings(verdict, stdout, "tirith security check failed")),
+      };
     });
   },
 };

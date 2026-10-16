@@ -19,7 +19,10 @@
 // stderr to the user.
 //
 // Environment:
-//   TIRITH_HOOK_WARN_ACTION       — "allow" (default) or "deny" for engine warnings
+//   TIRITH_HOOK_WARN_ACTION       — "allow" (default) or "deny" for engine warnings;
+//                                   these hosts have no confirmation result, so
+//                                   "ask" denies with guidance, and any other
+//                                   value denies
 //   TIRITH_HOOK_UNRESOLVED_ACTION — "deny" (default) or "warn" for an execution
 //                                   path whose real command this cannot read
 //   TIRITH_FAIL_OPEN              — "1" to allow on error (default: deny)
@@ -1181,14 +1184,30 @@ function failOpen() {
   return process.env.TIRITH_FAIL_OPEN === "1";
 }
 
-/** Validated `TIRITH_HOOK_WARN_ACTION`: "allow" or "deny". */
+/**
+ * `TIRITH_HOOK_WARN_ACTION`: "allow" (default), "ask", "deny", or "invalid"
+ * for any other value. An unparseable security setting fails closed, so
+ * callers deny "invalid" as they deny "deny".
+ */
 function warnAction() {
   const value = (process.env.TIRITH_HOOK_WARN_ACTION || "allow").toLowerCase();
-  if (value === "allow" || value === "deny") return value;
-  process.stderr.write(
-    `tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='${value}', defaulting to 'allow'\n`,
-  );
-  return "allow";
+  return value === "allow" || value === "ask" || value === "deny" ? value : "invalid";
+}
+
+/**
+ * Explain a warning denied by a non-allow warn action. This host has no
+ * confirmation result a hook can return, so "ask" is denied with guidance.
+ */
+function warnDenial(action, findings) {
+  if (action === "invalid") {
+    return `tirith: unrecognized TIRITH_HOOK_WARN_ACTION=${JSON.stringify(process.env.TIRITH_HOOK_WARN_ACTION ?? "")} `
+      + `(valid values: allow, ask, deny) — warning blocked for safety. ${findings}`;
+  }
+  if (action === "ask") {
+    return `${findings} — blocked; TIRITH_HOOK_WARN_ACTION=ask needs a confirmation prompt this host `
+      + "integration does not have. Review the command and retry from a Tirith-protected interactive shell to confirm it.";
+  }
+  return findings;
 }
 
 /**
@@ -1196,10 +1215,10 @@ function warnAction() {
  *
  * A vector this could not read is not a warning the engine issued; it is a
  * command the engine never saw. Refusing it is the only fail-closed answer,
- * so that is the default, and `TIRITH_HOOK_WARN_ACTION=deny` implies it too.
+ * so that is the default, and any warn action other than "allow" implies it.
  */
 function unresolvedAction() {
-  if (warnAction() === "deny") return "deny";
+  if (warnAction() !== "allow") return "deny";
   const value = (process.env.TIRITH_HOOK_UNRESOLVED_ACTION || "deny").toLowerCase();
   if (value === "deny" || value === "warn") return value;
   process.stderr.write(
@@ -1340,7 +1359,7 @@ export default function (pi) {
       } catch {
         if (exitCode !== 1) {
           recordHookEvent("unexpected_exit", "invalid checker JSON or requires_approval");
-          if (failOpen() && (exitCode !== 2 || warnAction() !== "deny")) return undefined;
+          if (failOpen() && (exitCode !== 2 || warnAction() === "allow")) return undefined;
           return {
             block: true,
             reason: "tirith: invalid check response — expected JSON with a boolean requires_approval; update Tirith and reinstall the integration",
@@ -1365,7 +1384,8 @@ export default function (pi) {
         recordHookEvent("check_ok");
         return undefined;
       }
-      if (warnAction() !== "deny") {
+      const action = warnAction();
+      if (action === "allow") {
         recordHookEvent("warn_allowed");
         process.stderr.write(
           describeFindings(verdict, stdout, "Tirith: security warnings detected (non-blocking)") + "\n",
@@ -1374,7 +1394,10 @@ export default function (pi) {
       }
 
       recordHookEvent("warn_denied");
-      return { block: true, reason: describeFindings(verdict, stdout, "Tirith security check failed") };
+      return {
+        block: true,
+        reason: warnDenial(action, describeFindings(verdict, stdout, "Tirith security check failed")),
+      };
     } finally {
       if (deferredUnresolved !== null) recordHookEvent("unresolved_vector", deferredUnresolved);
     }

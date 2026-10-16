@@ -5997,10 +5997,9 @@ mod tests {
     #[test]
     fn grok_build_hook_still_surfaces_a_warn_allow_finding() {
         // Grok's decision envelope carries a reason only for deny, so a
-        // warn-allow verdict had nowhere to put its finding and vanished: the
-        // user saw a bare `allow` and never learned the command was flagged.
-        // Grok surfaces hook stderr, so the finding goes there while stdout
-        // keeps the clean envelope Grok parses.
+        // warning has nowhere in stdout to put its finding. Grok surfaces hook
+        // stderr, so the finding goes there while stdout stays as empty as it
+        // is for a clean command.
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
@@ -6037,11 +6036,12 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
 
-        let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(decision["decision"], "allow");
+        // No decision, exactly like a clean command: a Grok "allow" could
+        // skip its own permission prompt, so a warning never sends one.
         assert!(
-            decision.get("reason").is_none(),
-            "Grok's allow envelope takes no reason field, got {decision}"
+            output.stdout.is_empty(),
+            "a warning carries no Grok decision, got {}",
+            String::from_utf8_lossy(&output.stdout)
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -6461,7 +6461,7 @@ mod tests {
                 run_openhands_hook_with_mode(&opt_out, python_input, true);
             assert_eq!(warn_code, Some(0));
             let warn_decision: Value = serde_json::from_str(warn_stdout.trim()).unwrap();
-            assert_eq!(warn_decision["decision"], "allow");
+            assert!(warn_decision.get("decision").is_none(), "{warn_decision}");
             assert!(warn_decision["additionalContext"]
                 .as_str()
                 .unwrap()
@@ -6670,7 +6670,10 @@ mod tests {
             "a warn-allow must not exit 2, which OpenHands reads as a block"
         );
         let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
-        assert_eq!(decision["decision"], "allow");
+        assert!(
+            decision.get("decision").is_none(),
+            "a warning is never an explicit allow: {decision}"
+        );
         assert!(decision["additionalContext"]
             .as_str()
             .unwrap()

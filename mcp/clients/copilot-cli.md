@@ -97,7 +97,7 @@ Expected: runs normally with no interference.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (silent exit 0), `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with no decision (silent exit 0), `ask` asks you to confirm, `deny` blocks them; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Decision logic
@@ -109,8 +109,10 @@ passes it to `tirith check --json`, and:
 - Exit 0 from tirith: silent allow, unless the JSON has
   `requires_approval: true`, then deny.
 - Exit 1: deny (stdout JSON, exit 0). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn-allow by default (`TIRITH_HOOK_WARN_ACTION=allow`); set to
-  `deny` to block warnings.
+- Exit 2: warn. By default (`TIRITH_HOOK_WARN_ACTION=allow`) no decision, so
+  Copilot applies its default behavior; `ask` answers
+  `permissionDecision: "ask"`; `deny` blocks; any other value blocks and names
+  the valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -121,7 +123,7 @@ passes it to `tirith check --json`, and:
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit / timeout / missing binary: **deny** (fail-closed by
   default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 

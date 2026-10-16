@@ -113,7 +113,7 @@ Expected: blocked by Tirith.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | path pinned by setup | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with findings in `user_message`, `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` answers a warning with the same `allow` a clean command gets, findings in `user_message` and `agent_message`; `ask` asks you to confirm; `deny` blocks it; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Hook decision logic
@@ -125,9 +125,13 @@ stdout (exit 0):
 - Exit 0 from tirith: allow, unless the JSON has `requires_approval: true`,
   then deny.
 - Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`),
-  findings in `user_message` and on stderr. Set `TIRITH_HOOK_WARN_ACTION=deny`
-  to block.
+- Exit 2: warn. Cursor requires a `permission` value in every response, and
+  a clean command is answered `allow`, so by default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) a warning gets that same answer and is
+  never less gated than a clean command; the findings go to `user_message`,
+  `agent_message` and stderr. `TIRITH_HOOK_WARN_ACTION=ask` answers
+  `permission: "ask"`; `deny` blocks; any other value blocks and names the
+  valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -138,7 +142,7 @@ stdout (exit 0):
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit code, or a missing binary or Python interpreter: **deny**
   (fail-closed by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 

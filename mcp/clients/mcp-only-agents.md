@@ -33,12 +33,18 @@ Every installed hook or plugin passes the command to `tirith check --json` and
 applies the same rules; only the host's deny shape differs (a JSON decision, a
 `{block: true}` return, or exit 2):
 
-- Exit 0 from tirith: allow, unless the JSON has `requires_approval: true`,
-  then deny.
+- Exit 0 from tirith: allow (the host's own rules apply), unless the JSON
+  has `requires_approval: true`, then deny.
 - Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`), with
-  the findings passed to the host where it has a channel for them. Set
-  `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- Exit 2: warn. A warning is never an approval: by default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) the hook answers exactly as for a clean
+  command, with no permission decision (Grok Build: no stdout, findings on
+  stderr; Cline: `cancel: false` with the findings in `contextModification`;
+  OpenHands: the findings in `additionalContext`, no `decision`). Set
+  `TIRITH_HOOK_WARN_ACTION=deny` to block. `ask` asks the user where the host
+  has a confirmation prompt (Claude Code, VS Code, Cursor, Copilot CLI) and is
+  denied with interactive-shell guidance elsewhere. Any other value blocks and
+  names the valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. Agent hooks have no channel to collect approval or
@@ -49,7 +55,7 @@ applies the same rules; only the host's deny shape differs (a JSON decision, a
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit code, timeout, or missing binary: deny unless
   `TIRITH_FAIL_OPEN=1`.
 

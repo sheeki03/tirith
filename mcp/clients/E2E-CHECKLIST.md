@@ -93,9 +93,9 @@ warn-level command (e.g., `curl http://example.com/file`).
 
 | Tool | Version | Test | Expected | Pass? |
 |---|---|---|---|---|
-| Claude Code | | Warn-level command with default warn action | Allowed, findings in `additionalContext` | |
-| Cursor | | Warn-level command with default warn action | Allowed, findings on stderr | |
-| VS Code | | Warn-level command with default warn action | Allowed, findings in `additionalContext` | |
+| Claude Code | | Warn-level command with default warn action | No `permissionDecision`: Claude Code's normal permission prompt still appears where it would for a clean command; findings shown as a `systemMessage` and in `additionalContext` | |
+| Cursor | | Warn-level command with default warn action | Same `permission: allow` as a clean command, findings in `user_message` and `agent_message` | |
+| VS Code | | Warn-level command with default warn action | No `permissionDecision`: VS Code's own confirmation still applies; findings in `systemMessage` and `additionalContext` | |
 | Windsurf | | Warn-level command with default warn action | Allowed (exit 0), findings on stderr | |
 | Gemini CLI | | Warn-level command with default warn action | Allowed (exit 0), findings on stderr | |
 | Pi CLI | | Warn-level command with default warn action | Allowed (returns undefined), findings on stderr | |
@@ -103,10 +103,12 @@ warn-level command (e.g., `curl http://example.com/file`).
 | Prime Agent | | Warn-level command with default warn action | Allowed (returns undefined), findings on stderr | |
 | OMP | | Warn-level command with default warn action | Allowed (returns undefined), findings on stderr | |
 | Cline | | Warn-level command with default warn action | Allowed (`cancel: false`), findings in `contextModification` | |
-| OpenHands | | Warn-level command with default warn action | Allowed (exit 0), findings in `additionalContext` | |
-| Grok Build | | Warn-level command with default warn action | Allowed (`decision: allow`), findings on stderr | |
+| OpenHands | | Warn-level command with default warn action | Allowed (exit 0, no `decision`), findings in `additionalContext` | |
+| Grok Build | | Warn-level command with default warn action | Allowed (no stdout decision, as for a clean command), findings on stderr | |
 | Copilot CLI | | Warn-level command with default warn action | Allowed (silent exit 0) | |
 | Kiro CLI | | Warn-level command with default warn action | Allowed (exit 0) | |
+| Claude Code | | Warn-level command, `TIRITH_HOOK_WARN_ACTION=ask` | Claude Code asks to confirm, with the Tirith warning as the reason | |
+| Any hook | | Warn-level command, `TIRITH_HOOK_WARN_ACTION=block` (unrecognized) | Blocked; the reason names the valid values `allow`, `ask`, `deny` | |
 
 ## MCP preview-tool advertisement
 

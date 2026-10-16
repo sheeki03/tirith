@@ -296,13 +296,121 @@ impl Host {
                     );
                 } else {
                     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-                    assert_eq!(
-                        response["hookSpecificOutput"]["permissionDecision"],
-                        if allowed { "allow" } else { "deny" },
-                        "{response}"
-                    );
+                    if allowed {
+                        // Never an explicit allow: VS Code's own confirmation
+                        // rules decide, exactly as for a clean command.
+                        assert!(
+                            response["hookSpecificOutput"]
+                                .get("permissionDecision")
+                                .is_none(),
+                            "{response}"
+                        );
+                    } else {
+                        assert_eq!(
+                            response["hookSpecificOutput"]["permissionDecision"], "deny",
+                            "{response}"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// The text a host shows for a decision: stdout JSON and stderr together.
+    fn decision_text(output: &Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+}
+
+#[test]
+fn installed_shell_hooks_answer_warnings_without_approving_them() {
+    for host in HOSTS {
+        let workspace = Workspace::new();
+        workspace.policy("LOW", false);
+        let hook = workspace.setup(host, false);
+        workspace.check(host.name(), WARNING_COMMAND, 2, false, "LOW");
+
+        // Default: no approval. VS Code gets the warning for the user and the
+        // model with no permissionDecision; Cursor, which must always answer
+        // with a permission, gets the same "allow" a clean command gets, with
+        // the findings for the user and the agent; Windsurf exits 0 as for a
+        // clean command, findings on stderr.
+        for warn_action in ["", "allow", "Allow"] {
+            let output = workspace.hook(host, &hook, WARNING_COMMAND, false, warn_action);
+            host.assert_permission(&output, true);
+            match host {
+                Host::Vscode => {
+                    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    for message in [
+                        &response["systemMessage"],
+                        &response["hookSpecificOutput"]["additionalContext"],
+                    ] {
+                        let message = message.as_str().expect("warning for user and model");
+                        assert!(message.contains("(non_standard_port)"), "{message}");
+                        assert!(message.contains("[LOW]"), "{message}");
+                    }
+                }
+                Host::Cursor => {
+                    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    for field in ["user_message", "agent_message"] {
+                        assert!(
+                            response[field].as_str().unwrap().contains("[LOW]"),
+                            "{response}"
+                        );
+                    }
+                }
+                Host::Windsurf => {
+                    assert!(String::from_utf8_lossy(&output.stderr).contains("[LOW]"));
+                }
+            }
+        }
+
+        // ask: VS Code and Cursor ask the user; Windsurf has no prompt and
+        // denies with interactive-shell guidance.
+        let output = workspace.hook(host, &hook, WARNING_COMMAND, true, "ask");
+        match host {
+            Host::Vscode => {
+                let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                let specific = &response["hookSpecificOutput"];
+                assert_eq!(specific["permissionDecision"], "ask", "{response}");
+                assert!(specific["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("non_standard_port"));
+            }
+            Host::Cursor => {
+                let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(response["permission"], "ask", "{response}");
+                assert!(response["user_message"].as_str().unwrap().contains("[LOW]"));
+            }
+            Host::Windsurf => {
+                host.assert_permission(&output, false);
+                let text = Host::decision_text(&output);
+                assert!(text.contains("TIRITH_HOOK_WARN_ACTION=ask"), "{text}");
+                assert!(text.contains("interactive shell"), "{text}");
+            }
+        }
+
+        // An unrecognized value fails closed and names the valid values.
+        for warn_action in ["block", "allow-auto"] {
+            for fail_open in [false, true] {
+                let output = workspace.hook(host, &hook, WARNING_COMMAND, fail_open, warn_action);
+                host.assert_permission(&output, false);
+                let text = Host::decision_text(&output);
+                assert!(text.contains("valid values: allow, ask, deny"), "{text}");
+                assert!(text.contains(warn_action), "{text}");
+            }
+        }
+        // A clean command is unaffected by the warn action.
+        for warn_action in ["ask", "deny", "block"] {
+            host.assert_permission(
+                &workspace.hook(host, &hook, CLEAN_COMMAND, false, warn_action),
+                true,
+            );
         }
     }
 }
@@ -387,18 +495,22 @@ fn installed_shell_hooks_reject_malformed_approval_metadata_unless_operator_fail
                     assert!(!workspace.root.path().join("json-must-not-execute").exists());
                 }
                 if command == WARNING_COMMAND {
-                    let mut process = workspace.command(&workspace.bash);
-                    process
-                        .arg(&hook)
-                        .env("TIRITH_BIN", &proxy)
-                        .env("TIRITH_FAIL_OPEN", "1")
-                        .env("TIRITH_HOOK_WARN_ACTION", "DENY");
-                    workspace.fault_environment(&mut process, fault);
-                    let output = with_stdin(
-                        &mut process,
-                        &serde_json::to_vec(&host.input(command)).unwrap(),
-                    );
-                    host.assert_permission(&output, false);
+                    // A gated warning (deny, ask, or an unrecognized value)
+                    // stays denied when its response is damaged.
+                    for warn_action in ["DENY", "ask", "block"] {
+                        let mut process = workspace.command(&workspace.bash);
+                        process
+                            .arg(&hook)
+                            .env("TIRITH_BIN", &proxy)
+                            .env("TIRITH_FAIL_OPEN", "1")
+                            .env("TIRITH_HOOK_WARN_ACTION", warn_action);
+                        workspace.fault_environment(&mut process, fault);
+                        let output = with_stdin(
+                            &mut process,
+                            &serde_json::to_vec(&host.input(command)).unwrap(),
+                        );
+                        host.assert_permission(&output, false);
+                    }
                 }
             }
         }

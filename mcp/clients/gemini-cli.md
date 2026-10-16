@@ -73,7 +73,7 @@ Expected: runs normally with no interference.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with stderr output, `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings printed to stderr, exit 0), `deny` blocks them; `ask` is denied with guidance because Gemini CLI has no confirmation prompt for this integration; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Decision logic
@@ -86,8 +86,12 @@ and:
   `requires_approval: true`, then deny.
 - Exit 1: deny (block finding) -- prints deny JSON to stdout.
   `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`),
-  findings printed to stderr. Set `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- Exit 2: warn. By default (`TIRITH_HOOK_WARN_ACTION=allow`) the command is
+  answered exactly like a clean one (findings printed to stderr, exit 0); a warning never
+  approves anything. `deny` blocks. `ask` is denied with guidance to confirm
+  from a Tirith-protected interactive shell, because Gemini CLI has no
+  confirmation prompt this integration can request. Any other value blocks
+  and names the valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -98,7 +102,7 @@ and:
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit / timeout / missing binary: **deny** (fail-closed by default).
   Set `TIRITH_FAIL_OPEN=1` for fail-open.
 

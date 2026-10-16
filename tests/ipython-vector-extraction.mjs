@@ -499,6 +499,20 @@ try {
       assert.equal(dynamic.block, true, "WARN_ACTION=deny is stricter than UNRESOLVED_ACTION=warn");
     });
 
+    // These hosts have no confirmation result: "ask" is denied with guidance,
+    // and an unrecognized value fails closed naming the valid values. Both are
+    // stricter than the unresolved opt-out, and neither changes a clean call.
+    for (const [action, expected] of [["ask", /interactive shell/], ["block", /valid values: allow, ask, deny/]]) {
+      await withEnv({ ...baseEnv, TIRITH_HOOK_WARN_ACTION: action, TIRITH_HOOK_UNRESOLVED_ACTION: "warn" }, async () => {
+        const warned = await call("bash", { command: "curl x WARN_TOKEN" });
+        assert.equal(warned.block, true, `${action}: a warning must not pass`);
+        assert.match(warned.reason, expected);
+        const dynamic = await call("ipython", { code: "import os\nos.system(user_input)" });
+        assert.equal(dynamic.block, true, `${action}: stricter than UNRESOLVED_ACTION=warn`);
+        assert.equal(await call("bash", { command: "ls -la" }), undefined);
+      });
+    }
+
     // Kernel bindings persist across handler calls, as they do across cells.
     await withEnv(baseEnv, async () => {
       assert.equal(await call("ipython", { code: "import subprocess as sp" }), undefined);

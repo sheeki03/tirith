@@ -18,24 +18,39 @@ Approvals and mandatory acknowledgements are denied: these adapters have no
 confirmation channel. Warn-allow and TIRITH_FAIL_OPEN never bypass either gate.
 Blocks (check exit 1) and deferred blocks (exit 4) are always denied.
 
+A warning (check exit 2) is never an approval. By default the hook answers it
+without a permission decision, so the host applies the user's own permission
+rules exactly as if Tirith had not answered, and the warning reaches the user
+and the agent through the host's message fields. Claude Code's "allow" skips
+its permission prompt, so a warned command would otherwise be less gated than
+a clean one.
+
 Exit codes:
   0 — hook completed successfully (decision in stdout JSON)
   Non-zero — hook error (fail-closed by default; set TIRITH_FAIL_OPEN=1 for fail-open)
 
-Output (stdout):
+Output (stdout, claude-code):
   For deny:
     {"hookSpecificOutput": {"hookEventName": "PreToolUse",
       "permissionDecision": "deny", "permissionDecisionReason": "..."}}
-  For warn-allow:
+  For a warning (default): no permission decision; `systemMessage` is shown to
+  the user and `additionalContext` is added to the model's context:
+    {"systemMessage": "...", "hookSpecificOutput": {"hookEventName":
+      "PreToolUse", "additionalContext": "..."}}
+  For a warning with TIRITH_HOOK_WARN_ACTION=ask (the reason is shown to the
+  user in the permission prompt):
     {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-      "permissionDecision": "allow", "permissionDecisionReason": "...",
+      "permissionDecision": "ask", "permissionDecisionReason": "...",
       "additionalContext": "..."}}
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
   TIRITH_HOOK_PROTOCOL    — "claude-code" (default), "grok-build", "cline",
                             or "openhands"
-  TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
+  TIRITH_HOOK_WARN_ACTION — "allow" (default: pass the warning on and let the
+                            host's own permission rules decide), "ask" (ask the
+                            user to confirm; hosts without a confirmation prompt
+                            deny instead), or "deny". Any other value denies.
   TIRITH_HOOK_UNRESOLVED_ACTION — "deny" (default) or "warn" when OpenHands
                             sends input to an unknown persistent process
 """
@@ -121,11 +136,50 @@ def decision(action, reason=None):
         }
         if reason:
             specific["permissionDecisionReason"] = reason
-            if action == "allow":
+            if action == "ask":
+                # The reason is shown to the user in the prompt; the agent
+                # learns why through its context.
                 specific["additionalContext"] = reason
         output = {"hookSpecificOutput": specific}
     print(json.dumps(output))
     sys.exit(exit_code)
+
+
+def warn_through(reason):
+    """Pass a warning on without a permission decision, and exit.
+
+    The host then applies its own permission rules exactly as for a command
+    Tirith did not flag; the warning only adds information. Each protocol uses
+    the fields its host delivers to the user and the agent.
+    """
+    proto = protocol()
+    if proto == "grok-build":
+        # A clean command gets no stdout, so neither does a warning. Grok
+        # surfaces hook stderr, and its envelope has no reason field for allow.
+        print(reason, file=sys.stderr)
+        sys.exit(0)
+    if proto == "cline":
+        # `cancel: false` lets Cline's own approval settings decide, and
+        # `contextModification` is delivered to the agent.
+        output = {"cancel": False, "contextModification": reason}
+    elif proto == "openhands":
+        # OpenHands treats a missing decision like a clean command; the
+        # executor reads `additionalContext` without one.
+        output = {"additionalContext": reason}
+    else:
+        # Claude Code: `systemMessage` is shown to the user and
+        # `additionalContext` reaches the model. With no permissionDecision the
+        # normal permission flow runs (the user's allow, ask and deny rules and
+        # the default prompt), so a warning never skips the prompt.
+        output = {
+            "systemMessage": reason,
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": reason,
+            },
+        }
+    print(json.dumps(output))
+    sys.exit(0)
 
 
 def deny(reason):
@@ -147,27 +201,53 @@ def fail_closed(reason):
         sys.exit(0)
 
 
+WARN_ACTIONS = ("allow", "ask", "deny")
+
+
 def warn_action():
-    """Return the validated TIRITH_HOOK_WARN_ACTION: "allow" (default) or "deny"."""
-    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-    if value in ("allow", "deny"):
-        return value
-    print(
-        f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{value}', defaulting to 'allow'",
-        file=sys.stderr,
-    )
-    return "allow"
+    """Return TIRITH_HOOK_WARN_ACTION: "allow" (default), "ask", "deny" or "invalid".
+
+    An unrecognized value is "invalid", which callers treat as deny: a security
+    setting that cannot be parsed fails closed rather than passing warnings.
+    """
+    value = (os.environ.get("TIRITH_HOOK_WARN_ACTION") or "allow").lower()
+    return value if value in WARN_ACTIONS else "invalid"
+
+
+def supports_ask():
+    """Whether the selected host has a confirmation prompt a hook can request."""
+    return protocol() not in ("grok-build", "cline", "openhands")
+
+
+def warn_denial(action, warning_text):
+    """Explain why a warning is denied under a non-allow warn action."""
+    if action == "invalid":
+        value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "")
+        return (
+            f"tirith: unrecognized TIRITH_HOOK_WARN_ACTION={value!r} "
+            "(valid values: allow, ask, deny) — warning blocked for safety. "
+            + warning_text
+        )
+    if action == "ask":
+        return (
+            warning_text
+            + " — blocked; TIRITH_HOOK_WARN_ACTION=ask needs a confirmation prompt"
+            " this host hook does not have. Review the command and retry from a"
+            " Tirith-protected interactive shell to confirm it."
+        )
+    return warning_text
 
 
 def checker_error(returncode, reason):
     """Deny a damaged response unless TIRITH_FAIL_OPEN=1, never past an intact verdict.
 
-    A warning the operator configured to deny stays denied when its response is
-    damaged, so TIRITH_FAIL_OPEN cannot turn a denied warning into an allow.
-    Under fail-open this returns, so the rest of a batch is still checked and a
-    later command's block or approval still applies.
+    A warning the operator configured to gate (ask, deny, or an unrecognized
+    value) stays denied when its response is damaged, so TIRITH_FAIL_OPEN cannot
+    turn a gated warning into an allow. Under fail-open this returns, so the
+    rest of a batch is still checked and a later command's block or approval
+    still applies.
     """
-    if returncode == 2 and warn_action() == "deny":
+    if returncode == 2 and warn_action() != "allow":
         deny(reason)
     if fail_action() == "deny":
         deny(reason)
@@ -175,7 +255,9 @@ def checker_error(returncode, reason):
 
 def unresolved_action():
     """Return the action for execution whose real interpreter is unavailable."""
-    if os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower() == "deny":
+    if warn_action() != "allow":
+        # Only hosts without a confirmation prompt reach this path, so ask and
+        # an unrecognized warn action are as strict as deny here.
         return "deny"
     value = os.environ.get("TIRITH_HOOK_UNRESOLVED_ACTION", "deny").lower()
     if value in ("deny", "warn"):
@@ -192,8 +274,7 @@ def unresolved(reason):
     """Deny an uninspectable execution path, or visibly apply the opt-out."""
     _hook_event("unresolved_vector", reason)
     if unresolved_action() == "warn":
-        decision(
-            "allow",
+        warn_through(
             reason
             + " — allowed by TIRITH_HOOK_UNRESOLVED_ACTION=warn; the input was not inspected",
         )
@@ -266,6 +347,52 @@ def _build_warning_text(stdout):
         except (ValueError, RecursionError):
             text = stdout.strip()[:500]
     return text
+
+
+MAX_FIX_CHARS = 200
+
+
+def _short_fix(remediation):
+    """Return the first sentence of a finding's remediation, bounded."""
+    if not isinstance(remediation, str):
+        return ""
+    text = " ".join(remediation.split())
+    end = text.find(". ")
+    if end != -1:
+        text = text[: end + 1]
+    if len(text) > MAX_FIX_CHARS:
+        text = text[: MAX_FIX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _warning_summary(stdout):
+    """Describe warning findings: severity, title, rule id and a short fix."""
+    try:
+        verdict = json.loads(stdout)
+    except (ValueError, RecursionError):
+        return _build_warning_text(stdout)
+    findings = verdict.get("findings") if isinstance(verdict, dict) else None
+    parts = []
+    if isinstance(findings, list):
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            rule = finding.get("rule_id")
+            rule = rule if isinstance(rule, str) and rule else ""
+            title = finding.get("title")
+            if not isinstance(title, str) or not title:
+                title = rule or "unknown"
+            severity = finding.get("severity")
+            part = f"[{severity}] {title}" if isinstance(severity, str) and severity else title
+            if rule and rule != title:
+                part += f" ({rule})"
+            fix = _short_fix(finding.get("remediation"))
+            if fix:
+                part += f" — fix: {fix}"
+            parts.append(part)
+    if not parts:
+        return "Tirith warning: the security check reported a warning"
+    return "Tirith warning: " + "; ".join(parts)
 
 
 def _block_reason(returncode, stdout):
@@ -606,7 +733,7 @@ def main():
                 _hook_event("check_block")
                 deny(_approval_reason(verdict, result.stdout))
             if result.returncode == 2:
-                warning_texts.append(_build_warning_text(result.stdout))
+                warning_texts.append(_warning_summary(result.stdout))
 
     if not warning_texts:
         if not skipped:
@@ -615,13 +742,18 @@ def main():
             print(json.dumps({"cancel": False}))
         sys.exit(0)
 
-    # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION
+    # Exit 2 = warn. TIRITH_HOOK_WARN_ACTION selects how it is answered; none of
+    # the answers is a permission grant.
     warning_text = "; ".join(dict.fromkeys(warning_texts))[:2000]
-    if warn_action() != "deny":
+    action = warn_action()
+    if action == "allow":
         _hook_event("warn_allowed")
-        decision("allow", warning_text)
+        warn_through(warning_text)
+    if action == "ask" and supports_ask():
+        _hook_event("warn_ask")
+        decision("ask", warning_text)
     _hook_event("warn_denied")
-    deny(warning_text)
+    deny(warn_denial(action, warning_text))
 
 
 if __name__ == "__main__":

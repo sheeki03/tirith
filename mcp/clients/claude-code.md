@@ -134,21 +134,29 @@ Expected: runs normally with no interference.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings in `additionalContext`), `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes a warning on with no permission decision (you see it as a `systemMessage`, the model in `additionalContext`, and Claude Code's own permission rules decide), `ask` asks you to confirm, `deny` blocks it; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## How it works
 
 The hook intercepts the Claude Code `PreToolUse` event for `Bash` tool calls.
 It extracts the command string, passes it to `tirith check --json`, and
-answers with `hookSpecificOutput.permissionDecision` on stdout (exit 0):
+answers on stdout (exit 0):
 
-- Exit 0 from tirith: allow (clean), unless the JSON has
-  `requires_approval: true`, then deny.
+- Exit 0 from tirith: no output, so Claude Code's normal permission flow
+  applies, unless the JSON has `requires_approval: true`, then deny.
 - Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn — allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`), with
-  the findings in `additionalContext`. Set `TIRITH_HOOK_WARN_ACTION=deny` to
-  block.
+- Exit 2: warn. A warning is never an approval. By default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) the hook answers without a
+  `permissionDecision`, so Claude Code applies your own permission rules (your
+  allow, ask and deny rules and its default prompt) exactly as for a clean
+  command. The warning (severity, title, rule id and a short fix) reaches you
+  as a `systemMessage` and the model as `additionalContext`.
+  `TIRITH_HOOK_WARN_ACTION=ask` answers `permissionDecision: "ask"`, with the
+  warning as the prompt's reason; `deny` blocks; any other value blocks and
+  names the valid values (`allow`, `ask`, `deny`). Earlier releases answered a
+  warning with `permissionDecision: "allow"`, which Claude Code documents as
+  skipping its permission prompt.
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -159,7 +167,7 @@ answers with `hookSpecificOutput.permissionDecision` on stdout (exit 0):
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error — deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit / timeout / missing binary: **deny** (fail-closed).
 
 The hook is **fail-closed by default**: if tirith is missing, times out, or errors,

@@ -300,6 +300,19 @@ fn assert_blocked(host: &str, result: Value) {
     assert!(result[reason_field].is_string(), "{host}: {result}");
 }
 
+/// Assert a block and return its reason.
+fn blocked_reason(host: &str, result: Value) -> String {
+    assert_blocked(host, result.clone());
+    result[if host == "openclaw" {
+        "blockReason"
+    } else {
+        "reason"
+    }]
+    .as_str()
+    .unwrap()
+    .to_owned()
+}
+
 // Capture once per command/policy, then exercise every host setting with that
 // completed response. The CLI still discovers the real isolated user policy;
 // only subprocess scheduling is removed from this decision-contract matrix.
@@ -467,6 +480,48 @@ fn exercise_host(host: &str) {
     assert_eq!(clean_response.status, 0, "{clean}");
     assert_eq!(clean["action"], "allow", "{clean}");
     assert_eq!(clean["requires_approval"], false, "{clean}");
+
+    // These hosts have no confirmation result, so "ask" is denied with
+    // interactive-shell guidance; an unrecognized value fails closed and names
+    // the valid values. Neither changes a clean command.
+    for tool in tools {
+        for fail_open in [false, true] {
+            for (warn_action, expected) in [
+                ("ask", "TIRITH_HOOK_WARN_ACTION=ask"),
+                ("ASK", "interactive shell"),
+                ("block", "valid values: allow, ask, deny"),
+                ("allow-auto", "\"allow-auto\""),
+            ] {
+                let reason = blocked_reason(
+                    host,
+                    callback(
+                        &state,
+                        host,
+                        tool,
+                        &warning_response,
+                        warn_action,
+                        fail_open,
+                        "none",
+                    ),
+                );
+                assert!(reason.contains(expected), "{host}/{warn_action}: {reason}");
+            }
+        }
+        for warn_action in ["ask", "block"] {
+            assert!(callback(
+                &state,
+                host,
+                tool,
+                &clean_response,
+                warn_action,
+                false,
+                "none"
+            )
+            .is_null());
+        }
+        assert!(callback(&state, host, tool, &warning_response, "", false, "none").is_null());
+    }
+
     for mutation in ["absent", "non_boolean", "invalid_json"] {
         for response in [&clean_response, &warning_response] {
             assert_blocked(
@@ -487,18 +542,20 @@ fn exercise_host(host: &str) {
                 mutation,
             ),
         );
-        assert_blocked(
-            host,
-            callback(
-                &state,
+        for warn_action in ["deny", "ask", "block"] {
+            assert_blocked(
                 host,
-                tools[0],
-                &warning_response,
-                "deny",
-                true,
-                mutation,
-            ),
-        );
+                callback(
+                    &state,
+                    host,
+                    tools[0],
+                    &warning_response,
+                    warn_action,
+                    true,
+                    mutation,
+                ),
+            );
+        }
     }
 
     // A deferred block (TIRITH_DEFER=1, exit 4 pending review) is a verdict,
