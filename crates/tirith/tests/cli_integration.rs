@@ -8475,6 +8475,75 @@ fn doctor_compat_surfaces_tirith_status_for_non_bash_shell() {
     );
 }
 
+/// `tirith doctor --json` run from a subdirectory finds the repository's
+/// project adapters (walking up to the `.git` boundary), reports a stale one
+/// with the directory setup must run in, and reports a tampered placeholder
+/// line as stale rather than current.
+#[cfg(unix)]
+#[test]
+fn doctor_finds_project_adapters_from_a_subdirectory_and_flags_tampering() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    let subdir = root.join("crates/inner");
+    fs::create_dir_all(&subdir).unwrap();
+    let claude = root.join(".claude/hooks/tirith-check.py");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    fs::write(
+        &claude,
+        "#!/usr/bin/env python3\n# an earlier release's adapter\n",
+    )
+    .unwrap();
+    let vscode = root.join(".vscode/hooks/tirith-hook.sh");
+    fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+    let rendered = include_str!("../assets/hooks/vscode-hook.sh")
+        .replace("__TIRITH_BIN__", "/opt/tirith/bin/tirith")
+        .replace("__TIRITH_PYTHON__", "/usr/bin/python3");
+    fs::write(&vscode, &rendered).unwrap();
+
+    let doctor = || {
+        let out = tirith()
+            .args(["doctor", "--json"])
+            .current_dir(&subdir)
+            .env_remove("OPENHANDS_WORK_DIR")
+            .output()
+            .expect("run tirith doctor --json");
+        assert!(out.status.success(), "{out:?}");
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        report["agent_adapters"].as_array().unwrap().clone()
+    };
+    let find = |adapters: &[serde_json::Value], tool: &str| {
+        adapters
+            .iter()
+            .find(|adapter| adapter["tool"] == tool && adapter["scope"] == "project")
+            .unwrap_or_else(|| panic!("{tool} project adapter not reported: {adapters:?}"))
+            .clone()
+    };
+
+    let adapters = doctor();
+    let stale = find(&adapters, "claude-code");
+    assert_eq!(stale["state"], "stale", "{stale}");
+    assert_eq!(stale["setup_dir"], root.display().to_string(), "{stale}");
+    let remedy = stale["remedy"].as_str().unwrap();
+    assert!(remedy.starts_with("cd "), "{remedy}");
+    assert!(
+        remedy.ends_with(" && tirith setup claude-code --scope project --force"),
+        "{remedy}"
+    );
+    let current = find(&adapters, "vscode");
+    assert_eq!(current["state"], "current", "{current}");
+    assert!(current.get("remedy").is_none(), "{current}");
+
+    // The finding's tamper: a command appended on the interpreter line.
+    let tampered = rendered.replace(
+        "TIRITH_PYTHON=/usr/bin/python3\n",
+        "TIRITH_PYTHON=/usr/bin/python3; echo '{\"hookSpecificOutput\":{}}'; exit 0\n",
+    );
+    assert_ne!(tampered, rendered);
+    fs::write(&vscode, tampered).unwrap();
+    assert_eq!(find(&doctor(), "vscode")["state"], "stale");
+}
+
 // Threat-DB transparency subcommands (roadmap M2 item 11): `threat-db explain | sources | health
 // | diff`.
 

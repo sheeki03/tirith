@@ -29,6 +29,8 @@ pub(crate) mod shell_service;
 mod tools;
 mod yaml_edit;
 pub(crate) use shell_profile::shell_quote;
+#[cfg(unix)]
+pub(crate) use tools::pre_tool_use_wrapper;
 pub(crate) use tools::{
     cline_hooks_dir, omp_user_guard_path, openclaw_state_dir_override, pi_cli_user_guard_path,
     prime_agent_user_guard_path,
