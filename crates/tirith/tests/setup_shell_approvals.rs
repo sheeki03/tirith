@@ -609,6 +609,84 @@ fn installed_shell_hooks_deny_deferred_blocks_and_allow_an_honored_bypass() {
 }
 
 #[test]
+fn installed_cursor_and_windsurf_hooks_deny_a_shell_call_without_a_string_command() {
+    for host in [Host::Cursor, Host::Windsurf] {
+        let workspace = Workspace::new();
+        workspace.policy("LOW", false);
+        let hook = workspace.setup(host, false);
+        // Telemetry may still call the binary; only a `check` marks the run,
+        // and answers with a clean verdict.
+        let marker = workspace.root.path().join("checker-ran");
+        let recorder = workspace.root.path().join("recording-checker");
+        fs::write(
+            &recorder,
+            format!(
+                "#!{}\nif [ \"$1\" = check ]; then\n  : > {}\n  printf '%s\\n' '{}'\nfi\nexit 0\n",
+                workspace.bash.display(),
+                quote(&marker),
+                json!({"action": "allow", "requires_approval": false, "findings": []}),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        let run = |payload: &Value, fail_open: bool| {
+            let mut process = workspace.command(&workspace.bash);
+            process.arg(&hook).env("TIRITH_BIN", &recorder);
+            if fail_open {
+                process.env("TIRITH_FAIL_OPEN", "1");
+            }
+            with_stdin(&mut process, &serde_json::to_vec(payload).unwrap())
+        };
+        // A non-string command must never be stringified and checked: the
+        // text "['rm', '-rf', '/']" is not what the host would run.
+        let commands = [
+            None,
+            Some(json!(["rm", "-rf", "/"])),
+            Some(json!(null)),
+            Some(json!(7)),
+            Some(json!({"argv": ["printf", "safe"]})),
+            Some(json!(" \n ")),
+            Some(json!("")),
+        ];
+        let mut payloads: Vec<Value> = commands
+            .iter()
+            .map(|command| match (host, command) {
+                (Host::Cursor, None) => json!({"cwd": "/tmp"}),
+                (Host::Cursor, Some(command)) => json!({"command": command}),
+                (_, None) => json!({"tool_info": {}}),
+                (_, Some(command)) => json!({"tool_info": {"command_line": command}}),
+            })
+            .collect();
+        if matches!(host, Host::Windsurf) {
+            payloads.push(json!({}));
+            payloads.push(json!({"tool_info": "printf safe"}));
+            payloads.push(json!({"tool_info": null}));
+        }
+        for payload in &payloads {
+            let output = run(payload, false);
+            host.assert_permission(&output, false);
+            assert!(
+                Host::decision_text(&output)
+                    .contains("tirith: no command found in hook input — blocked for safety"),
+                "{payload}: {output:?}"
+            );
+            // Like an unparseable payload, an operator's fail-open allows it.
+            host.assert_permission(&run(payload, true), true);
+            assert!(!marker.exists(), "{payload}: no command to check");
+        }
+        // A payload that is not a JSON object is still a parse failure.
+        let output = run(&json!(["printf", "safe"]), false);
+        host.assert_permission(&output, false);
+        assert!(!marker.exists());
+
+        // A real command is still checked.
+        let payload = host.input(CLEAN_COMMAND);
+        host.assert_permission(&run(&payload, false), true);
+        assert!(marker.exists(), "{}", host.name());
+    }
+}
+
+#[test]
 fn installed_vscode_hook_denies_a_shell_tool_call_without_a_string_command() {
     let workspace = Workspace::new();
     workspace.policy("LOW", false);

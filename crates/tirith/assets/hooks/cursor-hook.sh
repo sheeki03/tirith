@@ -60,14 +60,35 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo '{"permission":"deny","user_message":"configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1"}'; exit 0
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
+# The first line is "ok" only for a non-empty string command; anything else (a
+# missing, null, non-string, or blank command) is "invalid" and is denied below
+# without a check. A non-string command is never stringified and checked.
+PARSED=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+if not isinstance(d, dict):
+    sys.exit(1)
+cmd = d.get('command')
+ok = isinstance(cmd, str) and cmd.strip() != ''
+print('ok' if ok else 'invalid')
+print(cmd if ok else '')
+" <<< "$INPUT" 2>/dev/null)
 PARSE_RC=$?
-if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
+if [ "$PARSE_RC" -ne 0 ] || [ -z "$PARSED" ]; then
   _tirith_hook_event parse_error
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then
     echo '{"permission":"allow"}'; exit 0
   fi
   echo '{"permission":"deny","user_message":"tirith: failed to parse hook input — blocked for safety"}'; exit 0
+fi
+COMMAND_STATE=$(echo "$PARSED" | head -n 1)
+COMMAND=$(echo "$PARSED" | tail -n +2)
+if [ "$COMMAND_STATE" != "ok" ] || [ -z "$COMMAND" ]; then
+  _tirith_hook_event parse_error "no command in shell hook input"
+  if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then
+    echo '{"permission":"allow"}'; exit 0
+  fi
+  echo '{"permission":"deny","user_message":"tirith: no command found in hook input — blocked for safety"}'; exit 0
 fi
 RESULT=$(TIRITH_INTEGRATION=cursor "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
 RC=$?  # No || true here: we need the actual exit code. Without set -e, script continues safely.
