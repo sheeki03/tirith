@@ -85,6 +85,13 @@ every change in detail.
   errors. A warning that `TIRITH_HOOK_WARN_ACTION=deny` blocks stays denied when
   its output is damaged. The Cursor, VS Code and Windsurf adapters no longer
   import Python modules from the project directory.
+- **Malformed or oversized hook traffic is denied.** The VS Code and
+  OpenClaw adapters deny a shell call whose command is missing or not a
+  string; before, they skipped the check or checked the wrong text. The Pi,
+  Prime Agent, OMP and OpenClaw guards read checker responses up to 16 MiB
+  and deny anything larger, even with `TIRITH_FAIL_OPEN=1`.
+- With `allow_bypass_env_noninteractive: true`, the zsh non-interactive
+  guard allows an honored `TIRITH=0` bypass again, as 0.4.2 did.
 - **Fewer agent false positives.** These shapes, which 0.4.2 blocked or
   warned on, now pass:
   - `if` and `while` bracket conditions over a substitution, and arithmetic
