@@ -456,13 +456,20 @@ def update_pins(
                 # Nothing then shows the candidate is strictly ahead of the pin,
                 # so this source is observed by timestamp but never adopted.
                 item["comparison_unavailable"] = error.reason
-                print(
-                    f"threatdb_source_pins.py: warning: {source_name}: {error}; "
+                warning = (
+                    f"{source_name}: {error}; "
                     "lag comes from commit timestamps, and the pin stays at "
                     f"{source['commit'][:12]} instead of adopting "
-                    f"{candidate['commit'][:12]}",
-                    file=sys.stderr,
+                    f"{candidate['commit'][:12]}"
                 )
+                print(f"threatdb_source_pins.py: warning: {warning}", file=sys.stderr)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # An annotation keeps a pin that needs a manual update
+                    # visible on the run page, not only in the step log.
+                    print(
+                        "::warning title=ThreatDB source pin not updated::"
+                        + annotation_text(warning)
+                    )
             else:
                 item["comparison"] = summarize_comparison(
                     source["repository"],
@@ -484,6 +491,10 @@ def update_pins(
     return changed, changes
 
 
+def annotation_text(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def markdown_code(value: str) -> str:
     return value.replace("`", "'").replace("\r", " ").replace("\n", " ")
 
@@ -500,7 +511,7 @@ def render_report(selected_at: str, changes: list[dict[str, Any]]) -> str:
     ]
     for item in changes:
         if "comparison_unavailable" in item:
-            state = "skipped"
+            state = "skipped (stale)" if item["stale"] else "skipped"
         elif item["stale"]:
             state = "stale"
         else:

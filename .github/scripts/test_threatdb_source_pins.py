@@ -123,13 +123,15 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
             "2026-09-01T02:00:00Z",
         ]
         stderr = io.StringIO()
+        stdout = io.StringIO()
         with patch.object(PINS.sys, "argv", argv), contextlib.redirect_stderr(
             stderr
-        ), contextlib.redirect_stdout(io.StringIO()):
+        ), contextlib.redirect_stdout(stdout):
             try:
                 code = PINS.main()
             except SystemExit as error:
                 code = error.code
+        self.last_stdout = stdout.getvalue()
         return code, stderr.getvalue()
 
     def test_manifest_resolves_exact_required_sources(self) -> None:
@@ -267,6 +269,50 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
         self.assertNotIn("comparison_unavailable", ossf)
         self.assertIn("datadog_malicious_software_packages", stderr)
         self.assertIn("HTTP 422", stderr)
+        self.assertNotIn("::warning", self.last_stdout)
+
+    def test_report_keeps_staleness_visible_for_a_skipped_source(self) -> None:
+        item = {
+            "candidate": {
+                "commit": "b" * 40,
+                "commit_timestamp": "2026-10-15T08:38:07Z",
+                "subject": "update",
+            },
+            "comparison_unavailable": "github_http_422",
+            "lag_hours": 816.0,
+            "max_lag_hours": 168,
+            "old_commit": "a" * 40,
+            "policy": "latest_successful_upstream_commit",
+            "proposed": False,
+            "repository": "DataDog/malicious-software-packages-dataset",
+            "source": "datadog_malicious_software_packages",
+            "stale": True,
+        }
+        rendered = PINS.render_report("2026-10-16T00:00:00Z", [item])
+        self.assertIn(
+            "| datadog_malicious_software_packages | skipped (stale) |", rendered
+        )
+
+    def test_actions_runs_annotate_a_source_github_cannot_compare(self) -> None:
+        self.datadog_compare_answers(422)
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            PINS.os.environ, {"GITHUB_ACTIONS": "true"}
+        ):
+            directory = Path(temporary)
+            result = directory / "observations.json"
+            code, stderr = self.run_cli(
+                directory, "observe", str(MANIFEST), "--result", str(result)
+            )
+        self.assertEqual(code, 0, stderr)
+        annotations = [
+            line for line in self.last_stdout.splitlines() if line.startswith("::warning")
+        ]
+        self.assertEqual(len(annotations), 1, self.last_stdout)
+        self.assertTrue(
+            annotations[0].startswith("::warning title=ThreatDB source pin not updated::")
+        )
+        self.assertIn("datadog_malicious_software_packages", annotations[0])
+        self.assertIn("HTTP 422", annotations[0])
 
     def test_watcher_skips_an_uncomparable_source_and_proposes_the_rest(self) -> None:
         self.datadog_compare_answers(422)
