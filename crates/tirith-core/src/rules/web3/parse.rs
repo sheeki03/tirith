@@ -243,7 +243,8 @@ fn has_incomplete_quoting(input: &str, shell: ShellType) -> bool {
     let mut single = false;
     let mut double = false;
     let mut escaped = false;
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
             continue;
@@ -253,7 +254,10 @@ fn has_incomplete_quoting(input: &str, shell: ShellType) -> bool {
             ShellType::Cmd => '^',
             ShellType::Posix | ShellType::Fish => '\\',
         };
-        if ch == escape && !single {
+        // fish also escapes `\'` and `\\` inside single quotes.
+        let fish_single_escape =
+            shell == ShellType::Fish && matches!(chars.peek(), Some('\'' | '\\'));
+        if ch == escape && (!single || fish_single_escape) {
             escaped = true;
         } else if ch == '"' && !single {
             double = !double;

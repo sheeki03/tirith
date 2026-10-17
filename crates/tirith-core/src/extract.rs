@@ -3343,6 +3343,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
         let ch = chars[i];
         match quote {
             Quote::Single => {
+                if shell == ShellType::Fish
+                    && ch == '\\'
+                    && matches!(chars.get(i + 1), Some(&('\'' | '\\')))
+                {
+                    i += 2;
+                    continue;
+                }
                 if ch == '\'' {
                     if shell == ShellType::PowerShell
                         && chars.get(i + 1).is_some_and(|next| *next == '\'')
@@ -3439,6 +3446,14 @@ impl ShellDelimiter {
             Self::Brace => b'}',
         }
     }
+}
+
+/// fish reads `\'` and `\\` as escapes inside single quotes; every other
+/// backslash there is literal. True when `bytes[index]` starts one.
+fn fish_single_quote_escape_byte_at(shell: ShellType, bytes: &[u8], index: usize) -> bool {
+    shell == ShellType::Fish
+        && bytes.get(index) == Some(&b'\\')
+        && matches!(bytes.get(index + 1), Some(b'\'' | b'\\'))
 }
 
 fn shell_escape_byte(shell: ShellType) -> u8 {
@@ -3730,6 +3745,10 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
 
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, i) {
+                    i += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
@@ -6500,6 +6519,10 @@ fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
         let byte = bytes[index];
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, index) {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(index + 1) == Some(&b'\'') {
                         index += 2;
@@ -8008,6 +8031,10 @@ fn executable_body_upper_bound_exceeded(raw: &str, shell: ShellType, max_bodies:
             continue;
         }
         match quote {
+            Some(b'\'') if fish_single_quote_escape_byte_at(shell, bytes, index) => {
+                index += 2;
+                continue;
+            }
             Some(b'\'') => {
                 let closes = if shell == ShellType::PowerShell {
                     current_char.and_then(tokenize::powershell_quote_kind)
@@ -12094,6 +12121,10 @@ fn lexical_executable_substitutions_bounded(
         let byte = bytes[i];
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, i) {
+                    i += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
@@ -21783,6 +21814,62 @@ mod tests {
         let scan = executable_substitution_scan("nice -n5 sh -c 'id'", ShellType::Posix);
         assert!(scan.gap.is_none(), "{scan:?}");
         assert!(scan.bodies.iter().all(|body| !body.best_effort), "{scan:?}");
+    }
+
+    /// fish reads `\'` and `\\` as escapes inside single quotes (CORE-7).
+    #[test]
+    fn fish_single_quote_escapes_do_not_end_the_quote() {
+        let substitutions = |raw: &str| {
+            let (bodies, gap) = lexical_executable_substitutions(raw, ShellType::Fish);
+            (
+                bodies
+                    .into_iter()
+                    .map(|body| body.input)
+                    .collect::<Vec<_>>(),
+                gap,
+            )
+        };
+        for raw in [
+            r"echo 'it\'s'",
+            r"git commit -m 'it\'s done'",
+            r"echo 'x\'y\'z'",
+            r"echo 'back\\'",
+            r"echo 'a\'(id)'",
+            r"echo 'a\'; id'",
+        ] {
+            assert_eq!(substitutions(raw), (Vec::new(), None), "{raw:?}");
+            assert!(
+                !bounded_executable_candidates(raw, ShellType::Fish).1,
+                "{raw:?}"
+            );
+            assert!(
+                !executable_body_upper_bound_exceeded(raw, ShellType::Fish, 1),
+                "{raw:?}"
+            );
+        }
+        // The quote still ends at its real closer, so a substitution after
+        // it runs; `\\` is one backslash, so the following quote closes.
+        assert_eq!(substitutions(r"echo 'it\'s'(id)").0, ["id"]);
+        assert_eq!(substitutions(r"echo 'a\\'(id)").0, ["id"]);
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')')", 0, ShellType::Fish),
+            Some(12)
+        );
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')", 0, ShellType::Fish),
+            None
+        );
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')", 0, ShellType::Posix),
+            Some(10)
+        );
+        assert!(shell_word_is_proven_literal(r"'it\'s'", ShellType::Fish));
+        assert!(shell_word_is_proven_literal(r"'a\\'", ShellType::Fish));
+        assert!(!shell_word_is_proven_literal(r"'it\'s'", ShellType::Posix));
+        assert_eq!(
+            static_wrapper_word(r"'print(\'hi\')'", ShellType::Fish).as_deref(),
+            Some("print('hi')")
+        );
     }
 
     #[test]

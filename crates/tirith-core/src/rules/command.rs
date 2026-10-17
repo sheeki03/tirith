@@ -389,6 +389,12 @@ fn powershell_escape_value(
     }
 }
 
+/// fish reads `\'` and `\\` as escapes inside single quotes; every other
+/// backslash there is literal. True when `chars[index]` starts one.
+pub(crate) fn fish_single_quote_escape_at(chars: &[char], index: usize) -> bool {
+    chars.get(index) == Some(&'\\') && matches!(chars.get(index + 1), Some(&('\'' | '\\')))
+}
+
 /// One unquoted fish backslash escape at `index`: the index after it and the
 /// character it stands for. fish decodes `\a \b \e \f \n \r \t \v`, `\xHH` /
 /// `\XHH`, octal `\ooo`, `\uHHHH`, `\UHHHHHHHH` and `\cX` here, drops an
@@ -513,7 +519,10 @@ pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                 }
             }
             QState::Single => {
-                if chars[i] == '\'' {
+                if is_fish && fish_single_quote_escape_at(&chars, i) {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else if chars[i] == '\'' {
                     // PowerShell: '' inside single quotes is an escaped literal '
                     if is_ps && i + 1 < len && chars[i + 1] == '\'' {
                         out.push('\'');
@@ -751,6 +760,10 @@ pub(crate) fn command_word_is_statically_bound(raw: &str, shell: ShellType) -> b
         let ch = chars[index];
         match quote {
             Quote::Single => {
+                if shell == ShellType::Fish && fish_single_quote_escape_at(&chars, index) {
+                    index += 2;
+                    continue;
+                }
                 if ch == '\'' {
                     if shell == ShellType::PowerShell
                         && chars.get(index + 1).is_some_and(|next| *next == '\'')
@@ -7443,7 +7456,10 @@ fn non_posix_word_has_live_expansion(raw: &str, shell: ShellType) -> bool {
             ShellType::PowerShell => '`',
             _ => '\0',
         };
-        if character == escape && quote != Some('\'') {
+        if character == escape
+            && (quote != Some('\'')
+                || (shell == ShellType::Fish && fish_single_quote_escape_at(&chars, index)))
+        {
             escaped = true;
             index += 1;
             continue;
@@ -7544,7 +7560,10 @@ fn contains_live_sensitive_env_reference(raw: &str, shell: ShellType) -> bool {
         } else {
             '\\'
         };
-        if character == escape && quote != Some('\'') {
+        if character == escape
+            && (quote != Some('\'')
+                || (shell == ShellType::Fish && fish_single_quote_escape_at(&chars, index)))
+        {
             index = index.saturating_add(2);
             live.push(' ');
             continue;
@@ -9815,7 +9834,10 @@ fn ordered_fd_routing(
             index += 1;
             continue;
         }
-        if character == escape && quote != Some('\'') {
+        if character == escape
+            && (quote != Some('\'')
+                || (shell == ShellType::Fish && fish_single_quote_escape_at(&chars, index)))
+        {
             escaped = true;
             index += 1;
             continue;
@@ -11736,7 +11758,10 @@ fn segment_stdout_target(segment: &tokenize::Segment, shell: ShellType) -> Optio
             index += 1;
             continue;
         }
-        if character == escape && quote != Some('\'') {
+        if character == escape
+            && (quote != Some('\'')
+                || (shell == ShellType::Fish && fish_single_quote_escape_at(&chars, index)))
+        {
             escaped = true;
             index += 1;
             continue;
@@ -18646,6 +18671,40 @@ mod tests {
     }
 
     /// fish decodes unquoted backslash escapes; POSIX keeps the escaped byte.
+    /// fish single quotes escape only `\'` and `\\` (CORE-7).
+    #[test]
+    fn test_fish_single_quote_escapes() {
+        assert_eq!(normalize_shell_token(r"'it\'s'", ShellType::Fish), "it's");
+        assert_eq!(normalize_shell_token(r"'a\\b'", ShellType::Fish), r"a\b");
+        assert_eq!(normalize_shell_token(r"'a\nb'", ShellType::Fish), r"a\nb");
+        assert_eq!(normalize_shell_token(r"'a\'", ShellType::Posix), r"a\");
+        assert!(command_word_is_statically_bound(
+            r"'it\'s'",
+            ShellType::Fish
+        ));
+        assert!(!command_word_is_statically_bound(
+            r"'it\'s",
+            ShellType::Fish
+        ));
+        assert!(command_word_is_statically_bound(r"'a\\'", ShellType::Fish));
+        assert!(!non_posix_word_has_live_expansion(
+            r"'it\'s'",
+            ShellType::Fish
+        ));
+        assert!(!non_posix_word_has_live_expansion(
+            r"'a\'(id)'",
+            ShellType::Fish
+        ));
+        assert!(non_posix_word_has_live_expansion(
+            r"'a\\'$HOME",
+            ShellType::Fish
+        ));
+        assert!(non_posix_word_has_live_expansion(
+            r"'a\'$HOME",
+            ShellType::Fish
+        ));
+    }
+
     #[test]
     fn test_normalize_fish_unquoted_escapes() {
         for (raw, expected) in [
