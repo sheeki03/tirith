@@ -389,6 +389,53 @@ fn powershell_escape_value(
     }
 }
 
+/// One unquoted fish backslash escape at `index`: the index after it and the
+/// character it stands for. fish decodes `\a \b \e \f \n \r \t \v`, `\xHH` /
+/// `\XHH`, octal `\ooo`, `\uHHHH`, `\UHHHHHHHH` and `\cX` here, drops an
+/// escaped newline, and lets any other escaped character stand for itself, so
+/// `PYTHON\x49NSPECT` names `PYTHONINSPECT`. A value fish would reject is
+/// still decoded: it can never spell an ASCII name.
+fn fish_unquoted_escape_value(chars: &[char], index: usize) -> (usize, Option<char>) {
+    let numeric = |start: usize, max_digits: usize, radix: u32| {
+        let mut value = 0u32;
+        let mut cursor = start;
+        while cursor - start < max_digits {
+            let Some(digit) = chars.get(cursor).and_then(|ch| ch.to_digit(radix)) else {
+                break;
+            };
+            value = value.saturating_mul(radix).saturating_add(digit);
+            cursor += 1;
+        }
+        (cursor, char::from_u32(value))
+    };
+    let Some(&escaped) = chars.get(index + 1) else {
+        return (index + 1, None);
+    };
+    match escaped {
+        '\n' => (index + 2, None),
+        'a' => (index + 2, Some('\u{0007}')),
+        'b' => (index + 2, Some('\u{0008}')),
+        'e' => (index + 2, Some('\u{001b}')),
+        'f' => (index + 2, Some('\u{000c}')),
+        'n' => (index + 2, Some('\n')),
+        'r' => (index + 2, Some('\r')),
+        't' => (index + 2, Some('\t')),
+        'v' => (index + 2, Some('\u{000b}')),
+        'x' | 'X' => numeric(index + 2, 2, 16),
+        'u' => numeric(index + 2, 4, 16),
+        'U' => numeric(index + 2, 8, 16),
+        '0'..='7' => numeric(index + 1, 3, 8),
+        'c' => match chars.get(index + 2) {
+            Some(&control) => (
+                index + 3,
+                char::from_u32((control as u32 & 0x1f).max(1)).filter(|_| control.is_ascii()),
+            ),
+            None => (index + 2, None),
+        },
+        other => (index + 2, Some(other)),
+    }
+}
+
 /// Strip all shell quoting/escaping (single/double quotes, ANSI-C `$'...'`,
 /// POSIX backslash, PowerShell backtick) to the effective post-expansion string.
 pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
@@ -416,6 +463,7 @@ pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
     let mut i = 0;
     let is_ps = matches!(shell, ShellType::PowerShell);
     let is_cmd = matches!(shell, ShellType::Cmd);
+    let is_fish = matches!(shell, ShellType::Fish);
     let mut state = QState::Normal;
 
     while i < len {
@@ -426,6 +474,10 @@ pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     // Cmd caret escape.
                     out.push(chars[i + 1]);
                     i += 2;
+                } else if is_fish && ch == '\\' && i + 1 < len {
+                    let (next, value) = fish_unquoted_escape_value(&chars, i);
+                    out.extend(value);
+                    i = next;
                 } else if !is_ps && !is_cmd && ch == '\\' && i + 1 < len {
                     // POSIX removes a backslash-newline pair before tokenization;
                     // every other escaped byte contributes the escaped byte.
@@ -484,12 +536,17 @@ pub(crate) fn normalize_shell_token(input: &str, shell: ShellType) -> String {
                     out.push(chars[i + 1]);
                     i += 2;
                 } else if !is_ps && chars[i] == '\\' && i + 1 < len {
-                    // POSIX: only \", \\, \$, \` are special inside double quotes
+                    // POSIX: only \", \\, \$, \` are special inside double quotes;
+                    // fish leaves `\`` literal.
                     let next = chars[i + 1];
                     if next == '\n' {
                         // POSIX line continuation is removed inside double quotes too.
                         i += 2;
-                    } else if next == '"' || next == '\\' || next == '$' || next == '`' {
+                    } else if next == '"'
+                        || next == '\\'
+                        || next == '$'
+                        || (next == '`' && !is_fish)
+                    {
                         out.push(next);
                         i += 2;
                     } else {
@@ -3330,19 +3387,26 @@ fn python_body_is_known_data_parser(body: &str) -> bool {
 /// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
 /// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
 fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
-    // This proof is for an actual POSIX pipe with no redirection. Other shells
-    // and any redirection keep the ordinary interpreter finding. A leading
-    // assignment is refused because it may set PYTHONINSPECT (or another
-    // interpreter-control variable) for this one process: inspect mode starts a
-    // REPL after the fixed program exits, and that REPL reads the REST OF THE
-    // PIPE as code. Assignments elsewhere in the input are checked by the
-    // caller (`PythonInspectContext::extend`).
-    if shell != ShellType::Posix
-        || !tokenize::leading_env_assignments(&seg.raw).is_empty()
-        || seg.args.iter().any(|arg| {
+    // This proof is for an actual POSIX or fish pipe with no redirection.
+    // Other shells and any redirection keep the ordinary interpreter finding.
+    // A leading assignment is refused because it may set PYTHONINSPECT (or
+    // another interpreter-control variable) for this one process: inspect mode
+    // starts a REPL after the fixed program exits, and that REPL reads the REST
+    // OF THE PIPE as code. Assignments elsewhere in the input are checked by
+    // the caller (`PythonInspectContext::extend`).
+    let redirection = |arg: &String| match shell {
+        ShellType::Fish => {
+            crate::escalation::fish_redirection_token(arg).is_some()
+                || crate::escalation::fish_redirection_suffix(arg).is_some()
+        }
+        _ => {
             crate::escalation::shell_redirection_token(arg).is_some()
                 || crate::escalation::shell_redirection_suffix(arg).is_some()
-        })
+        }
+    };
+    if !matches!(shell, ShellType::Posix | ShellType::Fish)
+        || !tokenize::leading_env_assignments(&seg.raw).is_empty()
+        || seg.args.iter().any(redirection)
     {
         return false;
     }
@@ -3355,7 +3419,7 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
     ) {
         return false;
     }
-    let Some(body) = crate::extract::literal_posix_python_inline_program(&seg.args) else {
+    let Some(body) = crate::extract::literal_python_inline_program(&seg.args, shell) else {
         return false;
     };
     python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
@@ -3427,6 +3491,9 @@ const COMMAND_START_WORDS: &[&str] = &[
     "!", "time", "if", "then", "elif", "else", "do", "while", "until", "function",
 ];
 
+/// fish words that start a new command inside the same tokenizer segment.
+const FISH_COMMAND_START_WORDS: &[&str] = &["and", "or", "not", "begin", "switch"];
+
 const MAX_PYTHON_INSPECT_EVAL_DEPTH: usize = 2;
 
 /// What a checked command (and the commands enclosing it) may have done to
@@ -3486,7 +3553,11 @@ fn segments_may_enable_allexport(segments: &[tokenize::Segment], shell: ShellTyp
                 {
                     return true;
                 }
-                if ALLEXPORT_FLAG_COMMANDS.contains(&normalize_cmd_base(token, shell).as_str()) {
+                let base = normalize_cmd_base(token, shell);
+                // fish `set -a` appends to a list; fish has no allexport.
+                if ALLEXPORT_FLAG_COMMANDS.contains(&base.as_str())
+                    && !(shell == ShellType::Fish && matches!(base.as_str(), "set" | "setopt"))
+                {
                     after_flag_command = true;
                 }
             }
@@ -3504,8 +3575,11 @@ fn segments_may_enable_allexport(segments: &[tokenize::Segment], shell: ShellTyp
 /// command name, `eval`/`trap` with a dynamic word (a literal body is checked
 /// recursively), `source`/`.`/`alias`/`enable` at a command start, an exporting or
 /// name-assigning builtin with any non-literal word, or any non-literal word
-/// while allexport may be on all refuse the exemption. Pipeline stages run in
-/// subshells, but the check does not rely on that. Shell state from before
+/// while allexport may be on all refuse the exemption. In fish, a `set` whose
+/// option or NAME word is not literal and a `function` / `functions` that may
+/// define a python command refuse it too; fish escapes (`PYTHON\x49NSPECT`)
+/// are decoded before the literal check. Pipeline stages run in subshells,
+/// but the check does not rely on that. Shell state from before
 /// this input was typed (functions, aliases, an already-on allexport) cannot
 /// be seen here, apart from an inherited PYTHONINSPECT (the caller's
 /// `inherited_python_inspect`, carried in [`PythonInspectContext`]).
@@ -3576,10 +3650,35 @@ fn segment_may_enable_python_inspect(
             let previous = normalize_shell_token(words[index - 1], shell);
             COMMAND_START_WORDS.contains(&previous.as_str())
                 || ENV_EXPORTING_BUILTINS.contains(&previous.as_str())
+                || (shell == ShellType::Fish
+                    && FISH_COMMAND_START_WORDS.contains(&previous.as_str()))
                 || previous.ends_with(')')
         };
         match normalized.as_str() {
             "source" | "." | "alias" | "enable" if at_command_start => return true,
+            // fish `set [-x|--export|-gx|-Ux ...] NAME [VALUE...]` assigns (and
+            // may export) the variable its first operand names.
+            "set" if shell == ShellType::Fish && at_command_start => {
+                if fish_set_name_may_be_dynamic(&words[index + 1..], shell) {
+                    return true;
+                }
+            }
+            // fish `function NAME ...` and `functions --copy OLD NAME` define a
+            // command for the rest of the input. One named like the python sink
+            // (or not named literally) replaces the proven program with any
+            // body, `python3 -i` included. POSIX function definitions are bound
+            // to their call sites by the executable-body scan instead.
+            "function" | "functions" if shell == ShellType::Fish && at_command_start => {
+                if words[index + 1..].iter().any(|word| {
+                    !command_word_is_statically_bound(word, shell)
+                        || matches!(
+                            normalize_cmd_base(word, shell).as_str(),
+                            "python" | "python2" | "python3"
+                        )
+                }) {
+                    return true;
+                }
+            }
             // `trap` runs its action like `eval` (a DEBUG trap runs it before
             // every later command), so its body is checked the same way.
             "eval" | "trap" => {
@@ -3641,6 +3740,29 @@ fn segment_may_enable_python_inspect(
     let body_segments = tokenize::tokenize(&body, shell);
     let allexport = allexport || segments_may_enable_allexport(&body_segments, shell);
     segments_may_enable_python_inspect(&body_segments, shell, depth + 1, allexport)
+}
+
+/// Whether a fish `set` may assign a variable whose name is not literal: a
+/// non-literal option word or NAME (`set -gx $name 1`, `set $opts NAME`).
+/// The values after NAME may be anything (`set -gx PATH $HOME/bin $PATH`); a
+/// literal PYTHONINSPECT name is refused by the caller's literal check.
+fn fish_set_name_may_be_dynamic(after_set: &[&str], shell: ShellType) -> bool {
+    let mut words = after_set.iter();
+    while let Some(word) = words.next() {
+        if !command_word_is_statically_bound(word, shell) {
+            return true;
+        }
+        let word = normalize_shell_token(word, shell);
+        if word == "--" {
+            return words
+                .next()
+                .is_some_and(|name| !command_word_is_statically_bound(name, shell));
+        }
+        if !word.starts_with('-') || word == "-" {
+            return false;
+        }
+    }
+    false
 }
 
 /// `NAME=value` or `NAME+=value` with a literal identifier NAME, whatever
@@ -13699,6 +13821,93 @@ mod tests {
         }
     }
 
+    /// fish reads the issue #136 data pipeline like POSIX, with a fish-correct
+    /// inspect-mode refusal: `set -x`/`-gx`/`-Ux`/`--export PYTHONINSPECT`, a
+    /// `set` whose option or name is not literal, `read -x $v`, `env`/prefix
+    /// assignments, `-i`, eval/source/alias, and the caller's environment.
+    #[test]
+    fn fish_python_data_pipeline_with_fish_inspect_refusal() {
+        let fires = |input: &str, inherited: bool| {
+            check_with_inherited_python_inspect(
+                input,
+                ShellType::Fish,
+                None,
+                ScanContext::Exec,
+                inherited,
+            )
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::PipeToInterpreter)
+        };
+        for input in [
+            "echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "cat data.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"name\"])'",
+            "gh api x | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'",
+            "echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
+            "echo hi | python3 -c 'import sys; print(sys.stdin.readline())'",
+            "printf 'a\\nb' | python3 -c 'import sys; [print(l) for l in sys.stdin]'",
+            "echo hi | python3 -c \"import sys; print(sys.stdin.read())\"",
+            "set -gx PATH $HOME/bin $PATH; echo hi | python3 -c 'print(1)'",
+            "set -a PATH ~/bin; echo hi | python3 -c 'print(1)'",
+            "set -l f data.json; cat $f | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "begin; echo hi | python3 -c 'print(1)'; end",
+            // Unrelated functions and escapes that cannot spell the name.
+            "function greet; echo hi; end; echo hi | python3 -c 'print(1)'",
+            r"set -gx PYTHON\x48OME /opt/py; echo hi | python3 -c 'print(1)'",
+            "set -x LANG C.UTF-8; echo hi | python3 -c 'import sys; print(sys.stdin.read())'",
+        ] {
+            assert!(!fires(input, false), "{input:?}");
+        }
+        for input in [
+            "set -x PYTHONINSPECT 1; echo hi | python3 -c 'print(1)'",
+            "set -gx PYTHONINSPECT 1; echo hi | python3 -c 'print(1)'",
+            "set -Ux PYTHONINSPECT 1; echo hi | python3 -c 'print(1)'",
+            "set --export PYTHONINSPECT 1; echo hi | python3 -c 'print(1)'",
+            "set -x PYTHON'INSPECT' 1; echo hi | python3 -c 'print(1)'",
+            "set -x PYTHON{INSPECT} 1; echo hi | python3 -c 'print(1)'",
+            "set -gx $name 1; echo hi | python3 -c 'print(1)'",
+            "set -gx -- $name 1; echo hi | python3 -c 'print(1)'",
+            "set $opts NAME 1; echo hi | python3 -c 'print(1)'",
+            "true; and set -gx $name 1; echo hi | python3 -c 'print(1)'",
+            "begin; set -lx $name 1; echo hi | python3 -c 'print(1)'; end",
+            "read -x $v; echo hi | python3 -c 'print(1)'",
+            "export $v=1; echo hi | python3 -c 'print(1)'",
+            "echo hi | env PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo hi | PYTHONINSPECT=1 python3 -c 'print(1)'",
+            "echo hi | python3 -i -c 'print(1)'",
+            "eval $setup; echo hi | python3 -c 'print(1)'",
+            "eval 'set -gx PYTHONINSPECT 1'; echo hi | python3 -c 'print(1)'",
+            "source ./env.fish; echo hi | python3 -c 'print(1)'",
+            "and source ./env.fish; echo hi | python3 -c 'print(1)'",
+            "alias python3 'python3 -i'; echo hi | python3 -c 'print(1)'",
+            // fish decodes unquoted escapes before `set`, `export` and `read`
+            // see the name.
+            r"set -gx PYTHON\x49NSPECT 1; echo hi | python3 -c 'print(1)'",
+            r"set -gx PYTHON\X49NSPECT 1; echo hi | python3 -c 'print(1)'",
+            r"set -gx PYTHON\111NSPECT 1; echo hi | python3 -c 'print(1)'",
+            r"set -gx PYTHON\u0049NSPECT 1; echo hi | python3 -c 'print(1)'",
+            r"set -gx PYTHON\U00000049NSPECT 1; echo hi | python3 -c 'print(1)'",
+            r"export PYTHON\x49NSPECT=1; echo hi | python3 -c 'print(1)'",
+            r"echo 1 | read -gx PYTHON\x49NSPECT; echo hi | python3 -c 'print(1)'",
+            // A fish function can shadow the python sink for the rest of
+            // the input.
+            "function python3; /usr/bin/python3 -i -c 'print(1)'; end; echo hi | python3 -c 'print(1)'",
+            "function python3 -d wrapper; command python3 -i -c 'print(1)'; end; echo hi | python3 -c 'print(1)'",
+            "function $name; /usr/bin/python3 -i; end; echo hi | python3 -c 'print(1)'",
+            "functions -c py python3; echo hi | python3 -c 'print(1)'",
+            "functions --copy py python3; echo hi | python3 -c 'print(1)'",
+            "true; and function python3; end; echo hi | python3 -c 'print(1)'",
+            "echo hi | python3 -c 'print(1)' < /tmp/x",
+            "echo hi | python3 -c (cat prog.py)",
+            "echo hi | python3 -c 'import os; os.system(\"id\")'",
+        ] {
+            assert!(
+                fires(input, false),
+                "inspect source was not refused: {input:?}"
+            );
+        }
+        assert!(fires("echo hi | python3 -c 'print(1)'", true));
+    }
+
     #[test]
     fn inherited_python_inspect_is_the_callers_decision() {
         let input = "echo payload | python3 -c 'print(1)'";
@@ -18434,6 +18643,47 @@ mod tests {
     #[test]
     fn test_normalize_backslash() {
         assert_eq!(normalize_shell_token("ba\\sh", ShellType::Posix), "bash");
+    }
+
+    /// fish decodes unquoted backslash escapes; POSIX keeps the escaped byte.
+    #[test]
+    fn test_normalize_fish_unquoted_escapes() {
+        for (raw, expected) in [
+            (r"ba\sh", "bash"),
+            (r"\x63url", "curl"),
+            (r"\X63url", "curl"),
+            (r"\143url", "curl"),
+            (r"\u0063url", "curl"),
+            (r"\U00000063url", "curl"),
+            (r"PYTHON\x49NSPECT", "PYTHONINSPECT"),
+            (r"a\nb", "a\nb"),
+            (r"a\tb", "a\tb"),
+            (r"a\eb", "a\u{1b}b"),
+            (r"a\cAb", "a\u{1}b"),
+            (r"a\ b", "a b"),
+            (r"a\$b", "a$b"),
+            ("a\\\nb", "ab"),
+            (r"\x4g", "\u{4}g"),
+            (r"\1234", "S4"),
+        ] {
+            assert_eq!(
+                normalize_shell_token(raw, ShellType::Fish),
+                expected,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            normalize_shell_token(r"\x63url", ShellType::Posix),
+            "x63url"
+        );
+        // fish double quotes only escape `"`, `$`, `\` and a newline.
+        assert_eq!(normalize_shell_token(r#""a\`b""#, ShellType::Fish), r"a\`b");
+        assert_eq!(
+            normalize_shell_token(r#""a\$b\"c""#, ShellType::Fish),
+            r#"a$b"c"#
+        );
+        assert_eq!(normalize_shell_token(r#""\x63""#, ShellType::Fish), r"\x63");
+        assert_eq!(normalize_shell_token(r#""a\`b""#, ShellType::Posix), "a`b");
     }
 
     #[test]

@@ -11421,6 +11421,26 @@ fn posix_non_shell_interpreter_input_mode(
     Some(PosixInterpreterInputMode::StdinProgram)
 }
 
+/// The literal `python -c BODY` program of a POSIX or fish invocation, read
+/// with that shell's quoting. Only a leading `-c` counts: an earlier option
+/// (`-i`, `-I`, ...) or a non-literal body is not proven.
+pub(crate) fn literal_python_inline_program(args: &[String], shell: ShellType) -> Option<String> {
+    match shell {
+        ShellType::Posix => literal_posix_python_inline_program(args),
+        ShellType::Fish => {
+            let first = static_wrapper_word(args.first()?, shell)?;
+            if first == "-c" {
+                return static_wrapper_word(args.get(1)?, shell);
+            }
+            first
+                .strip_prefix("-c")
+                .filter(|body| !body.is_empty())
+                .map(str::to_string)
+        }
+        ShellType::PowerShell | ShellType::Cmd => None,
+    }
+}
+
 /// Return only a Python program selected by a leading literal `-c`. A later
 /// `-c` after a script, `-`, `--`, or `-m` is script argv, not source. Startup
 /// options stay outside this proof: `-i` may execute stdin afterward, and

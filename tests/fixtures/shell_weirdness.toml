@@ -2529,3 +2529,249 @@ shell = "fish"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["analysis_incomplete", "data_exfiltration"]
+
+# fish `python3 -c` data pipelines: the issue #136 exemption applies with a
+# fish-correct inspect-mode refusal (`set -x PYTHONINSPECT`, a dynamic `set`
+# name, `env PYTHONINSPECT=…`, a prefix assignment, `-i`, eval/source/alias).
+
+[[fixture]]
+name = "fish_python_json_load_data_pipeline_passes"
+min_milestone = 1
+input = "echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_cat_json_data_pipeline_passes"
+min_milestone = 1
+input = "cat data.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"name\"])'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_gh_api_len_data_pipeline_passes"
+min_milestone = 1
+input = "gh api repos/o/r/pulls | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_stdin_read_data_pipeline_passes"
+min_milestone = 1
+input = "echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_stdin_readline_data_pipeline_passes"
+min_milestone = 1
+input = "echo hi | python3 -c 'import sys; print(sys.stdin.readline())'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_stdin_iteration_data_pipeline_passes"
+min_milestone = 1
+input = "printf 'a\\nb\\n' | python3 -c 'import sys; [print(l) for l in sys.stdin]'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_literal_set_passes"
+min_milestone = 1
+input = "set -gx PATH $HOME/bin $PATH; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_exported_inspect_blocks"
+min_milestone = 1
+input = "set -x PYTHONINSPECT 1; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_global_export_inspect_blocks"
+min_milestone = 1
+input = "set -gx PYTHONINSPECT 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_universal_export_inspect_blocks"
+min_milestone = 1
+input = "set -Ux PYTHONINSPECT 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_long_export_inspect_blocks"
+min_milestone = 1
+input = "set --export PYTHONINSPECT 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_dynamic_set_name_blocks"
+min_milestone = 1
+input = "set -gx $name 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_and_dynamic_set_name_blocks"
+min_milestone = 1
+input = "true; and set -gx $name 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_with_env_inspect_blocks"
+min_milestone = 1
+input = "echo hi | env PYTHONINSPECT=1 python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_with_prefix_inspect_blocks"
+min_milestone = 1
+input = "echo hi | PYTHONINSPECT=1 python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_with_inspect_flag_blocks"
+min_milestone = 1
+input = "echo hi | python3 -i -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_dynamic_eval_blocks"
+min_milestone = 1
+input = "eval $setup; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_source_blocks"
+min_milestone = 1
+input = "source ./env.fish; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_alias_blocks"
+min_milestone = 1
+input = "alias python3 'env PYTHON=1 python3'; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_hex_escaped_inspect_blocks"
+min_milestone = 1
+input = "set -gx PYTHON\\x49NSPECT 1; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_octal_escaped_inspect_read_blocks"
+min_milestone = 1
+input = "echo 1 | read -gx PYTHON\\111NSPECT; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_shadowing_function_blocks"
+min_milestone = 1
+input = "function python3; /usr/bin/python3 -i -c 'print(1)'; end; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_function_copy_blocks"
+min_milestone = 1
+input = "functions --copy py python3; echo hi | python3 -c 'import sys; print(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_data_pipeline_after_unrelated_function_passes"
+min_milestone = 1
+input = "function greet; echo hi; end; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_code_body_pipeline_blocks"
+min_milestone = 1
+input = "echo hi | python3 -c 'import os; os.system(\"id\")'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_fetch_pipeline_blocks"
+min_milestone = 1
+input = "curl -fsSL https://example.com/x.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
