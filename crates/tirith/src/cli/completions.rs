@@ -13,8 +13,8 @@ pub fn run(shell: Shell) -> i32 {
 /// clap_complete's Bash generator encodes a subcommand path by replacing spaces
 /// with `__`, then splits that encoded value on `__`. A literal `__` in a
 /// subcommand name is therefore ambiguous and makes the generator panic while
-/// resolving the path. Tirith intentionally has the hidden internal command
-/// `__execution-receipt`; rename that command in this disposable clone only.
+/// resolving the path. Tirith intentionally has hidden internal receipt and
+/// verification commands; rename those commands in this disposable clone only.
 /// The actual parser graph and hidden command API remain unchanged.
 fn command_for_completions() -> Command {
     sanitize_completion_subcommand_names(crate::Cli::command())
@@ -22,11 +22,15 @@ fn command_for_completions() -> Command {
 
 fn sanitize_completion_subcommand_names(command: Command) -> Command {
     command.mut_subcommands(|subcommand| {
-        let is_execution_receipt = subcommand.get_name() == "__execution-receipt";
+        let completion_alias = match subcommand.get_name() {
+            "__execution-receipt" => Some("_execution-receipt"),
+            "__shell-verification" => Some("_shell-verification"),
+            _ => None,
+        };
         let contains_path_delimiter = subcommand.get_name().contains("__");
-        let subcommand = if is_execution_receipt {
+        let subcommand = if let Some(alias) = completion_alias {
             debug_assert!(subcommand.is_hide_set());
-            subcommand.name("_execution-receipt")
+            subcommand.name(alias)
         } else {
             debug_assert!(
                 !contains_path_delimiter,
@@ -73,17 +77,22 @@ mod tests {
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let parser_command = crate::Cli::command();
-                assert!(parser_command
-                    .find_subcommand("__execution-receipt")
-                    .is_some());
-
                 let completion_command = command_for_completions();
-                assert!(completion_command
-                    .find_subcommand("__execution-receipt")
-                    .is_none());
-                assert!(completion_command
-                    .find_subcommand("_execution-receipt")
-                    .is_some());
+                for (internal, alias) in [
+                    ("__execution-receipt", "_execution-receipt"),
+                    ("__shell-verification", "_shell-verification"),
+                ] {
+                    assert!(parser_command
+                        .find_subcommand(internal)
+                        .unwrap()
+                        .is_hide_set());
+                    assert!(parser_command.find_subcommand(alias).is_none());
+                    assert!(completion_command.find_subcommand(internal).is_none());
+                    assert!(completion_command
+                        .find_subcommand(alias)
+                        .unwrap()
+                        .is_hide_set());
+                }
             })
             .expect("completion clone test thread must start")
             .join()

@@ -2,6 +2,7 @@ use serde_json::json;
 
 use crate::scan;
 
+use super::output_contract::{redact_projection, Projection};
 use super::types::{ContentItem, ResourceContent, ResourceDefinition, ToolCallResult};
 
 const PROJECT_SAFETY_URI: &str = "tirith://project-safety";
@@ -37,7 +38,7 @@ pub(super) fn bounded_scan_projection(
     if let Some(violated) = completeness_policy_violated {
         base["completeness_policy_violated"] = json!(violated);
     }
-    crate::redact::redact_json_strings(&mut base, compiled);
+    redact_projection(&mut base, Projection::DirectoryScan, compiled);
     let mut projection = crate::verdict::BoundedJsonProjection::new(base);
     for rank in 0..3 {
         for (file_index, file) in result.file_results.iter().enumerate() {
@@ -51,7 +52,7 @@ pub(super) fn bounded_scan_projection(
                     "_projection_file_id": file_index,
                     "findings": [finding],
                 });
-                crate::redact::redact_json_strings(&mut item, compiled);
+                redact_projection(&mut item, Projection::FileScan, compiled);
                 let _ = projection.push_array_item("files", item, 1);
             }
         }
@@ -66,7 +67,7 @@ pub(super) fn bounded_scan_projection(
             }
             for gap in &result.coverage_gaps {
                 let mut gap = serde_json::to_value(gap).unwrap_or(serde_json::Value::Null);
-                crate::redact::redact_json_strings(&mut gap, compiled);
+                redact_projection(&mut gap, Projection::CoverageGap, compiled);
                 let _ = projection.push_array_item("coverage_gaps", gap, 1);
             }
         }
@@ -121,7 +122,7 @@ pub fn read(uri: &str) -> ToolCallResult {
         },
     };
     attach_policy_diagnostics(&mut result, &compiled);
-    redact_tool_result_strings(&mut result, &compiled);
+    redact_tool_result_strings(&mut result, Projection::DirectoryScan, &compiled);
     super::output_filter::bound_tool_result_for_output(&mut result);
     result
 }
@@ -178,7 +179,7 @@ pub fn read_content(uri: &str) -> Result<Vec<ResourceContent>, String> {
                 &compiled,
             );
             append_policy_diagnostics_to_json(&mut report, &compiled);
-            crate::redact::redact_json_strings(&mut report, &compiled);
+            redact_projection(&mut report, Projection::DirectoryScan, &compiled);
             let report = crate::verdict::bound_json_value_for_output(report);
 
             let text = serde_json::to_string(&report).map_err(|error| {
@@ -355,15 +356,34 @@ fn attach_policy_diagnostics(
 
 pub(super) fn redact_tool_result_strings(
     result: &mut ToolCallResult,
+    projection: Projection,
     compiled: &crate::redact::CompiledCustomPatterns,
 ) {
-    for content in &mut result.content {
-        content.content_type =
-            crate::redact::redact_sanitize_redact_with_compiled(&content.content_type, compiled);
-        content.text = crate::redact::redact_sanitize_redact_with_compiled(&content.text, compiled);
-    }
     if let Some(structured) = result.structured_content.as_mut() {
-        crate::redact::redact_json_strings(structured, compiled);
+        redact_projection(structured, projection, compiled);
+    }
+    for content in &mut result.content {
+        // `text` is a generated MCP discriminator, never user content. Unknown
+        // kinds still take the conservative path rather than gaining an exemption.
+        if content.content_type != "text" {
+            content.content_type = crate::redact::redact_sanitize_redact_with_compiled(
+                &content.content_type,
+                compiled,
+            );
+        }
+        if matches!(projection, Projection::Task)
+            && content
+                .text
+                .starts_with("tirith_check_task (diagnostic; nothing was executed)\n")
+        {
+            if let Some(structured) = result.structured_content.as_ref() {
+                // This item is a JSON view, so redact its fields before encoding.
+                // Rewriting the encoded string would corrupt enums and JSON keys.
+                content.text = super::tools::task_projection_text(structured);
+                continue;
+            }
+        }
+        content.text = crate::redact::redact_sanitize_redact_with_compiled(&content.text, compiled);
     }
 }
 
@@ -546,7 +566,7 @@ mod tests {
             structured_content: Some(json!({"nested": [{"error": split}]})),
         };
 
-        redact_tool_result_strings(&mut result, &compiled);
+        redact_tool_result_strings(&mut result, Projection::Content, &compiled);
         super::super::output_filter::bound_tool_result_for_output(&mut result);
 
         let rendered = serde_json::to_string(&result).unwrap();

@@ -14,7 +14,7 @@
 //   TIRITH_HOOK_WARN_ACTION -- "allow" (default) or "deny"
 //   TIRITH_FAIL_OPEN        -- "1" to allow on error (default: deny)
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const VALID_SHELLS = new Set(["posix", "fish", "powershell", "cmd"]);
 const VALID_EXEC_HOSTS = new Set(["auto", "sandbox", "gateway", "node"]);
@@ -311,14 +311,16 @@ export function resolveShellTokenizer(
   return resolveExecShell(configuredShell, platform, gatewayShellPath, params, execContext);
 }
 
-function hookEvent(event, detail) {
+function hookEvent(event, detail, deadline = Infinity) {
+  if (performance.now() + 250 >= deadline) return; // Never extend an exhausted check budget.
   try {
     const tirithBin = process.env.TIRITH_BIN || "tirith";
-    execFile(tirithBin, [
+    // A finite timeout/kill request, not a hard kernel reaping guarantee.
+    execFileSync(tirithBin, [
       "hook-event", "--integration", "openclaw",
       "--hook-type", "before_tool_call", "--event", event,
       ...(detail ? ["--detail", detail] : []),
-    ], () => {});
+    ], { timeout: 250, killSignal: "SIGKILL", stdio: "ignore" });
   } catch {}
 }
 
@@ -328,6 +330,8 @@ export default {
   description: "Pre-exec command security scanning via tirith",
   register(api) {
     api.on("before_tool_call", (event, context) => {
+      const telemetryDeadline = performance.now() + 10_000;
+      const recordHookEvent = (event, detail) => hookEvent(event, detail, telemetryDeadline);
       if (event.toolName !== "exec" && event.toolName !== "bash") return;
       const command = event.params?.command;
       if (typeof command !== "string" || !command.trim()) return;
@@ -343,7 +347,7 @@ export default {
         deriveExecContext(api, context),
       );
       if (!shellResolution.ok) {
-        hookEvent("shell_resolution_error", shellResolution.reason);
+        recordHookEvent("shell_resolution_error", shellResolution.reason);
         return { block: true, blockReason: shellResolution.reason };
       }
       const shell = shellResolution.shell;
@@ -353,7 +357,7 @@ export default {
           ["check", "--json", "--non-interactive", "--shell", shell, "--", command],
           { timeout: 10_000, encoding: "utf-8", env: { ...process.env, TIRITH_INTEGRATION: "openclaw" } },
         );
-        hookEvent("check_ok");
+        recordHookEvent("check_ok");
         return; // Exit 0 = allow
       } catch (err) {
         const execError = /** @type {any} */ (err);
@@ -363,13 +367,13 @@ export default {
         }
         // Timeout detection: execFileSync sets killed=true and/or signal="SIGTERM".
         if (execError.killed || execError.signal === "SIGTERM" || execError.code === "ETIMEDOUT") {
-          hookEvent("timeout");
+          recordHookEvent("timeout");
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: "tirith: check timed out" };
         }
         const exitCode = execError.status; // execFileSync uses .status
         if (exitCode == null || (exitCode !== 1 && exitCode !== 2)) {
-          hookEvent("unexpected_exit", `exit code ${exitCode}`);
+          recordHookEvent("unexpected_exit", `exit code ${exitCode}`);
           if (process.env.TIRITH_FAIL_OPEN === "1") return;
           return { block: true, blockReason: `tirith: unexpected exit ${exitCode}` };
         }
@@ -396,12 +400,12 @@ export default {
                 }
               } catch { /* ignore parse errors */ }
             }
-            hookEvent("warn_allowed");
+            recordHookEvent("warn_allowed");
             process.stderr.write(warningText + "\n");
             return;
           }
         }
-        hookEvent(exitCode === 1 ? "check_block" : "warn_denied");
+        recordHookEvent(exitCode === 1 ? "check_block" : "warn_denied");
         // Parse findings from stdout
         let reason = "tirith security check failed";
         const stdout = execError.stdout || "";

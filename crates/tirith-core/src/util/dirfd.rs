@@ -279,6 +279,7 @@ impl DirCapability {
                 windows_directory_access(),
                 windows_directory_options(),
                 windows_directory_attributes(),
+                false,
             )
             .map_err(ChildError::Io)?;
             let facts = windows_handle_facts(&handle).map_err(ChildError::Io)?;
@@ -305,6 +306,17 @@ impl DirCapability {
     /// symlinked component. The type and size gate is an `fstat` of the OPEN
     /// descriptor, so a swap after the open cannot substitute another inode.
     pub(crate) fn open_child_file(&self, name: &str, cap: u64) -> Result<File, OpenRegularError> {
+        self.open_child_file_with_sharing(name, cap, false)
+    }
+
+    fn open_child_file_with_sharing(
+        &self,
+        name: &str,
+        cap: u64,
+        deny_write: bool,
+    ) -> Result<File, OpenRegularError> {
+        #[cfg(not(windows))]
+        let _ = deny_write;
         #[cfg(unix)]
         {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -338,6 +350,7 @@ impl DirCapability {
                 windows_file_access(),
                 windows_file_options(),
                 windows_file_attributes(),
+                deny_write,
             )
             .map_err(classify_windows_file_error)?;
             let facts = windows_handle_facts(&file).map_err(OpenRegularError::Io)?;
@@ -378,12 +391,33 @@ impl DirCapability {
         relative: &str,
         cap: u64,
     ) -> Result<File, OpenRegularError> {
+        self.open_descendant_file_with_sharing(relative, cap, false)
+    }
+
+    /// For bounded content hashing, refuse Windows handles/mappings that can
+    /// write and deny new writers until the returned handle closes. Parent
+    /// traversal remains capability-relative and no-follow. On Unix, callers
+    /// retain the existing before/after generation checks instead.
+    pub(crate) fn open_descendant_file_read_lease(
+        &self,
+        relative: &str,
+        cap: u64,
+    ) -> Result<File, OpenRegularError> {
+        self.open_descendant_file_with_sharing(relative, cap, true)
+    }
+
+    fn open_descendant_file_with_sharing(
+        &self,
+        relative: &str,
+        cap: u64,
+        deny_write: bool,
+    ) -> Result<File, OpenRegularError> {
         let mut components = relative.split('/').peekable();
         let Some(first) = components.next() else {
             return Err(OpenRegularError::NotRegularFile);
         };
         if components.peek().is_none() {
-            return self.open_child_file(first, cap);
+            return self.open_child_file_with_sharing(first, cap, deny_write);
         }
 
         let mut current = self
@@ -391,7 +425,7 @@ impl DirCapability {
             .map_err(child_as_file_error)?;
         while let Some(component) = components.next() {
             if components.peek().is_none() {
-                return current.open_child_file(component, cap);
+                return current.open_child_file_with_sharing(component, cap, deny_write);
             }
             current = current
                 .open_child_directory(component)
@@ -613,6 +647,7 @@ fn windows_open_relative(
     access: u32,
     options: u32,
     attributes: u32,
+    deny_write: bool,
 ) -> std::io::Result<File> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -667,7 +702,11 @@ fn windows_open_relative(
             &mut status_block,
             null(),
             attributes,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            // The read lease refuses preexisting writable handles/mappings
+            // and new writers. DELETE remains shared: the caller binds the
+            // opened identity and performs its existing second tree walk.
+            // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+            FILE_SHARE_READ | FILE_SHARE_DELETE | if deny_write { 0 } else { FILE_SHARE_WRITE },
             FILE_OPEN,
             options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             null(),
@@ -913,23 +952,27 @@ fn stat_at(parent: i32, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
 /// clear, a stale non-zero `errno` makes the read look failed. That is the
 /// fail-closed direction: the walk reports an enumeration gap instead of
 /// returning a listing it cannot vouch for.
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+#[cfg(all(unix, any(target_os = "linux", target_os = "dragonfly")))]
 fn clear_errno() {
-    // SAFETY: __errno_location returns this thread's errno slot.
+    // SAFETY: the target accessor returns this thread's live errno slot.
     unsafe { *libc::__errno_location() = 0 };
 }
 
 #[cfg(all(
     unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly"
-    )
+    any(target_os = "android", target_os = "openbsd", target_os = "netbsd")
 ))]
 fn clear_errno() {
-    // SAFETY: __error returns this thread's errno slot.
+    // SAFETY: the target accessor returns this thread's live errno slot.
+    unsafe { *libc::__errno() = 0 };
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "macos", target_os = "ios", target_os = "freebsd")
+))]
+fn clear_errno() {
+    // SAFETY: the target accessor returns this thread's live errno slot.
     unsafe { *libc::__error() = 0 };
 }
 
@@ -941,7 +984,9 @@ fn clear_errno() {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
-        target_os = "dragonfly"
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
     ))
 ))]
 fn clear_errno() {}
@@ -1003,6 +1048,25 @@ impl Drop for DirStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn directory_eof_does_not_inherit_an_unrelated_errno() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = std::fs::File::open(root.path()).expect("directory");
+        let mut stream = DirStream::adopt(file.into()).expect("directory stream");
+        while stream.next_name().expect("listing").is_some() {}
+        // SAFETY: -1 is never a valid descriptor; close sets this thread's errno.
+        assert_eq!(unsafe { libc::close(-1) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert!(stream
+            .next_name()
+            .expect("clean end of directory")
+            .is_none());
+    }
 
     #[test]
     fn a_listing_reports_every_entry_kind() {

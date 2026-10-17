@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "reviewed",
+  "review": "docs/next-cycle/resource-reference/native-e282d038-v1/activation-review.json; SHA-256 a1d2a8db779bd3f73500eca695102946a61ce8635b26d124d2726d76b9615e88",
+  "budget_path": "docs/next-cycle/resource-reference/native-e282d038-v1/active-budget.json",
+  "budget_sha256": "d17aebcd9503d58f476342ae79ab6ae3d97d5d762a161c9d2f034d006af7705f",
+  "python_runtime": {
+    "version": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]",
+    "sha256": "d8f1d508de5acfd500f20d1949528375ff4a1f470efb267f00d1770941cdeee3"
+  },
+  "tools_sha256": {
+    "scripts/collect-native-resource-reference.py": "26c259e79ec34459a5586a9fbf75839c620ee3f402d3616a09573bf68473a7c2",
+    "scripts/check-resource-budgets.py": "c409c5eb9fec640ecb79f26b6dd82320ac8265103705aca1f1d6131489f9f436",
+    "scripts/record-resource-context.py": "2a2f826578b15be9611bb28cd5625b07ccad36dac92b05e8eee86d698c08c61c"
+  }
+}

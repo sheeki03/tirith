@@ -28,6 +28,39 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
+# Native npm contract review (cd914781): compare all parsed entries with
+# bd9d5068. 89 entries become 90; only pkg install-npm is added, in the existing
+# Package firewall group. No existing identity, relative order, group, inspected
+# value or policy_complete flag changes. Only pkg install coverage prose changes
+# to distinguish its unchanged disabled backend from the separate local-leaf
+# route. manifest_version remains 1. The new entry covers exact local archives
+# only on GNU Linux AArch64, with pinned tools, complete analysis, disabled
+# scripts, current authority/confinement checks and production-signed v2 data.
+# Native runs 36444393465 and 36447327426 supply explicit fixture-authority
+# qualification; production-feed publication remains a separate prerequisite.
+# This reviewed addition replaces digest
+# 36a81bdd0c28147d1395fc208855031bca72d295be07b74b985fe6e083edd6d4.
+# The exact-byte compatibility guard remains unchanged.
+#
+# Next-cycle compatibility review (71070bbb): parsed and compared the complete
+# previous/current manifest before approving this freeze. 88 entries become 89:
+# `review` is added as partial/read-only; zero existing entries are removed,
+# renamed, regrouped or reordered. manifest_version stays 1. Exactly eight
+# existing coverage descriptions change: capsule run (native ARM, conditional
+# controls and release qualification caveat), task check (bounded package
+# families; preview only), dashboard (authenticated typed plans; partial scope),
+# setup (shared journal, configuration is not interception), package (local npm
+# artifact inspection; no install approval), and audit (bounded history and
+# explicitly reviewed lifecycle), pkg install (native prerequisites and incomplete
+# package qualification), and pkg approve (opt-in privileged authority). No
+# `inspected` value changes. Only dashboard
+# changes `policy_complete`, true -> false, to disclose the broader control
+# surface's limits. The existing package-install entries are unchanged in this
+# comparison; this freeze does not certify their native execution coverage.
+# The old full-file digest was
+# 03270b4ec0ce3d38ad081d810a1bedca5b2904f32da05dc3cef9ee1ee8a0929f.
+# This documents reviewed capability evolution; the exact-byte guard remains.
+#
 # Release-documentation truthfulness note: the existing `mcp-server` coverage
 # now distinguishes the six cross-platform tools from the additional
 # `tirith_fetch_cloaking` tool available on Unix. No command, group, inspection
@@ -99,7 +132,10 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # tirith does not download, inspect, or bind the tarball bytes npm installs. No
 # command was added, removed, renamed, or regrouped, and no `inspected` or
 # `policy_complete` value changed; that was a documentation-truth edit only.
-sha256 = "03270b4ec0ce3d38ad081d810a1bedca5b2904f32da05dc3cef9ee1ee8a0929f"
+# Private-input execution qualification refusal: pkg install inspected changes
+# from full to none, and install/approve coverage now describes the refusal.
+# All 89 command identities, order and policy_complete values stay unchanged.
+sha256 = "a7eee1dc51d11e2e1c1df73c48ed997837afc6c73ba7c2f1b1b6ccecbff7ac63"
 
 [mcp]
 default_tools = [
