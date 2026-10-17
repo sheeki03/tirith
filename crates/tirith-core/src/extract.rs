@@ -2472,6 +2472,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
                 }
             }
             Quote::Double => {
+                if shell == ShellType::Posix && ch == '\\' {
+                    if i + 1 >= chars.len() {
+                        return false;
+                    }
+                    i += 2;
+                    continue;
+                }
                 if ch == '"' {
                     quote = Quote::Normal;
                 } else if (ch == '$' && shell != ShellType::Cmd)
@@ -2493,6 +2500,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
                 }
             }
             Quote::Normal => {
+                if shell == ShellType::Posix && ch == '\\' {
+                    if i + 1 >= chars.len() {
+                        return false;
+                    }
+                    i += 2;
+                    continue;
+                }
                 if shell == ShellType::Posix
                     && ch == '$'
                     && chars.get(i + 1).is_some_and(|next| *next == '\'')
