@@ -12,11 +12,11 @@ if set -q _TIRITH_FISH_LOADED
 end
 set -g _TIRITH_FISH_LOADED 1
 
-# Session tracking: generate ID per shell session if not inherited
-if not set -q TIRITH_SESSION_ID
-    set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
-        "$fish_pid" (builtin random) (builtin random) (builtin random))
-end
+# Each freshly loaded shell owns its session, even when its parent exported
+# an ID. The double-source guard preserves this value in the same live shell;
+# ordinary child commands still inherit it for that shell's correlation.
+set -gx TIRITH_SESSION_ID (builtin printf '%x-%x-%x-%x' \
+    "$fish_pid" (builtin random) (builtin random) (builtin random))
 
 # Pin the executable before any repository command can mutate PATH. Refuse an
 # interactive hook when fish cannot resolve an absolute executable path.

@@ -858,9 +858,10 @@ fn capability_paths(
 ) -> Result<(PathBuf, PathBuf), String> {
     let directory = receipt_directory()?;
     // The anchor is intentionally process-scoped, rather than session-scoped.
-    // A nested interactive shell normally inherits TIRITH_SESSION_ID, but it
-    // has a different PID/start identity and therefore receives an independent
-    // one-time bearer. Family, session, and executable remain sealed inside the
+    // New hooks give nested interactive shells fresh session IDs. Even an
+    // older hook sharing an inherited ID has a different PID/start identity and
+    // receives an independent one-time bearer. Family, session, and executable
+    // remain sealed inside the
     // single record for this process so changing any of them cannot mint a
     // second bearer for the same live shell. An in-place `exec` deliberately
     // remains the same one-time identity: because the bearer is non-exported,
@@ -3101,9 +3102,11 @@ pub fn discard_shell_execution_receipt(
 
 /// Reconcile a prior consume attempt without authorizing or promoting any new
 /// execution. `true` means the exact immutable transition was already durable;
-/// `false` means no committed transition exists yet. This is deliberately
-/// separate from `consume`: a hook may clear old recovery state after a lost
-/// acknowledgement, but can never use reconciliation to authorize a replay.
+/// `false` means no committed transition was found. An explicitly reconciled
+/// Consuming receipt with no durable transition becomes Discarded: reconciliation
+/// abandons that attempt rather than reserving another authorization retry. This
+/// is deliberately separate from `consume`: a hook may clear old recovery state
+/// after a lost acknowledgement, but can never authorize a replay.
 pub fn reconcile_shell_execution_receipt(
     token: &str,
     expected_channel: ShellReceiptChannel,
@@ -3120,7 +3123,6 @@ pub fn reconcile_shell_execution_receipt(
         draft_identity_sha256,
         committed_policy_basis_sha256,
         committed_verdict_basis_sha256,
-        consuming_unix_ms,
     ) = match &locked.receipt.state {
         ReceiptState::Committed { .. } => return Ok(true),
         ReceiptState::Conflict { .. } => {
@@ -3138,7 +3140,6 @@ pub fn reconcile_shell_execution_receipt(
             draft_identity_sha256,
             committed_policy_basis_sha256,
             committed_verdict_basis_sha256,
-            consuming_unix_ms,
             ..
         } => (
             observation.clone(),
@@ -3146,7 +3147,6 @@ pub fn reconcile_shell_execution_receipt(
             draft_identity_sha256.clone(),
             committed_policy_basis_sha256.clone(),
             committed_verdict_basis_sha256.clone(),
-            *consuming_unix_ms,
         ),
     };
     match recover_shell_receipt_transition(
@@ -3170,14 +3170,16 @@ pub fn reconcile_shell_execution_receipt(
             Ok(true)
         }
         ShellReceiptRecovery::Missing => {
-            let retry_window_ms =
-                u64::try_from(CONSUMING_RETRY_WINDOW.as_millis()).unwrap_or(u64::MAX);
-            if unix_time_ms()? >= consuming_unix_ms.saturating_add(retry_window_ms) {
-                locked.receipt.state = ReceiptState::Discarded {
-                    finished_unix_ms: unix_time_ms()?,
-                };
-                locked.publish()?;
-            }
+            // Recovery checked the exact evidence under the strict ledger's
+            // stable lock. We still hold this receipt's lock, so no competing
+            // consumer can start or promote this receipt between that absence
+            // check and its terminal publication. Abandon it now; leaving an
+            // old pre-promotion failure Consuming would block every new line
+            // until the unrelated consume-retry window elapsed.
+            locked.receipt.state = ReceiptState::Discarded {
+                finished_unix_ms: unix_time_ms()?,
+            };
+            locked.publish()?;
             Ok(false)
         }
     }
@@ -3343,7 +3345,7 @@ pub fn consume_shell_execution_receipt(
         })?;
     validate_draft(&prepared.draft)?;
     let evidence_id = evidence_id(&locked.receipt);
-    locked.receipt.state = ReceiptState::Consuming {
+    let consuming = ReceiptState::Consuming {
         approval,
         warn_ack_proof_sha256: prepared
             .draft
@@ -3360,9 +3362,15 @@ pub fn consume_shell_execution_receipt(
             None => unix_time_ms()?,
         },
     };
-    locked.publish()?;
-
+    // Acquisition checks the prepared generation and policy under the stable
+    // ledger lock but never promotes this execution. A stale/contended first
+    // attempt must therefore remain Armed and immediately discardable. A prior
+    // Consuming attempt remains uncertain until exact recovery above succeeds.
     let gate = ExecutionGate::acquire(prepared.into_authorizable_draft()?, lock_timeout)?;
+    locked.receipt.state = consuming;
+    // Retain the gate across publication. Consuming must be durable BEFORE any
+    // ledger effect; if publication fails, dropping the gate cannot promote.
+    locked.publish()?;
     let outcome = match gate.promote_shell_unresolved(evidence_id.clone()) {
         Ok(outcome) => outcome,
         Err(error) if is_terminal_execution_replay_conflict(&error) => {
@@ -5045,6 +5053,261 @@ mod tests {
     }
 
     #[test]
+    fn stale_pre_promotion_receipt_is_immediately_discardable_and_fresh_check_commits() {
+        isolated_state(|_, session_id| {
+            let command = "printf competing-shell-generation";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let winner = create(&verdict, &policy, command, session_id, false);
+            let loser = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&winner);
+            arm_allow(&loser);
+            let stale = prepare(&verdict, &policy, command, session_id);
+            let winner_prepared = prepare(&verdict, &policy, command, session_id);
+            consume_shell_execution_receipt(
+                &winner,
+                ShellReceiptChannel::Zsh,
+                command,
+                winner_prepared,
+                Duration::from_secs(1),
+            )
+            .expect("first contender commits");
+            let committed_generation = strict_generation(session_id);
+
+            let error = consume_shell_execution_receipt(
+                &loser,
+                ShellReceiptChannel::Zsh,
+                command,
+                stale,
+                Duration::from_secs(1),
+            )
+            .expect_err("the other contender's prepared generation is stale");
+            assert!(error.contains("execution decision is stale"), "{error}");
+            assert!(matches!(
+                lock_receipt(&loser)
+                    .expect("read losing receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Armed { .. }
+            ));
+            assert_eq!(strict_generation(session_id), committed_generation);
+            discard_shell_execution_receipt(&loser, ShellReceiptChannel::Zsh)
+                .expect("no ledger promotion started: discard without a retry delay");
+            assert!(consume_shell_execution_receipt(
+                &loser,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect_err("discarded token cannot be reused")
+            .contains("discarded"));
+
+            let retry = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&retry);
+            assert!(matches!(
+                consume_shell_execution_receipt(
+                    &retry,
+                    ShellReceiptChannel::Zsh,
+                    command,
+                    prepare(&verdict, &policy, command, session_id),
+                    Duration::from_secs(1),
+                )
+                .expect("an actual fresh check can commit immediately"),
+                PromotionOutcome::Committed { .. }
+            ));
+            assert_eq!(strict_generation(session_id), committed_generation + 1);
+        });
+    }
+
+    #[test]
+    fn first_consume_lock_timeout_does_not_mark_receipt_consuming() {
+        isolated_state(|_, session_id| {
+            let command = "printf contended-shell-lock";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let prepared = prepare(&verdict, &policy, command, session_id);
+            let path = crate::session_warnings::session_lock_path(session_id)
+                .expect("strict session lock path");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open strict session lock");
+            fs2::FileExt::lock_exclusive(&file).expect("hold competing owner");
+            let error = consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepared,
+                Duration::from_millis(20),
+            )
+            .expect_err("bounded lock acquisition refuses contention");
+            fs2::FileExt::unlock(&file).expect("release competing owner");
+            assert!(error.contains("timed out"), "{error}");
+            assert!(matches!(
+                lock_receipt(&token)
+                    .expect("read contended receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Armed { .. }
+            ));
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh)
+                .expect("discard a known pre-promotion failure immediately");
+            assert_eq!(strict_generation(session_id), 0);
+        });
+    }
+
+    #[test]
+    fn reconcile_abandons_missing_consuming_transition_without_waiting_for_retry_window() {
+        isolated_state(|_, session_id| {
+            let command = "printf abandoned-old-consuming-receipt";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            // This is also the state persisted by older clients before a
+            // stale-generation acquisition failed. An unrelated commit must
+            // not prevent safe non-authorizing abandonment of this attempt.
+            let other = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&other);
+            consume_shell_execution_receipt(
+                &other,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect("other shell advances the shared ledger");
+            let generation = strict_generation(session_id);
+            assert!(!reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .expect("exact transition is absent, not committed"));
+            assert!(matches!(
+                lock_receipt(&token)
+                    .expect("read abandoned receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Discarded { .. }
+            ));
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh)
+                .expect("the hook's reconcile-or-discard sequence clears recovery state");
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect_err("abandonment can never authorize a retry")
+            .contains("discarded"));
+            assert_eq!(strict_generation(session_id), generation);
+        });
+    }
+
+    #[test]
+    fn reconcile_missing_transition_requires_ledger_lock_before_abandoning() {
+        isolated_state(|_, session_id| {
+            let command = "printf uncertain-locked-consuming-receipt";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            let original = fs::read(receipt_path(&token)).expect("original consuming bytes");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(crate::session_warnings::session_lock_path(session_id).unwrap())
+                .expect("open strict session lock");
+            fs2::FileExt::lock_exclusive(&file).expect("hold unknown ledger owner");
+            let error = reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_millis(20),
+            )
+            .expect_err("an unavailable ledger cannot prove absence");
+            fs2::FileExt::unlock(&file).expect("release unknown ledger owner");
+            assert!(error.contains("timed out"), "{error}");
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), original);
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+        });
+    }
+
+    #[test]
+    fn reconcile_missing_transition_requires_authenticated_channel_and_state() {
+        isolated_state(|_, session_id| {
+            let command = "printf authenticated-consuming-cleanup";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            let original = fs::read(receipt_path(&token)).expect("original sealed receipt");
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Fish,
+                Duration::from_secs(1),
+            )
+            .is_err());
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), original);
+            let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            value["state"]["evidence_id"] = serde_json::Value::String("changed-evidence".into());
+            let altered = serde_json::to_vec(&value).unwrap();
+            replace_receipt_bytes(&token, &altered);
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .is_err());
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), altered);
+            assert_eq!(strict_generation(session_id), 0);
+        });
+    }
+
+    #[test]
+    fn missing_consuming_transition_can_retry_before_explicit_abandonment() {
+        isolated_state(|_, session_id| {
+            let command = "printf retry-unacknowledged-pre-promotion";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            assert!(matches!(
+                consume_shell_execution_receipt(
+                    &token,
+                    ShellReceiptChannel::Zsh,
+                    command,
+                    prepare(&verdict, &policy, command, session_id),
+                    Duration::from_secs(1),
+                )
+                .expect("unacknowledged pre-promotion retry remains supported"),
+                PromotionOutcome::Committed { .. }
+            ));
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .expect("committed transition remains committed"));
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert_eq!(strict_generation(session_id), 1);
+        });
+    }
+
+    #[test]
     fn consuming_crash_reconciles_durable_commit_without_authorizing_replay() {
         isolated_state(|_, session_id| {
             let command = "printf durable-consuming-crash";
@@ -5094,13 +5357,6 @@ mod tests {
             arm_allow(&token);
             let mut prepared = prepare(&verdict, &policy, command, session_id);
             force_consuming(&token, &mut prepared);
-
-            assert!(!reconcile_shell_execution_receipt(
-                &token,
-                ShellReceiptChannel::Zsh,
-                Duration::from_secs(1),
-            )
-            .expect("missing transition is recoverably absent"));
 
             let mut locked = lock_receipt(&token).expect("lock consuming receipt for aging");
             match &mut locked.receipt.state {

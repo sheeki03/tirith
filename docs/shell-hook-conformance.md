@@ -46,12 +46,19 @@ hook loads, then negotiate protocol v3. Registration creates one process-scoped
 capability bound to the live parent PID and start identity, effective user,
 shell family, session, and Tirith executable identity. The bearer is returned
 only to that shell; its persistent record stores a hash, not the bearer. Nested
-shells therefore register independently even when they inherit one session ID.
+shells register independently and receive a fresh session ID when their hook
+first loads. Re-sourcing an already loaded hook preserves its session ID;
+ordinary commands launched by that shell inherit it. A terminal multiplexer or
+nested shell cannot accidentally share a parent's strict execution ledger.
 Tirith owns approval and warning-acknowledgement interaction before it returns
 an armed receipt; hook code cannot assert either outcome after the decision.
 
 Each receipt is one-shot and follows
-`Prepared → Armed → Consuming → Committed | Conflict | Discarded`. Replay,
+`Prepared → Armed → Consuming → Committed | Conflict | Discarded`. The strict
+ledger lock and generation check precede Consuming publication; a failed
+pre-promotion acquisition remains discardable. Explicit reconciliation of a
+Consuming receipt either recovers its exact durable commit or abandons a proven
+missing transition. It never authorizes execution. Replay,
 command drift, expiry, a different family/session/process, an executable
 replacement, or a durable identity mismatch refuses. Zsh and fish consume at
 the line-acceptance boundary before native handoff; notification-only preexec
