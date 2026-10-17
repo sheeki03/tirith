@@ -514,6 +514,13 @@ fn human_validation_issue(issue: &policy_validate::PolicyIssue, ordinal: usize) 
         "invalid regular expression"
     } else if issue.message.starts_with("unknown field") {
         "unknown policy field"
+    } else if is_dead_list_entry(issue) {
+        if issue.message.contains("'*'") {
+            "allowlist or blocklist entry never matches: its '*' is not a wildcard there; \
+             list the bare host instead"
+        } else {
+            "allowlist entry never matches"
+        }
     } else if issue.message.contains("too long") || issue.message.contains("maximum") {
         "policy value exceeds its allowed size"
     } else {
@@ -524,6 +531,17 @@ fn human_validation_issue(issue: &policy_validate::PolicyIssue, ordinal: usize) 
     };
 
     format!("{category} (issue #{ordinal}; details available with --json)")
+}
+
+/// An allowlist, `allowlist_rules` or blocklist entry the runtime can never
+/// match (CORE-5). Only fixed text is shown for it; the entry and its
+/// replacement stay in the `--json` projection.
+fn is_dead_list_entry(issue: &policy_validate::PolicyIssue) -> bool {
+    issue.level == IssueLevel::Warning
+        && issue.message.contains(" never matches: ")
+        && issue.field.as_deref().is_some_and(|field| {
+            field == "allowlist" || field == "blocklist" || field.starts_with("allowlist_rules.")
+        })
 }
 
 fn bounded_human_value(value: &str, max_chars: usize) -> String {

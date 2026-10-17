@@ -3781,14 +3781,8 @@ pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
     // `*` is a wildcard only as a leading `*.` label. Anywhere else it is a
     // literal byte that no host, URL or image reference carries, so the entry
     // would be recorded as effective without ever matching (#271).
-    if pattern.strip_prefix("*.").unwrap_or(pattern).contains('*') {
-        let host = pattern
-            .split_once("://")
-            .map_or(pattern, |(_, rest)| rest)
-            .split('/')
-            .next()
-            .filter(|host| !host.is_empty() && !host.contains('*'));
-        return Err(match host {
+    if has_misplaced_wildcard(pattern) {
+        return Err(match misplaced_wildcard_host(pattern) {
             Some(host) => format!(
                 "'*' is a wildcard only as a leading '*.' label; to trust everything \
                  under {host}, trust the host itself ('{host}' with --broad), or name \
@@ -3800,6 +3794,51 @@ pub fn validate_trust_pattern(pattern: &str) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+/// Whether `pattern` has a `*` outside a leading `*.` label. Such a `*` is a
+/// literal byte, so the pattern can never match (#271).
+pub fn has_misplaced_wildcard(pattern: &str) -> bool {
+    pattern.strip_prefix("*.").unwrap_or(pattern).contains('*')
+}
+
+/// The host grant that covers what a pattern with a misplaced `*` was meant
+/// to cover: `registry.example.com` for `registry.example.com/*`,
+/// `https://registry.example.com:5000/team/*` or `registry.example.com?tag=*`,
+/// and `*.example.com` for `*.example.com/*`. A domain grant matches the bare
+/// host, so the scheme, user info and port are dropped.
+///
+/// `None` when the pattern has no misplaced `*`, or when the suggestion would
+/// not be a usable domain grant: an IPv6 literal, a dotless name (which would
+/// become a substring grant), a `*` inside the host, or a whole public suffix.
+pub fn misplaced_wildcard_host(pattern: &str) -> Option<&str> {
+    if !has_misplaced_wildcard(pattern) {
+        return None;
+    }
+    let authority = pattern
+        .split_once("://")
+        .map_or(pattern, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.starts_with('[') {
+        return None;
+    }
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => host_port,
+    };
+    let host = host.trim_end_matches('.');
+    let usable = !has_misplaced_wildcard(host)
+        && validate_trust_pattern(host).is_ok()
+        && matches!(
+            classify_trust_pattern(host),
+            TrustScopeKind::Domain | TrustScopeKind::Wildcard
+        );
+    usable.then_some(host)
 }
 
 /// Classify a trust pattern using the same grammar the matcher enforces.
@@ -5607,6 +5646,60 @@ custom_rules:
         ] {
             assert!(validate_trust_pattern(pattern).is_ok(), "{pattern}");
         }
+    }
+
+    /// CORE-5: the host grant named for a misplaced `*` is one that matches
+    /// the host itself: no scheme, user info or port, and never a substring
+    /// or public-suffix grant.
+    #[test]
+    fn misplaced_wildcard_host_names_a_usable_domain_grant() {
+        for (pattern, host) in [
+            ("registry.example.com/*", "registry.example.com"),
+            ("https://registry.example.com/*", "registry.example.com"),
+            ("registry.example.com/team/*", "registry.example.com"),
+            ("registry.example.com:5000/*", "registry.example.com"),
+            (
+                "https://user@registry.example.com:443/*",
+                "registry.example.com",
+            ),
+            ("registry.example.com?tag=*", "registry.example.com"),
+            ("registry.example.com./*", "registry.example.com"),
+            ("*.example.com/*", "*.example.com"),
+        ] {
+            assert_eq!(misplaced_wildcard_host(pattern), Some(host), "{pattern}");
+            let host = misplaced_wildcard_host(pattern).unwrap();
+            assert!(validate_trust_pattern(host).is_ok(), "{pattern} -> {host}");
+            assert!(
+                classify_trust_pattern(host).is_broad(),
+                "{pattern} -> {host}"
+            );
+            assert!(
+                allowlist_pattern_matches(host, "registry.example.com/team/image:latest")
+                    || host == "*.example.com",
+                "{pattern} -> {host}"
+            );
+        }
+        for pattern in [
+            // Valid patterns have nothing to replace.
+            "registry.example.com",
+            "*.example.com",
+            "https://example.com/install.sh",
+            // No usable host grant.
+            "*registry.example.com",
+            "registry.*.com",
+            "localhost/*",
+            "com/*",
+            "*.com/*",
+            "[::1]:8080/*",
+            "example.com:*",
+            "https://*/install.sh",
+        ] {
+            assert_eq!(misplaced_wildcard_host(pattern), None, "{pattern}");
+        }
+        assert!(has_misplaced_wildcard("registry.example.com/*"));
+        assert!(has_misplaced_wildcard("*registry.example.com"));
+        assert!(!has_misplaced_wildcard("*.example.com"));
+        assert!(!has_misplaced_wildcard("registry.example.com"));
     }
 
     #[test]

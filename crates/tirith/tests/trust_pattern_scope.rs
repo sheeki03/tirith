@@ -134,3 +134,157 @@ fn trust_add_refuses_a_star_after_a_host_and_names_the_host_grant() {
         assert_registry_warning(&state, input);
     }
 }
+
+/// CORE-5: a `host/*` entry that 0.4.x stored in the legacy trust store never
+/// matched. `trust list` and `trust migrate` name the exact remedy instead of
+/// a generic "invalid", migrate converts nothing on the operator's behalf, and
+/// running the named remedy gives the host grant that does match.
+#[test]
+fn legacy_star_grant_reports_the_remedy_and_the_remedy_works() {
+    let state = GlobalStateGuard::new().unwrap();
+    let config = tirith_core::policy::config_dir().unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("trust.json"),
+        r#"{"version":1,"entries":[{"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry","ttl_expires":null,"added":"2026-01-01T00:00:00Z","source":"cli"}]}"#,
+    )
+    .unwrap();
+    let remove = "tirith trust remove 'registry.example.com/*' --rule 'docker_untrusted_registry' --scope user";
+    let add = "tirith trust add 'registry.example.com' --broad --rule 'docker_untrusted_registry'";
+
+    // The dead entry never allowed anything.
+    assert_registry_warning(
+        &state,
+        "docker pull registry.example.com/group/image:latest",
+    );
+
+    let listed = tirith(&state, &["trust", "list", "--scope", "user"]);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(listed.status.success(), "{stderr}");
+    assert!(stderr.contains("wildcard_never_matches"), "{stderr}");
+    assert!(stderr.contains(remove) && stderr.contains(add), "{stderr}");
+    assert!(!stderr.contains("use tirith trust migrate"), "{stderr}");
+
+    let migrated = tirith(&state, &["trust", "migrate", "--scope", "user"]);
+    let stderr = String::from_utf8_lossy(&migrated.stderr);
+    assert!(migrated.status.success(), "{stderr}");
+    assert!(stderr.contains("1 legacy entry left in place"), "{stderr}");
+    assert!(stderr.contains(remove) && stderr.contains(add), "{stderr}");
+    let json = tirith(&state, &["trust", "migrate", "--scope", "user", "--json"]);
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        value["skipped"][0]["state_reason"],
+        "wildcard_never_matches"
+    );
+    assert!(value["migrated_ids"].as_array().unwrap().is_empty());
+    // Still nothing allowed: migrate did not convert the entry.
+    assert_registry_warning(
+        &state,
+        "docker pull registry.example.com/group/image:latest",
+    );
+
+    let explained = tirith(&state, &["trust", "explain", "registry.example.com/*"]);
+    let stderr = String::from_utf8_lossy(&explained.stderr);
+    assert!(explained.status.success(), "{stderr}");
+    assert!(stderr.contains(remove), "{stderr}");
+    assert!(stderr.contains("Target pattern:"), "{stderr}");
+
+    // Run the remedy exactly as printed.
+    let removed = tirith(
+        &state,
+        &[
+            "trust",
+            "remove",
+            "registry.example.com/*",
+            "--rule",
+            "docker_untrusted_registry",
+            "--scope",
+            "user",
+        ],
+    );
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let added = tirith(
+        &state,
+        &[
+            "trust",
+            "add",
+            "registry.example.com",
+            "--broad",
+            "--rule",
+            "docker_untrusted_registry",
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let (action, rules) = check(
+        &state,
+        "docker pull registry.example.com/group/image:latest",
+    );
+    assert_eq!(action, "allow", "{rules:?}");
+    assert_registry_warning(&state, "docker pull registry.example.com.evil.example/x:1");
+    let listed = tirith(&state, &["trust", "list", "--scope", "user"]);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(!stderr.contains("wildcard_never_matches"), "{stderr}");
+}
+
+/// CORE-5: `policy validate` reports a `host/*` allowlist entry (which never
+/// matches) with the entry that does, as a warning, instead of "valid".
+#[test]
+fn policy_validate_reports_star_allowlist_entries_with_the_host_entry() {
+    let state = GlobalStateGuard::new().unwrap();
+    let path = state.roots().cwd.join("policy.yaml");
+    std::fs::write(
+        &path,
+        "allowlist:\n  - registry.example.com/*\nblocklist:\n  - '*.bad.example'\n",
+    )
+    .unwrap();
+    let path = path.to_str().unwrap();
+    let output = tirith(&state, &["policy", "validate", path]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "warnings only: {stderr}");
+    assert!(!stderr.contains("valid, no issues"), "{stderr}");
+    // Human output names the problem with fixed text only (policy values are
+    // never echoed there); the entry and its replacement are in --json.
+    assert_eq!(
+        stderr
+            .matches("allowlist or blocklist entry never matches: its '*' is not a wildcard")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("registry.example.com"), "{stderr}");
+    let json = tirith(&state, &["policy", "validate", path, "--json"]);
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["warning_count"], 2);
+    let messages: Vec<&str> = value["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|issue| issue["message"].as_str().unwrap())
+        .collect();
+    assert!(
+        messages.iter().any(|m| m
+            .contains("allowlist entry 'registry.example.com/*' never matches")
+            && m.contains("use 'registry.example.com'")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("use 'bad.example' to block")),
+        "{messages:?}"
+    );
+
+    std::fs::write(path, "allowlist:\n  - registry.example.com\n").unwrap();
+    let output = tirith(&state, &["policy", "validate", path]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("valid, no issues"), "{stderr}");
+}
