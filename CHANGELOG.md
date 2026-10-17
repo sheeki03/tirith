@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- POSIX shell and paste checks recognize literal backslash escapes in nested command bodies, including the `'\''` quote sequence used by shell launchers, instead of blocking them as incomplete analysis. Dynamic expansions still fail closed, and recovered command bodies still receive threat analysis.
+
 ## [0.4.2] - 2026-09-11
 
 ### Fixed
