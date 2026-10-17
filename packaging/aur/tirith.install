@@ -7,6 +7,9 @@ post_install() {
   echo "  fish (~/.config/fish/config.fish):      tirith init --shell fish | source"
   echo ""
   echo "Then restart your terminal. Verify: tirith doctor"
+  echo "Native package approval is optional and never elevates automatically."
+  echo "Only 'tirith pkg approve' needs trusted sudo plus fresh administrator confirmation."
+  echo "Without it, package approval is unavailable; normal command checks and shell protection still work."
   echo ""
 }
 
