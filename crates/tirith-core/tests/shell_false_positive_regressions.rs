@@ -195,6 +195,8 @@ fn posix_escapes_do_not_hide_dynamic_wrapper_words() {
         r#"sh -c "echo \"$BODY\"""#,
         r#"sh -c "echo \\$BODY""#,
         r#"sh -c 'echo '\'"#,
+        r#"sh -c echo\"#,
+        r#"sh -c "echo\"#,
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             let verdict = analyze(input, context, true);
