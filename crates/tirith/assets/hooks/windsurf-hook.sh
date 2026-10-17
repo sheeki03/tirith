@@ -48,21 +48,44 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo "tirith: configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1" >&2; exit 2
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('tool_info',{}).get('command_line',''))" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
-if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
+# The first line is "ok" only for a non-empty string command line; anything
+# else (a missing, null, non-string, or blank command, or a non-object
+# tool_info) is "invalid" and is denied below without a check. A non-string
+# command is never stringified and checked.
+PARSED=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+if not isinstance(d, dict):
+    sys.exit(1)
+info = d.get('tool_info')
+cmd = info.get('command_line') if isinstance(info, dict) else None
+ok = isinstance(cmd, str) and cmd.strip() != ''
+print('ok' if ok else 'invalid')
+print(cmd if ok else '')
+" <<< "$INPUT" 2>/dev/null); PARSE_RC=$?
+if [ "$PARSE_RC" -ne 0 ] || [ -z "$PARSED" ]; then
   _tirith_hook_event parse_error
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
   echo "tirith: failed to parse hook input — blocked for safety" >&2; exit 2
+fi
+COMMAND_STATE=$(echo "$PARSED" | head -n 1)
+COMMAND=$(echo "$PARSED" | tail -n +2)
+if [ "$COMMAND_STATE" != "ok" ] || [ -z "$COMMAND" ]; then
+  _tirith_hook_event parse_error "no command in shell hook input"
+  if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then exit 0; fi
+  echo "tirith: no command found in hook input — blocked for safety" >&2; exit 2
 fi
 RESULT=$(TIRITH_INTEGRATION=windsurf "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
 RC=$?  # No || true: we need the actual exit code. Without set -e, script continues safely.
 
 if [ "$RC" -eq 2 ]; then
-  WARN_ACTION=$(echo "${TIRITH_HOOK_WARN_ACTION:-allow}" | tr '[:upper:]' '[:lower:]')
-  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
-    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
-    WARN_ACTION="allow"
-  fi
+  WARN_ACTION_RAW="${TIRITH_HOOK_WARN_ACTION:-allow}"
+  WARN_ACTION=$(printf '%s' "$WARN_ACTION_RAW" | tr '[:upper:]' '[:lower:]')
+  case "$WARN_ACTION" in
+    allow|ask|deny) ;;
+    # An unparseable security setting fails closed.
+    *) WARN_ACTION="invalid" ;;
+  esac
 fi
 
 # Validate the machine contract before either execution-permitting exit.
@@ -76,7 +99,7 @@ print('required' if v['requires_approval'] else 'none')
 " <<< "$RESULT" 2>/dev/null)
   if [ "$?" -ne 0 ]; then
     _tirith_hook_event parse_error "invalid check approval metadata"
-    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then exit 0; fi
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" = "allow" ]; }; then exit 0; fi
     echo "Tirith: invalid approval metadata from security check — blocked for safety" >&2; exit 2
   fi
   if [ "$APPROVAL_STATE" = "required" ]; then
@@ -115,17 +138,26 @@ if [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
   exit 2
 fi
 
-# Exit 2 = warn (Medium/Low findings) — check TIRITH_HOOK_WARN_ACTION
+# Exit 2 = warn (Medium/Low findings) — check TIRITH_HOOK_WARN_ACTION. Windsurf
+# hooks can only block or not, so a warning that is not blocked is answered
+# exactly like a clean command (exit 0) and never approves anything.
 if [ "$RC" -eq 2 ]; then
-  if [ "$WARN_ACTION" = "deny" ]; then
-    _tirith_hook_event warn_denied
+  if [ "$WARN_ACTION" = "allow" ]; then
+    # allow: print warnings to stderr, but let the command through
+    _tirith_hook_event warn_allowed
     _findings_summary >&2
-    exit 2
+    exit 0
   fi
-  # allow: print warnings to stderr, but let the command through
-  _tirith_hook_event warn_allowed
+  _tirith_hook_event warn_denied
+  if [ "$WARN_ACTION" = "invalid" ]; then
+    echo "tirith: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION_RAW' (valid values: allow, ask, deny) — warning blocked for safety." >&2
+  fi
   _findings_summary >&2
-  exit 0
+  if [ "$WARN_ACTION" = "ask" ]; then
+    # Windsurf has no confirmation prompt a hook can request.
+    echo "tirith: blocked; TIRITH_HOOK_WARN_ACTION=ask needs a confirmation prompt this host hook does not have. Review the command and retry from a Tirith-protected interactive shell to confirm it." >&2
+  fi
+  exit 2
 fi
 if [ "$RC" -eq 3 ]; then
   # WarnAck is an execution gate, not a checker failure eligible for fail-open.

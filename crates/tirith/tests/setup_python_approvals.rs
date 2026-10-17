@@ -102,17 +102,40 @@ impl Adapter {
         warn_action: &str,
         mutation: Option<&str>,
     ) -> Output {
+        self.run_with_warn_action(
+            state,
+            checker,
+            command,
+            fail_open,
+            Some(warn_action),
+            mutation,
+        )
+    }
+
+    /// Like `run`, with `None` leaving TIRITH_HOOK_WARN_ACTION unset.
+    fn run_with_warn_action(
+        &self,
+        state: &GlobalStateGuard,
+        checker: &Path,
+        command: &str,
+        fail_open: bool,
+        warn_action: Option<&str>,
+        mutation: Option<&str>,
+    ) -> Output {
         let mut process = Command::new("python3");
         state.apply_to_command(&mut process);
         process
             .arg(&self.path)
             .env("TIRITH_BIN", checker)
             .env("TIRITH_HOOK_PROTOCOL", self.protocol())
-            .env("TIRITH_HOOK_WARN_ACTION", warn_action)
             .env("TIRITH_FAIL_OPEN", if fail_open { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        match warn_action {
+            Some(value) => process.env("TIRITH_HOOK_WARN_ACTION", value),
+            None => process.env_remove("TIRITH_HOOK_WARN_ACTION"),
+        };
         if let Some(mutation) = mutation {
             process.env("TIRITH_TEST_APPROVAL_MUTATION", mutation);
         }
@@ -151,6 +174,9 @@ impl Adapter {
             return;
         }
         let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if !expected {
+            self.assert_no_approval(&decision, output);
+        }
         let denied = match self.host {
             Host::Claude | Host::WorktreeClaude => {
                 decision["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -163,6 +189,26 @@ impl Adapter {
             Host::Kiro => unreachable!(),
         };
         assert_eq!(denied, expected, "{:?}: {output:?}", self.host);
+    }
+
+    /// A command Tirith lets through is never an explicit approval: an allow
+    /// would skip the host's own permission prompt (Claude Code documents
+    /// "allow" as skipping it), making a flagged command less gated than a
+    /// clean one.
+    fn assert_no_approval(&self, decision: &Value, output: &Output) {
+        let explicit = match self.host {
+            Host::Claude | Host::WorktreeClaude => {
+                decision["hookSpecificOutput"].get("permissionDecision")
+            }
+            Host::Grok | Host::OpenHands | Host::Gemini => decision.get("decision"),
+            Host::Copilot => decision.get("permissionDecision"),
+            Host::Cline | Host::ClineBatch | Host::Kiro => None,
+        };
+        assert!(
+            explicit.is_none(),
+            "{:?}: an allowed command must carry no permission decision: {output:?}",
+            self.host
+        );
     }
 }
 
@@ -370,6 +416,152 @@ fn installed_python_adapters_preserve_warnings_and_blocks_but_deny_active_approv
 }
 
 #[test]
+fn installed_python_adapters_answer_warnings_without_approving_them() {
+    let state = state();
+    let adapters = adapters(&state);
+    let checker = Path::new(env!("CARGO_BIN_EXE_tirith"));
+    user_policy("LOW", false);
+    let (warning_output, warning) = check(&state, WARNING_COMMAND);
+    assert_eq!(warning_output.status.code(), Some(2));
+    assert_eq!(warning["requires_approval"], false);
+
+    // The default (unset, empty or "allow") passes the warning on with no
+    // permission decision, through the fields each host shows the user or
+    // the agent, so the host applies its own permission rules.
+    for warn_action in [None, Some(""), Some("allow"), Some("ALLOW")] {
+        for adapter in &adapters {
+            let output = adapter.run_with_warn_action(
+                &state,
+                checker,
+                WARNING_COMMAND,
+                false,
+                warn_action,
+                None,
+            );
+            adapter.assert_denied(&output, false);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match adapter.host {
+                Host::Claude | Host::WorktreeClaude => {
+                    let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    for message in [
+                        &decision["systemMessage"],
+                        &decision["hookSpecificOutput"]["additionalContext"],
+                    ] {
+                        let message = message.as_str().expect("warning for user and model");
+                        assert!(message.contains("[LOW]"), "{message}");
+                        assert!(message.contains("(shortened_url)"), "{message}");
+                    }
+                    assert_eq!(
+                        decision["hookSpecificOutput"]["hookEventName"],
+                        "PreToolUse"
+                    );
+                }
+                Host::Grok => {
+                    assert!(stdout.trim().is_empty(), "{output:?}");
+                    assert!(stderr.contains("shortened_url"), "{output:?}");
+                }
+                Host::Cline | Host::ClineBatch => {
+                    let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(decision["cancel"], false);
+                    assert!(decision["contextModification"]
+                        .as_str()
+                        .unwrap()
+                        .contains("shortened_url"));
+                }
+                Host::OpenHands => {
+                    let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert!(decision["additionalContext"]
+                        .as_str()
+                        .unwrap()
+                        .contains("shortened_url"));
+                }
+                Host::Copilot | Host::Gemini => assert!(stdout.trim().is_empty(), "{output:?}"),
+                Host::Kiro => {}
+            }
+        }
+    }
+
+    // "ask" asks where the host has a confirmation prompt, and is denied with
+    // interactive-shell guidance where it has none.
+    for adapter in &adapters {
+        let output = adapter.run(&state, checker, WARNING_COMMAND, true, "ask", None);
+        match adapter.host {
+            Host::Claude | Host::WorktreeClaude => {
+                assert!(output.status.success(), "{output:?}");
+                let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+                let specific = &decision["hookSpecificOutput"];
+                assert_eq!(specific["permissionDecision"], "ask", "{decision}");
+                assert!(specific["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("shortened_url"));
+                assert!(specific["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .contains("shortened_url"));
+            }
+            Host::Copilot => {
+                let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(decision["permissionDecision"], "ask", "{decision}");
+                assert!(decision["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Shortened URL"));
+            }
+            _ => {
+                adapter.assert_denied(&output, true);
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(text.contains("TIRITH_HOOK_WARN_ACTION=ask"), "{output:?}");
+                assert!(text.contains("interactive shell"), "{output:?}");
+            }
+        }
+    }
+
+    // An unrecognized value fails closed and names the valid values, even
+    // when the operator fails open on checker errors.
+    for warn_action in ["block", "allow-auto", "warn"] {
+        for adapter in &adapters {
+            for fail_open in [false, true] {
+                let output = adapter.run(
+                    &state,
+                    checker,
+                    WARNING_COMMAND,
+                    fail_open,
+                    warn_action,
+                    None,
+                );
+                adapter.assert_denied(&output, true);
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    text.contains("valid values: allow, ask, deny"),
+                    "{output:?}"
+                );
+                assert!(text.contains(warn_action), "{output:?}");
+            }
+        }
+    }
+
+    // A clean command is unaffected by the warn action, valid or not.
+    for warn_action in ["ask", "deny", "block"] {
+        for adapter in &adapters {
+            adapter.assert_denied(
+                &adapter.run(&state, checker, CLEAN_COMMAND, false, warn_action, None),
+                false,
+            );
+        }
+    }
+}
+
+#[test]
 fn installed_python_adapters_require_confirmation_for_otherwise_allowed_findings() {
     let state = state();
     let adapters = adapters(&state);
@@ -539,8 +731,9 @@ fn damaged_python_checker_output_cannot_relax_a_denying_verdict() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(value["requires_approval"], false);
     let checker = damaged_checker(&state, WARNING_COMMAND, &output);
-    // The operator denies warnings, so a damaged warning response stays denied
-    // even with TIRITH_FAIL_OPEN=1, as the shell and TypeScript adapters do.
+    // The operator gates warnings (deny, ask, or an unrecognized value), so a
+    // damaged warning response stays denied even with TIRITH_FAIL_OPEN=1, as
+    // the shell and TypeScript adapters do.
     for mutation in [
         "absent",
         "string",
@@ -551,7 +744,7 @@ fn damaged_python_checker_output_cannot_relax_a_denying_verdict() {
         "empty",
     ] {
         for adapter in &adapters {
-            for warn_action in ["deny", "DENY"] {
+            for warn_action in ["deny", "DENY", "ask", "block"] {
                 adapter.assert_denied(
                     &adapter.run(
                         &state,

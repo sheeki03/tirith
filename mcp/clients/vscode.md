@@ -123,7 +123,7 @@ Expected: blocked by Tirith.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | path pinned by setup | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with findings in `additionalContext`, `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes a warning on with no permission decision (`systemMessage` for you, `additionalContext` for the model; VS Code's own confirmation rules decide), `ask` asks you to confirm, `deny` blocks it; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Hook decision logic
@@ -136,8 +136,14 @@ silent exit 0):
 - Exit 0 from tirith: allow, unless the JSON has `requires_approval: true`,
   then deny.
 - Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`),
-  findings in `additionalContext`. Set `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- Exit 2: warn. A warning is never an approval. By default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) the hook answers without a
+  `permissionDecision`, so VS Code applies its own confirmation rules exactly
+  as for a clean command; the warning (severity, title, rule id and a short
+  fix) reaches you as a `systemMessage` and the model as `additionalContext`.
+  `TIRITH_HOOK_WARN_ACTION=ask` answers `permissionDecision: "ask"` with the
+  warning as the reason; `deny` blocks; any other value blocks and names the
+  valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -148,7 +154,7 @@ silent exit 0):
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit code, or a missing binary or Python interpreter: **deny**
   (fail-closed by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
@@ -158,7 +164,10 @@ deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
-it.
+it. Because the hook runs on the agent's behalf, that grant extends to the
+agent itself: it can prefix `TIRITH=0` to any command and skip every check,
+including blocks, `approval_rules` and `strict_warn`. Enable
+`allow_bypass_env_noninteractive` only for trusted automation.
 
 ## Upgrading
 

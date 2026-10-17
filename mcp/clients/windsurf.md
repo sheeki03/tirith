@@ -105,7 +105,7 @@ Expected: blocked by Tirith (exit code 2, reason on stderr).
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | path pinned by setup | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with findings on stderr, `deny` blocks them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings on stderr, exit 0), `deny` blocks them; `ask` is denied with guidance because Windsurf has no confirmation prompt for this integration; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Hook decision logic
@@ -117,8 +117,12 @@ the reason on stderr.
 - Exit 0 from tirith: allow, unless the JSON has `requires_approval: true`,
   then deny.
 - Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
-- Exit 2: warn -- allowed by default (`TIRITH_HOOK_WARN_ACTION=allow`),
-  findings on stderr. Set `TIRITH_HOOK_WARN_ACTION=deny` to block.
+- Exit 2: warn. By default (`TIRITH_HOOK_WARN_ACTION=allow`) the command is
+  answered exactly like a clean one (findings on stderr, exit 0); a warning
+  never approves anything. `deny` blocks. `ask` is denied with guidance to
+  confirm from a Tirith-protected interactive shell, because Windsurf has no
+  confirmation prompt this integration can request. Any other value blocks and
+  names the valid values (`allow`, `ask`, `deny`).
 - `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
   or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
   `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
@@ -129,7 +133,7 @@ the reason on stderr.
   `TIRITH_FAIL_OPEN`.
 - Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
   2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
-  `TIRITH_HOOK_WARN_ACTION=deny` stays denied.
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
 - Any other exit code, or a missing binary or Python interpreter: **deny**
   (fail-closed by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
@@ -139,7 +143,10 @@ deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
-it.
+it. Because the hook runs on the agent's behalf, that grant extends to the
+agent itself: it can prefix `TIRITH=0` to any command and skip every check,
+including blocks, `approval_rules` and `strict_warn`. Enable
+`allow_bypass_env_noninteractive` only for trusted automation.
 
 ## Upgrading
 

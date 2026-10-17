@@ -29,6 +29,8 @@ pub(crate) mod shell_service;
 mod tools;
 mod yaml_edit;
 pub(crate) use shell_profile::shell_quote;
+#[cfg(unix)]
+pub(crate) use tools::pre_tool_use_wrapper;
 pub(crate) use tools::{
     cline_hooks_dir, omp_user_guard_path, openclaw_state_dir_override, pi_cli_user_guard_path,
     prime_agent_user_guard_path,
@@ -473,28 +475,60 @@ mod run_impl {
     }
 
     /// Resolve a dependency that generated security configuration will execute
-    /// later. The first PATH hit is authoritative: a project/temp shadow is an
-    /// error, not a reason to skip ahead to a more convenient interpreter.
+    /// later, and return the absolute path setup pins into that configuration.
+    ///
+    /// Every PATH hit is validated and none is executed. An untrusted hit (a
+    /// project or temp shadow, or a package-manager tree writable by a group,
+    /// such as Homebrew's default `/opt/homebrew/Cellar`) is never pinned:
+    /// setup names it on stderr and pins the next trusted hit instead. The
+    /// generated hook runs only the pinned path, so a skipped shadow never
+    /// runs. With no trusted hit, the first refusal is reported together with
+    /// the way to fix it.
     pub(super) fn resolve_hook_dependency(
         names: &[&str],
         label: &str,
         dry_run: bool,
     ) -> Result<Option<String>, String> {
+        let path_value = std::env::var_os("PATH").unwrap_or_default();
+        let denied_roots = tirith_core::trusted_child::ambient_denied_roots();
+        let mut refused: Vec<String> = Vec::new();
         for name in names {
-            match tirith_core::trusted_child::resolve_ambient(name) {
-                Ok(executable) => {
-                    executable.revalidate().map_err(|error| {
-                        format!("validated {label} executable changed during setup: {error}")
-                    })?;
-                    return path_to_utf8(executable.invocation_path(), label).map(Some);
+            for dir in std::env::split_paths(&path_value) {
+                if dir.as_os_str().is_empty() {
+                    continue;
                 }
-                Err(tirith_core::trusted_child::TrustedExecutableError::NotFound(_)) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "refusing untrusted {label} executable selected from PATH: {error}"
-                    ));
+                // Validate one PATH entry at a time; an entry that cannot be
+                // expressed as a one-entry PATH is skipped.
+                let Ok(entry) = std::env::join_paths([&dir]) else {
+                    continue;
+                };
+                match tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
+                    name,
+                    &entry,
+                    &denied_roots,
+                ) {
+                    Ok(executable) => {
+                        executable.revalidate().map_err(|error| {
+                            format!("validated {label} executable changed during setup: {error}")
+                        })?;
+                        let pinned = path_to_utf8(executable.invocation_path(), label)?;
+                        for refusal in &refused {
+                            eprintln!(
+                                "tirith: note: skipped untrusted {label} executable on PATH ({refusal}); pinning {pinned}"
+                            );
+                        }
+                        return Ok(Some(pinned));
+                    }
+                    Err(tirith_core::trusted_child::TrustedExecutableError::NotFound(_)) => {}
+                    Err(error) => refused.push(format!("{}: {error}", dir.join(name).display())),
                 }
             }
+        }
+        if let Some(first) = refused.first() {
+            return Err(format!(
+                "refusing untrusted {label} executable selected from PATH: {first}; no trusted {label} executable was found on PATH. Put a root-managed interpreter (for example /usr/bin/{}) earlier on PATH and re-run setup",
+                names.first().copied().unwrap_or("python3")
+            ));
         }
         if dry_run {
             eprintln!("tirith: WARNING: {label} not found on PATH");
@@ -912,6 +946,68 @@ mod run_impl {
                     !marker.exists(),
                     "dependency validation must never execute a PATH shadow"
                 );
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn hook_dependency_skips_an_untrusted_path_hit_for_a_later_trusted_one() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+            // Needs a root-managed interpreter the trust policy accepts.
+            let system = Path::new("/usr/bin");
+            let trusted = tirith_core::trusted_child::TrustedExecutable::resolve_on_path(
+                "python3",
+                system.as_os_str(),
+                &tirith_core::trusted_child::ambient_denied_roots(),
+            );
+            let Ok(trusted) = trusted else {
+                eprintln!("skipping: /usr/bin/python3 is absent or not trusted here");
+                return;
+            };
+            let expected = trusted.invocation_path().to_str().unwrap().to_owned();
+            with_fake_env(true, |_home, cwd| {
+                let cwd = cwd.expect("isolated cwd");
+                let bin = cwd.join("bin");
+                let marker = cwd.join("python-was-executed");
+                write_executable(
+                    &bin.join("python3"),
+                    &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+                );
+                let path = std::env::join_paths([bin.as_path(), system]).unwrap();
+                let _path = EnvGuard::set("PATH", Path::new(&path));
+
+                let pinned = resolve_hook_dependency(&["python3"], "Python", false)
+                    .expect("a later trusted interpreter is pinned")
+                    .expect("not a dry run");
+                assert_eq!(pinned, expected);
+                assert!(
+                    !marker.exists(),
+                    "dependency validation must never execute a PATH shadow"
+                );
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn hook_dependency_with_no_trusted_hit_names_the_fix() {
+            use crate::cli::test_harness::{with_fake_env, EnvGuard};
+
+            with_fake_env(true, |_home, cwd| {
+                let cwd = cwd.expect("isolated cwd");
+                let bin = cwd.join("bin");
+                write_executable(&bin.join("python3"), "#!/bin/sh\nexit 0\n");
+                let _path = EnvGuard::set("PATH", &bin);
+                let error = resolve_hook_dependency(&["python3"], "Python", false).unwrap_err();
+                assert!(
+                    error.contains("refusing untrusted Python executable"),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("earlier on PATH and re-run setup"),
+                    "{error}"
+                );
+                assert!(error.contains("/usr/bin/python3"), "{error}");
             });
         }
 

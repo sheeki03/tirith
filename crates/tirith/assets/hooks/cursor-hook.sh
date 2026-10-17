@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # Tirith security hook for Cursor (beforeShellExecution)
+#
+# Cursor requires a `permission` value in every response (a response that does
+# not match its schema blocks the action), and a clean command is answered
+# "allow". A warning therefore gets the same answer as a clean command, so it
+# is never less gated than one, with the findings in user_message and
+# agent_message. TIRITH_HOOK_WARN_ACTION=ask asks the user to confirm, deny
+# blocks, and any other value blocks.
 set -uo pipefail  # No -e: we handle errors explicitly per command
 # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin() —
 # either "tirith" (portable) or "/abs/path/to/tirith" (fallback)
@@ -53,14 +60,35 @@ if [ ! -x "$TIRITH_PYTHON" ]; then
   echo '{"permission":"deny","user_message":"configured Python interpreter is unavailable — re-run tirith setup or set TIRITH_FAIL_OPEN=1"}'; exit 0
 fi
 INPUT=$(cat) || true  # guard: cat failure → empty string → deny path below
-COMMAND=$("$TIRITH_PYTHON" -I -S -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('command',''))" <<< "$INPUT" 2>/dev/null)
+# The first line is "ok" only for a non-empty string command; anything else (a
+# missing, null, non-string, or blank command) is "invalid" and is denied below
+# without a check. A non-string command is never stringified and checked.
+PARSED=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+if not isinstance(d, dict):
+    sys.exit(1)
+cmd = d.get('command')
+ok = isinstance(cmd, str) and cmd.strip() != ''
+print('ok' if ok else 'invalid')
+print(cmd if ok else '')
+" <<< "$INPUT" 2>/dev/null)
 PARSE_RC=$?
-if [ "$PARSE_RC" -ne 0 ] || [ -z "$COMMAND" ]; then
+if [ "$PARSE_RC" -ne 0 ] || [ -z "$PARSED" ]; then
   _tirith_hook_event parse_error
   if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then
     echo '{"permission":"allow"}'; exit 0
   fi
   echo '{"permission":"deny","user_message":"tirith: failed to parse hook input — blocked for safety"}'; exit 0
+fi
+COMMAND_STATE=$(echo "$PARSED" | head -n 1)
+COMMAND=$(echo "$PARSED" | tail -n +2)
+if [ "$COMMAND_STATE" != "ok" ] || [ -z "$COMMAND" ]; then
+  _tirith_hook_event parse_error "no command in shell hook input"
+  if [ "${TIRITH_FAIL_OPEN:-}" = "1" ]; then
+    echo '{"permission":"allow"}'; exit 0
+  fi
+  echo '{"permission":"deny","user_message":"tirith: no command found in hook input — blocked for safety"}'; exit 0
 fi
 RESULT=$(TIRITH_INTEGRATION=cursor "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
 RC=$?  # No || true here: we need the actual exit code. Without set -e, script continues safely.
@@ -87,12 +115,13 @@ except Exception:
 }
 
 if [ "$RC" -eq 2 ]; then
-  WARN_ACTION="${TIRITH_HOOK_WARN_ACTION:-allow}"
-  WARN_ACTION=$(echo "$WARN_ACTION" | tr '[:upper:]' '[:lower:]')
-  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
-    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
-    WARN_ACTION="allow"
-  fi
+  WARN_ACTION_RAW="${TIRITH_HOOK_WARN_ACTION:-allow}"
+  WARN_ACTION=$(printf '%s' "$WARN_ACTION_RAW" | tr '[:upper:]' '[:lower:]')
+  case "$WARN_ACTION" in
+    allow|ask|deny) ;;
+    # An unparseable security setting fails closed.
+    *) WARN_ACTION="invalid" ;;
+  esac
 fi
 
 # A successful/warning exit is not execution permission while a policy approval
@@ -107,7 +136,7 @@ print('required' if v['requires_approval'] else 'none')
 " <<< "$RESULT" 2>/dev/null)
   if [ "$?" -ne 0 ]; then
     _tirith_hook_event parse_error "invalid check approval metadata"
-    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" = "allow" ]; }; then
       echo '{"permission":"allow"}'; exit 0
     fi
     echo '{"permission":"deny","user_message":"Tirith: invalid approval metadata from security check — blocked for safety"}'; exit 0
@@ -137,10 +166,13 @@ print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message':
     echo "$DENY_JSON"
   fi
 elif [ "$RC" -eq 2 ]; then
-  if [ "$WARN_ACTION" = "deny" ]; then
-    # Treat warn as deny
+  if [ "$WARN_ACTION" = "deny" ] || [ "$WARN_ACTION" = "invalid" ]; then
+    # Treat warn as deny; an unrecognized warn action fails closed.
     _tirith_hook_event warn_denied
     REASON=$(_findings_summary)
+    if [ "$WARN_ACTION" = "invalid" ]; then
+      REASON="tirith: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION_RAW' (valid values: allow, ask, deny) — warning blocked for safety. $REASON"
+    fi
     DENY_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 reason = sys.argv[1]
@@ -152,19 +184,26 @@ print(json.dumps({'permission': 'deny', 'user_message': reason, 'agent_message':
       echo "$DENY_JSON"
     fi
   else
-    # Warn-allow: emit allow JSON with findings + stderr fallback
-    _tirith_hook_event warn_allowed
+    # allow: the same permission a clean command gets, with the findings for
+    # the user and the agent (and on stderr). ask: Cursor asks the user.
+    if [ "$WARN_ACTION" = "ask" ]; then
+      _tirith_hook_event warn_ask
+    else
+      _tirith_hook_event warn_allowed
+    fi
     REASON=$(_findings_summary)
     echo "$REASON" >&2
-    ALLOW_JSON=$("$TIRITH_PYTHON" -I -S -c "
+    WARN_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
-msg = sys.argv[1]
-print(json.dumps({'permission': 'allow', 'user_message': msg}))
-" "$REASON" 2>/dev/null) || true
-    if [ -z "$ALLOW_JSON" ]; then
-      echo '{"permission":"allow","user_message":"Tirith: warnings detected (non-blocking)"}'
+permission, msg = sys.argv[1], sys.argv[2]
+print(json.dumps({'permission': permission, 'user_message': msg, 'agent_message': msg}))
+" "$WARN_ACTION" "$REASON" 2>/dev/null) || true
+    if [ -n "$WARN_JSON" ]; then
+      echo "$WARN_JSON"
+    elif [ "$WARN_ACTION" = "ask" ]; then
+      echo '{"permission":"ask","user_message":"Tirith: warnings detected","agent_message":"Tirith: warnings detected"}'
     else
-      echo "$ALLOW_JSON"
+      echo '{"permission":"allow","user_message":"Tirith: warnings detected (non-blocking)","agent_message":"Tirith: warnings detected (non-blocking)"}'
     fi
   fi
 elif [ "$RC" -eq 3 ]; then

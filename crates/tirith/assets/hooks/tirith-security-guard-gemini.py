@@ -17,7 +17,10 @@ Output (stdout, only for deny):
 
 Environment:
   TIRITH_BIN              — path to tirith binary (default: "tirith")
-  TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny"
+  TIRITH_HOOK_WARN_ACTION — "allow" (default) or "deny". Gemini CLI documents
+                            no confirmation decision for BeforeTool hooks, so
+                            "ask" denies with guidance, and any other value
+                            denies.
 """
 
 import json
@@ -120,24 +123,43 @@ def _build_warning_text(stdout):
 
 
 def warn_action():
-    """Return the validated TIRITH_HOOK_WARN_ACTION: "allow" (default) or "deny"."""
-    value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "allow").lower()
-    if value in ("allow", "deny"):
-        return value
-    print(
-        f"tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='{value}', defaulting to 'allow'",
-        file=sys.stderr,
-    )
-    return "allow"
+    """Return TIRITH_HOOK_WARN_ACTION: "allow" (default), "ask", "deny" or "invalid".
+
+    An unrecognized value is "invalid", which is denied: a security setting
+    that cannot be parsed fails closed rather than passing warnings.
+    """
+    value = (os.environ.get("TIRITH_HOOK_WARN_ACTION") or "allow").lower()
+    return value if value in ("allow", "ask", "deny") else "invalid"
+
+
+def warn_denial(action, warning_text):
+    """Explain why a warning is denied under a non-allow warn action."""
+    if action == "invalid":
+        value = os.environ.get("TIRITH_HOOK_WARN_ACTION", "")
+        return (
+            f"tirith: unrecognized TIRITH_HOOK_WARN_ACTION={value!r} "
+            "(valid values: allow, ask, deny) — warning blocked for safety. "
+            + warning_text
+        )
+    if action == "ask":
+        # This host has no confirmation prompt a hook can request.
+        return (
+            warning_text
+            + " — blocked; TIRITH_HOOK_WARN_ACTION=ask needs a confirmation prompt"
+            " this host hook does not have. Review the command and retry from a"
+            " Tirith-protected interactive shell to confirm it."
+        )
+    return warning_text
 
 
 def checker_error(returncode, reason):
     """Fail closed (or open) on a damaged response, never past an intact verdict.
 
-    A warning the operator configured to deny stays denied when its response is
-    damaged, so TIRITH_FAIL_OPEN cannot turn a denied warning into an allow.
+    A warning the operator configured to gate (ask, deny, or an unrecognized
+    value) stays denied when its response is damaged, so TIRITH_FAIL_OPEN
+    cannot turn a gated warning into an allow.
     """
-    if returncode == 2 and warn_action() == "deny":
+    if returncode == 2 and warn_action() != "allow":
         deny(reason)
     fail_closed(reason)
 
@@ -296,17 +318,16 @@ def main():
         sys.exit(0)
 
     # Exit 2 = warn — check TIRITH_HOOK_WARN_ACTION
-    if result.returncode == 2:
-        if warn_action() != "deny":
-            _hook_event("warn_allowed")
-            warning_text = _build_warning_text(result.stdout)
-            print(warning_text, file=sys.stderr)
-            sys.exit(0)
+    action = warn_action()
+    if action == "allow":
+        _hook_event("warn_allowed")
+        warning_text = _build_warning_text(result.stdout)
+        print(warning_text, file=sys.stderr)
+        sys.exit(0)
 
-    # Exit 2 + deny = block.
+    # Exit 2 with ask, deny or an unrecognized warn action = block.
     _hook_event("warn_denied")
-    reason = _build_warning_text(result.stdout)
-    deny(reason)
+    deny(warn_denial(action, _build_warning_text(result.stdout)))
 
 
 if __name__ == "__main__":

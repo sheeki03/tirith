@@ -2,6 +2,11 @@
 # Tirith security hook for VS Code (PreToolUse)
 # Same protocol as Claude Code but implemented as a shell script.
 # Filters on hook_event_name == PreToolUse and tool_name matching shell tools.
+# A warning is never an approval: by default it is answered without a
+# permissionDecision (VS Code's own confirmation rules apply), with the
+# warning in systemMessage (user) and additionalContext (model).
+# TIRITH_HOOK_WARN_ACTION=ask asks the user to confirm, deny blocks, and any
+# other value blocks.
 set -uo pipefail  # No -e: we handle errors explicitly per command
 # __TIRITH_BIN__ is replaced at setup time by resolve_tirith_bin() —
 # either "tirith" (portable) or "/abs/path/to/tirith" (fallback)
@@ -123,6 +128,38 @@ fi
 RESULT=$(TIRITH_INTEGRATION=vscode "$TIRITH_BIN" check --json --non-interactive --shell posix -- "$COMMAND" 2>/dev/null)
 RC=$?  # No || true: we need the actual exit code. Without set -e, script continues safely.
 
+# Helper: describe warning findings (severity, title, rule id, short fix)
+_warning_summary() {
+  "$TIRITH_PYTHON" -I -S -c "
+import sys, json
+try:
+    v = json.loads(sys.stdin.read())
+    parts = []
+    for f in v.get('findings', []):
+        if not isinstance(f, dict):
+            continue
+        rule = f.get('rule_id') if isinstance(f.get('rule_id'), str) else ''
+        title = f.get('title') if isinstance(f.get('title'), str) and f.get('title') else (rule or 'unknown')
+        sev = f.get('severity')
+        part = '[%s] %s' % (sev, title) if isinstance(sev, str) and sev else title
+        if rule and rule != title:
+            part += ' (%s)' % rule
+        fix = f.get('remediation')
+        if isinstance(fix, str) and fix.strip():
+            fix = ' '.join(fix.split())
+            end = fix.find('. ')
+            if end != -1:
+                fix = fix[:end + 1]
+            if len(fix) > 200:
+                fix = fix[:197].rstrip() + '...'
+            part += ' \u2014 fix: ' + fix
+        parts.append(part)
+    print('Tirith warning: ' + '; '.join(parts) if parts else 'Tirith warning: the security check reported a warning')
+except Exception:
+    print('Tirith warning: the security check reported a warning')
+" <<< "$RESULT" 2>/dev/null || echo "Tirith warning: the security check reported a warning"
+}
+
 # Helper: extract finding titles from JSON result via python3
 _findings_summary() {
   "$TIRITH_PYTHON" -I -S -c "
@@ -145,12 +182,13 @@ except Exception:
 }
 
 if [ "$RC" -eq 2 ]; then
-  WARN_ACTION="${TIRITH_HOOK_WARN_ACTION:-allow}"
-  WARN_ACTION=$(echo "$WARN_ACTION" | tr '[:upper:]' '[:lower:]')
-  if [ "$WARN_ACTION" != "allow" ] && [ "$WARN_ACTION" != "deny" ]; then
-    echo "tirith: warning: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION', defaulting to 'allow'" >&2
-    WARN_ACTION="allow"
-  fi
+  WARN_ACTION_RAW="${TIRITH_HOOK_WARN_ACTION:-allow}"
+  WARN_ACTION=$(printf '%s' "$WARN_ACTION_RAW" | tr '[:upper:]' '[:lower:]')
+  case "$WARN_ACTION" in
+    allow|ask|deny) ;;
+    # An unparseable security setting fails closed.
+    *) WARN_ACTION="invalid" ;;
+  esac
 fi
 
 # A successful/warning exit is not execution permission while a policy approval
@@ -165,7 +203,7 @@ print('required' if v['requires_approval'] else 'none')
 " <<< "$RESULT" 2>/dev/null)
   if [ "$?" -ne 0 ]; then
     _tirith_hook_event parse_error "invalid check approval metadata"
-    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" != "deny" ]; }; then exit 0; fi
+    if [ "${TIRITH_FAIL_OPEN:-}" = "1" ] && { [ "$RC" -ne 2 ] || [ "$WARN_ACTION" = "allow" ]; }; then exit 0; fi
     deny "Tirith: invalid approval metadata from security check — blocked for safety"
   fi
   if [ "$APPROVAL_STATE" = "required" ]; then
@@ -184,26 +222,44 @@ elif [ "$RC" -eq 1 ] || [ "$RC" -eq 4 ]; then
   REASON=$(_findings_summary)
   deny "$REASON"
 elif [ "$RC" -eq 2 ]; then
-  if [ "$WARN_ACTION" = "deny" ]; then
-    # Treat warn as deny
-    _tirith_hook_event warn_denied
-    REASON=$(_findings_summary)
-    deny "$REASON"
-  else
-    # Warn-allow: emit allow with additionalContext so findings reach the model
+  REASON=$(_warning_summary)
+  if [ "$WARN_ACTION" = "allow" ]; then
+    # No permissionDecision: VS Code applies its own confirmation rules exactly
+    # as for a clean command. systemMessage reaches the user and
+    # additionalContext reaches the model.
     _tirith_hook_event warn_allowed
-    REASON=$(_findings_summary)
-    ALLOW_JSON=$("$TIRITH_PYTHON" -I -S -c "
+    WARN_JSON=$("$TIRITH_PYTHON" -I -S -c "
 import sys, json
 msg = sys.argv[1]
-print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow', 'permissionDecisionReason': msg, 'additionalContext': msg}}))
+print(json.dumps({'systemMessage': msg, 'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': msg}}))
 " "$REASON" 2>/dev/null) || true
-    if [ -z "$ALLOW_JSON" ]; then
-      echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Tirith: warnings detected (non-blocking)","additionalContext":"Tirith: warnings detected (non-blocking)"}}'
+    if [ -z "$WARN_JSON" ]; then
+      echo '{"systemMessage":"Tirith warning: the security check reported a warning","hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"Tirith warning: the security check reported a warning"}}'
     else
-      echo "$ALLOW_JSON"
+      echo "$WARN_JSON"
     fi
     exit 0
+  elif [ "$WARN_ACTION" = "ask" ]; then
+    # The reason is shown to the user in the confirmation prompt.
+    _tirith_hook_event warn_ask
+    ASK_JSON=$("$TIRITH_PYTHON" -I -S -c "
+import sys, json
+msg = sys.argv[1]
+print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'ask', 'permissionDecisionReason': msg, 'additionalContext': msg}}))
+" "$REASON" 2>/dev/null) || true
+    if [ -z "$ASK_JSON" ]; then
+      echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Tirith warning: the security check reported a warning","additionalContext":"Tirith warning: the security check reported a warning"}}'
+    else
+      echo "$ASK_JSON"
+    fi
+    exit 0
+  elif [ "$WARN_ACTION" = "invalid" ]; then
+    _tirith_hook_event warn_denied "unrecognized warn action"
+    deny "tirith: unrecognized TIRITH_HOOK_WARN_ACTION='$WARN_ACTION_RAW' (valid values: allow, ask, deny) — warning blocked for safety. $REASON"
+  else
+    # Treat warn as deny
+    _tirith_hook_event warn_denied
+    deny "$REASON"
   fi
 elif [ "$RC" -eq 3 ]; then
   # WarnAck is an execution gate, not a checker failure eligible for fail-open.
