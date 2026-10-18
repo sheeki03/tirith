@@ -357,8 +357,7 @@
    "set": "extended",
    "expected": "benign",
    "cmd": "curl -s https://api.github.com/repos/sheeki03/tirith | python3 -m json.tool",
-   "at_most": "block",
-   "why": "curl output piped to python3 -m json.tool is still treated as code (pipe-to-interpreter); not changed here"
+   "at_most": "warn"
   },
   {
    "id": "X12",
@@ -393,8 +392,7 @@
    "set": "extended",
    "expected": "benign",
    "cmd": "curl -s http://192.168.1.20:8080/health | python3 -m json.tool",
-   "at_most": "block",
-   "why": "curl output piped to python3 -m json.tool is still treated as code (pipe-to-interpreter); not changed here"
+   "at_most": "warn"
   },
   {
    "id": "X17",

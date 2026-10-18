@@ -12052,6 +12052,44 @@ pub(crate) fn literal_python_inline_program(args: &[String], shell: ShellType) -
     }
 }
 
+/// `python -m json.tool` followed only by its own formatting flags
+/// (`--sort-keys`, `--indent N`, `--compact`, `--tab`, `--no-indent`,
+/// `--no-ensure-ascii`, `--json-lines`): a fixed standard-library module that
+/// parses standard input as JSON and writes it back to standard output. The
+/// interpreter takes no other option first (`-i` runs stdin afterward, `-W` /
+/// `-X` can import code), and a file operand is refused too (an output file
+/// is a write the pipe rule does not inspect).
+pub(crate) fn literal_python_json_tool_invocation(args: &[String], shell: ShellType) -> bool {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return false;
+    }
+    let Some(words) = args
+        .iter()
+        .map(|arg| static_wrapper_word(arg, shell))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let options = match words.as_slice() {
+        [flag, module, rest @ ..] if flag == "-m" && module == "json.tool" => rest,
+        [attached, rest @ ..] if attached == "-mjson.tool" => rest,
+        _ => return false,
+    };
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    let mut index = 0usize;
+    while index < options.len() {
+        let option = options[index].as_str();
+        match option {
+            "--sort-keys" | "--compact" | "--tab" | "--no-indent" | "--no-ensure-ascii"
+            | "--json-lines" => index += 1,
+            "--indent" if options.get(index + 1).is_some_and(|value| digits(value)) => index += 2,
+            _ if option.strip_prefix("--indent=").is_some_and(digits) => index += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Return only a Python program selected by a leading literal `-c`. A later
 /// `-c` after a script, `-`, `--`, or `-m` is script argv, not source. Startup
 /// options stay outside this proof: `-i` may execute stdin afterward, and
@@ -16630,6 +16668,11 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment], shell: ShellTyp
             // This segment receives piped input — check if it's an interpreter
             if let Some(cmd) = resolve_segment_command_for_shell(segment, shell) {
                 if is_interpreter(&cmd.name) {
+                    // A proven python data program (`python3 -m json.tool`)
+                    // parses what it is fed and runs nothing named in it.
+                    if crate::rules::command::python_pipe_sink_is_data_program(segment, shell) {
+                        return false;
+                    }
                     if shell == ShellType::Posix {
                         let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
                         return posix_command_accepts_pipeline_as_code(
