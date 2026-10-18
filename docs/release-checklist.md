@@ -127,6 +127,14 @@ in-tree builds. The cross-crate failure only shows up at `cargo
 package` / `cargo publish` time, which is exactly the point where
 publishing tirith-core first becomes a hard prerequisite.
 
+Package and publish from a POSIX checkout (Linux or macOS; the release
+workflow publishes from Ubuntu). Each crate's `LICENSE-AGPL` and `NOTICE` are
+symlinks to the repository-root files, which `cargo package` stores as regular
+files with the full text. A Windows checkout without symlink support turns
+them into one-line path stubs, and the published crates would carry those
+instead of the license. `cargo package -p <crate> --allow-dirty --list` must
+list both files.
+
 ## Quick local check before tagging a release
 
 ```bash
