@@ -15512,6 +15512,43 @@ mod tests {
     }
 
     #[test]
+    fn fpperf_2_arithmetic_over_numeric_emitters_is_complete() {
+        let incomplete = |input: &str| {
+            check_default(input, ShellType::Posix)
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+        };
+        for input in [
+            "echo $(( $(nproc) + 1 ))",
+            "make -j$(( $(nproc) + 1 ))",
+            "echo $(( $(getconf _NPROCESSORS_ONLN) * 2 ))",
+            "echo $(( $(sysctl -n hw.ncpu) ))",
+            "echo $(( $(wc -l < file.txt) + 1 ))",
+            "echo $(( $(nproc --all) / 2 ))",
+            "echo $(( $(/usr/bin/nproc) ))",
+        ] {
+            assert!(!incomplete(input), "{input}");
+        }
+        for input in [
+            // Output that is not provably a number is evaluated as code
+            // (`a[$(id)]` runs `id`), so it stays unresolved.
+            "echo $(( $(cat count.txt) + 1 ))",
+            "echo $(( $(wc -l file.txt) + 1 ))",
+            "echo $(( $(wc -l < file.txt 2>/dev/null) + 1 ))",
+            "echo $(( $(getconf PATH) ))",
+            "echo $(( $(sysctl -n kern.ostype) ))",
+            "echo $(( $(nproc; id) + 1 ))",
+            "echo $(( $(nproc | sh) + 1 ))",
+            "echo $(( $(nproc) + n ))",
+            "echo $(( $(wc -l < /dev/tcp/example.com/80) + 1 ))",
+            "echo $(( $(NPROC=1 nproc) ))",
+            "{ $CMD; } > out.txt",
+        ] {
+            assert!(incomplete(input), "{input}");
+        }
+    }
+
+    #[test]
     fn issue_136_python_first_scope_leaves_node_unchanged() {
         // The carveout is Python-only for this PR; node -e is NOT carved out, so a
         // data pipeline into node still fires (documented follow-up).

@@ -4238,13 +4238,76 @@ fn posix_substitution_has_fixed_numeric_output(body: &str) -> bool {
     else {
         return false;
     };
-    if matches!(command.as_str(), "date" | "/bin/date" | "/usr/bin/date") {
+    let fixed = |name: &str| {
+        command == name
+            || ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
+                .iter()
+                .any(|prefix| command.strip_prefix(prefix) == Some(name))
+    };
+    if fixed("date") {
         return args == ["+%s"];
     }
-    if !matches!(
-        command.as_str(),
-        "printf" | "/bin/printf" | "/usr/bin/printf"
-    ) {
+    // Processor counts and fixed system constants print one decimal number.
+    if fixed("nproc") {
+        return args.is_empty() || args == ["--all"];
+    }
+    if fixed("getconf") {
+        return matches!(
+            args.as_slice(),
+            [name] if matches!(
+                name.as_str(),
+                "_NPROCESSORS_ONLN"
+                    | "NPROCESSORS_ONLN"
+                    | "_NPROCESSORS_CONF"
+                    | "NPROCESSORS_CONF"
+                    | "PAGESIZE"
+                    | "PAGE_SIZE"
+                    | "ARG_MAX"
+                    | "LONG_BIT"
+                    | "CLK_TCK"
+            )
+        );
+    }
+    if fixed("sysctl") {
+        return matches!(
+            args.as_slice(),
+            [flag, key] if flag == "-n" && matches!(
+                key.as_str(),
+                "hw.ncpu"
+                    | "hw.logicalcpu"
+                    | "hw.physicalcpu"
+                    | "hw.activecpu"
+                    | "hw.logicalcpu_max"
+                    | "hw.physicalcpu_max"
+                    | "hw.memsize"
+                    | "hw.pagesize"
+            )
+        );
+    }
+    // `wc -l < file` prints only the count; with a file operand it also
+    // prints the name, which arithmetic would read as an expression.
+    if fixed("wc") {
+        // bash reads `/dev/tcp/HOST/PORT` from the network.
+        let target_ok = |target: &str| {
+            !target.is_empty()
+                && !target.starts_with(['(', '&', '<', '>', '|'])
+                && !target.starts_with("/dev/tcp/")
+                && !target.starts_with("/dev/udp/")
+        };
+        return match args.as_slice() {
+            [flag, redirect, target] => {
+                matches!(flag.as_str(), "-l" | "-c" | "-w" | "-m")
+                    && redirect == "<"
+                    && target_ok(target)
+            }
+            [flag, redirect] => {
+                matches!(flag.as_str(), "-l" | "-c" | "-w" | "-m")
+                    && redirect.strip_prefix('<').is_some_and(target_ok)
+            }
+            _ => false,
+        };
+    }
+    if !fixed("printf") {
         return false;
     }
     let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
@@ -8507,8 +8570,15 @@ pub(crate) fn executable_substitution_scan(
     // (`posix_variable_command_literal_view`); a nested body inherits functions,
     // aliases and variables from the enclosing input (`export -f`, `$(...)`),
     // which a body-local proof cannot see.
-    for segment in tokenize::tokenize(scan_input, shell) {
+    let scan_segments = tokenize::tokenize(scan_input, shell);
+    let array_assignments = if shell == ShellType::Posix {
+        posix_literal_array_assignment_segments(scan_input, &scan_segments)
+    } else {
+        Vec::new()
+    };
+    for (index, segment) in scan_segments.into_iter().enumerate() {
         if shell != ShellType::PowerShell
+            && !array_assignments.get(index).copied().unwrap_or(false)
             && segment.command.as_deref().is_some_and(|command| {
                 !crate::rules::command::command_name_is_statically_bound(command, shell)
             })
@@ -8640,6 +8710,106 @@ pub(crate) fn literal_posix_function_definition_with_body_kind(
     }
 }
 
+/// Which of `segments` (of `raw`) are literal array element assignments,
+/// `name[subscript]=value` (or `+=`) with nothing after them (bash, zsh,
+/// ksh). An indexed array evaluates its subscript as arithmetic, which
+/// expands variable values recursively (`a='x[$(id)]'; arr[a]=1` runs `id`),
+/// so the subscript must be digits, or a plain key of an array that an
+/// unconditional `typeset -A` / `declare -A` made associative (its keys are
+/// strings). Only such declarations and element assignments may sit between
+/// the declaration and the assignment: any other command (`unset`, `eval`,
+/// a conditional) could change what the name is. Substitutions in the value
+/// are recovered by the executable-body scan like any word's.
+fn posix_literal_array_assignment_segments(raw: &str, segments: &[tokenize::Segment]) -> Vec<bool> {
+    let uncertain = uncertain_posix_state_mutation_segments(raw, segments);
+    let mut associative = std::collections::HashSet::<String>::new();
+    let mut result = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let element = segment.args.is_empty()
+            && segment
+                .command
+                .as_deref()
+                .and_then(posix_array_element_assignment)
+                .is_some_and(|(name, subscript)| {
+                    let digits = !subscript.is_empty()
+                        && subscript.bytes().all(|byte| byte.is_ascii_digit());
+                    let key = !subscript.is_empty()
+                        && subscript.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'_' | b'.' | b'-' | b':')
+                        });
+                    digits || (key && associative.contains(name))
+                });
+        result.push(element);
+        if element {
+            continue;
+        }
+        let certain = !uncertain.get(index).copied().unwrap_or(true)
+            && tokenize::leading_env_assignments(&segment.raw).is_empty();
+        let declared = certain
+            .then(|| posix_associative_declaration(segment))
+            .flatten();
+        match declared {
+            Some(names) => associative.extend(names),
+            None => associative.clear(),
+        }
+    }
+    result
+}
+
+/// The names a literal `typeset -A NAME...` / `declare -A NAME...` makes
+/// associative, or `None` for any other command.
+fn posix_associative_declaration(segment: &tokenize::Segment) -> Option<Vec<String>> {
+    if !matches!(
+        literal_posix_segment_command(segment).as_deref(),
+        Some("typeset" | "declare")
+    ) {
+        return None;
+    }
+    let words = segment
+        .args
+        .iter()
+        .map(|word| static_wrapper_word(word, ShellType::Posix))
+        .collect::<Option<Vec<_>>>()?;
+    let options = words
+        .iter()
+        .take_while(|word| word.starts_with(['-', '+']) && word.as_str() != "--")
+        .collect::<Vec<_>>();
+    let associative = options
+        .iter()
+        .any(|option| option.starts_with('-') && !option.starts_with("--") && option.contains('A'));
+    if !associative || options.iter().any(|option| option.starts_with('+')) {
+        return None;
+    }
+    let names = words
+        .iter()
+        .skip(options.len())
+        .map(|word| word.split('=').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    (!names.is_empty() && names.iter().all(|name| posix_identifier(name))).then_some(names)
+}
+
+/// A shell identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+fn posix_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// The array name and subscript of an unquoted `name[subscript]=value` /
+/// `name[subscript]+=value` word.
+fn posix_array_element_assignment(word: &str) -> Option<(&str, &str)> {
+    let open = word.find('[')?;
+    let name = &word[..open];
+    let close = open + 1 + word[open + 1..].find(']')?;
+    let subscript = &word[open + 1..close];
+    let rest = &word[close + 1..];
+    (posix_identifier(name) && (rest.starts_with('=') || rest.starts_with("+=")))
+        .then_some((name, subscript))
+}
+
 fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: ShellType) -> bool {
     if shell != ShellType::Posix || segment.command.as_deref() != Some("{") {
         return false;
@@ -8648,8 +8818,16 @@ fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: She
     raw.as_bytes().first() == Some(&b'{')
         && find_shell_delimiter_close(raw, 0, ShellType::Posix).is_some_and(|close| {
             raw.get(close + 1..)
-                .is_some_and(|suffix| suffix.trim().is_empty())
+                .is_some_and(posix_suffix_is_only_redirections)
         })
+}
+
+/// Whether `suffix`, the text after a compound command's closing word, holds
+/// nothing but redirections (`> out.txt`, `2>&1`, `>> log </dev/null`), which
+/// do not change what runs inside it. Substitutions in their targets are
+/// recovered by the executable-body scan like any word's.
+fn posix_suffix_is_only_redirections(suffix: &str) -> bool {
+    crate::escalation::args_without_redirections(&tokenize::split_words(suffix)).is_empty()
 }
 
 /// Recover the body of a complete literal POSIX brace group. Brace groups run
@@ -10876,6 +11054,11 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
     let segments = tokenize::tokenize(raw, shell);
     let uncertain_mutations = (shell == ShellType::Posix)
         .then(|| uncertain_posix_state_mutation_segments(raw, &segments));
+    let array_assignments = if shell == ShellType::Posix {
+        posix_literal_array_assignment_segments(raw, &segments)
+    } else {
+        Vec::new()
+    };
     let mut state = LiteralAliasState::default();
     let mut function_alias_dependencies = std::collections::HashMap::<String, bool>::new();
     let mut function_names = std::collections::HashSet::<String>::new();
@@ -11043,7 +11226,12 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                     }
                 }
             }
-            if is_complete_literal_posix_brace_group(segment, ShellType::Posix) {
+            if is_complete_literal_posix_brace_group(segment, ShellType::Posix)
+                || array_assignments
+                    .get(segment_index)
+                    .copied()
+                    .unwrap_or(false)
+            {
                 continue;
             }
         }
@@ -22060,6 +22248,77 @@ mod tests {
                     .iter()
                     .any(|body| body.input.contains("rm -rf /"));
             assert!(blocked, "{input}: {scan:?}");
+        }
+    }
+
+    #[test]
+    fn fpperf_2_brace_groups_with_trailing_redirections_are_complete() {
+        for (input, body) in [
+            ("{ echo a; echo b; } > out.txt", " echo a; echo b; "),
+            (
+                "{ cargo build; cargo test; } 2>&1 | tee build.log",
+                " cargo build; cargo test; ",
+            ),
+            (
+                "{ echo '## Notes'; cat notes.md; } >> README.md",
+                " echo '## Notes'; cat notes.md; ",
+            ),
+            ("{ echo a; } >out 2>err </dev/null", " echo a; "),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+        for input in ["{ echo a; } extra", "{ echo a; } always { echo b; }"] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+        }
+        // Substitutions in the redirection target are still recovered.
+        let scan = executable_substitution_scan("{ echo a; } > \"$(rm -rf /)\"", ShellType::Posix);
+        assert!(
+            scan.bodies.iter().any(|body| body.input == "rm -rf /"),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn fpperf_2_literal_array_element_assignments() {
+        for input in [
+            "typeset -A map; map[a]=1",
+            "declare -A map\nmap[key.name]=\"x y\"",
+            "typeset -gA map; map[a]+=1; map[b]=2",
+            "arr[0]=x",
+            "arr[12]+=y",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+        }
+        for input in [
+            // An indexed subscript is arithmetic: a name or expansion in it
+            // is evaluated, recursively.
+            "map[a]=1",
+            "arr[i]=1",
+            "if true; then typeset -A map; fi; map[a]=1",
+            "false && typeset -A map; map[a]=1",
+            "typeset -A map; unset map; map[a]=1",
+            "typeset -A map; echo hi; map[a]=1",
+            "typeset -A map; map[$k]=1",
+            "typeset -A map; map[a]=1 cmd",
+            "typeset -A $NAME; map[a]=1",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
         }
     }
 

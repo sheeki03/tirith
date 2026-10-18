@@ -465,6 +465,27 @@
    "at_most": "warn"
   },
   {
+   "id": "X29",
+   "set": "extended",
+   "expected": "benign",
+   "cmd": "{ cargo build; cargo test; } 2>&1 | tee build.log",
+   "at_most": "warn"
+  },
+  {
+   "id": "X30",
+   "set": "extended",
+   "expected": "benign",
+   "cmd": "make -j$(( $(nproc) + 1 ))",
+   "at_most": "warn"
+  },
+  {
+   "id": "X31",
+   "set": "extended",
+   "expected": "benign",
+   "cmd": "typeset -A map; map[a]=1",
+   "at_most": "warn"
+  },
+  {
    "id": "X32",
    "set": "extended",
    "expected": "attack",
