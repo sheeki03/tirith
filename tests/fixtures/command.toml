@@ -4465,6 +4465,15 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["data_exfiltration", "analysis_incomplete"]
 
+[[fixture]]
+name = "c4_loopback_proxy_path_segment_allowed"
+min_milestone = 1
+input = "curl -F 'env=@.env' http://localhost:3000/proxy/upload"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["data_exfiltration", "analysis_incomplete"]
+
 # a second, remote URL receives the same form
 [[fixture]]
 name = "c4_loopback_plus_remote_url_blocks"
