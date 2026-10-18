@@ -61,6 +61,15 @@ childProcess.execFileSync = (file, args, options) => {
     // checker cannot meet, so the guard sees exactly what Node reports.
     return realExecFileSync(file, args, { ...options, timeout: 1 });
   }
+  if (mutation === "crash") {
+    // A real checker process that dies from a signal (as a crash or the
+    // out-of-memory killer ends it), so the guard sees what Node reports.
+    return realExecFileSync(
+      process.execPath,
+      ["-e", "process.kill(process.pid, 'SIGSEGV')"],
+      { ...options, input: undefined },
+    );
+  }
   if (live) {
     try {
       const stdout = realExecFileSync(file, args, options);
@@ -544,6 +553,28 @@ fn exercise_host(host: &str) {
         } else {
             let reason = blocked_reason(host, result);
             assert!(reason.contains("timed out"), "{host}: {reason}");
+        }
+    }
+    // A checker killed by a signal produced no verdict either: denied unless
+    // the operator fails open, and not reported as a timeout.
+    for fail_open in [false, true] {
+        let result = callback(
+            &state,
+            host,
+            tools[0],
+            &warning_response,
+            "allow",
+            fail_open,
+            "crash",
+        );
+        if fail_open {
+            assert!(result.is_null(), "{host}: {result}");
+        } else {
+            let reason = blocked_reason(host, result);
+            assert!(!reason.contains("timed out"), "{host}: {reason}");
+            if host != "openclaw" {
+                assert!(reason.contains("terminated by SIGSEGV"), "{host}: {reason}");
+            }
         }
     }
     for mutation in ["absent", "non_boolean", "invalid_json"] {

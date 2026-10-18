@@ -1322,11 +1322,21 @@ export default function (pi) {
         }
         // execFileSync reports its own timeout as code ETIMEDOUT with the kill
         // signal set (it never sets `killed`, which only asynchronous exec
-        // does). A checker ended by any signal produced no verdict either.
-        if (err.code === "ETIMEDOUT" || (err.signal && err.status == null)) {
+        // does).
+        if (err.code === "ETIMEDOUT") {
           recordHookEvent("timeout");
           if (failOpen()) return undefined;
           return { block: true, reason: "tirith: check timed out — blocked for safety" };
+        }
+        // A checker ended by another signal (a crash, the out-of-memory killer)
+        // produced no verdict either; it did not time out.
+        if (err.signal && err.status == null) {
+          recordHookEvent("unexpected_exit", `terminated by ${err.signal}`);
+          if (failOpen()) return undefined;
+          return {
+            block: true,
+            reason: `tirith: checker terminated by ${err.signal} — blocked for safety`,
+          };
         }
 
         exitCode = err.status;

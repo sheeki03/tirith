@@ -573,7 +573,24 @@ struct Row {
 
 impl Row {
     fn project(&self, context: &Context) -> Value {
-        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v)),"remedy":self.remedy.as_deref().map(|v| context.redact(v))})
+        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v)),"remedy":self.projected_remedy(context)})
+    }
+    /// The remedy as printed. Output is redacted, so a remedy that embeds a
+    /// pattern holding redacted text (`http://user:pw@host/*`) would name an
+    /// entry that does not exist; such a remedy names the store to edit
+    /// instead, and keeps only the parts that survive redaction unchanged.
+    fn projected_remedy(&self, context: &Context) -> Option<String> {
+        let remedy = self.remedy.as_deref()?;
+        let pattern = self.pattern.as_deref()?;
+        if context.redact(pattern) == pattern {
+            return Some(context.redact(remedy));
+        }
+        Some(redacted_wildcard_remedy(
+            pattern,
+            self.rule_id.as_deref(),
+            self.source,
+            context,
+        ))
     }
     /// Whether this row still trusts `target` for the queried rule. Unlike the
     /// runtime [`TrustGrant::matches`] (one finding, one rule), callers here
@@ -696,6 +713,57 @@ fn misplaced_wildcard_remedy(pattern: &str, rule_id: Option<&str>, source: &str)
              with --broad"
         ),
     })
+}
+
+/// [`misplaced_wildcard_remedy`] for a pattern that output redaction changes:
+/// no printed command can name the entry, so it says which store to edit. A
+/// host grant is offered only when the host and rule print unchanged.
+fn redacted_wildcard_remedy(
+    pattern: &str,
+    rule_id: Option<&str>,
+    source: &str,
+    context: &Context,
+) -> String {
+    use tirith_core::safe_command::shell_single_quote as quote;
+    let lead = "'*' is a wildcard only as a leading '*.' label, so this entry never matched; \
+                its pattern holds text Tirith redacts in output, so no command here can name it";
+    let host = tirith_core::policy::misplaced_wildcard_host(pattern)
+        .filter(|host| context.redact(host) == *host);
+    let printable_rule = rule_id.filter(|rule| context.redact(rule) == *rule);
+    match source {
+        "legacy_user" => {
+            let grant = host.and_then(|host| {
+                let rule = match (rule_id, printable_rule) {
+                    (Some(_), Some(rule)) => format!("--rule {}", quote(rule)?),
+                    _ => "--rule RULE_ID".to_string(),
+                };
+                Some(format!(
+                    ", then trust the host with `tirith trust add {} --broad {rule}`",
+                    quote(host)?
+                ))
+            });
+            format!(
+                "{lead}; delete it from trust.json in the Tirith config directory{}",
+                grant.unwrap_or_default()
+            )
+        }
+        "legacy_repo" => format!(
+            "{lead}; delete it from .tirith/trust.json (repository trust is inactive; add an \
+             operator grant with --scope project only for a host you chose)"
+        ),
+        "repository_allowlist" => format!(
+            "{lead}; repository allowlists are ignored, so remove it from .tirith/allowlist"
+        ),
+        _ => match host {
+            Some(host) => format!(
+                "{lead}; replace it with '{host}' (that host and its subdomains) where it is \
+                 listed, or list the exact URL or image"
+            ),
+            None => format!(
+                "{lead}; replace it with the host or the exact URL or image where it is listed"
+            ),
+        },
+    }
 }
 
 fn legacy_row(value: &Value, source: &'static str, scope: &'static str, policy: &Policy) -> Row {
@@ -2361,6 +2429,53 @@ mod tests {
         let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
         assert_eq!(again["state"], "unchanged");
         assert_eq!(again["skipped"].as_array().unwrap().len(), 3);
+    }
+
+    /// A pattern that output redaction changes cannot appear in a printed
+    /// command: the remedy names the store to edit, and keeps the host grant.
+    #[test]
+    fn wildcard_remedy_never_prints_a_redacted_pattern_as_a_command() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let entries = json!({"version":1,"entries":[
+            {"pattern":"http://user:pw@mirror.example.net:8443/pkgs/*","rule_id":"plain_http_to_sink"},
+            {"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"},
+        ]});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let mut context = Context::capture().unwrap();
+        let listed = list_value(&mut context, None, true, "user").unwrap();
+        let rows = listed["grants"].as_array().unwrap();
+        let credential = rows
+            .iter()
+            .find(|row| row["rule_id"] == "plain_http_to_sink")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(credential["state_reason"], "wildcard_never_matches");
+        let pattern = credential["pattern"].as_str().unwrap();
+        assert!(!pattern.contains("pw"), "{pattern}");
+        let remedy = credential["remedy"].as_str().unwrap();
+        assert!(!remedy.contains("trust remove"), "{remedy}");
+        assert!(!remedy.contains("pw"), "{remedy}");
+        assert!(remedy.contains("trust.json"), "{remedy}");
+        assert!(
+            remedy.contains(
+                "`tirith trust add 'mirror.example.net' --broad --rule 'plain_http_to_sink'`"
+            ),
+            "{remedy}"
+        );
+        // A pattern redaction leaves alone keeps the exact commands.
+        let plain = rows
+            .iter()
+            .find(|row| row["pattern"] == "registry.example.com/*")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert!(plain["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("tirith trust remove 'registry.example.com/*'"));
     }
 
     /// Repository and policy rows get a remedy that fits where they live.

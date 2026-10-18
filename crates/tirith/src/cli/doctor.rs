@@ -921,12 +921,18 @@ fn placeholder_value_is_valid(placeholder: &str, value: &str, tool: Option<&str>
     match placeholder {
         // Substituted raw into `"${TIRITH_BIN:-...}"` and a comment: a bare
         // `tirith` or an absolute path, with nothing the double-quoted
-        // expansion would interpret or end at.
+        // expansion would interpret or end at. A backslash is literal there
+        // unless it precedes one of those characters, another backslash, or
+        // the closing `}` (a trailing `\` escapes it and the hook no longer
+        // parses), so a Windows path such as `C:\Program Files\...` stays
+        // valid.
         "__TIRITH_BIN__" => {
             (value == "tirith" || std::path::Path::new(value).is_absolute())
                 && !value
                     .chars()
                     .any(|c| matches!(c, '"' | '$' | '`' | '}' | '\r' | '\n'))
+                && !value.ends_with('\\')
+                && !value.contains("\\\\")
         }
         // `TIRITH_PYTHON=<shell_quote(absolute interpreter)>`.
         "__TIRITH_PYTHON__" => decode_setup_shell_quoted(value)
@@ -3977,6 +3983,8 @@ mod tests {
                 ("/opt/tirith\"; exit 0; \"", "/usr/bin/python3"),
                 ("/opt/`id`/tirith", "/usr/bin/python3"),
                 ("/opt/ti}rith", "/usr/bin/python3"),
+                ("/opt/tirith\\", "/usr/bin/python3"),
+                ("/opt/ti\\\\rith", "/usr/bin/python3"),
                 ("relative/tirith", "/usr/bin/python3"),
                 ("", "/usr/bin/python3"),
             ] {
