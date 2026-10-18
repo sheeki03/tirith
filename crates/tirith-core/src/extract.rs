@@ -10339,35 +10339,69 @@ fn wrapper_operand_is_one_word(raw: &str, shell: ShellType) -> bool {
     true
 }
 
+/// Where a delegation utility's child command starts, read with the
+/// utility's own option grammar. Shared by the executable-body scan
+/// ([`scan_posix_delegation_utility`]) and the pipe-sink interpreter
+/// resolution in `rules::command`, so the two readings cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelegationChild {
+    /// The child command's argv starts at this index (past the end when the
+    /// utility was given no command).
+    Argv(usize),
+    /// `flock FILE -c COMMAND`: the one command string at this index, which
+    /// flock runs with `$SHELL -c`.
+    CommandString(usize),
+    /// Nothing runs: help or version output, an existing-process mode, or a
+    /// missing operand.
+    Nothing,
+    /// The child position depends on a word that is not static.
+    Ambiguous,
+}
+
 fn scan_posix_delegation_utility(
     command: &str,
     args: &[String],
     shell: ShellType,
     scan: &mut ExecutableSubstitutionScan,
 ) {
+    match delegation_utility_child(command, args, shell) {
+        DelegationChild::Argv(index) => push_static_child_from(args, index, shell, scan),
+        DelegationChild::CommandString(index) => push_required_literal_wrapper_body(
+            args.get(index..).unwrap_or_default(),
+            shell,
+            shell,
+            scan,
+        ),
+        DelegationChild::Nothing => {}
+        DelegationChild::Ambiguous => {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+        }
+    }
+}
+
+pub(crate) fn delegation_utility_child(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> DelegationChild {
     let mut index = 0usize;
     match command {
-        "noglob" | "nocorrect" => {
-            push_static_child_from(args, 0, shell, scan);
-        }
+        "noglob" | "nocorrect" => DelegationChild::Argv(0),
         "repeat" => {
             let Some(count) = args.first().and_then(|arg| static_wrapper_word(arg, shell)) else {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                return;
+                return DelegationChild::Ambiguous;
             };
             if !count.chars().all(|ch| ch.is_ascii_digit()) {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                return;
+                return DelegationChild::Ambiguous;
             }
-            push_static_child_from(args, 1, shell, scan);
+            DelegationChild::Argv(1)
         }
         "nice" => {
             // GNU `+n:` plus the historical `-N` / `--N` / `-+N` adjustment;
             // BSD accepts the same spellings.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10396,25 +10430,22 @@ fn scan_posix_delegation_utility(
                     static_short_option_cluster(&option, next, &[], &['n'], shell)
                 };
                 match parsed {
-                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => return,
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => {
+                        return DelegationChild::Nothing
+                    }
                     Some(parsed) => index += parsed.words,
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "setsid" => {
             // util-linux `+Vhcfw`.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10443,27 +10474,22 @@ fn scan_posix_delegation_utility(
                 };
                 match parsed {
                     Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
-                        return
+                        return DelegationChild::Nothing
                     }
                     Some(parsed) => index += parsed.words,
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "timeout" => {
             // GNU `+k:s:v`; `-f`/`-p` are `--foreground`/`--preserve-status`
             // (coreutils 9.6+ and BSD). The duration operand precedes the child.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10491,14 +10517,12 @@ fn scan_posix_delegation_utility(
                     static_short_option_cluster(&option, next, &['v', 'f', 'p'], &['k', 's'], shell)
                 };
                 match parsed {
-                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => return,
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => {
+                        return DelegationChild::Nothing
+                    }
                     Some(parsed) => index += parsed.words,
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
@@ -10507,18 +10531,18 @@ fn scan_posix_delegation_utility(
                 .and_then(|arg| static_wrapper_word(arg, shell))
                 .is_none()
             {
-                if index < args.len() {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                }
-                return;
+                return if index < args.len() {
+                    DelegationChild::Ambiguous
+                } else {
+                    DelegationChild::Nothing
+                };
             }
-            push_static_child_from(args, index.saturating_add(1), shell, scan);
+            DelegationChild::Argv(index.saturating_add(1))
         }
         "stdbuf" => {
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10530,11 +10554,7 @@ fn scan_posix_delegation_utility(
                         .and_then(|arg| static_wrapper_word(arg, shell))
                         .is_none()
                     {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                     index += 2;
                     continue;
@@ -10549,23 +10569,21 @@ fn scan_posix_delegation_utility(
                     continue;
                 }
                 if matches!(option.as_str(), "--help" | "--version") {
-                    return;
+                    return DelegationChild::Nothing;
                 }
                 if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 }
                 break;
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "taskset" => {
             // util-linux `+apchV`. `-p` operates on an existing pid: no child.
             let mut pid_mode = false;
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10594,28 +10612,24 @@ fn scan_posix_delegation_utility(
                 };
                 match parsed {
                     Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
-                        return
+                        return DelegationChild::Nothing
                     }
                     Some(parsed) => {
                         pid_mode |= parsed.names(&["--pid"], &['p']);
                         index += parsed.words;
                     }
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
             if pid_mode {
-                return;
+                return DelegationChild::Nothing;
             }
             if index < args.len() {
                 index += 1; // CPU mask/list
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "ionice" => {
             // util-linux `+n:c:p:P:u:tVh`. `-p`/`-P`/`-u` change existing
@@ -10624,8 +10638,7 @@ fn scan_posix_delegation_utility(
             let mut process_mode = false;
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10654,7 +10667,7 @@ fn scan_posix_delegation_utility(
                 };
                 match parsed {
                     Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
-                        return
+                        return DelegationChild::Nothing
                     }
                     Some(parsed) => {
                         process_mode |=
@@ -10662,18 +10675,14 @@ fn scan_posix_delegation_utility(
                         index += parsed.words;
                     }
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
             if process_mode {
-                return;
+                return DelegationChild::Nothing;
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "flock" => {
             // util-linux `+sexnoFuw:E:hV`, then `FILE COMMAND [ARG...]`,
@@ -10684,8 +10693,7 @@ fn scan_posix_delegation_utility(
                     if wrapper_operand_is_one_word(&args[index], shell) {
                         break; // the lock file
                     }
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -10726,40 +10734,114 @@ fn scan_posix_delegation_utility(
                 };
                 match parsed {
                     Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
-                        return
+                        return DelegationChild::Nothing
                     }
                     Some(parsed) => index += parsed.words,
                     None => {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                 }
             }
             let operands = args.get(index..).unwrap_or_default();
             if operands.len() < 2 {
                 // A lone file descriptor, or a usage error: nothing runs.
-                return;
+                return DelegationChild::Nothing;
             }
             if !wrapper_operand_is_one_word(&operands[0], shell) {
                 // `$LOCK` may expand to any number of words, so the child
                 // position is unknown.
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                return;
+                return DelegationChild::Ambiguous;
             }
             match static_wrapper_word(&operands[1], shell).as_deref() {
-                Some("-c" | "--command") => {
-                    // flock refuses anything but exactly one command string.
-                    if operands.len() == 3 {
-                        push_required_literal_wrapper_body(&operands[2..], shell, shell, scan);
-                    }
+                // flock refuses anything but exactly one command string.
+                Some("-c" | "--command") if operands.len() == 3 => {
+                    DelegationChild::CommandString(index + 2)
                 }
-                _ => push_static_child_from(args, index + 1, shell, scan),
+                Some("-c" | "--command") => DelegationChild::Nothing,
+                _ => DelegationChild::Argv(index + 1),
             }
         }
-        _ => {}
+        "chrt" => {
+            // util-linux `+abdD:efihmoP:pRrT:vV`, then `PRIORITY COMMAND
+            // [ARG...]`. `-p` changes an existing pid and `-m` prints the
+            // priority ranges: no child. A priority that is not a static
+            // integer leaves the child position unproven.
+            let mut pid_mode = false;
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    return DelegationChild::Ambiguous;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--all-tasks",
+                            "--batch",
+                            "--deadline",
+                            "--ext",
+                            "--fifo",
+                            "--idle",
+                            "--other",
+                            "--rr",
+                            "--reset-on-fork",
+                            "--pid",
+                            "--max",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--sched-runtime", "--sched-period", "--sched-deadline"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &[
+                            'a', 'b', 'd', 'e', 'f', 'i', 'o', 'r', 'R', 'p', 'm', 'v', 'h', 'V',
+                        ],
+                        &['T', 'P', 'D'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed)
+                        if parsed.terminal(&["--max", "--help", "--version"], &['m', 'h', 'V']) =>
+                    {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => {
+                        pid_mode |= parsed.names(&["--pid"], &['p']);
+                        index += parsed.words;
+                    }
+                    None => return DelegationChild::Ambiguous,
+                }
+            }
+            if pid_mode {
+                return DelegationChild::Nothing;
+            }
+            let Some(priority) = args.get(index) else {
+                return DelegationChild::Nothing;
+            };
+            match static_wrapper_word(priority, shell) {
+                Some(priority)
+                    if !priority.is_empty() && priority.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    DelegationChild::Argv(index + 1)
+                }
+                _ => DelegationChild::Ambiguous,
+            }
+        }
+        _ => DelegationChild::Nothing,
     }
 }
 

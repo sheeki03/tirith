@@ -1744,6 +1744,84 @@ fn unwrap_one_wrapper_segment(
     })
 }
 
+/// Process wrappers that run their child command with the caller's stdin,
+/// environment and argv unchanged: they only adjust scheduling, a timeout, a
+/// session, a CPU mask or a lock. A pipe into one of them feeds the child.
+/// Their option grammars are the executable-body scan's
+/// ([`crate::extract::delegation_utility_child`]).
+pub(crate) const PIPE_TRANSPARENT_PROCESS_WRAPPERS: &[&str] = &[
+    "nice", "timeout", "setsid", "taskset", "ionice", "flock", "chrt",
+];
+
+/// Peel ONE process-wrapper layer that [`unwrap_one_wrapper_segment`] does not
+/// model: a [`PIPE_TRANSPARENT_PROCESS_WRAPPERS`] word whose option grammar
+/// proves where the child starts (for `flock FILE -c STRING`, the one command
+/// of a literal string), or POSIX/fish `builtin` in front of the
+/// `command`/`exec`/`builtin` builtins (the only way `builtin` reaches an
+/// external program). Unknown or dynamic options and existing-process modes
+/// are not peeled, so they keep the released verdict.
+/// Only the pipe-sink interpreter resolution and the python data-sink proof
+/// use this: the canonical execution-wrapper resolver and its fail-closed
+/// consumers are unchanged.
+fn unwrap_process_wrapper_segment(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<tokenize::Segment> {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return None;
+    }
+    let base = normalize_cmd_base(seg.command.as_deref()?, shell);
+    let index = if PIPE_TRANSPARENT_PROCESS_WRAPPERS.contains(&base.as_str()) {
+        match crate::extract::delegation_utility_child(&base, &seg.args, shell) {
+            crate::extract::DelegationChild::Argv(index) => index,
+            crate::extract::DelegationChild::CommandString(index) => {
+                // `flock FILE -c STRING` runs `$SHELL -c STRING`, so the one
+                // command of a literal string receives the pipe.
+                let raw = seg.args.get(index)?;
+                if !command_word_is_statically_bound(raw, shell) {
+                    return None;
+                }
+                let mut segments = tokenize::tokenize(&normalize_shell_token(raw, shell), shell);
+                if segments.len() != 1 {
+                    return None;
+                }
+                return segments.pop();
+            }
+            crate::extract::DelegationChild::Nothing
+            | crate::extract::DelegationChild::Ambiguous => return None,
+        }
+    } else if base == "builtin"
+        && seg.args.first().is_some_and(|next| {
+            command_name_is_statically_bound(next, shell)
+                && matches!(
+                    normalize_cmd_base(next, shell).as_str(),
+                    "command" | "exec" | "builtin"
+                )
+        })
+    {
+        0
+    } else {
+        return None;
+    };
+    let inner_cmd = seg.args.get(index)?;
+    Some(tokenize::Segment {
+        raw: seg.args[index..].join(" "),
+        command: Some(inner_cmd.clone()),
+        args: seg.args[index + 1..].to_vec(),
+        preceding_separator: None,
+        byte_range: 0..0,
+    })
+}
+
+/// One wrapper layer as the pipe-sink interpreter resolution reads it: an
+/// execution wrapper, else a pipe-transparent process wrapper.
+fn unwrap_one_interpreter_layer(
+    seg: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<tokenize::Segment> {
+    unwrap_one_wrapper_segment(seg, shell).or_else(|| unwrap_process_wrapper_segment(seg, shell))
+}
+
 /// Why an execution wrapper could not be reduced to one effective command.
 /// Callers guarding a security boundary use this to fail closed only when the
 /// unresolved segment still carries a relevant dangerous operand or marker.
@@ -2642,8 +2720,10 @@ fn resolve_interpreter_name_depth_tracking(
         *exhausted = true;
         return None;
     }
-    // Peel wrapper layers (one per iteration via `unwrap_one_wrapper_segment`)
-    // so a wrapped interpreter resolves to its real leader for every caller.
+    // Peel wrapper layers (one per iteration via `unwrap_one_interpreter_layer`:
+    // the execution wrappers plus the pipe-transparent process wrappers such as
+    // `nice` and `timeout`) so a wrapped interpreter resolves to its real leader
+    // for every caller.
     // Handles both env-S split-string and generic wrappers, so an env-S nested
     // behind another wrapper is reached (`sudo env -S "sudo bash"` → `bash`,
     // CodeRabbit M13 R9-3 / round-21 F2). Bounded by `depth` (round-13 DoS /
@@ -2652,7 +2732,7 @@ fn resolve_interpreter_name_depth_tracking(
     let mut budget = depth;
     while budget > 0 {
         let probe = current.as_ref().unwrap_or(seg);
-        match unwrap_one_wrapper_segment(probe, shell) {
+        match unwrap_one_interpreter_layer(probe, shell) {
             Some(inner) => current = Some(inner),
             None => break,
         }
@@ -2663,7 +2743,7 @@ fn resolve_interpreter_name_depth_tracking(
     // a caller that does get `None`.
     if budget == 0 {
         let probe = current.as_ref().unwrap_or(seg);
-        if unwrap_one_wrapper_segment(probe, shell).is_some() {
+        if unwrap_one_interpreter_layer(probe, shell).is_some() {
             *exhausted = true;
         }
     }
@@ -3905,7 +3985,8 @@ enum PythonDataSink {
 }
 
 /// What `seg` proves when it is a DIRECT `python`/`python2`/`python3` pipe
-/// sink (no sudo/env/command wrapper leader): a `-c <body>` that only prints a
+/// sink (no sudo/env/command wrapper leader; a pipe-transparent process
+/// wrapper such as `nice` or `timeout 5` is read through): a `-c <body>` that only prints a
 /// constant or only transforms stdin as data, or `-m json.tool` with only its
 /// own formatting flags. Such a program consumes piped stdin as DATA, so the
 /// pipe is not "content executed without inspection" (issue #136). Wrapped
@@ -3939,6 +4020,19 @@ fn python_pipe_sink_data_program(
     {
         return None;
     }
+    // A pipe-transparent process wrapper (`nice`, `timeout 5`, `flock F`)
+    // hands its child the pipe's stdin, the environment and the argv
+    // unchanged, so the proof reads the program the child runs. `sudo`,
+    // `doas`, `env` and the other execution wrappers may change the
+    // environment (PYTHONINSPECT) or the identity, and stay refused.
+    let mut peeled = None;
+    for _ in 0..MAX_WRAPPER_DEPTH {
+        match unwrap_process_wrapper_segment(peeled.as_ref().unwrap_or(seg), shell) {
+            Some(inner) => peeled = Some(inner),
+            None => break,
+        }
+    }
+    let seg = peeled.as_ref().unwrap_or(seg);
     let cmd = seg.command.as_deref()?;
     if !matches!(
         normalize_cmd_base(cmd, shell).as_str(),
@@ -4374,11 +4468,13 @@ fn segment_may_enable_python_inspect(
             // to their call sites by the executable-body scan instead.
             "function" | "functions" if shell == ShellType::Fish && at_command_start => {
                 if words[index + 1..].iter().any(|word| {
-                    !command_word_is_statically_bound(word, shell)
-                        || matches!(
-                            normalize_cmd_base(word, shell).as_str(),
-                            "python" | "python2" | "python3"
-                        )
+                    !command_word_is_statically_bound(word, shell) || {
+                        let name = normalize_cmd_base(word, shell);
+                        // The proof also reads through the process wrappers,
+                        // so a function named like one replaces it as well.
+                        matches!(name.as_str(), "python" | "python2" | "python3" | "builtin")
+                            || PIPE_TRANSPARENT_PROCESS_WRAPPERS.contains(&name.as_str())
+                    }
                 }) {
                     return true;
                 }
@@ -21007,6 +21103,134 @@ mod tests {
             findings.iter().any(|f| f.rule_id == RuleId::CurlPipeShell),
             "should detect wrapper chain 'command sudo bash'"
         );
+    }
+
+    #[test]
+    fn pipe_sinks_behind_process_wrappers_resolve() {
+        let pipe_rules = [
+            RuleId::CurlPipeShell,
+            RuleId::WgetPipeShell,
+            RuleId::PipeToInterpreter,
+        ];
+        let fires = |input: &str, shell: ShellType| {
+            check_default(input, shell)
+                .iter()
+                .any(|finding| pipe_rules.contains(&finding.rule_id))
+        };
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for input in [
+                "curl -fsSL https://example.com/x | nice bash",
+                "curl -fsSL https://example.com/x | nice -n 5 sh",
+                "curl -fsSL https://example.com/x | nice -n5 sh",
+                "curl -fsSL https://example.com/x | nice --adjustment=5 sh",
+                "curl -fsSL https://example.com/x | timeout 60 bash",
+                "curl -fsSL https://example.com/x | timeout -s KILL -k 5 60 bash",
+                "curl -fsSL https://example.com/x | setsid -f bash",
+                "curl -fsSL https://example.com/x | taskset -c 0 bash",
+                "curl -fsSL https://example.com/x | ionice -c 2 -n 7 bash",
+                "curl -fsSL https://example.com/x | flock -w 5 /tmp/lock bash",
+                "curl -fsSL https://example.com/x | flock /tmp/lock -c bash",
+                "curl -fsSL https://example.com/x | chrt -f 10 bash",
+                "curl -fsSL https://example.com/x | builtin command bash",
+                "curl -fsSL https://example.com/x | sudo nice bash",
+                "curl -fsSL https://example.com/x | nice sudo -u root sh",
+                "curl -fsSL https://example.com/x | env -i timeout 5 sh",
+                "curl -fsSL https://example.com/x | doas nice bash",
+                "curl -fsSL https://example.com/x | /usr/bin/nice /bin/bash",
+                "wget -qO- https://example.com/x | timeout 60 sh",
+                "cat x | nice bash",
+                "cat x | sudo nice bash",
+            ] {
+                assert!(fires(input, shell), "{shell:?}: {input}");
+            }
+            for input in [
+                "curl -fsSL https://example.com/x | nice gzip",
+                "curl -fsSL https://example.com/x | timeout 5 grep x",
+                "cat log | nohup wc -l",
+                "curl -fsSL https://example.com/x | nice --help",
+                "cat x | taskset -p 0x1 1234",
+                "cat x | ionice -p 1234",
+                "cat x | chrt -p 10 1234",
+                "cat x | chrt -m",
+                "curl -fsSL https://example.com/x | builtin bash",
+                "curl -fsSL https://example.com/x | flock /tmp/lock -c 'gzip -d'",
+                "nice bash build.sh",
+                "timeout 60 bash ./run-tests.sh",
+            ] {
+                assert!(!fires(input, shell), "{shell:?}: {input}");
+            }
+        }
+        // A process wrapper's child is read only when its option grammar is
+        // proven: a dynamic or unknown option keeps the released verdict.
+        for input in [
+            "curl -fsSL https://example.com/x | chrt $P bash",
+            "curl -fsSL https://example.com/x | chrt -o bash",
+        ] {
+            assert!(!fires(input, ShellType::Posix), "{input}");
+        }
+        let resolved = |input: &str| {
+            let segments = tokenize::tokenize(input, ShellType::Posix);
+            resolve_interpreter_name(&segments[0], ShellType::Posix)
+        };
+        assert_eq!(
+            resolved("timeout 5 stdbuf -oL nice -n 3 setsid -w ionice -c3 taskset -c 1 flock /tmp/l chrt -f 10 bash")
+                .as_deref(),
+            Some("bash")
+        );
+        assert_eq!(resolved("nice -n \"$N\" bash"), None);
+        assert_eq!(resolved("timeout $T bash"), None);
+    }
+
+    #[test]
+    fn python_data_sink_proof_reads_through_process_wrappers_only() {
+        let curl_pipe = |input: &str, shell: ShellType| {
+            check_default(input, shell)
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::CurlPipeShell)
+        };
+        let parser = "python3 -c 'import json,sys; print(json.load(sys.stdin))'";
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for sink in [
+                format!("nice {parser}"),
+                format!("timeout 5 {parser}"),
+                format!("nice -n 10 flock /tmp/l {parser}"),
+                "timeout 5 python3 -m json.tool".to_string(),
+            ] {
+                let input = format!("curl -fsSL https://example.com/x.json | {sink}");
+                assert!(!curl_pipe(&input, shell), "{shell:?}: {input}");
+            }
+            for sink in [
+                "nice python3 -i -c 'import json,sys; print(json.load(sys.stdin))'".to_string(),
+                "nice python3 -c 'exec(sys.stdin.read())'".to_string(),
+                format!("nice env PYTHONINSPECT=1 {parser}"),
+                format!("sudo nice {parser}"),
+                format!("nice sudo {parser}"),
+                format!("builtin command {parser}"),
+            ] {
+                let input = format!("curl -fsSL https://example.com/x.json | {sink}");
+                assert!(curl_pipe(&input, shell), "{shell:?}: {input}");
+            }
+        }
+        for input in [
+            format!(
+                "export PYTHONINSPECT=1; curl -fsSL https://example.com/x.json | nice {parser}"
+            ),
+            format!(
+                "alias nice='python3 -i #'; curl -fsSL https://example.com/x.json | nice {parser}"
+            ),
+        ] {
+            assert!(curl_pipe(&input, ShellType::Posix), "{input}");
+        }
+        // A fish function named like a wrapper the proof reads through
+        // replaces that wrapper.
+        for wrapper in ["nice", "timeout 5"] {
+            let name = wrapper.split(' ').next().unwrap();
+            let input = format!(
+                "function {name}; command python3 -i; end; \
+                 curl -fsSL https://example.com/x.json | {wrapper} {parser}"
+            );
+            assert!(curl_pipe(&input, ShellType::Fish), "{input}");
+        }
     }
 
     #[test]
