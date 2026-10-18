@@ -11363,21 +11363,61 @@ fn posix_body_accepts_pipeline_as_code(
     false
 }
 
-fn posix_stdin_code_path(path: &str) -> bool {
-    if path == "-" {
-        return true;
+pub(crate) fn posix_stdin_code_path(path: &str) -> bool {
+    path == "-" || names_standard_stream(path, 0)
+}
+
+/// Whether the absolute `path` names the process's own descriptor `fd`
+/// (0 stdin, 1 stdout, 2 stderr) by a spelling the kernel resolves to it:
+/// `/dev/stdin` (`stdout`, `stderr`), `/dev/fd/N`, `/proc/self/fd/N` and
+/// `/proc/thread-self/fd/N`. Empty and `.` components are dropped, `..` is
+/// resolved lexically, and the descriptor number may carry leading zeros
+/// (`/dev//stdout`, `/dev/./stdout`, `/dev/fd/01`). Reading more spellings as
+/// the stream only widens what a caller treats as code input or download
+/// output, the fail-closed direction for every caller.
+pub(crate) fn names_standard_stream(path: &str, fd: u32) -> bool {
+    match standard_stream_device(path) {
+        Some(StreamDevice::Named(named)) => named == fd,
+        Some(StreamDevice::Numbered(number)) => number == fd,
+        None => false,
     }
+}
+
+/// How a descriptor device path names its descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDevice {
+    /// `/dev/stdin`, `/dev/stdout`, `/dev/stderr` (0, 1, 2).
+    Named(u32),
+    /// `/dev/fd/N`, `/proc/self/fd/N`, `/proc/thread-self/fd/N`.
+    Numbered(u32),
+}
+
+/// The descriptor device the absolute `path` names, by the spellings
+/// [`names_standard_stream`] documents. `None` for any other path.
+pub(crate) fn standard_stream_device(path: &str) -> Option<StreamDevice> {
     if !path.starts_with('/') {
-        return false;
+        return None;
     }
-    let parts = path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect::<Vec<_>>();
-    let zero_fd = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte == b'0');
-    matches!(parts.as_slice(), ["dev", "stdin"])
-        || matches!(parts.as_slice(), ["dev", "fd", fd] if zero_fd(fd))
-        || matches!(parts.as_slice(), ["proc", "self", "fd", fd] if zero_fd(fd))
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let number = |value: &str| descriptor_number(value).and_then(|digits| digits.parse().ok());
+    match parts.as_slice() {
+        ["dev", "stdin"] => Some(StreamDevice::Named(0)),
+        ["dev", "stdout"] => Some(StreamDevice::Named(1)),
+        ["dev", "stderr"] => Some(StreamDevice::Named(2)),
+        ["dev", "fd", value] | ["proc", "self" | "thread-self", "fd", value] => {
+            number(value).map(StreamDevice::Numbered)
+        }
+        _ => None,
+    }
 }
 
 enum PosixInterpreterInputMode {
@@ -22300,6 +22340,53 @@ mod curl_glob_tests {
         assert_eq!(
             curl_host_glob(&reference(&"n".repeat(128)), true),
             CurlHostGlob::Unreadable
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_device_tests {
+    use super::*;
+
+    #[test]
+    fn standard_stream_spellings() {
+        for path in [
+            "/dev/stdout",
+            "/dev//stdout",
+            "/dev/./stdout",
+            "/tmp/../dev/stdout",
+            "/dev/fd/1",
+            "/dev/fd/01",
+            "/proc/self/fd/1",
+            "/proc/thread-self/fd/001",
+        ] {
+            assert!(names_standard_stream(path, 1), "{path}");
+        }
+        for path in [
+            "/dev/stdin",
+            "/dev/fd/0",
+            "/dev/fd/00",
+            "/proc/self/fd/0",
+            "-",
+        ] {
+            assert!(posix_stdin_code_path(path), "{path}");
+        }
+        for path in [
+            "dev/stdout",
+            "/dev/stdout2",
+            "/dev/fd/10",
+            "/dev/fd/x",
+            "/tmp/stdout",
+        ] {
+            assert!(!names_standard_stream(path, 1), "{path}");
+        }
+        assert_eq!(
+            standard_stream_device("/dev/fd/12"),
+            Some(StreamDevice::Numbered(12))
+        );
+        assert_eq!(
+            standard_stream_device("/dev/stderr"),
+            Some(StreamDevice::Named(2))
         );
     }
 }

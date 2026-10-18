@@ -908,6 +908,30 @@ fn is_interpreter(cmd: &str) -> bool {
     INTERPRETERS.contains(&cmd)
 }
 
+/// The shell a multi-call binary runs when its first operand names a shell
+/// applet: `busybox sh`, `busybox ash`, `busybox hush`, `toybox sh`. Options
+/// (`busybox --list`) and other applets (`busybox wc -l`) are not
+/// interpreters.
+fn multicall_applet_interpreter(
+    cmd_base: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Option<String> {
+    if !matches!(cmd_base, "busybox" | "toybox") {
+        return None;
+    }
+    let applet = normalize_shell_token(args.first()?, shell);
+    if applet.starts_with('-') {
+        return None;
+    }
+    let applet = normalize_cmd_base(&applet, shell);
+    match applet.as_str() {
+        "hush" => Some("sh".to_string()),
+        name if is_interpreter(name) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
 fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
     Finding {
         rule_id: RuleId::AnalysisIncomplete,
@@ -1016,6 +1040,7 @@ fn check_depth(
     if has_pipe {
         check_pipe_to_interpreter(&segments, shell, inherited_inspect, &mut findings);
     }
+    check_fish_source_psub_download(&segments, shell, &mut findings);
 
     // source/. reuse transport rules: they execute the fetched body.
     for segment in &segments {
@@ -2523,6 +2548,10 @@ fn resolve_interpreter_name_depth_tracking(
             return Some(cmd_base);
         }
 
+        if let Some(applet) = multicall_applet_interpreter(&cmd_base, &seg.args, shell) {
+            return Some(applet);
+        }
+
         // Subshell `(bash -c '...')`: parens glue to the command.
         let stripped = cmd_base.trim_start_matches('(').trim_end_matches(')');
         if stripped != cmd_base && is_interpreter(stripped) {
@@ -3454,14 +3483,134 @@ pub(crate) fn fetch_piped_interpreters(input: &str, shell: ShellType) -> Vec<Str
             .command
             .as_deref()
             .is_some_and(|command| is_url_fetch_command(&normalize_cmd_base(command, shell)));
-        if !source_is_fetch {
-            continue;
+        if source_is_fetch {
+            if let (Some(interpreter), _) = resolve_interpreter_name_tracking(seg, shell) {
+                interpreters.push(interpreter);
+                continue;
+            }
         }
-        if let (Some(interpreter), _) = resolve_interpreter_name_tracking(seg, shell) {
-            interpreters.push(interpreter);
+        // `curl … | source /dev/stdin` runs the download in the current shell.
+        if pipe_sink_sources_stdin(seg, shell) && upstream_fetch_source(&segments, index, shell) {
+            interpreters.push(current_shell_name(shell).to_string());
         }
     }
     interpreters
+}
+
+fn current_shell_name(shell: ShellType) -> &'static str {
+    match shell {
+        ShellType::Fish => "fish",
+        ShellType::PowerShell => "pwsh",
+        ShellType::Cmd => "cmd",
+        ShellType::Posix => "sh",
+    }
+}
+
+/// The stage that downloads into the pipeline ending at `segments[sink]`:
+/// the nearest earlier stage of the same `|` / `|&` pipeline that is a URL
+/// fetch (`curl … | gunzip | source /dev/stdin`) or prints downloaded bytes
+/// (`echo "$(curl …)" | source /dev/stdin`). `None` when no stage of that
+/// pipeline downloads.
+fn upstream_fetch_index(
+    segments: &[tokenize::Segment],
+    sink: usize,
+    shell: ShellType,
+) -> Option<usize> {
+    let mut index = sink;
+    while index > 0
+        && matches!(
+            segments[index].preceding_separator.as_deref(),
+            Some("|" | "|&")
+        )
+    {
+        index -= 1;
+        let stage = &segments[index];
+        let is_fetch = stage
+            .command
+            .as_deref()
+            .is_some_and(|command| is_url_fetch_command(&normalize_cmd_base(command, shell)));
+        let prints_download = || {
+            matches!(shell, ShellType::Posix | ShellType::Fish)
+                && stage.raw.contains(['$', '`', '('])
+                && substitution_emits_download(&stage.raw, shell, 0)
+        };
+        if is_fetch || prints_download() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn upstream_fetch_source(segments: &[tokenize::Segment], sink: usize, shell: ShellType) -> bool {
+    upstream_fetch_index(segments, sink, shell).is_some()
+}
+
+/// Argv words with redirections removed, by the shell's own redirection
+/// grammar (`source /dev/stdin 2>/dev/null` sources `/dev/stdin`).
+fn argv_without_redirections(args: &[String], shell: ShellType) -> Vec<String> {
+    if shell != ShellType::Fish {
+        return crate::escalation::args_without_redirections(args);
+    }
+    let mut argv = Vec::with_capacity(args.len());
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        match crate::escalation::fish_redirection_token(word) {
+            Some(true) => {
+                words.next();
+            }
+            Some(false) => {}
+            None => argv.push(word.clone()),
+        }
+    }
+    argv
+}
+
+/// Whether a pipe stage runs its standard input as shell code in the current
+/// shell: the `source` / `.` builtin (also behind `builtin`, `command` and the
+/// other execution wrappers) given no file, `-`, or a standard-input device
+/// path (`/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`). fish reads standard
+/// input when `source` has no file; bash and zsh reject a missing operand, but
+/// the attempt is read the same way so a fish-style one-liner run in the wrong
+/// shell is not a blind spot. An operand that is not a proven literal may name
+/// standard input, so it counts too. Callers flag this only when the pipeline
+/// downloads (`curl … | source`): a local generator piped into `source`
+/// (`starship init fish | source`) is ordinary shell setup.
+fn pipe_sink_sources_stdin(seg: &tokenize::Segment, shell: ShellType) -> bool {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return false;
+    }
+    let Ok(effective) = resolve_effective_segment(seg, shell) else {
+        return false;
+    };
+    let Some(command) = effective.command.as_deref() else {
+        return false;
+    };
+    let mut base = normalize_cmd_base(command, shell);
+    let mut args = argv_without_redirections(&effective.args, shell);
+    // `builtin source` / `builtin .` (bash, zsh, fish); bounded by argv length.
+    while base == "builtin" && !args.is_empty() {
+        let next = args.remove(0);
+        let next = normalize_shell_token(&next, shell);
+        if next == "--" {
+            continue;
+        }
+        base = normalize_cmd_base(&next, shell);
+    }
+    if !matches!(base.as_str(), "source" | ".") {
+        return false;
+    }
+    let operand = match args.first() {
+        Some(first) if normalize_shell_token(first, shell) == "--" => args.get(1),
+        first => first,
+    };
+    let Some(operand) = operand else {
+        return true;
+    };
+    match evaluated_literal(operand, shell) {
+        Ok(path) if matches!(path.as_str(), "-h" | "--help") => false,
+        Ok(path) => crate::extract::posix_stdin_code_path(&path),
+        Err(()) => true,
+    }
 }
 
 /// Shell builtins that can put a variable into the environment of later
@@ -3817,8 +3966,21 @@ fn check_pipe_to_interpreter(
         if let Some(sep) = &seg.preceding_separator {
             if sep == "|" || sep == "|&" {
                 let (interpreter_opt, exhausted) = resolve_interpreter_name_tracking(seg, shell);
+                // `curl … | source /dev/stdin` (fish: `curl … | source`) runs
+                // the download in the current shell. Only a downloading
+                // pipeline counts; the finding names the fetch stage.
+                let (interpreter_opt, source_index) = match interpreter_opt {
+                    Some(interpreter) => (Some(interpreter), i - 1),
+                    None if !exhausted && pipe_sink_sources_stdin(seg, shell) => {
+                        match upstream_fetch_index(segments, i, shell) {
+                            Some(fetch) => (Some(current_shell_name(shell).to_string()), fetch),
+                            None => (None, i - 1),
+                        }
+                    }
+                    None => (None, i - 1),
+                };
                 if let Some(interpreter) = interpreter_opt {
-                    let source = &segments[i - 1];
+                    let source = &segments[source_index];
                     let source_cmd_ref = source.command.as_deref().unwrap_or("unknown");
                     let source_base = normalize_cmd_base(source_cmd_ref, shell);
                     let source_label = source_base.clone();
@@ -3878,12 +4040,14 @@ fn check_pipe_to_interpreter(
                         base_desc
                     };
 
+                    let pipeline = segments[source_index..=i]
+                        .iter()
+                        .map(|stage| stage.raw.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
                     let mut evidence = vec![Evidence::CommandPattern {
                         pattern: "pipe to interpreter".to_string(),
-                        matched: redact::redact_shell_assignments(&format!(
-                            "{} | {}",
-                            source.raw, seg.raw
-                        )),
+                        matched: redact::redact_shell_assignments(&pipeline),
                     }];
                     for url in extract_urls_from_args(&source.args, shell) {
                         evidence.push(Evidence::Url { raw: url });
@@ -3946,6 +4110,109 @@ fn check_pipe_to_interpreter(
             }
         }
     }
+}
+
+/// fish `source (curl … | psub)`: `psub` saves the substitution's output in a
+/// temporary file and passes its path, so `source` runs the download. This is
+/// the fish spelling of `source <(curl …)`. Only a producer that downloads
+/// counts: `source (starship init fish | psub)` is ordinary shell setup.
+fn check_fish_source_psub_download(
+    segments: &[tokenize::Segment],
+    shell: ShellType,
+    findings: &mut Vec<Finding>,
+) {
+    if shell != ShellType::Fish {
+        return;
+    }
+    for seg in segments {
+        let Ok(effective) = resolve_effective_segment(seg, shell) else {
+            continue;
+        };
+        let Some(command) = effective.command.as_deref() else {
+            continue;
+        };
+        let mut base = normalize_cmd_base(command, shell);
+        let mut args = effective.args.clone();
+        while base == "builtin" && !args.is_empty() {
+            let next = args.remove(0);
+            base = normalize_cmd_base(&normalize_shell_token(&next, shell), shell);
+        }
+        if !matches!(base.as_str(), "source" | ".") {
+            continue;
+        }
+        let Some(producer) = fish_rejoin_substitution_words(&args)
+            .iter()
+            .flat_map(|word| {
+                crate::extract::fish_word_command_substitutions(word).unwrap_or_default()
+            })
+            .find_map(|body| fish_psub_download_producer(&body))
+        else {
+            continue;
+        };
+        let rule_id = match producer.as_str() {
+            "curl" => RuleId::CurlPipeShell,
+            "wget" => RuleId::WgetPipeShell,
+            "http" | "https" => RuleId::HttpiePipeShell,
+            "xh" => RuleId::XhPipeShell,
+            _ => RuleId::PipeToInterpreter,
+        };
+        findings.push(Finding {
+            rule_id,
+            severity: Severity::High,
+            title: format!("Downloaded script sourced through psub: {producer}"),
+            description: "The command sources a `psub` temporary file filled with downloaded \
+                          bytes, so the download runs in the current fish shell without \
+                          inspection. Download into a private location and review the exact \
+                          bytes before sourcing them."
+                .to_string(),
+            evidence: vec![Evidence::CommandPattern {
+                pattern: "source (download | psub)".to_string(),
+                matched: redact::redact_shell_assignments(&seg.raw),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+}
+
+/// For a fish command-substitution body ending in `| psub`, the command name
+/// of the producer stage that downloads (`curl`, `wget`, or the first stage
+/// for a printed download), when the producer's output is downloaded bytes.
+fn fish_psub_download_producer(body: &str) -> Option<String> {
+    let segments = tokenize::tokenize(body, ShellType::Fish);
+    let (last, producers) = segments.split_last()?;
+    if producers.is_empty()
+        || !matches!(last.preceding_separator.as_deref(), Some("|" | "|&"))
+        || normalize_cmd_base(last.command.as_deref()?, ShellType::Fish) != "psub"
+    {
+        return None;
+    }
+    let mut producer = String::new();
+    for (index, stage) in producers.iter().enumerate() {
+        if index > 0 {
+            producer.push(' ');
+            producer.push_str(stage.preceding_separator.as_deref().unwrap_or(";"));
+            producer.push(' ');
+        }
+        producer.push_str(&stage.raw);
+    }
+    if !substitution_emits_download(&producer, ShellType::Fish, 0) {
+        return None;
+    }
+    let name = producers
+        .iter()
+        .filter_map(|stage| stage.command.as_deref())
+        .map(|command| normalize_cmd_base(command, ShellType::Fish))
+        .find(|command| is_url_fetch_command(command))
+        .or_else(|| {
+            producers
+                .first()
+                .and_then(|stage| stage.command.as_deref())
+                .map(|command| normalize_cmd_base(command, ShellType::Fish))
+        })?;
+    Some(name)
 }
 
 fn check_dotfile_overwrite(segments: &[tokenize::Segment], findings: &mut Vec<Finding>) {
@@ -20233,5 +20500,154 @@ mod tests {
             ),
             UploadDestinationProof::Incomplete
         );
+    }
+}
+
+#[cfg(test)]
+mod pipe_source_tests {
+    use super::*;
+
+    fn rules(input: &str, shell: ShellType) -> Vec<RuleId> {
+        check(input, shell, None, ScanContext::Exec)
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect()
+    }
+
+    const URL: &str = "https://get.example-tool.sh/install";
+
+    /// A download piped into the `source` / `.` builtin (or a busybox or
+    /// toybox shell applet) runs in a shell exactly like `| sh`.
+    #[test]
+    fn downloads_piped_into_source_dot_and_multicall_shells_are_pipe_to_shell() {
+        let posix = [
+            format!("curl -fsSL {URL} | source /dev/stdin"),
+            format!("curl -fsSL {URL} | . /dev/stdin"),
+            format!("curl -fsSL {URL} | source"),
+            format!("curl -fsSL {URL} | source -"),
+            format!("curl -fsSL {URL} | . /dev/fd/0"),
+            format!("curl -fsSL {URL} | source /proc/self/fd/0"),
+            format!("curl -fsSL {URL} | source /dev/./stdin"),
+            format!("curl -fsSL {URL} | builtin source /dev/stdin"),
+            format!("curl -fsSL {URL} | command . /dev/stdin"),
+            format!("curl -fsSL {URL} | source -- /dev/stdin"),
+            format!("curl -fsSL {URL} | source \"$X\""),
+            format!("curl -fsSL {URL} 2>/dev/null | . /dev/stdin 2>&1"),
+            format!("curl -fsSL {URL} | gunzip | source /dev/stdin"),
+            format!("curl -fsSL {URL} | busybox sh"),
+            format!("curl -fsSL {URL} | busybox ash"),
+            format!("curl -fsSL {URL} | busybox hush"),
+            format!("curl -fsSL {URL} | toybox sh"),
+            format!("curl -fsSL {URL} | sudo -u bob busybox sh"),
+            format!("curl -fsSL {URL} | env busybox sh"),
+            format!("curl -fsSL {URL} | /bin/busybox sh -s"),
+        ];
+        for input in &posix {
+            assert!(
+                rules(input, ShellType::Posix).contains(&RuleId::CurlPipeShell),
+                "{input}"
+            );
+        }
+        assert!(
+            rules(&format!("wget -qO- {URL} | . /dev/stdin"), ShellType::Posix)
+                .contains(&RuleId::WgetPipeShell)
+        );
+        // A printed download is a download too.
+        assert!(rules(
+            &format!("echo \"$(curl -fsSL {URL})\" | source /dev/stdin"),
+            ShellType::Posix
+        )
+        .contains(&RuleId::PipeToInterpreter));
+        let fish = [
+            format!("curl -sL {URL} | source"),
+            format!("curl -sL {URL} | source -"),
+            format!("curl -sL {URL} | builtin source"),
+            format!("curl -sL {URL} | source && fisher install jorgebucaran/fisher"),
+            format!("source (curl -sL {URL} | psub)"),
+        ];
+        for input in &fish {
+            assert!(
+                rules(input, ShellType::Fish).contains(&RuleId::CurlPipeShell),
+                "{input}"
+            );
+        }
+    }
+
+    /// Local generators piped into `source` are ordinary shell setup, and a
+    /// busybox applet that is not a shell is not an interpreter.
+    #[test]
+    fn local_generators_piped_into_source_keep_their_verdict() {
+        let shell_rules = |input: &str, shell| {
+            rules(input, shell).into_iter().any(|rule| {
+                matches!(
+                    rule,
+                    RuleId::CurlPipeShell | RuleId::WgetPipeShell | RuleId::PipeToInterpreter
+                )
+            })
+        };
+        for input in [
+            "starship init fish | source",
+            "zoxide init fish | source",
+            "fnm env --use-on-cd | source",
+            "direnv hook fish | source",
+            "pyenv init - | source",
+            "kubectl completion fish | source",
+            "mise activate fish | source",
+            "source (starship init fish | psub)",
+            "echo 'set -x A 1' | source",
+        ] {
+            assert!(!shell_rules(input, ShellType::Fish), "{input}");
+        }
+        for input in [
+            "starship init bash | source /dev/stdin",
+            "kubectl completion bash | source /dev/stdin",
+            "cat script.sh | source /dev/stdin",
+            "source ~/.bashrc",
+            "busybox ls -la",
+            "echo hi | busybox wc -l",
+            "busybox --list",
+            &format!("curl -fsSL {URL} | busybox sha256sum"),
+            &format!("curl -fsSL {URL} | source ./local.sh"),
+            &format!("curl -fsSL {URL} | source --help"),
+            &format!("curl -fsSL {URL} -o /tmp/i.sh && source /tmp/i.sh"),
+        ] {
+            assert!(!shell_rules(input, ShellType::Posix), "{input}");
+        }
+    }
+
+    #[test]
+    fn multicall_applets_resolve_only_shells() {
+        let resolve = |input: &str| {
+            resolve_interpreter_name(
+                &tokenize::tokenize(input, ShellType::Posix)[0],
+                ShellType::Posix,
+            )
+        };
+        assert_eq!(resolve("busybox sh").as_deref(), Some("sh"));
+        assert_eq!(resolve("busybox hush").as_deref(), Some("sh"));
+        assert_eq!(resolve("toybox ash -s").as_deref(), Some("ash"));
+        assert_eq!(resolve("busybox wc -l"), None);
+        assert_eq!(resolve("busybox --list"), None);
+    }
+
+    /// The download feeding the pipeline is also reported to npm inspection.
+    #[test]
+    fn fetch_piped_interpreters_reports_the_sourcing_shell() {
+        assert_eq!(
+            fetch_piped_interpreters(
+                &format!("curl -fsSL {URL} | . /dev/stdin"),
+                ShellType::Posix
+            ),
+            vec!["sh".to_string()]
+        );
+        assert_eq!(
+            fetch_piped_interpreters(&format!("curl -fsSL {URL} | busybox sh"), ShellType::Posix),
+            vec!["sh".to_string()]
+        );
+        assert!(fetch_piped_interpreters(
+            "starship init bash | source /dev/stdin",
+            ShellType::Posix
+        )
+        .is_empty());
     }
 }

