@@ -4246,6 +4246,23 @@ expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
 
+# curl `--expand-url` reads `{{name}}` through literal `--variable` values.
+[[fixture]]
+name = "curl_expand_url_variable_metadata_endpoint"
+min_milestone = 1
+input = "curl --variable host=169.254.169.254 --expand-url 'http://{{host}}/latest/meta-data/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["metadata_endpoint"]
+
+[[fixture]]
+name = "curl_expand_url_variable_regular_api_allowed"
+min_milestone = 1
+input = "curl --variable id=7 --expand-url 'https://api.example.com/items/{{id}}' -o item.json"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
 # `>| sh` writes a file named `sh`; 0.4.2 and earlier 0.5.0 builds split it
 # as a pipe into `sh` (a false positive: nothing runs the download).
 [[fixture]]

