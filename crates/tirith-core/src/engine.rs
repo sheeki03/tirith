@@ -2906,6 +2906,13 @@ fn analyze_with_observation(
     observation: Option<&mut Option<ObservedAnalysis>>,
 ) -> (Verdict, Policy) {
     let start = Instant::now();
+    // One shared budget for every recursive shell scanner of this analysis
+    // (CORE-6). Exhausting it adds an incomplete-analysis finding below.
+    let _scan_work = crate::extract::ScanWorkScope::enter_for(
+        ctx.input
+            .len()
+            .max(ctx.raw_bytes.as_ref().map_or(0, Vec::len)),
+    );
 
     // Every enforcement decision must use one complete, immutable-in-this-call
     // policy object. In particular, a clean tier-1 command and `TIRITH=0` may not
@@ -3880,6 +3887,13 @@ fn analyze_with_observation(
         }
     }
 
+    if crate::extract::scan_work_exhausted()
+        && !findings
+            .iter()
+            .any(|finding| finding.title == SCAN_WORK_BUDGET_TITLE)
+    {
+        findings.push(scan_work_budget_finding());
+    }
     let observed = ObservedAnalysis {
         findings,
         extracted,
@@ -3911,6 +3925,32 @@ fn analyze_with_observation(
         *out = Some(observed);
     }
     (verdict, policy)
+}
+
+const SCAN_WORK_BUDGET_TITLE: &str = "Shell analysis exceeded its shared work budget";
+
+/// The input made the recursive shell scanners exceed the analysis's shared
+/// work budget ([`crate::extract::ScanWorkScope::enter_for`]): bodies past the
+/// boundary were not proven safe, so the command is blocked.
+fn scan_work_budget_finding() -> Finding {
+    Finding {
+        rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+        severity: crate::verdict::Severity::High,
+        title: SCAN_WORK_BUDGET_TITLE.to_string(),
+        description: "Nested substitutions, groups or wrapper bodies in this input needed more \
+                      analysis work than Tirith's bounded budget allows. What was analyzed \
+                      before the boundary still reports its findings, and the rest is blocked \
+                      instead of being treated as clean."
+            .to_string(),
+        evidence: vec![crate::verdict::Evidence::CommandPattern {
+            pattern: "shared shell-analysis work budget exhausted".to_string(),
+            matched: "nested shell text past the analysis work budget was not scanned".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
 }
 
 /// Private, unredacted observations. They are never serialized or execution permits.
@@ -10304,5 +10344,176 @@ mod tests {
             "a sensitive wrapper child output is a proven flow: {:?}",
             verdict.findings
         );
+    }
+}
+
+#[cfg(test)]
+mod scan_work_budget_tests {
+    use super::*;
+
+    fn ctx(input: &str, shell: ShellType, scan_context: ScanContext) -> AnalysisContext {
+        AnalysisContext {
+            input: input.to_string(),
+            shell,
+            scan_context,
+            raw_bytes: (scan_context == ScanContext::Paste).then(|| input.as_bytes().to_vec()),
+            interactive: true,
+            cwd: None,
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+        }
+    }
+
+    /// Scan work one analysis uses, measured inside an outer scope that the
+    /// analysis shares.
+    fn work_used(input: &str, shell: ShellType, scan_context: ScanContext) -> usize {
+        let _scope = crate::extract::ScanWorkScope::enter_for(input.len());
+        let _ = analyze(&ctx(input, shell, scan_context));
+        crate::extract::scan_work_used().unwrap_or(0)
+    }
+
+    fn realistic_script(target_bytes: usize) -> String {
+        let block = concat!(
+            "install_tool() {\n",
+            "  local version=\"$(curl -fsSL https://api.example.com/latest | jq -r .tag)\"\n",
+            "  if [ -n \"$version\" ]; then\n",
+            "    echo \"installing $version\" && tar -xzf \"tool-$version.tar.gz\" -C \"$HOME/.local\"\n",
+            "  fi\n",
+            "}\n",
+            "for f in $(ls ./*.txt); do wc -l \"$f\"; done\n",
+            "cat <<'NOTES' > /tmp/notes.txt\n",
+            "notes for $(whoami)\n",
+            "NOTES\n",
+            "export PATH=\"$HOME/.local/bin:$PATH\"; ",
+            "echo \"$(date +%s)-$(git rev-parse --short HEAD)\" > build-id\n",
+        );
+        let mut script = String::new();
+        while script.len() + block.len() < target_bytes {
+            script.push_str(block);
+        }
+        script
+    }
+
+    /// Every golden fixture and a large realistic script stay far below the
+    /// shared budget, so the budget only ever stops pathological inputs.
+    #[test]
+    fn realistic_inputs_leave_ample_scan_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        #[derive(serde::Deserialize)]
+        struct File {
+            fixture: Vec<Fixture>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            name: String,
+            input: String,
+            context: String,
+            #[serde(default)]
+            shell: Option<String>,
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut worst = (0usize, String::new());
+        let mut measured = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+            let path = entry.expect("fixture entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("fixture file");
+            let Ok(file) = toml::from_str::<File>(&text) else {
+                continue;
+            };
+            for fixture in file.fixture {
+                let scan_context = match fixture.context.as_str() {
+                    "exec" => ScanContext::Exec,
+                    "paste" => ScanContext::Paste,
+                    _ => continue,
+                };
+                let shell = match fixture.shell.as_deref() {
+                    Some("fish") => ShellType::Fish,
+                    Some("powershell") => ShellType::PowerShell,
+                    Some("cmd") => ShellType::Cmd,
+                    _ => ShellType::Posix,
+                };
+                let used = work_used(&fixture.input, shell, scan_context);
+                measured += 1;
+                if used > worst.0 {
+                    worst = (used, fixture.name.clone());
+                }
+            }
+        }
+        assert!(measured > 100, "only {measured} fixtures measured");
+        let script = realistic_script(96 * 1024);
+        let script_used = work_used(&script, ShellType::Posix, ScanContext::Exec);
+        eprintln!(
+            "scan work: worst of {measured} fixtures {} ({} bytes); 96 KiB script {} bytes; budget {}",
+            worst.1,
+            worst.0,
+            script_used,
+            crate::extract::MAX_SCAN_WORK_BYTES
+        );
+        assert!(
+            worst.0 < crate::extract::MAX_SCAN_WORK_BYTES / 8,
+            "fixture {} used {} of {} scan-work bytes",
+            worst.1,
+            worst.0,
+            crate::extract::MAX_SCAN_WORK_BYTES
+        );
+        assert!(
+            script_used < crate::extract::MAX_SCAN_WORK_BYTES / 4,
+            "a realistic 96 KiB script used {script_used} scan-work bytes"
+        );
+    }
+
+    /// Running out of the shared budget blocks as incomplete analysis instead
+    /// of returning whatever the scanners had proven so far.
+    #[test]
+    fn exhausted_scan_budget_is_incomplete_analysis() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let input = format!("echo {}x{}", "$(echo ".repeat(40), ")".repeat(40));
+        let verdict = {
+            let _scope = crate::extract::ScanWorkScope::enter_with(4096);
+            analyze(&ctx(&input, ShellType::Posix, ScanContext::Exec))
+        };
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|finding| finding.title == SCAN_WORK_BUDGET_TITLE),
+            "{:?}",
+            verdict.findings
+        );
+        assert_eq!(verdict.action, crate::verdict::Action::Block);
+        // Outside any scope the budget is not armed (direct rule calls).
+        assert!(crate::extract::charge_scan_work(usize::MAX));
+    }
+
+    /// CORE-6: 128 nested `$(echo` used to take 20-40 s on a release build.
+    #[test]
+    fn deep_command_substitution_nesting_stays_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        for depth in [128usize, 250] {
+            let input = format!("echo {}x{}", "$(echo ".repeat(depth), ")".repeat(depth));
+            let started = Instant::now();
+            let verdict = analyze(&ctx(&input, ShellType::Posix, ScanContext::Exec));
+            let elapsed = started.elapsed();
+            assert_eq!(
+                verdict.action,
+                crate::verdict::Action::Block,
+                "depth {depth}"
+            );
+            // Debug builds are far slower than release; this only catches a
+            // return of the old super-linear curve.
+            assert!(
+                elapsed < std::time::Duration::from_secs(60),
+                "depth {depth} took {elapsed:?}"
+            );
+        }
     }
 }

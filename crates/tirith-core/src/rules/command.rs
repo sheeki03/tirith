@@ -1000,6 +1000,11 @@ fn check_depth(
     inherited_inspect: PythonInspectContext,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // Out of the analysis's shared scan budget: the engine reports that as
+    // incomplete analysis for the whole input.
+    if !crate::extract::charge_scan_work(input.len()) {
+        return findings;
+    }
     let (input, segments, mut command_budget_exhausted) =
         bounded_command_analysis_segments(input, shell);
     let mut wrapper_depth_exhausted = false;
@@ -4953,14 +4958,15 @@ enum CurlOperandHosts {
 
 /// `budget` is the number of expanded host parts one command may still
 /// check (see [`crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND`]); a
-/// globbed operand past it is unreadable.
+/// globbed operand past it is unreadable. `globbing` is
+/// [`curl_globbing_enabled`] for the command's argv, read once per command
+/// (once per operand made thousands of operands quadratic, CORE-6).
 fn curl_operand_hosts(
-    args: &[String],
+    globbing: bool,
     operand: &FetchDestination,
-    shell: ShellType,
     budget: &mut usize,
 ) -> CurlOperandHosts {
-    if !curl_globbing_enabled(args, shell) {
+    if !globbing {
         return CurlOperandHosts::Plain;
     }
     match crate::extract::curl_host_glob(&operand.text, operand.curl_variables) {
@@ -5082,8 +5088,9 @@ fn check_network_destination(
         // `http://{10.0.0.1,x}/` reach the hosts they expand to.
         if cmd_base == "curl" {
             let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            let globbing = curl_globbing_enabled(&args, shell);
             for operand in curl_url_operands(&args, shell) {
-                match curl_operand_hosts(&args, &operand, shell, &mut budget) {
+                match curl_operand_hosts(globbing, &operand, &mut budget) {
                     CurlOperandHosts::Plain => {
                         check_host_for_network_issues(&operand.text, "curl", findings);
                     }
@@ -6092,12 +6099,13 @@ pub fn check_network_policy(
 
         if is_url_fetch_command(&cmd_base) {
             let mut budget = crate::extract::MAX_CURL_GLOB_EXPANSIONS_PER_COMMAND;
+            let globbing = cmd_base == "curl" && curl_globbing_enabled(resolved_args, shell);
             for destination in url_fetch_destination_operands(&cmd_base, resolved_args, shell) {
                 // A curl URL glob reaches every host it expands to: the
                 // operand is denied if any of them is denied and not allowed,
                 // so the allow list admits it only if it covers each of them.
                 let hosts: Vec<String> = match (cmd_base == "curl")
-                    .then(|| curl_operand_hosts(resolved_args, &destination, shell, &mut budget))
+                    .then(|| curl_operand_hosts(globbing, &destination, &mut budget))
                 {
                     Some(CurlOperandHosts::Unreadable) => {
                         // Its hosts are unknown: report it and go on, so a
@@ -7581,9 +7589,12 @@ fn fish_args_as_posix_dataflow(args: &[String]) -> Vec<String> {
 /// a fetch to stdout, a data-preserving transform of one, or a nested
 /// substitution or wrapper body that does.
 fn substitution_emits_download(body: &str, shell: ShellType, depth: usize) -> bool {
+    // An exhausted shared scan budget is reported by the engine as
+    // incomplete analysis, so this answer is never taken as clean.
     if depth > MAX_SHELL_SUBSTITUTION_EVAL_DEPTH
         || body.len() > MAX_SHELL_DATAFLOW_WORD_BYTES
         || !matches!(shell, ShellType::Posix | ShellType::Fish)
+        || !crate::extract::charge_scan_work(body.len())
     {
         return false;
     }

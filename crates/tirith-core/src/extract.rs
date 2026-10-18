@@ -1835,16 +1835,18 @@ pub(crate) fn strip_invisible(s: &str) -> String {
 pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let extracted = extract_urls_depth(input, shell, 0);
     let mut deduplicated: Vec<ExtractedUrl> = Vec::new();
+    // First occurrence of each (segment, URL text), so thousands of URLs do
+    // not compare every candidate with every kept one (CORE-6).
+    let mut first_index: std::collections::HashMap<(usize, String), usize> =
+        std::collections::HashMap::new();
     for candidate in extracted {
-        let identity = candidate.parsed.raw_str();
-        if let Some(existing) = deduplicated.iter_mut().find(|existing| {
-            existing.segment_index == candidate.segment_index
-                && existing.parsed.raw_str() == identity
-        }) {
+        let key = (candidate.segment_index, candidate.parsed.raw_str());
+        if let Some(&index) = first_index.get(&key) {
             // Recursive inspection of a command substitution carries the true
             // nested sink context and must win over a raw fallback match.
-            existing.in_sink_context |= candidate.in_sink_context;
+            deduplicated[index].in_sink_context |= candidate.in_sink_context;
         } else {
+            first_index.insert(key, deduplicated.len());
             deduplicated.push(candidate);
         }
     }
@@ -1854,7 +1856,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
 const MAX_SUBSTITUTION_DEPTH: usize = 8;
 
 fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<ExtractedUrl> {
-    if depth > MAX_SUBSTITUTION_DEPTH {
+    // An exhausted budget is reported by the engine as incomplete analysis.
+    if depth > MAX_SUBSTITUTION_DEPTH || !charge_scan_work(input.len()) {
         return Vec::new();
     }
     let heredocs = (shell == ShellType::Posix).then(|| recover_posix_heredocs(input));
@@ -1882,6 +1885,8 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
 
     for (seg_idx, segment) in segments.iter().enumerate() {
         let sink_context = is_sink_context(segment, &segments, shell);
+        // Built on the first URL candidate of the segment, then shared by all.
+        let mut url_owners: Option<NestedUrlOwners<'_>> = None;
         let resolved = resolve_segment_command_for_shell(segment, shell);
         let curl_destinations = resolved
             .as_ref()
@@ -1987,20 +1992,20 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             if !clean.is_empty() {
                 let first = results.len();
                 push_urls_from_source(&clean, shell, seg_idx, sink_context, &mut results);
-                for (index, candidate) in results.iter().enumerate().skip(first) {
-                    if nested_body_owns_url_fallback(
-                        candidate,
-                        &clean,
-                        segment,
-                        input,
-                        shell,
-                        &nested_bodies,
-                    ) {
-                        deferred_fallbacks.insert(index);
+                if results.len() > first {
+                    let owners = url_owners.get_or_insert_with(|| {
+                        NestedUrlOwners::new(segment, input, shell, &nested_bodies)
+                    });
+                    let source = owners.for_source(&clean);
+                    for (index, candidate) in results.iter().enumerate().skip(first) {
+                        if source.owns(candidate) {
+                            deferred_fallbacks.insert(index);
+                        }
                     }
                 }
             }
         }
+        let curl_operand_index = curl_destinations.as_deref().map(CurlOperandIndex::new);
         for source in &url_sources {
             let first = results.len();
             push_urls_from_source_with_curl_operands(
@@ -2008,19 +2013,18 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                 shell,
                 seg_idx,
                 sink_context,
-                curl_destinations.as_deref(),
+                curl_operand_index.as_ref(),
                 &mut results,
             );
-            for (index, candidate) in results.iter().enumerate().skip(first) {
-                if nested_body_owns_url_fallback(
-                    candidate,
-                    source,
-                    segment,
-                    input,
-                    shell,
-                    &nested_bodies,
-                ) {
-                    deferred_fallbacks.insert(index);
+            if results.len() > first {
+                let owners = url_owners.get_or_insert_with(|| {
+                    NestedUrlOwners::new(segment, input, shell, &nested_bodies)
+                });
+                let source = owners.for_source(source);
+                for (index, candidate) in results.iter().enumerate().skip(first) {
+                    if source.owns(candidate) {
+                        deferred_fallbacks.insert(index);
+                    }
                 }
             }
         }
@@ -2248,119 +2252,281 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
 /// It may misread curl's DNS authority as an IP, or promote URI-looking remote
 /// path text into a new destination. Equal text in a sibling wget or data word
 /// does not establish ownership and keeps its independent reading.
-fn nested_body_owns_url_fallback(
-    candidate: &ExtractedUrl,
-    source: &str,
-    segment: &Segment,
-    input: &str,
+///
+/// What depends only on the nested bodies is computed once per segment, and
+/// what depends on the source word once per word: a word holding thousands
+/// of URLs (`python3 -c "$(echo URL…)"`) used to compare every candidate with
+/// every nested URL and re-read the whole body for each (CORE-6), which grew
+/// with the square of the word.
+struct NestedUrlOwners<'a> {
+    segment: &'a Segment,
     shell: ShellType,
-    nested_bodies: &[(ExecutableBody, Vec<ExtractedUrl>)],
-) -> bool {
-    let dns_mismatch = matches!(&candidate.parsed, UrlLike::Standard { parsed, .. }
-        if matches!(parsed.host(), Some(url::Host::Ipv4(_)))
-            && parse::curl_empty_hex_dns_url_host(&candidate.raw).is_some());
-    nested_bodies.iter().any(|(body, urls)| {
-        let Some(origin) = &body.origin else {
-            return false;
-        };
-        if origin.parent_range.start < segment.byte_range.start
-            || origin.parent_range.end > segment.byte_range.end
-        {
-            return false;
+    bodies: Vec<NestedUrlOwner<'a>>,
+}
+
+struct NestedUrlOwner<'a> {
+    body: &'a ExecutableBody,
+    origin: &'a ExecutableBodyOrigin,
+    urls: &'a [ExtractedUrl],
+    /// The body's exact lexical span is retained and a `)` closes it.
+    closes_exact_body: bool,
+    /// Nested client URLs by their suffixes that start in the URL's path,
+    /// query or fragment, with where that tail starts.
+    path_suffixes: ShortSuffixIndex<'a, (&'a str, usize)>,
+    /// The input holds the body's exact text at its recorded span.
+    exact_span: bool,
+}
+
+/// [`NestedUrlOwners`] for one source word, with the word's facts computed
+/// on first use.
+struct SourceUrlOwners<'o, 'a> {
+    owners: &'o NestedUrlOwners<'a>,
+    source: &'o str,
+    normalized: std::cell::OnceCell<String>,
+    /// Where the (unique) source word starts in the segment.
+    start: std::cell::OnceCell<Option<usize>>,
+    /// Per body: the wrapper parser selected this unique complete code argv.
+    unique_wrapper_argv: Vec<std::cell::OnceCell<bool>>,
+}
+
+/// Strings indexed by each of their suffixes of at most
+/// [`ShortSuffixIndex::KEY_BYTES`] bytes. A string that ends with some text
+/// also ends with that text's own short suffix, so "which indexed strings may
+/// end with X" is one hash lookup instead of a scan of every string: URL
+/// extraction asks it once per URL candidate, and a word holding thousands of
+/// URLs made those scans quadratic (CORE-6).
+struct ShortSuffixIndex<'a, T> {
+    map: std::collections::HashMap<&'a str, Vec<T>>,
+}
+
+impl<'a, T> ShortSuffixIndex<'a, T> {
+    const KEY_BYTES: usize = 16;
+
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
         }
-        // URL_REGEX may include a command substitution's closing `)` in
-        // the URL path. Only an exact retained lexical span proves that this
-        // byte is shell syntax instead of part of the client's URL operand.
-        let closes_exact_body = input.get(origin.parent_range.clone()) == Some(body.input.as_str())
-            && input.as_bytes().get(origin.parent_range.end) == Some(&b')');
-        let comparable_raw = if closes_exact_body {
-            candidate.raw.strip_suffix(')').unwrap_or(&candidate.raw)
-        } else {
-            &candidate.raw
-        };
-        let has_client_authority = urls.iter().any(|url| {
-            let Some(host) = url.parsed.host() else {
-                return false;
+    }
+
+    /// Index `text` under its short suffixes that start at or after byte
+    /// `start` (a char boundary), the empty suffix included.
+    fn insert(&mut self, text: &'a str, start: usize, value: T)
+    where
+        T: Clone,
+    {
+        let mut offset = text.len();
+        loop {
+            self.map
+                .entry(&text[offset..])
+                .or_default()
+                .push(value.clone());
+            let Some((previous, _)) = text[start..offset].char_indices().last() else {
+                break;
             };
-            if let Some(offset) = url.raw.len().checked_sub(comparable_raw.len()) {
-                let tail_start = match &url.parsed {
-                    UrlLike::Scp { .. } => url.raw.find(':').map(|colon| colon + 1),
-                    _ => parse::curl_scheme_separator(&url.raw).and_then(|(colon, slashes)| {
-                        let authority_start = colon + 1 + slashes;
-                        url.raw[authority_start..]
-                            .find(['/', '?', '#'])
-                            .map(|end| authority_start + end)
-                    }),
-                };
-                if tail_start.is_some_and(|start| offset >= start)
-                    && url.raw.get(offset..) == Some(comparable_raw)
-                {
-                    return true;
-                }
+            let previous = start + previous;
+            if text.len() - previous > Self::KEY_BYTES {
+                break;
             }
-            if !dns_mismatch || parse::curl_empty_hex_dns_host(host).is_none() {
+            offset = previous;
+        }
+    }
+
+    /// The values of every indexed string that may end with `suffix`.
+    fn candidates(&self, suffix: &str) -> &[T] {
+        let mut key_start = 0usize;
+        while suffix.len() - key_start > Self::KEY_BYTES {
+            key_start += suffix[key_start..].chars().next().map_or(1, char::len_utf8);
+        }
+        self.map
+            .get(&suffix[key_start..])
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+impl NestedUrlOwner<'_> {
+    /// Whether `comparable` is a suffix of a nested client URL that starts in
+    /// that URL's path, query or fragment.
+    fn owned_by_url_tail(&self, comparable: &str) -> bool {
+        self.path_suffixes
+            .candidates(comparable)
+            .iter()
+            .any(|(raw, tail_start)| {
+                raw.len()
+                    .checked_sub(comparable.len())
+                    .is_some_and(|offset| {
+                        offset >= *tail_start && raw.get(offset..) == Some(comparable)
+                    })
+            })
+    }
+}
+
+impl<'a> NestedUrlOwners<'a> {
+    fn new(
+        segment: &'a Segment,
+        input: &'a str,
+        shell: ShellType,
+        nested_bodies: &'a [(ExecutableBody, Vec<ExtractedUrl>)],
+    ) -> Self {
+        let bodies = nested_bodies
+            .iter()
+            .filter_map(|(body, urls)| {
+                let origin = body.origin.as_ref()?;
+                if origin.parent_range.start < segment.byte_range.start
+                    || origin.parent_range.end > segment.byte_range.end
+                {
+                    return None;
+                }
+                let exact_span =
+                    input.get(origin.parent_range.clone()) == Some(body.input.as_str());
+                // URL_REGEX may include a command substitution's closing `)`
+                // in the URL path. Only an exact retained lexical span proves
+                // that this byte is shell syntax instead of part of the
+                // client's URL operand.
+                let closes_exact_body =
+                    exact_span && input.as_bytes().get(origin.parent_range.end) == Some(&b')');
+                let mut path_suffixes = ShortSuffixIndex::new();
+                for url in urls {
+                    if url.parsed.host().is_none() {
+                        continue;
+                    }
+                    let tail_start = match &url.parsed {
+                        UrlLike::Scp { .. } => url.raw.find(':').map(|colon| colon + 1),
+                        _ => parse::curl_scheme_separator(&url.raw).and_then(|(colon, slashes)| {
+                            let authority_start = colon + 1 + slashes;
+                            url.raw[authority_start..]
+                                .find(['/', '?', '#'])
+                                .map(|end| authority_start + end)
+                        }),
+                    };
+                    if let Some(tail_start) = tail_start {
+                        path_suffixes.insert(&url.raw, tail_start, (url.raw.as_str(), tail_start));
+                    }
+                }
+                Some(NestedUrlOwner {
+                    body,
+                    origin,
+                    urls,
+                    closes_exact_body,
+                    path_suffixes,
+                    exact_span,
+                })
+            })
+            .collect();
+        Self {
+            segment,
+            shell,
+            bodies,
+        }
+    }
+
+    fn for_source<'o>(&'o self, source: &'o str) -> SourceUrlOwners<'o, 'a> {
+        SourceUrlOwners {
+            owners: self,
+            source,
+            normalized: std::cell::OnceCell::new(),
+            start: std::cell::OnceCell::new(),
+            unique_wrapper_argv: self
+                .bodies
+                .iter()
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        }
+    }
+}
+
+impl SourceUrlOwners<'_, '_> {
+    fn owns(&self, candidate: &ExtractedUrl) -> bool {
+        let segment = self.owners.segment;
+        let shell = self.owners.shell;
+        let dns_mismatch = matches!(&candidate.parsed, UrlLike::Standard { parsed, .. }
+            if matches!(parsed.host(), Some(url::Host::Ipv4(_)))
+                && parse::curl_empty_hex_dns_url_host(&candidate.raw).is_some());
+        self.owners.bodies.iter().enumerate().any(|(index, owner)| {
+            let comparable_raw = if owner.closes_exact_body {
+                candidate.raw.strip_suffix(')').unwrap_or(&candidate.raw)
+            } else {
+                &candidate.raw
+            };
+            let has_client_authority = owner.owned_by_url_tail(comparable_raw)
+                || (dns_mismatch
+                    && owner.urls.iter().any(|url| {
+                        let Some(host) = url.parsed.host() else {
+                            return false;
+                        };
+                        if parse::curl_empty_hex_dns_host(host).is_none() {
+                            return false;
+                        }
+                        if url.raw == comparable_raw {
+                            return true;
+                        }
+                        // URL_REGEX can see ftp:// inside a complete sftp://
+                        // operand. Suppress only a suffix beginning inside
+                        // that same URI scheme.
+                        let Some(scheme_end) = url.raw.find("://") else {
+                            return false;
+                        };
+                        url.raw
+                            .len()
+                            .checked_sub(comparable_raw.len())
+                            .is_some_and(|offset| {
+                                offset < scheme_end && url.raw.get(offset..) == Some(comparable_raw)
+                            })
+                    }));
+            if !has_client_authority {
                 return false;
             }
-            if url.raw == comparable_raw {
+            let body = owner.body;
+            let unique_wrapper_argv = *self.unique_wrapper_argv[index].get_or_init(|| {
+                owner.origin.relation == ExecutableRelation::WrapperReplacement
+                    && *self.normalized.get_or_init(|| {
+                        crate::rules::command::normalize_shell_token(self.source, shell)
+                    }) == body.input
+                    && segment
+                        .command
+                        .iter()
+                        .chain(segment.args.iter())
+                        .filter(|word| {
+                            crate::rules::command::normalize_shell_token(word, shell) == body.input
+                        })
+                        .count()
+                        == 1
+            });
+            if unique_wrapper_argv {
+                // The wrapper parser selected this unique complete code argv.
+                // Decoded/generated bodies do not need a guessed byte mapping.
                 return true;
             }
-            // URL_REGEX can see ftp:// inside a complete sftp:// operand.
-            // Suppress only a suffix beginning inside that same URI scheme.
-            let Some(scheme_end) = url.raw.find("://") else {
+            if !owner.exact_span {
+                return false; // no exact lexical child span was retained
+            }
+            let Some(source_start) = *self.start.get_or_init(|| {
+                let mut spans = segment.raw.match_indices(self.source);
+                match (spans.next(), spans.next()) {
+                    // Repeated source words have distinct ownership.
+                    (Some((start, _)), None) => Some(start),
+                    _ => None,
+                }
+            }) else {
                 return false;
             };
-            url.raw
-                .len()
-                .checked_sub(comparable_raw.len())
-                .is_some_and(|offset| {
-                    offset < scheme_end && url.raw.get(offset..) == Some(comparable_raw)
-                })
-        });
-        if !has_client_authority {
-            return false;
-        }
-        if origin.relation == ExecutableRelation::WrapperReplacement
-            && crate::rules::command::normalize_shell_token(source, shell) == body.input
-            && segment
-                .command
-                .iter()
-                .chain(segment.args.iter())
-                .filter(|word| {
-                    crate::rules::command::normalize_shell_token(word, shell) == body.input
-                })
-                .count()
-                == 1
-        {
-            // The wrapper parser selected this unique complete code argv.
-            // Decoded/generated bodies do not need a guessed byte mapping.
-            return true;
-        }
-        if input.get(origin.parent_range.clone()) != Some(body.input.as_str()) {
-            return false; // no exact lexical child span was retained
-        }
-        let mut source_spans = segment.raw.match_indices(source);
-        let Some((source_start, _)) = source_spans.next() else {
-            return false;
-        };
-        if source_spans.next().is_some() {
-            return false; // repeated source words have distinct ownership
-        }
-        let mut found = false;
-        for (offset, _) in source.match_indices(&candidate.raw) {
-            found = true;
-            let start = segment.byte_range.start + source_start + offset;
-            let end = start + candidate.raw.len();
-            let closing_delimiter = closes_exact_body
-                && comparable_raw.len() + 1 == candidate.raw.len()
-                && end == origin.parent_range.end + 1;
-            if start < origin.parent_range.start
-                || (end > origin.parent_range.end && !closing_delimiter)
-            {
-                return false;
+            let origin = owner.origin;
+            let mut found = false;
+            for (offset, _) in self.source.match_indices(&candidate.raw) {
+                found = true;
+                let start = segment.byte_range.start + source_start + offset;
+                let end = start + candidate.raw.len();
+                let closing_delimiter = owner.closes_exact_body
+                    && comparable_raw.len() + 1 == candidate.raw.len()
+                    && end == origin.parent_range.end + 1;
+                if start < origin.parent_range.start
+                    || (end > origin.parent_range.end && !closing_delimiter)
+                {
+                    return false;
+                }
             }
-        }
-        found
-    })
+            found
+        })
+    }
 }
 
 /// An extracted URL with context.
@@ -3192,12 +3358,39 @@ fn curl_glob_range(raw: &str, start: usize) -> Result<(Vec<String>, usize), Curl
     Ok((values, start + end))
 }
 
+/// A curl segment's URL operands, indexed once for every URL candidate of
+/// the segment (see [`ShortSuffixIndex`]).
+struct CurlOperandIndex<'a> {
+    /// Operand texts, for exact matches.
+    exact: std::collections::HashSet<&'a str>,
+    /// Operands with a URI scheme separator, by their short suffixes.
+    with_scheme: ShortSuffixIndex<'a, &'a str>,
+}
+
+impl<'a> CurlOperandIndex<'a> {
+    fn new(operands: &'a [crate::rules::command::FetchDestination]) -> Self {
+        let mut with_scheme = ShortSuffixIndex::new();
+        for operand in operands {
+            if parse::curl_scheme_separator(&operand.text).is_some() {
+                with_scheme.insert(&operand.text, 0, operand.text.as_str());
+            }
+        }
+        Self {
+            exact: operands
+                .iter()
+                .map(|operand| operand.text.as_str())
+                .collect(),
+            with_scheme,
+        }
+    }
+}
+
 fn push_urls_from_source_with_curl_operands(
     source: &str,
     shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
-    curl_operands: Option<&[crate::rules::command::FetchDestination]>,
+    curl_operands: Option<&CurlOperandIndex<'_>>,
     results: &mut Vec<ExtractedUrl>,
 ) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
@@ -3210,22 +3403,20 @@ fn push_urls_from_source_with_curl_operands(
             // A complete selected operand owns its URI-looking path text and
             // any scheme suffix (`sftp://` also matches at `ftp://`). Attached
             // --url= / -x values are included; independent data URLs stay visible.
-            let inside_complete_operand = operands.iter().any(|operand| {
-                let operand = &operand.text;
-                if parse::curl_scheme_separator(operand).is_none() || operand.len() <= raw.len() {
-                    return false;
-                }
-                let suffix_start = operand.len() - raw.len();
-                operand.get(suffix_start..) == Some(raw.as_str())
-                    && normalized[..mat.start()].ends_with(&operand[..suffix_start])
-            });
+            let inside_complete_operand =
+                operands.with_scheme.candidates(&raw).iter().any(|operand| {
+                    if operand.len() <= raw.len() {
+                        return false;
+                    }
+                    let suffix_start = operand.len() - raw.len();
+                    operand.get(suffix_start..) == Some(raw.as_str())
+                        && normalized[..mat.start()].ends_with(&operand[..suffix_start])
+                });
             if inside_complete_operand {
                 continue;
             }
         }
-        let url = if curl_operands
-            .is_some_and(|operands| operands.iter().any(|operand| operand.text == raw))
-        {
+        let url = if curl_operands.is_some_and(|operands| operands.exact.contains(raw.as_str())) {
             parse_curl_destination(&raw)
         } else {
             parse::parse_url(&raw)
@@ -7940,6 +8131,101 @@ fn rewrite_inherited_directory_command_words(
     Some(rewritten)
 }
 
+/// Shell text (bytes) one analysis may hand to the recursive executable-body
+/// scanners in total, across every recursion level and every caller (the
+/// tier-1 nested-body walk, URL extraction, the command rules and their
+/// substitution evaluation). Each scanner already bounds its own depth and
+/// body count, but they call one another, so the product of those bounds
+/// could still turn one crafted input into minutes of work (CORE-6: 128
+/// nested `$(echo` took 20-40 s). The golden fixtures use at most a few KiB
+/// and a 96 KiB script about 1 MiB (see `engine::scan_work_budget_tests`);
+/// running out is reported as incomplete analysis, never as a clean result.
+/// A larger input (a file scan) gets [`SCAN_WORK_PER_INPUT_BYTE`] times its
+/// size instead, so linear work over a big file is never cut short.
+pub(crate) const MAX_SCAN_WORK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Scan work allowed per input byte when that exceeds
+/// [`MAX_SCAN_WORK_BYTES`]: a bound on super-linear work, not on size.
+pub(crate) const SCAN_WORK_PER_INPUT_BYTE: usize = 64;
+
+thread_local! {
+    /// Remaining scan work of the analysis running on this thread, or `None`
+    /// outside one (direct rule calls are unbounded, as before).
+    static SCAN_WORK_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The budget the outermost scope armed.
+    static SCAN_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCAN_WORK_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One analysis's shared scan-work budget. The outermost scope arms it and
+/// clears it on drop; a nested scope (an analysis started inside another on
+/// the same thread) shares the outer budget.
+pub(crate) struct ScanWorkScope {
+    outermost: bool,
+}
+
+impl ScanWorkScope {
+    /// The budget for analyzing an input of `input_bytes` bytes.
+    pub(crate) fn enter_for(input_bytes: usize) -> Self {
+        Self::enter_with(
+            MAX_SCAN_WORK_BYTES.max(input_bytes.saturating_mul(SCAN_WORK_PER_INPUT_BYTE)),
+        )
+    }
+
+    pub(crate) fn enter_with(limit: usize) -> Self {
+        let outermost = SCAN_WORK_REMAINING.with(|remaining| {
+            if remaining.get().is_some() {
+                false
+            } else {
+                remaining.set(Some(limit));
+                SCAN_WORK_LIMIT.with(|armed| armed.set(limit));
+                SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(false));
+                true
+            }
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for ScanWorkScope {
+    fn drop(&mut self) {
+        if self.outermost {
+            SCAN_WORK_REMAINING.with(|remaining| remaining.set(None));
+            SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(false));
+        }
+    }
+}
+
+/// Charge `bytes` of scanning to the running analysis. `false` once its
+/// budget is spent (and from then on): the caller returns its fail-closed
+/// answer.
+pub(crate) fn charge_scan_work(bytes: usize) -> bool {
+    SCAN_WORK_REMAINING.with(|remaining| match remaining.get() {
+        None => true,
+        Some(left) if left >= bytes && !scan_work_exhausted() => {
+            remaining.set(Some(left - bytes));
+            true
+        }
+        Some(_) => {
+            remaining.set(Some(0));
+            SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(true));
+            false
+        }
+    })
+}
+
+/// Whether the running analysis ran out of scan work.
+pub(crate) fn scan_work_exhausted() -> bool {
+    SCAN_WORK_EXHAUSTED.with(std::cell::Cell::get)
+}
+
+/// Scan work the running analysis has used, for tests.
+#[cfg(test)]
+pub(crate) fn scan_work_used() -> Option<usize> {
+    let limit = SCAN_WORK_LIMIT.with(std::cell::Cell::get);
+    SCAN_WORK_REMAINING.with(|remaining| remaining.get().map(|left| limit - left))
+}
+
 /// Structured executable-body scan.  Most callers only need the recovered
 /// bodies and use [`executable_substitutions`]; enforcement callers also retain
 /// `gap` so ambiguous PowerShell invocation never collapses to "no body".
@@ -7947,6 +8233,12 @@ pub(crate) fn executable_substitution_scan(
     raw: &str,
     shell: ShellType,
 ) -> ExecutableSubstitutionScan {
+    if !charge_scan_work(raw.len()) {
+        return ExecutableSubstitutionScan {
+            bodies: Vec::new(),
+            gap: Some(ShellExecutionGap::WorkBudgetExceeded),
+        };
+    }
     let (raw, input_budget_exhausted) = bounded_executable_input(raw);
     let (scan_input, mut heredoc_bodies, heredoc_gap) = if shell == ShellType::Posix {
         let recovery = recover_posix_heredocs(raw);
@@ -9950,6 +10242,14 @@ fn posix_body_calls_parent_alias(
     depth: usize,
     remaining_bodies: &mut usize,
 ) -> bool {
+    // No parent alias (proven or unresolved): nothing to call. See
+    // `posix_body_calls_parent_function`.
+    if state.aliases.is_empty() && state.unresolved.is_empty() {
+        return false;
+    }
+    if !charge_scan_work(raw.len()) {
+        return true;
+    }
     for segment in tokenize::tokenize(raw, ShellType::Posix) {
         if let Some(command_raw) = segment.command.as_deref() {
             if let Some(command) = posix_alias_invocation_name(command_raw) {
@@ -9965,8 +10265,13 @@ fn posix_body_calls_parent_alias(
             }
         }
 
-        let (nested_bodies, nested_gap) =
-            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        // The caller's budget, not a fresh one: re-arming it here made every
+        // nesting level pay the full budget again.
+        let (nested_bodies, nested_gap) = lexical_executable_substitutions_bounded(
+            &segment.raw,
+            ShellType::Posix,
+            remaining_bodies,
+        );
         if nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()) {
             return true;
         }
@@ -10299,15 +10604,19 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 PosixFunctionParse::NotDefinition => {}
             }
 
-            let (nested_bodies, nested_gap) =
-                lexical_executable_substitutions(&segment.raw, ShellType::Posix);
-            let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
-            if (nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()))
-                || nested_bodies.iter().any(|body| {
-                    posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
-                })
-            {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            // Only an alias in scope can be called from a nested body; with
+            // none, the nested scan has nothing to look for.
+            if !state.aliases.is_empty() || !state.unresolved.is_empty() {
+                let (nested_bodies, nested_gap) =
+                    lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+                let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+                if nested_gap.is_some()
+                    || nested_bodies.iter().any(|body| {
+                        posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
+                    })
+                {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
             }
 
             if let Some(dispatch_scan) = posix_current_scope_dispatch_scan(segment) {
@@ -11350,6 +11659,16 @@ fn posix_body_calls_parent_function(
     depth: usize,
     remaining_bodies: &mut usize,
 ) -> bool {
+    // With no parent function there is nothing a body can call: every answer
+    // below would be "no" except the fail-closed one for an exhausted budget,
+    // which then only re-walked every nested body at every enclosing level
+    // (CORE-6: deep `$(...)` nesting cost grew with the square of the depth).
+    if function_names.is_empty() {
+        return false;
+    }
+    if !charge_scan_work(raw.len()) {
+        return true;
+    }
     for segment in tokenize::tokenize(raw, ShellType::Posix) {
         if let Some(command) = posix_function_command_word(&segment) {
             if function_names.contains(&command) {
@@ -12307,6 +12626,9 @@ fn lexical_executable_substitutions_bounded(
     shell: ShellType,
     remaining_bodies: &mut usize,
 ) -> (Vec<ExecutableBody>, Option<ShellExecutionGap>) {
+    if !charge_scan_work(raw.len()) {
+        return (Vec::new(), Some(ShellExecutionGap::WorkBudgetExceeded));
+    }
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
     let mut functions = std::collections::HashMap::<String, PosixFunctionBinding>::new();
@@ -22636,5 +22958,31 @@ mod remote_heredoc_reader_tests {
         assert!(!local.or(remote).best_effort);
         assert!(remote.or(HeredocReading::DATA).best_effort);
         assert!(!HeredocReading::DATA.or(HeredocReading::DATA).best_effort);
+    }
+}
+
+#[cfg(test)]
+mod url_extraction_scale_tests {
+    use super::*;
+
+    /// A word holding thousands of URLs extracts in linear time and keeps the
+    /// same URLs as a small one.
+    #[test]
+    fn many_urls_in_one_substitution_extract_quickly() {
+        let urls = (0..3000)
+            .map(|index| format!("https://e{index}.example.com/p"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let input = format!("python3 -c \"$(echo {urls})\"");
+        let started = std::time::Instant::now();
+        let extracted = extract_urls(&input, ShellType::Posix);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(extracted
+            .iter()
+            .any(|url| url.raw == "https://e2999.example.com/p"));
     }
 }
