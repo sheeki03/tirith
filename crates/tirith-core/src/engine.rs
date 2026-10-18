@@ -89,6 +89,23 @@ fn collect_nested_executable_inputs(
     (bodies, incomplete)
 }
 
+/// The Exec Tier-1 gate's executable-body trigger: a nested body (`$(...)`,
+/// `eval`, `sh -c`, a function or heredoc body) Tirith could not resolve
+/// completely, or a recovered body that itself matches the Tier-1 patterns or
+/// names a sensitive asset. Such a command never takes the fast exit.
+/// Public so the reachability tests can mirror every input-side trigger of the
+/// gate, not only the PATTERN_TABLE regex.
+#[doc(hidden)]
+pub fn exec_executable_body_triggered(input: &str, shell: ShellType) -> bool {
+    let stripped = crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell);
+    let (nested, incomplete) = collect_nested_executable_inputs(&stripped, shell);
+    incomplete
+        || nested.iter().any(|body| {
+            extract::tier1_scan_for_shell(&body.input, ScanContext::Exec, body.shell)
+                || crate::sensitive_assets::tier1_sensitive_asset_candidate(&body.input)
+        })
+}
+
 /// Owned backing for a custom-rule-DSL [`crate::custom_rule_dsl::DslEvalContext`]
 /// (which borrows `&str`). Built ONCE (only when a DSL rule exists) by
 /// [`build_dsl_backing`]; borrowed via [`Self::as_eval_context`]. Public so
@@ -2979,18 +2996,8 @@ fn analyze_with_observation(
     // malformed bodies must reach the fail-closed Tier-3 rule, and a decoded
     // body (notably PowerShell `-EncodedCommand`) may contain the only built-in
     // risk signal even though the outer base64 spelling is otherwise clean.
-    let executable_body_triggered = if ctx.scan_context == ScanContext::Exec {
-        let stripped =
-            crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell);
-        let (nested, incomplete) = collect_nested_executable_inputs(&stripped, ctx.shell);
-        incomplete
-            || nested.iter().any(|body| {
-                extract::tier1_scan_for_shell(&body.input, ctx.scan_context, body.shell)
-                    || crate::sensitive_assets::tier1_sensitive_asset_candidate(&body.input)
-            })
-    } else {
-        false
-    };
+    let executable_body_triggered = ctx.scan_context == ScanContext::Exec
+        && exec_executable_body_triggered(&ctx.input, ctx.shell);
 
     // Exec-only: catch bidi/zero-width/invisible bytes even with no URL.
     // Proven-literal `tirith diff/score/why/receipt/explain` args are carved out

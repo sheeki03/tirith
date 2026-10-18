@@ -1298,8 +1298,12 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 shell,
             );
             let asset_triggered = public_sensitive_asset_gate(&fixture.input);
+            // A nested body the scanner cannot resolve (`eval "$X"`, a
+            // non-literal emitter under `eval`) is its own gate trigger: the
+            // block comes from incomplete analysis, not from PATTERN_TABLE.
+            let body_triggered = engine::exec_executable_body_triggered(&fixture.input, shell);
 
-            if !(byte_triggered || regex_triggered || asset_triggered) {
+            if !(byte_triggered || regex_triggered || asset_triggered || body_triggered) {
                 missed.push(format!("{file_name}:{}", fixture.name));
             }
 
