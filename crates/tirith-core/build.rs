@@ -545,10 +545,22 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             // PHP-capable primitives rather than changing other languages'
             // case semantics in the precise rule.
             r"(?i:\b(?:system|popen|shell_exec|passthru|proc_open)\s*\()",
+            // A program attached to its inline flag inside one quoted word
+            // (`perl '-esystem("id")'`, `python3 '-cexec(...)'`) puts flag
+            // letters right before the marker, where the `\b` anchors above
+            // cannot match. Same markers, preceded by a dash-letter run.
+            r"(?i:-[a-z0-9]*[a-z](?:exec|eval|system|popen|function|shell_exec|passthru|proc_open|execsync|spawn(?:sync)?)\s*\()",
+            r"(?i:-[a-z0-9]*[a-z](?:subprocess|child_process|pty\.spawn|socket\.socket|urllib|urlopen|requests\.|http\.client|httplib|io::socket|net::|lwp::))",
+            // perl and ruby join every -e/-E program with newlines, so a
+            // marker can be split across two programs
+            // (`perl -e 'system' -e '("id")'`). Any perl/ruby word followed by
+            // two inline-flag-shaped words reaches the joined-program check.
+            r"(?s:\b(?:perl|ruby).*-[A-Za-z0-9]*[eE].*\s['\x22]?-[A-Za-z0-9]*[eE])",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Inline-interpreter suspicious payload markers (python -c/node -e/... \
-                with exec/subprocess/network) — PR3",
+                with exec/subprocess/network), attached-flag and split perl/ruby \
+                program shapes — PR3",
     },
     PatternEntry {
         id: "cargo_vet",

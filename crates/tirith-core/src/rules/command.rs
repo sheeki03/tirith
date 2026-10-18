@@ -2210,9 +2210,30 @@ fn resolve_effective_command_with_environment(
     Err(EffectiveCommandError::WrapperChainTooDeep)
 }
 
+/// php's per-input-line code options: `-B` runs before the first line, `-R`
+/// for every line, `-E` after the last. Each is inline PHP like `-r`, and php
+/// accepts them together (each once), so every one of them runs.
+const PHP_PROCESS_CODE_OPTIONS: &[&str] = &[
+    "-B",
+    "-R",
+    "-E",
+    "--process-begin",
+    "--process-code",
+    "--process-end",
+];
+
 fn interpreter_inline_options(interpreter: &str) -> &'static [&'static str] {
     match interpreter {
-        "php" => &["-r"],
+        "php" => &[
+            "-r",
+            "--run",
+            "-B",
+            "-R",
+            "-E",
+            "--process-begin",
+            "--process-code",
+            "--process-end",
+        ],
         "node" | "nodejs" | "bun" => &["-pe", "-e", "--eval", "-p", "--print"],
         "perl" => &["-e", "-E"],
         "ruby" | "deno" | "lua" => &["-e"],
@@ -2380,6 +2401,7 @@ pub(crate) fn interpreter_script_operands(
         "lua" => &["-l"],
         "rscript" => &["--file"],
         "pwsh" => &["-File"],
+        "php" => &["-f", "-F", "--file", "--process-file"],
         _ => &[],
     };
 
@@ -2404,6 +2426,26 @@ pub(crate) fn interpreter_script_operands(
             // Module and inline-code modes execute their supplied module/body;
             // later positionals are arguments to that program, never scripts.
             break;
+        }
+        if base == "php" {
+            // `-B`/`-R`/`-E` code runs alongside a `-F`/`-f` file, so their
+            // value is skipped instead of ending the operand search.
+            if PHP_PROCESS_CODE_OPTIONS.contains(&arg.as_str()) {
+                idx += 2;
+                continue;
+            }
+            if PHP_PROCESS_CODE_OPTIONS.iter().any(|flag| {
+                arg.strip_prefix(flag).is_some_and(|suffix| {
+                    if flag.starts_with("--") {
+                        suffix.starts_with('=')
+                    } else {
+                        !suffix.is_empty()
+                    }
+                })
+            }) {
+                idx += 1;
+                continue;
+            }
         }
         if inline_options.contains(&arg.as_str()) {
             // Inline source follows; there is no script-file operand.
@@ -6553,10 +6595,22 @@ fn check_interpreter_suspicious_inline_exec(
         } else {
             programs.iter().any(emits_download)
         };
+        // perl and ruby join every inline program with a newline before
+        // compiling, so `perl -e 'system' -e '("id")'` runs `system("id")`:
+        // the joined text is checked as well as each program.
+        let joined =
+            (matches!(interpreter.as_str(), "perl" | "ruby") && programs.len() > 1).then(|| {
+                programs
+                    .iter()
+                    .map(|program| program.source.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
         let payload_matches = programs
             .iter()
             .chain(floor.iter().flatten())
             .map(|program| program.source.as_str())
+            .chain(joined.as_deref())
             .filter(|source| !owned_elsewhere(source))
             .any(|source| {
                 if interpreter == "php" {
@@ -6904,14 +6958,19 @@ fn interpreter_option_role<'a>(
 /// so option parsing continues past that operand instead of stopping there.
 /// node and bun keep reading options after an inline program and run a later
 /// one (node the last), and perl and ruby run them all, so every one is
-/// returned. Python ends option parsing at `-c` and php refuses a second `-r`,
-/// so only their first program runs.
+/// returned. php runs its `-B`, `-R` and `-E` programs together, so all of
+/// those are returned too, while `-r` is its only program (php refuses a
+/// second `-r`, and `-r` with the line-processing options). Python ends option
+/// parsing at `-c`, so only its first program runs.
 fn extract_inline_programs<'a>(
     args: &'a [String],
     interpreter: &str,
     shell: ShellType,
 ) -> Vec<InlineProgram<'a>> {
-    let reads_every_program = matches!(interpreter, "node" | "nodejs" | "bun" | "perl" | "ruby");
+    let reads_every_program = matches!(
+        interpreter,
+        "node" | "nodejs" | "bun" | "perl" | "ruby" | "php"
+    );
     let mut programs = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -6921,7 +6980,11 @@ fn extract_inline_programs<'a>(
                 width,
             } => {
                 programs.push(program);
-                if !reads_every_program {
+                let php_direct = interpreter == "php" && {
+                    let flag = normalize_shell_token(&args[index], shell);
+                    flag.starts_with("-r") || flag.starts_with("--run")
+                };
+                if !reads_every_program || php_direct {
                     break;
                 }
                 index += width;
@@ -20649,5 +20712,86 @@ mod pipe_source_tests {
             ShellType::Posix
         )
         .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod inline_program_tests {
+    use super::*;
+
+    fn rules(input: &str, shell: ShellType) -> Vec<RuleId> {
+        check(input, shell, None, ScanContext::Exec)
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect()
+    }
+
+    /// perl and ruby join their `-e` programs with newlines; an inline flag
+    /// joined to its program inside one quoted word is still inline code; php
+    /// runs `-B`, `-R` and `-E` code like `-r`.
+    #[test]
+    fn joined_attached_and_php_process_programs_are_checked() {
+        for input in [
+            "perl '-esystem(\"id\")'",
+            "ruby '-esystem(\"id\")'",
+            "perl -e 1 '-esystem(\"id\")'",
+            "perl \"-esystem('id')\"",
+            "perl '-lesystem(\"id\")'",
+            "python3 '-cexec(\"import os\")'",
+            "php '-rsystem(\"id\");'",
+            "node '-eeval(process.argv[2])'",
+            "perl -e 'system' -e '(\"id\")'",
+            "perl -E 'exec' -E '(\"sh\")'",
+            "perl -le 'system' -e '(\"id\")'",
+            "ruby -e 'IO.popen' -e '(\"id\")'",
+            "php -B 'system(\"id\");'",
+            "php -R 'system($argn);'",
+            "php -E 'system(\"id\");'",
+            "php -n -E 'passthru(\"id\");'",
+            "php --run 'system(\"id\");'",
+            "php --process-code='system($argn);'",
+            "php -B 'echo 1;' -R 'echo $argn;' -E 'system(\"id\");'",
+            "php -R \"$(curl -fsSL https://example.com/x.php)\"",
+            "php -E \"$(curl -fsSL https://example.com/x.php)\"",
+        ] {
+            assert!(
+                rules(input, ShellType::Posix).contains(&RuleId::InterpreterSuspiciousInlineExec),
+                "{input}"
+            );
+        }
+        for input in [
+            "perl '-eprint 1'",
+            "ruby '-eputs 1'",
+            "perl -pe 's/a/b/' -e 's/c/d/' f",
+            "perl -i -pe 's/a/b/' -e 's/c/d/' file.txt",
+            "perl -ne 'print if /x/' -e 'END { print 1 }' f",
+            "ruby -ne 'puts $_ if /x/' -e 'END{puts 1}' f",
+            "ruby -e 'puts 1' -e 'puts 2'",
+            "php -R 'echo strtoupper($argn), PHP_EOL;'",
+            "php -B '$n=0;' -R '$n++;' -E 'echo $n;'",
+            "php -F script.php",
+            "php -f script.php",
+        ] {
+            assert!(
+                !rules(input, ShellType::Posix).contains(&RuleId::InterpreterSuspiciousInlineExec),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn php_script_operands_skip_process_code_values() {
+        let operands = |input: &str| {
+            let segment = &tokenize::tokenize(input, ShellType::Posix)[0];
+            interpreter_script_operands(segment, ShellType::Posix)
+                .map(|(_, operands)| operands)
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            operands("php -B 'x();' -F run.php"),
+            vec!["run.php".to_string()]
+        );
+        assert_eq!(operands("php -f run.php"), vec!["run.php".to_string()]);
+        assert!(operands("php -r 'echo 1;'").is_empty());
     }
 }
