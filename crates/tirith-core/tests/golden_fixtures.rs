@@ -827,8 +827,13 @@ fn test_tier1_coverage() {
             let regex_triggered =
                 tirith_core::extract::tier1_scan_for_shell(&fixture.input, scan_context, shell);
             let sensitive_asset_triggered = public_sensitive_asset_gate(&fixture.input);
+            // The Exec gate's executable-body trigger: a nested body (here an
+            // `eval` of a trusted emitter whose output the same input can
+            // steer) that Tirith cannot resolve never takes the fast exit.
+            let body_triggered = scan_context == ScanContext::Exec
+                && tirith_core::engine::exec_executable_body_triggered(&fixture.input, shell);
 
-            if !regex_triggered && !sensitive_asset_triggered {
+            if !regex_triggered && !sensitive_asset_triggered && !body_triggered {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action

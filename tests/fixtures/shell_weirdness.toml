@@ -2744,12 +2744,23 @@ forbidden_rules = ["pipe_to_interpreter"]
 [[fixture]]
 name = "fish_python_data_pipeline_after_literal_set_passes"
 min_milestone = 1
-input = "set -gx PATH $HOME/bin $PATH; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+input = "set -gx LANG C.UTF-8; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
 context = "exec"
 shell = "fish"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["pipe_to_interpreter"]
+
+# the proof trusts the name python3; a PATH change can point it at a planted
+# program
+[[fixture]]
+name = "fish_python_data_pipeline_after_path_change_blocks"
+min_milestone = 1
+input = "set -gx PATH $HOME/bin $PATH; echo '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["pipe_to_interpreter"]
 
 [[fixture]]
 name = "fish_python_data_pipeline_after_exported_inspect_blocks"

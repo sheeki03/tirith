@@ -47,7 +47,8 @@ fn collect_nested_executable_inputs(
     input: &str,
     shell: ShellType,
 ) -> (Vec<crate::extract::ExecutableBody>, bool) {
-    type Seen = std::collections::HashSet<(String, ShellType, bool)>;
+    type Seen =
+        std::collections::HashSet<(String, ShellType, bool, crate::extract::ShellStateChange)>;
     fn collect(
         input: &str,
         shell: ShellType,
@@ -57,6 +58,13 @@ fn collect_nested_executable_inputs(
         incomplete: &mut bool,
         seen: &mut Seen,
     ) {
+        // A nested body runs with the shell state this input set up (a
+        // function exported to `bash -c`, a variable an `eval` emitter reads),
+        // as in the command rules' own recursion.
+        let _shell_state = crate::extract::ShellStateScope::enter(
+            crate::extract::ShellStateChange::of_input(input, shell),
+        );
+        let enclosing = crate::extract::enclosing_shell_state();
         let scan = crate::extract::executable_substitution_scan(input, shell);
         // Coverage inside a best-effort body (a fish wrapper child) is never
         // required, so its gaps and depth limit do not make `input` incomplete.
@@ -75,7 +83,12 @@ fn collect_nested_executable_inputs(
             // Its scan is deterministic, so a later copy has the same gap and
             // bodies. One reached deeper hits the depth limit sooner, and
             // that limit already marks the input incomplete.
-            if !seen.insert((nested_input.clone(), nested_shell, nested_best_effort)) {
+            if !seen.insert((
+                nested_input.clone(),
+                nested_shell,
+                nested_best_effort,
+                enclosing,
+            )) {
                 continue;
             }
             let mut execution_body = body;

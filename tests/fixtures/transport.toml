@@ -235,11 +235,47 @@ forbidden_rules = ["analysis_incomplete"]
 [[fixture]]
 name = "c4_insecure_tls_wget_loopback_is_low"
 min_milestone = 1
-input = "wget --no-check-certificate https://localhost:8443/health"
+input = "wget --max-redirect=0 --no-check-certificate https://localhost:8443/health"
 context = "exec"
 expected_action = "warn"
 expected_rules = ["insecure_tls_flags"]
 forbidden_rules = ["analysis_incomplete"]
+
+# wget follows redirects by default, and curl with -L: a redirect to a remote
+# host would go out unverified
+[[fixture]]
+name = "corefix_insecure_tls_wget_loopback_redirect_blocks"
+min_milestone = 1
+input = "wget --no-check-certificate https://localhost:8443/health"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "corefix_insecure_tls_curl_loopback_location_blocks"
+min_milestone = 1
+input = "curl -k https://localhost:8443/ -L"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+# an enclosing proxy variable reaches a nested body
+[[fixture]]
+name = "corefix_insecure_tls_nested_proxy_blocks"
+min_milestone = 1
+input = "export https_proxy=http://evil.example:8080; sh -c 'curl -k https://localhost/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "corefix_insecure_tls_fish_home_blocks"
+min_milestone = 1
+input = "set -x HOME /tmp/x; curl -k https://localhost:8443/"
+shell = "fish"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
 
 [[fixture]]
 name = "c4_insecure_tls_remote_still_blocks"
