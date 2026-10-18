@@ -153,13 +153,25 @@ const MAX_NESTED_COMMAND_DEPTH: usize = 8;
 /// findings, never an analysis gap.
 type ExecutableSegment = (tokenize::Segment, ShellType, bool);
 
+/// Why the nested-command walk could not see every executable segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestedCoverageGap {
+    /// A body nests deeper than [`MAX_NESTED_COMMAND_DEPTH`].
+    Depth,
+    /// A bounded scan, input, candidate or retained-body budget ran out.
+    Budget,
+    /// A nested shell body could not be resolved: a dynamic, grouped or
+    /// unsupported construct.
+    Unresolved,
+}
+
 fn collect_executable_segments(
     input: &str,
     shell: ShellType,
     depth: usize,
     best_effort: bool,
     out: &mut Vec<ExecutableSegment>,
-) -> bool {
+) -> Option<NestedCoverageGap> {
     let execution_view = crate::extract::shell_execution_view(input, shell);
     out.extend(
         tokenize::tokenize(execution_view.as_ref(), shell)
@@ -167,32 +179,43 @@ fn collect_executable_segments(
             .map(|segment| (segment, shell, best_effort)),
     );
     let nested_scan = crate::extract::executable_substitution_scan(input, shell);
-    let mut incomplete = !best_effort && nested_scan.gap.is_some();
+    let mut gap = nested_scan.gap.filter(|_| !best_effort).map(|gap| {
+        if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+            NestedCoverageGap::Budget
+        } else {
+            NestedCoverageGap::Unresolved
+        }
+    });
     let nested = nested_scan.bodies;
     if nested.is_empty() {
-        return incomplete;
+        return gap;
     }
     if depth >= MAX_NESTED_COMMAND_DEPTH {
-        return !best_effort && nested.iter().any(|body| !body.best_effort);
+        return (!best_effort && nested.iter().any(|body| !body.best_effort))
+            .then_some(NestedCoverageGap::Depth);
     }
     for body in nested {
         // Do not use `Iterator::any`: traversing every sibling is required to
         // collect all executable segments even after an earlier depth gap.
-        incomplete |= collect_executable_segments(
+        let child = collect_executable_segments(
             &body.input,
             body.shell,
             depth + 1,
             best_effort || body.best_effort,
             out,
         );
+        gap = gap.or(child);
     }
-    incomplete
+    gap
 }
 
-fn executable_segments(input: &str, shell: ShellType) -> (Vec<ExecutableSegment>, bool) {
+fn executable_segments(
+    input: &str,
+    shell: ShellType,
+) -> (Vec<ExecutableSegment>, Option<NestedCoverageGap>) {
     let mut segments = Vec::new();
-    let incomplete = collect_executable_segments(input, shell, 0, false, &mut segments);
-    (segments, incomplete)
+    let gap = collect_executable_segments(input, shell, 0, false, &mut segments);
+    (segments, gap)
 }
 
 /// Cheap, filesystem-free blast-radius check for the hot path. Fires the
@@ -206,18 +229,38 @@ pub fn cheap_check(
     env_map: &HashMap<String, String>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let (segments, nested_incomplete) = executable_segments(input, shell);
+    let (segments, nested_gap) = executable_segments(input, shell);
 
-    if nested_incomplete {
+    if let Some(gap) = nested_gap {
+        // Name the boundary that was actually hit: a body Tirith could not
+        // resolve is not a budget or depth limit.
+        let (description, matched) = match gap {
+            NestedCoverageGap::Depth => (
+                "A nested shell body is deeper than Tirith's bounded nested-shell depth, so a \
+                 destructive command inside it cannot be ruled out.",
+                "nested body beyond the depth limit",
+            ),
+            NestedCoverageGap::Budget => (
+                "Tirith reached its bounded nested-shell analysis budget (input, \
+                 lexical-candidate or retained-body limit), so a destructive command in the \
+                 unexamined part cannot be ruled out.",
+                "nested body suffix omitted by bounded analysis",
+            ),
+            NestedCoverageGap::Unresolved => (
+                "The command runs a nested shell body Tirith could not resolve (a dynamic, \
+                 grouped or unsupported shell construct), so a destructive command inside it \
+                 cannot be ruled out.",
+                "unresolved nested shell body",
+            ),
+        };
         findings.push(finding(
             RuleId::AnalysisIncomplete,
             Severity::High,
             "nested command analysis was incomplete",
-            "A destructive command may be hidden beyond Tirith's bounded nested-shell depth, \
-             lexical-candidate, input, or retained-body budget.",
+            description,
             Evidence::CommandPattern {
                 pattern: "nested shell execution coverage gap".to_string(),
-                matched: "nested body suffix omitted by bounded analysis".to_string(),
+                matched: matched.to_string(),
             },
         ));
     }
@@ -460,8 +503,8 @@ fn simulate_with_work_limit(
         ..BlastReport::default()
     };
     let mut budget = WorkBudget::new(work_limit);
-    let (segments, nested_incomplete) = executable_segments(input, shell);
-    if nested_incomplete {
+    let (segments, nested_gap) = executable_segments(input, shell);
+    if nested_gap.is_some() {
         report.walk_errors += 1;
         report.walk_truncated = true;
         report.classification_incomplete = true;
@@ -1581,6 +1624,28 @@ mod tests {
 
     fn empty_env() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn nested_coverage_gap_wording_names_the_boundary_that_was_hit() {
+        let description = |input: &str| {
+            cheap_check(input, ShellType::Posix, &empty_env())
+                .into_iter()
+                .find(|finding| finding.title == "nested command analysis was incomplete")
+                .map(|finding| finding.description)
+        };
+        // An unresolvable construct is not a budget or depth limit.
+        let unresolved = description("$CMD --version").expect("dynamic command name gap");
+        assert!(unresolved.contains("could not resolve"), "{unresolved}");
+        assert!(!unresolved.contains("budget"), "{unresolved}");
+        // Complete literal bodies report no gap at all.
+        for input in [
+            "{ echo a; echo b; } > out.txt",
+            "cat <<< \"hello\"",
+            "echo a | xargs -I{} echo {}",
+        ] {
+            assert_eq!(description(input), None, "{input}");
+        }
     }
 
     #[test]
