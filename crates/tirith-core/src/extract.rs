@@ -9225,11 +9225,22 @@ fn cmd_start_body_index(args: &[String]) -> Result<Option<usize>, ()> {
     Ok(None)
 }
 
+/// A literal xargs word. POSIX shells leave an empty `{}` pair unexpanded
+/// (brace expansion needs a comma or a `..` range), so `-I{}`, `{}` and
+/// `--replace={}` are literal there; any other brace keeps the word unproven.
+/// fish is left to [`static_wrapper_word`].
+fn xargs_static_word(raw: &str, shell: ShellType) -> Option<String> {
+    if shell != ShellType::Posix || !raw.contains("{}") || raw.contains('\u{1}') {
+        return static_wrapper_word(raw, shell);
+    }
+    static_wrapper_word(&raw.replace("{}", "\u{1}"), shell).map(|word| word.replace('\u{1}', "{}"))
+}
+
 fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
     let mut index = 0usize;
     let mut replacement: Option<String> = None;
     while index < args.len() {
-        let Some(option) = static_wrapper_word(&args[index], shell) else {
+        let Some(option) = xargs_static_word(&args[index], shell) else {
             record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             return;
         };
@@ -9263,36 +9274,37 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
                 index += 1;
                 continue;
             }
+            // GNU optional arguments are only ever attached (`--replace=R`):
+            // a bare `--replace` means `{}` and the next word is the command.
+            if matches!(name, "--replace" | "--eof" | "--max-lines") {
+                if name == "--replace" {
+                    replacement = Some(attached.unwrap_or("{}").to_string());
+                }
+                index += 1;
+                continue;
+            }
             if matches!(
                 name,
                 "--arg-file"
                     | "--delimiter"
-                    | "--eof"
-                    | "--replace"
-                    | "--max-lines"
                     | "--max-args"
                     | "--max-procs"
                     | "--max-chars"
                     | "--process-slot-var"
             ) {
-                let value = if let Some(value) = attached {
-                    value.to_string()
-                } else {
-                    let Some(value) = args
+                if attached.is_none() {
+                    if args
                         .get(index + 1)
-                        .and_then(|value| static_wrapper_word(value, shell))
-                    else {
+                        .and_then(|value| xargs_static_word(value, shell))
+                        .is_none()
+                    {
                         record_shell_execution_gap(
                             scan,
                             ShellExecutionGap::AmbiguousExecutableBody,
                         );
                         return;
-                    };
+                    }
                     index += 1;
-                    value
-                };
-                if name == "--replace" {
-                    replacement = Some(value);
                 }
                 index += 1;
                 continue;
@@ -9327,7 +9339,7 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
                 let value = if attached.is_empty() {
                     consumed_next = true;
                     args.get(index + 1)
-                        .and_then(|value| static_wrapper_word(value, shell))
+                        .and_then(|value| xargs_static_word(value, shell))
                 } else {
                     Some(attached.to_string())
                 };
@@ -9354,18 +9366,149 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
         // With no utility operand, xargs executes its fixed default `echo`.
         return;
     };
-    let Some(first_static) = static_wrapper_word(first, shell) else {
+    let Some(first_static) = xargs_static_word(first, shell) else {
         record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
         return;
     };
-    if replacement
-        .as_deref()
-        .is_some_and(|replacement| !replacement.is_empty() && first_static.contains(replacement))
-    {
-        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-        return;
+    let utility = args.get(index..).unwrap_or_default();
+    if let Some(replacement) = replacement.as_deref().filter(|value| !value.is_empty()) {
+        // xargs substitutes each input item for every occurrence of the
+        // replacement string, so an item in the command name or in code a
+        // child interpreter runs is input data executed as code.
+        if first_static.contains(replacement)
+            || xargs_placeholder_reaches_code(utility, replacement, shell)
+        {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
     }
-    push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan);
+    push_control_prefix_body(utility, shell, scan);
+}
+
+/// Whether an `xargs -I REPL` input item substituted into `utility` (the
+/// command xargs runs and its arguments) lands in code: the command name, the
+/// `-c` script of a shell, the inline program of another interpreter, the
+/// remote command of `ssh`, or any argument of a command that runs its
+/// arguments as a command line (`eval`, `watch`, `su`, ...). An item that
+/// names what a destructive filesystem command (`rm`, `mv`, `chmod`, ...)
+/// acts on is kept unresolved too: the targets come from data the analysis
+/// cannot see (`echo / | xargs -I{} rm -rf {}`). An argument of an ordinary
+/// command (`cp REPL backup/`, `git branch -d REPL`) and a shell script
+/// operand (as `xargs sh` runs) are data. Anything that cannot be resolved
+/// counts as code.
+fn xargs_placeholder_reaches_code(utility: &[String], replacement: &str, shell: ShellType) -> bool {
+    // Lowercase: the resolver folds command names to lowercase.
+    const ITEM: &str = "tirithxargsitem";
+    // xargs replaces inside the words the shell hands it (quotes removed),
+    // so compare and substitute those, then requote them for the resolver.
+    let Some(words) = utility
+        .iter()
+        .map(|word| xargs_static_word(word, shell))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return true;
+    };
+    if !words.iter().any(|word| word.contains(replacement)) {
+        return false;
+    }
+    let line = words
+        .iter()
+        .map(|word| {
+            let word = word.replace(replacement, ITEM);
+            if !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&byte))
+            {
+                word
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let segments = tokenize::tokenize(&line, ShellType::Posix);
+    let [segment] = segments.as_slice() else {
+        return true;
+    };
+    let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
+        return true;
+    };
+    if command.to_ascii_lowercase().contains(ITEM) {
+        return true;
+    }
+    if !args
+        .iter()
+        .any(|arg| arg.to_ascii_lowercase().contains(ITEM))
+    {
+        return false;
+    }
+    let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    match command.as_str() {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "fish" => {
+            let mut index = 0usize;
+            while index < args.len() {
+                let Some(word) = static_wrapper_word(&args[index], ShellType::Posix) else {
+                    return true;
+                };
+                if word == "--" || !word.starts_with(['-', '+']) {
+                    // A script operand and its arguments.
+                    return false;
+                }
+                let command_string = word == "-c"
+                    || word == "--command"
+                    || (!word.starts_with("--") && word[1..].contains('c'));
+                if command_string {
+                    return args.get(index + 1).is_none_or(|body| body.contains(ITEM));
+                }
+                index += if matches!(word.as_str(), "-o" | "-O" | "+o" | "+O") {
+                    2
+                } else {
+                    1
+                };
+            }
+            false
+        }
+        "ssh" => {
+            let mut index = 0usize;
+            while index < args.len() {
+                let Some(word) = static_wrapper_word(&args[index], ShellType::Posix) else {
+                    return true;
+                };
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                    break;
+                };
+                let takes_value = flags
+                    .char_indices()
+                    .find(|(_, flag)| SSH_VALUE_OPTIONS.contains(*flag))
+                    .is_some_and(|(offset, flag)| offset + flag.len_utf8() == flags.len());
+                index += if takes_value { 2 } else { 1 };
+            }
+            // The host, then the remote command line.
+            args.iter().skip(index + 1).any(|arg| arg.contains(ITEM))
+        }
+        base if crate::rules::command::INTERPRETERS.contains(&base) => {
+            match posix_non_shell_interpreter_input_mode(base, &args) {
+                Some(PosixInterpreterInputMode::InlineProgram(body)) => body.contains(ITEM),
+                Some(
+                    PosixInterpreterInputMode::FixedProgram
+                    | PosixInterpreterInputMode::StdinProgram,
+                ) => false,
+                _ => true,
+            }
+        }
+        "rm" | "rmdir" | "unlink" | "shred" | "mv" | "chmod" | "chown" | "chgrp" | "rsync"
+        | "dd" | "truncate" => true,
+        "eval" | "source" | "." | "exec" | "command" | "builtin" | "env" | "sudo" | "doas"
+        | "su" | "runuser" | "watch" | "script" | "busybox" | "toybox" | "xargs" | "parallel"
+        | "find" | "nohup" | "nice" | "timeout" | "time" | "stdbuf" | "setsid" | "chroot"
+        | "flock" | "ionice" | "taskset" | "unbuffer" | "powershell" => true,
+        _ => false,
+    }
 }
 
 fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
@@ -21835,6 +21978,89 @@ mod tests {
                 .any(|body| body.input == "rm -rf /"),
             "{descriptor:?}"
         );
+    }
+
+    #[test]
+    fn fpperf_2_xargs_replacement_runs_the_command_with_substituted_data() {
+        for (input, body) in [
+            ("echo a | xargs -I{} echo {}", "echo {}"),
+            (
+                "git branch --merged | xargs -I{} git branch -d {}",
+                "git branch -d {}",
+            ),
+            ("cat files.txt | xargs -I{} cp {} backup/", "cp {} backup/"),
+            ("cat files.txt | xargs -I {} cp {} backup/", "cp {} backup/"),
+            (
+                "cat files.txt | xargs --replace cp {} backup/",
+                "cp {} backup/",
+            ),
+            (
+                "cat files.txt | xargs --replace={} cp {} backup/",
+                "cp {} backup/",
+            ),
+            ("cat files.txt | xargs -i cp {} backup/", "cp {} backup/"),
+            ("cat files.txt | xargs -I % cp % %.bak", "cp % %.bak"),
+            ("ls | xargs -I{} sudo -u {} id", "sudo -u {} id"),
+            ("git ls-files -m | xargs -I{} git add {}", "git add {}"),
+            (
+                "ls | xargs -I{} sh -c 'echo \"$1\"' _ {}",
+                "sh -c 'echo \"$1\"' _ {}",
+            ),
+            ("ls *.py | xargs -I{} python3 {}", "python3 {}"),
+            ("cat hosts | xargs -I{} ssh {} uptime", "ssh {} uptime"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fpperf_2_xargs_replacement_in_code_stays_unresolved() {
+        for input in [
+            // The item is the command, a shell's -c script, an interpreter's
+            // inline program, the remote command line, or an argument of a
+            // command that runs its arguments.
+            "ls | xargs -I{} {} --version",
+            "ls | xargs -I{} sh -c 'rm -rf {}'",
+            "ls | xargs -I{} bash -c '{}'",
+            "ls | xargs -I {} bash -lc 'echo {}'",
+            "ls | xargs -I REPL sh -c REPL",
+            "ls | xargs -I REPL sh -c 'echo REPL'",
+            "ls | xargs -i sh -c 'echo {}'",
+            "ls | xargs --replace=X sh -c 'echo X'",
+            "ls | xargs -I{} python3 -c 'print({})'",
+            "ls | xargs -I{} sudo sh -c 'echo {}'",
+            "ls | xargs -I{} env {}",
+            "ls | xargs -I REPL env REPL",
+            "ls | xargs -I REPL nohup REPL",
+            "ls | xargs -I REPL sudo REPL",
+            "ls | xargs -I REPL env X=1 REPL",
+            "ls | xargs -I{} ssh host {}",
+            "ls | xargs -I{} watch {}",
+            "ls | xargs -I e sh -c 'echo x'",
+            // The item is what a destructive filesystem command acts on.
+            "echo / | xargs -I{} rm -rf {}",
+            "ls | xargs -I REPL rm -rf REPL",
+            "find . -name '*.pyc' | xargs -I{} rm {}",
+            "ls | xargs -I{} sudo chmod -R 777 {}",
+            // GNU's optional-argument options never take the next word.
+            "echo hi | xargs --eof sh -c 'rm -rf /'",
+            // Any other brace stays unproven.
+            "ls | xargs -I{a,b} echo {a,b}",
+            "ls | xargs -I'{}' sh -c 'echo {}'",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            let blocked = scan.gap == Some(ShellExecutionGap::AmbiguousExecutableBody)
+                || scan
+                    .bodies
+                    .iter()
+                    .any(|body| body.input.contains("rm -rf /"));
+            assert!(blocked, "{input}: {scan:?}");
+        }
     }
 
     #[test]

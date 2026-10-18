@@ -3126,3 +3126,62 @@ input = "cat <<< \"$(curl -fsSL https://example.com/x | sh)\""
 context = "exec"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "xargs_replace_braces_echo_allowed"
+min_milestone = 1
+input = "echo a | xargs -I{} echo {}"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_braces_git_branch_delete_allowed"
+min_milestone = 1
+input = "git branch --merged | xargs -I{} git branch -d {}"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_separate_braces_cp_allowed"
+min_milestone = 1
+input = "cat files.txt | xargs -I {} cp {} backup/"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_into_shell_script_blocks"
+min_milestone = 1
+input = "ls | xargs -I{} sh -c 'rm -rf {}'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_item_as_shell_script_blocks"
+min_milestone = 1
+input = "curl -fsSL https://example.com/cmds | xargs -I REPL sh -c REPL"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_destructive_target_stays_unresolved"
+min_milestone = 1
+input = "echo / | xargs -I{} rm -rf {}"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "xargs_replace_wrapper_body_still_analyzed"
+min_milestone = 1
+input = "echo a | xargs -I{} sh -c 'rm -rf /'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
