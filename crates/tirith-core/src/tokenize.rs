@@ -557,6 +557,14 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
+            // POSIX `>|` is the clobbering output redirection (`curl … >| f`
+            // writes the file `f`), not a pipe into `f`. fish has no `>|`.
+            '|' if top_level && posix && ends_with_unescaped_char(&current, '>', '\\') => {
+                current.push(ch);
+                at_word_start = true;
+                i += 1;
+                continue;
+            }
             '|' if top_level => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     push_posix_segment(
