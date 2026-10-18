@@ -2088,6 +2088,30 @@ pub fn is_project_secret_file(path: &str) -> bool {
     )
 }
 
+/// Public files in an SSH directory: a public key (`*.pub`), `known_hosts`,
+/// `authorized_keys` and the client `config`. They sit under the `.ssh`
+/// credential root, which keeps protecting the directory itself and every
+/// private key in it, but uploading or copying one of these files to a host
+/// leaks no secret (`scp ~/.ssh/id_ed25519.pub host:`, the `ssh-copy-id`
+/// pattern). Used only by the command upload / exfiltration dataflow; the
+/// catalogue, container-bind and capsule rules still read the whole root.
+pub fn is_public_ssh_material(path: &str) -> bool {
+    let mut components = path.rsplit(['/', '\\']);
+    let basename = components.next().unwrap_or_default();
+    if !components
+        .next()
+        .is_some_and(|parent| parent.eq_ignore_ascii_case(".ssh"))
+    {
+        return false;
+    }
+    let lower = basename.to_ascii_lowercase();
+    (lower.len() > ".pub".len() && lower.ends_with(".pub"))
+        || matches!(
+            lower.as_str(),
+            "known_hosts" | "known_hosts.old" | "authorized_keys" | "authorized_keys2" | "config"
+        )
+}
+
 pub fn sensitive_path_match_count(text: &str) -> usize {
     let (normalized, flavor) = normalize_path_with_flavor(text);
     if classify_path(text).is_none() {
@@ -3421,6 +3445,43 @@ mod tests {
         // `.env`.
         assert!(!is_sensitive_path(".env"));
         assert!(!is_sensitive_bind_path("./.env"));
+    }
+
+    #[test]
+    fn public_ssh_material_is_only_public_files_directly_in_ssh_dir() {
+        for path in [
+            "~/.ssh/id_ed25519.pub",
+            "/home/alice/.ssh/id_rsa.pub",
+            "~/.ssh/*.pub",
+            "~/.ssh/known_hosts",
+            "~/.ssh/known_hosts.old",
+            "~/.ssh/authorized_keys",
+            "~/.ssh/authorized_keys2",
+            "~/.ssh/config",
+            r"C:\Users\alice\.ssh\id_ed25519.pub",
+        ] {
+            assert!(is_public_ssh_material(path), "{path}");
+        }
+        for path in [
+            "~/.ssh/id_ed25519",
+            "~/.ssh/id_rsa",
+            "~/.ssh/id_*",
+            "~/.ssh/*",
+            "~/.ssh",
+            "~/.ssh/",
+            "~/.ssh/.pub",
+            "~/.ssh/id_rsa{,.pub}",
+            "~/.ssh/config.d/work",
+            "~/.ssh/keys/id_rsa.pub.bak",
+            "~/keys/id_rsa.pub",
+            "id_rsa.pub",
+            "/etc/ssh/ssh_host_ed25519_key",
+        ] {
+            assert!(!is_public_ssh_material(path), "{path}");
+        }
+        // The catalogue keeps the whole root: only the upload dataflow uses
+        // this carve-out.
+        assert!(is_sensitive_path("~/.ssh/id_ed25519.pub"));
     }
 
     #[test]

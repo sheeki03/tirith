@@ -228,6 +228,20 @@ not: `cat ~/.config/solana/id.json` on its own is an allow with zero findings,
 because a security tool that fires on reading your own wallet file is a security
 tool you turn off.
 
+A loopback destination is not a remote sink either. `curl -F 'env=@.env'
+http://localhost:3000/debug` posts to a service on the same machine, so it is
+allowed, like `nc localhost 4444` already was. Only a literal `localhost`,
+dotted-quad `127.x.y.z` / `0.0.0.0` or bracketed `[::1]` authority counts, and
+only when nothing in the command can reroute the connection: a proxy option or
+variable (`-x`, `--proxy`, `https_proxy=`, `ALL_PROXY`), `--resolve`,
+`--connect-to`, `--socks5`, or a config file (`-K`, `CURL_HOME=`, `HOME=`,
+`WGETRC=`, wget `-e`) keeps the remote verdict. A DNS name such as
+`127.0.0.1.example` is remote. The public files of an SSH directory (`*.pub`,
+`known_hosts`, `authorized_keys`, `config`) are not secret material, so `scp
+~/.ssh/id_ed25519.pub host:` is allowed; the private keys and the directory
+itself are still protected, and a private key copied or linked to a public name
+in the same command is still followed.
+
 Staging is modelled across ordered same-command segments, including archive,
 base64, hex, single-file compressor (`gzip -c`, `xz -c`, `zstd -c`), and
 encryptor (`openssl enc -out`, `gpg -o`, `age -o`) hops, plus operand promotion

