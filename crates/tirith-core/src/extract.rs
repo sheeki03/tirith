@@ -4814,14 +4814,44 @@ pub(crate) struct ExecutableBodyOccurrence {
 
 const MAX_HEREDOCS: usize = 32;
 const MAX_HEREDOC_DELIMITER_BYTES: usize = 256;
-const MAX_HEREDOC_BODY_BYTES: usize = 256 * 1024;
-// Keep the root ceiling above every supported single-body decoder/rewrite
-// ceiling (currently 256 KiB), while preventing the 10 MiB file/LSP ceiling
-// from reaching the allocation-heavy shell parsers in one pass.
-pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 256;
-const MAX_EXECUTABLE_SCAN_BODIES: usize = 64;
-const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 512 * 1024;
+/// A heredoc body up to the whole root ceiling: an agent writing a file of a
+/// few thousand lines (`cat > notes.md <<'EOF' ... EOF`, about 550 KiB at
+/// 5000 lines) is analyzed instead of blocked.
+const MAX_HEREDOC_BODY_BYTES: usize = MAX_EXECUTABLE_SCAN_INPUT_BYTES;
+// Keep the root ceiling at or above every supported single-body decoder or
+// rewrite ceiling, while preventing the 10 MiB file/LSP ceiling from reaching
+// the allocation-heavy shell parsers in one pass. 1 MiB is also the most a
+// checked command can carry as an argument (macOS ARG_MAX; Linux allows 128
+// KiB per argument).
+pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 1024 * 1024;
+/// Shell words (and substitution or group openers) one scan level hands to the
+/// body parsers. Large enough for a batch script of a few thousand lines;
+/// every recursive level still charges the shared scan-work budget
+/// ([`MAX_SCAN_WORK_BYTES`]).
+pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 16 * 1024;
+/// Recovered bodies one scan level retains, and their total size. Every
+/// retained body is analyzed again by the full rule set at the next level, so
+/// these (not the root size) bound the multiplied work of `f() { ... }; f; f;
+/// f; ...`. A file written through a heredoc (`cat > f <<'EOF'`) is data, not
+/// a body; a heredoc fed to a shell is.
+const MAX_EXECUTABLE_SCAN_BODIES: usize = 256;
+const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 256 * 1024;
+
+/// The finding text for a scan that stopped at one of the per-level size
+/// limits above, naming them.
+pub(crate) fn executable_scan_size_limit_description() -> String {
+    format!(
+        "The command is larger than Tirith analyzes in one check: at most {} KiB of shell \
+         text, {} shell words, and {} nested bodies (substitutions, groups, wrapper, \
+         function and shell-fed heredoc bodies) totalling {} KiB per level. Everything before \
+         the limit was analyzed; the part after it was not examined and is blocked instead of \
+         being treated as clean. Split a longer script into several checked commands.",
+        MAX_EXECUTABLE_SCAN_INPUT_BYTES / 1024,
+        MAX_EXECUTABLE_SCAN_CANDIDATES,
+        MAX_EXECUTABLE_SCAN_BODIES,
+        MAX_EXECUTABLE_SCAN_BODY_BYTES / 1024,
+    )
+}
 
 #[derive(Debug)]
 struct PosixHeredocSpec {
@@ -11280,6 +11310,16 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
         let command_function_shadowed = !wrapped_alias && function_names.contains(&command);
 
         if command_function_shadowed && !command_alias_shadowed {
+            // Once the retained-body limit is full, every further body is
+            // dropped by `bound_executable_bodies` and the scan fails closed.
+            // Record that now instead of re-tokenizing the same function body
+            // for each of thousands of calls (`f() { ... }; f; f; f; ...`).
+            if scan.bodies.iter().filter(|body| !body.best_effort).count()
+                >= MAX_EXECUTABLE_SCAN_BODIES
+            {
+                record_shell_execution_gap(scan, ShellExecutionGap::WorkBudgetExceeded);
+                continue;
+            }
             if let Some(binding) = function_bindings.get(&command) {
                 scan.bodies.push(ExecutableBody {
                     best_effort: false,
@@ -13060,9 +13100,13 @@ fn posix_function_invocation_needs_context(
     body: &str,
     segments: &[tokenize::Segment],
 ) -> bool {
+    // Segments are in input order: find the one holding `offset` by bisection
+    // (a linear scan per call made thousands of calls quadratic).
+    let candidate = segments.partition_point(|segment| segment.byte_range.end <= offset);
     let Some(index) = segments
-        .iter()
-        .position(|segment| segment.byte_range.start <= offset && offset < segment.byte_range.end)
+        .get(candidate)
+        .filter(|segment| segment.byte_range.start <= offset)
+        .map(|_| candidate)
     else {
         return true;
     };
@@ -14195,14 +14239,28 @@ fn lexical_executable_substitutions_bounded(
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        // Every call of one function pushes the same body text; check each
+        // distinct text once (`f() { ... }; f; f; f; ...` re-walked the body
+        // per call and spent the shared scan-work budget).
+        let mut checked = std::collections::HashSet::new();
+        let mut checked_function_bodies = std::collections::HashSet::new();
         if invoked_function_needs_context
-            || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(&body.input, &function_names, 0, remaining_bodies)
-            })
+            || bodies
+                .iter()
+                .filter(|body| checked.insert(body.input.as_str()))
+                .any(|body| {
+                    posix_body_calls_parent_function(
+                        &body.input,
+                        &function_names,
+                        0,
+                        remaining_bodies,
+                    )
+                })
             || function_body_indices.iter().any(|index| {
-                bodies
-                    .get(*index)
-                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(&body.input))
+                bodies.get(*index).is_some_and(|body| {
+                    checked_function_bodies.insert(body.input.as_str())
+                        && contains_literal_posix_dispatch_mutation(&body.input)
+                })
             })
         {
             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);

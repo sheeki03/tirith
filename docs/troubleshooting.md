@@ -415,6 +415,19 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
 
+## Long scripts and analysis limits
+
+tirith analyzes a checked command completely up to fixed limits: 1 MiB of shell
+text, 16384 shell words, 4096 commands, 96 KiB or 4096 words per simple
+command, and 256 nested bodies (substitutions, groups, wrapper, function and
+shell-fed heredoc bodies) totalling 256 KiB per level. An agent's batch script
+of a few hundred to a few thousand lines and a heredoc file write of several
+thousand lines fit. Past a limit, the unexamined part is blocked as
+`analysis_incomplete` ("Command exceeds Tirith's analysis size limits" or
+"Command analysis exceeded its work budget") instead of being treated as clean,
+so a destructive command cannot hide after it. Split such a script into several
+checked commands.
+
 ## Numeric curl destinations and ports
 
 `curl HOST PORT` supplies two URL operands. For example, curl interprets the

@@ -49,15 +49,17 @@ pub const INTERPRETERS: &[&str] = &[
 pub(crate) const MAX_WRAPPER_DEPTH: usize = 32;
 
 /// Command-rule work ceilings are deliberately below the 10 MiB file/LSP
-/// ceiling. A shell command path cannot legitimately approach these limits;
-/// exceeding one is represented as `AnalysisIncomplete`, never as a clean
-/// non-match. The input ceiling still admits the complete 64 KiB `env -S`
-/// payload supported below, including its wrapper spelling.
-pub(crate) const MAX_COMMAND_ANALYSIS_INPUT_BYTES: usize = 128 * 1024;
+/// ceiling. They admit an agent's batch script of a few thousand simple
+/// commands and a heredoc file write of several thousand lines (the input
+/// ceiling matches the executable-body scanner's); exceeding one is represented
+/// as `AnalysisIncomplete`, never as a clean non-match. The input ceiling still
+/// admits the complete 64 KiB `env -S` payload supported below, including its
+/// wrapper spelling.
+pub(crate) const MAX_COMMAND_ANALYSIS_INPUT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_COMMAND_ANALYSIS_SEGMENT_BYTES: usize = 96 * 1024;
 pub(crate) const MAX_COMMAND_NORMALIZED_TOKEN_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT: usize = 4096;
-pub(crate) const MAX_COMMAND_ANALYSIS_SEGMENTS: usize = 256;
+pub(crate) const MAX_COMMAND_ANALYSIS_SEGMENTS: usize = 4096;
 
 const SUDO_VALUE_LONG_FLAGS: &[&str] = &[
     "--user",
@@ -966,9 +968,15 @@ fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
         severity: Severity::High,
         title: "Command analysis exceeded its work budget".to_string(),
         description: format!(
-            "Tirith reached its bounded command-analysis budget while evaluating {boundary}. \
-             Complete short commands before the boundary were analyzed, and the omitted input \
-             or token suffix is blocked instead of being treated as clean."
+            "Tirith reached its bounded command-analysis budget while evaluating {boundary}: \
+             it analyzes at most {} KiB of shell text and {} commands per check, and {} KiB or \
+             {} words per simple command. Complete commands before the boundary were \
+             analyzed, and the omitted input or token suffix is blocked instead of being \
+             treated as clean. Split a longer script into several checked commands.",
+            MAX_COMMAND_ANALYSIS_INPUT_BYTES / 1024,
+            MAX_COMMAND_ANALYSIS_SEGMENTS,
+            MAX_COMMAND_ANALYSIS_SEGMENT_BYTES / 1024,
+            MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT,
         ),
         evidence: vec![Evidence::CommandPattern {
             pattern: "bounded command analysis work budget exhausted".to_string(),
@@ -1141,6 +1149,10 @@ fn check_depth(
                         && (command.contains('$') || command.contains('`'))
                 })
             });
+        // The shared scan-work budget (nested bodies) and the per-level size
+        // limits (shell text, words, retained bodies) share one gap; name the
+        // one that was hit.
+        let shared_budget_spent = crate::extract::scan_work_exhausted();
         let (title, pattern) = match gap {
             crate::extract::ShellExecutionGap::AmbiguousExecutableBody if dynamic_command_name => (
                 "Executable name could not be resolved",
@@ -1166,11 +1178,16 @@ fn check_depth(
                 "Nested executable body could not be parsed completely",
                 "incomplete shell group or substitution",
             ),
-            crate::extract::ShellExecutionGap::WorkBudgetExceeded => (
+            crate::extract::ShellExecutionGap::WorkBudgetExceeded if shared_budget_spent => (
                 "Nested executable-body analysis exceeded its work budget",
                 "bounded shell execution work budget exhausted",
             ),
+            crate::extract::ShellExecutionGap::WorkBudgetExceeded => (
+                "Command exceeds Tirith's analysis size limits",
+                "bounded shell execution size limit reached",
+            ),
         };
+        let size_limit_description;
         let matched = if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
             "input suffix omitted after bounded nested-execution analysis".to_string()
         } else {
@@ -1182,10 +1199,15 @@ fn check_depth(
              `/bin/echo --help`. Quoting a variable preserves argument boundaries \
              but does not prove which executable it selects. The unresolved \
              command remains blocked."
-        } else if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+        } else if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded
+            && shared_budget_spent
+        {
             "Tirith reached its bounded executable-body analysis budget before it could prove \
              the complete command safe. Bodies recovered before the boundary were analyzed, \
              and the unexamined suffix is blocked instead of being treated as clean."
+        } else if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+            size_limit_description = crate::extract::executable_scan_size_limit_description();
+            size_limit_description.as_str()
         } else {
             "The shell will execute a grouped, encoded, or dynamically selected value, but \
              Tirith cannot prove the complete executable body. The command is blocked instead \
@@ -1232,7 +1254,13 @@ fn check_depth(
         // A nested body runs with the environment the enclosing command set up
         // (`export PYTHONINSPECT=1; (… | python3 -c …)`).
         let nested_inspect = inherited_inspect.extend(&segments, shell);
+        // An identical body (every call of one function) yields the same
+        // findings; analyze each distinct one once.
+        let mut seen = std::collections::HashSet::new();
         for body in nested {
+            if !seen.insert((body.input.clone(), body.shell, body.best_effort)) {
+                continue;
+            }
             let body_findings = check_depth(
                 &body.input,
                 body.shell,
@@ -9829,6 +9857,13 @@ enum PosixLoopFrame {
     Other { in_body: bool },
 }
 
+/// Open `while read` loops whose variables the dataflow follows into the loop
+/// body. Every body segment is checked against each open loop, so a script of
+/// thousands of unclosed or nested loops was quadratic. A loop past this depth
+/// is modeled like an unsupported `while read`: its output is incomplete when
+/// its input is relevant, which fails closed at a remote sink.
+const MAX_POSIX_WHILE_READ_FRAMES: usize = 32;
+
 impl PosixLoopFrame {
     fn enter_body(&mut self) {
         match self {
@@ -10154,33 +10189,47 @@ fn posix_control_prefix_opens_loop(args: &[String]) -> bool {
         .is_ok_and(|command| matches!(command.as_str(), "while" | "until" | "for" | "select"))
 }
 
-fn posix_while_compound_stdin(
-    segments: &[tokenize::Segment],
-    opener: usize,
-    shell: ShellType,
-) -> FlowProof {
-    let mut depth = 0usize;
-    for (index, segment) in segments.iter().enumerate().skip(opener) {
+/// The matching `done` of every POSIX loop opener (`while`, `until`, `for`,
+/// `select`, or a `do` that opens a nested loop), found in one pass. Scanning
+/// forward from each opener instead made a script of many unclosed loops
+/// quadratic.
+fn posix_loop_closers(segments: &[tokenize::Segment], shell: ShellType) -> Vec<Option<usize>> {
+    let mut closers = vec![None; segments.len()];
+    let mut open = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
         let command = segment
             .command
             .as_deref()
             .map(|command| normalize_cmd_base(command, shell));
         match command.as_deref() {
-            Some("while" | "until" | "for" | "select") => depth += 1,
-            Some("do") if posix_control_prefix_opens_loop(&segment.args) => depth += 1,
+            Some("while" | "until" | "for" | "select") => open.push(index),
+            Some("do") if posix_control_prefix_opens_loop(&segment.args) => open.push(index),
             Some("done") => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let outgoing = segments
-                        .get(index + 1)
-                        .and_then(|next| next.preceding_separator.as_deref());
-                    return ordered_fd_routing(segment, shell, FlowProof::Clean, outgoing).stdin;
+                if let Some(opener) = open.pop() {
+                    closers[opener] = Some(index);
                 }
             }
             _ => {}
         }
     }
-    FlowProof::Clean
+    closers
+}
+
+/// The stdin a POSIX loop compound reads: the redirection on its matching
+/// `done` (`while read x; do ...; done < file`).
+fn posix_while_compound_stdin(
+    segments: &[tokenize::Segment],
+    closers: &[Option<usize>],
+    opener: usize,
+    shell: ShellType,
+) -> FlowProof {
+    let Some(done) = closers.get(opener).copied().flatten() else {
+        return FlowProof::Clean;
+    };
+    let outgoing = segments
+        .get(done + 1)
+        .and_then(|next| next.preceding_separator.as_deref());
+    ordered_fd_routing(&segments[done], shell, FlowProof::Clean, outgoing).stdin
 }
 
 fn reviewed_dynamic_sensitive_path(parsed: &ParsedShellWord) -> bool {
@@ -14117,6 +14166,7 @@ fn check_data_exfiltration_depth(
     let mut previous_entry: Option<StagedDataflow> = None;
     let mut previous_outcome = StaticCommandOutcome::Unknown;
     let mut posix_loop_frames = Vec::<PosixLoopFrame>::new();
+    let mut loop_closers: Option<Vec<Option<usize>>> = None;
     for (segment_index, seg) in segments.iter().enumerate() {
         let separator = seg.preceding_separator.as_deref();
         let statically_skipped = matches!(
@@ -14311,15 +14361,31 @@ fn check_data_exfiltration_depth(
         };
         let mut opened_while_read = false;
         if shell == ShellType::Posix {
-            let loop_input = || {
+            let mut loop_input = || {
+                let closers =
+                    loop_closers.get_or_insert_with(|| posix_loop_closers(segments, shell));
                 merge_flow_proof(
                     routing.stdin,
-                    posix_while_compound_stdin(segments, segment_index, shell),
+                    posix_while_compound_stdin(segments, closers, segment_index, shell),
                 )
             };
             match cmd_base.as_str() {
                 "while" => match posix_while_read_variables(&cmd_base, &effective.args) {
-                    Ok(Some(variables)) => {
+                    Ok(Some(variables))
+                        if posix_loop_frames
+                            .iter()
+                            .filter(|frame| {
+                                matches!(
+                                    frame,
+                                    PosixLoopFrame::WhileRead(PosixWhileReadFlow {
+                                        supported: true,
+                                        ..
+                                    })
+                                )
+                            })
+                            .count()
+                            < MAX_POSIX_WHILE_READ_FRAMES =>
+                    {
                         posix_loop_frames.push(PosixLoopFrame::WhileRead(PosixWhileReadFlow {
                             variables,
                             input: loop_input(),
@@ -14329,7 +14395,7 @@ fn check_data_exfiltration_depth(
                         }));
                         opened_while_read = true;
                     }
-                    Err(()) => {
+                    Ok(Some(_)) | Err(()) => {
                         let input = loop_input();
                         posix_loop_frames.push(PosixLoopFrame::WhileRead(PosixWhileReadFlow {
                             variables: Vec::new(),
@@ -21935,6 +22001,36 @@ mod tests {
                 c05_has(input, ShellType::Posix, RuleId::DataExfiltration),
                 "private SSH material: {input}"
             );
+        }
+    }
+
+    #[test]
+    fn c4_posix_loop_closers_match_nested_and_unclosed_loops() {
+        let segments = tokenize::tokenize(
+            "while read a; do for b in x; do echo $b; done; done < in; until false; do while true",
+            ShellType::Posix,
+        );
+        let closers = posix_loop_closers(&segments, ShellType::Posix);
+        let command = |index: usize| segments[index].command.clone().unwrap_or_default();
+        let pairs: Vec<(String, String)> = closers
+            .iter()
+            .enumerate()
+            .filter_map(|(opener, done)| done.map(|done| (command(opener), command(done))))
+            .collect();
+        assert_eq!(pairs.len(), 2, "{pairs:?}");
+        let outer = segments
+            .iter()
+            .position(|segment| segment.command.as_deref() == Some("while"))
+            .unwrap();
+        let outer_done = closers[outer].expect("outer while closes");
+        assert!(
+            segments[outer_done].raw.contains("< in"),
+            "{:?}",
+            segments[outer_done]
+        );
+        // `until` and the inner `while` never close.
+        for (index, segment) in segments.iter().enumerate().skip(outer_done + 1) {
+            assert_eq!(closers[index], None, "{segment:?}");
         }
     }
 

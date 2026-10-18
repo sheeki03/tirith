@@ -2196,7 +2196,9 @@ mod tests {
 
     #[test]
     fn cheap_check_retains_executable_scan_budget_exhaustion() {
-        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(254));
+        // `echo` and the `$(` opener are the last two lexical candidates.
+        let fill = crate::extract::MAX_EXECUTABLE_SCAN_CANDIDATES - 2;
+        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(fill));
         let exact_findings = cheap_check(&exact, ShellType::Posix, &empty_env());
         assert!(
             exact_findings
@@ -2211,7 +2213,7 @@ mod tests {
             "the exact-cap control must remain complete: {exact_findings:?}"
         );
 
-        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(255));
+        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(fill + 1));
         let findings = cheap_check(&plus_one, ShellType::Posix, &empty_env());
         assert!(
             findings.iter().any(|finding| {

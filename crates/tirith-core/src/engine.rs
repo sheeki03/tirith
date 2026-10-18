@@ -47,6 +47,7 @@ fn collect_nested_executable_inputs(
     input: &str,
     shell: ShellType,
 ) -> (Vec<crate::extract::ExecutableBody>, bool) {
+    type Seen = std::collections::HashSet<(String, ShellType, bool)>;
     fn collect(
         input: &str,
         shell: ShellType,
@@ -54,6 +55,7 @@ fn collect_nested_executable_inputs(
         best_effort: bool,
         out: &mut Vec<crate::extract::ExecutableBody>,
         incomplete: &mut bool,
+        seen: &mut Seen,
     ) {
         let scan = crate::extract::executable_substitution_scan(input, shell);
         // Coverage inside a best-effort body (a fish wrapper child) is never
@@ -67,6 +69,15 @@ fn collect_nested_executable_inputs(
             let nested_input = body.input.clone();
             let nested_shell = body.shell;
             let nested_best_effort = best_effort || body.best_effort;
+            // Callers analyze each body as text, so an identical body (every
+            // call of one function, a repeated substitution) adds nothing the
+            // first one did not; analyzing it again only multiplied the work.
+            // Its scan is deterministic, so a later copy has the same gap and
+            // bodies. One reached deeper hits the depth limit sooner, and
+            // that limit already marks the input incomplete.
+            if !seen.insert((nested_input.clone(), nested_shell, nested_best_effort)) {
+                continue;
+            }
             let mut execution_body = body;
             execution_body.input =
                 crate::extract::shell_execution_view(&nested_input, nested_shell).into_owned();
@@ -79,13 +90,23 @@ fn collect_nested_executable_inputs(
                 nested_best_effort,
                 out,
                 incomplete,
+                seen,
             );
         }
     }
 
     let mut bodies = Vec::new();
     let mut incomplete = false;
-    collect(input, shell, 0, false, &mut bodies, &mut incomplete);
+    let mut seen = Seen::new();
+    collect(
+        input,
+        shell,
+        0,
+        false,
+        &mut bodies,
+        &mut incomplete,
+        &mut seen,
+    );
     (bodies, incomplete)
 }
 
@@ -10499,6 +10520,131 @@ mod scan_work_budget_tests {
         assert_eq!(verdict.action, crate::verdict::Action::Block);
         // Outside any scope the budget is not armed (direct rule calls).
         assert!(crate::extract::charge_scan_work(usize::MAX));
+    }
+
+    fn lines(count: usize, line: impl Fn(usize) -> String) -> String {
+        (0..count).map(line).collect::<Vec<_>>().join("\n")
+    }
+
+    fn has_incomplete(verdict: &crate::verdict::Verdict) -> bool {
+        verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete)
+    }
+
+    /// FPPERF-6: an agent's batch script of a few hundred plain lines and a
+    /// heredoc file write of several thousand lines are analyzed in full
+    /// instead of blocking at the old 256-word / 256-command / 128 KiB limits.
+    #[test]
+    fn agent_batch_scripts_are_analyzed_in_full() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let heredoc = |count: usize, line: &dyn Fn(usize) -> String| {
+            format!("cat > notes.md <<'EOF'\n{}\nEOF", lines(count, line))
+        };
+        for (name, input) in [
+            ("plain", lines(600, |i| format!("echo step {i}"))),
+            (
+                "git add",
+                lines(400, |i| format!("git add src/file_{i}.rs")),
+            ),
+            (
+                "mkdir and touch",
+                lines(400, |i| format!("mkdir -p d{i} && touch d{i}/f")),
+            ),
+            (
+                "pipelines",
+                lines(300, |i| {
+                    format!("echo \"step {i}\" && cargo test -p crate_{i} 2>&1 | tail -5")
+                }),
+            ),
+            (
+                "heredoc",
+                heredoc(5000, &|i| {
+                    format!("line {i}: realistic generated text with words and numbers {i}")
+                }),
+            ),
+            (
+                "heredoc with links",
+                heredoc(3000, &|i| {
+                    format!("- see https://docs.example.com/page/{i} for details")
+                }),
+            ),
+        ] {
+            let verdict = analyze(&ctx(&input, ShellType::Posix, ScanContext::Exec));
+            assert_eq!(
+                verdict.action,
+                crate::verdict::Action::Allow,
+                "{name}: {:?}",
+                verdict.findings
+            );
+            assert!(!has_incomplete(&verdict), "{name}");
+        }
+    }
+
+    /// Raising the limits must not let a destructive command hide: one after
+    /// the old boundary is found by its own rule, and input past the new
+    /// limits still blocks as incomplete analysis that names the limit.
+    #[test]
+    fn destructive_command_cannot_hide_past_the_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        for input in [
+            format!("{}\nrm -rf /", lines(2000, |i| format!("echo step {i}"))),
+            format!("rm -rf /\n{}", lines(2000, |i| format!("echo step {i}"))),
+            format!(
+                "cat > notes.md <<'EOF'\n{}\nEOF\nrm -rf /",
+                lines(5000, |i| format!("line {i}: text"))
+            ),
+        ] {
+            let verdict = analyze(&ctx(&input, ShellType::Posix, ScanContext::Exec));
+            assert_eq!(verdict.action, crate::verdict::Action::Block);
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == crate::verdict::RuleId::BlastWritesSystemPath),
+                "{:?}",
+                verdict.findings
+            );
+        }
+
+        let too_many_commands = format!(
+            "{}\nrm -rf /",
+            lines(
+                crate::rules::command::MAX_COMMAND_ANALYSIS_SEGMENTS + 8,
+                |_| { "true".to_string() }
+            )
+        );
+        let too_many_words = format!(
+            "echo {}\nrm -rf /",
+            lines(crate::extract::MAX_EXECUTABLE_SCAN_CANDIDATES, |i| format!(
+                "w{i}"
+            ))
+            .replace('\n', " ")
+        );
+        for (input, title) in [
+            (
+                too_many_commands,
+                "Command analysis exceeded its work budget",
+            ),
+            (
+                too_many_words,
+                "Command exceeds Tirith's analysis size limits",
+            ),
+        ] {
+            let verdict = analyze(&ctx(&input, ShellType::Posix, ScanContext::Exec));
+            assert_eq!(verdict.action, crate::verdict::Action::Block);
+            let finding = verdict
+                .findings
+                .iter()
+                .find(|finding| finding.title == title)
+                .unwrap_or_else(|| panic!("{title}: {:?}", verdict.findings));
+            assert!(
+                finding.description.contains("Split a longer script"),
+                "{}",
+                finding.description
+            );
+        }
     }
 
     /// CORE-6: 128 nested `$(echo` used to take 20-40 s on a release build.
