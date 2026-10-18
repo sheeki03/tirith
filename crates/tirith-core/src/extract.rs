@@ -412,6 +412,20 @@ pub fn scan_bytes_with_ignored_ranges(
                     i += 2;
                     continue;
                 }
+                // Any other ESC sequence is a terminal control too, and some
+                // rewrite the display without an introducer: `\e7` / `\e8`
+                // save and restore the cursor (text printed in between is
+                // overwritten), `\eM` moves it up a line, `\ec` resets.
+                accumulator.result.has_ansi_escapes = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Ansi,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: "escape sequence".to_string(),
+                    },
+                );
             } else {
                 accumulator.result.has_ansi_escapes = true;
                 accumulator.push_detail(

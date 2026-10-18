@@ -18368,10 +18368,17 @@ fn commands_run_human_banner_sanitizes_manifest_fields() {
     let root = tempfile::tempdir().expect("tempdir");
     let hostile_name = "safe\x1b[2J\nFORGED-NAME";
     // A quoted argument to the no-op `:` builtin lets the raw command contain
-    // ANSI and a newline without producing child output or a second command.
-    let hostile_command = ": 'command\x1b[31mRED\x1b[0m\nFORGED-COMMAND'";
+    // a newline without producing child output or a second command.
+    let hostile_command = ": 'command\nFORGED-COMMAND'";
+    // Raw ANSI in the command itself is a terminal-control finding that
+    // blocks the command; its refusal must be sanitized the same way.
+    let ansi_name = "ansi\x1b[2J\nFORGED-NAME";
+    let ansi_command = ": 'command\x1b[31mRED\x1b[0m\nFORGED-COMMAND'";
     let manifest = serde_json::json!({
-        "allowed": [{ "name": hostile_name, "command": hostile_command }],
+        "allowed": [
+            { "name": hostile_name, "command": hostile_command },
+            { "name": ansi_name, "command": ansi_command },
+        ],
     });
     write_root_manifest(root.path(), &manifest.to_string());
 
@@ -18395,10 +18402,36 @@ fn commands_run_human_banner_sanitizes_manifest_fields() {
         "manifest newlines must not forge run-output rows: {stderr:?}"
     );
     assert!(
-        stderr.contains(
-            r"Running allowed command 'safe\nFORGED-NAME': : 'commandRED\nFORGED-COMMAND'"
-        ),
+        stderr
+            .contains(r"Running allowed command 'safe\nFORGED-NAME': : 'command\nFORGED-COMMAND'"),
         "the safe banner must retain readable manifest text: {stderr:?}"
+    );
+
+    let out = commands_tirith(root.path())
+        .args(["commands", "run", ansi_name, "--yes"])
+        .output()
+        .expect("commands run ANSI command");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a command carrying raw ANSI escapes is blocked; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ansi_escapes"),
+        "the refusal names the finding: {stderr:?}"
+    );
+    assert!(
+        !out.stderr.contains(&0x1b),
+        "manifest ANSI controls must not reach the refusal: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\nFORGED-"),
+        "manifest newlines must not forge refusal rows: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(r"(: 'commandRED\nFORGED-COMMAND')"),
+        "the refusal must show the sanitized command: {stderr:?}"
     );
 }
 

@@ -3004,7 +3004,11 @@ fn analyze_with_observation(
     let exec_bidi_triggered = if ctx.scan_context == ScanContext::Exec {
         let ignored_ranges: &[std::ops::Range<usize>] = inert_range.as_slice();
         let scan = extract::scan_bytes_excluding(ctx.input.as_bytes(), ignored_ranges);
-        scan.has_bidi_controls
+        // Raw ESC sequences and display-overwriting control bytes too: agent
+        // integrations submit every command through this path.
+        scan.has_ansi_escapes
+            || scan.has_control_chars
+            || scan.has_bidi_controls
             || scan.has_zero_width
             || scan.has_unicode_tags
             || scan.has_variation_selectors
@@ -3469,7 +3473,9 @@ fn analyze_with_observation(
             // Same inert-range carveout as tier-1 (agree with `exec_bidi_triggered`).
             let ignored_ranges: &[std::ops::Range<usize>] = inert_range.as_slice();
             let scan = extract::scan_bytes_excluding(byte_input, ignored_ranges);
-            if scan.has_bidi_controls
+            if scan.has_ansi_escapes
+                || scan.has_control_chars
+                || scan.has_bidi_controls
                 || scan.has_zero_width
                 || scan.has_unicode_tags
                 || scan.has_variation_selectors
@@ -3482,22 +3488,12 @@ fn analyze_with_observation(
                 // rules (e.g. UnicodeTags) have no offset to post-filter, so they
                 // must be suppressed at scan time.
                 let ignore_ranges: &[std::ops::Range<usize>] = inert_range.as_slice();
-                let byte_findings =
-                    crate::rules::terminal::check_bytes_with_ignore(byte_input, ignore_ranges);
-                // Exec keeps invisible-char findings only (ANSI/control don't apply).
-                findings.extend(byte_findings.into_iter().filter(|f| {
-                    matches!(
-                        f.rule_id,
-                        crate::verdict::RuleId::BidiControls
-                            | crate::verdict::RuleId::ZeroWidthChars
-                            | crate::verdict::RuleId::UnicodeTags
-                            | crate::verdict::RuleId::InvisibleMathOperator
-                            | crate::verdict::RuleId::VariationSelector
-                            | crate::verdict::RuleId::InvisibleWhitespace
-                            | crate::verdict::RuleId::HangulFiller
-                            | crate::verdict::RuleId::ConfusableText
-                    )
-                }));
+                // Invisible characters plus raw terminal control bytes, worded
+                // for a command (see `check_command_bytes_with_ignore`).
+                findings.extend(crate::rules::terminal::check_command_bytes_with_ignore(
+                    byte_input,
+                    ignore_ranges,
+                ));
             }
         }
 

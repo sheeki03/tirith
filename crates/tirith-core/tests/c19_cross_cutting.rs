@@ -1279,7 +1279,11 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 &fixture.raw_bytes
             };
             let byte_scan = tirith_core::extract::scan_bytes(bytes);
-            let byte_triggered = byte_scan.has_bidi_controls
+            // Mirrors the engine's exec byte trigger (`exec_bidi_triggered`),
+            // which includes raw terminal control bytes.
+            let byte_triggered = byte_scan.has_ansi_escapes
+                || byte_scan.has_control_chars
+                || byte_scan.has_bidi_controls
                 || byte_scan.has_zero_width
                 || byte_scan.has_unicode_tags
                 || byte_scan.has_variation_selectors

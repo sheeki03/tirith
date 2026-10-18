@@ -809,7 +809,9 @@ fn test_tier1_coverage() {
             // Exec: byte scan bypasses tier-1 via the exec_bidi_triggered path in engine.rs.
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
-                if byte_scan.has_bidi_controls
+                if byte_scan.has_ansi_escapes
+                    || byte_scan.has_control_chars
+                    || byte_scan.has_bidi_controls
                     || byte_scan.has_zero_width
                     || byte_scan.has_unicode_tags
                     || byte_scan.has_variation_selectors
