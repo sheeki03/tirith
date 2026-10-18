@@ -375,6 +375,21 @@ show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
 
+`eval` or `source` of a generated script is normally an unresolved body. A
+short reviewed list of shell-init emitters is the exception, when the emitter
+runs with literal words only: `eval "$(brew shellenv)"` (also
+`/opt/homebrew/bin/brew` and the other system bin directories),
+`eval "$(direnv hook bash)"`, `eval "$(pyenv init -)"` / `--path`,
+`eval "$(rbenv init -)"`, `eval "$(ssh-agent -s)"` (also unquoted or with
+backticks), `eval "$(zoxide init zsh)"`, `eval "$(starship init bash)"`,
+`eval "$(fnm env)"`, `eval "$(mise activate bash)"`,
+`source <(kubectl completion zsh)` and `source <(fzf --zsh)`. The emitter
+itself is still analyzed as a command. A variable, an extra pipe, command or
+operand, a redirection, a wrapper (`command eval`), an assignment prefix, a
+relative or non-system path (`./brew`, `/tmp/brew`), another subcommand, or
+anything in the input that can rebind the name (a function or alias
+definition, a `PATH`, `hash` or `IFS` change) keeps the unresolved-body block.
+
 A command word whose directory is a double-quoted parameter expansion and
 whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,
 `"$REPO_ROOT/scripts/test.sh"`, `"${PROJECT_DIR}"/bin/run`) is analyzed as
