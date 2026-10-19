@@ -11936,7 +11936,7 @@ fn cmd_for_body_index(args: &[String]) -> Option<usize> {
 /// `args.len()` means `-c` has no operand. Empty when the shell runs a script
 /// file or reads standard input, or when an option word before `-c` is not
 /// literal.
-fn shell_command_operands(args: &[String], shell: ShellType, fish: bool) -> Vec<usize> {
+pub(crate) fn shell_command_operands(args: &[String], shell: ShellType, fish: bool) -> Vec<usize> {
     let takes_value = |option: &str| {
         matches!(
             option,

