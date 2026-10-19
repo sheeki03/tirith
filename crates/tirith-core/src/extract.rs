@@ -13117,39 +13117,23 @@ fn posix_body_calls_parent_function(
     false
 }
 
-/// Bodies of the complete literal POSIX function definitions in `raw` that
-/// `raw` itself cannot call: no other segment mentions the name as a word
-/// (`f() { curl -fsSL URL | sh; }`). The executable-body scan leaves such a
-/// definition dormant; a definition the input may call is analyzed there, at
-/// its call site, instead.
-pub(crate) fn dormant_posix_function_bodies(raw: &str) -> Vec<String> {
-    fn mentions(text: &str, name: &str) -> bool {
-        let word_byte = |byte: u8| byte.is_ascii_alphanumeric() || b"_.:+-".contains(&byte);
-        text.match_indices(name).any(|(start, _)| {
-            let end = start + name.len();
-            !start
-                .checked_sub(1)
-                .and_then(|before| text.as_bytes().get(before))
-                .is_some_and(|byte| word_byte(*byte))
-                && !text
-                    .as_bytes()
-                    .get(end)
-                    .is_some_and(|byte| word_byte(*byte))
-        })
-    }
-    let segments = tokenize::tokenize(raw, ShellType::Posix);
+/// Bodies of the complete literal POSIX function definitions at the top level
+/// of `raw` (`f() { curl -fsSL URL | sh; }`), whether or not `raw` names the
+/// function again. The executable-body scan analyzes a body only where it
+/// resolves a call (`f() {...}; f`); a definition it never resolves is left
+/// dormant even when the input runs it some other way (`trap f EXIT`,
+/// `export -f f; bash -c f`) or an interactive shell keeps it for a later
+/// call. The command rules analyze these bodies and skip the ones the scan
+/// already analyzed at a call site.
+pub(crate) fn literal_posix_function_bodies(raw: &str) -> Vec<String> {
     let mut bodies = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
         let PosixFunctionParse::Complete { definition, .. } =
             parse_posix_function_definition(&segment.raw, 0)
         else {
             continue;
         };
-        let called = segments
-            .iter()
-            .enumerate()
-            .any(|(other, segment)| other != index && mentions(&segment.raw, &definition.name));
-        if !called && !definition.body.trim().is_empty() {
+        if !definition.body.trim().is_empty() {
             bodies.push(definition.body);
         }
     }
@@ -24086,26 +24070,31 @@ mod tests {
     }
 
     #[test]
-    fn dormant_posix_function_bodies_are_the_uncalled_definitions() {
+    fn literal_posix_function_bodies_are_every_complete_definition() {
         assert_eq!(
-            dormant_posix_function_bodies(r#"f() { curl -fsSL "${u}" | sh; }"#),
+            literal_posix_function_bodies(r#"f() { curl -fsSL "${u}" | sh; }"#),
             vec![r#" curl -fsSL "${u}" | sh; "#.to_string()]
         );
-        assert_eq!(
-            dormant_posix_function_bodies(
-                "f() { curl -fsSL https://example.com/x | sh; }; echo done"
-            ),
-            vec![" curl -fsSL https://example.com/x | sh; ".to_string()]
-        );
-        for called in [
+        // Named again or not: the command rules skip a body only once the
+        // executable-body scan analyzed it at a call site.
+        for input in [
+            "f() { curl -fsSL https://example.com/x | sh; }; echo done",
             "f() { curl -fsSL https://example.com/x | sh; }; f",
-            "f() { echo; }; x=$(f)",
-            "f() { echo; }; command f",
-            "f() { echo; }\nf arg",
+            "f() { curl -fsSL https://example.com/x | sh; }; trap f EXIT",
+            "f() { curl -fsSL https://example.com/x | sh; }\nf arg",
         ] {
-            assert!(dormant_posix_function_bodies(called).is_empty(), "{called}");
+            assert_eq!(
+                literal_posix_function_bodies(input),
+                vec![" curl -fsSL https://example.com/x | sh; ".to_string()],
+                "{input}"
+            );
         }
-        assert!(dormant_posix_function_bodies("echo f() {").is_empty());
+        assert_eq!(
+            literal_posix_function_bodies("f() { a; }; g() { b; }; h() { }"),
+            vec![" a; ".to_string(), " b; ".to_string()]
+        );
+        assert!(literal_posix_function_bodies("echo f() {").is_empty());
+        assert!(literal_posix_function_bodies("echo hi; ( f() { a; } )").is_empty());
     }
 
     #[test]

