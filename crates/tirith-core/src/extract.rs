@@ -12334,13 +12334,17 @@ pub(crate) fn input_may_change_python_lookup(raw: &str) -> bool {
 /// `X+=...`), a `${NAME=...}` / `${NAME:=...}` default assignment, an
 /// exporting or variable-setting builtin (`export`, `declare`, `typeset`,
 /// `local`, `readonly`, `setenv`, `env`, `read`, `getopts`, `mapfile`,
-/// `readarray`, `unset`, `let`, zsh `vared` / `zparseopts`), `printf -v`, and
-/// allexport (`set -a`, `set -o allexport`). In fish every `set` counts.
+/// `readarray`, `unset`, `let`, zsh `vared` / `zparseopts`), `printf -v`,
+/// allexport (`set -a`, `set -o allexport`), and a name a loop or coprocess
+/// binds (`for NAME`, zsh `foreach NAME`, `select NAME`, `coproc NAME`; fish
+/// `for NAME in`), which sets that variable for the commands in its body and
+/// after it. In fish every `set` counts.
 static VARIABLE_SETTING_TEXT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?:^|[\s;&|(){}!`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=",
         r"|\$\{[^}]*=",
         r"|(?:^|[\s;&|(){}!`])(?:export|declare|typeset|local|readonly|setenv|env|read|getopts|mapfile|readarray|unset|let|vared|zparseopts)(?:$|[\s;&|()])",
+        r"|(?:^|[\s;&|(){}!`])(?:for|foreach|select|coproc)[ \t]+[A-Za-z_][A-Za-z0-9_]*(?:$|[\s;&|(){])",
         r"|(?:^|[\s;&|(){}!`])printf[ \t]+-\S*v",
         r"|(?:^|[\s;&|(){}!`])set[ \t]+[-+][A-Za-z]*a",
         r"|(?i:all_?export)",
@@ -23523,6 +23527,14 @@ mod tests {
             (": ${X:=y}", ShellType::Posix),
             ("a[1]=x", ShellType::Posix),
             ("set -l x 1", ShellType::Fish),
+            // A loop or coprocess name binds that variable.
+            ("for TMPDIR in \"/tmp/;id;\"; do :; done", ShellType::Posix),
+            ("for HOME; do :; done", ShellType::Posix),
+            ("select TMPDIR in a b; do break; done", ShellType::Posix),
+            ("coproc TMPDIR { :; }", ShellType::Posix),
+            ("foreach TMPDIR (/tmp/x) :; end", ShellType::Posix),
+            ("for TMPDIR (/tmp/x) :", ShellType::Posix),
+            ("for TMPDIR in /tmp/x; :; end", ShellType::Fish),
         ] {
             assert!(input_may_set_variables(raw, shell), "{raw}");
         }
@@ -23532,6 +23544,9 @@ mod tests {
             ("ls /usr/local/bin", ShellType::Posix),
             ("set_color red", ShellType::Fish),
             ("readlink -f x", ShellType::Posix),
+            ("forge build", ShellType::Posix),
+            ("git log --format=oneline", ShellType::Posix),
+            ("echo transform", ShellType::Posix),
         ] {
             assert!(!input_may_set_variables(raw, shell), "{raw}");
         }

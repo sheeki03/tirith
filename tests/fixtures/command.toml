@@ -5490,6 +5490,85 @@ context = "exec"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
 
+# A loop or coprocess variable sets TMPDIR / HOME, which ssh-agent prints
+# unquoted inside SSH_AUTH_SOCK, so it steers the evaluated text like an
+# assignment does: the discard and bare-ssh-agent allowances do not apply.
+[[fixture]]
+name = "r4_eval_ssh_agent_discard_in_for_tmpdir_loop_blocks"
+min_milestone = 1
+input = 'for TMPDIR in "/tmp/;id;"; do eval "$(ssh-agent -s)" >/dev/null; done'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_bare_ssh_agent_in_for_tmpdir_loop_blocks"
+min_milestone = 1
+input = 'for TMPDIR in "/tmp/;id;"; do eval "$(ssh-agent)"; done'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_after_for_home_loop_blocks"
+min_milestone = 1
+input = 'for HOME in /tmp/x; do :; done; eval "$(ssh-agent -s)" > /dev/null 2>&1'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_in_select_tmpdir_loop_blocks"
+min_milestone = 1
+input = 'select TMPDIR in "/tmp/;id;"; do eval "$(ssh-agent -s)"; break; done'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_after_named_coproc_blocks"
+min_milestone = 1
+input = 'coproc TMPDIR { :; }; eval "$(ssh-agent -s)"'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_discard_in_fish_for_tmpdir_loop_blocks"
+min_milestone = 1
+input = 'for TMPDIR in "/tmp/;id;"; eval (ssh-agent -s) >/dev/null; end'
+shell = "fish"
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_pyenv_init_in_for_pyenv_root_loop_blocks"
+min_milestone = 1
+input = 'for PYENV_ROOT in "/tmp/;id;"; do eval "$(pyenv init -)"; done'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+# The same emitters with no loop variable keep their allowances.
+[[fixture]]
+name = "r4_eval_ssh_agent_discard_without_loop_still_allowed"
+min_milestone = 1
+input = 'eval "$(ssh-agent -s)" >/dev/null && ssh-add -l'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_pyenv_init_after_forge_build_still_allowed"
+min_milestone = 1
+input = 'forge build && eval "$(pyenv init -)"'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["analysis_incomplete"]
+
 # ── Round 4: netcat/socat redirections and environment dumps ────────────────
 # A secret file fed to netcat or socat by redirection, `socat FILE:<secret>
 # TCP:...`, and a whole-environment dump piped into an upload are
