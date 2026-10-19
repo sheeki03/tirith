@@ -34,6 +34,18 @@ ignore = [
     # parser migration tracked separately from this release. Remove this
     # ignore (and the .cargo/audit.toml twin) once serde_yaml is replaced.
     "RUSTSEC-2024-0449",
+    # zip 2.4.2: ZipArchive::extract and ZipStreamReader::extract keep SUID/SGID
+    # bits (0367), create symlinks whose targets leave the destination (0368)
+    # and apply permissions through symlinks (0369). The fixed line is
+    # zip >=9.0.0, which requires Rust 1.88, above tirith's MSRV 1.83. Tirith
+    # never calls either extract function: it reads wheel and artifact members
+    # into memory by index, rejects symlink members, and writes no member to
+    # disk; ZipWriter only builds archives in memory (tests and lab artifacts).
+    # Remove these ignores (and the .cargo/audit.toml twin) once MSRV allows
+    # zip >=9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]
