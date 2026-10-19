@@ -380,15 +380,21 @@ short reviewed list of shell-init emitters is the exception, when the emitter
 runs with literal words only: `eval "$(brew shellenv)"` (also
 `/opt/homebrew/bin/brew` and the other system bin directories),
 `eval "$(direnv hook bash)"`, `eval "$(pyenv init -)"` / `--path`,
-`eval "$(rbenv init -)"`, `eval "$(ssh-agent -s)"` (also unquoted or with
-backticks), `eval "$(zoxide init zsh)"`, `eval "$(starship init bash)"`,
-`eval "$(fnm env)"`, `eval "$(mise activate bash)"`,
-`source <(kubectl completion zsh)` and `source <(fzf --zsh)`. The emitter
-itself is still analyzed as a command. A variable, an extra pipe, command or
-operand, a redirection, a wrapper (`command eval`), an assignment prefix, a
+`eval "$(rbenv init -)"`, `eval "$(ssh-agent -s)"` or `eval "$(ssh-agent)"`
+(also unquoted or with backticks), `eval "$(zoxide init zsh)"`,
+`eval "$(starship init bash)"`, `eval "$(fnm env)"`,
+`eval "$(mise activate bash)"`, `source <(kubectl completion zsh)` and
+`source <(fzf --zsh)`. The emitter itself is still analyzed as a command.
+Sending the `eval` or `source` output to `/dev/null` (`>/dev/null`,
+`1>/dev/null`, `2>/dev/null`, `&>/dev/null`, and `2>&1` once stdout already
+goes there) keeps the trust. A variable, an extra pipe, command or operand,
+any other redirection, a wrapper (`command eval`), an assignment prefix, a
 relative or non-system path (`./brew`, `/tmp/brew`), another subcommand, or
 anything in the input that can rebind the name (a function or alias
 definition, a `PATH`, `hash` or `IFS` change) keeps the unresolved-body block.
+So does a variable set or exported anywhere in the same input, including a
+`for`, `select` or `coproc` loop variable, because the emitters build their
+output from the environment (`TMPDIR`, `HOME`, `PYENV_ROOT`).
 
 A command word whose directory is a double-quoted parameter expansion and
 whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,
