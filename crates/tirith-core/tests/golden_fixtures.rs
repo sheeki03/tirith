@@ -2153,6 +2153,32 @@ fn test_tier1_matches_all_interpreters() {
         tier1_scan("cat /tmp/s.sh | BASH", ScanContext::Exec),
         "Tier-1 scan must match uppercase interpreter"
     );
+
+    // Versioned and implementation-suffixed names resolve to their
+    // interpreter, and wrapped sinks reach the same rule.
+    for sink in [
+        "python3.12",
+        "python2.7",
+        "/usr/bin/python3.11",
+        "pypy",
+        "pypy3.10",
+        "perl5.34.1",
+        "php82",
+        "ruby33",
+        "nodejs",
+        "lua5.4",
+        "tclsh8.6",
+        "bash-5.2",
+        "ksh93",
+        "nice -n 5 bash",
+        "timeout 60 sh",
+    ] {
+        let input = format!("cat /tmp/s.sh | {sink}");
+        assert!(
+            tier1_scan(&input, ScanContext::Exec),
+            "Tier-1 scan does not match '{input}'"
+        );
+    }
 }
 
 // Lab corpus safeguard: the `tirith lab` corpus (in the sibling `tirith` crate)

