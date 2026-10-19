@@ -10164,8 +10164,37 @@ fn push_static_child_from(
 /// External programs that run a child command, read in fish with the same
 /// option grammar as POSIX (`scan_posix_delegation_utility`).
 const FISH_EXTERNAL_WRAPPERS: &[&str] = &[
-    "nice", "timeout", "setsid", "stdbuf", "taskset", "ionice", "flock",
+    "nice", "timeout", "setsid", "stdbuf", "taskset", "ionice", "flock", "chrt",
 ];
+
+/// `chrt PRIORITY COMMAND`'s child in a POSIX shell, which the released
+/// analysis never read (`chrt 10 bash -c "$(curl …)"`). As with fish's
+/// external wrappers ([`push_fish_wrapper_child`]), a child the grammar proves
+/// is a best-effort body: it adds the findings its own analysis proves, never
+/// an analysis gap, and an unproven child (`chrt $PRIO cmd`, a dynamic
+/// priority) keeps the released verdict instead of becoming an
+/// incomplete-analysis block.
+fn push_best_effort_delegation_child(
+    wrapper: &str,
+    args: &[String],
+    segment: &tokenize::Segment,
+    shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    let mut child = ExecutableSubstitutionScan::default();
+    scan_posix_delegation_utility(wrapper, args, shell, &mut child);
+    if child.gap.is_some() {
+        return;
+    }
+    for mut body in child.bodies {
+        body.best_effort = true;
+        body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+            parent_range: segment.byte_range.clone(),
+            relation: ExecutableRelation::WrapperReplacement,
+        });
+        scan.bodies.push(body);
+    }
+}
 
 /// How many directly nested fish wrappers one pass flattens. A longer chain
 /// continues in the next body, so this bounds work, not coverage.
@@ -12738,6 +12767,9 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 if shell == ShellType::Posix =>
             {
                 scan_posix_delegation_utility(&command, &args, shell, scan)
+            }
+            "chrt" if shell == ShellType::Posix => {
+                push_best_effort_delegation_child(&command, &args, &segment, shell, scan);
             }
             wrapper if shell == ShellType::Fish && FISH_EXTERNAL_WRAPPERS.contains(&wrapper) => {
                 push_fish_wrapper_child(wrapper, &args, &segment, scan);

