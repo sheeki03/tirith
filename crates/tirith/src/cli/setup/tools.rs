@@ -6384,12 +6384,11 @@ mod tests {
             command.env("TIRITH_FAIL_OPEN", "1");
         }
         let mut child = command.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        // A hook that fails closed (its pinned interpreter is gone) can exit
+        // before it reads its input, so the write may meet a closed pipe.
+        if let Err(error) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+        }
         let output = child.wait_with_output().unwrap();
         (
             output.status.code(),

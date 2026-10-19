@@ -62,11 +62,16 @@ childProcess.execFileSync = (file, args, options) => {
     return realExecFileSync(file, args, { ...options, timeout: 1 });
   }
   if (mutation === "crash") {
-    // A real checker process that dies from a signal (as a crash or the
-    // out-of-memory killer ends it), so the guard sees what Node reports.
+    // A real checker process that crashes, so the guard sees what Node
+    // reports: on POSIX it dies from a signal (as a crash or the
+    // out-of-memory killer ends it); Windows has no signals, and a crash
+    // there is the exit status of an access violation (0xC0000005).
+    const crash = process.platform === "win32"
+      ? "process.exit(-1073741819)"
+      : "process.kill(process.pid, 'SIGSEGV')";
     return realExecFileSync(
       process.execPath,
-      ["-e", "process.kill(process.pid, 'SIGSEGV')"],
+      ["-e", crash],
       { ...options, input: undefined },
     );
   }
@@ -555,8 +560,9 @@ fn exercise_host(host: &str) {
             assert!(reason.contains("timed out"), "{host}: {reason}");
         }
     }
-    // A checker killed by a signal produced no verdict either: denied unless
-    // the operator fails open, and not reported as a timeout.
+    // A checker killed by a signal (on Windows, one that exits with a crash
+    // status) produced no verdict either: denied unless the operator fails
+    // open, and not reported as a timeout.
     for fail_open in [false, true] {
         let result = callback(
             &state,
@@ -573,7 +579,12 @@ fn exercise_host(host: &str) {
             let reason = blocked_reason(host, result);
             assert!(!reason.contains("timed out"), "{host}: {reason}");
             if host != "openclaw" {
-                assert!(reason.contains("terminated by SIGSEGV"), "{host}: {reason}");
+                let expected = if cfg!(windows) {
+                    "unexpected exit code"
+                } else {
+                    "terminated by SIGSEGV"
+                };
+                assert!(reason.contains(expected), "{host}: {reason}");
             }
         }
     }
