@@ -13,6 +13,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// A private HOME below `root` for an interactive test shell, so its history
+/// and any dotfile writes never reach the developer's real home directory.
+fn isolated_home(root: &Path) -> PathBuf {
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    home
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -61,7 +69,8 @@ fn run_bash_script(script: &str, env_vars: &[(&str, &str)]) -> (String, String, 
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1474,7 +1483,8 @@ fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
     let mut child = Command::new("bash")
         .args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1739,7 +1749,8 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1900,7 +1911,8 @@ fn capability_cache_read_survives_set_plus_o_history() {
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1989,7 +2001,8 @@ fn capability_stale_cache_falls_back_and_installs_debug_trap() {
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(

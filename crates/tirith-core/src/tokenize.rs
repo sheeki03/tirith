@@ -557,6 +557,14 @@ fn tokenize_posix(
                 i += 1;
                 continue;
             }
+            // POSIX `>|` is the clobbering output redirection (`curl … >| f`
+            // writes the file `f`), not a pipe into `f`. fish has no `>|`.
+            '|' if top_level && posix && ends_with_unescaped_char(&current, '>', '\\') => {
+                current.push(ch);
+                at_word_start = true;
+                i += 1;
+                continue;
+            }
             '|' if top_level => {
                 if i + 1 < len && chars[i + 1] == '|' {
                     push_posix_segment(
@@ -1943,6 +1951,9 @@ fn push_segment_impl(
         } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Posix
         {
             posix_command_and_args(words)
+        } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Fish
+        {
+            fish_command_and_args(words)
         } else {
             // Skip leading `VAR=VALUE` assignments.
             let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
@@ -1986,7 +1997,7 @@ fn push_segment_impl(
 /// arguments still see it; rules that read argv by position see the shell's
 /// argv, as for a trailing redirection. Inside `[[ ... ]]` and `(( ... ))`
 /// `<` and `>` compare, so those words are left as they are.
-fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+pub(crate) fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
 
     let Some(first) = words.iter().position(|word| !is_env_assignment(word)) else {
@@ -1997,11 +2008,26 @@ fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
         let args = words[first + 1..].to_vec();
         return (Some(words[first].clone()), args);
     }
+    command_and_args_past_redirections(words, shell_redirection_token, shell_redirection_suffix)
+}
 
+/// Fish also takes a redirection joined to a word out of argv
+/// (`sh>/dev/null` runs `sh`), with its own quoting and substitution syntax.
+fn fish_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+    use crate::escalation::{fish_redirection_suffix, fish_redirection_token};
+
+    command_and_args_past_redirections(words, fish_redirection_token, fish_redirection_suffix)
+}
+
+fn command_and_args_past_redirections(
+    words: Vec<String>,
+    redirection_token: fn(&str) -> Option<bool>,
+    redirection_suffix: fn(&str) -> Option<(&str, bool)>,
+) -> (Option<String>, Vec<String>) {
     let mut split = Vec::with_capacity(words.len());
     for word in words {
-        if shell_redirection_token(&word).is_none() {
-            if let Some((prefix, _)) = shell_redirection_suffix(&word) {
+        if redirection_token(&word).is_none() {
+            if let Some((prefix, _)) = redirection_suffix(&word) {
                 let at = prefix.len();
                 split.push(word[..at].to_owned());
                 split.push(word[at..].to_owned());
@@ -2016,7 +2042,7 @@ fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     let mut redirections = Vec::new();
     let mut words = split.into_iter();
     while let Some(word) = words.next() {
-        if let Some(target_is_separate) = shell_redirection_token(&word) {
+        if let Some(target_is_separate) = redirection_token(&word) {
             redirections.push(word);
             if target_is_separate {
                 redirections.extend(words.next());
@@ -3766,9 +3792,37 @@ mod tests {
             assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
             assert_eq!(segs[0].args, *args, "{input:?}");
         }
-        // Fish keeps its word reading.
-        let fish = tokenize("sh>/dev/null", ShellType::Fish);
-        assert_eq!(fish[0].command.as_deref(), Some("sh>/dev/null"));
+        // Fish reads a joined redirection the same way, with fish quoting:
+        // a single-quoted string accepts `\'`, a backtick is an ordinary
+        // byte, and `>(cmd)` redirects to the file the substitution names.
+        let fish: &[(&str, &str, &[&str])] = &[
+            ("sh>/dev/null", "sh", &[">/dev/null"]),
+            ("sh 2>/dev/null", "sh", &["2>/dev/null"]),
+            ("bash&>/dev/null", "bash", &["&>/dev/null"]),
+            ("sh2>/dev/null", "sh2", &[">/dev/null"]),
+            ("sh>(pwd)", "sh", &[">(pwd)"]),
+            (
+                "echo 'it\\'s'>/dev/null",
+                "echo",
+                &["'it\\'s'", ">/dev/null"],
+            ),
+            ("echo s(pwd)>/dev/null", "echo", &["s(pwd)", ">/dev/null"]),
+        ];
+        for (input, command, args) in fish {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+        }
+        for (input, command, args) in [
+            ("'sh>/dev/null'", "'sh>/dev/null'", &[] as &[&str]),
+            ("sh\\>/dev/null", "sh\\>/dev/null", &[]),
+            ("echo 'a\\'>b'", "echo", &["'a\\'>b'"]),
+        ] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs[0].command.as_deref(), Some(command), "{input:?}");
+            assert_eq!(segs[0].args, args, "{input:?}");
+        }
     }
 
     #[test]

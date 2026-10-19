@@ -408,7 +408,8 @@ try {
     join(fakeTirithDir, "check"),
     [
       'const shellIndex = process.argv.indexOf("--shell");',
-      "process.exit(process.argv[shellIndex + 1] === process.env.TIRITH_TEST_EXPECTED_TOKENIZER ? 0 : 3);",
+      "if (process.argv[shellIndex + 1] !== process.env.TIRITH_TEST_EXPECTED_TOKENIZER) process.exit(3);",
+      'process.stdout.write(JSON.stringify({ requires_approval: false, findings: [] }));',
       "",
     ].join("\n"),
     "utf8",

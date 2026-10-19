@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "TIRITH_BIN=\"${HOME}/.cargo/bin/tirith\" python3 \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\""
+            "command": "TIRITH_BIN=\"${HOME}/.cargo/bin/tirith\" /usr/bin/python3 \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\" || exit 2"
           }
         ]
       }

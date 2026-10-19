@@ -1032,6 +1032,8 @@ fn expected_materialized_files<'a>(
     ]
 }
 
+const MATERIALIZED_READ_RETRIES: u64 = 20;
+
 fn prepared_file_matches(
     destination: &tirith_core::util::ContainedAtomicFile,
     path: &Path,
@@ -1040,7 +1042,22 @@ fn prepared_file_matches(
     let cap = u64::try_from(expected.len())
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    match destination.read_capped(cap) {
+    // Concurrent first runs rename identical bytes over these names. A read
+    // whose file is replaced mid-read reports a changed generation rather than
+    // returning bytes, so retry that briefly before treating it as an error.
+    let mut read = destination.read_capped(cap);
+    for attempt in 1..=MATERIALIZED_READ_RETRIES {
+        match &read {
+            Err(tirith_core::util::OpenRegularError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(attempt));
+                read = destination.read_capped(cap);
+            }
+            _ => break,
+        }
+    }
+    match read {
         Ok(observed) => Ok(observed == expected),
         Err(tirith_core::util::OpenRegularError::NotFound)
         | Err(tirith_core::util::OpenRegularError::TooLarge) => Ok(false),
@@ -1110,12 +1127,18 @@ fn materialize_hooks_at(data_dir: &Path) -> Result<(PathBuf, bool), String> {
     }
 
     for (path, expected, destination) in &prepared {
-        destination.write_atomic(expected, true).map_err(|error| {
-            format!(
+        if let Err(error) = destination.write_atomic(expected, true) {
+            // Many shells starting at once on a fresh install all publish the
+            // same embedded bytes. Losing that publication race is success when
+            // the file now named here is exactly what this process would write.
+            if prepared_file_matches(destination, path, expected).unwrap_or(false) {
+                continue;
+            }
+            return Err(format!(
                 "failed to write materialized hook {}: {error}",
                 path.display()
-            )
-        })?;
+            ));
+        }
     }
     for (path, expected, destination) in &prepared {
         if !prepared_file_matches(destination, path, expected)? {
@@ -1603,6 +1626,29 @@ mod tests {
         );
         let (_, rewrote_current_bundle) = materialize_hooks_at(data_dir.path()).unwrap();
         assert!(!rewrote_current_bundle);
+    }
+
+    #[test]
+    fn concurrent_first_materialization_succeeds_for_every_caller() {
+        for _ in 0..4 {
+            let data_dir = tempfile::tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    let root = data_dir.path().to_path_buf();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        materialize_hooks_at(&root)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let (shell_dir, _) = worker.join().unwrap().unwrap();
+                assert_eq!(shell_dir, data_dir.path().join("shell"));
+            }
+            assert!(materialized_hooks_match_at(data_dir.path()).unwrap());
+        }
     }
 
     #[cfg(unix)]

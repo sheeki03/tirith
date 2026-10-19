@@ -6,6 +6,62 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     check_bytes_with_ignore(input, &[])
 }
 
+/// Byte rules for a command about to run (exec context, which is how agent
+/// integrations submit every command): the invisible-character classes, plus
+/// the raw terminal control bytes the paste path flags. A command shown for
+/// approval is rendered by a terminal or UI, so an ESC sequence (an OSC 52
+/// clipboard write, an OSC 8 hyperlink, a CSI erase, `\e[8m` hidden text) or
+/// a bare CR that returns the cursor (`ls\rrm -rf ~`) can make the displayed
+/// command differ from what runs. The scanner is the paste scanner, so the
+/// same bytes are exempt: TAB, LF, a CR directly before LF (CRLF line endings
+/// of a pasted script) and a CR that ends the input. The bounded-evidence
+/// notice stays paste-only, as before.
+pub fn check_command_bytes_with_ignore(
+    input: &[u8],
+    ignore_ranges: &[std::ops::Range<usize>],
+) -> Vec<Finding> {
+    check_bytes_with_ignore(input, ignore_ranges)
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule_id,
+                RuleId::AnsiEscapes
+                    | RuleId::ControlChars
+                    | RuleId::BidiControls
+                    | RuleId::ZeroWidthChars
+                    | RuleId::UnicodeTags
+                    | RuleId::InvisibleMathOperator
+                    | RuleId::VariationSelector
+                    | RuleId::InvisibleWhitespace
+                    | RuleId::HangulFiller
+                    | RuleId::ConfusableText
+            )
+        })
+        .map(|mut finding| {
+            match finding.rule_id {
+                RuleId::AnsiEscapes => {
+                    finding.title = "ANSI escape sequences in command".to_string();
+                    finding.description = "The command contains raw terminal escape sequences \
+                        (CSI, OSC, APC or DCS). A terminal or approval prompt that renders them \
+                        can hide text, rewrite the visible command, set the clipboard or \
+                        disguise a link, so what is shown may not be what runs."
+                        .to_string();
+                }
+                RuleId::ControlChars => {
+                    finding.title = "Control characters in command".to_string();
+                    finding.description = "The command contains raw control characters (a \
+                        carriage return that is not part of a CRLF line ending, backspace, \
+                        bell, DEL and the like). Rendered, they can overwrite or hide part of \
+                        the displayed command, so what is shown may not be what runs."
+                        .to_string();
+                }
+                _ => {}
+            }
+            finding
+        })
+        .collect()
+}
+
 /// Like [`check_bytes`] but skips bytes whose offset falls inside `ignore_ranges`
 /// when deciding to emit a finding and assembling its evidence. Carves out the
 /// inert arg span of tirith inspection subcommands (`diff`/`score`/`why`/…); the
@@ -1039,5 +1095,69 @@ mod tests {
         assert_eq!(strip_html_tags("<div><span>A</span> <b>B</b></div>"), "A B");
         assert_eq!(strip_html_tags("No tags here"), "No tags here");
         assert_eq!(strip_html_tags("&amp; &lt;"), "");
+    }
+}
+
+#[cfg(test)]
+mod command_byte_tests {
+    use super::*;
+
+    fn command_rules(input: &str) -> Vec<RuleId> {
+        check_command_bytes_with_ignore(input.as_bytes(), &[])
+            .into_iter()
+            .map(|finding| finding.rule_id)
+            .collect()
+    }
+
+    /// The paste path's terminal-control classes apply to a command too,
+    /// worded for a command.
+    #[test]
+    fn terminal_control_bytes_in_commands_are_flagged() {
+        for (input, rule) in [
+            (
+                "echo -e \"\x1b]52;c;ZWNobyBoaQ==\x07\"",
+                RuleId::AnsiEscapes,
+            ),
+            ("echo hi\x1b[8m hidden\x1b[0m", RuleId::AnsiEscapes),
+            ("printf 'ls\x1b[2K'", RuleId::AnsiEscapes),
+            ("echo safe\x1b7rm -rf ~\x1b8", RuleId::AnsiEscapes),
+            ("ls\rrm -rf ~", RuleId::ControlChars),
+            ("echo a\x08\x08b", RuleId::ControlChars),
+            ("echo bell\x07", RuleId::ControlChars),
+        ] {
+            assert!(command_rules(input).contains(&rule), "{input:?}");
+        }
+        let findings = check_command_bytes_with_ignore(b"ls\rrm -rf ~", &[]);
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.title.contains("pasted")));
+    }
+
+    /// CRLF line endings, a trailing CR, tabs and newlines are not terminal
+    /// controls, in commands as in pastes; printf escape TEXT is not a byte.
+    #[test]
+    fn line_endings_and_escape_text_are_not_flagged() {
+        for input in [
+            "echo a\r\necho b\r\n",
+            "ls -la\r",
+            "printf 'a\\tb\\n'",
+            "printf '\\033[1mbold\\033[0m\\n'",
+            "echo -e '\\e[31mred\\e[0m'",
+            "cat <<'X'\n\tindented\nX",
+        ] {
+            assert!(command_rules(input).is_empty(), "{input:?}");
+        }
+    }
+
+    /// An ESC outside the four introducers is still a terminal control
+    /// (`\e7` / `\e8` cursor save and restore), on the paste path too.
+    #[test]
+    fn lone_escape_sequences_are_ansi_escapes() {
+        assert!(check_bytes(b"echo safe\x1b7rm -rf ~\x1b8")
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnsiEscapes));
+        assert!(check_bytes(b"x\x1bc")
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::AnsiEscapes));
     }
 }

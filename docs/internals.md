@@ -211,11 +211,32 @@ receipts already require redacted inputs before hashing/signing.
 
 ### Compatibility decision
 
-Command-check JSON defaults to the frozen schema-3 contract. Callers explicitly
+Command-check JSON defaults to schema 3. Callers explicitly
 select `tirith check --format json --json-schema 4` to include typed recovery
 advice. Both versions retain the same action and exit code. Schema selection is
 rejected without JSON output and cannot be combined with approval checks or
 execution receipts. `tirith commands check` keeps its existing schema-3 output.
+
+The 0.5.0 execution contract adds an always-present `requires_approval` boolean
+to both versions. It is true for an active approval-rule gate, `WarnAck`, or a
+strict-warning acknowledgement required by the CLI flag/effective policy.
+`strict_warn` does not rewrite a standalone non-interactive Warn or its exit 2;
+the metadata tells execution consumers that confirmation is required. Optional
+`approval_timeout_secs`, `approval_fallback`, `approval_rule` and redacted
+`approval_description` are emitted only for the active approval-rule gate.
+
+Execution adapters must test confirmation before ordinary warning filtering or
+warning-allow handling. Hermes asks through its native gate; installed hosts
+without an approval contract deny. Known `WarnAck`/exit 3 cannot fall through
+checker fail-open even when JSON is damaged. The new adapters refuse or report a
+checker failure for absent/non-boolean approval metadata, rather than treating an
+older unsupported response as false. Report-only older schema readers can ignore
+the additive fields. Action and process-exit semantics remain unchanged.
+
+The writer's contextual acknowledgement argument avoids cloning/mutating the
+enforcement verdict. Confirmation survives content redaction and oversized
+fallback envelopes; canonical rule/fallback values remain machine metadata,
+while the description receives normal content projection.
 
 This correction preserves current field names, serialized enum spellings,
 optional fields, stdout/stderr routing and process exits. It repairs corruption
@@ -353,6 +374,27 @@ the expansion cannot run with the inherited value. State the command cannot
 show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
+
+`eval` or `source` of a generated script is normally an unresolved body. A
+short reviewed list of shell-init emitters is the exception, when the emitter
+runs with literal words only: `eval "$(brew shellenv)"` (also
+`/opt/homebrew/bin/brew` and the other system bin directories),
+`eval "$(direnv hook bash)"`, `eval "$(pyenv init -)"` / `--path`,
+`eval "$(rbenv init -)"`, `eval "$(ssh-agent -s)"` or `eval "$(ssh-agent)"`
+(also unquoted or with backticks), `eval "$(zoxide init zsh)"`,
+`eval "$(starship init bash)"`, `eval "$(fnm env)"`,
+`eval "$(mise activate bash)"`, `source <(kubectl completion zsh)` and
+`source <(fzf --zsh)`. The emitter itself is still analyzed as a command.
+Sending the `eval` or `source` output to `/dev/null` (`>/dev/null`,
+`1>/dev/null`, `2>/dev/null`, `&>/dev/null`, and `2>&1` once stdout already
+goes there) keeps the trust. A variable, an extra pipe, command or operand,
+any other redirection, a wrapper (`command eval`), an assignment prefix, a
+relative or non-system path (`./brew`, `/tmp/brew`), another subcommand, or
+anything in the input that can rebind the name (a function or alias
+definition, a `PATH`, `hash` or `IFS` change) keeps the unresolved-body block.
+So does a variable set or exported anywhere in the same input, including a
+`for`, `select` or `coproc` loop variable, because the emitters build their
+output from the environment (`TMPDIR`, `HOME`, `PYENV_ROOT`).
 
 A command word whose directory is a double-quoted parameter expansion and
 whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,

@@ -1676,6 +1676,10 @@ thread_local! {
     static TRANSACTION_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Upper bound for a lock taken while this thread already holds a setup
+/// transaction lock (see `PlatformTransaction::lock_for`).
+const NESTED_TRANSACTION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) struct PlatformLock {
     mutex: OwnedHandle,
     owned: bool,
@@ -1738,15 +1742,18 @@ impl PlatformTransaction {
         timeout: std::time::Duration,
     ) -> Result<PlatformLock, String> {
         let mutex = open_transaction_mutex(path, scope_root)?;
-        // Multi-file authorization may read another destination while holding
-        // the current writer lock. Never wait in that situation: two writers
-        // could otherwise hold A/B and each wait for the other's snapshot.
-        // Same-thread recursion on the same native mutex still succeeds.
+        // A writer may read another file while holding its own lock: the
+        // operation journal from the publication callback, or another
+        // destination during multi-file authorization. Wait only briefly
+        // then. A snapshot reader on another thread (a dashboard status poll)
+        // holds a file's mutex for milliseconds and must not fail the apply,
+        // while two writers holding A/B still cannot deadlock: both give up
+        // after the bound and release. Same-thread recursion still succeeds.
         let timeout = TRANSACTION_LOCK_DEPTH.with(|depth| {
             if depth.get() == 0 {
                 timeout
             } else {
-                std::time::Duration::ZERO
+                timeout.min(NESTED_TRANSACTION_LOCK_TIMEOUT)
             }
         });
         super::fs_transaction::wait_for_lock(timeout, || {
@@ -3148,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_target_snapshot_contention_refuses_without_a_nested_lock_wait() {
+    fn cross_target_snapshot_contention_refuses_after_a_bounded_nested_wait() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first.json");
         let second = root.path().join("second.json");
@@ -3161,20 +3168,24 @@ mod tests {
         let holder = std::thread::spawn(move || {
             let _lock = PlatformTransaction::lock(&worker_path, &worker_root).unwrap();
             held_tx.send(()).unwrap();
-            // A broken reader that waits will only proceed after this deadline
-            // and return success, causing the parent's refusal assertion to fail.
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            // A broken reader that waits the full setup timeout will only
+            // proceed after this deadline and return success, causing the
+            // parent's refusal assertion to fail.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
         });
         held_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         let lock = PlatformTransaction::lock(&first, root.path()).unwrap();
+        let started = std::time::Instant::now();
         let result = read_snapshot_scoped(&second, root.path());
+        let waited = started.elapsed();
         let released_while_held = release_tx.send(()).is_ok();
         drop(lock);
         holder.join().unwrap();
         assert!(result.is_err());
         assert!(released_while_held);
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         // Releasing every guard restores normal reads; failed acquisition must
         // not leave the thread's nesting count elevated.
         assert_eq!(
@@ -3184,6 +3195,35 @@ mod tests {
                 .as_deref(),
             Some(&b"second"[..])
         );
+    }
+
+    #[test]
+    fn nested_snapshot_waits_out_a_transient_reader_on_another_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("policy.yaml");
+        let journal = root.path().join("operation.json");
+        create_protected_owner_only_file(&destination, b"destination");
+        create_protected_owner_only_file(&journal, b"journal");
+        let worker_path = journal.clone();
+        let worker_root = root.path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        // Stands in for a dashboard status poll that holds the journal mutex
+        // while it snapshots the record.
+        let reader = std::thread::spawn(move || {
+            let _lock = PlatformTransaction::lock(&worker_path, &worker_root).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The apply worker holds the destination's writer lock and re-reads
+        // the journal from its publication callback.
+        let writer = PlatformTransaction::lock(&destination, root.path()).unwrap();
+        let snapshot = read_snapshot_scoped(&journal, root.path()).unwrap();
+        assert_eq!(snapshot.bytes.as_deref(), Some(&b"journal"[..]));
+        drop(writer);
+        reader.join().unwrap();
     }
 
     fn symlink_directory_or_explicitly_skip(target: &Path, link: &Path) -> bool {

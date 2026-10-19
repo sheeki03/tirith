@@ -5,8 +5,8 @@ bounty, a "can you reproduce this", a take-home exercise. This is the workflow
 tirith supports for that, and, just as importantly, the workflow's real limits.
 
 The short version: **`tirith capsule run --preset untrusted-project` is the only
-control here that can stop anything, and it is enforceable on x86_64 Linux
-only.** Everything else on this page is inspection and evidence.
+control here that can stop anything, and the 0.5.0 candidate supports native
+x86_64 and AArch64 Linux.** Everything else on this page is inspection and evidence.
 
 ## Before you clone
 
@@ -58,11 +58,11 @@ caps at 100,000 files, 200,000 entries of every kind, 256 levels of nesting, and
 
 ### It refuses on the wrong host, before copying anything
 
-The preset is enforceable on x86_64 Linux with a usable Landlock ABI and nowhere
-else. Raw-network denial needs seccomp, which is x86_64 Linux only in this
-build; macOS cannot enforce a per-process memory ceiling or a process-count
-ceiling at all; and the parent-owned wall-clock and combined-output supervisor
-is Linux-only.
+The candidate preset is enforceable on native x86_64 and AArch64 Linux with
+usable Landlock and seccomp, not merely on a matching CPU. Both Linux backends
+provide raw-network denial; macOS cannot enforce a per-process memory or
+process-count ceiling, and the parent-owned wall-clock/combined-output supervisor
+is Linux-only. Final released artifacts still require native qualification.
 
 On any other host the command refuses before anything is copied or spawned,
 names the exact control it could not deliver, and writes a refusal receipt. On a

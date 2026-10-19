@@ -16,7 +16,7 @@ transition below:
    tip and review the resulting tree, not only each stacked diff.
 2. Resolve or explicitly defer every item under `[Unreleased]` → `Known issues`.
 3. Run the required Linux, macOS, and Windows matrices on that exact tree,
-   including native x86_64-Linux containment and host-shaped hook tests.
+   including native x86_64/AArch64 Linux containment and host-shaped hook tests.
 4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
 5. Change the workspace version to `<VERSION>` in BOTH root `Cargo.toml`
    lines (`[workspace.package] version` and the `[workspace.dependencies]
@@ -74,6 +74,37 @@ block the merge window itself.
   defaults, then re-enable the workflow and monitor one deliberate run.
 - [ThreatDB v2 rollout](threatdb-v2-rollout.md): the separate database-format
   playbook.
+
+### Hermes plugin cutover
+
+The external plugin is a separate release artifact, not part of a Tirith
+binary tag. Its implementation branch and green checks do not make the
+default-branch install or catalog entry available.
+
+1. Publish a qualified Tirith `0.5.0` artifact first. Check the actual
+   `check --stdin --format json` response, including the always-present boolean
+   `requires_approval`; a version string alone is insufficient. Confirm that
+   released `0.4.2` is refused rather than scanned with an incompatible contract.
+2. Run the plugin's Linux, macOS and Windows unit matrix and its real-binary
+   checks against the final artifact. Validate all three hooks with the pinned
+   minimum and current Hermes SDK revisions from the plugin CI. Exercise policy
+   confirmation and strict warnings with no approver, and preserve unknown
+   background input after overlapping calls, unanswered confirmation, timeout
+   and late completion. Timing simulations qualify bookkeeping, not concurrent
+   shell exploitation.
+3. Merge and publish the plugin repository's reviewed implementation. Confirm
+   the documented install URL resolves to that implementation, not the current
+   placeholder `main`. Submit and verify the Hermes catalog entry separately;
+   do not promise a Hermes release's migration pointer or automatic installation.
+4. On the chosen Hermes host, inspect whether the legacy core Tirith gate is
+   actually present before enabling the external gate. Version ranges alone do
+   not prove its absence. Confirm loaded hooks, capability checks, refusal and
+   scoped approval with harmless input on the installed bytes.
+5. Report corpus results as proposed scanner/hook decisions. Warning-only
+   commands run by default; database-dependent rows require the relevant threat
+   data. Neither a successful validator nor a green corpus proves that no attack
+   executes.
+
 
 ## crates.io publish order
 

@@ -702,6 +702,38 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     dp[m][n]
 }
 
+/// Whether `levenshtein(a, b) <= 1`, in one linear pass without the distance
+/// table: the hostname typosquat check asks this for every URL against every
+/// known domain, so a command holding thousands of URLs paid a quadratic table
+/// per pair (CORE-6).
+pub fn within_one_edit(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let prefix = short
+        .iter()
+        .zip(long.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if short.len() == long.len() {
+        // One substitution: everything after the first mismatch must match.
+        short[prefix + 1..] == long[prefix + 1..]
+    } else {
+        // One insertion into `short`.
+        short[prefix..] == long[prefix + 1..]
+    }
+}
+
 /// Normalize a path's separators to forward slashes for the `file.path_matches`
 /// DSL predicate (its regexes are written with `/`, so a Windows `C:\repo\.env`
 /// would never match otherwise). Both the FileScan path and `tirith rule test`
@@ -1511,5 +1543,45 @@ mod normalize_path_separators_tests {
             Some("src/secrets/.env"),
             "a path with no backslashes is returned unchanged"
         );
+    }
+}
+
+#[cfg(test)]
+mod one_edit_tests {
+    use super::{levenshtein, within_one_edit};
+
+    #[test]
+    fn within_one_edit_matches_levenshtein() {
+        let words = [
+            "",
+            "a",
+            "ab",
+            "ba",
+            "abc",
+            "acb",
+            "abd",
+            "abcd",
+            "github.com",
+            "githab.com",
+            "githubb.com",
+            "gthub.com",
+            "gitlab.com",
+            "glthub.com",
+            "github.co",
+            "xgithub.com",
+            "githuc.org",
+            "\u{440}\u{430}\u{443}\u{440}\u{430}l.com",
+            "paypal.com",
+            "paypa1.com",
+        ];
+        for a in words {
+            for b in words {
+                assert_eq!(
+                    within_one_edit(a, b),
+                    levenshtein(a, b) <= 1,
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
     }
 }

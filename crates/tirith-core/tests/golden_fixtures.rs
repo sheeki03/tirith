@@ -809,7 +809,9 @@ fn test_tier1_coverage() {
             // Exec: byte scan bypasses tier-1 via the exec_bidi_triggered path in engine.rs.
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
-                if byte_scan.has_bidi_controls
+                if byte_scan.has_ansi_escapes
+                    || byte_scan.has_control_chars
+                    || byte_scan.has_bidi_controls
                     || byte_scan.has_zero_width
                     || byte_scan.has_unicode_tags
                     || byte_scan.has_variation_selectors
@@ -825,8 +827,13 @@ fn test_tier1_coverage() {
             let regex_triggered =
                 tirith_core::extract::tier1_scan_for_shell(&fixture.input, scan_context, shell);
             let sensitive_asset_triggered = public_sensitive_asset_gate(&fixture.input);
+            // The Exec gate's executable-body trigger: a nested body (here an
+            // `eval` of a trusted emitter whose output the same input can
+            // steer) that Tirith cannot resolve never takes the fast exit.
+            let body_triggered = scan_context == ScanContext::Exec
+                && tirith_core::engine::exec_executable_body_triggered(&fixture.input, shell);
 
-            if !regex_triggered && !sensitive_asset_triggered {
+            if !regex_triggered && !sensitive_asset_triggered && !body_triggered {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action
@@ -2146,6 +2153,32 @@ fn test_tier1_matches_all_interpreters() {
         tier1_scan("cat /tmp/s.sh | BASH", ScanContext::Exec),
         "Tier-1 scan must match uppercase interpreter"
     );
+
+    // Versioned and implementation-suffixed names resolve to their
+    // interpreter, and wrapped sinks reach the same rule.
+    for sink in [
+        "python3.12",
+        "python2.7",
+        "/usr/bin/python3.11",
+        "pypy",
+        "pypy3.10",
+        "perl5.34.1",
+        "php82",
+        "ruby33",
+        "nodejs",
+        "lua5.4",
+        "tclsh8.6",
+        "bash-5.2",
+        "ksh93",
+        "nice -n 5 bash",
+        "timeout 60 sh",
+    ] {
+        let input = format!("cat /tmp/s.sh | {sink}");
+        assert!(
+            tier1_scan(&input, ScanContext::Exec),
+            "Tier-1 scan does not match '{input}'"
+        );
+    }
 }
 
 // Lab corpus safeguard: the `tirith lab` corpus (in the sibling `tirith` crate)

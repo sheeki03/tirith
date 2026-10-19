@@ -988,6 +988,36 @@ fn query_osv(
 struct DepsPackageResponse {
     #[serde(default)]
     versions: Vec<DepsPackageVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_published_at_secs: Option<i64>,
+}
+
+impl DepsPackageResponse {
+    fn bound_versions(&mut self) {
+        self.default_version = None;
+        self.first_published_at_secs = None;
+        if self.versions.len() > MAX_DECODED_ITEMS {
+            // Retain semantic metadata, not an arbitrary replacement record.
+            // Moving a late default avoids copying; the original prefix stays
+            // readable by older cache readers without losing its oldest entry.
+            self.first_published_at_secs = self
+                .versions
+                .iter()
+                .filter_map(|version| version.published_at.as_deref())
+                .filter_map(parse_rfc3339_secs)
+                .min();
+            if let Some(index) = self.versions.iter().position(|version| version.is_default) {
+                if index >= MAX_DECODED_ITEMS {
+                    self.default_version = Some(std::mem::take(
+                        &mut self.versions[index].version_key.version,
+                    ));
+                }
+            }
+            self.versions.truncate(MAX_DECODED_ITEMS);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1048,7 +1078,7 @@ fn deps_package(
             Ok(response) => response,
             Err(error) => return LookupOutcome::Incomplete(error),
         };
-    response.versions.truncate(MAX_DECODED_ITEMS);
+    response.bound_versions();
     store_cache("deps-package", &cache_key, &response);
     LookupOutcome::Complete(response)
 }
@@ -1066,7 +1096,8 @@ fn resolve_default_version(
                 .versions
                 .into_iter()
                 .find(|version| version.is_default)
-                .map(|version| version.version_key.version),
+                .map(|version| version.version_key.version)
+                .or(package.default_version),
         ),
         LookupOutcome::Unsupported => LookupOutcome::Unsupported,
         LookupOutcome::Incomplete(error) => LookupOutcome::Incomplete(error),
@@ -1156,14 +1187,18 @@ fn collect_package_metadata(
     let mut incomplete = Vec::new();
     let first_release_days = match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(response) => response
-            .versions
-            .iter()
-            .filter_map(|version| version.published_at.as_deref())
-            .filter_map(parse_rfc3339_secs)
-            .min()
+            .first_published_at_secs
+            .or_else(|| {
+                response
+                    .versions
+                    .iter()
+                    .filter_map(|version| version.published_at.as_deref())
+                    .filter_map(parse_rfc3339_secs)
+                    .min()
+            })
             .map(|first_seen| {
                 let now = cache.now as i64;
-                ((now - first_seen).max(0)) / 86_400
+                now.saturating_sub(first_seen).max(0) / 86_400
             }),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -1783,6 +1818,123 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, value).unwrap();
         path
+    }
+
+    #[test]
+    fn bounded_package_cache_preserves_default_version_resolution() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        for (name, defaults, expected) in [
+            ("late-default", vec![MAX_DECODED_ITEMS + 16], Some("1.64.0")),
+            (
+                "boundary-default",
+                vec![MAX_DECODED_ITEMS - 1],
+                Some("1.64.0"),
+            ),
+            (
+                "first-default",
+                vec![0, MAX_DECODED_ITEMS + 16],
+                Some("1.64.0"),
+            ),
+            ("no-default", vec![], None),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: if defaults.contains(&index) {
+                                "1.64.0".into()
+                            } else {
+                                format!("0.{index}.0")
+                            },
+                        },
+                        published_at: None,
+                        is_default: defaults.contains(&index),
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            // Preserve the first default's meaning even if malformed upstream
+            // metadata designates a different later version as default too.
+            if name == "first-default" {
+                response.versions[MAX_DECODED_ITEMS + 16]
+                    .version_key
+                    .version = "2.0.0".into();
+            }
+            response.bound_versions();
+            store_cache(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &response,
+            );
+            let cache = CacheReadContext::new(unix_now(), Duration::from_secs(5));
+            let result = resolve_default_version(
+                Ecosystem::Npm,
+                name,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            match result {
+                LookupOutcome::Complete(version) => {
+                    assert_eq!(version.as_deref(), expected, "{name}");
+                }
+                other => panic!("bounded cache must remain usable for {name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_package_cache_preserves_package_age_with_a_late_default() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let now = parse_rfc3339_secs("2026-01-15T00:00:00Z").unwrap() as u64;
+        for (name, oldest_index) in [
+            ("oldest-boundary", MAX_DECODED_ITEMS - 1),
+            ("oldest-beyond-prefix", MAX_DECODED_ITEMS + 8),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: format!("1.{index}.0"),
+                        },
+                        published_at: Some(if index == oldest_index {
+                            "2000-01-01T00:00:00Z".into()
+                        } else {
+                            "2026-01-01T00:00:00Z".into()
+                        }),
+                        is_default: index == MAX_DECODED_ITEMS + 16,
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            response.bound_versions();
+            write_cache_fixture(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &serde_json::json!({"fetched_at": now, "value": response}).to_string(),
+            );
+            let cache = CacheReadContext::new(now, Duration::from_secs(5));
+            let metadata = collect_package_metadata(
+                Ecosystem::Npm,
+                name,
+                None,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            let signal = metadata.signal.expect("cached package age");
+            assert_eq!(
+                signal.first_release_days,
+                Some((now as i64 - parse_rfc3339_secs("2000-01-01T00:00:00Z").unwrap()) / 86_400),
+                "{name}",
+            );
+            assert!(
+                !signal.is_suspicious(),
+                "established package cannot become new: {name}"
+            );
+        }
     }
 
     #[test]
