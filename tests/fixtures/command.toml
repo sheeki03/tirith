@@ -5437,3 +5437,55 @@ context = "exec"
 expected_action = "allow"
 expected_rules = []
 forbidden_rules = ["interpreter_suspicious_inline_exec"]
+
+# ── Round 4: a trusted init emitter whose output is discarded ───────────────
+# `>/dev/null`, `2>/dev/null`, `&>/dev/null` and a `2>&1` after a stdout
+# discard only silence what the evaluated setup code prints. Any other
+# redirection, and every rebinding or assignment refusal, keeps the block.
+[[fixture]]
+name = "r4_eval_ssh_agent_stdout_discarded_allowed"
+min_milestone = 1
+input = 'eval "$(ssh-agent -s)" >/dev/null'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_eval_ssh_agent_both_streams_discarded_allowed"
+min_milestone = 1
+input = 'eval "$(ssh-agent -s)" > /dev/null 2>&1'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_eval_ssh_agent_ampersand_discard_allowed"
+min_milestone = 1
+input = 'eval "$(ssh-agent)" &>/dev/null'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "r4_eval_ssh_agent_redirected_to_file_blocks"
+min_milestone = 1
+input = 'eval "$(ssh-agent -s)" > out.txt'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_append_discard_blocks"
+min_milestone = 1
+input = 'eval "$(ssh-agent -s)" >> /dev/null'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "r4_eval_ssh_agent_discard_with_assignment_prefix_blocks"
+min_milestone = 1
+input = 'SSH_AUTH_SOCK=/tmp/x eval "$(ssh-agent -s)" >/dev/null'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
