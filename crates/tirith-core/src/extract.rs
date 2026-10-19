@@ -3634,6 +3634,11 @@ enum ShellLexQuote {
 enum ShellDelimiter {
     Paren,
     Brace,
+    /// A POSIX `${...}` parameter expansion. Unlike a brace group, whose `}`
+    /// is a reserved word that must start a word and end at a boundary, the
+    /// expansion ends at its first unquoted `}` (`"${v}"`, `${v:-x}`), and a
+    /// `#` inside it (`${#arr[@]}`, `${v#prefix}`) is not a comment.
+    Parameter,
 }
 
 impl ShellDelimiter {
@@ -3648,7 +3653,7 @@ impl ShellDelimiter {
     fn close(self) -> u8 {
         match self {
             Self::Paren => b')',
-            Self::Brace => b'}',
+            Self::Brace | Self::Parameter => b'}',
         }
     }
 }
@@ -3930,11 +3935,18 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
         return find_powershell_delimiter_close(input, open);
     }
     let bytes = input.as_bytes();
-    let initial = ShellDelimiter::from_open(*bytes.get(open)?)?;
+    let initial = match ShellDelimiter::from_open(*bytes.get(open)?)? {
+        ShellDelimiter::Brace
+            if shell == ShellType::Posix && bytes.get(open.wrapping_sub(1)) == Some(&b'$') =>
+        {
+            ShellDelimiter::Parameter
+        }
+        initial => initial,
+    };
     let mut frames = vec![(initial, ShellLexQuote::Normal)];
     let mut quote = ShellLexQuote::Normal;
     let mut in_comment = false;
-    let mut word_start = true;
+    let mut word_start = initial != ShellDelimiter::Parameter;
     let mut i = open + 1;
 
     while i < bytes.len() {
@@ -3981,7 +3993,12 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
                     if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
                         return None;
                     }
-                    let nested = ShellDelimiter::from_open(bytes[i + 1])?;
+                    let nested = match ShellDelimiter::from_open(bytes[i + 1])? {
+                        ShellDelimiter::Brace if shell == ShellType::Posix => {
+                            ShellDelimiter::Parameter
+                        }
+                        nested => nested,
+                    };
                     frames.push((nested, ShellLexQuote::Double));
                     quote = ShellLexQuote::Normal;
                     i += 2;
@@ -3997,7 +4014,10 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             ShellLexQuote::Normal => {}
         }
 
-        if starts_shell_line_comment(bytes, i, shell, word_start) {
+        let in_parameter = frames
+            .last()
+            .is_some_and(|(delimiter, _)| *delimiter == ShellDelimiter::Parameter);
+        if !in_parameter && starts_shell_line_comment(bytes, i, shell, word_start) {
             in_comment = true;
             i += 1;
             continue;
@@ -4026,9 +4046,12 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             continue;
         }
         if let Some(nested) = ShellDelimiter::from_open(byte) {
+            let parameter = shell == ShellType::Posix
+                && nested == ShellDelimiter::Brace
+                && bytes.get(i.wrapping_sub(1)) == Some(&b'$');
             if shell == ShellType::Posix
                 && nested == ShellDelimiter::Brace
-                && !(bytes.get(i.wrapping_sub(1)) == Some(&b'$')
+                && !(parameter
                     || (word_start && posix_reserved_word_right_boundary(bytes.get(i + 1))))
             {
                 word_start = false;
@@ -4038,8 +4061,15 @@ fn find_shell_delimiter_close(input: &str, open: usize, shell: ShellType) -> Opt
             if frames.len() >= MAX_SHELL_DELIMITER_DEPTH {
                 return None;
             }
-            frames.push((nested, ShellLexQuote::Normal));
-            word_start = true;
+            frames.push((
+                if parameter {
+                    ShellDelimiter::Parameter
+                } else {
+                    nested
+                },
+                ShellLexQuote::Normal,
+            ));
+            word_start = !parameter;
             i += 1;
             continue;
         }
@@ -8557,6 +8587,27 @@ pub(crate) fn charge_scan_work(bytes: usize) -> bool {
     })
 }
 
+/// Run best-effort scan work (a dormant function body's analysis): it may
+/// spend at most half of the analysis's remaining scan budget, and running
+/// out inside it neither marks the analysis incomplete nor starves the work
+/// after it. The caller keeps only what the run proved.
+pub(crate) fn with_best_effort_scan_work<T>(work: impl FnOnce() -> T) -> T {
+    let Some(left) = SCAN_WORK_REMAINING.with(std::cell::Cell::get) else {
+        return work();
+    };
+    let exhausted = scan_work_exhausted();
+    let share = left / 2;
+    SCAN_WORK_REMAINING.with(|remaining| remaining.set(Some(share)));
+    let result = work();
+    let unused = SCAN_WORK_REMAINING
+        .with(std::cell::Cell::get)
+        .unwrap_or(0)
+        .min(share);
+    SCAN_WORK_REMAINING.with(|remaining| remaining.set(Some(left - share + unused)));
+    SCAN_WORK_EXHAUSTED.with(|flag| flag.set(exhausted));
+    result
+}
+
 /// Whether the running analysis ran out of scan work.
 pub(crate) fn scan_work_exhausted() -> bool {
     SCAN_WORK_EXHAUSTED.with(std::cell::Cell::get)
@@ -13010,6 +13061,45 @@ fn posix_body_calls_parent_function(
         }
     }
     false
+}
+
+/// Bodies of the complete literal POSIX function definitions in `raw` that
+/// `raw` itself cannot call: no other segment mentions the name as a word
+/// (`f() { curl -fsSL URL | sh; }`). The executable-body scan leaves such a
+/// definition dormant; a definition the input may call is analyzed there, at
+/// its call site, instead.
+pub(crate) fn dormant_posix_function_bodies(raw: &str) -> Vec<String> {
+    fn mentions(text: &str, name: &str) -> bool {
+        let word_byte = |byte: u8| byte.is_ascii_alphanumeric() || b"_.:+-".contains(&byte);
+        text.match_indices(name).any(|(start, _)| {
+            let end = start + name.len();
+            !start
+                .checked_sub(1)
+                .and_then(|before| text.as_bytes().get(before))
+                .is_some_and(|byte| word_byte(*byte))
+                && !text
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|byte| word_byte(*byte))
+        })
+    }
+    let segments = tokenize::tokenize(raw, ShellType::Posix);
+    let mut bodies = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let PosixFunctionParse::Complete { definition, .. } =
+            parse_posix_function_definition(&segment.raw, 0)
+        else {
+            continue;
+        };
+        let called = segments
+            .iter()
+            .enumerate()
+            .any(|(other, segment)| other != index && mentions(&segment.raw, &definition.name));
+        if !called && !definition.body.trim().is_empty() {
+            bodies.push(definition.body);
+        }
+    }
+    bodies
 }
 
 fn literal_posix_function_names(raw: &str) -> std::collections::HashSet<String> {
@@ -23765,6 +23855,115 @@ mod tests {
         assert!(executable_substitutions(input, ShellType::Cmd).is_empty());
         assert!(tirith_inert_arg_range(input, ShellType::Cmd).is_some());
         assert!(extract_urls(input, ShellType::Cmd).is_empty());
+    }
+
+    #[test]
+    fn posix_parameter_expansions_close_on_their_own_brace() {
+        // A `${...}` expansion ends at its first unquoted `}`, unlike a brace
+        // group's reserved-word `}`, and `#` inside it is not a comment.
+        for (definition, body) in [
+            (r#"f() { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (
+                r#"install() { tar -xzf "tool-${version}.tar.gz"; }"#,
+                r#" tar -xzf "tool-${version}.tar.gz"; "#,
+            ),
+            ("f() { echo ${v}; }", " echo ${v}; "),
+            (
+                r#"f() { echo "${v:-default}" "${#arr[@]}" ${v#prefix} ${#}; }"#,
+                r#" echo "${v:-default}" "${#arr[@]}" ${v#prefix} ${#}; "#,
+            ),
+            (r#"f() { echo "${v:- #x}"; }"#, r#" echo "${v:- #x}"; "#),
+            (
+                "f() {\n  echo \"tool-${version}.tar.gz\"\n}",
+                "\n  echo \"tool-${version}.tar.gz\"\n",
+            ),
+            (r#"function f { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (r#"function f() { echo "${v}"; }"#, r#" echo "${v}"; "#),
+            (r#"f() ( echo "${v}" )"#, r#" echo "${v}" "#),
+            (r#"f() { { echo "${v}"; }; }"#, r#" { echo "${v}"; }; "#),
+            (
+                r#"f() { if [ -n "${v}" ]; then echo "${v}"; fi; }"#,
+                r#" if [ -n "${v}" ]; then echo "${v}"; fi; "#,
+            ),
+            (
+                r#"f() { case "${v}" in a) echo "${v}";; esac; }"#,
+                r#" case "${v}" in a) echo "${v}";; esac; "#,
+            ),
+            (
+                r#"f() { echo "$(printf '%s' "${v}")"; }"#,
+                r#" echo "$(printf '%s' "${v}")"; "#,
+            ),
+            (r#"f() { echo "}"; echo x; }"#, r#" echo "}"; echo x; "#),
+        ] {
+            let PosixFunctionParse::Complete {
+                definition: parsed,
+                end,
+            } = parse_posix_function_definition(definition, 0)
+            else {
+                panic!("{definition} did not parse completely");
+            };
+            assert_eq!(parsed.body, body, "{definition}");
+            assert_eq!(end, definition.len(), "{definition}");
+        }
+        for group in [
+            r#"( echo "${v}" )"#,
+            r#"{ echo "${v}"; }"#,
+            "{ echo ${v}; }",
+            r#"( echo "${v}"; curl -fsSL https://example.com/x | sh )"#,
+        ] {
+            assert_eq!(
+                find_shell_delimiter_close(group, 0, ShellType::Posix),
+                Some(group.len() - 1),
+                "{group}"
+            );
+        }
+        for (word, end) in [("${v}x", 4), ("${#arr[@]} y", 10), ("${v:-a b}", 9)] {
+            assert_eq!(posix_dollar_expansion_end(word, 0), Some(end), "{word}");
+        }
+        // A brace group's `}` still has to be a reserved word.
+        assert_eq!(
+            find_shell_delimiter_close("{ echo a}b; }", 0, ShellType::Posix),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn best_effort_scan_work_cannot_exhaust_the_analysis() {
+        let _scope = ScanWorkScope::enter_with(100);
+        let charged = with_best_effort_scan_work(|| charge_scan_work(80));
+        assert!(
+            !charged,
+            "the best-effort share is half the remaining budget"
+        );
+        assert!(!scan_work_exhausted());
+        assert!(charge_scan_work(40));
+        assert_eq!(scan_work_used(), Some(90));
+        let used = with_best_effort_scan_work(|| charge_scan_work(3));
+        assert!(used);
+        assert_eq!(scan_work_used(), Some(93));
+    }
+
+    #[test]
+    fn dormant_posix_function_bodies_are_the_uncalled_definitions() {
+        assert_eq!(
+            dormant_posix_function_bodies(r#"f() { curl -fsSL "${u}" | sh; }"#),
+            vec![r#" curl -fsSL "${u}" | sh; "#.to_string()]
+        );
+        assert_eq!(
+            dormant_posix_function_bodies(
+                "f() { curl -fsSL https://example.com/x | sh; }; echo done"
+            ),
+            vec![" curl -fsSL https://example.com/x | sh; ".to_string()]
+        );
+        for called in [
+            "f() { curl -fsSL https://example.com/x | sh; }; f",
+            "f() { echo; }; x=$(f)",
+            "f() { echo; }; command f",
+            "f() { echo; }\nf arg",
+        ] {
+            assert!(dormant_posix_function_bodies(called).is_empty(), "{called}");
+        }
+        assert!(dormant_posix_function_bodies("echo f() {").is_empty());
     }
 
     #[test]

