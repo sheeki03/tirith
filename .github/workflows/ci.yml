@@ -219,6 +219,7 @@ jobs:
           --test bash_preexec_enforce
           --test bash_hook_exports
           --test shell_conformance
+          --test shell_session_identity
 
   msrv:
     name: MSRV (1.83)
