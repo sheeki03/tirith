@@ -327,7 +327,7 @@ fn reached_prepare_plan(stderr: &str) -> bool {
 }
 
 #[test]
-fn pkg_approve_without_the_gate_reaches_plan_preparation() {
+fn pkg_approve_without_the_gate_checks_native_prerequisites_before_preparation() {
     let workspace = Workspace::new(None);
     let target = workspace.dir.path().join("approved-target");
     let target = target.to_string_lossy();
@@ -344,6 +344,11 @@ fn pkg_approve_without_the_gate_reaches_plan_preparation() {
             stderr.contains("package approvals are redeemable only on x86_64 Linux"),
             "the native capability refusal drifted: {stderr}"
         );
+        return;
+    }
+    if stderr.contains("Native package-approval issuance is off:") {
+        assert!(!reached_prepare_plan(&stderr));
+        assert!(collect_paths(&workspace.home().join("data")).is_empty());
         return;
     }
     assert!(
@@ -375,7 +380,8 @@ fn pkg_approve_denies_before_any_resolver_or_quarantine_work() {
         return;
     }
     assert!(
-        stderr.contains("refused before any network or install step"),
+        stderr.contains("Native package-approval issuance is off:")
+            || stderr.contains("refused before any network or install step"),
         "stderr: {stderr}"
     );
     assert!(
@@ -416,10 +422,13 @@ fn pkg_approve_json_reports_the_refusal_as_structured_output() {
     assert_eq!(json["command"], "approve");
     assert_eq!(
         json["error_phase"],
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "task_gate"
-        } else {
+        if json["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("blocked_native:"))
+        {
             "native_authority"
+        } else {
+            "task_gate"
         }
     );
     assert_eq!(json["target_executed"], false);
