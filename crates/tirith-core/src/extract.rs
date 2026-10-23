@@ -59,6 +59,13 @@ static URL_REGEX: Lazy<Regex> = Lazy::new(|| {
     .expect("url regex must compile")
 });
 
+/// Scheme URLs are matched separately so a leftmost SCP-shaped prefix such as
+/// `pkg@http://host/path` cannot consume a real HTTP destination.
+static SCHEME_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i:(?:https?|ftp|ssh|git)://[^\s'"<>]+)"#)
+        .expect("scheme URL regex must compile")
+});
+
 /// Control character patterns for paste-time byte scanning.
 pub struct ByteScanResult {
     pub has_ansi_escapes: bool,
@@ -1947,11 +1954,30 @@ fn extract_urls_depth(input: &str, shell: ShellType, depth: usize) -> Vec<Extrac
             }
             let clean = strip_quotes(&value);
             if !clean.is_empty() {
-                push_urls_from_source(&clean, shell, seg_idx, sink_context, &mut results);
+                push_urls_from_source(&clean, shell, seg_idx, sink_context, false, &mut results);
             }
         }
         for source in &url_sources {
-            push_urls_from_source(source, shell, seg_idx, sink_context, &mut results);
+            // A URI in the path of an actual remote-copy operand is path DATA.
+            // Resolve wrappers first; a package spec with the same spelling is
+            // not an SCP operand and must retain its HTTP destination.
+            let remote_operand = resolved.as_ref().is_some_and(|cmd| {
+                matches!(cmd.name.as_str(), "git" | "scp" | "rsync")
+                    && cmd.args.iter().any(|arg| arg == *source)
+                    && parse_scp_remote_spec(
+                        &crate::rules::command::normalize_shell_token(source, shell),
+                        shell,
+                    )
+                    .is_some()
+            });
+            push_urls_from_source(
+                source,
+                shell,
+                seg_idx,
+                sink_context,
+                remote_operand,
+                &mut results,
+            );
         }
 
         // Schemeless URLs in sink contexts. Skip docker/podman/nerdctl — their
@@ -2328,10 +2354,54 @@ fn push_urls_from_source(
     shell: ShellType,
     segment_index: usize,
     in_sink_context: bool,
+    remote_operand: bool,
     results: &mut Vec<ExtractedUrl>,
 ) {
     let normalized = crate::rules::command::normalize_shell_token(source, shell);
+    if remote_operand {
+        // Preserve the entire outer remote, including a URI-looking path.
+        // Parsing the complete operand avoids a leftmost SCP/URI overlap and
+        // does not promote the path into a separate network destination.
+        results.push(ExtractedUrl {
+            parsed: parse::parse_url(&normalized),
+            raw: normalized,
+            segment_index,
+            in_sink_context,
+        });
+        return;
+    }
+    let schemes: Vec<_> = SCHEME_URL_REGEX.find_iter(&normalized).collect();
+    for mat in &schemes {
+        let raw = mat.as_str().to_string();
+        results.push(ExtractedUrl {
+            parsed: parse::parse_url(&raw),
+            raw,
+            segment_index,
+            in_sink_context,
+        });
+    }
     for mat in URL_REGEX.find_iter(&normalized) {
+        // A package@http URL is not an SCP remote. A real SCP spec with
+        // URI-looking path is still a distinct outer remote, even in other
+        // command contexts. Aliases with another @ inside their path are not.
+        if schemes
+            .iter()
+            .any(|scheme| mat.start() < scheme.end() && scheme.start() < mat.end())
+            && !parse_scp_remote_spec(mat.as_str(), shell).is_some_and(|spec| {
+                !spec.path.contains('@')
+                    && mat.start() + mat.as_str().find(':').unwrap_or(0)
+                        < schemes
+                            .iter()
+                            .filter(|scheme| {
+                                mat.start() < scheme.end() && scheme.start() < mat.end()
+                            })
+                            .map(|scheme| scheme.start())
+                            .min()
+                            .unwrap_or(0)
+            })
+        {
+            continue;
+        }
         let raw = mat.as_str().to_string();
         let url = parse::parse_url(&raw);
         results.push(ExtractedUrl {
@@ -11956,6 +12026,9 @@ fn is_registry_package_operand(
                 return first_package_runner_operand(args, 1, shell) == Some(index)
                     || (index > 0 && matches!(normalized[index - 1].as_str(), "--package" | "-p"));
             }
+            if matches!(subcommand.as_str(), "view" | "info" | "show" | "v") {
+                return npm_view_registry_position(args, index, shell);
+            }
             index > 0
                 && matches!(
                     subcommand.as_str(),
@@ -11994,6 +12067,142 @@ fn is_registry_package_operand(
         }
         _ => false,
     }
+}
+
+/// The exemption requires a literal named package at an exact three-component
+/// version and a completely understood argv. Normalization alone is not proof
+/// of literal shell spelling: $VERSION, backticks and substitutions are active.
+fn npm_view_exact_package(raw: &str) -> bool {
+    let separator = if raw.starts_with('@') {
+        raw.rfind('@').filter(|at| *at > 0)
+    } else {
+        raw.find('@')
+    };
+    let Some(at) = separator else {
+        return false;
+    };
+    let version = &raw[at + 1..];
+    registry_package_name(raw)
+        && version.split('.').count() == 3
+        && version.split('.').all(|part| {
+            !part.is_empty()
+                && (part.len() == 1 || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn npm_view_registry_position(args: &[String], target: usize, shell: ShellType) -> bool {
+    // The literal/exact-spec carveout is qualified only for POSIX spelling.
+    // Other shells retain full inspection, including quoted Cmd expansions.
+    if shell != ShellType::Posix {
+        return false;
+    }
+    let mut package_index = None;
+    let mut field_index = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = crate::rules::command::normalize_shell_token(&args[i], shell);
+        if !shell_word_is_proven_literal(&args[i], shell) {
+            return false;
+        }
+        // Only the already supported npm-view options and the approved
+        // qualification flags are understood. Values remain extraction DATA:
+        // this parser exempts package/field indices, never option-value indices.
+        let (option, attached) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        let string_value = matches!(
+            option,
+            "--registry"
+                | "--workspace"
+                | "--prefix"
+                | "--cache"
+                | "--userconfig"
+                | "--globalconfig"
+                | "--tag"
+                | "--config"
+                | "-w"
+                | "-c"
+        );
+        let numeric_value = option == "--fetch-retries";
+        let boolean = matches!(
+            option,
+            "--json" | "--parseable" | "--silent" | "--ignore-scripts" | "--no-audit" | "--no-fund"
+        );
+        if string_value || numeric_value {
+            let (value, consumed) = if let Some(value) = attached {
+                // Long attached spelling only; do not invent short aliases.
+                if !option.starts_with("--") {
+                    return false;
+                }
+                (value.to_string(), 1)
+            } else {
+                let Some(value) = args.get(i + 1) else {
+                    return false;
+                };
+                if !shell_word_is_proven_literal(value, shell) {
+                    return false;
+                }
+                (
+                    crate::rules::command::normalize_shell_token(value, shell),
+                    2,
+                )
+            };
+            if value.is_empty()
+                || value.starts_with('-')
+                || (numeric_value && !value.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                return false;
+            }
+            i += consumed;
+            continue;
+        }
+        if boolean {
+            if let Some(value) = attached {
+                if !matches!(value, "true" | "false") {
+                    return false;
+                }
+            } else if let Some(value) = args.get(i + 1) {
+                let normalized = crate::rules::command::normalize_shell_token(value, shell);
+                if matches!(normalized.as_str(), "true" | "false") {
+                    if !shell_word_is_proven_literal(value, shell) {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') || arg == "--" {
+            return false;
+        }
+        if package_index.is_none() {
+            if !npm_view_exact_package(&arg) {
+                return false;
+            }
+            package_index = Some(i);
+        } else if field_index.is_none()
+            && matches!(
+                arg.as_str(),
+                "version"
+                    | "versions"
+                    | "name"
+                    | "description"
+                    | "dist.tarball"
+                    | "dist-tags"
+                    | "license"
+                    | "dependencies"
+                    | "devdependencies"
+            )
+        {
+            field_index = Some(i);
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    package_index == Some(target) || field_index == Some(target)
 }
 
 /// Parsed scp/rsync remote spec of shape `[user@]host:path`, returned by
@@ -12640,6 +12849,293 @@ fn looks_like_schemeless_host(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npm_view_exemption_requires_literal_exact_spec_and_complete_argv() {
+        // These are argv spellings, not executed commands. Test the classifier
+        // directly: an IP-only extraction assertion cannot prove non-exemption
+        // for a range/tag/dynamic selector with no IP in its spelling.
+        let cases: &[(&[&str], &[usize])] = &[
+            (&["view", "vitest@4.1.11"], &[1]),
+            (&["info", "'vitest@4.1.11'", "version"], &[1, 2]),
+            (&["show", "@scope/pkg@4.1.11", "dist.tarball"], &[1, 2]),
+            (
+                &[
+                    "v",
+                    "--registry=https://registry.npmjs.org",
+                    "vitest@4.1.11",
+                ],
+                &[2],
+            ),
+            (
+                &[
+                    "view",
+                    "--registry",
+                    "https://registry.npmjs.org",
+                    "vitest@4.1.11",
+                ],
+                &[3],
+            ),
+            (&["view", "vitest@4.1.11", "version"], &[1, 2]),
+            (
+                &[
+                    "view",
+                    "vitest@4.1.11",
+                    "version",
+                    "--userconfig=/qualification/empty.npmrc",
+                ],
+                &[1, 2],
+            ),
+            (&["view", "vitest@4.1.11", "--registry"], &[]),
+            (&["view", "vitest@4.1.11", "--mystery"], &[]),
+            (&["view", "--mystery", "vitest@4.1.11"], &[]),
+            (&["view", "--mystery", "4.1.0.11", "vitest@4.1.11"], &[]),
+            (&["view", "--", "vitest@4.1.11"], &[]),
+            (&["view", "vitest@4.1.11", "unknown.selector"], &[]),
+            (
+                &["view", "vitest@4.1.11", "versions.http://4.1.0.11/a"],
+                &[],
+            ),
+            (&["view", "vitest@4.1.11", "extra@4.1.11"], &[]),
+            (&["view", "vitest@4.1.11", "version", "extra"], &[]),
+            (&["view", "vitest@4.1.11", "--registry", "$HOST"], &[]),
+            (
+                &[
+                    "view",
+                    "vitest@4.1.11",
+                    "--registry=$(curl http://4.1.0.11/a)",
+                ],
+                &[],
+            ),
+            (&["view", "vitest@4.1.11", "--registry", "`hostname`"], &[]),
+            (&["view", "vitest@$VERSION"], &[]),
+            (&["view", "vitest@4.1.11$VERSION"], &[]),
+            (&["view", "vitest@4.1.11$(printf x)"], &[]),
+            (&["view", "vitest@`printf 4.1.11`"], &[]),
+            (&["view", "\"vitest@4.1.11$VERSION\""], &[]),
+            (&["view", "vitest@^4.1.11"], &[]),
+            (&["view", "vitest@~4.1.11"], &[]),
+            (&["view", "vitest@latest"], &[]),
+            (&["view", "vitest@4.1"], &[]),
+            (&["view", "vitest@04.1.11"], &[]),
+            (&["view", "vitest@4.1.11", "version", "--mystery"], &[]),
+        ];
+        let original = [
+            "view",
+            "vitest@4.1.11",
+            "version",
+            "--registry=https://registry.npmjs.org/",
+            "--userconfig=/qualification/empty.npmrc",
+            "--globalconfig=/qualification/empty.npmrc",
+            "--cache=/qualification/npm-cache",
+            "--fetch-retries=1",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ];
+        let original: Vec<String> = original.iter().map(|word| word.to_string()).collect();
+        for index in 0..original.len() {
+            assert_eq!(
+                npm_view_registry_position(&original, index, ShellType::Posix),
+                [1, 2].contains(&index),
+                "original argv, index={index}"
+            );
+        }
+        for (words, exempt) in cases {
+            let args: Vec<_> = words.iter().map(|word| word.to_string()).collect();
+            for index in 1..args.len() {
+                let expected = exempt.contains(&index);
+                assert_eq!(
+                    npm_view_registry_position(&args, index, ShellType::Posix),
+                    expected,
+                    "argv={words:?}, index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn npm_view_exemption_is_posix_only() {
+        let cases: &[&[&str]] = &[
+            &["view", "vitest@4.1.11", "version"],
+            &[
+                "view",
+                "vitest@4.1.11",
+                "version",
+                "--globalconfig",
+                "\"%CONFIG%\"",
+            ],
+            &[
+                "view",
+                "vitest@4.1.11",
+                "version",
+                "--globalconfig=\"%CONFIG%\"",
+            ],
+            &[
+                "view",
+                "vitest@4.1.11",
+                "version",
+                "--globalconfig",
+                "\"!CONFIG!\"",
+            ],
+            &[
+                "view",
+                "vitest@4.1.11",
+                "version",
+                "--globalconfig=\"!CONFIG!\"",
+            ],
+            &[
+                "view",
+                "vitest@4.1.11",
+                "version",
+                "--registry=https://registry.npmjs.org/",
+                "--userconfig=/qualification/empty.npmrc",
+                "--globalconfig=/qualification/empty.npmrc",
+                "--cache=/qualification/npm-cache",
+                "--fetch-retries=1",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+        ];
+        let mut incorrectly_exempt = Vec::new();
+        for words in cases {
+            let args: Vec<String> = words.iter().map(|word| word.to_string()).collect();
+            for shell in [ShellType::Fish, ShellType::PowerShell, ShellType::Cmd] {
+                for index in 0..args.len() {
+                    if npm_view_registry_position(&args, index, shell) {
+                        incorrectly_exempt
+                            .push(format!("shell={shell:?}, argv={words:?}, index={index}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            incorrectly_exempt.is_empty(),
+            "{}",
+            incorrectly_exempt.join("\n")
+        );
+    }
+
+    #[test]
+    fn npm_view_approved_option_roles_preserve_only_package_and_field() {
+        let values = [
+            ("--registry", "https://registry.npmjs.org/"),
+            ("--workspace", "workspace"),
+            ("--prefix", "/qualification/prefix"),
+            ("--cache", "/qualification/npm-cache"),
+            ("--userconfig", "/qualification/empty.npmrc"),
+            ("--globalconfig", "/qualification/empty.npmrc"),
+            ("--tag", "latest"),
+            ("--config", "/qualification/config"),
+            ("-w", "workspace"),
+            ("-c", "/qualification/config"),
+            ("--fetch-retries", "1"),
+        ];
+        let booleans = [
+            "--json",
+            "--parseable",
+            "--silent",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ];
+        for (option, value) in values {
+            let mut forms = vec![vec![option.to_string(), value.to_string()]];
+            if option.starts_with("--") {
+                forms.push(vec![format!("{option}={value}")]);
+            }
+            for form in forms {
+                for before in [true, false] {
+                    let mut args = vec!["view".to_string()];
+                    if before {
+                        args.extend(form.clone());
+                    }
+                    let package = args.len();
+                    args.extend(["vitest@4.1.11".to_string(), "version".to_string()]);
+                    if !before {
+                        args.extend(form.clone());
+                    }
+                    for index in 0..args.len() {
+                        assert_eq!(
+                            npm_view_registry_position(&args, index, ShellType::Posix),
+                            index == package || index == package + 1,
+                            "{args:?}, {index}"
+                        );
+                    }
+                }
+            }
+            for bad in [
+                "",
+                "--json",
+                "$VALUE",
+                "$(curl http://4.1.0.11/a)",
+                "`hostname`",
+                "\"$VALUE\"",
+            ] {
+                let args = vec![
+                    "view".into(),
+                    "vitest@4.1.11".into(),
+                    option.into(),
+                    bad.into(),
+                ];
+                assert!(
+                    !(0..args.len()).any(|index| npm_view_registry_position(
+                        &args,
+                        index,
+                        ShellType::Posix
+                    )),
+                    "{args:?}"
+                );
+            }
+        }
+        for option in booleans {
+            for form in [
+                vec![option.to_string()],
+                vec![format!("{option}=true")],
+                vec![format!("{option}=false")],
+                vec![option.into(), "true".into()],
+                vec![option.into(), "false".into()],
+            ] {
+                for before in [true, false] {
+                    let mut args = vec!["view".to_string()];
+                    if before {
+                        args.extend(form.clone());
+                    }
+                    let package = args.len();
+                    args.extend(["vitest@4.1.11".into(), "version".into()]);
+                    if !before {
+                        args.extend(form.clone());
+                    }
+                    for index in 0..args.len() {
+                        assert_eq!(
+                            npm_view_registry_position(&args, index, ShellType::Posix),
+                            index == package || index == package + 1,
+                            "{args:?}, {index}"
+                        );
+                    }
+                }
+            }
+        }
+        for words in [
+            vec!["view", "vitest@4.1.11", "--fetch-retries=abc"],
+            vec!["view", "vitest@4.1.11", "--fetch-retries", "-1"],
+            vec!["view", "vitest@4.1.11", "--userconfig="],
+            vec!["view", "vitest@4.1.11", "--mystery=literal"],
+            vec!["view", "vitest@4.1.11", "--ignore-scripts=maybe"],
+            vec!["view", "vitest@4.1.11", "--ignore-scripts", "$BOOL"],
+        ] {
+            let args: Vec<String> = words.iter().map(|word| word.to_string()).collect();
+            assert!(
+                !(0..args.len()).any(|index| npm_view_registry_position(
+                    &args,
+                    index,
+                    ShellType::Posix
+                )),
+                "{args:?}"
+            );
+        }
+    }
 
     #[test]
     fn strip_invisible_maps_stealth_whitespace_to_space() {
