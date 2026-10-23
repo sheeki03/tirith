@@ -1,7 +1,11 @@
 //! `tirith pkg install | verify-env | approve | receipt`, the package-firewall
 //! CLI surface (PR D7).
 //!
-//! This is the operator-facing command that drives the D1-D6 machinery end to end:
+//! Contained `pkg install` execution is currently disabled by the shared
+//! private-input qualification guard, before resolver or package side effects.
+//! The remaining commands retain their existing authority and platform gates.
+//!
+//! The retained D1-D6 implementation provides:
 //!
 //! * **`pkg approve`** resolves a Python requirement set into the D1 quarantine (D2),
 //!   firewalls + re-binds it (D3/D4), and prints the [`InstallPlanDigest`] the
@@ -10,11 +14,10 @@
 //!   interpreter, target env, platform tags, install-command semantics, redacted
 //!   policy hash, threat-DB sequence, capsule backend, required coverage, expiry);
 //!   the sorted SHA-set is a display label only.
-//! * **`pkg install`** repeats the resolve + re-bind, re-derives the digest of the
-//!   plan it is ABOUT to run, requires a matching un-expired approval record (or an
-//!   explicit `--yes` for the unattended path), runs the contained install (D4,
-//!   fail-closed under degraded coverage), verifies the installed RECORD (D5), and
-//!   records a tamper-evident, Ed25519-mandatory receipt (D6).
+//! * **`pkg install`** currently refuses before this pipeline. The retained
+//!   implementation resolves and re-binds an approved plan, installs through the
+//!   capsule (D4), verifies RECORD (D5), and requires a signed receipt (D6).
+//!   None of those stages can bypass the private-input qualification refusal.
 //! * **`pkg verify-env`** runs the D5 post-install RECORD verification over an
 //!   already-installed environment, without installing anything.
 //! * **`pkg receipt`** lists and shows the D6 [`ArtifactScanReceipt`]s.
@@ -23,9 +26,9 @@
 //!
 //! `tirith install` (in [`crate::cli::install`]) is the ANALYSIS path: it inspects a
 //! package-manager command and optionally runs the real, UNcontained install.
-//! `tirith pkg install` is the ENFORCING path: it installs ONLY the inspected,
-//! hash-pinned bytes, inside the capsule, and refuses on degraded coverage. The two
-//! stay separate commands. This module reuses `tirith install`'s
+//! `tirith pkg install` retains the ENFORCING path but currently refuses on every
+//! host because the private-input backend is unqualified. The two stay separate
+//! commands. This module reuses `tirith install`'s
 //! `MISPLACED_TIRITH_FLAGS` footgun guard (a tirith-owned flag placed after the
 //! trailing args would silently not affect tirith).
 //!
@@ -1185,10 +1188,6 @@ fn run_install(
     if let Some(failure) = precheck(ecosystem, requirements) {
         return report_pkg_precheck_failure("install", &failure, json);
     }
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
-    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
     let request = match validated_resolver_request(requirements, index_url, artifact_origin) {
         Ok(request) => request,
         Err(error) => {
@@ -1202,6 +1201,23 @@ fn run_install(
             );
         }
     };
+    // Validate syntax first, then refuse an unqualified execution backend before
+    // policy discovery, target retention, resolver/network work, quarantine,
+    // approval consumption, checkpoint creation, or receipt publication.
+    if let Err(error) = capsule::require_private_input_execution_qualification() {
+        return report_install_failure(
+            "refused_before_exec",
+            &error.to_string(),
+            false,
+            false,
+            json,
+            1,
+        );
+    }
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let policy = discover_pkg_enforcement_policy(cwd.as_deref());
     let target_binding = match bind_install_target(target) {
         Ok(binding) => binding,
         Err(error) => {

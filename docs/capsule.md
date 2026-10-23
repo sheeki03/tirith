@@ -16,7 +16,7 @@ tirith itself launches, never to arbitrary shell commands.
 | `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | default for every live run (`--capsule` remains accepted) | deny-all | fail closed |
 | `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
 | `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
-| `tirith pkg install` (enforcing execution is x86_64 Linux-only) | always | deny-all | fail closed; every other platform or architecture refuses before pip starts |
+| `tirith pkg install` (execution currently disabled on every host) | always | deny-all | refuses before resolver, quarantine, checkpoint, or package execution |
 | `tirith capsule run` (enforceable on x86_64 Linux only) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; every other platform or architecture refuses before anything is copied or spawned |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
@@ -25,9 +25,22 @@ uncontained. The `temp-run` surface is the only best-effort one, because it is
 explicitly a filesystem-impact preview rather than a security boundary; with
 `--capsule` it hardens the run where it can and reports honestly when it cannot.
 
-The `tirith pkg install` platform limit applies only to the enforcing execution
-step. `tirith pkg approve` remains a non-installing approval flow, and
-`tirith pkg verify-env` verifies an existing environment without launching pip.
+`tirith pkg install pip` currently refuses with `private_input_execution_unqualified`
+on every host. The private named-input backend has not been qualified to keep
+package inputs unchanged throughout execution against another process owned by
+the same user.
+Read-only mounts and initial digest checks alone do not establish that guarantee.
+The command refuses before resolver execution, network access, quarantine writes,
+checkpoint creation, or package execution. `--yes`, `--allow-degraded`, sudo, and
+administrator access do not enable it. The hidden private-input launcher also
+refuses before creating a namespace or starting its target.
+
+This restriction applies to contained package execution. `tirith package inspect`
+and `tirith pkg verify-env` remain available; the latter verifies an existing
+environment without launching pip. `tirith pkg approve` remains subject to its
+separate approval-authority and platform requirements and never installs; an
+approval cannot bypass this execution refusal. Ordinary capsules and command
+protection retain their existing platform and coverage requirements.
 
 ### The untrusted-project preset
 
