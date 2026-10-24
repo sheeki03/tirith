@@ -1042,6 +1042,27 @@ fn open_or_create_capability_anchor(
 }
 
 #[cfg(unix)]
+fn retire_capability_pair_for_reregistration(
+    capability_path: &Path,
+    anchor_path: &Path,
+) -> Result<(), String> {
+    for path in [capability_path, anchor_path] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "retire previous shell hook capability {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    crate::util::fsync_parent_dir(capability_path)
+        .map_err(|error| format!("sync retired shell hook capability directory: {error}"))
+}
+
+#[cfg(unix)]
 fn open_capability_registry_lock(directory: &Path) -> Result<File, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -1532,6 +1553,23 @@ fn cleanup_hook_capabilities(directory: &Path) -> Result<(), String> {
     cleanup_hook_capabilities_locked(directory)
 }
 
+/// How a registration call treats a capability that already exists for the
+/// same live shell process identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistrationMode {
+    /// Reject a second registration for a live shell identity.
+    Fresh,
+    /// Retire the existing pair for this exact process binding first.
+    ///
+    /// A shell hook passes this when it is a fresh process image that
+    /// inherited a pid and start fingerprint through `exec`: the previous
+    /// image can never consume its bearer, and `exec` skips the exit hook that
+    /// would otherwise have retired it. Bindings that do not match the
+    /// requesting shell are never touched, and the mode stays opt-in so an
+    /// accidental double registration is still rejected.
+    Replace,
+}
+
 /// Register exactly one capability for a live shell process identity and
 /// return its bearer only after the durable issued marker is complete.
 pub fn register_shell_hook_instance(
@@ -1539,9 +1577,13 @@ pub fn register_shell_hook_instance(
     family: ShellHookFamily,
     session_id: &str,
 ) -> Result<String, String> {
-    register_shell_hook_instance_with_delivery(shell_pid, family, session_id, |secret| {
-        Ok(secret.to_string())
-    })
+    register_shell_hook_instance_with_delivery(
+        shell_pid,
+        family,
+        session_id,
+        RegistrationMode::Fresh,
+        |secret| Ok(secret.to_string()),
+    )
 }
 
 /// Register a capability and synchronously deliver its bearer before making
@@ -1555,6 +1597,7 @@ pub fn register_shell_hook_instance_with_delivery<T, F>(
     shell_pid: u32,
     family: ShellHookFamily,
     session_id: &str,
+    mode: RegistrationMode,
     deliver: F,
 ) -> Result<T, String>
 where
@@ -1562,7 +1605,7 @@ where
 {
     #[cfg(not(unix))]
     {
-        let _ = (shell_pid, family, session_id, deliver);
+        let _ = (shell_pid, family, session_id, mode, deliver);
         return Err("strict shell execution receipts are unsupported on this platform".to_string());
     }
 
@@ -1604,6 +1647,15 @@ where
         cleanup_hook_capabilities_locked(&directory)?;
         let (capability_path, anchor_path) =
             capability_paths(effective_uid, shell_pid, &shell_identity.start_fingerprint)?;
+        // An `exec`'d shell keeps its pid and kernel start time but never runs
+        // the exit hook that retires its capability pair, so the previous
+        // image's pair would otherwise reject every later registration for
+        // this process. The caller holds the registry lock and both paths are
+        // derived from the confirmed binding, so this can only ever retire the
+        // registering shell's own state.
+        if mode == RegistrationMode::Replace {
+            retire_capability_pair_for_reregistration(&capability_path, &anchor_path)?;
+        }
         match fs::symlink_metadata(&capability_path) {
             Ok(_) => {
                 return Err("shell hook process already has a protocol-v3 registration".to_string())
@@ -3832,6 +3884,48 @@ mod tests {
     }
 
     #[test]
+    fn registration_replace_retires_only_its_own_stale_capability() {
+        isolated_unregistered_state(|_temporary, session_id| {
+            let shell_pid = unsafe { libc::getppid() } as u32;
+            let secret = register_shell_hook_instance(shell_pid, ShellHookFamily::Zsh, session_id)
+                .expect("first registration");
+            let duplicate =
+                register_shell_hook_instance(shell_pid, ShellHookFamily::Zsh, session_id)
+                    .expect_err("a live shell identity must not register twice");
+            assert!(
+                duplicate.contains("already has"),
+                "unexpected duplicate error: {duplicate}"
+            );
+
+            // `exec $SHELL` keeps the pid and start fingerprint but never runs
+            // the exit hook, so a fresh image has to retire the pair itself.
+            let replacement = register_shell_hook_instance_with_delivery(
+                shell_pid,
+                ShellHookFamily::Zsh,
+                session_id,
+                RegistrationMode::Replace,
+                |replacement| Ok(replacement.to_string()),
+            )
+            .expect("replace a stale exec image registration");
+            assert_ne!(replacement, secret, "replacement must mint a new bearer");
+            assert!(
+                validate_shell_hook_instance(&secret, shell_pid, ShellHookFamily::Zsh, session_id)
+                    .is_err(),
+                "the retired bearer must no longer authenticate"
+            );
+            validate_shell_hook_instance(&replacement, shell_pid, ShellHookFamily::Zsh, session_id)
+                .expect("the replacement bearer must authenticate");
+            let replaced_again =
+                register_shell_hook_instance(shell_pid, ShellHookFamily::Zsh, session_id)
+                    .expect_err("--replace must not leave duplicate registration open");
+            assert!(
+                replaced_again.contains("already has"),
+                "unexpected post-replace duplicate error: {replaced_again}"
+            );
+        });
+    }
+
+    #[test]
     fn failed_bearer_delivery_never_issues_and_allows_same_process_retry() {
         isolated_unregistered_state(|_, session_id| {
             let shell_pid = unsafe { libc::getppid() } as u32;
@@ -3849,6 +3943,7 @@ mod tests {
                 shell_pid,
                 ShellHookFamily::Zsh,
                 session_id,
+                RegistrationMode::Fresh,
                 |secret| {
                     partially_delivered = Some(secret.to_string());
                     assert!(
