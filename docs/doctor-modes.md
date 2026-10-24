@@ -13,8 +13,16 @@
   reports only what a polling integration needs. It skips every expensive probe
   the full report runs, so it is cheap enough to poll on a short interval.
 
-The full report's behavior, fields, and output are unchanged by the addition of
-`--quick`.
+Full, quick, and compatibility JSON reports include `protection_evidence`.
+Their inherited environment markers and startup-file configuration are diagnostic
+inputs: neither verifies that the current shell blocks dangerous commands. Raw
+legacy fields and generic command exit codes remain available. Human reports
+label inherited markers as reported and blocking as unverified.
+
+For a strict blocking requirement, use `tirith status --require-verified-blocking`.
+A fresh authenticated caller-shell observation can establish blocking only for
+that shell and its bound configuration; full doctor and `doctor --compat` do not
+perform that verification.
 
 ## When to use `--quick`
 
@@ -52,9 +60,10 @@ The JSON object is intentionally minimal and stable — exactly these fields:
 | field             | type             | meaning                                                                                                                                                                                                       |
 | ----------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schema_version`  | integer          | Version of this payload's shape. Currently `1`. Bumped only on a breaking change to the field set or meaning.                                                                                                  |
-| `protection_mode` | string           | Live protection mode. `doctor --quick` is an external process, so it reads the hook-EXPORTED `TIRITH_BASH_EFFECTIVE_PROTECTION` first (the bash hook re-exports it for exactly this reason) and falls back to `TIRITH_STATUS`, which the hooks deliberately leave non-exported. One of `guarded`, `warn-only`, `degraded`, or `off`; an unrecognized value is passed through verbatim. (`off` here can also mean "a configured hook whose live mode this external process cannot see" — `tirith status` reports that case as still-protected.) |
+| `protection_mode` | string | Legacy reported mode: reads `TIRITH_BASH_EFFECTIVE_PROTECTION` first, then `TIRITH_STATUS`. Values are `guarded`, `warn-only`, `degraded`, `off`, or an unrecognized value passed through verbatim. An absent/nonexported marker also maps to `off`; it does not establish missing activation or verified blocking. |
 | `policy_path_used`| string or `null` | The single policy file the engine would load for the current directory, or `null` when none is discovered. Existence-based discovery only — never a network fetch.                                            |
 | `hook_configured` | boolean          | Whether the tirith shell hook is configured in the detected shell's profile.                                                                                                                                   |
+| `protection_evidence` | object | Canonical evidence with source, state, freshness, observation/expiry times, and `verified_blocking`. Ordinary doctor capture always leaves `verified_blocking` and `fresh` false. |
 
 Example:
 
@@ -63,7 +72,21 @@ Example:
   "schema_version": 1,
   "protection_mode": "guarded",
   "policy_path_used": "/path/to/repo/.tirith/policy.yaml",
-  "hook_configured": true
+  "hook_configured": true,
+  "protection_evidence": {
+    "schema_version": 1,
+    "surface": "current-shell",
+    "state": "configured",
+    "source": "inherited-environment-unverified",
+    "observed_at": null,
+    "expires_at": null,
+    "fresh": false,
+    "verified_blocking": false,
+    "invalidation_reason": "no allow-and-block observation for this shell process and current configuration",
+    "reported_integration_version": null,
+    "reported_integration_shell": null,
+    "integration_version_source": "inherited-environment-unverified"
+  }
 }
 ```
 
@@ -76,14 +99,16 @@ signal — `TIRITH_BASH_EFFECTIVE_PROTECTION` first, falling back to
 
 | hook signal value   | `protection_mode` | meaning                                            |
 | ------------------- | ----------------- | -------------------------------------------------- |
-| `blocks`            | `guarded`         | A dangerous command is stopped before it runs.     |
-| `warn-only`         | `warn-only`       | Commands are checked but not blocked.              |
-| `degraded`          | `degraded`        | Protection was downgraded to warn-only this session.|
+| `blocks`            | `guarded`         | Marker reports blocking; current-shell blocking remains unverified. |
+| `warn-only`         | `warn-only`       | Marker reports checking without blocking. |
+| `degraded`          | `degraded`        | Marker reports a downgrade to warn-only. |
 | `off`, empty, unset | `off`             | No live mode visible to this external process / protection off.|
 | (any other value)   | (verbatim)        | Forwarded unchanged for forward compatibility.     |
 
-`protection_mode` reflects the live hook state of the process that invoked
-`doctor`. A non-interactive subshell with no tirith hook sourced reports `off`.
+`protection_mode` preserves the reported marker, which may be inherited or
+absent. It does not authenticate the hook state of the calling shell. A saved
+report, a startup-file entry, or exporting `TIRITH_STATUS=blocks` cannot promote
+`protection_evidence.verified_blocking`.
 
 ## `--quick` human output
 
@@ -91,7 +116,7 @@ Without `--format json`, `--quick` prints a short 2-3 line summary instead of
 the full diagnostic:
 
 ```text
-  protection:   guarded
+  protection:   guarded (reported; blocking unverified)
   hook:         configured
   policy:       /path/to/repo/.tirith/policy.yaml
 ```

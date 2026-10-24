@@ -45,6 +45,13 @@ import sys
 import time
 
 
+# Optional telemetry owns its child until exit, or a bounded kill/reap attempt.
+# These waits do not extend the checker or host timeout.
+HOOK_EVENT_WAIT_SECONDS = 0.25
+HOOK_EVENT_REAP_SECONDS = 0.25
+_HOOK_CHECK_DEADLINE = None
+
+
 MAX_HOOK_INPUT_BYTES = 2 * 1024 * 1024
 MAX_COMMANDS = 16
 MAX_COMMAND_BYTES = 1024 * 1024
@@ -167,8 +174,12 @@ def unresolved(reason):
 
 
 def _hook_event(event, detail=None):
-    """Log a hook telemetry event via tirith hook-event (fire-and-forget)."""
+    """Log optional telemetry without leaving an ordinary background writer."""
+    if (_HOOK_CHECK_DEADLINE is not None and
+            time.monotonic() + HOOK_EVENT_WAIT_SECONDS + HOOK_EVENT_REAP_SECONDS >= _HOOK_CHECK_DEADLINE):
+        return  # Telemetry cannot extend an exhausted check budget.
     tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
+    child = None
     try:
         cmd = [
             tirith_bin,
@@ -182,11 +193,25 @@ def _hook_event(event, detail=None):
         ]
         if detail:
             cmd.extend(["--detail", detail])
-        subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        child = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+        child.wait(timeout=HOOK_EVENT_WAIT_SECONDS)
     except Exception:
         pass
+    finally:
+        if child is not None:
+            try:
+                if child.poll() is None:
+                    try:
+                        child.kill()
+                    finally:
+                        child.wait(timeout=HOOK_EVENT_REAP_SECONDS)
+            except Exception:
+                # A bounded wait cannot guarantee kernel reaping. Do not claim
+                # cleanup or change the already selected security decision.
+                print("tirith: optional hook telemetry unavailable", file=sys.stderr)
 
 
 def _build_warning_text(stdout):
@@ -335,6 +360,8 @@ def _run_check(tirith_bin, command, shell, env, timeout):
 
 
 def main():
+    global _HOOK_CHECK_DEADLINE
+    _HOOK_CHECK_DEADLINE = None
     try:
         raw = sys.stdin.read(MAX_HOOK_INPUT_BYTES + 1)
         if len(raw.encode("utf-8")) > MAX_HOOK_INPUT_BYTES:
@@ -440,6 +467,7 @@ def main():
     env["TIRITH_INTEGRATION"] = proto
 
     deadline = time.monotonic() + CHECK_BUDGET_SECONDS
+    _HOOK_CHECK_DEADLINE = deadline
     warning_texts = []
     for command, args, shells in command_specs:
         for shell in shells:

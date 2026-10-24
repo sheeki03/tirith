@@ -24,7 +24,7 @@
 //                                   path whose real command this cannot read
 //   TIRITH_FAIL_OPEN              — "1" to allow on error (default: deny)
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 const TIRITH_BIN = "__TIRITH_BIN__";
 const TIRITH_INTEGRATION = "__TIRITH_INTEGRATION__";
@@ -1143,14 +1143,16 @@ export function buildCheckScript(toolName, input, bindings) {
 /** Bindings for the lifetime of this extension process: one kernel, one set. */
 const kernelBindings = createBindings();
 
-function hookEvent(event, detail) {
+function hookEvent(event, detail, deadline = Infinity) {
+  if (performance.now() + 250 >= deadline) return; // Never extend an exhausted check budget.
   try {
     const args = [
       "hook-event", "--integration", TIRITH_INTEGRATION,
       "--hook-type", "tool_call", "--event", event,
     ];
     if (detail) args.push("--detail", detail);
-    execFile(TIRITH_BIN, args, () => {});
+    // A finite timeout/kill request, not a hard kernel reaping guarantee.
+    execFileSync(TIRITH_BIN, args, { timeout: 250, killSignal: "SIGKILL", stdio: "ignore" });
   } catch {
     /* telemetry is best effort */
   }
@@ -1206,6 +1208,8 @@ function unresolvedAction() {
 
 export default function (pi) {
   pi.on("tool_call", async (event, _ctx) => {
+    const telemetryDeadline = performance.now() + 10_000;
+    const recordHookEvent = (event, detail) => hookEvent(event, detail, telemetryDeadline);
     const toolName = event && typeof event.toolName === "string" ? event.toolName : "";
     const built = buildCheckScript(toolName, event ? event.input : undefined, kernelBindings);
     if (built === null) return undefined;
@@ -1217,15 +1221,21 @@ export default function (pi) {
         + "are hidden, built at runtime, malformed, or exceed the inspection limit and could not be inspected"
       : "";
 
+    let deferredUnresolved = null;
     if (unresolvedNote) {
-      hookEvent("unresolved_vector", unresolved.join(","));
       if (unresolvedAction() === "deny") {
+        recordHookEvent("unresolved_vector", unresolved.join(","));
         return { block: true, reason: unresolvedNote + " — blocked; set TIRITH_HOOK_UNRESOLVED_ACTION=warn to allow uninspectable execution calls" };
       }
+      // Optional telemetry must not consume the security checker's budget.
+      deferredUnresolved = unresolved.join(",");
       process.stderr.write(unresolvedNote + "\n");
     }
 
-    if (script.trim().length === 0) return undefined;
+    if (script.trim().length === 0) {
+      if (deferredUnresolved !== null) recordHookEvent("unresolved_vector", deferredUnresolved);
+      return undefined;
+    }
 
     try {
       execFileSync(
@@ -1238,7 +1248,7 @@ export default function (pi) {
           env: { ...process.env, TIRITH_INTEGRATION },
         },
       );
-      hookEvent("check_ok");
+      recordHookEvent("check_ok");
       return undefined;
     } catch (err) {
       // execFileSync throws on a non-zero exit as well as on spawn failure.
@@ -1250,14 +1260,14 @@ export default function (pi) {
         };
       }
       if (err.killed) {
-        hookEvent("timeout");
+        recordHookEvent("timeout");
         if (failOpen()) return undefined;
         return { block: true, reason: "tirith: check timed out — blocked for safety" };
       }
 
       const exitCode = err.status;
       if (exitCode === null || exitCode === undefined) {
-        hookEvent("unexpected_exit", err.message || "unknown");
+        recordHookEvent("unexpected_exit", err.message || "unknown");
         if (failOpen()) return undefined;
         return { block: true, reason: `tirith: unexpected error — ${err.message || "unknown"}` };
       }
@@ -1265,7 +1275,7 @@ export default function (pi) {
       const stdout = err.stdout || "";
 
       if (exitCode !== 1 && exitCode !== 2) {
-        hookEvent("unexpected_exit", `exit code ${exitCode}`);
+        recordHookEvent("unexpected_exit", `exit code ${exitCode}`);
         if (failOpen()) return undefined;
         return {
           block: true,
@@ -1274,15 +1284,17 @@ export default function (pi) {
       }
 
       if (exitCode === 2 && warnAction() !== "deny") {
-        hookEvent("warn_allowed");
+        recordHookEvent("warn_allowed");
         process.stderr.write(
           describeFindings(stdout, "Tirith: security warnings detected (non-blocking)") + "\n",
         );
         return undefined;
       }
 
-      hookEvent(exitCode === 1 ? "check_block" : "warn_denied");
+      recordHookEvent(exitCode === 1 ? "check_block" : "warn_denied");
       return { block: true, reason: describeFindings(stdout, "Tirith security check failed") };
+    } finally {
+      if (deferredUnresolved !== null) recordHookEvent("unresolved_vector", deferredUnresolved);
     }
   });
 }

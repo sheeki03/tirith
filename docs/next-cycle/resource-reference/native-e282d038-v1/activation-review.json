@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "status": "reviewed_for_ordinary_ci_activation",
+  "source_revision": "e282d038519848caa8328cf32aa05a05daa502d2",
+  "qualification_controller_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+  "scope": "Six byte metrics measured on the current GitHub event source when the native cohort, build, runtime, producers, workloads and before/after source contracts match. No universal timing, live-heap, fleet or release certification.",
+  "baseline_review": "threshold-review.json",
+  "baseline_review_sha256": "d1d247d806ede8239f98801b8b5c9145c4dbcabdb91ca4b2cd17c875a4f8621e",
+  "qualification_budget_sha256": "dbb19f074abdf6df0cfe6335f463fe125df1c5ebcd27b7048a76d114069305f0",
+  "qualification_protocol_sha256": "265e453c82490e502f62604fca4745714ff8a38dc100c864c0169cc905aa5f0e",
+  "completed_pair_review_sha256": "0d38e2c773621ef39a13fc452d213f8b68c3a1bd2ba268b937aa805daac53207",
+  "independent_activation_review_sha256": "1d974dd6c09200efbc97f2c4a36d51dfc83fdeebc21208c482299372ec66cfa8",
+  "independent_checks": {
+    "original_archives_rehashed": 6,
+    "extracted_files_rehashed": 246,
+    "distinct_pair_boots": 6,
+    "raw_metric_and_delta_recomputations": 6,
+    "all_control_ceilings_pass": true,
+    "only_selected_growth_ceiling_fails": true,
+    "every_rss_growth_sample_above_ceiling": true
+  },
+  "pairs": [
+    {
+      "experiment": "clean_first",
+      "run_id": 36338492904,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338492904",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10938349388,
+      "archive_sha256": "bdb2290177e900a224c37ed13cf6358b6d02406964e0d31ce8c650a32615a978",
+      "extracted_manifest_sha256": "5fac97773fc7bf6e13842135b7cc4aedfef73dcf68e33517eb72f267dc765337",
+      "independent_evaluation_sha256": "e3fc662a3f7b6666669fbd646ca5edbbfdb2d0db835b2973075107c76a768320",
+      "native_host": {
+        "boot": "44acb008-93e6-44f7-992a-dddf4e311e82",
+        "runner_name": "GitHub Actions 1000036698",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "956c9d7e72db1fa9cde000839d0b2cc8dcf6e2c5",
+        "tree": "330d9e78b88ab496bdd455d28835dc7cc0e42423",
+        "source_sha256": "c115a48bad1759022ddacaa71712c1ec04050eee9e81c97c1eee024ffbb216b5"
+      },
+      "growth": {
+        "revision": "645a69fbc06b33fb7fb7998f2ea82ceaecabbab0",
+        "tree": "c1129d3c2381e8d990ff3b46d5b0c67faecfa220",
+        "source_sha256": "7ce79b1af2c3a72cb3e5131f7994be94b8ed9cbd68574a830a4b155dd505c469"
+      },
+      "selected_metric": "allocation.analysis_clean.requested_bytes.max",
+      "mutation_dose_bytes": 33554432,
+      "mutation_selector": "first",
+      "selected_control_bytes": 48307398,
+      "selected_growth_bytes": 81861830,
+      "reviewed_ceiling_bytes": 67108864,
+      "raw_selected_deltas": {
+        "n": 1,
+        "min": 33554432,
+        "median": 33554432,
+        "max": 33554432
+      },
+      "independent_raw_delta": {
+        "n": 1,
+        "min": 33554432,
+        "median": 33554432,
+        "max": 33554432
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060277,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670675,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44564480
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 81861830,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060277,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670675,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 43925504
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    },
+    {
+      "experiment": "clean_subsequent",
+      "run_id": 36338496133,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338496133",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10938344412,
+      "archive_sha256": "f2fb61e1b301ba326ab86b8e4e9db7077748103f9db35b871ac9f24e8d61beb5",
+      "extracted_manifest_sha256": "6ea1ace328402876099bcaed97fea90552854b8cf4c95164d4f396233085388b",
+      "independent_evaluation_sha256": "6f949d19e09a348fc39b6fbcd3a1f7e9e3a367f9f666efc975f644376b1312b2",
+      "native_host": {
+        "boot": "00bc791e-869b-43f4-83da-1285430054e3",
+        "runner_name": "GitHub Actions 1000036699",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "080cc54c948759d4932d359efa4d2ee5027014dd",
+        "tree": "a3038f314a561ec2e382ba771df24e7b30932957",
+        "source_sha256": "07648f45d30d885000f4856c7c24727f7e9bbda7b1a482feea5e39f80eac6368"
+      },
+      "growth": {
+        "revision": "c6778bc89a3dfebdc0a30332ba25952a38f6c92c",
+        "tree": "fe61b64829178a29a21396773739b58a8dc56752",
+        "source_sha256": "a5e41d982143af5210b7ebe0e96dfdcef28101a78024642694c899052b2588a5"
+      },
+      "selected_metric": "allocation.analysis_clean.subsequent.requested_bytes.max",
+      "mutation_dose_bytes": 32768,
+      "mutation_selector": "subsequent",
+      "selected_control_bytes": 120397,
+      "selected_growth_bytes": 153165,
+      "reviewed_ceiling_bytes": 131072,
+      "raw_selected_deltas": {
+        "n": 99,
+        "min": 32768,
+        "median": 32768,
+        "max": 32768
+      },
+      "independent_raw_delta": {
+        "n": 99,
+        "min": 32768,
+        "median": 32768,
+        "max": 32768
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060282,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670680,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44597248
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 153165,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060282,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670680,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 43876352
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    },
+    {
+      "experiment": "url_first",
+      "run_id": 36338499259,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338499259",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10938428541,
+      "archive_sha256": "029492845053fc5065bfbaa9d7288e76614f27405939f5db83643ffdfd84d975",
+      "extracted_manifest_sha256": "0fff18c5a32a02ad6e84c6e4aaa718f39fdbcc93eefe88e782796ee27ff8372f",
+      "independent_evaluation_sha256": "10445e0956cbf8c060285e6c327626c9e93924e2404d7f472f117f6677783f49",
+      "native_host": {
+        "boot": "6343554e-1759-4217-bd68-0838ddd6f906",
+        "runner_name": "GitHub Actions 1000036700",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "62ba7996b1fff1531a122a48d2162f04eeb954fa",
+        "tree": "1d24682e1287a65917983c4c8778a1b3e6f725fb",
+        "source_sha256": "fea0ea6468ef31792753c1c8d93bfec5df2804598c6b2c63161fc9eb473572d4"
+      },
+      "growth": {
+        "revision": "1a6e993553b77f0c8d9793b2075c4f6a1359a0d6",
+        "tree": "e5e44d6dd56d60c9c6ac6ddff30b110febfa6369",
+        "source_sha256": "fa6fcd3b1f96083d6e948700533403adef1548162bed2928e2a78050d57886e5"
+      },
+      "selected_metric": "allocation.analysis_url_pipeline.requested_bytes.max",
+      "mutation_dose_bytes": 33554432,
+      "mutation_selector": "first",
+      "selected_control_bytes": 72060275,
+      "selected_growth_bytes": 105614707,
+      "reviewed_ceiling_bytes": 100663296,
+      "raw_selected_deltas": {
+        "n": 1,
+        "min": 33554432,
+        "median": 33554432,
+        "max": 33554432
+      },
+      "independent_raw_delta": {
+        "n": 1,
+        "min": 33554432,
+        "median": 33554432,
+        "max": 33554432
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060275,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670673,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44335104
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 105614707,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670673,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44564480
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    },
+    {
+      "experiment": "url_subsequent",
+      "run_id": 36338503185,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338503185",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10938028937,
+      "archive_sha256": "abbde45376c61789b92a648b9ba9cb7859c6d8f923ea1f57a1da6d24b4517f93",
+      "extracted_manifest_sha256": "0a6110b55fe3349f358f4118190ef0346b5f078ddcf326bababdc9822e9daa4f",
+      "independent_evaluation_sha256": "e63982e89cfbb6f70f0941fde12724649fbd2a5e56bfe068596eaaa908dc205e",
+      "native_host": {
+        "boot": "b674981b-8587-4260-aa06-8edf89353e88",
+        "runner_name": "GitHub Actions 1000036701",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "c370412f45b841c6be607422fe6f610437cc3da7",
+        "tree": "f7944d7908c562adab700427ca271bb2846575e7",
+        "source_sha256": "a2b94786ba88bfb548cfdda1fa208ccdb745d5f543e4d6047f0d2f8c73643631"
+      },
+      "growth": {
+        "revision": "aedaa896bce0946ac2ebeeb550f9163501dbed87",
+        "tree": "ff4593746105bde5a94c6c6d174687ea8ce3b8d7",
+        "source_sha256": "f65af98467f3093670a12f8b3e3a2a8b3934d06782f0b59c0da3351c4b69eb91"
+      },
+      "selected_metric": "allocation.analysis_url_pipeline.subsequent.requested_bytes.max",
+      "mutation_dose_bytes": 524288,
+      "mutation_selector": "subsequent",
+      "selected_control_bytes": 1670678,
+      "selected_growth_bytes": 2194966,
+      "reviewed_ceiling_bytes": 2097152,
+      "raw_selected_deltas": {
+        "n": 99,
+        "min": 524288,
+        "median": 524288,
+        "max": 524288
+      },
+      "independent_raw_delta": {
+        "n": 99,
+        "min": 524288,
+        "median": 524288,
+        "max": 524288
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060280,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670678,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44138496
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060280,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 2194966,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44662784
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    },
+    {
+      "experiment": "history_requests",
+      "run_id": 36338506423,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338506423",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10938592237,
+      "archive_sha256": "bf337e4c719e45905c65e06d29a72c6b71dcde5a8605264159c7d30ca2f9f0b9",
+      "extracted_manifest_sha256": "6012be678337a098e59f4d124f7c8f8b7130347f1b6423eb4275526d3a2c5a24",
+      "independent_evaluation_sha256": "44b9b16d959cfa18f9b62f840fd9ef537a2d0b74462690faabd0da134a707648",
+      "native_host": {
+        "boot": "713a78fa-d90e-40f3-a712-5e30ddf0f7e4",
+        "runner_name": "GitHub Actions 1000036702",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "5e53dcd32bc8ff84207043bc0387818c818ced93",
+        "tree": "ee1c851ab4e65d715f209157c145f0e8fc1c2975",
+        "source_sha256": "6e4e6b11070001206657fd77aa8d124192c0ecd38d9fbcd3e57da7d08d64cf2d"
+      },
+      "growth": {
+        "revision": "c846862bb9ec79bc6398e21ccbb826697d356310",
+        "tree": "ac92c6b0bffab90f95b03c5e46065d48cd7852e5",
+        "source_sha256": "512d4f092bc306e04edc3b1801b090b2c73951b13f6e127dd2c2a5dd85c1ffd5"
+      },
+      "selected_metric": "allocation.history_recent_100.requested_bytes.max",
+      "mutation_dose_bytes": 4194304,
+      "mutation_selector": "every",
+      "selected_control_bytes": 8692440,
+      "selected_growth_bytes": 12886744,
+      "reviewed_ceiling_bytes": 12582912,
+      "raw_selected_deltas": {
+        "n": 100,
+        "min": 4194304,
+        "median": 4194304.0,
+        "max": 4194304
+      },
+      "independent_raw_delta": {
+        "n": 100,
+        "min": 4194304,
+        "median": 4194304.0,
+        "max": 4194304
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060282,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670680,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44711936
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060282,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670680,
+          "allocation.history_recent_100.requested_bytes.max": 12886744,
+          "local.ordinary_check.peak_rss_bytes.max": 44105728
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    },
+    {
+      "experiment": "ordinary_rss",
+      "run_id": 36338509243,
+      "run_attempt": 1,
+      "url": "https://github.com/sheeki03/tirith/actions/runs/36338509243",
+      "workflow_revision": "80872df8d227cc1efcd102b65ea5b31d4c584b80",
+      "artifact_id": 10939516171,
+      "archive_sha256": "5b067579c3fec1848b0ecf39506a9063076827056a77e9bb04711f8065dd123d",
+      "extracted_manifest_sha256": "cbebbd86e535c5803883398c14778fdfe2e2547a35de2697da5baf704e80ff54",
+      "independent_evaluation_sha256": "eef92b69faf7d8a161f736a5a955208bfd2d4e68d0ae1e7f676bf3f0f350c833",
+      "native_host": {
+        "boot": "2fd49a62-94ac-4bb9-9dac-6c86e1040f7c",
+        "runner_name": "GitHub Actions 1000036704",
+        "class": {
+          "system": "Darwin",
+          "release": "24.6.0",
+          "machine": "arm64",
+          "image": "macos15",
+          "image_version": "20260907.0337.1",
+          "cpu_model": "Apple M1 (Virtual)",
+          "logical_cpus": 3
+        }
+      },
+      "control": {
+        "revision": "bc2caf413222f2d619e540f395876e1f86e50d2d",
+        "tree": "38d6c50a90df698db214942f740d7524156f211e",
+        "source_sha256": "a3e3c68afc384c530c72764d517ef962552b7b65bf5bf096399f1626ebe5e216"
+      },
+      "growth": {
+        "revision": "d69247f74a3c107b639e03bbff5c6a48e3af6646",
+        "tree": "bc3c6fd2ce3b8fd26358e7abd6d577b9da0483a2",
+        "source_sha256": "4978dff7baafd266cce719aa1e695f1704b9b0dca0cd8f7dd826b00182c62c6b"
+      },
+      "selected_metric": "local.ordinary_check.peak_rss_bytes.max",
+      "mutation_dose_bytes": 16777216,
+      "mutation_selector": "every",
+      "selected_control_bytes": 44138496,
+      "selected_growth_bytes": 61390848,
+      "reviewed_ceiling_bytes": 50331648,
+      "raw_selected_deltas": {
+        "n": 100,
+        "min": 9535488,
+        "median": 17186816.0,
+        "max": 23592960
+      },
+      "independent_raw_delta": {
+        "n": 100,
+        "min": 9535488,
+        "median": 17186816.0,
+        "max": 23592960
+      },
+      "independent_six_metrics": {
+        "control": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060278,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670676,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 44138496
+        },
+        "growth": {
+          "allocation.analysis_clean.requested_bytes.max": 48307398,
+          "allocation.analysis_clean.subsequent.requested_bytes.max": 120397,
+          "allocation.analysis_url_pipeline.requested_bytes.max": 72060278,
+          "allocation.analysis_url_pipeline.subsequent.requested_bytes.max": 1670676,
+          "allocation.history_recent_100.requested_bytes.max": 8692440,
+          "local.ordinary_check.peak_rss_bytes.max": 61390848
+        }
+      },
+      "all_control_ceilings_pass": true,
+      "only_selected_growth_ceiling_fails": true,
+      "qualification": "detector_qualified"
+    }
+  ],
+  "activation_conditions": [
+    "The unchanged native collector measures the current workflow event source, not a retained baseline executable.",
+    "Admission matches the exact reviewed host class, image, Python executable digest/version, compiler, build manifests, producer/helper bytes and measurement tools.",
+    "Post-collection admission confirms unchanged facts, native boot, runtime, role and before/after source snapshots.",
+    "The unchanged resource checker validates retained raw samples, context and provenance before enforcing all six byte limits.",
+    "Incompatible or missing evidence fails the job and is retained; it does not widen limits, substitute a cohort or count as a pass."
+  ],
+  "first_ordinary_ci_run": "Pending the integration commit. Detector qualification is complete; this review does not claim an ordinary CI result."
+}

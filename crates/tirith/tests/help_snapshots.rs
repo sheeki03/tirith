@@ -444,11 +444,17 @@ fn help_check_shows_format_flag() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--format"));
     assert!(stdout.contains("human, json"));
-    // --json is an alias; only --format should be documented.
+    // Match the complete option token: the visible --json-schema selector is
+    // distinct from the hidden --json compatibility alias.
     assert!(
-        !stdout.contains("  --json"),
+        !stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("--json")),
         "--json should be hidden from help"
     );
+    assert!(stdout
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("--json-schema")));
 }
 
 #[test]
@@ -790,4 +796,19 @@ fn help_mcp_diff_documents_exit_codes() {
         stdout.contains("2  usage error"),
         "mcp diff --help must document exit 2 on usage error, got:\n{stdout}"
     );
+}
+
+#[test]
+fn package_install_help_states_the_disabled_execution_scope() {
+    for args in [vec!["pkg", "--help"], vec!["pkg", "install", "--help"]] {
+        let out = tirith().args(&args).output().expect("read package help");
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("disabled on every host"), "{args:?}: {text}");
+        assert!(text.contains("private_input_execution_unqualified"));
+        assert!(text
+            .contains("--yes, --allow-degraded, sudo, and administrator access do not enable it"));
+        assert!(text.contains("verify-env"));
+    }
 }

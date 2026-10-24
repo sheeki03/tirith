@@ -17,7 +17,8 @@ the RPC reference, safety flags, destinations, and an explicit list of the gaps
 it could not resolve. `crates/tirith-core/src/rules/web3_gate.rs` turns those
 facts into findings.
 
-Three rule ids, and only three:
+Three Web3-specific rule IDs, with the shared `analysis_incomplete` rule for
+configured analysis gaps:
 
 | Rule | Fires when | Severity |
 |---|---|---|
@@ -28,16 +29,12 @@ Three rule ids, and only three:
 Bare private-key fragments stay out of the hot path because the credential and
 exfiltration rules already cover them in their own contexts.
 
-**A parser gap produces no finding on the engine surfaces.** There is no fourth
-rule id, and `analysis_incomplete` is not reused here either: `web3_gate::check`
-iterates only the commands the grammar recognized
-(`crates/tirith-core/src/rules/web3_gate.rs:37-45`) and never reads the parse
-result's gaps, while the only emitters of `analysis_incomplete` live in
-`crates/tirith-core/src/repo_hooks.rs`. So `forge create`, which has no grammar
-arm, returns a clean `allow` with zero findings from `tirith check`, the shell
-hook, `tirith_check_command`, and the gateway. The gap IS recorded in the parse
-result and `tirith task check` reports it as `"complete": false`, but silence on
-an engine surface must not be read as "nothing to see".
+Parser gaps are retained. With a non-default `web3_guard`, the configured
+`action_incomplete_analysis` decides how incomplete command or policy matching
+is reported; a gap without command facts uses `analysis_incomplete`. The empty
+default guard does not enable that policy action. `forge create` remains outside
+the declared Forge grammar, so do not treat a default-policy allow as complete
+coverage. `tirith task check` also reports incomplete inferred effects.
 
 ### The severity ladder, and why it stops where it does
 
@@ -111,7 +108,7 @@ web3_guard:
       host: rpc.untrusted.invalid
       subdomains: host_and_subdomains
   action_unclassified_rpc: warn
-  # Accepted and validated, but INERT today. See "Declared but not yet wired".
+  # Enforced constraints; see "Policy fields and current limits" below.
   deny_destinations: ["0x0000000000000000000000000000000000000000"]
   require_command_card: false
   action_incomplete_analysis: warn
@@ -142,37 +139,22 @@ Field notes that matter more than the shape:
   legitimate endpoint is being reported, add it to the network's endpoints
   rather than suppressing the rule.
 
-### Declared but not yet wired
+### Policy fields and current limits
 
-Six of the fields in that block are parsed, bounds-checked, merged with the
-repo-scope directions below, and printed by `tirith policy effective`, but no
-rule consults them. `rules::web3_gate` is the only consumer of
-`policy.web3_guard` (`crates/tirith-core/src/engine.rs:3072`) and it reads
-exactly five things: `denies_rpc` (`web3_gate.rs:299`), `classify_rpc`
-(`:300`), `networks` (`:315`), `action_unclassified_rpc` (`:316`), and
-`permits_signer` (`:352`).
+The current engine consults these fields. Policy validation checks syntax and
+bounds; it does not prove that an external tool or host is intercepted.
 
-| Field | Status today |
+| Field | Current behavior |
 |---|---|
-| `deny_destinations` | inert; `web3_policy.rs` exposes no destination lookup at all |
-| `require_command_card` | inert; nothing requires or checks a card, and the CLI cannot author a Web3 card |
-| `command_card_key_ids` | inert beyond a `policy validate` non-empty check |
-| `selector_aliases` | inert; no rule resolves a selector alias |
-| `action_incomplete_analysis` | inert HERE; only the `task_gate` copy is read (`task_boundary.rs:325`) |
-| `action_ambiguous_hardhat_production_run` | inert; no production reader anywhere |
+| `deny_destinations` | Blocks a resolved denied destination on a state-changing command; unresolved destinations use the incomplete-analysis action |
+| `require_command_card` | Blocks state-changing commands without an exactly bound, policy-authorized card; current executable/artifact qualification limits can make approval unavailable |
+| `command_card_key_ids` | Restricts which verified signing key can satisfy Web3 approval |
+| `selector_aliases` | Maps recognized tool/network selectors to trusted named networks; ambiguity remains incomplete |
+| `action_incomplete_analysis` | Applies to incomplete parser and policy matching when the guard is configured |
+| `action_ambiguous_hardhat_production_run` | Applies to arbitrary Hardhat scripts aimed at a resolved trusted non-development network |
 
-`tirith policy validate` reports such a policy as `"valid": true` with zero
-issues, so validation is not the place you will find this out. Setting
-`deny_destinations` to the zero address and `require_command_card: true` leaves
-`cast send 0x0000000000000000000000000000000000000000 --value 1ether --rpc-url <endpoint> --keystore <path>`
-at exactly one `web3_state_changing_command` MEDIUM, action `warn`. Setting both
-inert actions to `block` leaves
-`npx hardhat run scripts/deploy.js --network mainnet` at `allow` with zero
-findings.
-
-Do not stand down a manual review on the strength of these fields. Wiring them
-to a rule is a behaviour change and therefore a future slice, not a
-documentation slice.
+These checks do not query chain state or certify a transaction. See the command
+card limits below before enabling a required approval workflow.
 
 ### A repository may tighten, never authorize
 
@@ -186,11 +168,8 @@ each field carries a direction:
 | `deny_rpc`, `deny_destinations` | **UNION.** More denial is strictly safer. |
 | `action_*`, `require_command_card` | **STRICTER wins** on a total lattice. |
 
-These directions describe the MERGE, and the merge is real and tested for every
-row. They do not imply the merged value is then acted on: of the fields named
-here, only `networks`, `allowed_signers`, `deny_rpc`, and
-`action_unclassified_rpc` reach a rule. The rest merge correctly into a value
-nothing reads. See "Declared but not yet wired" above.
+The engine evaluates the resulting constraints; repository values cannot
+introduce trusted networks, signers or approval keys.
 
 A property test proves the resulting effect set is always a subset of the
 trusted one, across every provenance and trust combination, and that the merge
@@ -202,60 +181,31 @@ dropped rather than wondering why it had no effect.
 
 ## Command cards for Web3 operations
 
-**Not a control you can turn on today.** This section describes a data structure
-that ships with no caller and no authoring surface. It is documented so that
-nobody configures `require_command_card` believing an approval step now exists.
+`require_command_card` is an enforced requirement. The engine has a reachable
+Web3 approval path that checks a verified card's signing key against trusted
+policy and compares shell, network, chain/genesis, signer bindings, destinations,
+policy identity and ordered operations. A signature alone does not authorize a
+command, and a schema-1 card cannot approve a Web3 operation.
 
-A command card is an operator-authored, ed25519-signed attestation that a known
-command is what it claims. Schema 2 adds Web3 bindings: the named network, the
-family, the chain or genesis identity, the signer KIND, destinations, artifact
-hashes, the policy identity, the ordered operation set, and the authorized
-approval key.
+The requirement currently has strict availability limits. Unbound executable
+identity or incomplete command facts refuse exact approval. Artifact-bearing
+operations also refuse because the external tool cannot be held to the same
+opened artifact at execution time. Requiring a card can therefore block a
+workflow that the current implementation cannot approve; sudo does not supply
+that missing execution binding. Do not advertise these checks as a generally
+available transaction-approval service.
 
-What is missing is everything that would make it act:
+`tirith command-card create` and `sign` call the Web3 derivation path when
+appropriate trusted keys are configured. They refuse these unsupported cases
+with a categorical reason, rather than emitting an approval with weaker
+bindings. New authoring uses schema 3: a command digest and shell identity
+replace stored raw command text. Raw or interactive signer material is refused
+before authoring. Signer references use nonsecret identity digests, and explicit
+legacy signing migration does not bypass the binding requirements.
 
-- **No surface compares a card's Web3 bindings against an observed command.**
-  `Card::approves_web3` (`crates/tirith-core/src/command_card.rs:518`),
-  `Web3CardBindings` (`:157`), and `CARD_SCHEMA_V2` (`:146`) have zero
-  references outside `command_card.rs` and its own unit tests.
-- **The engine's card path is v1 only.** `engine.rs:1754` calls
-  `command_card::evaluate_card`, which at `command_card.rs:868-888` does
-  signature and expiry verification plus `card.command_matches(cmd)` string
-  equality, and nothing Web3-aware.
-- **The CLI cannot author one.** `tirith command-card create` exposes only
-  `--command`, `--expected-domain`, `--script-sha256`, `--writes`,
-  `--requires-sudo`, and `--expires`. There is no flag for a network, a signer
-  kind, a destination, or an operation set.
-- **`require_command_card` is inert**, as recorded above.
-
-Three properties of the unreachable routine are structural rather than advisory,
-and are stated here for the reader of the code:
-
-1. **A card may never bind raw signer material.** `raw_private_key`,
-   `raw_keypair`, `mnemonic`, `stdin`, `prompt`, and `unknown` are refused at
-   construction and again at verification. A card is checked into a repository;
-   binding a key would publish it.
-2. **A v1 card can never approve a Web3 operation.** It attests to a command
-   string and nothing about network, signer, or destination, so honoring it
-   would let an old card bless an operation nobody reviewed. `approves_web3`
-   returns `V1CannotApproveWeb3`.
-3. **Operation comparison is ordered-set equality, not subset.** A card
-   approving one deployment would not silently approve a second appended to the
-   same command line.
-
-Wiring a card check into a surface, and adding the flags to author one, is a
-behaviour change and therefore a future slice, not a documentation slice.
-
-Destinations are bound literally rather than hashed, because a card is an
-operator-authored artifact meant to be reviewed by a human and an address is
-public data. That is a different trust context from the automatic findings
-above, where addresses stay out of the output deliberately.
-
-Compatibility: both schema-2 fields are omitted from the JSON unless set, so a
-v1 card's signing bytes are byte-identical to what they were before this release
-and every checked-in v1 signature still verifies. A test pins the v1 payload to
-an exact literal rather than to a round-trip, because a round-trip would still
-pass if both sides changed together.
+The declared comparison contract rejects raw signer material and legacy v1
+Web3 approval, and requires ordered operation equality. These source-level
+contracts and their tests are separate from native host/release qualification.
 
 ## Wallet material and exfiltration
 

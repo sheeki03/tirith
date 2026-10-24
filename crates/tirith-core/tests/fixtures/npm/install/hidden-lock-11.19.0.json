@@ -1,0 +1,123 @@
+{
+  "contract": "LocalLeafNoScriptsV1 metadata characterization only",
+  "node": "26.7.0",
+  "npm": "11.19.0",
+  "cases": [
+    {
+      "fixture": "scripted",
+      "manifest": {
+        "name": "tirith-leaf-scripts",
+        "version": "1.0.0",
+        "scripts": {
+          "preinstall": "node -e \"require('fs').writeFileSync('/work/forbidden-preinstall','executed')\"",
+          "install": "node -e \"require('fs').writeFileSync('/work/forbidden-install','executed')\"",
+          "postinstall": "node -e \"require('fs').writeFileSync('/work/forbidden-postinstall','executed')\"",
+          "prepublish": "node -e \"require('fs').writeFileSync('/work/forbidden-prepublish','executed')\"",
+          "preprepare": "node -e \"require('fs').writeFileSync('/work/forbidden-preprepare','executed')\"",
+          "prepare": "node -e \"require('fs').writeFileSync('/work/forbidden-prepare','executed')\"",
+          "postprepare": "node -e \"require('fs').writeFileSync('/work/forbidden-postprepare','executed')\""
+        },
+        "bin": {
+          "leaf-bin": "cli.js"
+        }
+      },
+      "row": {
+        "version": "1.0.0",
+        "resolved": "file:../../../inputs/scripted.tgz",
+        "integrity": "sha512-w9j2O+XsHG0wDIoUuLWhxe1ox41AZMTIkeFdb8yS6zTyUbsUWTX2KdIJZc9Hok5w2vjhRIeagiqsIOKBO4YzAg==",
+        "hasInstallScript": true,
+        "bin": {
+          "leaf-bin": "cli.js"
+        }
+      }
+    },
+    {
+      "fixture": "implicit-gyp",
+      "manifest": {
+        "name": "tirith-leaf-gyp",
+        "version": "2.0.0"
+      },
+      "row": {
+        "version": "2.0.0",
+        "resolved": "file:../../../inputs/implicit-gyp.tgz",
+        "integrity": "sha512-+B5cbl9Dfrzc1TwbCkzFrCKrJGbU9JewsMFm98p2tXBWFmJ40GGbF5SSz+sjzrpgWz3dLS2A5ABw8W4orP9n3Q=="
+      }
+    },
+    {
+      "fixture": "scoped-dev",
+      "manifest": {
+        "name": "@tirith-fixture/leaf",
+        "version": "3.0.0-beta.1",
+        "devDependencies": {
+          "not-selected-in-this-contract": "99.99.99"
+        }
+      },
+      "row": {
+        "version": "3.0.0-beta.1",
+        "resolved": "file:../../../inputs/scoped-dev.tgz",
+        "integrity": "sha512-vJrtrR50TI/QMiNwtCw1tJxrS159tSdEiDfnooXOfORUlxDfg6yR3Q2ppCnJhiK28aKi02IGPU2URzQ7q/9Jrw=="
+      }
+    },
+    {
+      "fixture": "metadata",
+      "manifest": {
+        "name": "@tirith-fixture/meta",
+        "version": "1.2.3",
+        "license": {
+          "type": "MIT",
+          "url": "https://example.invalid/license"
+        },
+        "funding": [
+          {
+            "type": "individual",
+            "url": "https://example.invalid/fund"
+          }
+        ],
+        "engines": {
+          "node": ">=26"
+        },
+        "os": [
+          "linux"
+        ],
+        "cpu": [
+          "arm64"
+        ],
+        "libc": [
+          "glibc"
+        ],
+        "deprecated": "controlled fixture only",
+        "bin": "./cli.js",
+        "dependencies": {},
+        "acceptDependencies": {}
+      },
+      "row": {
+        "version": "1.2.3",
+        "resolved": "file:../../../inputs/metadata.tgz",
+        "integrity": "sha512-libRTsBj2b5QXKPto/Ms+4v1UIHjFgoJOvxBnaENfQ5IO5EDzk+2/PZaX7+xEkRH+qVHbJw0Vx07BFHss7IW0A==",
+        "cpu": [
+          "arm64"
+        ],
+        "deprecated": "controlled fixture only",
+        "funding": [
+          {
+            "type": "individual",
+            "url": "https://example.invalid/fund"
+          }
+        ],
+        "libc": [
+          "glibc"
+        ],
+        "license": "MIT",
+        "os": [
+          "linux"
+        ],
+        "bin": {
+          "meta": "cli.js"
+        },
+        "engines": {
+          "node": ">=26"
+        }
+      }
+    }
+  ]
+}

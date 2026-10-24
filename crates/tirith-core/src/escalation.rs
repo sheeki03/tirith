@@ -104,6 +104,29 @@ pub fn apply_escalation(
     session: &SessionWarnings,
     rules: &[EscalationRule],
 ) -> (Action, HashSet<String>, Vec<EscalationHit>, Option<String>) {
+    apply_escalation_at(current_action, findings, session, rules, chrono::Utc::now())
+}
+
+/// Evaluate escalation against an explicit clock and immutable session evidence.
+pub(crate) fn apply_escalation_at(
+    current_action: Action,
+    findings: &[Finding],
+    session: &SessionWarnings,
+    rules: &[EscalationRule],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Action, HashSet<String>, Vec<EscalationHit>, Option<String>) {
+    apply_escalation_at_with_urls(current_action, findings, session, rules, now, &[])
+}
+
+/// Contextual equivalent retaining every authority in the analyzed command.
+pub(crate) fn apply_escalation_at_with_urls(
+    current_action: Action,
+    findings: &[Finding],
+    session: &SessionWarnings,
+    rules: &[EscalationRule],
+    now: chrono::DateTime<chrono::Utc>,
+    urls: &[crate::extract::ExtractedUrl],
+) -> (Action, HashSet<String>, Vec<EscalationHit>, Option<String>) {
     let mut action = current_action;
     let mut causal = HashSet::new();
     let mut hits: Vec<EscalationHit> = Vec::new();
@@ -135,7 +158,11 @@ pub fn apply_escalation(
                             continue;
                         }
                         if *domain_scoped {
-                            let domains = extract_finding_domains(f);
+                            let domains =
+                                crate::session_warnings::extract_domains_from_evidence_with_urls(
+                                    &f.evidence,
+                                    urls,
+                                );
                             if domains.is_empty() {
                                 *map.entry((rid, None)).or_insert(0) += 1;
                             } else {
@@ -169,7 +196,7 @@ pub fn apply_escalation(
                             };
                             rule_matches
                                 && domain_matches
-                                && is_within_minutes(&ev.timestamp, *cooldown_minutes)
+                                && is_within_minutes_at(&ev.timestamp, *cooldown_minutes, now)
                         });
                         if cooldown_active {
                             continue;
@@ -178,11 +205,23 @@ pub fn apply_escalation(
 
                     let session_count = if *domain_scoped {
                         match domain {
-                            Some(d) => session.count_by_rule_and_domain(fid, d, *window_minutes),
-                            None => session.count_by_rule(fid, *window_minutes),
+                            Some(d) => count_session_events_at(
+                                session,
+                                Some(fid),
+                                Some(d),
+                                *window_minutes,
+                                now,
+                            ),
+                            None => count_session_events_at(
+                                session,
+                                Some(fid),
+                                None,
+                                *window_minutes,
+                                now,
+                            ),
                         }
                     } else {
-                        session.count_by_rule(fid, *window_minutes)
+                        count_session_events_at(session, Some(fid), None, *window_minutes, now)
                     };
 
                     let total = session_count + current_count;
@@ -213,14 +252,16 @@ pub fn apply_escalation(
                 if wildcard && !domain_scoped && !action_gte(action, target) {
                     if *cooldown_minutes > 0 {
                         let wildcard_cooled = session.escalation_events.iter().any(|ev| {
-                            ev.rule_id == "*" && is_within_minutes(&ev.timestamp, *cooldown_minutes)
+                            ev.rule_id == "*"
+                                && is_within_minutes_at(&ev.timestamp, *cooldown_minutes, now)
                         });
                         if wildcard_cooled {
                             continue;
                         }
                     }
 
-                    let total = session.count_all(*window_minutes) + findings.len() as u32;
+                    let total = count_session_events_at(session, None, None, *window_minutes, now)
+                        + findings.len() as u32;
                     if total >= *threshold {
                         action = target;
                         for f in findings {
@@ -273,13 +314,34 @@ pub fn apply_escalation(
 
 /// Is an RFC 3339 timestamp within `minutes` of now? Fail-safe: an unparseable
 /// timestamp counts as within-window so cooldown stays active.
-fn is_within_minutes(timestamp: &str, minutes: u64) -> bool {
+fn is_within_minutes_at(timestamp: &str, minutes: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return true;
     };
+    ts >= now - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64)
+}
+
+fn count_session_events_at(
+    session: &SessionWarnings,
+    rule: Option<&str>,
+    domain: Option<&str>,
+    minutes: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u32 {
     let cutoff =
-        chrono::Utc::now() - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64);
-    ts >= cutoff
+        (now - chrono::Duration::minutes(minutes.min(u32::MAX as u64) as i64)).to_rfc3339();
+    session
+        .events
+        .iter()
+        .filter(|event| {
+            rule.is_none_or(|rule| event.rule_id == rule)
+                && event.timestamp.as_str() >= cutoff.as_str()
+                && domain.is_none_or(|domain| {
+                    event.domains.iter().any(|d| d.eq_ignore_ascii_case(domain))
+                })
+        })
+        .count()
+        .min(u32::MAX as usize) as u32
 }
 
 /// Apply per-rule action overrides (only "block" is valid). Returns the
@@ -393,11 +455,6 @@ fn action_rank(a: Action) -> u8 {
         Action::WarnAck => 2,
         Action::Block => 3,
     }
-}
-
-/// Extract domains from a single finding's evidence.
-fn extract_finding_domains(finding: &Finding) -> Vec<String> {
-    crate::session_warnings::extract_domains_from_evidence(&finding.evidence)
 }
 
 /// Where the verdict is processed. Non-CLI callers can't prompt, so an approval
@@ -636,15 +693,58 @@ pub fn post_process_verdict_for_verification(
     session_id: &str,
     caller: CallerContext,
 ) -> Verdict {
+    post_process_verdict_for_verification_with_urls(
+        raw_verdict,
+        policy,
+        cmd,
+        session_id,
+        caller,
+        ShellType::Posix,
+        &[],
+    )
+}
+
+/// Shell-aware counterpart for callers holding the actual analyzed command.
+pub fn post_process_verdict_for_verification_for_shell(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+    shell: ShellType,
+) -> Verdict {
+    let urls = crate::extract::extract_urls(cmd, shell);
+    post_process_verdict_for_verification_with_urls(
+        raw_verdict,
+        policy,
+        cmd,
+        session_id,
+        caller,
+        shell,
+        &urls,
+    )
+}
+
+fn post_process_verdict_for_verification_with_urls(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+    shell: ShellType,
+    urls: &[crate::extract::ExtractedUrl],
+) -> Verdict {
     let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
     let session = crate::session_warnings::load(session_id);
 
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
-        let (new_action, _caused_by, _hits, reason) = apply_escalation(
+        let (new_action, _caused_by, _hits, reason) = apply_escalation_at_with_urls(
             effective.action,
             &effective.findings,
             &session,
             &policy.escalation,
+            chrono::Utc::now(),
+            urls,
         );
         if new_action != effective.action {
             effective.escalation_reason = reason;
@@ -652,7 +752,7 @@ pub fn post_process_verdict_for_verification(
         effective.action = new_action;
     }
 
-    let provisional_events = derive_typed_events(cmd, &effective);
+    let provisional_events = derive_typed_events_with_urls(cmd, &effective, shell, urls);
     let correlation_hits = if provisional_events.is_empty() {
         Vec::new()
     } else {
@@ -685,7 +785,7 @@ pub fn post_process_verdict_for_verification(
 /// origin, not findings, and re-running would duplicate its denial finding.
 /// Escalation is likewise not re-run: it is session-stateful (repeat-density
 /// recording), not a monotonic pure function of the finding set.
-fn reapply_monotonic_policy_effects(
+pub(crate) fn reapply_monotonic_policy_effects(
     effective: &mut Verdict,
     policy: &crate::policy::Policy,
     caller: CallerContext,
@@ -752,16 +852,51 @@ pub fn post_process_verdict(
     session_id: &str,
     caller: CallerContext,
 ) -> Verdict {
+    post_process_verdict_with_urls(
+        raw_verdict,
+        policy,
+        cmd,
+        session_id,
+        caller,
+        ShellType::Posix,
+        &[],
+    )
+}
+
+/// Shell-aware counterpart for callers holding the actual analyzed command.
+pub fn post_process_verdict_for_shell(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+    shell: ShellType,
+) -> Verdict {
+    let urls = crate::extract::extract_urls(cmd, shell);
+    post_process_verdict_with_urls(raw_verdict, policy, cmd, session_id, caller, shell, &urls)
+}
+
+fn post_process_verdict_with_urls(
+    raw_verdict: &Verdict,
+    policy: &crate::policy::Policy,
+    cmd: &str,
+    session_id: &str,
+    caller: CallerContext,
+    shell: ShellType,
+    urls: &[crate::extract::ExtractedUrl],
+) -> Verdict {
     let mut effective = apply_stateless_policy_effects(raw_verdict, policy, caller);
 
     // Escalation runs BEFORE warning recording so the escalated action wins.
     if !policy.escalation.is_empty() && matches!(effective.action, Action::Warn | Action::WarnAck) {
         let session = crate::session_warnings::load(session_id);
-        let (new_action, _caused_by, escalation_hits, reason) = apply_escalation(
+        let (new_action, _caused_by, escalation_hits, reason) = apply_escalation_at_with_urls(
             effective.action,
             &effective.findings,
             &session,
             &policy.escalation,
+            chrono::Utc::now(),
+            urls,
         );
         if new_action != effective.action {
             effective.escalation_reason = reason;
@@ -821,12 +956,13 @@ pub fn post_process_verdict(
             } else {
                 vec![]
             };
-        crate::session_warnings::record_outcome(
+        crate::session_warnings::record_outcome_with_urls(
             session_id,
             &warn_findings,
             &hidden_findings_vec,
             cmd,
             &policy.dlp_custom_patterns,
+            urls,
         );
     }
 
@@ -839,7 +975,7 @@ pub fn post_process_verdict(
     // The correlator returns EVERY matching hit, including signatures already
     // de-duplicated for session-warning presentation. Presentation de-duplication
     // must never suppress a Critical hit's Block enforcement on a retry.
-    let provisional_events = derive_typed_events(cmd, &effective);
+    let provisional_events = derive_typed_events_with_urls(cmd, &effective, shell, urls);
     let correlation_hits = if provisional_events.is_empty() {
         Vec::new()
     } else {
@@ -912,14 +1048,26 @@ pub(crate) fn record_executed_verdict_events(
 /// non-manifest) files (intentionally not recorded from the command string to
 /// avoid flooding the ring; only the dependency-manifest case above emits a
 /// `FileWrite`).
+#[cfg(test)]
 pub(crate) fn derive_event_prototypes(cmd: &str, verdict: &Verdict) -> Vec<EventPrototype> {
-    derive_event_prototypes_for_shell(cmd, verdict, ShellType::Posix)
+    derive_event_prototypes_with_urls(cmd, verdict, ShellType::Posix, &[])
 }
 
 pub(crate) fn derive_event_prototypes_for_shell(
     cmd: &str,
     verdict: &Verdict,
     shell: ShellType,
+) -> Vec<EventPrototype> {
+    let urls = crate::extract::extract_urls(cmd, shell);
+    derive_event_prototypes_with_urls(cmd, verdict, shell, &urls)
+}
+
+/// Frozen evaluation can reuse the extraction captured in its analysis mode.
+pub(crate) fn derive_event_prototypes_with_urls(
+    cmd: &str,
+    verdict: &Verdict,
+    shell: ShellType,
+    urls: &[crate::extract::ExtractedUrl],
 ) -> Vec<EventPrototype> {
     let mut events: Vec<EventPrototype> = Vec::new();
     // EventKind is Copy + Eq (not Hash, by design), so a small Vec is the seen-set.
@@ -1057,11 +1205,26 @@ pub(crate) fn derive_event_prototypes_for_shell(
         // Extract hosts from finding evidence lazily, only when a Network event
         // is actually emitted, so a benign command with non-network findings
         // does not pay the evidence clone + host scan.
+        let evidence = collect_evidence(verdict);
         let finding_hosts =
-            crate::session_warnings::extract_domains_from_evidence(&collect_evidence(verdict));
+            crate::session_warnings::extract_domains_from_evidence_with_urls(&evidence, urls);
+        // Distinct URLs retain the existing representative first host. Omit
+        // it only when one URL spelling has conflicting client authorities;
+        // its complete identity set remains in the warning domains.
+        let ambiguous_authority = evidence.iter().any(|item| {
+            matches!(item, Evidence::Url { .. })
+                && crate::session_warnings::extract_domains_from_evidence_with_urls(
+                    std::slice::from_ref(item),
+                    urls,
+                )
+                .len()
+                    > 1
+        });
         let mut meta = BTreeMap::new();
-        if let Some(host) = finding_hosts.first() {
-            meta.insert("host".to_string(), host.clone());
+        if !ambiguous_authority {
+            if let Some(host) = finding_hosts.first() {
+                meta.insert("host".to_string(), host.clone());
+            }
         }
         push(
             &mut events,
@@ -1155,9 +1318,23 @@ pub(crate) fn derive_event_prototypes_for_shell(
 /// execution authorization keeps the timestamp-free prototypes above and lets
 /// [`crate::execution_state::ExecutionGate`] assign durable identities only
 /// after evidence reaches a trusted boundary.
+#[cfg(test)]
 fn derive_typed_events(cmd: &str, verdict: &Verdict) -> Vec<TypedEvent> {
+    materialize_diagnostic_events(derive_event_prototypes(cmd, verdict))
+}
+
+fn derive_typed_events_with_urls(
+    cmd: &str,
+    verdict: &Verdict,
+    shell: ShellType,
+    urls: &[crate::extract::ExtractedUrl],
+) -> Vec<TypedEvent> {
+    materialize_diagnostic_events(derive_event_prototypes_with_urls(cmd, verdict, shell, urls))
+}
+
+fn materialize_diagnostic_events(prototypes: Vec<EventPrototype>) -> Vec<TypedEvent> {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    derive_event_prototypes(cmd, verdict)
+    prototypes
         .into_iter()
         .map(|prototype| {
             prototype.materialize(
@@ -1292,7 +1469,7 @@ fn delete_path_args<'a>(tool: &str, args: &'a [String]) -> Vec<std::borrow::Cow<
 /// Split the first unquoted, unescaped redirection suffix from a preceding argv
 /// word. Returns the argv prefix plus whether the operator consumes the next
 /// shell word. Process substitutions stay part of the word.
-fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -1412,7 +1589,7 @@ fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
 /// token (`2> /tmp/log`) rather than carrying an attached target
 /// (`2>/tmp/log`, `2>&1`). Quoted or escaped lookalikes remain ordinary delete
 /// operands.
-fn shell_redirection_token(word: &str) -> Option<bool> {
+pub(crate) fn shell_redirection_token(word: &str) -> Option<bool> {
     let mut rest = word;
     rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
 
@@ -5042,5 +5219,150 @@ mod tests {
             2,
             "post-processing the retry must not persist another Network event"
         );
+    }
+}
+
+#[cfg(test)]
+mod contextual_escalation_tests {
+    use super::*;
+    use crate::session_warnings::{EscalationEvent, WarningEvent};
+
+    fn finding() -> Finding {
+        Finding {
+            rule_id: RuleId::PlainHttpToSink,
+            severity: Severity::Medium,
+            title: "network warning".into(),
+            description: "context fixture".into(),
+            evidence: vec![Evidence::Url {
+                raw: "http://0x7f.0x/path".into(),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        }
+    }
+    fn verdict() -> Verdict {
+        let mut verdict = Verdict::allow_fast(3, Default::default());
+        verdict.action = Action::Warn;
+        verdict.findings.push(finding());
+        verdict
+    }
+
+    #[test]
+    fn domain_scoped_escalation_and_cooldown_use_contextual_authorities() {
+        let now = chrono::Utc::now();
+        let mut session = SessionWarnings::new("context-fixture");
+        let rule_id = RuleId::PlainHttpToSink.to_string();
+        session.events.push_back(WarningEvent {
+            timestamp: now.to_rfc3339(),
+            rule_id: rule_id.clone(),
+            severity: "MEDIUM".into(),
+            title: "prior warning".into(),
+            command_redacted: "curl".into(),
+            domains: vec!["0x7f.0x".into()],
+        });
+        // A prior numeric-IP cooldown must not hide a DNS-domain repeat.
+        session.escalation_events.push_back(EscalationEvent {
+            timestamp: now.to_rfc3339(),
+            rule_id: rule_id.clone(),
+            domain: Some("127.0.0.0".into()),
+        });
+        let rules = [EscalationRule::RepeatCount {
+            rule_ids: vec![rule_id.clone()],
+            threshold: 2,
+            window_minutes: 60,
+            action: EscalationAction::Block,
+            domain_scoped: true,
+            cooldown_minutes: 60,
+        }];
+        let findings = [finding()];
+        assert_eq!(
+            apply_escalation_at(Action::Warn, &findings, &session, &rules, now).0,
+            Action::Warn
+        );
+        for cmd in [
+            "curl http://0x7f.0x/path",
+            "wget http://0x7f.0x/path; curl http://0x7f.0x/path",
+        ] {
+            let urls = crate::extract::extract_urls(cmd, ShellType::Posix);
+            let (action, _, hits, _) = apply_escalation_at_with_urls(
+                Action::Warn,
+                &findings,
+                &session,
+                &rules,
+                now,
+                &urls,
+            );
+            assert_eq!(action, Action::Block, "{cmd}");
+            assert!(hits
+                .iter()
+                .any(|hit| hit.domain.as_deref() == Some("0x7f.0x")));
+        }
+        let wget = crate::extract::extract_urls("wget http://0x7f.0x/path", ShellType::Posix);
+        assert_eq!(
+            apply_escalation_at_with_urls(Action::Warn, &findings, &session, &rules, now, &wget).0,
+            Action::Warn
+        );
+        session.escalation_events.push_back(EscalationEvent {
+            timestamp: now.to_rfc3339(),
+            rule_id,
+            domain: Some("0x7f.0x".into()),
+        });
+        let curl = crate::extract::extract_urls("curl http://0x7f.0x/path", ShellType::Posix);
+        assert_eq!(
+            apply_escalation_at_with_urls(Action::Warn, &findings, &session, &rules, now, &curl).0,
+            Action::Warn
+        );
+    }
+
+    #[test]
+    fn network_event_does_not_choose_one_of_conflicting_authorities() {
+        let verdict = verdict();
+        for (command, expected) in [
+            ("curl http://0x7f.0x/path", Some("0x7f.0x")),
+            ("wget http://0x7f.0x/path", Some("127.0.0.0")),
+            ("wget http://0x7f.0x/path; curl http://0x7f.0x/path", None),
+        ] {
+            let events = derive_event_prototypes_for_shell(command, &verdict, ShellType::Posix);
+            let network: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == EventKind::Network)
+                .collect();
+            assert_eq!(network.len(), 1);
+            assert_eq!(
+                network[0].metadata.get("host").map(String::as_str),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_distinct_urls_keep_the_existing_representative_network_host() {
+        let mut verdict = verdict();
+        verdict.findings[0].evidence = vec![
+            Evidence::Url {
+                raw: "http://zeta.example/path".into(),
+            },
+            Evidence::Url {
+                raw: "http://alpha.example/path".into(),
+            },
+        ];
+        let command = "curl http://zeta.example/path; curl http://alpha.example/path";
+        let contextual = derive_event_prototypes_for_shell(command, &verdict, ShellType::Posix);
+        let legacy = derive_event_prototypes(command, &verdict);
+        let contextual_network = contextual
+            .iter()
+            .find(|event| event.kind == EventKind::Network)
+            .unwrap();
+        let legacy_network = legacy
+            .iter()
+            .find(|event| event.kind == EventKind::Network)
+            .unwrap();
+        assert_eq!(
+            contextual_network.metadata.get("host").map(String::as_str),
+            Some("alpha.example")
+        );
+        assert_eq!(contextual_network.metadata, legacy_network.metadata);
     }
 }

@@ -1040,7 +1040,7 @@ fn hash_bound_file(
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
-    let mut handle = match root.open_descendant_file(&entry.relative, entry.size) {
+    let mut handle = match root.open_descendant_file_read_lease(&entry.relative, entry.size) {
         Ok(handle) => handle,
         Err(OpenRegularError::NotFound) => {
             return Err(TreeScanError::Changed(entry.relative.clone()))
@@ -1066,6 +1066,9 @@ fn hash_bound_file(
     if entry.identity != opened_identity {
         return Err(TreeScanError::Changed(entry.relative.clone()));
     }
+    // Windows holds a no-write sharing lease through the complete read. File
+    // times alone can miss a same-size rewrite; identity/generation checks
+    // remain necessary for changes between the inventory and this open.
     let opened_generation = file_generation(&handle)
         .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
     if entry.generation != Some(opened_generation) || opened_generation.links != 1 {

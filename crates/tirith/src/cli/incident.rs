@@ -912,6 +912,7 @@ mod tests {
 
     #[test]
     fn report_escapes_reason_with_newline_and_heading_injection() {
+        let _isolate = tirith_test_support::GlobalStateGuard::new().unwrap();
         // CodeRabbit R6 #11: a `--reason` with a newline + `#` must NOT break the
         // report structure or inject a heading.
         let state = IncidentState {

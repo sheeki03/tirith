@@ -15,6 +15,7 @@ run_rollback_case() {
     TIRITH_INSTALL_SH_LIB=1 . "$INSTALL_SH"
     run_root() { "$@"; }
     TARGET=x86_64-unknown-linux-gnu
+    PAIRED_HELPER_MANAGED=1
     PAIRED_TMPDIR="$CASE_DIR/runtime"
     PAIRED_MAIN_DEST="$CASE_DIR/main"
     PAIRED_HELPER_DEST="$CASE_DIR/helper"
@@ -71,6 +72,7 @@ if CASE_DIR="$both_case" INSTALL_SH="$INSTALL_SH" sh -c '
   TIRITH_INSTALL_SH_LIB=1 . "$INSTALL_SH"
   run_root() { "$@"; }
   TARGET=x86_64-unknown-linux-gnu
+  PAIRED_HELPER_MANAGED=1
   PAIRED_TMPDIR="$CASE_DIR/runtime"
   PAIRED_MAIN_DEST="$CASE_DIR/main"
   PAIRED_HELPER_DEST="$CASE_DIR/helper"

@@ -9,6 +9,10 @@ crates/tirith-core/assets/data/bip39_english.txt text eol=lf
 crates/tirith-core/assets/data/bip39_english.SOURCE text eol=lf
 docs/capability-manifest.toml text eol=lf
 
+# Sealed npm code and vendored parser fixtures are checked by exact digest.
+crates/tirith/src/cli/npm_sealed_bootstrap.cjs text eol=lf
+tools/npm-bootstrap/** text eol=lf
+
 # The remediation ledger's generated artifacts are digest-pinned the same way:
 # main.md embeds a SHA-256 of each schema, and validate_ledger.py compares the
 # rendered bytes. A CRLF checkout would break both. Same reason as above.
