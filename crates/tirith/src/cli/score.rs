@@ -13,7 +13,9 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         shell: ShellType::Posix,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
-        interactive: true,
+        // The URL is an argument, not a line an interactive shell reads, so
+        // nothing history-expands it (`https://example.com/#!/page`).
+        interactive: false,
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),

@@ -3379,6 +3379,28 @@ fn score_suspicious_url() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A `!` in a scored URL is not interactive shell input, so it is never read
+/// as a history reference.
+#[test]
+fn score_url_with_bang_gets_no_history_expansion_finding() {
+    for url in ["https://example.com/#!/page", "https://example.com/a!b"] {
+        let out = tirith()
+            .args(["score", "--json", url])
+            .output()
+            .expect("failed to run tirith");
+        assert_eq!(out.status.code(), Some(0), "{url}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("score --json should output valid JSON");
+        assert_eq!(json["score"].as_u64(), Some(0), "{url}: {stdout}");
+        assert_eq!(
+            json["findings"].as_array().map(Vec::len),
+            Some(0),
+            "{url}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn score_json_output() {
     let out = tirith()
