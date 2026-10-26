@@ -387,7 +387,8 @@ moderation and distribution packages such as nixpkgs may update later; if your
 package manager does not offer 0.5.0 yet, use the project tap or a signed
 GitHub release artifact.
 
-After updating, restart your shell, then run:
+After updating, open a new terminal (not `exec $SHELL`, which keeps the old
+shell's receipt registration and runs in legacy mode, #281), then run:
 
 ```bash
 tirith --version

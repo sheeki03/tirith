@@ -869,9 +869,9 @@ See `mcp/clients/` for the host-specific guides that are available.
 **GitHub Action** with SARIF upload to GitHub Security tab:
 
 ```yaml
-- uses: sheeki03/tirith@v0.4.2
+- uses: sheeki03/tirith@v0.5.0
   with:
-    version: 0.4.2
+    version: 0.5.0
     fail_on: high
     sarif: true
 ```
