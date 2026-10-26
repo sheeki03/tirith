@@ -43,7 +43,7 @@ These capabilities shipped in 0.4.0:
   resolver identity, native approval authority, contained hash-pinned pip
   installation, environment verification, provenance graphs, release diffs,
   PyPI attestation binding, and receipts. Enforcement is x86_64 Linux only.
-  The next release (0.5.0) removes the pip resolve, quarantine, firewall and
+  0.5.0 removes the pip resolve, quarantine, firewall and
   approval-issuance pipeline: `pkg install` and `pkg approve` refuse with
   `private_input_execution_unqualified`, while inspection, environment
   verification, provenance graphs, release diffs and reading existing receipts
