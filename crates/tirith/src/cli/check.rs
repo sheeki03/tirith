@@ -2339,12 +2339,22 @@ pub fn receipt_capability() -> i32 {
     }
 }
 
-pub fn register_receipt_instance(shell_pid: u32, family: execution_state::ShellHookFamily) -> i32 {
+pub fn register_receipt_instance(
+    shell_pid: u32,
+    family: execution_state::ShellHookFamily,
+    replace: bool,
+) -> i32 {
     let session_id = tirith_core::session::resolve_session_id();
+    let mode = if replace {
+        execution_state::RegistrationMode::Replace
+    } else {
+        execution_state::RegistrationMode::Fresh
+    };
     match execution_state::register_shell_hook_instance_with_delivery(
         shell_pid,
         family,
         &session_id,
+        mode,
         write_stdout_line_sigpipe_safe,
     ) {
         Ok(()) => 0,

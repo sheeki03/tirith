@@ -334,7 +334,7 @@ if [[ $- == *i* ]]; then
      && [[ "$_TIRITH_CAPTURE_LINE" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
     : >| "$_tirith_receipt_capture_file"
     if builtin command "$_TIRITH_BIN" __execution-receipt register \
-         --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
+         --family bash --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" --replace \
          >|"$_tirith_receipt_capture_file" 2>|"$_tirith_receipt_error_file" \
        && _tirith_read_single_capture_line "$_tirith_receipt_capture_file"; then
       _TIRITH_RECEIPT_INSTANCE="$_TIRITH_CAPTURE_LINE"
