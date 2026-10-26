@@ -134,6 +134,42 @@ fn history_expansion_findings(
     shell: ShellType,
     input_incomplete: bool,
 ) -> Vec<Finding> {
+    let mut findings = history_reference_findings(input, shell, input_incomplete);
+    let seeding = history_seeding_segments(input, shell);
+    if !seeding.is_empty() {
+        findings.push(crate::history_expansion::seeding_finding(&seeding));
+    }
+    findings
+}
+
+/// The segments of `input`, and of the bodies it runs in the current shell
+/// (`eval '...'`, a function), that add history entries (see
+/// [`crate::history_expansion::history_seeding_segments`]). Substitution
+/// bodies run in a subshell whose history is discarded; they are included
+/// anyway, which only reports more.
+fn history_seeding_segments(input: &str, shell: ShellType) -> Vec<String> {
+    if !crate::history_expansion::may_seed_history(input) {
+        return Vec::new();
+    }
+    let mut segments = crate::history_expansion::history_seeding_segments(input);
+    let bodies = crate::extract::with_best_effort_scan_work(|| {
+        collect_nested_executable_inputs(input, shell).0
+    });
+    for body in bodies {
+        if body.shell == ShellType::Posix {
+            segments.extend(crate::history_expansion::history_seeding_segments(
+                &body.input,
+            ));
+        }
+    }
+    segments
+}
+
+fn history_reference_findings(
+    input: &str,
+    shell: ShellType,
+    input_incomplete: bool,
+) -> Vec<Finding> {
     let expansions = crate::history_expansion::history_expansions(input);
     if expansions.is_empty() {
         return Vec::new();
@@ -165,8 +201,9 @@ fn history_expansion_findings(
 
 /// The Exec/Paste Tier-1 gate's history-expansion trigger: input read by an
 /// interactive POSIX shell that holds a history reference the shell rewrites
-/// before it parses the line (see [`crate::history_expansion`]). Public so the
-/// reachability tests can mirror every input-side trigger of the gate.
+/// before it parses the line, or that adds history entries a later re-run
+/// executes (see [`crate::history_expansion`]). Public so the reachability
+/// tests can mirror every input-side trigger of the gate.
 #[doc(hidden)]
 pub fn history_expansion_triggered(
     input: &str,
@@ -175,7 +212,8 @@ pub fn history_expansion_triggered(
     interactive: bool,
 ) -> bool {
     crate::history_expansion::applies(shell, scan_context, interactive)
-        && crate::history_expansion::has_history_expansion(input)
+        && (crate::history_expansion::has_history_expansion(input)
+            || !history_seeding_segments(input, shell).is_empty())
 }
 
 /// The Exec Tier-1 gate's executable-body trigger: a nested body (`$(...)`,

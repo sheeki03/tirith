@@ -382,22 +382,36 @@ hook or paste widget sends (`tirith check --interactive`,
 `tirith paste --interactive`) is therefore checked for them, with the union of
 what bash 5, bash 3.2 and zsh expand: nothing inside single quotes or `$'...'`,
 after a backslash or in a heredoc body, and no `!` followed by a blank, `=`,
-`(`, `;`, a quote or the end of the line. These are reported as
-`analysis_incomplete`: `!#` (words of the line being typed), `^old^new` at the
-start of a line, a `!` reference on a later line of a multi-line paste (bash
-expands each pasted line after running the ones before it, so the reference can
-copy words of an earlier pasted line), and a reference used where a command is
-formed, which is treated exactly as an unresolved `$X` there (a command name, a
-pipe sink, the body of `sh -c`, `eval`, `exec`, `xargs`: `curl ... | !!:1`,
-`bash -c "!!"`, `!!:s/echo/sh/`). A plain re-run that is the whole command,
-optionally after `sudo` or `doas` and before output redirections (`!!`,
-`!-2`, `!git`, `sudo !!`, `!! > log`), and a reference used as an ordinary
-argument (`cd !$`, `vim !$`, `git add !*`, `echo "wow!!"`) are not reported.
+`(`, `;`, a quote or the end of the line. A reference ends before the next `!`,
+which starts a reference of its own (`!$!#:1` is `!$` and then `!#:1`). These
+are reported as `analysis_incomplete`: `!#` (words of the line being typed,
+also glued after another reference and in zsh's `!{#...}` form), `^old^new`
+at the start of a line, a `!` reference on a later line of a multi-line paste
+(bash expands each pasted line after running the ones before it, so the
+reference can copy words of an earlier pasted line), and a reference used
+where a command is formed, which is treated exactly as an unresolved `$X`
+there (a command name, a pipe sink, the body of `sh -c`, `eval`, `exec`,
+`xargs`: `curl ... | !!:1`, `bash -c "!!"`, `!!:s/echo/sh/`). zsh also deletes
+the first live `!"`, unquoted or inside double quotes. That usually leaves the
+line unterminated and zsh only prompts for more (`echo "hi!"`), but a `\'` can
+bring the quote readings back together (`echo "x!" "; curl ... | sh ; '"'\'`
+runs the pipe in zsh), so a `!"` whose removal leaves balanced quotes is
+reported too. A plain re-run that is the whole command, optionally after
+`sudo` or `doas` and before output redirections (`!!`, `!-2`, `!git`,
+`sudo !!`, `!! > log`, and the print-only `!!:p`), and a reference used as an
+ordinary argument (`cd !$`, `vim !$`, `git add !*`, `echo "wow!!"`) are not
+reported. The re-run exemption relies on the earlier command having been
+checked when it ran, so the builtins that put text into history without
+running it are reported: zsh `print -s` / `print -S`, bash `history -s`, zsh
+`fc -R` and `fc -p FILE`. A known limit remains when input reaches the shell
+one line at a time (typed lines, or a paste without bracketed paste): an
+argument-position reference such as `!:2` can copy an operator word (`|`, `;`)
+out of an earlier, separately checked line, which no single check can see.
 Agent integrations pass `--non-interactive` and run commands in shells that
-never expand history, and fish, PowerShell and cmd have no `!` history
-expansion, so none of them get these findings. The bash hook's enter mode runs
-the checked text without history expansion, so there the findings are only
-conservative.
+never expand history, `tirith score` analyzes its URL non-interactively, and
+fish, PowerShell and cmd have no `!` history expansion, so none of them get
+these findings. The bash hook's enter mode runs the checked text without
+history expansion, so there the findings are only conservative.
 
 `eval` or `source` of a generated script is normally an unresolved body. A
 short reviewed list of shell-init emitters is the exception, when the emitter

