@@ -3501,8 +3501,10 @@ fn push_urls_hidden_in_scp_match(
 /// inside a schemeless, SCP-shaped `URL_REGEX` match whose SCP reading is
 /// bogus: it does not parse as `[user@]host:path` at all
 /// (`--@scope:registry=http://host/`), its host is the scheme name
-/// (`pkg@http://host/x.tgz`), or its path holds another `@`
-/// (`alias@npm:pkg@http://host/x.tgz`). A real remote such as
+/// (`pkg@http://host/x.tgz`), its path holds another `@`
+/// (`alias@npm:pkg@http://host/x.tgz`), or the scheme URL is the value of a
+/// `key=` (`npm_config_@scope:registry=http://host/`, which parses as user
+/// `npm_config_`, host `scope`). A real remote such as
 /// `git@github.com:org/repo.git` or `git@github.com:http://host/x` is left
 /// alone.
 fn scp_match_embedded_url_start(raw: &str, shell: ShellType) -> Option<usize> {
@@ -3510,10 +3512,13 @@ fn scp_match_embedded_url_start(raw: &str, shell: ShellType) -> Option<usize> {
         return None;
     }
     let start = embedded_scheme_url_start(raw)?;
-    let bogus = match parse_scp_remote_spec(raw, shell) {
-        None => true,
-        Some(spec) => raw.find('@').is_some_and(|at| at + 1 == start) || spec.path.contains('@'),
-    };
+    let bogus = raw[..start].ends_with('=')
+        || match parse_scp_remote_spec(raw, shell) {
+            None => true,
+            Some(spec) => {
+                raw.find('@').is_some_and(|at| at + 1 == start) || spec.path.contains('@')
+            }
+        };
     bogus.then_some(start)
 }
 
@@ -3649,7 +3654,11 @@ fn is_tirith_inspection_subcommand(sub: &str) -> bool {
 /// [`posix_double_quoted_escape_is_static`]), so `echo\ hi` and
 /// `"say \"hi\""` are proven, exactly as their single-quoted spellings are;
 /// [`crate::rules::command::normalize_shell_token`] removes the same
-/// backslashes, so a recovered body is the text the shell runs.
+/// backslashes, so a recovered body is the text the shell runs. Each single
+/// escape agrees, but one sequence does not: an interactive zsh's history
+/// lexer removes the backslash right before a `!` before escapes are paired,
+/// so an escaped backslash followed by `!` (`\\!`, unquoted or in double
+/// quotes) leaves `!` there and `\!` in bash; that word is not proven.
 fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
@@ -3685,6 +3694,9 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
             }
             Quote::Double => {
                 if shell == ShellType::Posix && ch == '\\' {
+                    if posix_escaped_backslash_before_bang(&chars, i) {
+                        return false;
+                    }
                     if posix_double_quoted_escape_is_static(chars.get(i + 1).copied()) {
                         i += 2;
                         continue;
@@ -3713,6 +3725,9 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
             }
             Quote::Normal => {
                 if shell == ShellType::Posix && ch == '\\' {
+                    if posix_escaped_backslash_before_bang(&chars, i) {
+                        return false;
+                    }
                     if posix_unquoted_escape_is_static(chars.get(i + 1).copied()) {
                         i += 2;
                         continue;
@@ -3755,12 +3770,21 @@ fn shell_word_is_proven_literal(raw: &str, shell: ShellType) -> bool {
 
 /// Whether an unquoted POSIX `\` followed by `next` stands for `next` alone
 /// in bash, zsh and dash alike. That holds for every printable ASCII
-/// character. A trailing `\` (the word, and so the input, continues on a line
-/// Tirith cannot see) and `\` before a newline (a line continuation that
-/// splices the next line into the word) are not proven, nor is any other
-/// escaped character.
+/// character on its own; the one sequence that differs, `\\!`, is refused by
+/// [`posix_escaped_backslash_before_bang`]. A trailing `\` (the word, and so
+/// the input, continues on a line Tirith cannot see) and `\` before a newline
+/// (a line continuation that splices the next line into the word) are not
+/// proven, nor is any other escaped character.
 fn posix_unquoted_escape_is_static(next: Option<char>) -> bool {
     next.is_some_and(|next| matches!(next, ' '..='~'))
+}
+
+/// The `\` at `chars[index]` escapes a backslash that a `!` follows (`\\!`).
+/// An interactive zsh's history lexer drops the backslash right before `!`
+/// before it pairs escapes, so `\\!` reads as `!` there and as `\!` in bash
+/// (`printf '[%s]' \\!` prints `[!]` in `zsh -i`, `[\!]` in `bash -i`).
+fn posix_escaped_backslash_before_bang(chars: &[char], index: usize) -> bool {
+    chars.get(index + 1) == Some(&'\\') && chars.get(index + 2) == Some(&'!')
 }
 
 /// Whether a POSIX `\` followed by `next` inside double quotes has one
@@ -4737,6 +4761,14 @@ fn is_strict_posix_reserved_word(raw: &str, expected: &str) -> bool {
 /// bash and dash run a command (or function) named `!` instead. Callers read
 /// it as the keyword in addition to their command-name reading, which covers
 /// both shells.
+///
+/// The keyword reading is right only for text the interactive zsh lexes
+/// itself: the typed or pasted line and its `$(...)`, backtick and `<(...)`
+/// bodies. Callers also apply it inside recovered `sh -c`, `eval` and
+/// heredoc bodies, where no history lexer runs and `\!` stays a command named
+/// `!` (`sh -c '\! rm -rf ~/'` never runs `rm`). That over-approximation is
+/// kept on purpose: it can only add findings, and only for this contrived
+/// spelling.
 fn is_posix_escaped_bang_word(raw: &str) -> bool {
     is_strict_posix_reserved_word(raw, "\\!")
 }
@@ -11218,6 +11250,40 @@ fn posix_segment_uses_reserved_time(segment: &tokenize::Segment) -> bool {
         && !matches!(segment.preceding_separator.as_deref(), Some("|" | "|&"))
 }
 
+/// Index in `segment.args` of the first word after a reserved `time`'s `-p`
+/// and `--`, or `None` when the segment does not use the reserved word.
+fn posix_reserved_time_operand_index(segment: &tokenize::Segment) -> Option<usize> {
+    if !posix_segment_uses_reserved_time(segment) {
+        return None;
+    }
+    let mut index = 0usize;
+    if segment
+        .args
+        .get(index)
+        .is_some_and(|word| is_strict_posix_reserved_word(word, "-p"))
+    {
+        index += 1;
+    }
+    if segment
+        .args
+        .get(index)
+        .is_some_and(|word| is_strict_posix_reserved_word(word, "--"))
+    {
+        index += 1;
+    }
+    Some(index)
+}
+
+/// Whether a reserved `time` (after its `-p` / `--`) is followed by the `!`
+/// keyword (or `\!`, see [`is_posix_escaped_bang_word`]). bash and zsh read
+/// `time ! cmd` and `time -p ! cmd` as a timed, negated pipeline, so `cmd`
+/// runs exactly as it would after a bare `!`.
+fn posix_reserved_time_leads_bang(segment: &tokenize::Segment) -> bool {
+    posix_reserved_time_operand_index(segment)
+        .and_then(|index| segment.args.get(index))
+        .is_some_and(|word| is_posix_bang_keyword_word(word))
+}
+
 pub(crate) fn posix_current_scope_dispatch_scan(
     segment: &tokenize::Segment,
 ) -> Option<ExecutableSubstitutionScan> {
@@ -12797,7 +12863,10 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             || segment.command.as_deref().is_some_and(|raw| {
                 is_strict_posix_reserved_word(raw, command.as_str())
                     || (command == "!" && is_posix_escaped_bang_word(raw))
-            });
+            })
+            // `time ! cmd`: the wrapper resolver peels the reserved `time`
+            // and lands on the `!` keyword.
+            || (command == "!" && posix_reserved_time_leads_bang(&segment));
         if shell == ShellType::Posix {
             let literal_leader = segment
                 .command
@@ -13003,7 +13072,9 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 // coprocess; `coproc` is syntax, not the effective leader.
                 scan_posix_coproc(&args, shell, scan);
             }
-            "if" | "while" | "and" | "or" | "not" | "begin" if shell == ShellType::Fish => {
+            // fish's `!` is `not`, in any quoting (`\!` and `'!'` too: it is a
+            // builtin looked up by its unquoted name).
+            "if" | "while" | "and" | "or" | "not" | "!" | "begin" if shell == ShellType::Fish => {
                 push_control_prefix_body(&args, shell, scan);
             }
             _ => {}
@@ -14124,26 +14195,22 @@ fn posix_current_shell_builtin_invocation(
         return posix_current_shell_builtin_from_words(target, &segment.args[1..], 0);
     }
 
-    if command == "time" && posix_segment_uses_reserved_time(segment) {
-        let mut index = 0usize;
-        if segment
-            .args
-            .get(index)
-            .is_some_and(|word| is_strict_posix_reserved_word(word, "-p"))
-        {
-            index += 1;
+    if command == "time" {
+        if let Some(mut index) = posix_reserved_time_operand_index(segment) {
+            // `time ! cmd` times the negated `cmd` (see
+            // `posix_reserved_time_leads_bang`).
+            while segment
+                .args
+                .get(index)
+                .is_some_and(|word| is_posix_bang_keyword_word(word))
+            {
+                index += 1;
+            }
+            let Some(target) = segment.args.get(index) else {
+                return Ok(None);
+            };
+            return posix_current_shell_builtin_from_words(target, &segment.args[index + 1..], 0);
         }
-        if segment
-            .args
-            .get(index)
-            .is_some_and(|word| is_strict_posix_reserved_word(word, "--"))
-        {
-            index += 1;
-        }
-        let Some(target) = segment.args.get(index) else {
-            return Ok(None);
-        };
-        return posix_current_shell_builtin_from_words(target, &segment.args[index + 1..], 0);
     }
 
     posix_current_shell_builtin_from_words(command_raw, &segment.args, 0)
@@ -25086,6 +25153,9 @@ mod tests {
             r"cu\rl",
             r"\!",
             r"a\!b",
+            // An odd run ends in `\!`, which both shells read as `!`.
+            r"a\\\!b",
+            r"a\\b",
             r"\~/x",
             r"\*",
             r"\$\(id\)",
@@ -25103,6 +25173,12 @@ mod tests {
             // An interactive zsh drops this backslash; bash and dash keep it.
             r#""a\!b""#,
             r#""\! rm -rf ~/""#,
+            // zsh's history lexer drops the backslash before `!` before
+            // escapes pair up, so `\\!` is `!` there and `\!` in bash.
+            r"a\\!b",
+            r"\\!",
+            r"a\\\\!b",
+            r#""a\\!b""#,
             // A trailing backslash or a line continuation joins text Tirith
             // cannot see (or splices the next line into the word).
             r"echo\",

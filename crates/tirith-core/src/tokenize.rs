@@ -2062,6 +2062,16 @@ fn command_and_args_past_redirections(
     (command, args)
 }
 
+/// A `NAME=VALUE` operand of the `env` utility. GNU and BSD `env` set every
+/// leading operand after their options that contains `=`, whatever the name
+/// (`env 'npm_config_@scope:registry=http://host/' npm install` sets that
+/// variable, which npm reads, and runs `npm`), while a shell assignment
+/// ([`is_env_assignment`]) needs an identifier. A word that starts with `=`
+/// (which `env` rejects) or with `-` (an option) is not one.
+pub fn is_env_wrapper_assignment(word: &str) -> bool {
+    !word.starts_with(['-', '=']) && word.contains('=')
+}
+
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
 /// Must have at least one char before `=`, and the name must be alphanumeric/underscore.
 pub fn is_env_assignment(word: &str) -> bool {

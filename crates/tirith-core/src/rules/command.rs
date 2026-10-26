@@ -1698,14 +1698,17 @@ fn wrapper_disposition(
     let mut idx = 0;
     while idx < args.len() {
         let normalized = normalize_shell_token(args[idx].trim(), shell);
+        // `env` sets any `NAME=VALUE` operand, whatever the name (see
+        // `tokenize::is_env_wrapper_assignment`); sudo's are shell names.
+        let assignment = |word: &str| match wrapper {
+            "env" => tokenize::is_env_wrapper_assignment(word),
+            "sudo" => tokenize::is_env_assignment(word),
+            _ => false,
+        };
         if normalized == "--" {
             idx += 1;
-            if matches!(wrapper, "env" | "sudo") {
-                while idx < args.len()
-                    && tokenize::is_env_assignment(&normalize_shell_token(&args[idx], shell))
-                {
-                    idx += 1;
-                }
+            while idx < args.len() && assignment(&normalize_shell_token(&args[idx], shell)) {
+                idx += 1;
             }
             return Ok(if idx < args.len() {
                 WrapperDisposition::Execute(idx)
@@ -1713,7 +1716,7 @@ fn wrapper_disposition(
                 WrapperDisposition::Terminal
             });
         }
-        if matches!(wrapper, "env" | "sudo") && tokenize::is_env_assignment(&normalized) {
+        if assignment(&normalized) {
             idx += 1;
             continue;
         }
@@ -2096,12 +2099,32 @@ fn record_environment_assignment(
     shell: ShellType,
 ) {
     let normalized = normalize_shell_token(assignment, shell);
+    if tokenize::is_env_assignment(&normalized) {
+        record_normalized_environment_assignment(environment, &normalized, shell);
+    }
+}
+
+/// [`record_environment_assignment`] for an `env` operand, whose name need
+/// not be an identifier (see [`tokenize::is_env_wrapper_assignment`]).
+fn record_env_wrapper_assignment(
+    environment: &mut EffectiveEnvironment,
+    assignment: &str,
+    shell: ShellType,
+) {
+    let normalized = normalize_shell_token(assignment, shell);
+    if tokenize::is_env_wrapper_assignment(&normalized) {
+        record_normalized_environment_assignment(environment, &normalized, shell);
+    }
+}
+
+fn record_normalized_environment_assignment(
+    environment: &mut EffectiveEnvironment,
+    normalized: &str,
+    shell: ShellType,
+) {
     let Some((name, value)) = normalized.split_once('=') else {
         return;
     };
-    if !tokenize::is_env_assignment(&normalized) {
-        return;
-    }
     let unresolved = value.contains('$')
         || value.contains('`')
         || (shell == ShellType::Cmd && value.matches('%').count() >= 2);
@@ -2183,16 +2206,16 @@ fn collect_env_wrapper_environment_depth(
             idx += 1;
             while idx < args.len() {
                 let assignment = normalize_shell_token(&args[idx], shell);
-                if !tokenize::is_env_assignment(&assignment) {
+                if !tokenize::is_env_wrapper_assignment(&assignment) {
                     return;
                 }
-                record_environment_assignment(environment, &assignment, shell);
+                record_env_wrapper_assignment(environment, &assignment, shell);
                 idx += 1;
             }
             return;
         }
-        if tokenize::is_env_assignment(&arg) {
-            record_environment_assignment(environment, &arg, shell);
+        if tokenize::is_env_wrapper_assignment(&arg) {
+            record_env_wrapper_assignment(environment, &arg, shell);
             idx += 1;
             continue;
         }
@@ -2366,7 +2389,7 @@ fn env_wrapper_changes_cwd(args: &[String], shell: ShellType) -> bool {
     let mut index = 0;
     while index < args.len() {
         let arg = normalize_shell_token(&args[index], shell);
-        if tokenize::is_env_assignment(&arg) {
+        if tokenize::is_env_wrapper_assignment(&arg) {
             index += 1;
             continue;
         }
@@ -4418,7 +4441,7 @@ const COMMAND_START_WORDS: &[&str] = &[
 ];
 
 /// fish words that start a new command inside the same tokenizer segment.
-const FISH_COMMAND_START_WORDS: &[&str] = &["and", "or", "not", "begin", "switch"];
+const FISH_COMMAND_START_WORDS: &[&str] = &["and", "or", "not", "!", "begin", "switch"];
 
 const MAX_PYTHON_INSPECT_EVAL_DEPTH: usize = 2;
 
@@ -10913,7 +10936,7 @@ fn prints_whole_environment(command: &str, args: &[String], shell: ShellType) ->
                     }
                     _ if word.starts_with("--unset=")
                         || (word.starts_with("-u") && word.len() > 2) => {}
-                    _ if tokenize::is_env_assignment(&word) => {}
+                    _ if tokenize::is_env_wrapper_assignment(&word) => {}
                     _ => return false,
                 }
             }

