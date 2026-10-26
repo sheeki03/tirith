@@ -232,6 +232,13 @@ every change in detail.
   network-deny checks.
 - A bare number given as a curl proxy (`curl -x 8080 …`) is read as a numeric
   host and warns `raw_ip_url`.
+- A URL glued to a package name or config key (`npm install pkg@http://…`,
+  `pip install pkg@https://…`, `npm install --@scope:registry=http://…`,
+  `env npm_config_@scope:registry=http://… npm install @scope/pkg`) gets the
+  checks the bare URL gets; these were allowed without findings (found while
+  reviewing [#276](https://github.com/sheeki03/tirith/pull/276)). `env` takes
+  any `NAME=VALUE` operand as an assignment, so `env x@y=1 rm -rf ~/` is
+  analyzed as `rm`.
 
 ## Shells
 
@@ -255,6 +262,20 @@ every change in detail.
   reads a `#` inside `${...}` or backticks, quotes inside a substitution, a
   heredoc inside `$(...)` and a redirection joined to the command word the
   way the shells do.
+- **History expansion.** In an interactive bash or zsh, a line that history
+  expansion would turn into a different command blocks as incomplete
+  analysis: `!#` (zsh runs `true sh; curl … | !#:1` as `curl … | sh`, which
+  0.4.2 allowed), `^old^new`, a reference that forms a command
+  (`curl … | !!:1`, `eval !!`), a zsh `!"` deletion that changes the quoting,
+  and `print -s`, `history -s` or `fc -R`, which add history entries a later
+  re-run would execute unchecked. Plain re-runs (`!!`, `sudo !!`, `!git`,
+  `!-2`) and references used as arguments (`cd !$`, `vim !$`) still run.
+  Agent commands are not affected.
+- `-c` scripts written with backslash escapes
+  (`bash -c "git commit -m \"fix bug\""`) are analyzed instead of blocking as
+  incomplete analysis (the proposal in
+  [#279](https://github.com/sheeki03/tirith/pull/279), reimplemented).
+  `\! cmd`, `time ! cmd` and fish's `! cmd` are analyzed as `cmd`.
 
 ## Packaging
 
@@ -349,6 +370,10 @@ every change in detail.
 - On Windows, the Gemini CLI and Kiro hook commands run the pinned Python
   directly, so a moved or removed interpreter makes them fail open until
   `tirith setup` is run again.
+- In an interactive bash or zsh, a re-run behind a wrapper (`time !!`,
+  `nohup !! &`, `(!!)`) blocks as incomplete analysis, and a history
+  reference that copies words from an earlier, separately entered line
+  (`!:2`) is checked as typed.
 - Source ages in `tirith threat-db status` and `health` stay unavailable, and
   `tirith threat-db update` prints a "source evidence HTTP 404" notice, until
   the v2 threat feed is enabled. The signed database still updates and
