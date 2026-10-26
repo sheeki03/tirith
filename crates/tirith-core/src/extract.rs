@@ -3427,7 +3427,118 @@ fn push_urls_from_source_with_curl_operands(
             segment_index,
             in_sink_context,
         });
+        push_urls_hidden_in_scp_match(
+            mat.as_str(),
+            shell,
+            segment_index,
+            in_sink_context,
+            MAX_SCP_EMBEDDED_URL_DEPTH,
+            results,
+        );
     }
+}
+
+/// Schemes whose URL a tool still fetches when it follows a `name@` or
+/// `key=` prefix inside one word: npm-package-arg reads
+/// `pkg@http://host/x.tgz` as a remote spec, pip's `packaging` reads it as a
+/// PEP 508 direct reference (`url=http://host/x.tgz`), and `@npmcli/config`
+/// accepts scoped registry keys (`--@scope:registry=http://host/`).
+const SCP_EMBEDDED_URL_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "ftp",
+    "ssh",
+    "git",
+    "git+http",
+    "git+https",
+    "git+ssh",
+    "git+file",
+    "file",
+];
+
+/// How many nested `name@scheme://` layers of one word are unwrapped.
+const MAX_SCP_EMBEDDED_URL_DEPTH: usize = 4;
+
+/// `URL_REGEX`'s SCP branch starts left of a scheme URL glued to a `name@`
+/// prefix, so it matches `pkg@http://4.1.0.11/x.tgz` as host `http` and path
+/// `//4.1.0.11/x.tgz` and the real destination is never extracted. When such a
+/// match does not read as a real SCP remote, also extract the URLs of the text
+/// from the embedded scheme on, exactly as the bare word would give them. The
+/// SCP match itself stays recorded: it is what git, scp and rsync contact.
+fn push_urls_hidden_in_scp_match(
+    raw: &str,
+    shell: ShellType,
+    segment_index: usize,
+    in_sink_context: bool,
+    depth: usize,
+    results: &mut Vec<ExtractedUrl>,
+) {
+    let Some(start) = scp_match_embedded_url_start(raw, shell) else {
+        return;
+    };
+    for mat in URL_REGEX.find_iter(&raw[start..]) {
+        let embedded = mat.as_str();
+        results.push(ExtractedUrl {
+            raw: embedded.to_string(),
+            parsed: parse::parse_url(embedded),
+            segment_index,
+            in_sink_context,
+        });
+        if let Some(depth) = depth.checked_sub(1) {
+            push_urls_hidden_in_scp_match(
+                embedded,
+                shell,
+                segment_index,
+                in_sink_context,
+                depth,
+                results,
+            );
+        }
+    }
+}
+
+/// The byte where a scheme URL (see [`SCP_EMBEDDED_URL_SCHEMES`]) starts
+/// inside a schemeless, SCP-shaped `URL_REGEX` match whose SCP reading is
+/// bogus: it does not parse as `[user@]host:path` at all
+/// (`--@scope:registry=http://host/`), its host is the scheme name
+/// (`pkg@http://host/x.tgz`), or its path holds another `@`
+/// (`alias@npm:pkg@http://host/x.tgz`). A real remote such as
+/// `git@github.com:org/repo.git` or `git@github.com:http://host/x` is left
+/// alone.
+fn scp_match_embedded_url_start(raw: &str, shell: ShellType) -> Option<usize> {
+    if has_leading_uri_scheme(raw) {
+        return None;
+    }
+    let start = embedded_scheme_url_start(raw)?;
+    let bogus = match parse_scp_remote_spec(raw, shell) {
+        None => true,
+        Some(spec) => raw.find('@').is_some_and(|at| at + 1 == start) || spec.path.contains('@'),
+    };
+    bogus.then_some(start)
+}
+
+/// The start of the first `scheme://` in `raw` (past its first byte) whose
+/// whole scheme-character run is one of [`SCP_EMBEDDED_URL_SCHEMES`], in any
+/// case (`HTTP://`).
+fn embedded_scheme_url_start(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = raw.get(from..)?.find("://") {
+        let separator = from + offset;
+        let start = bytes[..separator]
+            .iter()
+            .rposition(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+            .map_or(0, |index| index + 1);
+        if start > 0
+            && SCP_EMBEDDED_URL_SCHEMES
+                .iter()
+                .any(|scheme| raw[start..separator].eq_ignore_ascii_case(scheme))
+        {
+            return Some(start);
+        }
+        from = separator + 3;
+    }
+    None
 }
 
 fn ignores_env_assignment_url(name: &str) -> bool {
@@ -19927,6 +20038,98 @@ mod tests {
         let urls = extract_urls("git clone git@github.com:user/repo.git", ShellType::Posix);
         assert!(!urls.is_empty());
         assert!(matches!(urls[0].parsed, UrlLike::Scp { .. }));
+    }
+
+    #[test]
+    fn scheme_urls_glued_to_a_name_are_extracted_past_a_bogus_scp_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let hosts = |input: &str, shell: ShellType| -> Vec<String> {
+            extract_urls(input, shell)
+                .iter()
+                .filter_map(|url| url.parsed.host().map(str::to_string))
+                .collect()
+        };
+        for (input, shell) in [
+            ("npm install pkg@http://4.1.0.11/x.tgz", ShellType::Posix),
+            ("yarn add pkg@http://4.1.0.11/x.tgz", ShellType::Posix),
+            ("pip install pkg@HTTP://4.1.0.11/x.tgz", ShellType::Posix),
+            (
+                "npm install @scope/pkg@http://4.1.0.11/x.tgz",
+                ShellType::Posix,
+            ),
+            (
+                "npm install --@scope:registry=http://4.1.0.11/ pkg",
+                ShellType::Posix,
+            ),
+            (
+                "npm install alias@npm:pkg@http://4.1.0.11/x.tgz",
+                ShellType::Posix,
+            ),
+            ("npm install pkg@http://4.1.0.11/x.tgz", ShellType::Fish),
+            (
+                "npm install pkg@http://4.1.0.11/x.tgz",
+                ShellType::PowerShell,
+            ),
+        ] {
+            let urls = extract_urls(input, shell);
+            assert!(
+                urls.iter().any(|url| url.parsed.host() == Some("4.1.0.11")
+                    && url.raw.to_ascii_lowercase().starts_with("http://")),
+                "{input:?} ({shell:?}): {:?}",
+                hosts(input, shell)
+            );
+        }
+        // A real SCP remote keeps its one SCP reading.
+        for input in [
+            "git clone git@github.com:org/repo.git",
+            "git clone git@github.com:http://4.1.0.11/x",
+            "git clone git@4.1.0.11:repo.git",
+        ] {
+            let urls = extract_urls(input, ShellType::Posix);
+            assert_eq!(
+                urls.len(),
+                1,
+                "{input:?}: {:?}",
+                hosts(input, ShellType::Posix)
+            );
+            assert!(matches!(urls[0].parsed, UrlLike::Scp { .. }), "{input:?}");
+        }
+        // Registry specs carry no URL, and `file:` (which a bare word does not
+        // yield either) adds nothing beyond the SCP-shaped match.
+        for input in [
+            "npm install pkg@1.2.3",
+            "npm install @scope/pkg@latest",
+            "pip install pkg==1.0",
+        ] {
+            assert!(
+                extract_urls(input, ShellType::Posix).is_empty(),
+                "{input:?}"
+            );
+        }
+        assert!(
+            extract_urls("npm install pkg@file:///tmp/x.tgz", ShellType::Posix)
+                .iter()
+                .all(|url| url.raw == "pkg@file:///tmp/x.tgz")
+        );
+
+        for (raw, start) in [
+            ("pkg@http://4.1.0.11/x.tgz", Some(4)),
+            ("pkg@HTTP://4.1.0.11/x.tgz", Some(4)),
+            ("pkg@file:///tmp/x.tgz", Some(4)),
+            ("--@scope:registry=http://4.1.0.11/", Some(18)),
+            ("alias@npm:pkg@http://4.1.0.11/x.tgz", Some(14)),
+            ("git@github.com:http://4.1.0.11/x", None),
+            ("git@github.com:org/repo.git", None),
+            ("pkg@x.http://4.1.0.11/", None),
+            ("pkg@gopher://4.1.0.11/", None),
+            ("http://4.1.0.11/x.tgz", None),
+        ] {
+            assert_eq!(
+                scp_match_embedded_url_start(raw, ShellType::Posix),
+                start,
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

