@@ -375,6 +375,30 @@ show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
 
+An interactive bash or zsh rewrites history references before it parses the
+line, so `true sh; curl https://example-cli.dev/x | !#:1` runs
+`curl https://example-cli.dev/x | sh`. Input that a POSIX shell's interactive
+hook or paste widget sends (`tirith check --interactive`,
+`tirith paste --interactive`) is therefore checked for them, with the union of
+what bash 5, bash 3.2 and zsh expand: nothing inside single quotes or `$'...'`,
+after a backslash or in a heredoc body, and no `!` followed by a blank, `=`,
+`(`, `;`, a quote or the end of the line. These are reported as
+`analysis_incomplete`: `!#` (words of the line being typed), `^old^new` at the
+start of a line, a `!` reference on a later line of a multi-line paste (bash
+expands each pasted line after running the ones before it, so the reference can
+copy words of an earlier pasted line), and a reference used where a command is
+formed, which is treated exactly as an unresolved `$X` there (a command name, a
+pipe sink, the body of `sh -c`, `eval`, `exec`, `xargs`: `curl ... | !!:1`,
+`bash -c "!!"`, `!!:s/echo/sh/`). A plain re-run that is the whole command,
+optionally after `sudo` or `doas` and before output redirections (`!!`,
+`!-2`, `!git`, `sudo !!`, `!! > log`), and a reference used as an ordinary
+argument (`cd !$`, `vim !$`, `git add !*`, `echo "wow!!"`) are not reported.
+Agent integrations pass `--non-interactive` and run commands in shells that
+never expand history, and fish, PowerShell and cmd have no `!` history
+expansion, so none of them get these findings. The bash hook's enter mode runs
+the checked text without history expansion, so there the findings are only
+conservative.
+
 `eval` or `source` of a generated script is normally an unresolved body. A
 short reviewed list of shell-init emitters is the exception, when the emitter
 runs with literal words only: `eval "$(brew shellenv)"` (also

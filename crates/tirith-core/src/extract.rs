@@ -8176,15 +8176,20 @@ fn posix_input_has_word_start_comment(raw: &str) -> bool {
 /// arithmetic, even inside double quotes); a zsh `$~` / `$=` / `$^` expansion
 /// flag (`$~X` glob-substitutes a value that can hide an `e:...:` qualifier
 /// behind `$'\x28'`); a backslash-newline (the shell splices it out, so
-/// `BI\<newline>N=x` assigns `BIN` without spelling it); a `!` that can start
-/// an interactive history expansion; any `(` that is not a command/process
+/// `BI\<newline>N=x` assigns `BIN` without spelling it); an interactive
+/// history reference (a live `!` reference or a line-start `^` quick
+/// substitution, see [`crate::history_expansion`], which an interactive shell
+/// rewrites before it parses the line); any `(` that is not a command/process
 /// substitution opener (`$(`, `<(`, `>(`) or inside a quoted literal word
 /// (function definitions, zsh glob qualifiers and anonymous functions, arrays,
 /// subshells); and any unquoted expansion in a command segment (a live
 /// `GLOB_SUBST` makes an unquoted `$X` behave like `$~X`).
 fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segment]) -> bool {
     let bytes = raw.as_bytes();
-    if raw.contains("\\\n") || raw.contains("\\\r") {
+    if raw.contains("\\\n")
+        || raw.contains("\\\r")
+        || crate::history_expansion::has_history_expansion(raw)
+    {
         return true;
     }
     // Characters of a parameter reference after `$`: names, positional and
@@ -8202,13 +8207,6 @@ fn posix_input_has_hidden_binding_syntax(raw: &str, segments: &[tokenize::Segmen
             if end > index + 1 && bytes.get(end) == Some(&b'[') {
                 return true;
             }
-        }
-        if *byte == b'!'
-            && bytes
-                .get(index + 1)
-                .is_some_and(|next| !next.is_ascii_whitespace() && *next != b'=')
-        {
-            return true;
         }
         if *byte == b'(' && bytes.get(index + 1) == Some(&b'(') {
             return true;

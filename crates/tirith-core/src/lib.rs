@@ -43,6 +43,7 @@ pub mod execution_state;
 pub mod extract;
 pub mod history;
 pub mod history_aggregate;
+mod history_expansion;
 pub mod homoglyph;
 pub mod hygiene;
 pub mod iac_plan;

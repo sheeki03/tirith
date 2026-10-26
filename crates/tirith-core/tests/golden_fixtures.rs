@@ -832,8 +832,20 @@ fn test_tier1_coverage() {
             // steer) that Tirith cannot resolve never takes the fast exit.
             let body_triggered = scan_context == ScanContext::Exec
                 && tirith_core::engine::exec_executable_body_triggered(&fixture.input, shell);
+            // Fixtures are analyzed as interactive input (`run_fixture`), where
+            // a history reference that rewrites the line is a trigger of its own.
+            let history_triggered = tirith_core::engine::history_expansion_triggered(
+                &fixture.input,
+                shell,
+                scan_context,
+                true,
+            );
 
-            if !regex_triggered && !sensitive_asset_triggered && !body_triggered {
+            if !regex_triggered
+                && !sensitive_asset_triggered
+                && !body_triggered
+                && !history_triggered
+            {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action

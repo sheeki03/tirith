@@ -123,6 +123,61 @@ fn collect_nested_executable_inputs(
     (bodies, incomplete)
 }
 
+/// Findings for the interactive history references in `input` (see
+/// [`crate::history_expansion`]); the caller checks
+/// [`crate::history_expansion::applies`]. `input_incomplete` is whether the
+/// executable-body scan of `input` itself already found a gap: a reference
+/// that only shares a command position with an unresolved word adds nothing
+/// to the finding that gap produces.
+fn history_expansion_findings(
+    input: &str,
+    shell: ShellType,
+    input_incomplete: bool,
+) -> Vec<Finding> {
+    let expansions = crate::history_expansion::history_expansions(input);
+    if expansions.is_empty() {
+        return Vec::new();
+    }
+    let rewriting = crate::history_expansion::rewriting_references(&expansions);
+    if !rewriting.is_empty() {
+        return vec![crate::history_expansion::rewrite_finding(input, &rewriting)];
+    }
+    if input_incomplete {
+        return Vec::new();
+    }
+    let Some(probe) = crate::history_expansion::command_probe(input, &expansions) else {
+        return Vec::new();
+    };
+    // Each reference now reads as an unresolved `$X`; the scan that blocks
+    // `curl ... | $X`, `sudo $X`, `bash -c "$X"` and `eval "$X"` decides
+    // whether one is used where a command is formed. Best-effort budget: the
+    // probe must not starve the rest of this analysis, and running out still
+    // reports the probe incomplete.
+    let probe_incomplete = crate::extract::with_best_effort_scan_work(|| {
+        collect_nested_executable_inputs(&probe.text, shell).1
+    });
+    if probe_incomplete {
+        vec![crate::history_expansion::command_finding(input, &probe)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The Exec/Paste Tier-1 gate's history-expansion trigger: input read by an
+/// interactive POSIX shell that holds a history reference the shell rewrites
+/// before it parses the line (see [`crate::history_expansion`]). Public so the
+/// reachability tests can mirror every input-side trigger of the gate.
+#[doc(hidden)]
+pub fn history_expansion_triggered(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+) -> bool {
+    crate::history_expansion::applies(shell, scan_context, interactive)
+        && crate::history_expansion::has_history_expansion(input)
+}
+
 /// The Exec Tier-1 gate's executable-body trigger: a nested body (`$(...)`,
 /// `eval`, `sh -c`, a function or heredoc body) Tirith could not resolve
 /// completely, or a recovered body that itself matches the Tier-1 patterns or
@@ -3033,6 +3088,13 @@ fn analyze_with_observation(
     let executable_body_triggered = ctx.scan_context == ScanContext::Exec
         && exec_executable_body_triggered(&ctx.input, ctx.shell);
 
+    // An interactive bash/zsh rewrites a history reference (`!#:1`, `!!:s/a/b/`,
+    // `^old^new`) before it parses the line, so the rewritten command may carry
+    // no tier-1 pattern of its own. Only input read by an interactive POSIX
+    // shell is affected (see `history_expansion::applies`).
+    let history_expansion_triggered =
+        history_expansion_triggered(&ctx.input, ctx.shell, ctx.scan_context, ctx.interactive);
+
     // Exec-only: catch bidi/zero-width/invisible bytes even with no URL.
     // Proven-literal `tirith diff/score/why/receipt/explain` args are carved out
     // (inspection targets) for the eight Unicode-style rule classes only.
@@ -3204,6 +3266,7 @@ fn analyze_with_observation(
         && !regex_triggered
         && !sensitive_asset_triggered
         && !executable_body_triggered
+        && !history_expansion_triggered
         && !exec_bidi_triggered
         && !exec_guard_triggered
         && !hooks_guard_triggered
@@ -3598,6 +3661,14 @@ fn analyze_with_observation(
             ctx.python_inspect_inherited,
         );
         findings.extend(command_findings);
+
+        if crate::history_expansion::applies(ctx.shell, ctx.scan_context, ctx.interactive) {
+            findings.extend(history_expansion_findings(
+                &typed_input,
+                ctx.shell,
+                nested_execution_incomplete,
+            ));
+        }
 
         // C10 — Web3 execution boundary. The bounded parser from the parser
         // slice runs here for the first time and its facts become findings.
