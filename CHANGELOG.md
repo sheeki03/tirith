@@ -151,6 +151,7 @@ This release removes `tirith-core` library API (see Removed), so it is `0.5.0`, 
 ### Security
 
 - Update rustls to 0.23.46 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349) in the workspace and fuzz lockfiles.
+- Update rustls-webpki to 0.103.16 (RUSTSEC-2026-0382) and webpki-roots to 1.0.11 (RUSTSEC-2026-0381), which no longer accept certificate paths through the distrusted emSign intermediates, and tokio to 1.51.6 (RUSTSEC-2026-0386, unsound `AsyncFd` constructors that Tirith does not use), in the workspace and fuzz lockfiles (tokio 1.54.1 in the fuzz lockfile). 0.4.2 shipped the affected rustls-webpki 0.103.13, webpki-roots 1.0.6 and tokio 1.49.0.
 
 ### Known issues
 
