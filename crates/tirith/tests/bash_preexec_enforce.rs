@@ -178,6 +178,63 @@ echo clean_post_block && touch {sentinels}/clean_ran
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
+/// With `shopt -u interactive_comments` bash runs the text after a word-start
+/// `#`. The hook reads the option at each check and then passes
+/// `--no-interactive-comments`, and its whole-line drift check takes that `#`
+/// as a word, so the command hidden behind it is blocked instead of the
+/// session degrading to warn-only. With the option back on, the flag is gone.
+#[test]
+fn enforce_passes_comment_state_and_blocks_text_after_hash() {
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+echo visible # comment_on_marker
+shopt -u interactive_comments
+echo hi #; sh -c 'touch {sentinels}/hidden_ran' BLOCK_TOKEN-hash
+touch {sentinels}/after_ran
+shopt -s interactive_comments
+echo back # comment_again_marker
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        !sentinel_path(&sentinel_dir, "hidden_ran").exists(),
+        "the command after `#` must be blocked; stderr: {stderr}\ninvocations: {invocations:#?}"
+    );
+    assert!(
+        sentinel_path(&sentinel_dir, "after_ran").exists(),
+        "enforcement must continue after the block; stderr: {stderr}\ninvocations: {invocations:#?}"
+    );
+    assert!(
+        !stderr.contains("falling back to warn-only"),
+        "the drift check must accept a word-start `#` as a word: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|line| line.contains("BLOCK_TOKEN-hash")
+                && line.contains("--no-interactive-comments")),
+        "checks must report the option while it is off: {invocations:#?}"
+    );
+    for marker in ["comment_on_marker", "comment_again_marker"] {
+        let checks: Vec<_> = invocations
+            .iter()
+            .filter(|line| line.contains(marker))
+            .collect();
+        assert!(!checks.is_empty(), "{marker}: {invocations:#?}");
+        assert!(
+            checks
+                .iter()
+                .all(|line| !line.contains("--no-interactive-comments")),
+            "{marker}: no flag while the option is on: {invocations:#?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
 #[test]
 fn invalid_mode_warns_and_cannot_bypass_requested_enforcement() {
     let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(

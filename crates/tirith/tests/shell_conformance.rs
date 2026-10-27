@@ -1898,6 +1898,61 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
     sess.close();
 }
 
+/// zsh runs the text after a word-start `#` unless `interactivecomments` is
+/// set, and `zsh -f -i` leaves it unset (zsh's default). The hook reports the
+/// option at every check, so a pipe to `sh` hidden behind `#` is blocked and
+/// nothing on the line runs; after `setopt interactivecomments` in the same
+/// session the `#` starts a comment again and only the text before it runs.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_hook_reads_hash_text_by_the_live_interactivecomments_option() {
+    let mut env = IsolatedEnv::new();
+    let hidden = env.workdir.join("zsh_hash_hidden.txt");
+    let visible = env.workdir.join("zsh_hash_visible.txt");
+    let mut sess = match zsh_session(&mut env) {
+        Some(session) => session,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+
+    sess.send_line(&format!(
+        "print -r -- hi #; printf 'true' | sh; touch '{}'",
+        hidden.display()
+    ));
+    let output = sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    assert!(
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
+        "the text after `#` must be checked while interactivecomments is unset, got:\n{output}"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!hidden.exists(), "a blocked line must not run");
+    sess.clear_buffer();
+
+    sess.send_line("setopt interactivecomments");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    sess.send_line(&format!(
+        "print -r -- RAN >> '{}' #; printf 'true' | sh; touch '{}'",
+        visible.display(),
+        hidden.display()
+    ));
+    let body = wait_for_marker(&visible, "RAN", MARKER_MAX);
+    assert_eq!(count_occurrences(&body, "RAN"), 1, "{body:?}");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !hidden.exists(),
+        "with interactivecomments set the text after `#` is a comment and must not run"
+    );
+    sess.close();
+}
+
 // === PowerShell / nushell follow-up stubs ===
 
 /// Follow-up stub: PowerShell PTY conformance is not yet implemented.

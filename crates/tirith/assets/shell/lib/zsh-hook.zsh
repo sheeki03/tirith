@@ -354,6 +354,16 @@ _tirith_parse_warn_ack() {
   return 0
 }
 
+# zsh runs the text after a word-start `#` unless `interactivecomments` is set,
+# and it is unset by default: `echo hi #; cmd` prints `hi #` and runs `cmd`.
+# Sets the caller's `comment_flag` array to `--no-interactive-comments` then, so
+# Tirith reads the line the way this shell runs it, and to nothing otherwise.
+# Read at every check, because `setopt` can change the option mid-session.
+_tirith_comment_flag() {
+  comment_flag=()
+  [[ -o interactivecomments ]] || comment_flag=(--no-interactive-comments)
+}
+
 # Save original accept-line widget if it exists
 if (( $+widgets[accept-line] )); then
   zle -A accept-line _tirith_original_accept_line
@@ -363,6 +373,8 @@ _tirith_accept_line() {
   builtin setopt localoptions noxtrace noallexport
   setopt localoptions clobber   # mktemp + redirect needs clobber
   local -h +x buf="$BUFFER"
+  local -a comment_flag
+  _tirith_comment_flag
 
   # Never create or deliver a second receipt while recovery of an older one is
   # unresolved. Reconciliation/discard runs in the original working directory.
@@ -410,13 +422,15 @@ _tirith_accept_line() {
     _TIRITH_VERIFICATION_CAPTURE=1 _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
       _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
       _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-      command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
+      command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive \
+      "${comment_flag[@]}" --shell posix \
       --execution-receipt zsh -- "$buf" >"$outfile" 2>"$errfile" <<<"$verification_capture"
     else
     _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
       _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
       _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-      command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
+      command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive \
+      "${comment_flag[@]}" --shell posix \
       --execution-receipt zsh -- "$buf" >"$outfile" 2>"$errfile"
     fi
     rc=$?
@@ -523,7 +537,8 @@ _tirith_accept_line() {
     return
   fi
   check_stdout=$(_TIRITH_HOOK=1 command "$_TIRITH_BIN" check \
-    --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
+    --approval-check --non-interactive --interactive "${comment_flag[@]}" --shell posix \
+    -- "$buf" 2>"$errfile")
   rc=$?
   output=$(<"$errfile")
   _tirith_v3_remove_capture_files "$errfile" >/dev/null 2>&1
@@ -655,8 +670,11 @@ _tirith_bracketed_paste() {
       zle send-break
       return
     fi
+    local -a comment_flag
+    _tirith_comment_flag
     builtin printf '%s' "$pasted" \
-      | _TIRITH_HOOK=1 command "$_TIRITH_BIN" paste --shell posix --interactive >"$tmpfile" 2>&1
+      | _TIRITH_HOOK=1 command "$_TIRITH_BIN" paste --shell posix --interactive \
+        "${comment_flag[@]}" >"$tmpfile" 2>&1
     rc=$?
     output=$(<"$tmpfile")
     if ! _tirith_v3_remove_capture_files "$tmpfile" >/dev/null 2>&1; then

