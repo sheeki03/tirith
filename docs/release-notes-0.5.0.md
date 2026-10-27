@@ -329,6 +329,11 @@ every change in detail.
 
 - x86_64 Linux containment restricts `clone` flags with the same table as
   aarch64 and returns `ENOSYS` for `clone3`.
+- x86_64 Linux containment allows `poll` and `epoll_wait`, which glibc uses
+  there for `poll()` and `epoll_wait()`. Without them every Rust program,
+  including the coreutils of Ubuntu 25.10 and later, crashed inside the
+  capsule, so `tirith run` failed most install scripts on those systems.
+  0.4.2 has the same gap.
 - The `python -c` data-pipeline exemption no longer applies when the input may
   enable Python inspect mode.
 - rustls is updated to 0.23.46 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349). The
