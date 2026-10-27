@@ -6956,6 +6956,7 @@ custom_rules:
                 clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             let v = analyze(&ctx);
             assert!(

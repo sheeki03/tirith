@@ -35,7 +35,8 @@ mod shell_receipt;
 pub use shell_receipt::{
     acknowledge_shell_execution_receipt, arm_shell_execution_receipt,
     consume_shell_execution_receipt, create_shell_execution_receipt,
-    discard_shell_execution_receipt, execute_shell_verification_probe, finish_shell_verification,
+    create_shell_execution_receipt_with_comment_reading, discard_shell_execution_receipt,
+    execute_shell_verification_probe, finish_shell_verification,
     finish_shell_verification_authenticated, hook_freshness, observe_shell_verification_hook,
     reconcile_shell_execution_receipt, register_hook_presence, register_shell_hook_instance,
     register_shell_hook_instance_with_delivery, shell_execution_receipt_context,

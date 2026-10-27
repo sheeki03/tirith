@@ -2106,6 +2106,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
             context,

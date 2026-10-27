@@ -538,6 +538,7 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
@@ -616,6 +617,7 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     // Single Policy snapshot for analysis + enforcement + approval + audit (the
@@ -697,6 +699,7 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     // Single Policy snapshot for analysis + enforcement + approval + audit (see

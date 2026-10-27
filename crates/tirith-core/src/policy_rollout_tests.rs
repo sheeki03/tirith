@@ -69,6 +69,7 @@ fn capture(snapshot: &EffectivePolicySnapshot) -> FrozenEvaluation {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         },
         snapshot,
         CallerContext::Cli,

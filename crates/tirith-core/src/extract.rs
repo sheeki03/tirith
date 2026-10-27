@@ -5138,6 +5138,22 @@ pub(crate) fn posix_heredoc_spans(raw: &str) -> Option<Vec<PosixHeredocSpan>> {
     Some(recovery.spans)
 }
 
+/// `raw` with its heredoc operators and bodies masked, byte for byte, as in
+/// [`shell_execution_view`], and the heredocs that were recovered. Unlike
+/// [`posix_heredoc_spans`] this answers for a source with an unsupported or
+/// unterminated heredoc too: what could not be read stays visible, as it
+/// does in the execution view the analysis tokenizes.
+pub(crate) fn posix_heredoc_masked_view(raw: &str) -> (String, Vec<PosixHeredocSpan>) {
+    if !raw.contains("<<") {
+        return (raw.to_string(), Vec::new());
+    }
+    let recovery = recover_posix_heredocs(raw);
+    if recovery.sanitized.len() != raw.len() {
+        return (raw.to_string(), recovery.spans);
+    }
+    (recovery.sanitized, recovery.spans)
+}
+
 fn parse_posix_heredoc_delimiter(line: &str, operator: usize) -> Result<(String, bool, usize), ()> {
     let bytes = line.as_bytes();
     let mut index = operator + 2;

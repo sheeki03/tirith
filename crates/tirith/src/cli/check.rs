@@ -152,6 +152,7 @@ pub fn run(
     json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
+    interactive_comments: bool,
     approval_check: bool,
     execution_receipt: Option<ShellReceiptChannel>,
     strict_warn: bool,
@@ -277,9 +278,13 @@ pub fn run(
             shell_name,
             cwd.as_deref(),
             interactive,
+            interactive_comments,
             offline,
         ) {
-            if let Some(ref raw_findings) = resp.raw_findings {
+            // A daemon that predates `interactive_comments` ignores it; its
+            // verdict lacks that reading, so analyze locally instead.
+            let reading_supported = interactive_comments || resp.interactive_comments_read;
+            if let Some(raw_findings) = resp.raw_findings.as_ref().filter(|_| reading_supported) {
                 let raw_action_parsed = resp
                     .raw_action
                     .as_deref()
@@ -312,10 +317,13 @@ pub fn run(
                     None,
                 )
             } else {
-                // Pre-upgrade daemon without raw-findings support — run locally.
-                eprintln!(
-                    "tirith: daemon does not support raw findings — falling back to local analysis"
-                );
+                // Pre-upgrade daemon without raw-findings support (or without
+                // the `--no-interactive-comments` reading) — run locally.
+                if reading_supported {
+                    eprintln!(
+                        "tirith: daemon does not support raw findings — falling back to local analysis"
+                    );
+                }
                 let ctx = AnalysisContext {
                     input: cmd.to_string(),
                     shell: shell_type,
@@ -331,6 +339,7 @@ pub fn run(
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                     python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                     cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                    interactive_comments,
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -351,6 +360,7 @@ pub fn run(
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                 python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                 cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                interactive_comments,
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -371,6 +381,7 @@ pub fn run(
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
             cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         let (v, p) = if execution_receipt.is_some() {
             // A durable receipt must freeze every effective policy overlay even
@@ -547,10 +558,11 @@ pub fn run(
                 return 1;
             }
         };
-        match execution_state::create_shell_execution_receipt(
+        match execution_state::create_shell_execution_receipt_with_comment_reading(
             prepared,
             channel,
             interactive,
+            interactive_comments,
             strict_warn,
             Duration::from_secs(ttl_secs),
         ) {
@@ -767,6 +779,7 @@ pub fn run(
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
             cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         if ran_locally {
             tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
@@ -2638,6 +2651,7 @@ pub(super) fn prepare_receipt_consumption_with_network(
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: context.interactive_comments(),
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));

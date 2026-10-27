@@ -216,6 +216,203 @@ pub fn history_expansion_triggered(
             || !history_seeding_segments(input, shell).is_empty())
 }
 
+/// The probe copy of `input` for an interactive shell that does not treat a
+/// word-start `#` as a comment (see [`crate::interactive_comments`]), or
+/// `None` when the analysis is not of such input. An Exec input is read
+/// without its `# tirith-card:` prelude, as the rule pass reads it.
+fn interactive_comments_probe(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+    interactive_comments: bool,
+) -> Option<crate::interactive_comments::CommentProbe> {
+    if !crate::interactive_comments::applies(shell, scan_context, interactive, interactive_comments)
+    {
+        return None;
+    }
+    let typed = if scan_context == ScanContext::Exec {
+        crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell)
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    };
+    Some(crate::interactive_comments::comment_probe(&typed))
+}
+
+/// The input side of the Exec/Paste Tier-1 gate's interactive-comments
+/// trigger: input read by an interactive POSIX shell that does not treat a
+/// word-start `#` as a comment and that holds such a `#`, so the text after it
+/// runs there (see [`crate::interactive_comments`]). The gate then passes the
+/// input on when the probe copy's own analysis (which has the same gate)
+/// finds something, or when the copy cannot be settled. Public so the
+/// reachability tests can mirror every input-side trigger of the gate.
+#[doc(hidden)]
+pub fn interactive_comments_triggered(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+    interactive_comments: bool,
+) -> bool {
+    !matches!(
+        interactive_comments_probe(
+            input,
+            shell,
+            scan_context,
+            interactive,
+            interactive_comments
+        ),
+        None | Some(crate::interactive_comments::CommentProbe::Unchanged)
+    )
+}
+
+/// Analyze the probe copy of the input (see [`crate::interactive_comments`])
+/// as a detection pass bound to the outer analysis's policy snapshot, or
+/// `None` when the copy takes the Tier-1 fast exit, which by the gate's
+/// invariant means it has no finding. The copy shares the outer analysis's
+/// scan-work budget. Side effects stay with the outer pass: no bypass, no
+/// runtime effects, no command card, no clipboard record or HTML, and no raw
+/// bytes (the outer pass scans them).
+fn capture_interactive_comments_probe(
+    ctx: &AnalysisContext,
+    policy: &Policy,
+    probe: &crate::interactive_comments::ProbeText,
+) -> Option<ObservedAnalysis> {
+    let probe_ctx = AnalysisContext {
+        input: probe.text.clone(),
+        raw_bytes: None,
+        clipboard_html: None,
+        card_ref: None,
+        clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+        // The copy has no live comment start left outside process
+        // substitutions, which every reading treats as comments.
+        interactive_comments: true,
+        ..ctx.clone()
+    };
+    let mut observed = None;
+    analyze_with_observation(
+        &probe_ctx,
+        false,
+        Some(policy),
+        false,
+        None,
+        false,
+        Some(&mut observed),
+    );
+    observed
+}
+
+/// Whether merging the probe's observations can change the outer verdict: it
+/// has a finding or a Web3 decision stricter than Allow.
+fn probe_adds_to_verdict(observed: &ObservedAnalysis) -> bool {
+    !observed.findings.is_empty()
+        || observed
+            .web3_decision
+            .as_ref()
+            .is_some_and(|decision| decision.action != crate::web3_policy::Web3GuardAction::Allow)
+}
+
+/// Whether a probe finding repeats one the outer pass already reports: the
+/// same rule, severity, words and evidence. A command pattern's matched text
+/// is not compared, since the probe's spelling of the same segment holds the
+/// escaped `#` and the text after it (`curl ... | sh \# install`). Policy
+/// treats the two alike: severity overrides and allowlists key on the rule
+/// and the URL evidence, which must be equal.
+fn same_finding(left: &Finding, right: &Finding) -> bool {
+    use crate::verdict::Evidence;
+    left.rule_id == right.rule_id
+        && left.severity == right.severity
+        && left.title == right.title
+        && left.description == right.description
+        && left.custom_rule_id == right.custom_rule_id
+        && left.evidence.len() == right.evidence.len()
+        && left
+            .evidence
+            .iter()
+            .zip(&right.evidence)
+            .all(|pair| match pair {
+                (
+                    Evidence::CommandPattern { pattern: left, .. },
+                    Evidence::CommandPattern { pattern: right, .. },
+                ) => left == right,
+                (left, right) => left == right,
+            })
+}
+
+/// Add the probe analysis's observations to the outer analysis's: a finding
+/// the outer pass already has (with its byte offsets read back into the
+/// input and its URL indexes into the merged list) is not repeated, the
+/// others are added with a note on the reading that produced them, and the
+/// stricter Web3 decision wins. A manifest `RepoCommandUnknown` annotation
+/// concerns the command as typed, so the probe's is dropped.
+fn merge_interactive_comments_probe(
+    findings: &mut Vec<Finding>,
+    extracted: &mut Vec<crate::extract::ExtractedUrl>,
+    web3_decision: &mut Option<crate::rules::web3_gate::Web3Decision>,
+    approval_policy_bound: &mut bool,
+    probe: &crate::interactive_comments::ProbeText,
+    observed: ObservedAnalysis,
+) {
+    let ObservedAnalysis {
+        findings: probe_findings,
+        extracted: probe_extracted,
+        manifest_allowed_match: _,
+        web3_decision: probe_web3_decision,
+        approval_policy_bound: probe_approval_policy_bound,
+    } = observed;
+    let mut url_index = Vec::with_capacity(probe_extracted.len());
+    for url in probe_extracted {
+        let existing = extracted.iter().position(|known| {
+            known.raw == url.raw
+                && known.in_sink_context == url.in_sink_context
+                && known.parsed.raw_str() == url.parsed.raw_str()
+        });
+        url_index.push(existing.unwrap_or_else(|| {
+            extracted.push(url);
+            extracted.len() - 1
+        }));
+    }
+    let mut added: Vec<Finding> = Vec::new();
+    for mut finding in probe_findings {
+        if finding.rule_id == crate::verdict::RuleId::RepoCommandUnknown {
+            continue;
+        }
+        for evidence in &mut finding.evidence {
+            crate::verdict::remap_web3_extraction_index(evidence, |index| {
+                url_index.get(index).copied()
+            });
+            if let crate::verdict::Evidence::ByteSequence { offset, .. } = evidence {
+                *offset = probe.source_offset(*offset);
+            }
+        }
+        if findings
+            .iter()
+            .chain(added.iter())
+            .any(|known| same_finding(known, &finding))
+        {
+            continue;
+        }
+        added.push(finding);
+    }
+    findings.extend(added.into_iter().map(|mut finding| {
+        finding.description = format!(
+            "{}{}",
+            crate::interactive_comments::PROBE_FINDING_NOTE,
+            finding.description
+        );
+        finding
+    }));
+    if let Some(probe_decision) = probe_web3_decision {
+        let stricter = web3_decision
+            .as_ref()
+            .is_none_or(|decision| probe_decision.action > decision.action);
+        if stricter {
+            *web3_decision = Some(probe_decision);
+        }
+    }
+    *approval_policy_bound |= probe_approval_policy_bound;
+}
+
 /// The Exec Tier-1 gate's executable-body trigger: a nested body (`$(...)`,
 /// `eval`, `sh -c`, a function or heredoc body) Tirith could not resolve
 /// completely, or a recovered body that itself matches the Tier-1 patterns or
@@ -531,6 +728,16 @@ pub struct AnalysisContext {
     /// `python_inspect_inherited`, usually with [`cdpath_env_active`]; a
     /// daemon takes it from the request. Core rules never read the variable.
     pub cdpath_inherited: bool,
+    /// Whether the interactive shell that will run the input treats a
+    /// word-start `#` as a comment. `true` (what every caller passes unless
+    /// told otherwise) keeps the plain POSIX reading. The bash and zsh hooks
+    /// pass `--no-interactive-comments` when the option is off (zsh's
+    /// default `interactivecomments` unset, or bash after `shopt -u
+    /// interactive_comments`): an interactive POSIX exec or paste analysis
+    /// then also reads the input with each such `#` as a literal word
+    /// character and adds what that reading finds (see
+    /// [`crate::interactive_comments`]).
+    pub interactive_comments: bool,
 }
 
 /// Whether this process's environment has a non-empty `PYTHONINSPECT`. For
@@ -3133,6 +3340,19 @@ fn analyze_with_observation(
     let history_expansion_triggered =
         history_expansion_triggered(&ctx.input, ctx.shell, ctx.scan_context, ctx.interactive);
 
+    // An interactive zsh without `interactivecomments` (its default), or bash
+    // after `shopt -u interactive_comments`, runs the text after a word-start
+    // `#`, which may carry the only tier-1 signal. The probe copy built here
+    // is analyzed in addition to the input (see `interactive_comments`) once
+    // the gate policy is known below.
+    let comment_probe = interactive_comments_probe(
+        &ctx.input,
+        ctx.shell,
+        ctx.scan_context,
+        ctx.interactive,
+        ctx.interactive_comments,
+    );
+
     // Exec-only: catch bidi/zero-width/invisible bytes even with no URL.
     // Proven-literal `tirith diff/score/why/receipt/explain` args are carved out
     // (inspection targets) for the eight Unicode-style rule classes only.
@@ -3182,6 +3402,23 @@ fn analyze_with_observation(
         } else {
             None
         };
+
+    // The probe copy goes through the same gate, bound to the same policy. A
+    // copy that fast-exits has no finding, so a commented line whose reading
+    // without comments is clean still takes the fast path itself; one whose
+    // copy finds something (or cannot be settled) is analyzed in full and the
+    // copy's observations are merged below.
+    let comment_probe_observed = match (&comment_probe, gate_policy.as_ref()) {
+        (Some(crate::interactive_comments::CommentProbe::Rewritten(probe)), Some(policy)) => {
+            capture_interactive_comments_probe(ctx, policy, probe).filter(probe_adds_to_verdict)
+        }
+        _ => None,
+    };
+    let interactive_comments_triggered = comment_probe_observed.is_some()
+        || matches!(
+            comment_probe,
+            Some(crate::interactive_comments::CommentProbe::Unreliable)
+        );
 
     // M9 ch5/ch6 — exec-provenance and repo-hook subsets are not tier-1 signals,
     // so force past the fast-exit when the opt-in `exec_guard_enabled` /
@@ -3305,6 +3542,7 @@ fn analyze_with_observation(
         && !sensitive_asset_triggered
         && !executable_body_triggered
         && !history_expansion_triggered
+        && !interactive_comments_triggered
         && !exec_bidi_triggered
         && !exec_guard_triggered
         && !hooks_guard_triggered
@@ -4037,6 +4275,26 @@ fn analyze_with_observation(
         }
     }
 
+    // The input as an interactive shell without comment recognition reads
+    // it: scanned in addition to the input as typed, never instead of it.
+    match (&comment_probe, comment_probe_observed) {
+        (
+            Some(crate::interactive_comments::CommentProbe::Rewritten(probe)),
+            Some(probe_observed),
+        ) => merge_interactive_comments_probe(
+            &mut findings,
+            &mut extracted,
+            &mut web3_decision,
+            &mut approval_policy_bound,
+            probe,
+            probe_observed,
+        ),
+        (Some(crate::interactive_comments::CommentProbe::Unreliable), _) => {
+            findings.push(crate::interactive_comments::unreliable_finding(&ctx.input));
+        }
+        _ => {}
+    }
+
     if crate::extract::scan_work_exhausted()
         && !findings
             .iter()
@@ -4640,6 +4898,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let fragments = [
             crate::rules::rendered::PdfTextFragment {
@@ -4686,6 +4945,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let second = "tions";
         let suffix = "\nignore previous instruc";
@@ -4747,6 +5007,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let fragment = crate::rules::rendered::PdfTextFragment {
             text: format!("embedded credential {canary}"),
@@ -4789,6 +5050,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = analyze(&ctx);
         assert!(verdict.findings.iter().any(|finding| {
@@ -4844,6 +5106,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         });
         assert!(verdict.findings.iter().any(|finding| {
             finding.rule_id == crate::verdict::RuleId::AnalysisIncomplete
@@ -4870,6 +5133,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
 
         let (verdict, coverage) = analyze_file_with_pdf_coverage(&ctx);
@@ -5233,6 +5497,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -5275,6 +5540,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = analyze(&ctx);
         assert_eq!(verdict.action, crate::verdict::Action::Block);
@@ -5329,6 +5595,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -5965,6 +6232,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = analyze(&ctx);
         assert!(
@@ -6781,6 +7049,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         }
     }
 
@@ -7376,6 +7645,7 @@ mod tests {
                     clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
                     python_inspect_inherited: false,
                     cdpath_inherited: false,
+                    interactive_comments: true,
                 };
                 let label = format!(
                     "{}/{}",
@@ -7453,6 +7723,7 @@ mod tests {
                 clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             assert_fast_full_security_equivalence(&ctx, &format!("generated-case-{case}"));
         }
@@ -7516,6 +7787,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         }
     }
 
@@ -7827,6 +8099,7 @@ mod tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         }
     }
 
@@ -10517,6 +10790,7 @@ mod scan_work_budget_tests {
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         }
     }
 

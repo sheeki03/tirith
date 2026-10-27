@@ -428,6 +428,7 @@ fn plan_install_inner(
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
     let command_verdict = engine::analyze(&ctx);
     let mut findings: Vec<Finding> = command_verdict.findings;

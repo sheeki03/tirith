@@ -51,6 +51,7 @@ pub mod incident;
 pub mod install_script_analysis;
 pub mod install_txn;
 pub mod intent;
+mod interactive_comments;
 pub mod lexical_path;
 pub mod license;
 pub mod location;

