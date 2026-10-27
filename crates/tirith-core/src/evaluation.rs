@@ -122,6 +122,7 @@ impl FrozenEvaluation {
         let (runtime_threat_findings, runtime_threat_complete) =
             crate::threatdb_api::capture_cached_enrichment(
                 &context.input,
+                context.interactive_comments_reading().as_deref(),
                 context.shell,
                 &policy.threat_intel,
                 captured_at,

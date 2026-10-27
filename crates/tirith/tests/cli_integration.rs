@@ -3451,6 +3451,75 @@ fn check_and_paste_accept_no_interactive_comments() {
     }
 }
 
+/// Runtime threat enrichment also reads the command the way an interactive
+/// shell without comment recognition runs it: with the hooks'
+/// `_TIRITH_INTERACTIVE_COMMENTS=0`, `echo hi #; npm install <pkg>` looks up
+/// the package that shell installs, so a cached malicious-package advisory
+/// blocks the line as it blocks the plain install.
+#[test]
+fn check_enriches_the_interactive_comments_reading() {
+    use sha2::Digest as _;
+    let state = tempfile::tempdir().unwrap();
+    fs::create_dir_all(state.path().join("tirith/threatdb-api-cache")).unwrap();
+    // As in `fresh_command_environment`: no threat-DB download.
+    fs::write(
+        state.path().join("tirith/threatdb-next-check-at"),
+        "99999999999",
+    )
+    .unwrap();
+    let digest = sha2::Sha256::digest(b"osv:npm:tirith-hidden-pkg:1.0.0");
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        state
+            .path()
+            .join(format!("tirith/threatdb-api-cache/osv-{hex}.json")),
+        format!(
+            r#"{{"fetched_at":{now},"value":{{"vulns":[{{"id":"MAL-0000-00001","aliases":[],"summary":"fixture","references":[]}}]}}}}"#
+        ),
+    )
+    .unwrap();
+    let run = |input: &str, reading: Option<&str>| {
+        let mut command = tirith();
+        command.env("XDG_STATE_HOME", state.path()).args([
+            "check",
+            "--offline",
+            "--no-daemon",
+            "--interactive",
+            "--format",
+            "json",
+            "--shell",
+            "posix",
+            "--",
+            input,
+        ]);
+        if let Some(reading) = reading {
+            command.env("_TIRITH_INTERACTIVE_COMMENTS", reading);
+        }
+        let out = command.output().expect("failed to run tirith check");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (code, stdout) = run("npm install tirith-hidden-pkg@1.0.0", None);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("threat_osv_vulnerable"), "{stdout}");
+    let hidden = "echo hi #; npm install tirith-hidden-pkg@1.0.0";
+    let (code, stdout) = run(hidden, Some("0"));
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.contains("threat_osv_vulnerable"), "{stdout}");
+    let (code, stdout) = run(hidden, Some("1"));
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(!stdout.contains("threat_osv_vulnerable"), "{stdout}");
+}
+
 #[test]
 fn score_clean_url() {
     let out = tirith()

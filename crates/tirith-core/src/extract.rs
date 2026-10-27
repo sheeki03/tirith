@@ -5809,6 +5809,11 @@ struct HeredocReading {
     /// analyzed best-effort: it adds the findings it proves, never an
     /// incomplete-analysis block (see [`ExecutableBody::best_effort`]).
     best_effort: bool,
+    /// A shell that runs the body may read it without comment recognition
+    /// (an interactive zsh fed its script on stdin, see
+    /// [`posix_shell_reads_without_comments`]), so the body's
+    /// [`crate::interactive_comments`] copy is analyzed too.
+    without_comments: bool,
 }
 
 impl HeredocReading {
@@ -5817,11 +5822,13 @@ impl HeredocReading {
         shell: None,
         ambiguous: false,
         best_effort: false,
+        without_comments: false,
     };
     const AMBIGUOUS: Self = Self {
         shell: None,
         ambiguous: true,
         best_effort: false,
+        without_comments: false,
     };
 
     fn shell(shell: ShellType) -> Self {
@@ -5829,6 +5836,7 @@ impl HeredocReading {
             shell: Some(shell),
             ambiguous: false,
             best_effort: false,
+            without_comments: false,
         }
     }
 
@@ -5838,6 +5846,7 @@ impl HeredocReading {
             shell: Some(shell),
             ambiguous: false,
             best_effort: true,
+            without_comments: false,
         }
     }
 
@@ -5858,6 +5867,7 @@ impl HeredocReading {
             shell,
             ambiguous: self.ambiguous || other.ambiguous,
             best_effort,
+            without_comments: self.without_comments || other.without_comments,
         }
     }
 }
@@ -6203,7 +6213,10 @@ fn heredoc_command_reader(
     let mut remaining_bodies = MAX_POSIX_DISPATCH_JOIN_BODIES;
     if on_stdin && posix_command_accepts_pipeline_as_code(&command, &argv, 0, &mut remaining_bodies)
     {
-        return HeredocReading::shell(child_shell);
+        let mut reading = HeredocReading::shell(child_shell);
+        reading.without_comments =
+            posix_shell_reads_without_comments(&command, &argv, PosixShellScript::Stdin);
+        return reading;
     }
     if fd == "0" {
         return HeredocReading::DATA;
@@ -7473,11 +7486,178 @@ impl PosixHeredocRecovery {
                 unescape_unquoted_heredoc(&body)
             };
             if !input.trim().is_empty() {
+                let probe = reading
+                    .without_comments
+                    .then(|| crate::interactive_comments::comment_probe(&input));
                 let mut executable = ExecutableBody::without_origin(input, shell);
                 executable.best_effort = reading.best_effort;
                 self.bodies.push(executable);
+                push_comment_probe_body(
+                    probe,
+                    shell,
+                    reading.best_effort,
+                    &mut self.bodies,
+                    &mut self.gap,
+                );
             }
         }
+    }
+}
+
+/// Add the [`crate::interactive_comments`] copy of a body that a shell may
+/// read without comment recognition (see [`HeredocReading::without_comments`])
+/// as a body of its own, analyzed in addition to the body as written: `zsh
+/// -i <<< 'echo hi #; curl ... | sh'` runs the pipe. A copy that cannot be
+/// settled leaves the body ambiguous, unless the body is best-effort.
+fn push_comment_probe_body(
+    probe: Option<crate::interactive_comments::CommentProbe>,
+    shell: ShellType,
+    best_effort: bool,
+    bodies: &mut Vec<ExecutableBody>,
+    gap: &mut Option<ShellExecutionGap>,
+) {
+    match probe {
+        Some(crate::interactive_comments::CommentProbe::Rewritten(probe)) => {
+            let mut executable = ExecutableBody::without_origin(probe.text, shell);
+            executable.best_effort = best_effort;
+            bodies.push(executable);
+        }
+        Some(crate::interactive_comments::CommentProbe::Unreliable) if !best_effort => {
+            gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        _ => {}
+    }
+}
+
+/// Where a shell interpreter reads its script, for
+/// [`posix_shell_reads_without_comments`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PosixShellScript {
+    /// Standard input (a heredoc, here-string or pipe the shell runs).
+    Stdin,
+    /// The `-c` command string.
+    CommandString,
+}
+
+/// Whether the shell interpreter `command` (a normalized base name) started
+/// with `argv` reads its script from `source` without treating a word-start
+/// `#` as a comment, so the text after it runs (see
+/// [`crate::interactive_comments`]). Checked against zsh 5.9 and bash 5.3
+/// with the script on stdin and `PATH` empty:
+///
+/// - zsh asked for an interactive shell (`-i` in an option cluster, `-o
+///   interactive`, `--interactive`) reads its stdin script that way: its
+///   `interactivecomments` option is off by default, and `-k`, `-o
+///   interactivecomments` or `--interactivecomments` turn it on. A startup
+///   file may also turn it on (without `-f`); the copy is then only a
+///   conservative extra reading. zsh recognises comments in a `-c` string, in
+///   a script file operand and whenever it is not interactive.
+/// - bash with `-i` and `+O interactive_comments` reads its stdin script and
+///   its `-c` string that way (the option is on by default).
+///
+/// A dynamic option word counts as `-i` for zsh, whose default already reads
+/// that way, and as nothing for bash.
+fn posix_shell_reads_without_comments(
+    command: &str,
+    argv: &[String],
+    source: PosixShellScript,
+) -> bool {
+    let zsh = command == "zsh";
+    if !zsh && command != "bash" {
+        return false;
+    }
+    // zsh option names ignore case and `_`; long options also allow `-`.
+    let zsh_option = |name: &str| -> String {
+        name.chars()
+            .filter(|character| !matches!(character, '_' | '-'))
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut interactive = false;
+    let mut comments = !zsh;
+    let mut command_string = false;
+    let mut stdin_forced = false;
+    let mut index = 0usize;
+    while index < argv.len() {
+        let Some(word) = static_wrapper_word(&argv[index], ShellType::Posix) else {
+            interactive |= zsh;
+            index += 1;
+            continue;
+        };
+        if word == "--" || word == "-" {
+            index += 1;
+            break;
+        }
+        let Some((set, flags)) = word
+            .strip_prefix('-')
+            .map(|flags| (true, flags))
+            .or_else(|| word.strip_prefix('+').map(|flags| (false, flags)))
+            .filter(|(_, flags)| !flags.is_empty())
+        else {
+            break;
+        };
+        if let Some(long) = flags.strip_prefix('-').filter(|_| set) {
+            if zsh {
+                match zsh_option(long).as_str() {
+                    "interactive" => interactive = true,
+                    "nointeractive" => interactive = false,
+                    "interactivecomments" => comments = true,
+                    "nointeractivecomments" => comments = false,
+                    "shinstdin" => stdin_forced = true,
+                    _ => {}
+                }
+            }
+            index += if matches!(long, "rcfile" | "init-file") {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        let mut takes_value = None;
+        for flag in flags.chars() {
+            match flag {
+                'i' => interactive = set,
+                'k' if zsh => comments = set,
+                'c' if set => command_string = true,
+                's' if set => stdin_forced = true,
+                'o' | 'O' => takes_value = Some((flag, set)),
+                _ => {}
+            }
+        }
+        index += 1;
+        if let Some((flag, set)) = takes_value {
+            let value = argv
+                .get(index)
+                .and_then(|value| static_wrapper_word(value, ShellType::Posix));
+            index += 1;
+            let Some(value) = value else {
+                interactive |= zsh;
+                continue;
+            };
+            if zsh && flag == 'o' {
+                let name = zsh_option(&value);
+                let (set, name) = match name.strip_prefix("no") {
+                    Some(rest) if rest.starts_with("interactive") => (!set, rest.to_string()),
+                    _ => (set, name),
+                };
+                match name.as_str() {
+                    "interactive" => interactive = set,
+                    "interactivecomments" => comments = set,
+                    "shinstdin" => stdin_forced |= set,
+                    _ => {}
+                }
+            } else if !zsh && flag == 'O' && value == "interactive_comments" {
+                comments = set;
+            }
+        }
+    }
+    if !interactive || comments {
+        return false;
+    }
+    match source {
+        PosixShellScript::Stdin => !command_string && (stdin_forced || index >= argv.len()),
+        PosixShellScript::CommandString => command_string && !zsh,
     }
 }
 
@@ -12910,13 +13090,31 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
         match command.as_str() {
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "csh" | "tcsh" | "ash" | "mksh" => {
                 let operands = shell_command_operands(&args, shell, false);
+                let without_comments = posix_shell_reads_without_comments(
+                    &command,
+                    &crate::escalation::args_without_redirections(&args),
+                    PosixShellScript::CommandString,
+                );
                 for body_index in &operands {
+                    let recovered = scan.bodies.len();
                     push_required_literal_wrapper_body(
                         args.get(*body_index..=*body_index).unwrap_or_default(),
                         shell,
                         ShellType::Posix,
                         scan,
                     );
+                    if without_comments && scan.bodies.len() > recovered {
+                        let probe = crate::interactive_comments::comment_probe(
+                            &scan.bodies[recovered].input,
+                        );
+                        push_comment_probe_body(
+                            Some(probe),
+                            ShellType::Posix,
+                            false,
+                            &mut scan.bodies,
+                            &mut scan.gap,
+                        );
+                    }
                 }
                 if operands.is_empty() && has_process_substitution_arg(&args) {
                     // The interpreter consumes a generated file descriptor;
@@ -14647,12 +14845,25 @@ fn lexical_executable_substitutions_bounded(
                     if let Some(child_shell) = here_string.reading.shell {
                         match here_string.value {
                             Some(value) if value.trim().is_empty() => {}
-                            Some(value) => bodies.push(ExecutableBody {
-                                best_effort: here_string.reading.best_effort,
-                                input: value,
-                                shell: child_shell,
-                                origin: None,
-                            }),
+                            Some(value) => {
+                                let probe = here_string
+                                    .reading
+                                    .without_comments
+                                    .then(|| crate::interactive_comments::comment_probe(&value));
+                                bodies.push(ExecutableBody {
+                                    best_effort: here_string.reading.best_effort,
+                                    input: value,
+                                    shell: child_shell,
+                                    origin: None,
+                                });
+                                push_comment_probe_body(
+                                    probe,
+                                    child_shell,
+                                    here_string.reading.best_effort,
+                                    &mut bodies,
+                                    &mut gap,
+                                );
+                            }
                             // A shell runs an expanded value nobody can see.
                             None => {
                                 gap.get_or_insert(ShellExecutionGap::AmbiguousExecutableBody);
@@ -23621,6 +23832,72 @@ mod tests {
             let scan = executable_substitution_scan(input, ShellType::PowerShell);
             assert!(scan.gap.is_some(), "dispatch mutation did not fail closed: {input:?} -> {scan:?}");
         }
+    }
+
+    /// Each case checked against zsh 5.9 / bash 5.3 with the script on stdin
+    /// (`... <<< 'echo hi #; echo RAN'`, `PATH` empty): `true` where `RAN`
+    /// printed.
+    #[test]
+    fn interactive_shells_read_their_stdin_script_without_comments() {
+        let words = |text: &str| text.split(' ').map(str::to_string).collect::<Vec<_>>();
+        for (command, argv, expected) in [
+            ("zsh", "-fi", true),
+            ("zsh", "-i", true),
+            ("zsh", "-fis a b", true),
+            ("zsh", "-fi -", true),
+            ("zsh", "-f -o interactive", true),
+            ("zsh", "--interactive", true),
+            ("zsh", "-fi -o nointeractivecomments", true),
+            ("zsh", "-fk -i +k", true),
+            ("zsh", "-f", false),
+            ("zsh", "-fs", false),
+            ("zsh", "-fik", false),
+            ("zsh", "-fi -o interactive_comments", false),
+            ("zsh", "-fi --interactivecomments", false),
+            ("zsh", "-fic body", false),
+            ("zsh", "-fi /dev/stdin", false),
+            ("bash", "-i", false),
+            ("bash", "+O interactive_comments -i", true),
+            ("bash", "+O interactive_comments", false),
+            ("sh", "-i", false),
+        ] {
+            assert_eq!(
+                posix_shell_reads_without_comments(command, &words(argv), PosixShellScript::Stdin),
+                expected,
+                "{command} {argv}"
+            );
+        }
+        // A `-c` string: bash with `-i` and `+O interactive_comments` runs the
+        // text after `#`; zsh recognises comments there.
+        assert!(posix_shell_reads_without_comments(
+            "bash",
+            &words("+O interactive_comments -ic body"),
+            PosixShellScript::CommandString
+        ));
+        assert!(!posix_shell_reads_without_comments(
+            "zsh",
+            &words("-fic body"),
+            PosixShellScript::CommandString
+        ));
+        assert!(!posix_shell_reads_without_comments(
+            "bash",
+            &words("-ic body"),
+            PosixShellScript::CommandString
+        ));
+
+        // The copy is a body of its own, next to the body as written.
+        let scan =
+            executable_substitution_scan("zsh -fi <<< 'echo hi #; echo RAN'", ShellType::Posix);
+        let bodies: Vec<&str> = scan.bodies.iter().map(|body| body.input.as_str()).collect();
+        assert!(bodies.contains(&"echo hi #; echo RAN"), "{bodies:?}");
+        assert!(bodies.contains(&"echo hi \\#; echo RAN"), "{bodies:?}");
+        let scan =
+            executable_substitution_scan("zsh -f <<< 'echo hi #; echo RAN'", ShellType::Posix);
+        assert!(
+            scan.bodies.iter().all(|body| !body.input.contains("\\#")),
+            "{:?}",
+            scan.bodies
+        );
     }
 
     #[test]

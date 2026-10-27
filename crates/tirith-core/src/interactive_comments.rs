@@ -13,7 +13,18 @@
 //! == false` ([`applies`]). The engine then also analyzes [`comment_probe`]'s
 //! copy of the input, in which each such `#` is escaped into a literal word
 //! character, and adds what that analysis finds to the analysis of the input
-//! as typed: the raw reading is never replaced.
+//! as typed: the raw reading is never replaced. The copy is built from the
+//! whole input, `# tirith-card:` prelude included (that shell runs a prelude
+//! line), a line-scoped `TIRITH=0` bypass must be eligible in the copy too
+//! (`TIRITH=0 ls #; cmd` is two commands there), and runtime threat
+//! enrichment reads the copy as well
+//! ([`crate::engine::interactive_comments_reading`]).
+//!
+//! The same copy is made for a nested shell that reads its script that way,
+//! whatever the outer shell does: an interactive zsh fed its script on stdin
+//! (`zsh -i <<< 'echo hi #; cmd'`), and bash with `-i` and `+O
+//! interactive_comments` (stdin or `-c`); see the executable-body recovery in
+//! `extract`.
 //!
 //! Where the interactive shell reads a word-start `#` as a word character,
 //! each checked in a pty against zsh 5.9 (`-f -i`) and bash 5.3 (`shopt -u

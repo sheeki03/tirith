@@ -439,7 +439,22 @@ a `#` is escaped too: zsh history-expands it into a word that starts with `#`
 (`#!/bin/bash` fails with `event not found`, or runs no program), so a pasted
 script's shebang line is not read as a command formed by history expansion.
 The copy goes through the same Tier-1 gate as any input, so a commented line
-whose copy is clean keeps the fast path. Checked in a pty against
+whose copy is clean keeps the fast path. It is built from the whole input,
+`# tirith-card:` prelude included: with comments off a prelude line is a
+command line (`# tirith-card: x; curl ... | sh` runs the pipe), and in the copy
+it is no longer a prelude. A line-scoped `TIRITH=0` bypass must be eligible in
+the copy too, so `TIRITH=0 ls #; curl ... | sh` (two commands for that shell)
+is not bypassed, while `TIRITH=0 curl ... | bash # note` still is. Runtime
+threat enrichment (OSV, deps.dev, Safe Browsing) looks up the packages and URLs
+of both readings on every path that runs it (inline check, daemon, receipt
+consumption, suggestions, frozen evaluations). A nested shell that reads its script without comments gets
+the same extra reading for that body, whatever the outer shell does: an
+interactive zsh fed its script on stdin (`zsh -i <<< 'echo hi #; cmd'`, also
+`-o interactive` or `--interactive`, unless `-k` or `-o interactivecomments`;
+zsh recognises comments in a `-c` string and in a script file), and bash with
+`-i` and `+O interactive_comments`, on stdin or in its `-c` string. Without
+`-f` a startup file may turn zsh's option on, which only makes that reading
+conservative. Checked in a pty against
 zsh 5.9 (`zsh -f -i`) and bash 5.3: both shells read the line, `{ ...; }`,
 `( ... )`, `if`/`for`/`while` bodies, function bodies and `case` patterns
 without comments; zsh also reads `$(...)` and backtick bodies that way (also
@@ -455,7 +470,10 @@ preexec hook's whole-line drift check also takes such a `#` as a word while the
 option is off, so enforcement covers the command after it instead of degrading
 to warn-only. Known limits: bash with `interactive_comments` off also runs the
 text after a word-start `#` inside an `eval` string, which this reading does
-not model (zsh recognises comments there). bash's enter mode delivers the
+not model (zsh recognises comments there). In the bash preexec hook with
+enforcement that matters little today: any `eval` line already fails the
+whole-line drift check and drops the session to warn-only, with the option on
+or off, which is a separate, older gap. bash's enter mode delivers the
 accepted line with `eval` from its prompt hook, where bash recognised comments
 even with the option off in the same pty check, so there the findings are only
 conservative. A brace group followed by a `#` word (`{ a; b; } # note`) reads as

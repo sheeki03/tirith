@@ -218,8 +218,11 @@ pub fn history_expansion_triggered(
 
 /// The probe copy of `input` for an interactive shell that does not treat a
 /// word-start `#` as a comment (see [`crate::interactive_comments`]), or
-/// `None` when the analysis is not of such input. An Exec input is read
-/// without its `# tirith-card:` prelude, as the rule pass reads it.
+/// `None` when the analysis is not of such input. The copy is built from the
+/// input itself, `# tirith-card:` prelude included: that shell runs a prelude
+/// line as a command (`# tirith-card: x; curl ... | sh` runs the pipe), and
+/// in the copy the escaped `\# tirith-card:` line is no longer a prelude, so
+/// the rule pass reads its text.
 fn interactive_comments_probe(
     input: &str,
     shell: ShellType,
@@ -231,12 +234,45 @@ fn interactive_comments_probe(
     {
         return None;
     }
-    let typed = if scan_context == ScanContext::Exec {
-        crate::command_card::strip_card_comment_lines_cow_for_shell(input, shell)
-    } else {
-        std::borrow::Cow::Borrowed(input)
-    };
-    Some(crate::interactive_comments::comment_probe(&typed))
+    Some(crate::interactive_comments::comment_probe(input))
+}
+
+/// The input as an interactive shell without comment recognition reads it
+/// (the probe copy of [`crate::interactive_comments`]), when an analysis
+/// with these parameters reads that copy in addition to the input. Runtime
+/// threat enrichment, which runs after the engine on the command text, reads
+/// it too, so a package or URL only that reading exposes is looked up
+/// (`echo hi #; npm install <pkg>`).
+pub fn interactive_comments_reading(
+    input: &str,
+    shell: ShellType,
+    scan_context: ScanContext,
+    interactive: bool,
+    interactive_comments: bool,
+) -> Option<String> {
+    match interactive_comments_probe(
+        input,
+        shell,
+        scan_context,
+        interactive,
+        interactive_comments,
+    ) {
+        Some(crate::interactive_comments::CommentProbe::Rewritten(probe)) => Some(probe.text),
+        _ => None,
+    }
+}
+
+impl AnalysisContext {
+    /// [`interactive_comments_reading`] for this analysis.
+    pub fn interactive_comments_reading(&self) -> Option<String> {
+        interactive_comments_reading(
+            &self.input,
+            self.shell,
+            self.scan_context,
+            self.interactive,
+            self.interactive_comments,
+        )
+    }
 }
 
 /// The input side of the Exec/Paste Tier-1 gate's interactive-comments
@@ -731,7 +767,8 @@ pub struct AnalysisContext {
     /// Whether the interactive shell that will run the input treats a
     /// word-start `#` as a comment. `true` (what every caller passes unless
     /// told otherwise) keeps the plain POSIX reading. The bash and zsh hooks
-    /// pass `--no-interactive-comments` when the option is off (zsh's
+    /// set `_TIRITH_INTERACTIVE_COMMENTS=0` for `tirith check` / `paste`
+    /// (`--no-interactive-comments` on the command line) when the option is off (zsh's
     /// default `interactivecomments` unset, or bash after `shopt -u
     /// interactive_comments`): an interactive POSIX exec or paste analysis
     /// then also reads the input with each such `#` as a literal word
@@ -3286,11 +3323,35 @@ fn analyze_with_observation(
     // still applies everywhere). Parsed off the prelude-STRIPPED command so a
     // `# tirith-card: …\nTIRITH=0 cmd | sh` honors the bypass like the un-prefixed
     // form (the marker is transport metadata; stripping is zero-alloc when absent).
+    //
+    // An interactive zsh without `interactivecomments` (its default), or bash
+    // after `shopt -u interactive_comments`, runs the text after a word-start
+    // `#`, which may carry the only tier-1 signal. The probe copy built here
+    // is analyzed in addition to the input (see `interactive_comments`) once
+    // the gate policy is known below. The line-scoped bypass covers one
+    // command (pipeline), and under that shell's reading the line must still
+    // be one: `TIRITH=0 ls #; curl ... | sh` runs `curl ... | sh` as a second
+    // command there (and a prelude line is a command of its own), so the copy
+    // must be eligible too, and a copy that cannot be settled is not.
+    let comment_probe = interactive_comments_probe(
+        &ctx.input,
+        ctx.shell,
+        ctx.scan_context,
+        ctx.interactive,
+        ctx.interactive_comments,
+    );
     let bypass_inline = ctx.scan_context == ScanContext::Exec
         && find_inline_bypass(
             &crate::command_card::strip_card_comment_lines_cow_for_shell(&ctx.input, ctx.shell),
             ctx.shell,
-        );
+        )
+        && match &comment_probe {
+            None | Some(crate::interactive_comments::CommentProbe::Unchanged) => true,
+            Some(crate::interactive_comments::CommentProbe::Rewritten(probe)) => {
+                find_inline_bypass(&probe.text, ctx.shell)
+            }
+            Some(crate::interactive_comments::CommentProbe::Unreliable) => false,
+        };
     let bypass_requested = honor_bypass && (bypass_env || bypass_inline);
     let tier0_ms = tier0_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -3339,19 +3400,6 @@ fn analyze_with_observation(
     // shell is affected (see `history_expansion::applies`).
     let history_expansion_triggered =
         history_expansion_triggered(&ctx.input, ctx.shell, ctx.scan_context, ctx.interactive);
-
-    // An interactive zsh without `interactivecomments` (its default), or bash
-    // after `shopt -u interactive_comments`, runs the text after a word-start
-    // `#`, which may carry the only tier-1 signal. The probe copy built here
-    // is analyzed in addition to the input (see `interactive_comments`) once
-    // the gate policy is known below.
-    let comment_probe = interactive_comments_probe(
-        &ctx.input,
-        ctx.shell,
-        ctx.scan_context,
-        ctx.interactive,
-        ctx.interactive_comments,
-    );
 
     // Exec-only: catch bidi/zero-width/invisible bytes even with no URL.
     // Proven-literal `tirith diff/score/why/receipt/explain` args are carved out

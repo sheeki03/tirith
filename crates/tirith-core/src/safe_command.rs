@@ -210,8 +210,9 @@ fn analyze_cli_inline_candidate_with_network(
     network: crate::threatdb_api::RuntimeThreatNetwork,
 ) -> Verdict {
     let mut raw = engine::analyze_with_policy_without_bypass(ctx, policy);
-    let runtime_findings = crate::threatdb_api::enrich_command_with_network(
+    let runtime_findings = crate::threatdb_api::enrich_command_readings_with_network(
         &ctx.input,
+        ctx.interactive_comments_reading().as_deref(),
         ctx.shell,
         &policy.threat_intel,
         crate::threatdb_api::RuntimeThreatMode::Inline,

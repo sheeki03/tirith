@@ -596,8 +596,9 @@ fn handle_request_with_analysis(
     // different policy if configuration changes during the request.
     let (mut verdict, policy) = analyze(&ctx);
 
-    let mut late_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    let mut late_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
         &req.input,
+        ctx.interactive_comments_reading().as_deref(),
         shell_type,
         &policy.threat_intel,
         RuntimeThreatMode::Daemon,

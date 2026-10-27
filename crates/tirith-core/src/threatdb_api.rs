@@ -484,8 +484,26 @@ pub fn enrich_command_with_network(
     mode: RuntimeThreatMode,
     network: RuntimeThreatNetwork,
 ) -> Vec<Finding> {
+    enrich_command_readings_with_network(input, None, shell, config, mode, network)
+}
+
+/// [`enrich_command_with_network`] over every reading the engine analyzed:
+/// the command as typed and, when the analysis also read it the way an
+/// interactive shell without comment recognition runs it, that reading
+/// ([`crate::engine::interactive_comments_reading`]). The packages and URLs
+/// of both are looked up together, each once, so `echo hi #; npm install
+/// <pkg>` looks up the package that shell installs. The typed reading is
+/// always enriched; the other only adds to it.
+pub fn enrich_command_readings_with_network(
+    input: &str,
+    interactive_comments_reading: Option<&str>,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+) -> Vec<Finding> {
     enrich_command_with_cache(
-        input,
+        &readings(input, interactive_comments_reading),
         shell,
         config,
         mode,
@@ -494,16 +512,25 @@ pub fn enrich_command_with_network(
     )
 }
 
+/// The input as typed, then the interactive-comments reading when there is
+/// one.
+fn readings<'a>(input: &'a str, interactive_comments_reading: Option<&'a str>) -> Vec<&'a str> {
+    std::iter::once(input)
+        .chain(interactive_comments_reading)
+        .collect()
+}
+
 /// One explicit read phase, with no network, cache publication or eviction.
 /// Complete refers to configured enrichment, not arbitrary command safety.
 pub(crate) fn capture_cached_enrichment(
     input: &str,
+    interactive_comments_reading: Option<&str>,
     shell: ShellType,
     config: &ThreatIntelConfig,
     captured_at: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<Finding>, bool) {
     let findings = enrich_command_with_cache(
-        input,
+        &readings(input, interactive_comments_reading),
         shell,
         config,
         RuntimeThreatMode::Inline,
@@ -523,7 +550,7 @@ pub(crate) fn capture_cached_enrichment(
 }
 
 fn enrich_command_with_cache(
-    input: &str,
+    inputs: &[&str],
     shell: ShellType,
     config: &ThreatIntelConfig,
     mode: RuntimeThreatMode,
@@ -535,19 +562,27 @@ fn enrich_command_with_cache(
         return Vec::new();
     }
 
-    // Issue #264: `N=npm; "$N" install pkg` is enriched exactly like the literal
-    // `npm install pkg` it is proven to run.
-    let literal_view = crate::extract::posix_variable_command_literal_view(input, shell);
-    let input = literal_view.as_deref().unwrap_or(input);
-    let segments = crate::tokenize::tokenize(input, shell);
-    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
-    // exists precisely so a consumer whose output is a security decision can see
-    // that the package list was cut. Discarding it made a runtime verdict read
-    // as a complete assessment of a command it had only partly looked at.
-    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
-    let extraction_truncated = extracted.truncated;
-    let packages = extracted.packages;
-    let urls = extract::extract_urls(input, shell);
+    let mut extraction_truncated = false;
+    let mut packages = Vec::new();
+    let mut urls = Vec::new();
+    for input in inputs {
+        // Issue #264: `N=npm; "$N" install pkg` is enriched exactly like the
+        // literal `npm install pkg` it is proven to run.
+        let literal_view = crate::extract::posix_variable_command_literal_view(input, shell);
+        let input = literal_view.as_deref().unwrap_or(input);
+        let segments = crate::tokenize::tokenize(input, shell);
+        // `extract_packages_detail_for_shell`, not the bare variant: the detail
+        // form exists precisely so a consumer whose output is a security
+        // decision can see that the package list was cut. Discarding it made a
+        // runtime verdict read as a complete assessment of a command it had
+        // only partly looked at.
+        let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
+        extraction_truncated |= extracted.truncated;
+        // Repeats across readings are looked up once (`deduplicate_packages`,
+        // and the URL candidate set below).
+        packages.extend(extracted.packages);
+        urls.extend(extract::extract_urls(input, shell));
+    }
     let backend = LivePackageThreatBackend { network, cache };
     let (mut findings, package_budget_truncated) =
         enrich_packages_with_backend(packages, config, mode.timeout(), &backend);
@@ -2054,6 +2089,7 @@ mod tests {
         assert!(!directory.exists());
         let (findings, complete) = capture_cached_enrichment(
             "pip install missing-package==1.0.0",
+            None,
             ShellType::Posix,
             &config,
             chrono::Utc::now(),
@@ -2157,6 +2193,93 @@ mod tests {
             .explanation
             .gaps
             .contains(&crate::evaluation::EvidenceGap::DetectorPolicyChanged));
+    }
+
+    /// `echo hi #; pip install <pkg>` in an interactive shell without comment
+    /// recognition installs the package, so enrichment of that reading looks
+    /// it up; the typed reading alone holds only a comment. Both runtime
+    /// paths read it: inline enrichment and a frozen capture.
+    #[test]
+    fn enrichment_also_reads_the_interactive_comments_reading() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let name = "tirith-hidden-behind-hash";
+        store_cache(
+            "osv",
+            &format!("pypi:{name}:1"),
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-HIDDEN-FIXTURE".into(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+        store_cache("kev", "active", &Vec::<String>::new());
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        };
+        let typed = format!("echo hi #; pip install {name}==1.0.0");
+        let reading = |interactive_comments| {
+            crate::engine::interactive_comments_reading(
+                &typed,
+                ShellType::Posix,
+                crate::extract::ScanContext::Exec,
+                true,
+                interactive_comments,
+            )
+        };
+        assert_eq!(
+            reading(true),
+            None,
+            "comments recognised: no second reading"
+        );
+        let reading = reading(false).expect("the reading without comments");
+        let osv = |findings: &[Finding]| {
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+        };
+        let enrich = |reading: Option<&str>| {
+            enrich_command_readings_with_network(
+                &typed,
+                reading,
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        assert!(!osv(&enrich(None)));
+        let both = enrich(Some(&reading));
+        assert!(osv(&both), "{both:?}");
+        let plain = format!("pip install {name}==1.0.0");
+        assert_eq!(
+            enrich_command_readings_with_network(
+                &plain,
+                Some(&plain),
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+            .count(),
+            1,
+            "a package both readings hold is looked up once"
+        );
+        let (captured, _) = capture_cached_enrichment(
+            &typed,
+            Some(&reading),
+            ShellType::Posix,
+            &config,
+            chrono::Utc::now(),
+        );
+        assert!(osv(&captured), "{captured:?}");
     }
 
     #[derive(Default)]
@@ -2824,6 +2947,7 @@ mod tests {
             );
             let (_, complete) = capture_cached_enrichment(
                 input,
+                None,
                 crate::tokenize::ShellType::Posix,
                 &config,
                 chrono::Utc::now(),

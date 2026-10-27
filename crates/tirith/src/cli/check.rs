@@ -459,8 +459,16 @@ pub fn run(
     crate::cli::warn_repo_policy_neutralized(&policy);
 
     if ran_locally {
-        let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+        let comment_reading = tirith_core::engine::interactive_comments_reading(
             cmd,
+            shell_type,
+            ScanContext::Exec,
+            interactive,
+            interactive_comments,
+        );
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            cmd,
+            comment_reading.as_deref(),
             shell_type,
             &policy.threat_intel,
             RuntimeThreatMode::Inline,
@@ -2655,8 +2663,9 @@ pub(super) fn prepare_receipt_consumption_with_network(
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
         command,
+        analysis.interactive_comments_reading().as_deref(),
         context.shell(),
         &policy.threat_intel,
         RuntimeThreatMode::Inline,

