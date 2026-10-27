@@ -334,6 +334,10 @@ every change in detail.
 - rustls is updated to 0.23.46 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349). The
   rustls 0.23.36 that 0.4.2 shipped is affected by RUSTSEC-2026-0285, -0346,
   -0348 and -0349.
+- rustls-webpki 0.103.16 and webpki-roots 1.0.11 no longer accept certificate
+  paths through the distrusted emSign intermediates (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0381; 0.4.2 shipped affected versions). tokio is updated to
+  1.51.6 for RUSTSEC-2026-0386, an unsound API that Tirith does not use.
 
 ## Known gaps
 
