@@ -3863,7 +3863,7 @@ exact_rules = true
 [[fixture]]
 name = "history_current_line_in_pasted_shell_body"
 min_milestone = 1
-input = 'true rm -rf ~/; sh -c "!#:1-3"'
+input = 'true rm -rf /; sh -c "!#:1-3"'
 context = "paste"
 expected_action = "block"
 expected_rules = ["analysis_incomplete"]
@@ -3902,7 +3902,7 @@ exact_rules = true
 [[fixture]]
 name = "no_interactive_comments_hash_hides_destructive_rm"
 min_milestone = 1
-input = 'echo hi #; rm -rf ~/'
+input = 'echo hi #; rm -rf /'
 context = "exec"
 interactive_comments = false
 expected_action = "block"
@@ -3988,7 +3988,7 @@ expected_rules = ["curl_pipe_shell"]
 [[fixture]]
 name = "no_interactive_comments_glued_card_prelude_hides_destructive_rm"
 min_milestone = 1
-input = "#tirith-card:x;rm -rf ~/\necho ok"
+input = "#tirith-card:x;rm -rf /\necho ok"
 context = "exec"
 interactive_comments = false
 expected_action = "block"
@@ -4033,7 +4033,7 @@ expected_rules = ["curl_pipe_shell"]
 [[fixture]]
 name = "nested_interactive_zsh_heredoc_runs_text_after_hash"
 min_milestone = 1
-input = "zsh -i <<'EOF'\necho hi #; rm -rf ~/\nEOF"
+input = "zsh -i <<'EOF'\necho hi #; rm -rf /\nEOF"
 context = "exec"
 expected_action = "block"
 expected_rules = ["blast_writes_system_path"]
@@ -4049,7 +4049,7 @@ expected_rules = ["curl_pipe_shell"]
 [[fixture]]
 name = "nested_bash_interactive_without_comments_runs_text_after_hash"
 min_milestone = 1
-input = "bash +O interactive_comments -i <<< 'echo hi #; rm -rf ~/'"
+input = "bash +O interactive_comments -i <<< 'echo hi #; rm -rf /'"
 context = "exec"
 expected_action = "block"
 expected_rules = ["blast_writes_system_path"]
@@ -4057,7 +4057,7 @@ expected_rules = ["blast_writes_system_path"]
 [[fixture]]
 name = "nested_bash_interactive_command_string_without_comments"
 min_milestone = 1
-input = "bash +O interactive_comments -ic 'echo hi #; rm -rf ~/'"
+input = "bash +O interactive_comments -ic 'echo hi #; rm -rf /'"
 context = "exec"
 expected_action = "block"
 expected_rules = ["blast_writes_system_path"]
@@ -4089,7 +4089,7 @@ expected_rules = []
 [[fixture]]
 name = "nested_interactive_bash_here_string_comment"
 min_milestone = 1
-input = "bash -i <<< 'echo hi #; rm -rf ~/'"
+input = "bash -i <<< 'echo hi #; rm -rf /'"
 context = "exec"
 expected_action = "allow"
 expected_rules = []

