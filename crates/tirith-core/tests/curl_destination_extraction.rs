@@ -209,3 +209,111 @@ fn curl_non_special_schemes_normalize_numeric_hosts_without_changing_components(
         }
     }
 }
+
+#[test]
+fn curl_scheme_slashes_preserve_authority_and_component_boundaries() {
+    for scheme in ["http", "HTTP", "https", "ftp", "sftp"] {
+        for slashes in ["/", "//", "///"] {
+            let raw = format!("{scheme}:{slashes}user:password@134744072:8080/path?x=1#part");
+            for option in ["", "--url ", "--url=", "--proxy=", "-x", "-svx", "-- "] {
+                let input = format!("curl {option}'{raw}'");
+                let urls = extract_urls(&input, ShellType::Posix);
+                assert_eq!(urls.len(), 1, "{input}: {urls:?}");
+                assert_eq!(urls[0].raw, raw);
+                assert_eq!(urls[0].parsed.host(), Some("8.8.8.8"), "{input}");
+                assert_eq!(urls[0].parsed.raw_host(), Some("134744072"));
+                assert_eq!(
+                    urls[0].parsed.scheme(),
+                    Some(scheme.to_ascii_lowercase().as_str())
+                );
+                assert_eq!(urls[0].parsed.userinfo(), Some("user"));
+                assert_eq!(urls[0].parsed.port(), Some(8080));
+                assert_eq!(urls[0].parsed.path(), Some("/path"));
+            }
+        }
+    }
+}
+
+#[test]
+fn curl_paths_userinfo_and_non_destination_values_do_not_replace_the_host() {
+    for slashes in ["/", "//", "///"] {
+        for raw in [
+            format!("https:{slashes}169.254.169.254@example.com/path"),
+            format!("https:{slashes}example.com:8443/path/http://169.254.169.254/x"),
+            format!("https:{slashes}example.com/path?next=http://169.254.169.254/x"),
+        ] {
+            for input in [
+                format!("curl '{raw}'"),
+                format!("env -S 'curl {raw}'"),
+                format!("sh -c 'curl {raw}'"),
+                format!("echo \"$(curl '{raw}')\""),
+            ] {
+                let urls = extract_urls(&input, ShellType::Posix);
+                assert!(
+                    urls.iter()
+                        .any(|url| url.parsed.host() == Some("example.com")),
+                    "{input}: {urls:?}"
+                );
+                assert!(
+                    urls.iter()
+                        .all(|url| url.parsed.host() != Some("169.254.169.254")),
+                    "{input}: {urls:?}"
+                );
+            }
+        }
+        for option in ["--header", "--data", "--output", "--user"] {
+            let input =
+                format!("curl {option} 'http:{slashes}169.254.169.254/x' https://example.com/");
+            let findings = tirith_core::rules::command::check(
+                &input,
+                ShellType::Posix,
+                None,
+                tirith_core::extract::ScanContext::Exec,
+            );
+            assert!(
+                findings.iter().all(
+                    |finding| finding.rule_id != tirith_core::verdict::RuleId::MetadataEndpoint
+                ),
+                "{input}: {findings:?}"
+            );
+            let denied = tirith_core::rules::command::check_network_policy(
+                &input,
+                ShellType::Posix,
+                &["169.254.0.0/16".into()],
+                &[],
+            );
+            assert!(denied.is_empty(), "{input}: {denied:?}");
+        }
+    }
+    let urls = extract_urls("curl http:////169.254.169.254/x", ShellType::Posix);
+    assert!(
+        urls.iter().all(|url| url.parsed.host().is_none()),
+        "{urls:?}"
+    );
+}
+
+#[test]
+fn curl_slash_normalization_is_not_a_generic_url_or_remote_path_rule() {
+    let generic = tirith_core::parse::parse_url("sftp:/user@host.example:22/path");
+    assert_eq!(generic.host(), None);
+    for input in [
+        "git clone git@github.com:http://4.1.0.11/repo.git",
+        "env -S 'git clone git@github.com:http://4.1.0.11/repo.git'",
+        "scp git@github.com:http://4.1.0.11/repo.git destination",
+        "rsync -a git@github.com:http://4.1.0.11/repo.git destination",
+    ] {
+        let urls = extract_urls(input, ShellType::Posix);
+        assert!(
+            urls.iter().any(|url| {
+                url.parsed.host() == Some("github.com")
+                    && url.parsed.path() == Some("http://4.1.0.11/repo.git")
+                    && matches!(url.parsed, UrlLike::Scp { .. })
+            }),
+            "{input}: {urls:?}"
+        );
+        assert!(
+            urls.iter().all(|url| url.parsed.host() != Some("4.1.0.11")),
+            "{input}: {urls:?}"
+        );
+    }
+}

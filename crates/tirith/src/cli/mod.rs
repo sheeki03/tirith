@@ -58,6 +58,18 @@ impl HumanJsonSarifFormat {
     }
 }
 
+/// Whether the interactive shell that runs a `check`ed or `paste`d command
+/// treats a word-start `#` as a comment: `false` with
+/// `--no-interactive-comments`, or when `_TIRITH_INTERACTIVE_COMMENTS` is `0`.
+/// The bash and zsh hooks report the shell's option through that variable
+/// rather than the flag, so a pinned binary older than the hooks ignores it
+/// and keeps its own reading, where an unknown flag would be a usage error
+/// (paste) or, before `--`, the start of the checked command itself (check).
+pub(crate) fn interactive_comments_reading(no_interactive_comments_flag: bool) -> bool {
+    !no_interactive_comments_flag
+        && std::env::var_os("_TIRITH_INTERACTIVE_COMMENTS").is_none_or(|value| value != "0")
+}
+
 /// `true` when `TIRITH_OFFLINE` is set truthy (`1`/`true`/`yes`/`on`,
 /// case-insensitive, trimmed). The env-var half of the CLI-wide offline switch
 /// that every networked command routes through, so it behaves identically.

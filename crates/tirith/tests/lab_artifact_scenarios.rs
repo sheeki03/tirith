@@ -26,8 +26,29 @@
 
 use std::process::Command;
 
+/// A private HOME and XDG tree per test process, removed at exit, so a lab run
+/// never writes into the developer's real home directory.
 fn tirith() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tirith"))
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT
+        .get_or_init(|| {
+            let root = tempfile::Builder::new()
+                .prefix("tirith-lab-artifacts-")
+                .tempdir()
+                .expect("create hermetic root");
+            tirith_test_support::remove_at_exit(root.path());
+            root
+        })
+        .path();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TIRITH_LOG", "0");
+    cmd
 }
 
 /// Run `tirith lab --format json --filter artifact --non-interactive` and return

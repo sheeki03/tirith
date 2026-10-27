@@ -121,10 +121,39 @@ fn run_fix(yes: bool) -> i32 {
     }
 
     {
-        let tools: Vec<_> = detect_ai_tools()
+        // A stale adapter (installed by an earlier release) is repaired like a
+        // broken one: setup refuses to overwrite it without force.
+        let (stale, elsewhere): (Vec<_>, Vec<_>) = gather_agent_adapters()
+            .into_iter()
+            .filter(|adapter| adapter.state == AdapterState::Stale)
+            .partition(|adapter| adapter.setup_dir.is_none());
+        // Setup writes these project adapters where it runs, so repairing one
+        // found in an ancestor from here would install a second adapter
+        // instead. Print the command that refreshes it in place.
+        for adapter in &elsewhere {
+            if let Some(remedy) = &adapter.remedy {
+                println!(
+                    "Fix: refresh the stale {} adapter at {}: run `{remedy}`",
+                    adapter.tool, adapter.path
+                );
+            }
+        }
+        let mut tools: Vec<_> = detect_ai_tools()
             .into_iter()
             .filter(|tool| tool.hook_state != HookInstallState::Effective)
+            .filter(|tool| !stale.iter().any(|adapter| adapter.tool == tool.name))
             .collect();
+        for adapter in &stale {
+            if !tools.iter().any(|tool| {
+                tool.name == adapter.tool && tool.configured_scope == Some(adapter.scope)
+            }) {
+                tools.push(DetectedTool {
+                    name: adapter.tool,
+                    configured_scope: Some(adapter.scope),
+                    hook_state: HookInstallState::Broken,
+                });
+            }
+        }
         if !tools.is_empty() {
             println!("Fix: Configure tirith for AI coding tools");
             for tool in &tools {
@@ -548,6 +577,463 @@ fn cline_hook_artifact(home: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Whether an installed agent hook adapter still matches the asset this binary
+/// embeds. Setup never rewrites an existing adapter without `--force`, so a
+/// binary upgrade leaves the previous release's adapter in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdapterState {
+    Current,
+    Stale,
+}
+
+/// One installed agent hook adapter and its currency against the embedded asset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AgentAdapterReport {
+    tool: &'static str,
+    scope: &'static str,
+    path: String,
+    state: AdapterState,
+    /// The command that refreshes a stale adapter; absent when current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remedy: Option<String>,
+    /// The directory `tirith setup` must run in to refresh this project
+    /// adapter, when it is not the current directory (the adapter was found
+    /// in an ancestor up to the repository root). `doctor --fix` leaves such
+    /// an adapter to the printed remedy rather than installing a new one here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_dir: Option<String>,
+}
+
+/// The asset setup renders into an adapter, and the placeholders it substitutes.
+type AdapterTemplate = (&'static str, &'static [&'static str]);
+
+const VERBATIM: &[&str] = &[];
+const SHELL_HOOK_PLACEHOLDERS: &[&str] = &["__TIRITH_BIN__", "__TIRITH_PYTHON__"];
+const PI_GUARD_PLACEHOLDERS: &[&str] = &["\"__TIRITH_BIN__\"", "\"__TIRITH_INTEGRATION__\""];
+
+/// One adapter file setup may have written.
+struct AdapterCandidate {
+    tool: &'static str,
+    scope: &'static str,
+    path: PathBuf,
+    template: AdapterTemplate,
+    /// Where `tirith setup --scope project` must run to refresh the adapter,
+    /// when that is not the current directory.
+    setup_dir: Option<PathBuf>,
+}
+
+fn candidate(
+    tool: &'static str,
+    scope: &'static str,
+    path: PathBuf,
+    template: AdapterTemplate,
+) -> AdapterCandidate {
+    AdapterCandidate {
+        tool,
+        scope,
+        path,
+        template,
+        setup_dir: None,
+    }
+}
+
+/// The directory holding the project adapter at `relative` that applies to
+/// `cwd`: the nearest one from `cwd` up to the repository root (the `.git`
+/// boundary where policy discovery also stops), or `cwd` itself when none
+/// does. Setup writes these adapters in the directory it runs in, so doctor
+/// run from a subdirectory must still find the project's adapters.
+fn project_adapter_dir(cwd: &std::path::Path, relative: &str) -> PathBuf {
+    for dir in cwd.ancestors() {
+        if std::fs::symlink_metadata(dir.join(relative)).is_ok() {
+            return dir.to_path_buf();
+        }
+        if std::fs::metadata(dir.join(".git")).is_ok() {
+            break;
+        }
+    }
+    cwd.to_path_buf()
+}
+
+/// A project candidate found by walking up from `cwd`; `setup_dir` records an
+/// ancestor, since setup writes this host's project adapter where it runs.
+fn walked_project_candidate(
+    tool: &'static str,
+    cwd: &std::path::Path,
+    relative: &str,
+    template: AdapterTemplate,
+) -> AdapterCandidate {
+    let dir = project_adapter_dir(cwd, relative);
+    AdapterCandidate {
+        tool,
+        scope: "project",
+        path: dir.join(relative),
+        template,
+        setup_dir: (dir != cwd).then_some(dir),
+    }
+}
+
+/// Every adapter file setup writes for a host, in the same locations setup
+/// resolves, project scope first.
+fn agent_adapter_candidates(
+    home: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> Vec<AdapterCandidate> {
+    use crate::assets;
+    let check_py = (assets::TIRITH_CHECK_PY, VERBATIM);
+    let pi_guard = (assets::TIRITH_GUARD_TS, PI_GUARD_PLACEHOLDERS);
+    let mut candidates = Vec::new();
+    if let Some(cwd) = cwd {
+        // Kiro's own discovery (and setup's) already walks up to the nearest
+        // `.kiro/`, so its refresh command works from here.
+        let kiro_root =
+            tirith_core::policy::find_workspace_kiro_dir(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        candidates.extend([
+            walked_project_candidate(
+                "claude-code",
+                cwd,
+                ".claude/hooks/tirith-check.py",
+                check_py,
+            ),
+            walked_project_candidate(
+                "cursor",
+                cwd,
+                ".cursor/hooks/tirith-hook.sh",
+                (assets::CURSOR_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+            ),
+            walked_project_candidate(
+                "vscode",
+                cwd,
+                ".vscode/hooks/tirith-hook.sh",
+                (assets::VSCODE_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+            ),
+            walked_project_candidate(
+                "gemini-cli",
+                cwd,
+                ".gemini/hooks/tirith-security-guard-gemini.py",
+                (assets::GEMINI_HOOK_PY, VERBATIM),
+            ),
+            candidate(
+                "kiro",
+                "project",
+                kiro_root.join(".kiro/hooks/kiro-hook.py"),
+                (assets::KIRO_HOOK_PY, VERBATIM),
+            ),
+            walked_project_candidate(
+                "openclaw",
+                cwd,
+                ".openclaw/extensions/tirith-security/index.ts",
+                (assets::OPENCLAW_GUARD_TS, VERBATIM),
+            ),
+            walked_project_candidate("pi-cli", cwd, ".pi/extensions/tirith-guard.ts", pi_guard),
+        ]);
+        #[cfg(unix)]
+        {
+            let relative = ".openhands/hooks/tirith-check.py";
+            candidates.push(match std::env::var_os("OPENHANDS_WORK_DIR") {
+                // OpenHands reads exactly this directory, as setup writes it.
+                Some(value) if !value.is_empty() => candidate(
+                    "openhands",
+                    "project",
+                    PathBuf::from(value).join(relative),
+                    check_py,
+                ),
+                _ => walked_project_candidate("openhands", cwd, relative, check_py),
+            });
+        }
+    }
+    if let Some(root) = tirith_core::policy::find_repo_root(None) {
+        // Setup writes these at the repository root from any subdirectory.
+        candidates.push(candidate(
+            "copilot-cli",
+            "project",
+            root.join(".github/hooks/copilot-cli-hook.py"),
+            (assets::COPILOT_HOOK_PY, VERBATIM),
+        ));
+        #[cfg(unix)]
+        candidates.push(candidate(
+            "grok-build",
+            "project",
+            root.join(".grok/hooks/tirith-check.py"),
+            check_py,
+        ));
+    }
+    let gemini_home = std::env::var_os("GEMINI_CLI_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_path_buf());
+    let openclaw_user = crate::cli::setup::openclaw_state_dir_override(home)
+        .unwrap_or_else(|| home.join(".openclaw"));
+    candidates.extend([
+        candidate(
+            "claude-code",
+            "user",
+            home.join(".claude/hooks/tirith-check.py"),
+            check_py,
+        ),
+        candidate(
+            "cursor",
+            "user",
+            home.join(".cursor/hooks/tirith-hook.sh"),
+            (assets::CURSOR_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+        ),
+        candidate(
+            "windsurf",
+            "user",
+            home.join(".codeium/windsurf/hooks/tirith-hook.sh"),
+            (assets::WINDSURF_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+        ),
+        candidate(
+            "gemini-cli",
+            "user",
+            gemini_home.join(".gemini/hooks/tirith-security-guard-gemini.py"),
+            (assets::GEMINI_HOOK_PY, VERBATIM),
+        ),
+        candidate(
+            "kiro",
+            "user",
+            home.join(".kiro/hooks/kiro-hook.py"),
+            (assets::KIRO_HOOK_PY, VERBATIM),
+        ),
+        candidate(
+            "openclaw",
+            "user",
+            openclaw_user.join("extensions/tirith-security/index.ts"),
+            (assets::OPENCLAW_GUARD_TS, VERBATIM),
+        ),
+        candidate(
+            "cline",
+            "user",
+            cline_hook_artifact(home).with_file_name("tirith-check.py"),
+            check_py,
+        ),
+    ]);
+    for (tool, path) in [
+        (
+            "pi-cli",
+            crate::cli::setup::pi_cli_user_guard_path(home).ok(),
+        ),
+        (
+            "prime-agent",
+            crate::cli::setup::prime_agent_user_guard_path(home).ok(),
+        ),
+        ("omp", crate::cli::setup::omp_user_guard_path(home).ok()),
+    ] {
+        if let Some(path) = path {
+            candidates.push(candidate(tool, "user", path, pi_guard));
+        }
+    }
+    #[cfg(unix)]
+    candidates.extend([
+        candidate(
+            "grok-build",
+            "user",
+            home.join(".grok/hooks/tirith-check.py"),
+            check_py,
+        ),
+        candidate(
+            "openhands",
+            "user",
+            home.join(".openhands/hooks/tirith-check.py"),
+            check_py,
+        ),
+    ]);
+    candidates
+}
+
+/// The Pi-family hosts that share one guard; its integration placeholder
+/// names one of them.
+const PI_FAMILY_INTEGRATIONS: &[&str] = &["pi-cli", "prime-agent", "omp"];
+
+/// Whether `installed` is exactly `template` with each placeholder replaced by
+/// one consistent value of the shape setup renders (see
+/// [`placeholder_value_is_valid`]); every other byte must match the embedded
+/// asset.
+#[cfg(test)]
+fn rendered_asset_matches(installed: &str, template: &str, placeholders: &[&str]) -> bool {
+    rendered_adapter_matches(None, installed, template, placeholders)
+}
+
+/// [`rendered_asset_matches`] for one host: a Pi-family guard must also name
+/// `tool` as its integration.
+fn rendered_adapter_matches(
+    tool: Option<&str>,
+    installed: &str,
+    template: &str,
+    placeholders: &[&str],
+) -> bool {
+    rendered_placeholder_values(installed, template, placeholders).is_some_and(|values| {
+        values.iter().zip(placeholders).all(|(value, placeholder)| {
+            value.is_none_or(|value| placeholder_value_is_valid(placeholder, value, tool))
+        })
+    })
+}
+
+/// The value each placeholder was rendered with, when `installed` is
+/// `template` with every placeholder replaced by one consistent single-line
+/// value; `None` when any other byte differs.
+fn rendered_placeholder_values<'a>(
+    installed: &'a str,
+    template: &str,
+    placeholders: &[&str],
+) -> Option<Vec<Option<&'a str>>> {
+    let mut literals = Vec::new();
+    let mut slots = Vec::new();
+    let mut rest = template;
+    loop {
+        let next = placeholders
+            .iter()
+            .enumerate()
+            .filter_map(|(index, placeholder)| rest.find(placeholder).map(|at| (at, index)))
+            .min();
+        let Some((at, index)) = next else {
+            literals.push(rest);
+            break;
+        };
+        literals.push(&rest[..at]);
+        slots.push(index);
+        rest = &rest[at + placeholders[index].len()..];
+    }
+    let mut remaining = installed.strip_prefix(literals[0])?;
+    let mut values: Vec<Option<&str>> = vec![None; placeholders.len()];
+    for (position, (slot, literal)) in slots.iter().zip(&literals[1..]).enumerate() {
+        let last = position + 1 == slots.len();
+        let value_end = if last {
+            remaining.strip_suffix(literal).map(str::len)
+        } else if literal.is_empty() {
+            None
+        } else {
+            remaining.find(literal)
+        }?;
+        let value = &remaining[..value_end];
+        if value.contains('\n') || values[*slot].is_some_and(|previous| previous != value) {
+            return None;
+        }
+        values[*slot] = Some(value);
+        remaining = &remaining[value_end + literal.len()..];
+    }
+    remaining.is_empty().then_some(values)
+}
+
+/// Whether a substituted placeholder value has the shape setup writes. Any
+/// single line used to be accepted, so a tampered line (a command appended
+/// after the interpreter path, say) was reported as a current adapter.
+fn placeholder_value_is_valid(placeholder: &str, value: &str, tool: Option<&str>) -> bool {
+    match placeholder {
+        // Substituted raw into `"${TIRITH_BIN:-...}"` and a comment: a bare
+        // `tirith` or an absolute path, with nothing the double-quoted
+        // expansion would interpret or end at. A backslash is literal there
+        // unless it precedes one of those characters, another backslash, or
+        // the closing `}` (a trailing `\` escapes it and the hook no longer
+        // parses), so a Windows path such as `C:\Program Files\...` stays
+        // valid.
+        "__TIRITH_BIN__" => {
+            (value == "tirith" || std::path::Path::new(value).is_absolute())
+                && !value
+                    .chars()
+                    .any(|c| matches!(c, '"' | '$' | '`' | '}' | '\r' | '\n'))
+                && !value.ends_with('\\')
+                && !value.contains("\\\\")
+        }
+        // `TIRITH_PYTHON=<shell_quote(absolute interpreter)>`.
+        "__TIRITH_PYTHON__" => decode_setup_shell_quoted(value)
+            .is_some_and(|python| std::path::Path::new(&python).is_absolute()),
+        // JSON string literals in the Pi-family guard.
+        "\"__TIRITH_BIN__\"" => canonical_json_string(value)
+            .is_some_and(|binary| std::path::Path::new(&binary).is_absolute()),
+        "\"__TIRITH_INTEGRATION__\"" => {
+            canonical_json_string(value).is_some_and(|integration| match tool {
+                Some(tool) => integration == tool,
+                None => PI_FAMILY_INTEGRATIONS.contains(&integration.as_str()),
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Decode a value setup quoted with `shell_quote(value, "bash")`, only when
+/// quoting the decoded text reproduces it exactly.
+fn decode_setup_shell_quoted(value: &str) -> Option<String> {
+    let decoded = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("'\\''", "'")
+    } else {
+        value.to_string()
+    };
+    (!decoded.contains(['\n', '\r']) && crate::cli::setup::shell_quote(&decoded, "bash") == value)
+        .then_some(decoded)
+}
+
+/// Decode a JSON string literal only in the exact form `serde_json` writes it.
+fn canonical_json_string(value: &str) -> Option<String> {
+    let decoded: String = serde_json::from_str(value).ok()?;
+    (serde_json::to_string(&decoded).ok()? == value).then_some(decoded)
+}
+
+fn adapter_remedy(tool: &str, scope: &str, setup_dir: Option<&std::path::Path>) -> String {
+    let setup = format!("tirith setup {tool} --scope {scope} --force");
+    match setup_dir.and_then(std::path::Path::to_str) {
+        Some(dir) => format!(
+            "cd {} && {setup}",
+            crate::cli::setup::shell_quote(dir, "bash")
+        ),
+        None => setup,
+    }
+}
+
+/// Report every installed agent hook adapter, current or stale. Paths shared by
+/// two scopes (a project rooted at HOME) are reported once, as user scope.
+fn gather_agent_adapters_with(
+    home: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> Vec<AgentAdapterReport> {
+    let mut reports: Vec<AgentAdapterReport> = Vec::new();
+    for candidate in agent_adapter_candidates(home, cwd) {
+        let AdapterCandidate {
+            tool,
+            scope,
+            path,
+            template: (template, placeholders),
+            setup_dir,
+        } = candidate;
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        let current = read_hook_text(&path).is_some_and(|installed| {
+            rendered_adapter_matches(Some(tool), &installed, template, placeholders)
+        });
+        let path = path.display().to_string();
+        let state = if current {
+            AdapterState::Current
+        } else {
+            AdapterState::Stale
+        };
+        let report = AgentAdapterReport {
+            tool,
+            scope,
+            remedy: (state == AdapterState::Stale)
+                .then(|| adapter_remedy(tool, scope, setup_dir.as_deref())),
+            setup_dir: setup_dir.map(|dir| dir.display().to_string()),
+            path,
+            state,
+        };
+        match reports
+            .iter_mut()
+            .find(|existing| existing.tool == tool && existing.path == report.path)
+        {
+            Some(existing) => *existing = report,
+            None => reports.push(report),
+        }
+    }
+    reports
+}
+
+fn gather_agent_adapters() -> Vec<AgentAdapterReport> {
+    let Some(home) = home::home_dir() else {
+        return Vec::new();
+    };
+    let cwd = std::env::current_dir().ok();
+    gather_agent_adapters_with(&home, cwd.as_deref())
+}
+
 const MAX_DOCTOR_HOOK_BYTES: u64 = 1024 * 1024;
 
 /// Read a hook artifact without following its final path component and without
@@ -706,20 +1192,31 @@ fn posix_wrapper_execs_pinned_python(path: &std::path::Path, protocol: &str) -> 
     let protocol_reaches_exec = lines
         .windows(2)
         .any(|pair| pair[0] == protocol_assignment && pair[1].starts_with("exec "));
-    let pinned_exec = lines.iter().any(|line| {
-        let Some(command) = line.trim_start().strip_prefix("exec ") else {
-            return false;
-        };
-        command
+    let pinned_python = lines.iter().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("exec ")?
             .strip_suffix(&expected_adapter)
             .and_then(|python| python.strip_suffix(' '))
             .and_then(setup_shell_path)
-            .is_some()
     });
+    // The wrapper must be exactly what this release's setup writes for those
+    // pinned paths. An earlier wrapper lacks the missing-interpreter guard, so
+    // a moved interpreter would let the host run the tool unchecked.
+    let current_wrapper = match (&pinned_binary, &pinned_python) {
+        (Some(binary), Some(python)) => match (binary.to_str(), python.to_str()) {
+            (Some(binary), Some(python)) => {
+                crate::cli::setup::pre_tool_use_wrapper(protocol, binary, python, &adapter)
+                    .is_ok_and(|expected| expected == content)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
     executable
-        && pinned_exec
+        && pinned_python.is_some()
         && pinned_binary.is_some()
         && protocol_reaches_exec
+        && current_wrapper
         && !content.contains("__TIRITH_PYTHON__")
         && hook_adapter_is_current(&adapter)
 }
@@ -1128,6 +1625,9 @@ struct DoctorInfo {
     webhooks_available: bool,
     /// Other `tirith` binaries found on PATH that shadow or conflict with this one.
     shadow_binaries: Vec<String>,
+    /// Installed agent hook adapters and whether each matches this binary's
+    /// embedded asset; a stale adapter predates this release's checks.
+    agent_adapters: Vec<AgentAdapterReport>,
     /// Detection gap analysis from audit log data.
     #[serde(skip_serializing_if = "Option::is_none")]
     detection_gaps: Option<DetectionGapInfo>,
@@ -1416,6 +1916,7 @@ fn gather_info() -> DoctorInfo {
         cloaking_available: cfg!(unix),
         webhooks_available: cfg!(unix),
         shadow_binaries,
+        agent_adapters: gather_agent_adapters(),
         detection_gaps,
         threat_db,
         baseline,
@@ -2767,6 +3268,25 @@ fn print_human(info: &DoctorInfo) {
         }
     );
 
+    for (index, adapter) in info.agent_adapters.iter().enumerate() {
+        let label = if index == 0 { "agent hooks:" } else { "" };
+        match adapter.remedy.as_deref() {
+            None => println!(
+                "  {label:<13} {} ({}): current — {}",
+                adapter.tool, adapter.scope, adapter.path
+            ),
+            Some(remedy) => {
+                println!(
+                    "  {label:<13} {} ({}): STALE — {}",
+                    adapter.tool, adapter.scope, adapter.path
+                );
+                println!(
+                    "                installed adapter does not match this tirith release; run `{remedy}`"
+                );
+            }
+        }
+    }
+
     if let Some(ref tdb) = info.threat_db {
         if !tdb.installed {
             println!("  threat DB:    not installed — run 'tirith threat-db update'");
@@ -3261,11 +3781,27 @@ mod tests {
     fn write_effective_wrapper(path: &std::path::Path, protocol: &str) {
         let adapter = path.parent().unwrap().join("tirith-check.py");
         write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
+        write_executable(
+            path,
+            &crate::cli::setup::pre_tool_use_wrapper(
+                protocol,
+                "/opt/tirith/bin/tirith",
+                "/usr/bin/python3",
+                &adapter,
+            )
+            .unwrap(),
+        );
+    }
+
+    /// The wrapper an earlier release wrote: no missing-interpreter guard.
+    fn write_pre_guard_wrapper(path: &std::path::Path, protocol: &str) {
+        let adapter = path.parent().unwrap().join("tirith-check.py");
+        write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
         let adapter = crate::cli::setup::shell_quote(adapter.to_str().unwrap(), "bash");
         write_executable(
             path,
             &format!(
-                "#!/bin/sh\nTIRITH_BIN=/opt/tirith/bin/tirith \\\nTIRITH_HOOK_PROTOCOL={protocol} \\\nexec /usr/bin/python3 {adapter}\n"
+                "#!/bin/sh\n# Generated by `tirith setup`. Runs the shared pre-tool-use adapter with\n# this host's wire protocol. Do not edit; re-run setup to refresh it.\nTIRITH_BIN=/opt/tirith/bin/tirith \\\nTIRITH_HOOK_PROTOCOL={protocol} \\\nexec /usr/bin/python3 {adapter}\n"
             ),
         );
     }
@@ -3368,6 +3904,324 @@ mod tests {
                 omp_path,
                 home.join("custom-omp/profiles/work/agent/hooks/pre/tirith-guard.ts")
             );
+        });
+    }
+
+    fn render_shell_hook(template: &str, tirith: &str, python: &str) -> String {
+        template
+            .replace("__TIRITH_BIN__", tirith)
+            .replace("__TIRITH_PYTHON__", python)
+    }
+
+    #[test]
+    fn rendered_asset_matches_accepts_setup_substitutions_and_rejects_drift() {
+        for template in [
+            crate::assets::CURSOR_HOOK_SH,
+            crate::assets::VSCODE_HOOK_SH,
+            crate::assets::WINDSURF_HOOK_SH,
+        ] {
+            for (tirith, python) in [
+                ("/opt/tirith/bin/tirith", "/usr/bin/python3"),
+                ("tirith", "'/Users/a b/py thon/bin/python3'"),
+                (
+                    "/Users/o'brien/bin/tirith",
+                    "'/Users/o'\\''brien/bin/python3'",
+                ),
+            ] {
+                let rendered = render_shell_hook(template, tirith, python);
+                assert!(
+                    rendered_asset_matches(&rendered, template, SHELL_HOOK_PLACEHOLDERS),
+                    "{tirith} {python}"
+                );
+                assert!(!rendered_asset_matches(
+                    &format!("{rendered}\n"),
+                    template,
+                    SHELL_HOOK_PLACEHOLDERS
+                ));
+            }
+            // An earlier release's adapter: same placeholders, different logic.
+            let older = template.replacen("-I -S -c", "-c", 1);
+            assert_ne!(older, template);
+            let rendered = render_shell_hook(&older, "/opt/tirith/bin/tirith", "/usr/bin/python3");
+            assert!(!rendered_asset_matches(
+                &rendered,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // One placeholder rendered with two different values never matches.
+            let inconsistent = render_shell_hook(
+                &template.replacen("__TIRITH_BIN__", "/elsewhere/tirith", 1),
+                "/opt/tirith/bin/tirith",
+                "/usr/bin/python3",
+            );
+            assert!(!rendered_asset_matches(
+                &inconsistent,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // A substituted value is a single line.
+            let multiline =
+                render_shell_hook(template, "/opt/tirith\nrm -rf ~", "/usr/bin/python3");
+            assert!(!rendered_asset_matches(
+                &multiline,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // A tampered placeholder line is not a setup value: setup writes a
+            // shell-quoted absolute interpreter and a bare or absolute Tirith
+            // path that the double-quoted expansion cannot interpret.
+            for (tirith, python) in [
+                (
+                    "/opt/tirith/bin/tirith",
+                    "/usr/bin/python3; echo '{\"permission\":\"allow\"}'; exit 0",
+                ),
+                ("/opt/tirith/bin/tirith", "python3"),
+                ("/opt/tirith/bin/tirith", "'/usr/bin/python3"),
+                ("/opt/tirith/bin/tirith", "/usr/bin/python3 #"),
+                ("/opt/tirith/bin/tirith", ""),
+                ("/opt/$(touch /tmp/x)/tirith", "/usr/bin/python3"),
+                ("/opt/tirith\"; exit 0; \"", "/usr/bin/python3"),
+                ("/opt/`id`/tirith", "/usr/bin/python3"),
+                ("/opt/ti}rith", "/usr/bin/python3"),
+                ("/opt/tirith\\", "/usr/bin/python3"),
+                ("/opt/ti\\\\rith", "/usr/bin/python3"),
+                ("relative/tirith", "/usr/bin/python3"),
+                ("", "/usr/bin/python3"),
+            ] {
+                let rendered = render_shell_hook(template, tirith, python);
+                assert!(
+                    !rendered_asset_matches(&rendered, template, SHELL_HOOK_PLACEHOLDERS),
+                    "tampered value accepted: {tirith:?} {python:?}"
+                );
+            }
+        }
+
+        let guard = crate::assets::TIRITH_GUARD_TS
+            .replace("\"__TIRITH_BIN__\"", "\"/opt/tirith/bin/tirith\"")
+            .replace("\"__TIRITH_INTEGRATION__\"", "\"omp\"");
+        assert!(rendered_asset_matches(
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        assert!(!rendered_asset_matches(
+            &rendered_guard("omp"),
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        // Guard values must be the canonical JSON string literals setup writes:
+        // an absolute Tirith path and the host's own integration name.
+        for (binary, integration) in [
+            (r#""/x"; globalThis.allow = true; "y""#, r#""omp""#),
+            (r#""\/opt\/tirith\/bin\/tirith""#, r#""omp""#),
+            (r#""tirith""#, r#""omp""#),
+            (r#"'/opt/tirith/bin/tirith'"#, r#""omp""#),
+            (r#""/opt/tirith/bin/tirith""#, r#""evil""#),
+            (r#""/opt/tirith/bin/tirith""#, r#""omp" || "x""#),
+        ] {
+            let tampered = crate::assets::TIRITH_GUARD_TS
+                .replace("\"__TIRITH_BIN__\"", binary)
+                .replace("\"__TIRITH_INTEGRATION__\"", integration);
+            assert!(
+                !rendered_asset_matches(
+                    &tampered,
+                    crate::assets::TIRITH_GUARD_TS,
+                    PI_GUARD_PLACEHOLDERS
+                ),
+                "tampered guard accepted: {binary} {integration}"
+            );
+        }
+        // A guard labelled for another Pi-family host is not this host's.
+        assert!(rendered_adapter_matches(
+            Some("omp"),
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        assert!(!rendered_adapter_matches(
+            Some("pi-cli"),
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+
+        for asset in [
+            crate::assets::TIRITH_CHECK_PY,
+            crate::assets::KIRO_HOOK_PY,
+            crate::assets::COPILOT_HOOK_PY,
+            crate::assets::GEMINI_HOOK_PY,
+            crate::assets::OPENCLAW_GUARD_TS,
+        ] {
+            assert!(rendered_asset_matches(asset, asset, VERBATIM));
+            assert!(!rendered_asset_matches(
+                &format!("{asset}# local edit\n"),
+                asset,
+                VERBATIM
+            ));
+            assert!(!rendered_asset_matches(&asset[1..], asset, VERBATIM));
+        }
+    }
+
+    #[test]
+    fn agent_adapters_report_current_and_stale_installs_with_a_force_remedy() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let cursor = home.join(".cursor/hooks/tirith-hook.sh");
+            write_executable(
+                &cursor,
+                &render_shell_hook(
+                    crate::assets::CURSOR_HOOK_SH,
+                    "/opt/tirith/bin/tirith",
+                    "/usr/bin/python3",
+                ),
+            );
+            let claude = home.join(".claude/hooks/tirith-check.py");
+            write_executable(&claude, "#!/usr/bin/env python3\n# adapter from 0.4.x\n");
+            let gemini = cwd.join(".gemini/hooks/tirith-security-guard-gemini.py");
+            write_executable(&gemini, crate::assets::GEMINI_HOOK_PY);
+            let omp = crate::cli::setup::omp_user_guard_path(home).unwrap();
+            write_executable(&omp, &rendered_guard("omp"));
+
+            let reports = gather_agent_adapters_with(home, Some(cwd));
+            let find = |tool: &str| {
+                reports
+                    .iter()
+                    .find(|report| report.tool == tool)
+                    .unwrap_or_else(|| panic!("{tool} adapter not reported: {reports:?}"))
+            };
+            let cursor_report = find("cursor");
+            assert_eq!(cursor_report.scope, "user");
+            assert_eq!(cursor_report.state, AdapterState::Current);
+            assert_eq!(cursor_report.remedy, None);
+            assert_eq!(cursor_report.path, cursor.display().to_string());
+
+            let claude_report = find("claude-code");
+            assert_eq!(claude_report.scope, "user");
+            assert_eq!(claude_report.state, AdapterState::Stale);
+            assert_eq!(
+                claude_report.remedy.as_deref(),
+                Some("tirith setup claude-code --scope user --force")
+            );
+
+            let gemini_report = find("gemini-cli");
+            assert_eq!(gemini_report.scope, "project");
+            assert_eq!(gemini_report.state, AdapterState::Current);
+
+            assert_eq!(find("omp").state, AdapterState::Stale);
+            for absent in ["vscode", "windsurf", "kiro", "openclaw", "copilot-cli"] {
+                assert!(
+                    reports.iter().all(|report| report.tool != absent),
+                    "{absent}: {reports:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn agent_adapters_are_found_up_to_the_repository_root() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // A repository whose root holds a stale project adapter, and a
+            // project adapter above that root that belongs to another tree.
+            let outer = cwd.join("outer");
+            let repo = outer.join("repo");
+            let subdir = repo.join("crates/inner");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(&subdir).unwrap();
+            write_executable(
+                &repo.join(".claude/hooks/tirith-check.py"),
+                "#!/usr/bin/env python3\n# adapter from an earlier release\n",
+            );
+            write_executable(
+                &repo.join(".gemini/hooks/tirith-security-guard-gemini.py"),
+                crate::assets::GEMINI_HOOK_PY,
+            );
+            write_executable(
+                &outer.join(".cursor/hooks/tirith-hook.sh"),
+                "#!/bin/sh\n# not this repository's adapter\n",
+            );
+
+            let reports = gather_agent_adapters_with(home, Some(&subdir));
+            let claude = reports
+                .iter()
+                .find(|report| report.tool == "claude-code")
+                .unwrap_or_else(|| panic!("repository adapter not found: {reports:?}"));
+            assert_eq!(claude.scope, "project");
+            assert_eq!(claude.state, AdapterState::Stale);
+            assert_eq!(
+                claude.path,
+                repo.join(".claude/hooks/tirith-check.py")
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(claude.setup_dir, Some(repo.display().to_string()));
+            // Setup writes this adapter where it runs, so the remedy runs there.
+            assert_eq!(
+                claude.remedy.as_deref(),
+                Some(
+                    format!(
+                        "cd {} && tirith setup claude-code --scope project --force",
+                        crate::cli::setup::shell_quote(repo.to_str().unwrap(), "bash")
+                    )
+                    .as_str()
+                )
+            );
+            let gemini = reports
+                .iter()
+                .find(|report| report.tool == "gemini-cli")
+                .unwrap();
+            assert_eq!(gemini.state, AdapterState::Current);
+            assert_eq!(gemini.remedy, None);
+            // Discovery stops at the `.git` boundary, as policy discovery does.
+            assert!(
+                reports.iter().all(|report| report.tool != "cursor"),
+                "{reports:?}"
+            );
+
+            // From the directory that holds the adapter, the remedy needs no cd.
+            let reports = gather_agent_adapters_with(home, Some(&repo));
+            let claude = reports
+                .iter()
+                .find(|report| report.tool == "claude-code")
+                .unwrap();
+            assert_eq!(claude.setup_dir, None);
+            assert_eq!(
+                claude.remedy.as_deref(),
+                Some("tirith setup claude-code --scope project --force")
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_without_the_missing_interpreter_guard_needs_repair() {
+        with_fake_env(true, |home, cwd| {
+            let wrapper = cline_hook_artifact(home);
+            write_pre_guard_wrapper(&wrapper, "cline");
+            let tools = detect_ai_tools_with(home, cwd);
+            let cline = tools.iter().find(|tool| tool.name == "cline").unwrap();
+            assert_eq!(cline.hook_state, HookInstallState::Broken);
+
+            write_effective_wrapper(&wrapper, "cline");
+            let tools = detect_ai_tools_with(home, cwd);
+            let cline = tools.iter().find(|tool| tool.name == "cline").unwrap();
+            assert_eq!(cline.hook_state, HookInstallState::Effective);
+        });
+    }
+
+    #[test]
+    fn agent_adapter_shared_by_both_scopes_is_reported_once_as_user() {
+        with_fake_env(false, |home, _| {
+            let adapter = home.join(".claude/hooks/tirith-check.py");
+            write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
+            let reports = gather_agent_adapters_with(home, Some(home));
+            let claude: Vec<_> = reports
+                .iter()
+                .filter(|report| report.tool == "claude-code")
+                .collect();
+            assert_eq!(claude.len(), 1, "{reports:?}");
+            assert_eq!(claude[0].scope, "user");
+            assert_eq!(claude[0].state, AdapterState::Current);
         });
     }
 

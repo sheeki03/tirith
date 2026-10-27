@@ -150,6 +150,7 @@ fn scenario_context(
         // inherits them.
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     }
 }
 
@@ -727,6 +728,7 @@ mod tests {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         assert!(evaluate_scenario(&s, &ctx).is_err());
     }

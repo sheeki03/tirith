@@ -876,8 +876,22 @@ impl extrasafe::RuleSet for PostExecRuntime {
             Sysno::epoll_create1,
             Sysno::epoll_ctl,
             Sysno::epoll_pwait,
+            // epoll_pwait(2) without a signal mask. glibc's epoll_wait(3), and
+            // with it mio/tokio's event loop, issues this legacy syscall on
+            // x86_64 (aarch64 has only epoll_pwait, already granted there).
+            Sysno::epoll_wait,
             Sysno::eventfd2,
             Sysno::ppoll,
+            // glibc's poll(3) issues the legacy poll(2) syscall on x86_64
+            // (aarch64 has only ppoll, already granted there). Every Rust
+            // binary polls fds 0-2 during std runtime start-up and calls
+            // abort() on EPERM; with tgkill denied, glibc's abort() then
+            // executes `hlt` and the target dies with SIGSEGV. Ubuntu 25.10+
+            // ships the Rust uutils coreutils as /usr/bin/mkdir, cat, ls, ...,
+            // so without this grant every coreutil crashes in the capsule.
+            // poll(2) is ppoll(2) without a signal mask: it only waits on
+            // descriptors the process already holds.
+            Sysno::poll,
             Sysno::sysinfo,
             // POSIX-shell redirection and in-script pipelines. Every inherited
             // descriptor was closed before this filter is installed, and newly
@@ -1654,6 +1668,10 @@ mod tests {
         let rules = PostExecRuntime.simple_rules();
         assert!(rules.contains(&Sysno::mkdir));
         assert!(rules.contains(&Sysno::mkdirat));
+        // Rust's std runtime start-up depends on this (see the grant's comment).
+        assert!(rules.contains(&Sysno::poll));
+        // So does every mio/tokio event loop on x86_64.
+        assert!(rules.contains(&Sysno::epoll_wait));
         for denied in [
             Sysno::socket,
             Sysno::socketpair,
@@ -2331,6 +2349,9 @@ mod tests {
             unsafe { libc::epoll_pwait(epoll, &mut observed, 1, 100, std::ptr::null()) },
             1
         );
+        // glibc's epoll_wait(3) (mio/tokio) issues the legacy epoll_wait
+        // syscall on x86_64; the level-triggered eventfd is still readable.
+        assert_eq!(unsafe { libc::epoll_wait(epoll, &mut observed, 1, 100) }, 1);
         let mut poll = libc::pollfd {
             fd: event,
             events: libc::POLLIN,
@@ -2339,6 +2360,19 @@ mod tests {
         assert_eq!(
             unsafe { libc::ppoll(&mut poll, 1, &duration, std::ptr::null()) },
             1
+        );
+        // The exact start-up probe of every Rust binary's std runtime: poll(3)
+        // on fds 0-2 with a zero timeout. Any errno other than EINTR, EINVAL,
+        // EAGAIN or ENOMEM makes std abort the target before main().
+        let mut standard_streams = [0, 1, 2].map(|fd| libc::pollfd {
+            fd,
+            events: 0,
+            revents: 0,
+        });
+        assert!(
+            unsafe { libc::poll(standard_streams.as_mut_ptr(), 3, 0) } >= 0,
+            "Rust std start-up poll(3) must not be denied: {}",
+            std::io::Error::last_os_error()
         );
         unsafe {
             libc::close(event);

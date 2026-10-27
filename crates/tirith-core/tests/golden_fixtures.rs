@@ -75,10 +75,19 @@ struct Fixture {
     /// File path for file-scan context fixtures.
     #[serde(default)]
     file_path: Option<String>,
+    /// `false` reads the input the way an interactive shell that does not
+    /// treat a word-start `#` as a comment runs it (`--no-interactive-comments`
+    /// from the bash/zsh hooks).
+    #[serde(default = "default_interactive_comments")]
+    interactive_comments: bool,
 }
 
 fn default_shell() -> String {
     "posix".to_string()
+}
+
+fn default_interactive_comments() -> bool {
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -363,6 +372,7 @@ fn run_fixture(fixture: &Fixture) {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: fixture.interactive_comments,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -809,7 +819,9 @@ fn test_tier1_coverage() {
             // Exec: byte scan bypasses tier-1 via the exec_bidi_triggered path in engine.rs.
             if scan_context == ScanContext::Exec {
                 let byte_scan = tirith_core::extract::scan_bytes(fixture.input.as_bytes());
-                if byte_scan.has_bidi_controls
+                if byte_scan.has_ansi_escapes
+                    || byte_scan.has_control_chars
+                    || byte_scan.has_bidi_controls
                     || byte_scan.has_zero_width
                     || byte_scan.has_unicode_tags
                     || byte_scan.has_variation_selectors
@@ -825,8 +837,35 @@ fn test_tier1_coverage() {
             let regex_triggered =
                 tirith_core::extract::tier1_scan_for_shell(&fixture.input, scan_context, shell);
             let sensitive_asset_triggered = public_sensitive_asset_gate(&fixture.input);
+            // The Exec gate's executable-body trigger: a nested body (here an
+            // `eval` of a trusted emitter whose output the same input can
+            // steer) that Tirith cannot resolve never takes the fast exit.
+            let body_triggered = scan_context == ScanContext::Exec
+                && tirith_core::engine::exec_executable_body_triggered(&fixture.input, shell);
+            // Fixtures are analyzed as interactive input (`run_fixture`), where
+            // a history reference that rewrites the line is a trigger of its own.
+            let history_triggered = tirith_core::engine::history_expansion_triggered(
+                &fixture.input,
+                shell,
+                scan_context,
+                true,
+            );
+            // So is a word-start `#` read by a shell without comment
+            // recognition, for a fixture analyzed that way.
+            let comments_triggered = tirith_core::engine::interactive_comments_triggered(
+                &fixture.input,
+                shell,
+                scan_context,
+                true,
+                fixture.interactive_comments,
+            );
 
-            if !regex_triggered && !sensitive_asset_triggered {
+            if !regex_triggered
+                && !sensitive_asset_triggered
+                && !body_triggered
+                && !history_triggered
+                && !comments_triggered
+            {
                 missed.push(format!(
                     "{}:{} (expected {})",
                     filename, fixture.name, fixture.expected_action
@@ -2036,6 +2075,7 @@ fn test_tier1_does_not_gate_findings() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: fixture.interactive_comments,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2091,6 +2131,7 @@ fn test_non_ascii_paste_not_sole_warn() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         let verdict = engine::analyze(&ctx);
         assert_eq!(
@@ -2146,6 +2187,32 @@ fn test_tier1_matches_all_interpreters() {
         tier1_scan("cat /tmp/s.sh | BASH", ScanContext::Exec),
         "Tier-1 scan must match uppercase interpreter"
     );
+
+    // Versioned and implementation-suffixed names resolve to their
+    // interpreter, and wrapped sinks reach the same rule.
+    for sink in [
+        "python3.12",
+        "python2.7",
+        "/usr/bin/python3.11",
+        "pypy",
+        "pypy3.10",
+        "perl5.34.1",
+        "php82",
+        "ruby33",
+        "nodejs",
+        "lua5.4",
+        "tclsh8.6",
+        "bash-5.2",
+        "ksh93",
+        "nice -n 5 bash",
+        "timeout 60 sh",
+    ] {
+        let input = format!("cat /tmp/s.sh | {sink}");
+        assert!(
+            tier1_scan(&input, ScanContext::Exec),
+            "Tier-1 scan does not match '{input}'"
+        );
+    }
 }
 
 // Lab corpus safeguard: the `tirith lab` corpus (in the sibling `tirith` crate)
@@ -2263,6 +2330,7 @@ fn test_lab_corpus_reaches_tier3() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
 
         let verdict = engine::analyze(&ctx);
@@ -2367,6 +2435,7 @@ fn context_rule_blocks_kubectl_delete_in_labeled_prod() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2434,6 +2503,7 @@ fn context_rule_allows_kubectl_get_in_labeled_prod() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
 
     let verdict = engine::analyze(&ctx);
@@ -2496,6 +2566,7 @@ fn ssh_rule_blocks_destructive_on_labeled_host() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2548,6 +2619,7 @@ fn ssh_rule_emits_info_on_bare_labeled_host() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2602,6 +2674,7 @@ fn ssh_rule_allows_unlabeled_host_with_destructive_inner() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2661,6 +2734,7 @@ fn iac_rule_blocks_apply_without_plan_when_policy_on() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2719,6 +2793,7 @@ fn iac_rule_blocks_plan_hash_mismatch_when_policy_on() {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 
@@ -2785,6 +2860,7 @@ fn iac_rule_detects_plan_modification_after_record() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
     };
@@ -2886,6 +2962,7 @@ fn iac_plan_gate_follows_directory_changes_and_chained_check_plan() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
             .findings
@@ -3067,6 +3144,7 @@ fn iac_plan_gate_reads_relative_plans_from_the_callers_directory() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
             .findings
@@ -3154,6 +3232,7 @@ fn iac_plan_gate_does_not_follow_a_cd_that_may_not_run() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
             .findings
@@ -3477,6 +3556,7 @@ fn iac_plan_gate_takes_cdpath_from_the_caller_not_from_tirith() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
             .findings
@@ -3598,6 +3678,7 @@ fn iac_plan_gate_sees_cdpath_spellings_and_nested_body_context() {
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
             .findings
@@ -3899,6 +3980,7 @@ fn paste_source_absent_or_invalid_does_not_reread_sidecar() {
             clipboard_source: state,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
     };
@@ -4002,6 +4084,7 @@ fn paste_source_loaded_uses_in_memory_record_not_disk() {
             clipboard_source: state,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
     };
@@ -4095,6 +4178,7 @@ fn paste_source_loaded_hash_guard_drives_verdict_with_no_sidecar() {
             clipboard_source: state,
             python_inspect_inherited: false,
             cdpath_inherited: false,
+            interactive_comments: true,
         };
         engine::analyze(&ctx)
     };

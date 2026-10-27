@@ -1194,6 +1194,33 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
             bounded |= reading_bounded;
         }
     }
+    // dash drops NUL bytes while it reads a script, and so does macOS
+    // `/bin/sh` (bash 3.2 in POSIX mode), which ALSO honors `$'...'`
+    // (bash 5 refuses such a file and zsh ends the word at the NUL). So
+    // `cu\0rl … | sh` runs curl there, and `x=$'a\'' ; cu\0rl … | sh # '`
+    // runs it under macOS `/bin/sh`. Where the text holds a NUL, it is also
+    // read with the NULs dropped, both the dash way and the `$'...'` way, and
+    // the line pass below covers that text too.
+    let nul_stripped = text.contains('\0').then(|| text.replace('\0', ""));
+    let mut stripped_view = None;
+    if let Some(reading) = nul_stripped.as_deref() {
+        let reading_heredocs = inert_heredoc::analyze(reading);
+        let reading_readings = shell_readings(reading, &reading_heredocs);
+        if !found {
+            let (reading_found, reading_bounded) = descend_all(reading, &reading_heredocs);
+            found = reading_found;
+            bounded |= reading_bounded;
+        }
+        if !found {
+            if let Some(ansi) = ansi_c_reading(reading, &reading_readings.ansi_c_escaped_quotes) {
+                let (reading_found, reading_bounded) =
+                    descend_all(&ansi, &inert_heredoc::analyze(&ansi));
+                found = reading_found;
+                bounded |= reading_bounded;
+            }
+        }
+        stripped_view = Some((reading_heredocs, reading_readings));
+    }
     if bounded {
         inspection.issue(NpmIssueKind::CodeLimit, Some(member),
             "Shell brace-group, function, subshell or substitution nesting exceeds the bounded descent; a line-by-line download-to-shell pass was used for the rest.");
@@ -1205,15 +1232,26 @@ fn inspect_shell(text: &str, member: &str, events: &[String], inspection: &mut N
     // single quotes, comments and heredoc data (a `$${` or `$$(`, a
     // backslash-newline inside `$(`/`${`, or a `$'...'` string holding a
     // `\'`), since the descent follows one reading of those only.
-    let reads_differently = readings.dollars_differ || !readings.ansi_c_escaped_quotes.is_empty();
-    let found = found
-        || ((bounded || heredocs.ambiguous || reads_differently)
+    let line_pass = |text: &str,
+                     heredocs: &inert_heredoc::HeredocView,
+                     readings: &crate::tokenize::PosixReadings| {
+        let reads_differently =
+            readings.dollars_differ || !readings.ansi_c_escaped_quotes.is_empty();
+        ((bounded || heredocs.ambiguous || reads_differently)
             && any_line_feeds_shell(text, heredocs.ambiguous))
-        || (bounded
-            && heredocs
-                .live_bodies
-                .iter()
-                .any(|live| !live.quoted && any_line_feeds_shell(&text[live.range.clone()], true)));
+            || (bounded
+                && heredocs.live_bodies.iter().any(|live| {
+                    !live.quoted && any_line_feeds_shell(&text[live.range.clone()], true)
+                }))
+    };
+    let found = found
+        || line_pass(text, &heredocs, &readings)
+        || nul_stripped
+            .as_deref()
+            .zip(stripped_view.as_ref())
+            .is_some_and(|(reading, (reading_heredocs, reading_readings))| {
+                line_pass(reading, reading_heredocs, reading_readings)
+            });
     if found {
         push(inspection, signal(NpmSignalKind::DownloadToShell, NpmSignalLevel::Review, member,
             vec![NpmCapability::NetworkAccess, NpmCapability::ProcessSpawn], events,

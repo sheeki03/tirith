@@ -394,6 +394,16 @@ Examples:
         #[arg(long)]
         interactive: bool,
 
+        /// The interactive shell that runs the command does not treat a
+        /// word-start `#` as a comment (zsh with `interactivecomments` unset,
+        /// its default, or bash after `shopt -u interactive_comments`), so the
+        /// text after it runs. With `--interactive` and `--shell posix` the
+        /// command is also analyzed the way that shell reads it. The bash and
+        /// zsh hooks report the same with `_TIRITH_INTERACTIVE_COMMENTS=0` in
+        /// the environment; without either a word-start `#` starts a comment.
+        #[arg(long)]
+        no_interactive_comments: bool,
+
         /// Write approval metadata to a temp file and print its path to stdout.
         /// Used by shell hooks for the approval workflow.
         #[arg(long)]
@@ -499,6 +509,16 @@ Examples:
         /// Force interactive mode
         #[arg(long)]
         interactive: bool,
+
+        /// The interactive shell the paste lands in does not treat a
+        /// word-start `#` as a comment (zsh with `interactivecomments` unset,
+        /// its default, or bash after `shopt -u interactive_comments`), so the
+        /// text after it runs. With `--interactive` and `--shell posix` the
+        /// paste is also analyzed the way that shell reads it. The bash and
+        /// zsh paste widgets report the same with
+        /// `_TIRITH_INTERACTIVE_COMMENTS=0` in the environment.
+        #[arg(long)]
+        no_interactive_comments: bool,
 
         /// Path to clipboard HTML for rich-text paste analysis
         #[arg(long)]
@@ -8318,6 +8338,7 @@ fn run() {
             json_schema,
             non_interactive,
             interactive,
+            no_interactive_comments,
             approval_check,
             execution_receipt,
             strict_warn,
@@ -8360,6 +8381,7 @@ fn run() {
                     json_schema.unwrap_or(3),
                     non_interactive,
                     interactive,
+                    cli::interactive_comments_reading(no_interactive_comments),
                     approval_check,
                     execution_receipt.map(tirith_core::execution_state::ShellReceiptChannel::from),
                     strict_warn,
@@ -8392,6 +8414,7 @@ fn run() {
             json,
             non_interactive,
             interactive,
+            no_interactive_comments,
             html,
             with_source,
         } => {
@@ -8401,6 +8424,7 @@ fn run() {
                 json,
                 non_interactive,
                 interactive,
+                cli::interactive_comments_reading(no_interactive_comments),
                 html.as_deref(),
                 with_source,
             )

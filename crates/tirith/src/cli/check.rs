@@ -152,6 +152,7 @@ pub fn run(
     json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
+    interactive_comments: bool,
     approval_check: bool,
     execution_receipt: Option<ShellReceiptChannel>,
     strict_warn: bool,
@@ -277,9 +278,13 @@ pub fn run(
             shell_name,
             cwd.as_deref(),
             interactive,
+            interactive_comments,
             offline,
         ) {
-            if let Some(ref raw_findings) = resp.raw_findings {
+            // A daemon that predates `interactive_comments` ignores it; its
+            // verdict lacks that reading, so analyze locally instead.
+            let reading_supported = interactive_comments || resp.interactive_comments_read;
+            if let Some(raw_findings) = resp.raw_findings.as_ref().filter(|_| reading_supported) {
                 let raw_action_parsed = resp
                     .raw_action
                     .as_deref()
@@ -312,10 +317,13 @@ pub fn run(
                     None,
                 )
             } else {
-                // Pre-upgrade daemon without raw-findings support — run locally.
-                eprintln!(
-                    "tirith: daemon does not support raw findings — falling back to local analysis"
-                );
+                // Pre-upgrade daemon without raw-findings support (or without
+                // the `--no-interactive-comments` reading) — run locally.
+                if reading_supported {
+                    eprintln!(
+                        "tirith: daemon does not support raw findings — falling back to local analysis"
+                    );
+                }
                 let ctx = AnalysisContext {
                     input: cmd.to_string(),
                     shell: shell_type,
@@ -331,6 +339,7 @@ pub fn run(
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                     python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                     cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                    interactive_comments,
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -351,6 +360,7 @@ pub fn run(
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
                 python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                 cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                interactive_comments,
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -371,6 +381,7 @@ pub fn run(
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
             cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         let (v, p) = if execution_receipt.is_some() {
             // A durable receipt must freeze every effective policy overlay even
@@ -407,14 +418,57 @@ pub fn run(
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
+        // Machine callers require the ordinary channel output for an honored
+        // bypass. The approval-check channel (the zshenv guard, legacy shell
+        // hooks) expects a no-approval metadata file path on stdout, exactly
+        // as for any other non-approval verdict; without it the caller sees
+        // missing metadata and blocks the command it was told to allow.
+        if approval_check {
+            match tirith_core::approval::write_no_approval_file() {
+                Ok(path) => println!("{}", path.display()),
+                Err(e) => {
+                    eprintln!("tirith: failed to write approval file: {e}");
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        // JSON callers (agent adapters, the Hermes plugin) require the
+        // ordinary envelope; an honored bypass is `action: allow` with
+        // `bypass_honored: true` and no approval requirement.
+        if json {
+            let empty: [tirith_core::safe_command::SafeSuggestion; 0] = [];
+            let recovery = (json_schema == 4)
+                .then(|| tirith_core::recovery::for_command(&raw_verdict, cmd, shell_type));
+            if output::write_json_with_recovery(
+                &raw_verdict,
+                &policy.dlp_custom_patterns,
+                suggest_safe_command.then_some(empty.as_slice()),
+                recovery.as_ref(),
+                false,
+                std::io::stdout().lock(),
+            )
+            .is_err()
+            {
+                eprintln!("tirith: failed to write JSON output");
+            }
+        }
         return 0;
     }
 
     crate::cli::warn_repo_policy_neutralized(&policy);
 
     if ran_locally {
-        let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+        let comment_reading = tirith_core::engine::interactive_comments_reading(
             cmd,
+            shell_type,
+            ScanContext::Exec,
+            interactive,
+            interactive_comments,
+        );
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            cmd,
+            comment_reading.as_deref(),
             shell_type,
             &policy.threat_intel,
             RuntimeThreatMode::Inline,
@@ -512,10 +566,11 @@ pub fn run(
                 return 1;
             }
         };
-        match execution_state::create_shell_execution_receipt(
+        match execution_state::create_shell_execution_receipt_with_comment_reading(
             prepared,
             channel,
             interactive,
+            interactive_comments,
             strict_warn,
             Duration::from_secs(ttl_secs),
         ) {
@@ -732,6 +787,7 @@ pub fn run(
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
             python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
             cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         if ran_locally {
             tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
@@ -771,6 +827,7 @@ pub fn run(
             &policy.dlp_custom_patterns,
             suggestions_opt,
             recovery.as_ref(),
+            effective.action == Action::Warn && (strict_warn || policy.strict_warn),
             std::io::stdout().lock(),
         )
         .is_err()
@@ -2602,11 +2659,13 @@ pub(super) fn prepare_receipt_consumption_with_network(
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: context.interactive_comments(),
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
         command,
+        analysis.interactive_comments_reading().as_deref(),
         context.shell(),
         &policy.threat_intel,
         RuntimeThreatMode::Inline,

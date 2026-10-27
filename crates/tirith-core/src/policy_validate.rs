@@ -132,6 +132,7 @@ pub fn validate(yaml: &str) -> Vec<PolicyIssue> {
     }
     validate_severity_overrides(&policy, &mut issues);
     validate_allowlist_blocklist_overlap(&policy, &mut issues);
+    validate_list_patterns(&policy, &mut issues);
     validate_custom_rules(&policy, &mut issues);
     validate_injection_seeds(&policy, &mut issues);
     validate_approval_rules(&policy, &mut issues);
@@ -233,6 +234,88 @@ fn validate_allowlist_blocklist_overlap(
             }
         }
     }
+}
+
+/// CORE-5: report allowlist and blocklist entries that can never match.
+///
+/// Allowlist entries use the trust-pattern grammar, so a `*` outside a leading
+/// `*.` label is a literal byte (#271); `registry.example.com/*` silently
+/// allows nothing. Blocklist entries are literal substrings, so any `*` there
+/// is literal too and the entry silently blocks nothing. Both are warnings:
+/// the runtime has always ignored these entries, so the policy still loads.
+fn validate_list_patterns(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
+    for entry in &policy.allowlist {
+        if let Some(message) = allowlist_entry_problem(entry) {
+            issues.push(PolicyIssue {
+                level: IssueLevel::Warning,
+                message: format!("allowlist entry '{entry}' never matches: {message}"),
+                field: Some("allowlist".into()),
+            });
+        }
+    }
+    for rule in &policy.allowlist_rules {
+        for entry in &rule.patterns {
+            if let Some(message) = allowlist_entry_problem(entry) {
+                issues.push(PolicyIssue {
+                    level: IssueLevel::Warning,
+                    message: format!(
+                        "allowlist_rules.{}: entry '{entry}' never matches: {message}",
+                        rule.rule_id
+                    ),
+                    field: Some(format!("allowlist_rules.{}", rule.rule_id)),
+                });
+            }
+        }
+    }
+    for entry in &policy.blocklist {
+        if !entry.contains('*') {
+            continue;
+        }
+        // `*.evil.example` -> `evil.example`; `evil.example/*` and
+        // `*.evil.example/*` -> the host. Only a real domain is suggested: a
+        // public suffix such as `com` would block nearly everything.
+        let stripped = entry.strip_prefix("*.").unwrap_or(entry);
+        let host = if stripped.contains('*') {
+            crate::policy::misplaced_wildcard_host(entry).map(|host| host.trim_start_matches("*."))
+        } else {
+            Some(stripped)
+        }
+        .filter(|host| {
+            crate::policy::classify_trust_pattern(host) == crate::policy::TrustScopeKind::Domain
+                && crate::policy::validate_trust_pattern(host).is_ok()
+        });
+        let remedy = match host {
+            Some(host) => format!("use '{host}' to block that host and every name containing it"),
+            None => "remove the '*'".to_string(),
+        };
+        issues.push(PolicyIssue {
+            level: IssueLevel::Warning,
+            message: format!(
+                "blocklist entry '{entry}' never matches: blocklist entries are literal \
+                 case-insensitive substrings, so '*' is not a wildcard; {remedy}"
+            ),
+            field: Some("blocklist".into()),
+        });
+    }
+}
+
+/// Why an allowlist entry can never match, with the replacement when there is
+/// one. Matching trims the entry first, so surrounding whitespace is fine.
+fn allowlist_entry_problem(entry: &str) -> Option<String> {
+    let pattern = entry.trim();
+    let error = crate::policy::validate_trust_pattern(pattern).err()?;
+    if !crate::policy::has_misplaced_wildcard(pattern) {
+        return Some(error);
+    }
+    Some(match crate::policy::misplaced_wildcard_host(pattern) {
+        Some(host) => format!(
+            "'*' is a wildcard only as a leading '*.' label; use '{host}' to allow \
+             that host and its subdomains, or list the exact URL or image"
+        ),
+        None => "'*' is a wildcard only as a leading '*.' label (for example \
+                 '*.example.com'); list the host or the exact URL or image instead"
+            .to_string(),
+    })
 }
 
 fn validate_custom_rules(policy: &crate::policy::Policy, issues: &mut Vec<PolicyIssue>) {
@@ -1187,6 +1270,64 @@ custom_rules:
         assert!(issues
             .iter()
             .any(|i| i.message.contains("both allowlist and blocklist")));
+    }
+
+    /// CORE-5: entries the runtime can never match are reported with the
+    /// replacement that does match, as warnings (the policy still loads).
+    #[test]
+    fn list_entries_that_never_match_are_reported_with_the_replacement() {
+        let yaml = "allowlist:\n  - registry.example.com/*\n  - https://cdn.example.org/team/*\n  \
+                    - '*registry.example.net'\n  - registry.example.com\n  - '*.example.com'\n  \
+                    - https://example.com/install.sh\n\
+                    allowlist_rules:\n  - rule_id: docker_untrusted_registry\n    patterns:\n      \
+                    - mirror.example.io:5000/*\n      - mirror.example.io\n\
+                    blocklist:\n  - evil.example/*\n  - '*.bad.example'\n  - 'bad.*.example'\n  \
+                    - '*.com'\n  - evil.example\n";
+        let issues = validate(yaml);
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            issues.iter().all(|i| i.level == IssueLevel::Warning),
+            "{messages:?}"
+        );
+        let expect = |needle: &str| {
+            assert!(
+                messages.iter().any(|m| m.contains(needle)),
+                "missing {needle:?} in {messages:?}"
+            );
+        };
+        expect("allowlist entry 'registry.example.com/*' never matches");
+        expect("use 'registry.example.com' to allow that host and its subdomains");
+        expect("use 'cdn.example.org' to allow");
+        expect("allowlist entry '*registry.example.net' never matches");
+        expect("list the host or the exact URL or image instead");
+        expect("allowlist_rules.docker_untrusted_registry: entry 'mirror.example.io:5000/*'");
+        expect("use 'mirror.example.io' to allow");
+        expect("blocklist entry 'evil.example/*' never matches");
+        expect("use 'evil.example' to block");
+        expect("use 'bad.example' to block");
+        expect("blocklist entry 'bad.*.example' never matches");
+        expect("blocklist entry '*.com' never matches");
+        // Exactly the eight dead entries; valid entries are not reported, and
+        // no suggestion names a bare public suffix.
+        assert_eq!(issues.len(), 8, "{messages:?}");
+        for valid in [
+            "'registry.example.com' never",
+            "'*.example.com' never",
+            "'https://example.com/install.sh' never",
+            "'mirror.example.io' never",
+            "'evil.example' never",
+            "use 'com'",
+        ] {
+            assert!(
+                !messages.iter().any(|m| m.contains(valid)),
+                "{valid:?} in {messages:?}"
+            );
+        }
+        let com = messages
+            .iter()
+            .find(|m| m.contains("'*.com'"))
+            .expect("bare-suffix blocklist entry");
+        assert!(com.ends_with("remove the '*'"), "{com}");
     }
 
     #[test]

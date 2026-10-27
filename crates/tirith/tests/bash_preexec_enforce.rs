@@ -13,6 +13,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// A private HOME below `root` for an interactive test shell, so its history
+/// and any dotfile writes never reach the developer's real home directory.
+fn isolated_home(root: &Path) -> PathBuf {
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    home
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -20,13 +28,23 @@ fn hook_path() -> String {
     )
 }
 
-/// Build a fake tirith binary that logs its args to `log_path` and exits by
+/// Build a fake tirith binary that logs its args to `log_path`, each line
+/// prefixed with `ic=<_TIRITH_INTERACTIVE_COMMENTS or unset>`, and exits by
 /// input token: `BLOCK_TOKEN` → 1, `WARN_TOKEN` → 2, `BADRC_TOKEN` → 99, else 0.
+/// Like a binary older than the hooks, it rejects `--no-interactive-comments`
+/// as a usage error (2) before looking at the input.
 fn install_fake_tirith(bin_dir: &Path, log_path: &Path) {
     fs::create_dir_all(bin_dir).unwrap();
     let script = format!(
         r#"#!/bin/bash
-printf '%s\n' "$*" >> {log}
+printf 'ic=%s %s\n' "${{_TIRITH_INTERACTIVE_COMMENTS-unset}}" "$*" >> {log}
+for arg in "$@"; do
+  [[ "$arg" == "--" ]] && break
+  if [[ "$arg" == "--no-interactive-comments" ]]; then
+    printf "error: unexpected argument '%s' found\n" "$arg" >&2
+    exit 2
+  fi
+done
 case "$*" in
   *BLOCK_TOKEN*)  exit 1 ;;
   *WARN_TOKEN*)   exit 2 ;;
@@ -61,7 +79,8 @@ fn run_bash_script(script: &str, env_vars: &[(&str, &str)]) -> (String, String, 
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -166,6 +185,68 @@ echo clean_post_block && touch {sentinels}/clean_ran
         invocations.iter().any(|i| i.contains("BLOCK_TOKEN-one")),
         "fake tirith did not see the blocked line: {invocations:#?}"
     );
+    let _ = fs::remove_dir_all(&sentinel_dir);
+}
+
+/// With `shopt -u interactive_comments` bash runs the text after a word-start
+/// `#`. The hook reads the option at each check and reports it in the
+/// environment (`_TIRITH_INTERACTIVE_COMMENTS=0`, never a flag an older
+/// binary would reject or read as the command), and its whole-line drift
+/// check takes that `#` as a word, so the command hidden behind it is blocked
+/// instead of the session degrading to warn-only. With the option back on the
+/// variable is 1.
+#[test]
+fn enforce_passes_comment_state_and_blocks_text_after_hash() {
+    let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
+        r#"
+echo visible # comment_on_marker
+shopt -u interactive_comments
+echo hi #; sh -c 'touch {sentinels}/hidden_ran' BLOCK_TOKEN-hash
+touch {sentinels}/after_ran
+shopt -s interactive_comments
+echo back # comment_again_marker
+"#,
+        &[
+            ("TIRITH_BASH_MODE", "preexec"),
+            ("TIRITH_BASH_PREEXEC_ENFORCE", "1"),
+        ],
+    );
+
+    assert!(
+        !sentinel_path(&sentinel_dir, "hidden_ran").exists(),
+        "the command after `#` must be blocked; stderr: {stderr}\ninvocations: {invocations:#?}"
+    );
+    assert!(
+        sentinel_path(&sentinel_dir, "after_ran").exists(),
+        "enforcement must continue after the block; stderr: {stderr}\ninvocations: {invocations:#?}"
+    );
+    assert!(
+        !stderr.contains("falling back to warn-only"),
+        "the drift check must accept a word-start `#` as a word: {stderr}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|line| line.contains("BLOCK_TOKEN-hash") && line.starts_with("ic=0 ")),
+        "checks must report the option while it is off: {invocations:#?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.contains("--no-interactive-comments")),
+        "the hook must not pass a flag an older binary rejects: {invocations:#?}"
+    );
+    for marker in ["comment_on_marker", "comment_again_marker"] {
+        let checks: Vec<_> = invocations
+            .iter()
+            .filter(|line| line.contains(marker))
+            .collect();
+        assert!(!checks.is_empty(), "{marker}: {invocations:#?}");
+        assert!(
+            checks.iter().all(|line| line.starts_with("ic=1 ")),
+            "{marker}: the option is reported on: {invocations:#?}"
+        );
+    }
     let _ = fs::remove_dir_all(&sentinel_dir);
 }
 
@@ -1474,7 +1555,8 @@ fn mid_session_ignorespace_does_not_bypass_via_stale_cache() {
     let mut child = Command::new("bash")
         .args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1739,7 +1821,8 @@ fn run_hook_with_capability(verdict: Option<&str>, env_vars: &[(&str, &str)]) ->
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1900,7 +1983,8 @@ fn capability_cache_read_survives_set_plus_o_history() {
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(
@@ -1989,7 +2073,8 @@ fn capability_stale_cache_falls_back_and_installs_debug_trap() {
     let mut cmd = Command::new("bash");
     cmd.args(["--norc", "--noprofile", "-i"])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(state_path))
+        .env("HISTFILE", "")
         .env(
             "PATH",
             format!(

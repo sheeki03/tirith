@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -101,6 +103,36 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
         fixture_path = directory / "api.json"
         fixture_path.write_text(json.dumps(self.fixture), encoding="utf-8")
         return PINS.FixtureClient(fixture_path)
+
+    def datadog_compare_answers(self, status: int) -> None:
+        key = (
+            "DataDog/malicious-software-packages-dataset:"
+            f"{self.old_datadog}...{self.new_datadog}"
+        )
+        self.fixture["comparisons"][key] = {"http_status": status}
+
+    def run_cli(self, directory: Path, *arguments: str) -> tuple[int, str]:
+        fixture_path = directory / "api.json"
+        fixture_path.write_text(json.dumps(self.fixture), encoding="utf-8")
+        argv = [
+            "threatdb_source_pins.py",
+            *arguments,
+            "--api-fixture",
+            str(fixture_path),
+            "--now",
+            "2026-09-01T02:00:00Z",
+        ]
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with patch.object(PINS.sys, "argv", argv), contextlib.redirect_stderr(
+            stderr
+        ), contextlib.redirect_stdout(stdout):
+            try:
+                code = PINS.main()
+            except SystemExit as error:
+                code = error.code
+        self.last_stdout = stdout.getvalue()
+        return code, stderr.getvalue()
 
     def test_manifest_resolves_exact_required_sources(self) -> None:
         self.assertEqual(set(self.manifest["sources"]), set(PINS.SOURCE_ORDER))
@@ -214,6 +246,183 @@ class ThreatDbSourcePinsTests(unittest.TestCase):
         pending = document["sources"]["ossf_malicious_packages"]
         self.assertTrue(pending["review_required"])
         self.assertEqual(pending["pinned_commit"], self.old_ossf)
+
+    def test_observe_records_a_compare_github_cannot_generate_and_exits_zero(self) -> None:
+        self.datadog_compare_answers(422)
+        # CI itself runs under Actions; outside it no annotation is printed.
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            PINS.os.environ, {"GITHUB_ACTIONS": "false"}
+        ):
+            directory = Path(temporary)
+            result = directory / "observations.json"
+            code, stderr = self.run_cli(
+                directory, "observe", str(MANIFEST), "--result", str(result)
+            )
+            self.assertEqual(code, 0, stderr)
+            document = json.loads(result.read_text(encoding="utf-8"))
+        datadog = document["sources"]["datadog_malicious_software_packages"]
+        self.assertIsNone(datadog["ahead_by"])
+        self.assertEqual(datadog["comparison_unavailable"], "github_http_422")
+        self.assertTrue(datadog["review_required"])
+        self.assertEqual(datadog["pinned_commit"], self.old_datadog)
+        self.assertEqual(datadog["candidate_commit"], self.new_datadog)
+        self.assertEqual(datadog["candidate_timestamp"], "2026-09-01T00:30:00Z")
+        ossf = document["sources"]["ossf_malicious_packages"]
+        self.assertEqual(ossf["ahead_by"], 4)
+        self.assertNotIn("comparison_unavailable", ossf)
+        self.assertIn("datadog_malicious_software_packages", stderr)
+        self.assertIn("HTTP 422", stderr)
+        self.assertNotIn("::warning", self.last_stdout)
+
+    def test_report_keeps_staleness_visible_for_a_skipped_source(self) -> None:
+        item = {
+            "candidate": {
+                "commit": "b" * 40,
+                "commit_timestamp": "2026-10-15T08:38:07Z",
+                "subject": "update",
+            },
+            "comparison_unavailable": "github_http_422",
+            "lag_hours": 816.0,
+            "max_lag_hours": 168,
+            "old_commit": "a" * 40,
+            "policy": "latest_successful_upstream_commit",
+            "proposed": False,
+            "repository": "DataDog/malicious-software-packages-dataset",
+            "source": "datadog_malicious_software_packages",
+            "stale": True,
+        }
+        rendered = PINS.render_report("2026-10-16T00:00:00Z", [item])
+        self.assertIn(
+            "| datadog_malicious_software_packages | skipped (stale) |", rendered
+        )
+
+    def test_actions_runs_annotate_a_source_github_cannot_compare(self) -> None:
+        self.datadog_compare_answers(422)
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            PINS.os.environ, {"GITHUB_ACTIONS": "true"}
+        ):
+            directory = Path(temporary)
+            result = directory / "observations.json"
+            code, stderr = self.run_cli(
+                directory, "observe", str(MANIFEST), "--result", str(result)
+            )
+        self.assertEqual(code, 0, stderr)
+        annotations = [
+            line for line in self.last_stdout.splitlines() if line.startswith("::warning")
+        ]
+        self.assertEqual(len(annotations), 1, self.last_stdout)
+        self.assertTrue(
+            annotations[0].startswith("::warning title=ThreatDB source pin not updated::")
+        )
+        self.assertIn("datadog_malicious_software_packages", annotations[0])
+        self.assertIn("HTTP 422", annotations[0])
+
+    def test_watcher_skips_an_uncomparable_source_and_proposes_the_rest(self) -> None:
+        self.datadog_compare_answers(422)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = directory / "pins.json"
+            shutil.copy(MANIFEST, manifest)
+            report = directory / "report.md"
+            result = directory / "result.json"
+            code, stderr = self.run_cli(
+                directory, "update", str(manifest),
+                "--report", str(report), "--result", str(result),
+            )
+            self.assertEqual(code, 0, stderr)
+            proposed = PINS.load_manifest(manifest)["sources"]
+            outcome = json.loads(result.read_text(encoding="utf-8"))
+            rendered = report.read_text(encoding="utf-8")
+        self.assertEqual(proposed["ossf_malicious_packages"]["commit"], self.new_ossf)
+        self.assertEqual(
+            proposed["datadog_malicious_software_packages"],
+            self.manifest["sources"]["datadog_malicious_software_packages"],
+        )
+        self.assertTrue(outcome["changed"])
+        self.assertEqual(outcome["changed_sources"], ["ossf_malicious_packages"])
+        self.assertEqual(
+            outcome["skipped_sources"], ["datadog_malicious_software_packages"]
+        )
+        self.assertIn("| datadog_malicious_software_packages | skipped |", rendered)
+        self.assertIn("not proposed", rendered)
+        self.assertIn("github_http_422", rendered)
+
+    def test_watcher_writes_nothing_when_the_only_moved_source_is_uncomparable(self) -> None:
+        self.datadog_compare_answers(422)
+        self.fixture["commits"]["ossf/malicious-packages"] = [
+            commit(
+                self.old_ossf,
+                self.manifest["sources"]["ossf_malicious_packages"]["commit_timestamp"],
+                "Assign IDs",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = directory / "pins.json"
+            shutil.copy(MANIFEST, manifest)
+            result = directory / "result.json"
+            code, stderr = self.run_cli(
+                directory, "update", str(manifest),
+                "--report", str(directory / "report.md"), "--result", str(result),
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(manifest.read_bytes(), MANIFEST.read_bytes())
+            outcome = json.loads(result.read_text(encoding="utf-8"))
+        self.assertFalse(outcome["changed"])
+        self.assertEqual(outcome["changed_sources"], [])
+
+    def test_other_compare_failures_and_unproven_candidates_still_fail(self) -> None:
+        self.datadog_compare_answers(404)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with self.assertRaisesRegex(PINS.PinError, "HTTP 404") as raised:
+                PINS.update_pins(
+                    copy.deepcopy(self.manifest),
+                    self.fixture_client(directory),
+                    "2026-09-01T02:00:00Z",
+                )
+            self.assertNotIsInstance(raised.exception, PINS.ComparisonUnavailable)
+            result = directory / "observations.json"
+            code, _ = self.run_cli(
+                directory, "observe", str(MANIFEST), "--result", str(result)
+            )
+            self.assertEqual(code, 2)
+            self.assertFalse(result.exists())
+
+        key = (
+            "DataDog/malicious-software-packages-dataset:"
+            f"{self.old_datadog}...{self.new_datadog}"
+        )
+        self.fixture["comparisons"][key] = {
+            "status": "diverged", "ahead_by": 2, "total_commits": 2, "files": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(PINS.PinError, "strictly ahead"):
+                PINS.update_pins(
+                    copy.deepcopy(self.manifest),
+                    self.fixture_client(Path(temporary)),
+                    "2026-09-01T02:00:00Z",
+                )
+
+    def test_live_client_treats_only_a_compare_422_as_unavailable(self) -> None:
+        def refusal(status: int) -> urllib.error.HTTPError:
+            return urllib.error.HTTPError(
+                "https://api.github.com/x", status, "refused", {}, None
+            )
+
+        with patch.object(PINS.urllib.request, "urlopen", side_effect=refusal(422)) as opener:
+            with self.assertRaises(PINS.ComparisonUnavailable) as raised:
+                PINS.GitHubClient(None).compare("o/r", "a" * 40, "b" * 40)
+            self.assertEqual(raised.exception.reason, "github_http_422")
+            self.assertEqual(opener.call_count, 1)
+        for status, call in [
+            (404, lambda client: client.compare("o/r", "a" * 40, "b" * 40)),
+            (422, lambda client: client.commits("o/r")),
+        ]:
+            with patch.object(PINS.urllib.request, "urlopen", side_effect=refusal(status)):
+                with self.assertRaises(PINS.GitHubStatusError) as raised:
+                    call(PINS.GitHubClient(None))
+                self.assertNotIsInstance(raised.exception, PINS.ComparisonUnavailable)
 
     def test_retry_obeys_server_backoff_and_overall_deadline(self) -> None:
         self.assertEqual(PINS.retry_delay("4", 0, 10), 4)

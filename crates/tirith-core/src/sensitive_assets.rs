@@ -880,13 +880,17 @@ fn alias_variants(name: &str) -> Vec<String> {
         .collect()
 }
 
-fn prefix_alias_variants(prefix: &str) -> Vec<String> {
-    let words = prefix
+fn prefix_words(prefix: &str) -> Vec<String> {
+    prefix
         .trim_matches('_')
         .split('_')
         .filter(|word| !word.is_empty())
         .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn prefix_alias_variants(prefix: &str) -> Vec<String> {
+    let words = prefix_words(prefix);
     if words.is_empty() {
         return Vec::new();
     }
@@ -919,6 +923,85 @@ fn alias_alternation(kinds: &[SensitiveEnvKind], extras: &[&str]) -> String {
     aliases.sort();
     aliases.dedup();
     aliases.join("|")
+}
+
+/// Alias kinds of `TIER1_ENV_ALIAS_RE`.
+const TIER1_ENV_ALIAS_KINDS: &[SensitiveEnvKind] = &[
+    SensitiveEnvKind::Credential,
+    SensitiveEnvKind::EvmPrivateKey,
+    SensitiveEnvKind::Mnemonic,
+    SensitiveEnvKind::SolanaKeypair,
+    SensitiveEnvKind::Password,
+    SensitiveEnvKind::RpcEndpoint,
+];
+
+/// Alias kinds of `SYMBOLIC_ENV_RE`; a subset of [`TIER1_ENV_ALIAS_KINDS`], so
+/// [`ENV_ALIAS_LITERALS`] covers it too.
+const SYMBOLIC_ENV_KINDS: &[SensitiveEnvKind] = &[
+    SensitiveEnvKind::Credential,
+    SensitiveEnvKind::EvmPrivateKey,
+    SensitiveEnvKind::Mnemonic,
+    SensitiveEnvKind::SolanaKeypair,
+    SensitiveEnvKind::Password,
+];
+
+/// The literal text each alternative of `alias_alternation(kinds, &[])`
+/// begins with, ASCII-lowercased: every spelling of an exact name, and a
+/// prefix family's words plus its required `_` or `-` separator. Built from
+/// the same registry walk as [`alias_alternation`].
+fn alias_literals(kinds: &[SensitiveEnvKind]) -> Vec<String> {
+    let mut literals = Vec::new();
+    for definition in SENSITIVE_ENV_DEFINITIONS
+        .iter()
+        .filter(|definition| kinds.contains(&definition.kind))
+    {
+        literals.extend(
+            alias_spellings(definition.name)
+                .into_iter()
+                .map(|alias| alias.to_ascii_lowercase()),
+        );
+    }
+    for definition in SENSITIVE_ENV_PREFIX_DEFINITIONS
+        .iter()
+        .filter(|definition| kinds.contains(&definition.kind))
+    {
+        let words = prefix_words(definition.prefix);
+        if words.is_empty() {
+            continue;
+        }
+        literals.push(format!("{}_", words.join("_")));
+        literals.push(format!("{}-", words.join("-")));
+    }
+    literals.sort();
+    literals.dedup();
+    literals
+}
+
+static ENV_ALIAS_LITERALS: Lazy<Vec<String>> = Lazy::new(|| alias_literals(TIER1_ENV_ALIAS_KINDS));
+
+/// Inputs above this go straight to the regex: scanning them once per literal
+/// would cost more than the regex's one-time compile.
+const ENV_ALIAS_PRECHECK_MAX_BYTES: usize = 16 * 1024;
+
+/// Exact pre-check for the alias regexes (`TIER1_ENV_ALIAS_RE`,
+/// `SYMBOLIC_ENV_RE`). `false` means neither can match, so the caller skips
+/// it without compiling it; each of those case-insensitive alternations costs
+/// 15-20 ms to build, and most commands and paths name no alias at all.
+///
+/// Every match of either regex contains a substring that matches one alias
+/// alternative case-insensitively. On ASCII text that is plain ASCII case
+/// folding, so the lowercased input contains that alternative's literal (see
+/// [`alias_literals`]). Unicode case folding also lets an ASCII `k` or `s`
+/// match a non-ASCII letter (KELVIN SIGN, LONG S), so non-ASCII input always
+/// goes to the regex, as does an input over [`ENV_ALIAS_PRECHECK_MAX_BYTES`].
+fn env_alias_literal_candidate(input: &str) -> bool {
+    if !input.is_ascii() || input.len() > ENV_ALIAS_PRECHECK_MAX_BYTES {
+        return true;
+    }
+    let lowered = input.to_ascii_lowercase();
+    ENV_ALIAS_LITERALS
+        .iter()
+        .any(|literal| lowered.contains(literal.as_str()))
 }
 
 static EVM_CONTEXT_RE: Lazy<Regex> = Lazy::new(|| {
@@ -1028,17 +1111,9 @@ fn bip39_word_index(word: &str) -> Option<u16> {
 }
 
 static TIER1_ENV_ALIAS_RE: Lazy<Regex> = Lazy::new(|| {
-    let aliases = alias_alternation(
-        &[
-            SensitiveEnvKind::Credential,
-            SensitiveEnvKind::EvmPrivateKey,
-            SensitiveEnvKind::Mnemonic,
-            SensitiveEnvKind::SolanaKeypair,
-            SensitiveEnvKind::Password,
-            SensitiveEnvKind::RpcEndpoint,
-        ],
-        &[],
-    );
+    // No extras: `env_alias_literal_candidate` relies on every alternative
+    // coming from `alias_literals(TIER1_ENV_ALIAS_KINDS)`.
+    let aliases = alias_alternation(TIER1_ENV_ALIAS_KINDS, &[]);
     RegexBuilder::new(&format!(
         r#"(?:\"?\b(?:{aliases})\b\"?[\t \r\n]*[:=]|--?(?:{aliases})(?:[ \t]*=[ \t]*|[ \t]+)|\bset(?:[ \t]+--?[a-z-]+)*[ \t]+(?:{aliases})(?:[ \t]|$))"#
     ))
@@ -1142,7 +1217,7 @@ fn has_registry_path_candidate_for_platform(
 /// keypair, URL, and path-boundary validation. Every scan must consult this gate
 /// before the normal fast exit so a new registry entry cannot become unreachable.
 pub(crate) fn tier1_sensitive_asset_candidate(input: &str) -> bool {
-    TIER1_ENV_ALIAS_RE.is_match(input)
+    (env_alias_literal_candidate(input) && TIER1_ENV_ALIAS_RE.is_match(input))
         || contains_symbolic_env_reference(input)
         || has_registry_path_candidate(input)
         || TIER1_EVM_HEX_RE.is_match(input)
@@ -1161,16 +1236,8 @@ pub(crate) fn tier1_sensitive_asset_candidate_deep(input: &str) -> bool {
 }
 
 static SYMBOLIC_ENV_RE: Lazy<Regex> = Lazy::new(|| {
-    let names = alias_alternation(
-        &[
-            SensitiveEnvKind::Credential,
-            SensitiveEnvKind::EvmPrivateKey,
-            SensitiveEnvKind::Mnemonic,
-            SensitiveEnvKind::SolanaKeypair,
-            SensitiveEnvKind::Password,
-        ],
-        &[],
-    );
+    // No extras: see `TIER1_ENV_ALIAS_RE`.
+    let names = alias_alternation(SYMBOLIC_ENV_KINDS, &[]);
     RegexBuilder::new(&format!(
         r"(?:\$(?:{names})\b|\$\{{(?:{names})\}}|%(?:{names})%|\$env:(?:{names})\b)"
     ))
@@ -1393,7 +1460,10 @@ pub(crate) fn secret_env_regex_fragment() -> String {
 }
 
 pub fn contains_symbolic_env_reference(input: &str) -> bool {
-    SYMBOLIC_ENV_RE.is_match(input)
+    // Every branch starts with `$` or `%` and names an alias.
+    input.contains(['$', '%'])
+        && env_alias_literal_candidate(input)
+        && SYMBOLIC_ENV_RE.is_match(input)
 }
 
 fn looks_like_windows_path(path: &str) -> bool {
@@ -2016,6 +2086,30 @@ pub fn is_project_secret_file(path: &str) -> bool {
             | "id_ecdsa"
             | "id_ed25519"
     )
+}
+
+/// Public files in an SSH directory: a public key (`*.pub`), `known_hosts`,
+/// `authorized_keys` and the client `config`. They sit under the `.ssh`
+/// credential root, which keeps protecting the directory itself and every
+/// private key in it, but uploading or copying one of these files to a host
+/// leaks no secret (`scp ~/.ssh/id_ed25519.pub host:`, the `ssh-copy-id`
+/// pattern). Used only by the command upload / exfiltration dataflow; the
+/// catalogue, container-bind and capsule rules still read the whole root.
+pub fn is_public_ssh_material(path: &str) -> bool {
+    let mut components = path.rsplit(['/', '\\']);
+    let basename = components.next().unwrap_or_default();
+    if !components
+        .next()
+        .is_some_and(|parent| parent.eq_ignore_ascii_case(".ssh"))
+    {
+        return false;
+    }
+    let lower = basename.to_ascii_lowercase();
+    (lower.len() > ".pub".len() && lower.ends_with(".pub"))
+        || matches!(
+            lower.as_str(),
+            "known_hosts" | "known_hosts.old" | "authorized_keys" | "authorized_keys2" | "config"
+        )
 }
 
 pub fn sensitive_path_match_count(text: &str) -> usize {
@@ -3171,6 +3265,131 @@ pub fn redact_sensitive_values(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The literal one alternative of an alias alternation must start with:
+    /// its text up to the first unescaped `[` (a prefix family's extension),
+    /// with `regex::escape` undone.
+    fn alternative_literal(alternative: &str) -> String {
+        let mut literal = String::new();
+        let mut chars = alternative.chars();
+        while let Some(character) = chars.next() {
+            match character {
+                '\\' => literal.extend(chars.next()),
+                '[' => break,
+                other => literal.push(other),
+            }
+        }
+        literal.to_ascii_lowercase()
+    }
+
+    /// FPPERF-7: `env_alias_literal_candidate` may skip the alias regexes only
+    /// because every one of their alternatives starts with a registered
+    /// literal. Check that structurally for both regexes, then differentially.
+    #[test]
+    fn env_alias_literals_cover_every_alias_regex_alternative() {
+        assert!(SYMBOLIC_ENV_KINDS
+            .iter()
+            .all(|kind| TIER1_ENV_ALIAS_KINDS.contains(kind)));
+        for kinds in [TIER1_ENV_ALIAS_KINDS, SYMBOLIC_ENV_KINDS] {
+            let alternation = alias_alternation(kinds, &[]);
+            assert!(alternation.split('|').count() > 100, "{alternation}");
+            for alternative in alternation.split('|') {
+                let literal = alternative_literal(alternative);
+                assert!(!literal.is_empty(), "{alternative}");
+                assert!(
+                    ENV_ALIAS_LITERALS.contains(&literal),
+                    "{alternative} -> {literal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn env_alias_precheck_never_hides_an_alias_regex_match() {
+        let mut inputs: Vec<String> = [
+            "true",
+            "git status",
+            "ls -la /Users/dev/projects/api",
+            "cd /tmp && npm test",
+            "echo $HOME and %PATH%",
+            "curl -H 'x: y' https://example.com/token",
+            "TOKEN=1 make",
+            "--password hunter2",
+            "set password x",
+            "export Github_Token=abc",
+            "printf %AWS_SECRET_ACCESS_KEY%",
+            "echo ${GITHUB_TOKEN}",
+            "echo $env:OPENAI_API_KEY",
+            // Unicode case folding: KELVIN SIGN for k, LONG S for s.
+            "export AWS_SECRET_ACCESS_\u{212A}EY=x",
+            "echo $AW\u{17F}_SECRET_ACCESS_KEY",
+            "--api-\u{212A}ey value",
+        ]
+        .iter()
+        .map(|input| (*input).to_string())
+        .collect();
+        for literal in ENV_ALIAS_LITERALS.iter() {
+            // A prefix family needs an extension after its separator.
+            let extension = if literal.ends_with(['_', '-']) {
+                "x"
+            } else {
+                ""
+            };
+            let upper = literal.to_ascii_uppercase();
+            for name in [literal.as_str(), upper.as_str()] {
+                let name = format!("{name}{extension}");
+                inputs.push(format!("export {name}=x"));
+                inputs.push(format!("tool --{name} value"));
+                inputs.push(format!("set {name} value"));
+                inputs.push(format!("echo ${name}"));
+                inputs.push(format!("echo ${{{name}}}"));
+                inputs.push(format!("type %{name}%"));
+                // Embedded in a longer word: the literal is present but the
+                // regex's word boundaries may reject it.
+                inputs.push(format!("echo x{name}y"));
+            }
+        }
+        let mut matched = 0usize;
+        for input in &inputs {
+            let tier1 = TIER1_ENV_ALIAS_RE.is_match(input);
+            let symbolic = SYMBOLIC_ENV_RE.is_match(input);
+            if tier1 || symbolic {
+                matched += 1;
+                assert!(env_alias_literal_candidate(input), "{input:?}");
+            }
+            assert_eq!(
+                contains_symbolic_env_reference(input),
+                symbolic,
+                "{input:?}"
+            );
+            assert_eq!(
+                tier1_sensitive_asset_candidate(input),
+                tier1
+                    || symbolic
+                    || has_registry_path_candidate(input)
+                    || TIER1_EVM_HEX_RE.is_match(input)
+                    || SOLANA_ARRAY_RE.is_match(input),
+                "{input:?}"
+            );
+        }
+        assert!(matched > inputs.len() / 2, "{matched} of {}", inputs.len());
+        for input in [
+            "export AWS_SECRET_ACCESS_\u{212A}EY=x",
+            "echo $AW\u{17F}_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                TIER1_ENV_ALIAS_RE.is_match(input) || SYMBOLIC_ENV_RE.is_match(input),
+                "{input:?}"
+            );
+        }
+        for input in ["true", "git status", "ls -la /Users/dev/projects/api"] {
+            assert!(!env_alias_literal_candidate(input), "{input:?}");
+        }
+        // Long inputs skip the pre-check and use the regex directly.
+        assert!(env_alias_literal_candidate(
+            &"x".repeat(ENV_ALIAS_PRECHECK_MAX_BYTES + 1)
+        ));
+    }
+
     fn solana_keypair(seed: [u8; 32]) -> String {
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let mut bytes = seed.to_vec();
@@ -3226,6 +3445,43 @@ mod tests {
         // `.env`.
         assert!(!is_sensitive_path(".env"));
         assert!(!is_sensitive_bind_path("./.env"));
+    }
+
+    #[test]
+    fn public_ssh_material_is_only_public_files_directly_in_ssh_dir() {
+        for path in [
+            "~/.ssh/id_ed25519.pub",
+            "/home/alice/.ssh/id_rsa.pub",
+            "~/.ssh/*.pub",
+            "~/.ssh/known_hosts",
+            "~/.ssh/known_hosts.old",
+            "~/.ssh/authorized_keys",
+            "~/.ssh/authorized_keys2",
+            "~/.ssh/config",
+            r"C:\Users\alice\.ssh\id_ed25519.pub",
+        ] {
+            assert!(is_public_ssh_material(path), "{path}");
+        }
+        for path in [
+            "~/.ssh/id_ed25519",
+            "~/.ssh/id_rsa",
+            "~/.ssh/id_*",
+            "~/.ssh/*",
+            "~/.ssh",
+            "~/.ssh/",
+            "~/.ssh/.pub",
+            "~/.ssh/id_rsa{,.pub}",
+            "~/.ssh/config.d/work",
+            "~/.ssh/keys/id_rsa.pub.bak",
+            "~/keys/id_rsa.pub",
+            "id_rsa.pub",
+            "/etc/ssh/ssh_host_ed25519_key",
+        ] {
+            assert!(!is_public_ssh_material(path), "{path}");
+        }
+        // The catalogue keeps the whole root: only the upload dataflow uses
+        // this carve-out.
+        assert!(is_sensitive_path("~/.ssh/id_ed25519.pub"));
     }
 
     #[test]

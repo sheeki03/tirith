@@ -1186,7 +1186,7 @@ pub(crate) enum OutputDataOperation {
     Stealth,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Evidence {
     Url {
@@ -1912,8 +1912,40 @@ pub(crate) fn internal_web3_evidence(evidence: &Evidence) -> Option<InternalWeb3
     }
 }
 
+/// Re-point the extraction index of an internal Web3 evidence record (see
+/// [`internal_web3_evidence`]) at `map(index)`, or at no URL when `map` has
+/// none. Other evidence is left alone. Used when the findings of one
+/// analysis join another analysis's extracted-URL list.
+pub(crate) fn remap_web3_extraction_index(
+    evidence: &mut Evidence,
+    map: impl Fn(usize) -> Option<usize>,
+) {
+    let Some(
+        InternalWeb3Evidence::Endpoint {
+            extraction_index: Some(index),
+        }
+        | InternalWeb3Evidence::Address {
+            extraction_index: Some(index),
+        },
+    ) = internal_web3_evidence(evidence)
+    else {
+        return;
+    };
+    let Evidence::Text { detail } = evidence else {
+        return;
+    };
+    let Some(token_start) = detail.find(";index=").map(|at| at + ";index=".len()) else {
+        return;
+    };
+    let token_end = detail[token_start..]
+        .find(';')
+        .map_or(detail.len(), |offset| token_start + offset);
+    let token = map(index).map_or_else(|| "none".to_string(), |index| index.to_string());
+    detail.replace_range(token_start..token_end, &token);
+}
+
 /// A suspicious character with its position and details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SuspiciousChar {
     /// Byte offset in the string
     pub offset: usize,
@@ -2309,6 +2341,11 @@ pub fn bound_json_value_for_output(value: serde_json::Value) -> serde_json::Valu
     if let Some(object) = value.as_object() {
         for key in [
             "action",
+            "requires_approval",
+            "approval_timeout_secs",
+            "approval_fallback",
+            "approval_rule",
+            "approval_description",
             "status",
             "kind",
             "event",
@@ -3102,6 +3139,34 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web3_extraction_indexes_remap_and_other_evidence_is_untouched() {
+        let mut address = web3_address_evidence(Some(3));
+        remap_web3_extraction_index(&mut address, |index| (index == 3).then_some(12));
+        assert_eq!(
+            internal_web3_evidence(&address),
+            Some(InternalWeb3Evidence::Address {
+                extraction_index: Some(12)
+            })
+        );
+        remap_web3_extraction_index(&mut address, |_| None);
+        assert_eq!(
+            internal_web3_evidence(&address),
+            Some(InternalWeb3Evidence::Address {
+                extraction_index: None
+            })
+        );
+        let mut url = Evidence::Url {
+            raw: "https://example.com/;index=3".to_string(),
+        };
+        remap_web3_extraction_index(&mut url, |_| Some(9));
+        assert!(
+            url == Evidence::Url {
+                raw: "https://example.com/;index=3".to_string(),
+            }
+        );
+    }
 
     fn assert_secret_free_projection(label: &str, projection: &str, secret: &str) {
         assert!(!projection.contains(secret), "{label}: {projection}");

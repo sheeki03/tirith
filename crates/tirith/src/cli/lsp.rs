@@ -367,6 +367,7 @@ fn analysis_context(path: &Path, text: &str, context: ScanContext) -> AnalysisCo
         // irrelevant.
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     }
 }
 
