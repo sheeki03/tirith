@@ -28,13 +28,23 @@ fn hook_path() -> String {
     )
 }
 
-/// Build a fake tirith binary that logs its args to `log_path` and exits by
+/// Build a fake tirith binary that logs its args to `log_path`, each line
+/// prefixed with `ic=<_TIRITH_INTERACTIVE_COMMENTS or unset>`, and exits by
 /// input token: `BLOCK_TOKEN` → 1, `WARN_TOKEN` → 2, `BADRC_TOKEN` → 99, else 0.
+/// Like a binary older than the hooks, it rejects `--no-interactive-comments`
+/// as a usage error (2) before looking at the input.
 fn install_fake_tirith(bin_dir: &Path, log_path: &Path) {
     fs::create_dir_all(bin_dir).unwrap();
     let script = format!(
         r#"#!/bin/bash
-printf '%s\n' "$*" >> {log}
+printf 'ic=%s %s\n' "${{_TIRITH_INTERACTIVE_COMMENTS-unset}}" "$*" >> {log}
+for arg in "$@"; do
+  [[ "$arg" == "--" ]] && break
+  if [[ "$arg" == "--no-interactive-comments" ]]; then
+    printf "error: unexpected argument '%s' found\n" "$arg" >&2
+    exit 2
+  fi
+done
 case "$*" in
   *BLOCK_TOKEN*)  exit 1 ;;
   *WARN_TOKEN*)   exit 2 ;;
@@ -179,10 +189,12 @@ echo clean_post_block && touch {sentinels}/clean_ran
 }
 
 /// With `shopt -u interactive_comments` bash runs the text after a word-start
-/// `#`. The hook reads the option at each check and then passes
-/// `--no-interactive-comments`, and its whole-line drift check takes that `#`
-/// as a word, so the command hidden behind it is blocked instead of the
-/// session degrading to warn-only. With the option back on, the flag is gone.
+/// `#`. The hook reads the option at each check and reports it in the
+/// environment (`_TIRITH_INTERACTIVE_COMMENTS=0`, never a flag an older
+/// binary would reject or read as the command), and its whole-line drift
+/// check takes that `#` as a word, so the command hidden behind it is blocked
+/// instead of the session degrading to warn-only. With the option back on the
+/// variable is 1.
 #[test]
 fn enforce_passes_comment_state_and_blocks_text_after_hash() {
     let (_out, stderr, invocations, sentinel_dir) = run_with_sentinels(
@@ -215,9 +227,14 @@ echo back # comment_again_marker
     assert!(
         invocations
             .iter()
-            .any(|line| line.contains("BLOCK_TOKEN-hash")
-                && line.contains("--no-interactive-comments")),
+            .any(|line| line.contains("BLOCK_TOKEN-hash") && line.starts_with("ic=0 ")),
         "checks must report the option while it is off: {invocations:#?}"
+    );
+    assert!(
+        invocations
+            .iter()
+            .all(|line| !line.contains("--no-interactive-comments")),
+        "the hook must not pass a flag an older binary rejects: {invocations:#?}"
     );
     for marker in ["comment_on_marker", "comment_again_marker"] {
         let checks: Vec<_> = invocations
@@ -226,10 +243,8 @@ echo back # comment_again_marker
             .collect();
         assert!(!checks.is_empty(), "{marker}: {invocations:#?}");
         assert!(
-            checks
-                .iter()
-                .all(|line| !line.contains("--no-interactive-comments")),
-            "{marker}: no flag while the option is on: {invocations:#?}"
+            checks.iter().all(|line| line.starts_with("ic=1 ")),
+            "{marker}: the option is reported on: {invocations:#?}"
         );
     }
     let _ = fs::remove_dir_all(&sentinel_dir);

@@ -1375,25 +1375,28 @@ _tirith_session_lost_debug_trap() {
 
 # bash runs the text after a word-start `#` when `interactive_comments` is off
 # (`shopt -u interactive_comments`; it is on by default): `echo hi #; cmd`
-# prints `hi #` and runs `cmd`. Sets the caller's `comment_flag` array to
-# `--no-interactive-comments` then, so Tirith reads the line the way this shell
-# runs it, and to nothing otherwise. Read at every check, because `shopt` can
-# change the option mid-session. Callers expand it as
-# `${comment_flag[@]+"${comment_flag[@]}"}`, which `set -u` accepts in every
-# bash version.
-_tirith_comment_flag() {
-  comment_flag=()
-  builtin shopt -q interactive_comments || comment_flag=(--no-interactive-comments)
+# prints `hi #` and runs `cmd`. Sets the caller's `comment_reading` to 0 then,
+# so Tirith reads the line the way this shell runs it, and to 1 otherwise. Read
+# at every check, because `shopt` can change the option mid-session. Callers
+# pass it to the binary as `_TIRITH_INTERACTIVE_COMMENTS`, never as a flag: a
+# pinned binary older than this hook ignores the variable and keeps its own
+# reading, while it would reject an unknown flag (`paste`) or take it for the
+# checked command (`check`).
+_tirith_comment_reading() {
+  comment_reading=1
+  builtin shopt -q interactive_comments || comment_reading=0
+  builtin export -n comment_reading
 }
 
 _tirith_preexec_receipt_check_untraced() {
   local scan_target="$1" warn_only="$2"
   builtin export -n scan_target
   _tirith_receipt_parent_context_is_valid || return 1
-  local -a render_args comment_flag
+  local -a render_args
+  local comment_reading
   render_args=()
   [[ "$warn_only" == "yes" ]] && render_args=(--warn-only)
-  _tirith_comment_flag
+  _tirith_comment_reading
   local stdout_file rc
   stdout_file="$(_tirith_new_capture_file 2>/dev/null)" || return 1
   [[ -n "$stdout_file" ]] || return 1
@@ -1405,17 +1408,19 @@ _tirith_preexec_receipt_check_untraced() {
     _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
     _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
     _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
     builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
-    --non-interactive --interactive ${comment_flag[@]+"${comment_flag[@]}"} --shell posix "${render_args[@]}" \
-    -- "$scan_target" >|"$stdout_file" <<<"$_tirith_verification_capture"
+    --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
+    >|"$stdout_file" <<<"$_tirith_verification_capture"
   else
   _TIRITH_HOOK=1 _TIRITH_BASH_INTERNAL=1 \
     _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
     _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
     _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
     builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
-    --non-interactive --interactive ${comment_flag[@]+"${comment_flag[@]}"} --shell posix "${render_args[@]}" \
-    -- "$scan_target" >|"$stdout_file"
+    --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
+    >|"$stdout_file"
   fi
   rc=$?
 
@@ -1671,10 +1676,10 @@ _tirith_preexec() {
       _tirith_preexec_receipt_check "$history_line" no
       rc=$?
     else
-      local -a comment_flag
-      _tirith_comment_flag
-      _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
-        -- "$history_line"
+      local comment_reading
+      _tirith_comment_reading
+      _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --shell posix -- "$history_line"
       rc=$?
     fi
     _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
@@ -1747,8 +1752,8 @@ _tirith_preexec() {
   builtin export -n _tirith_last_cmd
 
   _TIRITH_BASH_INTERNAL=1
-  local -a comment_flag
-  _tirith_comment_flag
+  local comment_reading
+  _tirith_comment_reading
   if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 \
         && "${_TIRITH_PREEXEC_RECEIPTS_TRUSTED:-0}" == "1" ]]; then
     if _tirith_receipt_parent_context_is_valid; then
@@ -1759,8 +1764,8 @@ _tirith_preexec() {
         # in warn-only mode, which makes the scan the only thing this mode
         # offers. Run it plainly, and say once that execution evidence for this
         # shell is no longer strict.
-        _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
-          --warn-only -- "$scan_target" || true
+        _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+          builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
         if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
           _TIRITH_RECEIPT_DEGRADE_WARNED=1
           _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
@@ -1772,12 +1777,12 @@ _tirith_preexec() {
       # A functrace-inherited DEBUG trap may run in a Bash subshell where `$$`
       # still names the registered top-level shell. Do not make a false strict
       # receipt claim there; retain the mode's honest warn-only scan instead.
-      _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
-        --warn-only -- "$scan_target" || true
+      _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
     fi
   else
-    _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
-      --warn-only -- "$scan_target" || true
+    _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+      builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
   fi
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
   _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
@@ -2474,10 +2479,11 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       builtin export -n receipt_token
       local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
       _TIRITH_BASH_INTERNAL=1
-      local -a receipt_args comment_flag
+      local -a receipt_args
+      local comment_reading
       receipt_args=()
       [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]] && receipt_args=(--execution-receipt bash-enter)
-      _tirith_comment_flag
+      _tirith_comment_reading
       if [[ "$READLINE_LINE" == "_tirith_verification_probe "* ]]; then
         local _tirith_verification_capture
         builtin export -n _tirith_verification_capture
@@ -2485,15 +2491,15 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       _TIRITH_VERIFICATION_CAPTURE=1 _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
         _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
         _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive \
-        ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
+        _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
         "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile" <<<"$_tirith_verification_capture"
       else
       _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
         _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
         _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-        builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive \
-        ${comment_flag[@]+"${comment_flag[@]}"} --shell posix \
+        _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
         "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile"
       fi
       rc=$?
@@ -2735,10 +2741,10 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         }
         local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
         _TIRITH_BASH_INTERNAL=1
-        local -a comment_flag
-        _tirith_comment_flag
-        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive \
-          ${comment_flag[@]+"${comment_flag[@]}"} >|"$tmpfile" 2>&1
+        local comment_reading
+        _tirith_comment_reading
+        printf '%s' "$pasted" | _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+          builtin command "$_TIRITH_BIN" paste --shell posix --interactive >|"$tmpfile" 2>&1
         local rc=$?
         _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
         local output=$(<"$tmpfile")
