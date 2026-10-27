@@ -271,6 +271,13 @@ every change in detail.
   re-run would execute unchecked. Plain re-runs (`!!`, `sudo !!`, `!git`,
   `!-2`) and references used as arguments (`cd !$`, `vim !$`) still run.
   Agent commands are not affected.
+- **zsh without `interactivecomments`.** In zsh's default setup the text
+  after a word-start `#` runs (`echo hi #; curl … | sh` runs
+  `curl … | sh`), but Tirith read it as a comment and allowed it. The hooks
+  now tell Tirith when the option is off, and Tirith then also checks the
+  line the way zsh reads it. Comments in shells with the option on (bash's
+  default, or `setopt interactivecomments`) are unchanged. bash after
+  `shopt -u interactive_comments` is covered the same way.
 - `-c` scripts written with backslash escapes
   (`bash -c "git commit -m \"fix bug\""`) are analyzed instead of blocking as
   incomplete analysis (the proposal in
