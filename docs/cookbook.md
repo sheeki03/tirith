@@ -36,14 +36,19 @@ tirith policy tune --from-audit
 tirith policy tune --from-audit --format json   # machine-readable
 ```
 
-It is **suggest-only** — it never edits your policy. The headline suggestion
-is a rule you allowed or bypassed *every* time and *never* blocked: that rule
-is probably firing on something you trust, so an `allowlist` entry or a
-`severity_overrides` downgrade may be warranted. A rule you *sometimes* block
-on is never suggested for a downgrade — it is doing its job. Every suggestion
-is a plain count from the log, not an inference; when the log is too small to
-be meaningful, `policy tune` says so rather than guessing. Review each
-suggestion, then apply it by hand to `.tirith/policy.yaml`.
+It is **suggest-only** — it never edits your policy. The counts describe
+recorded check decisions; they do not prove execution, user intent, or safety.
+Rules that recur in allowed or bypassed checks are candidates for manual review.
+A rule appearing in blocked checks is never suggested for a downgrade. Recurring
+blocked checks are reported separately, even when no safe relaxation is suggested.
+A check can contain several rules, so the per-rule counts do not identify which
+rule caused its final action. Repetition does not establish a false positive.
+
+When the history is too small for recommendations, `policy tune` says so. Before
+applying a reviewed change, inspect `tirith policy effective --runtime` and choose
+an authorized policy target. Repository policy cannot lower severity or suppress
+findings. User settings can still be overridden by repository, remote,
+organization, or incident restrictions. Re-check the command after changing policy.
 
 ## 1. Strict Organization (Fail Closed, No Bypass)
 
@@ -335,14 +340,12 @@ A repo policy carrying `web3_guard.networks` and `web3_guard.allowed_signers`
 prints them as neutralized while keeping its `deny_rpc` and `deny_destinations`
 entries, because denial is the only direction a repository may move.
 
-Note that surviving the merge is not the same as being enforced. Of the
-`web3_guard` fields, only `networks`, `allowed_signers`, `deny_rpc`, and
-`action_unclassified_rpc` are read by a rule. `deny_destinations`,
-`require_command_card`, `command_card_key_ids`, `selector_aliases`,
-`action_incomplete_analysis`, and `action_ambiguous_hardhat_production_run` are
-parsed, validated, and merged, but no rule consults them, so a destination
-listed in `deny_destinations` is not flagged. See
-[web3-command-guard.md](security/web3-command-guard.md#declared-but-not-yet-wired).
+The current engine also enforces destination denials, configured incomplete
+analysis and ambiguous-Hardhat actions, selector aliases, and required exact
+command cards. Card approval remains unavailable when executable identity or
+artifact consumption cannot be bound at the execution boundary. Review the
+[current field limits](security/web3-command-guard.md#policy-fields-and-current-limits)
+before requiring cards for a workflow.
 
 ## 9. Untrusted-Task Gate (observation first)
 

@@ -153,12 +153,13 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
     tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(interactive));
     let session_id = tirith_core::session::resolve_session_id();
-    let verdict = tirith_core::escalation::post_process_verdict_for_verification(
+    let verdict = tirith_core::escalation::post_process_verdict_for_verification_for_shell(
         &raw_verdict,
         &policy,
         &cmd,
         &session_id,
         tirith_core::escalation::CallerContext::Cli,
+        shell_type,
     );
 
     // Effective Allow path: nothing to fix, unless approval is still pending.

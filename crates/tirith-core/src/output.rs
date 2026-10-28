@@ -120,26 +120,13 @@ fn project_public_text(s: &str) -> String {
     crate::redact::redact_blocked_output(&share_safe)
 }
 
-fn project_public_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => *text = project_public_text(text),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                project_public_json(value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                project_public_json(value);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
-}
-
 fn project_verdict(verdict: &Verdict) -> std::io::Result<Verdict> {
     let mut value = serde_json::to_value(verdict).map_err(std::io::Error::other)?;
-    project_public_json(&mut value);
+    crate::output_contract::project_sensitive_strings(
+        &mut value,
+        crate::output_contract::Projection::Verdict,
+        &project_public_text,
+    );
     serde_json::from_value(value).map_err(std::io::Error::other)
 }
 
@@ -221,12 +208,19 @@ fn redact_suggestion(
             " Executable command omitted because mandatory output projection would change the verified bytes.",
         );
     }
-    let rule_id = crate::redact::redact_with_compiled(&s.rule_id, compiled);
-    let rule_id = project_public_text(&rule_id);
+    let rule_id = if serde_json::from_value::<RuleId>(s.rule_id.clone().into()).is_ok()
+        || matches!(
+            s.rule_id.as_str(),
+            "sudo_narrow" | "env_scrub" | "composed_safe_command"
+        ) {
+        s.rule_id.clone()
+    } else {
+        project_public_text(&crate::redact::redact_with_compiled(&s.rule_id, compiled))
+    };
     let remediation = crate::redact::redact_with_compiled(&s.remediation, compiled);
     let remediation = project_public_text(&remediation);
     SafeSuggestion {
-        rule_id: crate::redact::redact_sanitize_redact_with_compiled(&rule_id, compiled),
+        rule_id,
         safe_command,
         rationale,
         remediation: crate::redact::redact_sanitize_redact_with_compiled(&remediation, compiled),
@@ -248,6 +242,19 @@ pub fn write_json_with_suggestions(
     verdict: &Verdict,
     custom_patterns: &[String],
     suggestions: Option<&[SafeSuggestion]>,
+    w: impl Write,
+) -> std::io::Result<()> {
+    write_json_with_recovery(verdict, custom_patterns, suggestions, None, w)
+}
+
+/// Recovery contains only closed enums, rule IDs and compiler-owned strings;
+/// its original command is used for eligibility and never serialized.
+/// Supplying advice selects schema 4; None preserves the schema-3 contract.
+pub fn write_json_with_recovery(
+    verdict: &Verdict,
+    custom_patterns: &[String],
+    suggestions: Option<&[SafeSuggestion]>,
+    recovery: Option<&crate::recovery::RecoveryAdvice>,
     mut w: impl Write,
 ) -> std::io::Result<()> {
     // Redact before applying presentation bounds: truncating first can split a
@@ -300,10 +307,25 @@ pub fn write_json_with_suggestions(
             );
         }
     }
-    crate::redact::redact_json_strings(&mut output, &compiled);
+    crate::output_contract::redact_projection(
+        &mut output,
+        crate::output_contract::Projection::Verdict,
+        &compiled,
+    );
     // Diagnostics and suggestion metadata are attached after the verdict
     // projection, so re-project the complete public response before bounding.
-    project_public_json(&mut output);
+    crate::output_contract::project_sensitive_strings(
+        &mut output,
+        crate::output_contract::Projection::Verdict,
+        &project_public_text,
+    );
+    if let (Some(recovery), Some(object)) = (recovery, output.as_object_mut()) {
+        object.insert("schema_version".into(), 4.into());
+        object.insert(
+            "recovery".into(),
+            serde_json::to_value(recovery).map_err(std::io::Error::other)?,
+        );
+    }
     let output = crate::verdict::bound_json_value_for_output(output);
     serde_json::to_writer(&mut w, &output)?;
     writeln!(w)?;
@@ -313,7 +335,7 @@ pub fn write_json_with_suggestions(
 /// Write human-readable verdict to stderr.
 ///
 /// `warn_only` (caller cannot enforce a block, e.g. bash preexec `DEBUG` trap)
-/// renders Block as `DETECTED (... command will still run)` instead of `BLOCKED`
+/// renders Block as `DETECTED (... execution is not withheld by this hook)` instead of `BLOCKED`
 /// and rewrites the bypass hint. Human-only — it MUST never reach `write_json`,
 /// audit logs, or exit codes.
 pub fn write_human(verdict: &Verdict, warn_only: bool, w: impl Write) -> std::io::Result<()> {
@@ -373,6 +395,42 @@ fn write_captured_policy_diagnostics_human(
     Ok(())
 }
 
+/// Human labels describe the decision and the supplied integration capability.
+/// They do not establish that a command ran or that interception was observed.
+fn human_action_label(action: Action, warn_only: bool) -> &'static str {
+    match action {
+        Action::Allow => "ALLOWED WITH ADVISORY",
+        // Legacy callers can require acknowledgement through strict_warn
+        // without changing Action::Warn. The renderer has no such context.
+        Action::Warn => "WARNING",
+        Action::WarnAck if warn_only => {
+            "CONFIRMATION REQUIRED (this hook cannot enforce acknowledgement)"
+        }
+        Action::WarnAck => "CONFIRMATION REQUIRED",
+        Action::Block if warn_only => {
+            "DETECTED (shell hook cannot block in preexec mode — execution is not withheld by this hook)"
+        }
+        Action::Block => "BLOCKED",
+    }
+}
+
+fn write_analysis_coverage_note(verdict: &Verdict, mut w: impl Write) -> std::io::Result<()> {
+    if verdict.findings.iter().any(|finding| {
+        matches!(
+            finding.rule_id,
+            RuleId::AnalysisIncomplete
+                | RuleId::OutputAnalysisOverflow
+                | RuleId::WrapperChainTooDeep
+        )
+    }) {
+        writeln!(
+            w,
+            "  ANALYSIS INCOMPLETE: some relevant behavior could not be checked; this gap alone is not evidence of malicious content."
+        )?;
+    }
+    Ok(())
+}
+
 fn write_human_color_into(
     verdict: &Verdict,
     warn_only: bool,
@@ -389,14 +447,7 @@ fn write_human_color_into(
         return Ok(());
     }
     let is_warn_only_block = warn_only && verdict.action == Action::Block;
-    let action_str = match verdict.action {
-        Action::Allow => "INFO",
-        Action::Warn | Action::WarnAck => "WARNING",
-        Action::Block if is_warn_only_block => {
-            "DETECTED (shell hook cannot block in preexec mode — command will still run)"
-        }
-        Action::Block => "BLOCKED",
-    };
+    let action_str = human_action_label(verdict.action, warn_only);
 
     if let Some(ref reason) = verdict.escalation_reason {
         writeln!(
@@ -407,6 +458,8 @@ fn write_human_color_into(
     } else {
         writeln!(w, "tirith: {action_str}")?;
     }
+
+    write_analysis_coverage_note(original_verdict, &mut w)?;
 
     for finding in &verdict.findings {
         let sev = crate::style::severity_label(&finding.severity, crate::style::Stream::Stderr);
@@ -472,16 +525,16 @@ fn write_human_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+                "  This hook reports warn-only mode; inspect activation with tirith doctor --quick."
             )?;
             writeln!(
                 w,
-                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
+                "  Run tirith doctor --simulate-enter for a disposable Bash allow/block probe."
             )?;
         } else {
             writeln!(
                 w,
-                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+                "  Bypass policy is enabled; tirith check --shell <shell> provides exact-input recovery eligibility."
             )?;
         }
     }
@@ -522,7 +575,7 @@ fn is_destructive_or_fetch_pipe(r: RuleId) -> bool {
 ///   destructive/fetch-pipe finding (the engine ran `blast_radius::cheap_check`
 ///   on the exec path, so this only summarizes existing findings; it never
 ///   recomputes). One line, pointing at `tirith preview`.
-/// * **14a "To allow" line** — the first finding carrying a URL or host in its
+/// * **14a exception review line** — the first finding carrying a URL or host in its
 ///   evidence yields a copy-pasteable `tirith trust add` invocation. A full URL
 ///   is a NARROW trust pattern (no `--broad`); a bare domain needs `--broad`
 ///   because `trust add` rejects bare domains otherwise. Findings without any
@@ -591,14 +644,15 @@ fn write_block_advisories(
             match quoted {
                 Some(quoted) => writeln!(
                     w,
-                    "  To allow: tirith trust add {quoted} --rule {rule} --ttl 30d"
+                    "  Review an exception: tirith trust add {quoted} --rule {rule} --ttl 30d"
                 )?,
                 None => writeln!(
                     w,
-                    "  To allow: trust this target manually with `tirith trust add` \
+                    "  Review an exception: trust this target manually with `tirith trust add` \
                      (it contains characters unsafe to embed in a suggested command)."
                 )?,
             }
+            write_trust_scope_note(original_verdict, original_index, &mut w)?;
             break;
         }
         // Else fall back to a bare domain; `trust add` rejects bare domains
@@ -626,18 +680,53 @@ fn write_block_advisories(
             match quoted {
                 Some(quoted) => writeln!(
                     w,
-                    "  To allow (trusts the whole domain): tirith trust add {quoted} --broad --rule {rule} --ttl 30d"
+                    "  Review a domain-wide exception (trusts the whole domain): tirith trust add {quoted} --broad --rule {rule} --ttl 30d"
                 )?,
                 None => writeln!(
                     w,
-                    "  To allow: trust this target manually with `tirith trust add` \
+                    "  Review an exception: trust this target manually with `tirith trust add` \
                      (it contains characters unsafe to embed in a suggested command)."
                 )?,
             }
+            write_trust_scope_note(original_verdict, original_index, &mut w)?;
             break;
         }
     }
 
+    Ok(())
+}
+
+/// A suggested grant is scoped to one target and rule. The renderer does not
+/// evaluate the hypothetical grant and cannot promise an allowed decision.
+fn write_trust_scope_note(
+    verdict: &Verdict,
+    suggested_index: usize,
+    mut w: impl Write,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "    This suggestion covers only the shown target and rule, if policy permits it. Re-check the command after any change; other policy restrictions still apply."
+    )?;
+    let other_rules: std::collections::BTreeSet<String> = verdict
+        .findings
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != suggested_index)
+        .map(|(_, finding)| finding.rule_id.to_string())
+        .collect();
+    if !other_rules.is_empty() {
+        let shown = other_rules.iter().take(5).cloned().collect::<Vec<_>>();
+        let suffix = if other_rules.len() > shown.len() {
+            format!(" (and {} more)", other_rules.len() - shown.len())
+        } else {
+            String::new()
+        };
+        writeln!(
+            w,
+            "    Other findings to re-check: {}{suffix}.",
+            shown.join(", ")
+        )?;
+    }
     Ok(())
 }
 
@@ -822,14 +911,7 @@ fn write_human_no_color_into(
         return Ok(());
     }
     let is_warn_only_block = warn_only && verdict.action == Action::Block;
-    let action_str = match verdict.action {
-        Action::Allow => "INFO",
-        Action::Warn | Action::WarnAck => "WARNING",
-        Action::Block if is_warn_only_block => {
-            "DETECTED (shell hook cannot block in preexec mode — command will still run)"
-        }
-        Action::Block => "BLOCKED",
-    };
+    let action_str = human_action_label(verdict.action, warn_only);
 
     if let Some(ref reason) = verdict.escalation_reason {
         writeln!(
@@ -840,6 +922,8 @@ fn write_human_no_color_into(
     } else {
         writeln!(w, "tirith: {action_str}")?;
     }
+
+    write_analysis_coverage_note(original_verdict, &mut w)?;
 
     for finding in &verdict.findings {
         writeln!(
@@ -894,16 +978,16 @@ fn write_human_no_color_into(
         if is_warn_only_block {
             writeln!(
                 w,
-                "  Safer: use zsh or fish to actually block this, or prefix with TIRITH=0 to suppress."
+                "  This hook reports warn-only mode; inspect activation with tirith doctor --quick."
             )?;
             writeln!(
                 w,
-                "  Bash can block too: export TIRITH_BASH_PREEXEC_ENFORCE=1 before the tirith init line (remove any TIRITH_BASH_MODE=enter override)."
+                "  Run tirith doctor --simulate-enter for a disposable Bash allow/block probe."
             )?;
         } else {
             writeln!(
                 w,
-                "  Bypass: prefix your command with TIRITH=0 (applies to that command only)"
+                "  Bypass policy is enabled; tirith check --shell <shell> provides exact-input recovery eligibility."
             )?;
         }
     }
@@ -958,6 +1042,61 @@ mod tests {
     use super::*;
     use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Timings, Verdict};
 
+    #[test]
+    fn broad_custom_dlp_preserves_json_actions_and_suggestion_ids() {
+        let verdict = block_verdict_with_bypass();
+        let suggestions = vec![SafeSuggestion {
+            rule_id: "plain_http_to_sink".into(),
+            safe_command: Some("echo operator-secret".into()),
+            rationale: "operator-secret".into(),
+            remediation: "operator-secret".into(),
+        }];
+        let mut bytes = Vec::new();
+        write_json_with_suggestions(&verdict, &["(?s).+".into()], Some(&suggestions), &mut bytes)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["findings"][0]["rule_id"], "plain_http_to_sink");
+        assert_eq!(value["findings"][0]["severity"], "HIGH");
+        assert_eq!(
+            value["safe_suggestions"][0]["rule_id"],
+            "plain_http_to_sink"
+        );
+        assert!(value["safe_suggestions"][0].get("safe_command").is_none());
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("operator-secret"));
+    }
+
+    #[test]
+    fn recovery_is_explicit_schema_four_and_remains_typed_under_broad_dlp() {
+        let verdict = block_verdict_with_bypass();
+        let advice = crate::recovery::for_command(
+            &verdict,
+            "echo recovery-private | sh",
+            crate::tokenize::ShellType::Posix,
+        );
+        let mut bytes = Vec::new();
+        write_json_with_recovery(
+            &verdict,
+            &["(?s).+".into()],
+            None,
+            Some(&advice),
+            &mut bytes,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["action"], "block");
+        assert_eq!(value["recovery"]["schema_version"], 1);
+        assert_eq!(value["recovery"]["bypass"], "eligible");
+        assert_eq!(value["recovery"]["execution_permitted"], false);
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("recovery-private"));
+    }
+
     fn block_verdict_with_bypass() -> Verdict {
         let mut v = Verdict::from_findings(
             vec![Finding {
@@ -1003,12 +1142,12 @@ mod tests {
             "warn-only must render DETECTED with explanation: {out}"
         );
         assert!(
-            !out.contains("Bypass:"),
+            !out.contains("Bypass policy"),
             "warn-only must replace the Bypass hint: {out}"
         );
         assert!(
-            out.contains("Safer:"),
-            "warn-only must render the Safer hint: {out}"
+            out.contains("inspect activation"),
+            "warn-only must render activation guidance: {out}"
         );
     }
 
@@ -1027,8 +1166,8 @@ mod tests {
             "default must not render DETECTED: {out}"
         );
         assert!(
-            out.contains("Bypass:"),
-            "default must render the Bypass hint: {out}"
+            out.contains("exact-input recovery eligibility"),
+            "context-free output must require exact-input recovery eligibility: {out}"
         );
     }
 
@@ -1182,7 +1321,7 @@ mod tests {
             assert!(!rendered.contains(canary), "raw custom secret: {rendered}");
             assert!(rendered.contains("[REDACTED:custom]"), "{rendered}");
             assert!(
-                !rendered.contains("To allow: tirith trust add"),
+                !rendered.contains("Review an exception: tirith trust add"),
                 "redaction changed the original trust target, so no runnable trust command is valid: {rendered}"
             );
             assert!(rendered.contains("trust this target manually"));
@@ -1588,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn block_with_full_url_renders_to_allow_without_broad() {
+    fn block_with_full_url_renders_exception_hint_without_broad() {
         // 14a: a finding carrying a full URL emits the NARROW trust line — the
         // exact URL (single-quoted), the snake_case rule id, a 30d TTL, and NO
         // `--broad`.
@@ -1608,9 +1747,9 @@ mod tests {
             let out = String::from_utf8(buf).unwrap();
             assert!(
                 out.contains(
-                    "To allow: tirith trust add 'https://bit.ly/x' --rule shortened_url --ttl 30d"
+                    "Review an exception: tirith trust add 'https://bit.ly/x' --rule shortened_url --ttl 30d"
                 ),
-                "full-URL block must render the narrow, single-quoted To-allow line (color={color}): {out}"
+                "full-URL block must render the narrow, single-quoted exception-review line (color={color}): {out}"
             );
             assert!(
                 !out.contains("--broad"),
@@ -1672,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn block_with_bare_domain_only_renders_broad_to_allow() {
+    fn block_with_bare_domain_only_discloses_domain_wide_exception() {
         // 14a: a finding with only a HOST (no full URL) must emit the domain form
         // WITH `--broad` (single-quoted), because `trust add` rejects bare domains
         // otherwise.
@@ -1688,16 +1827,16 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains(
-                "To allow (trusts the whole domain): tirith trust add 'gіthub.com' --broad --rule confusable_domain --ttl 30d"
+                "Review a domain-wide exception (trusts the whole domain): tirith trust add 'gіthub.com' --broad --rule confusable_domain --ttl 30d"
             ),
-            "bare-domain block must render the single-quoted --broad To-allow line: {out}"
+            "bare-domain block must render the single-quoted --broad exception-review line: {out}"
         );
     }
 
     #[test]
     fn block_with_url_and_host_prefers_full_url_no_broad() {
         // When both a full URL and a host are present, the full URL wins (narrow,
-        // no --broad, single-quoted) and only ONE To-allow line is emitted.
+        // no --broad, single-quoted) and only ONE exception-review line is emitted.
         let verdict = block_verdict_with_evidence(
             RuleId::PlainHttpToSink,
             vec![
@@ -1724,15 +1863,15 @@ mod tests {
             "full-URL path must not use --broad: {out}"
         );
         assert_eq!(
-            out.matches("To allow").count(),
+            out.matches("Review an exception:").count(),
             1,
-            "exactly one To-allow line: {out}"
+            "exactly one exception-review line: {out}"
         );
     }
 
     #[test]
-    fn block_to_allow_url_shell_quotes_injection_payloads() {
-        // F1 (HIGH): the To-allow line is meant to be copy/pasted into a shell,
+    fn block_exception_hint_shell_quotes_url_injection_payloads() {
+        // F1 (HIGH): the exception-review line is meant to be copy/pasted into a shell,
         // so an attacker-controlled URL carrying shell metacharacters must be
         // single-quoted — a developer who pastes the suggested line must NOT
         // trigger command substitution, separators, redirects, or globbing.
@@ -1764,7 +1903,7 @@ mod tests {
                     .lines()
                     .find(|l| l.contains("tirith trust add"))
                     .unwrap_or_else(|| {
-                        panic!("no To-allow line for {raw:?} (color={color}): {out}")
+                        panic!("no exception-review line for {raw:?} (color={color}): {out}")
                     });
                 // The emitted token is the single-quoted form of the URL. A
                 // single quote in the URL is escaped as '\'' (still one token).
@@ -1772,7 +1911,7 @@ mod tests {
                     crate::safe_command::shell_single_quote(raw).expect("quotable URL");
                 assert!(
                     line.contains(&expected_token),
-                    "URL must be single-quoted on the To-allow line so a shell would NOT \
+                    "URL must be single-quoted on the exception-review line so a shell would NOT \
                      expand it (raw={raw:?}, color={color}): {line}"
                 );
                 // The dangerous fragment must never appear UNquoted (outside the
@@ -1807,7 +1946,7 @@ mod tests {
         let line = out
             .lines()
             .find(|l| l.contains("tirith trust add"))
-            .unwrap_or_else(|| panic!("no To-allow line: {out}"));
+            .unwrap_or_else(|| panic!("no exception-review line: {out}"));
         assert!(
             line.contains('\''),
             "the domain target must be single-quoted: {line}"
@@ -1927,7 +2066,7 @@ mod tests {
     #[test]
     fn block_without_url_or_destructive_renders_neither_advisory() {
         // A non-URL, non-destructive block (e.g. a bidi-control terminal finding
-        // whose only evidence is a byte sequence) must emit NEITHER the To-allow
+        // whose only evidence is a byte sequence) must emit NEITHER the exception-review
         // line NOR the blast-radius header.
         let verdict = block_verdict_with_evidence(
             RuleId::BidiControls,
@@ -1941,8 +2080,8 @@ mod tests {
         write_human_no_color(&verdict, false, &[], &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
-            !out.contains("To allow"),
-            "no URL/host → no To-allow line: {out}"
+            !out.contains("Review an exception") && !out.contains("Review a domain-wide exception"),
+            "no URL/host → no exception-review line: {out}"
         );
         assert!(
             !out.contains("blast radius:"),
@@ -1965,8 +2104,8 @@ mod tests {
         write_human_no_color(&verdict, false, &[], &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
-            !out.contains("To allow"),
-            "Warn must not show To-allow: {out}"
+            !out.contains("Review an exception") && !out.contains("Review a domain-wide exception"),
+            "Warn must not show exception-review: {out}"
         );
         assert!(
             !out.contains("blast radius:"),
@@ -2054,5 +2193,111 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains(&scalar), "{output}");
         assert!(output.contains("[REDACTED:evm_private_key]"), "{output}");
+    }
+    fn render_decision(verdict: &Verdict, warn_only: bool, color: bool) -> String {
+        let compiled = crate::redact::CompiledCustomPatterns::new(&[]);
+        let mut output = Vec::new();
+        if color {
+            write_human_color_into(verdict, warn_only, &compiled, &mut output).unwrap();
+        } else {
+            write_human_no_color_into(verdict, warn_only, &compiled, &mut output).unwrap();
+        }
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn human_labels_distinguish_advisory_and_required_confirmation_without_changing_actions() {
+        for color in [false, true] {
+            for (action, label, token, exit) in [
+                (Action::Allow, "ALLOWED WITH ADVISORY", "allow", 0),
+                (Action::Warn, "WARNING", "warn", 2),
+                (Action::WarnAck, "CONFIRMATION REQUIRED", "warn_ack", 3),
+                (Action::Block, "BLOCKED", "block", 1),
+            ] {
+                let mut verdict = block_verdict_with_bypass();
+                verdict.action = action;
+                let output = render_decision(&verdict, false, color);
+                assert!(
+                    output.starts_with(&format!("tirith: {label}\n")),
+                    "{output}"
+                );
+                assert!(!output.contains("command will still run"), "{output}");
+                assert!(!output.contains("acknowledgement not required"), "{output}");
+                assert_eq!(verdict.action.exit_code(), exit);
+                let mut json = Vec::new();
+                write_json(&verdict, &[], &mut json).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                assert_eq!(value["action"], token);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_analysis_is_visible_without_reclassifying_the_decision() {
+        for color in [false, true] {
+            for rule in [
+                RuleId::AnalysisIncomplete,
+                RuleId::OutputAnalysisOverflow,
+                RuleId::WrapperChainTooDeep,
+            ] {
+                for action in [Action::Warn, Action::Block] {
+                    let mut verdict = block_verdict_with_evidence(rule, Vec::new());
+                    verdict.action = action;
+                    let output = render_decision(&verdict, false, color);
+                    assert!(output.contains("ANALYSIS INCOMPLETE:"), "{output}");
+                    assert!(
+                        output.contains("gap alone is not evidence of malicious content"),
+                        "{output}"
+                    );
+                    assert_eq!(verdict.action, action);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn warn_only_decisions_do_not_claim_interception_or_execution() {
+        for color in [false, true] {
+            let mut verdict = block_verdict_with_bypass();
+            let output = render_decision(&verdict, true, color);
+            assert!(
+                output.contains("execution is not withheld by this hook"),
+                "{output}"
+            );
+            assert!(!output.contains("BLOCKED"), "{output}");
+            assert!(!output.contains("will still run"), "{output}");
+            verdict.action = Action::WarnAck;
+            let output = render_decision(&verdict, true, color);
+            assert!(
+                output.contains("CONFIRMATION REQUIRED (this hook cannot enforce acknowledgement)"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_target_exception_does_not_claim_to_resolve_another_finding() {
+        let mut verdict = block_verdict_with_bypass();
+        verdict.findings.push(
+            block_verdict_with_evidence(RuleId::BlastDeletesOutsideRepo, Vec::new())
+                .findings
+                .remove(0),
+        );
+        for color in [false, true] {
+            let output = render_decision(&verdict, false, color);
+            assert!(
+                output.contains("Review an exception: tirith trust add"),
+                "{output}"
+            );
+            assert!(
+                output.contains("only the shown target and rule, if policy permits it"),
+                "{output}"
+            );
+            assert!(
+                output.contains("Other findings to re-check: blast_deletes_outside_repo."),
+                "{output}"
+            );
+            assert!(!output.contains("To allow"), "{output}");
+        }
     }
 }

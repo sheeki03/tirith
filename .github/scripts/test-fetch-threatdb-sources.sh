@@ -158,16 +158,23 @@ url=
 connect_timeout=
 max_time=
 max_filesize=
+retry=
+retry_max_time=
+retry_connrefused=
 while (( $# > 0 )); do
   case "$1" in
     -sSfL)
+      shift
+      ;;
+    --retry-connrefused)
+      retry_connrefused=yes
       shift
       ;;
     -o)
       output=$2
       shift 2
       ;;
-    --connect-timeout|--max-time|--max-filesize)
+    --connect-timeout|--max-time|--max-filesize|--retry|--retry-max-time)
       option=$1
       value=${2:-}
       case "$value" in
@@ -180,6 +187,8 @@ while (( $# > 0 )); do
         --connect-timeout) connect_timeout=$value ;;
         --max-time) max_time=$value ;;
         --max-filesize) max_filesize=$value ;;
+        --retry) retry=$value ;;
+        --retry-max-time) retry_max_time=$value ;;
       esac
       shift 2
       ;;
@@ -198,7 +207,8 @@ while (( $# > 0 )); do
   esac
 done
 if [ -z "$output" ] || [ -z "$url" ] ||
-   [ "$connect_timeout" != "15" ] || [ "$max_time" != "120" ]; then
+   [ "$connect_timeout" != "15" ] || [ "$max_time" != "120" ] ||
+   [ "$retry" != "2" ] || [ "$retry_max_time" != "240" ] || [ "$retry_connrefused" != yes ]; then
   exit 64
 fi
 case "$url" in

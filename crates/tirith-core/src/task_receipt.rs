@@ -86,6 +86,8 @@ enum OwnedBoundaryProjectionV1 {
     PackageApproval,
     PackageResolve,
     PackageInstallPreparation,
+    LocalPackageMaterialization,
+    LocalPackageRecovery,
     PackageManagerNetwork,
     PackageManagerExecution,
     RemoteScriptRun,
@@ -103,6 +105,8 @@ impl From<OwnedBoundary> for OwnedBoundaryProjectionV1 {
             OwnedBoundary::PackageApproval => Self::PackageApproval,
             OwnedBoundary::PackageResolve => Self::PackageResolve,
             OwnedBoundary::PackageInstallPreparation => Self::PackageInstallPreparation,
+            OwnedBoundary::LocalPackageMaterialization => Self::LocalPackageMaterialization,
+            OwnedBoundary::LocalPackageRecovery => Self::LocalPackageRecovery,
             OwnedBoundary::PackageManagerNetwork => Self::PackageManagerNetwork,
             OwnedBoundary::PackageManagerExecution => Self::PackageManagerExecution,
             OwnedBoundary::RemoteScriptRun => Self::RemoteScriptRun,
@@ -122,6 +126,10 @@ impl From<OwnedBoundaryProjectionV1> for OwnedBoundary {
             OwnedBoundaryProjectionV1::PackageApproval => Self::PackageApproval,
             OwnedBoundaryProjectionV1::PackageResolve => Self::PackageResolve,
             OwnedBoundaryProjectionV1::PackageInstallPreparation => Self::PackageInstallPreparation,
+            OwnedBoundaryProjectionV1::LocalPackageMaterialization => {
+                Self::LocalPackageMaterialization
+            }
+            OwnedBoundaryProjectionV1::LocalPackageRecovery => Self::LocalPackageRecovery,
             OwnedBoundaryProjectionV1::PackageManagerNetwork => Self::PackageManagerNetwork,
             OwnedBoundaryProjectionV1::PackageManagerExecution => Self::PackageManagerExecution,
             OwnedBoundaryProjectionV1::RemoteScriptRun => Self::RemoteScriptRun,
@@ -2317,6 +2325,14 @@ mod tests {
     #[test]
     fn every_owned_boundary_has_one_stable_receipt_projection() {
         let cases = [
+            (
+                OwnedBoundary::LocalPackageMaterialization,
+                "local_package_materialization",
+            ),
+            (
+                OwnedBoundary::LocalPackageRecovery,
+                "local_package_recovery",
+            ),
             (OwnedBoundary::GatewayForward, "gateway_forward"),
             (OwnedBoundary::PackageApproval, "package_approval"),
             (OwnedBoundary::PackageResolve, "package_resolve"),

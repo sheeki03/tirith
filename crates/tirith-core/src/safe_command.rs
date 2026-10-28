@@ -216,12 +216,13 @@ fn analyze_cli_inline_candidate_with_network(
     );
     crate::escalation::merge_late_findings(&mut raw, runtime_findings, policy);
     raw.agent_origin = Some(origin.clone());
-    crate::escalation::post_process_verdict_for_verification(
+    crate::escalation::post_process_verdict_for_verification_for_shell(
         &raw,
         policy,
         &ctx.input,
         session_id,
         crate::escalation::CallerContext::Cli,
+        ctx.shell,
     )
 }
 

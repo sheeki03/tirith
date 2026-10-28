@@ -247,7 +247,7 @@ fn load_lockfile_retained(
 /// policy`) joins `.tirith/` onto it. They line up in the common case but
 /// diverge under the trust resolver. Unifying them is a behavior change for its
 /// own PR.
-fn resolve_repo_root() -> Option<PathBuf> {
+pub(crate) fn resolve_repo_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("TIRITH_POLICY_ROOT") {
         if !root.trim().is_empty() {
             return Some(PathBuf::from(root));

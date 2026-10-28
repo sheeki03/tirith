@@ -46,12 +46,19 @@ hook loads, then negotiate protocol v3. Registration creates one process-scoped
 capability bound to the live parent PID and start identity, effective user,
 shell family, session, and Tirith executable identity. The bearer is returned
 only to that shell; its persistent record stores a hash, not the bearer. Nested
-shells therefore register independently even when they inherit one session ID.
+shells register independently and receive a fresh session ID when their hook
+first loads. Re-sourcing an already loaded hook preserves its session ID;
+ordinary commands launched by that shell inherit it. A terminal multiplexer or
+nested shell cannot accidentally share a parent's strict execution ledger.
 Tirith owns approval and warning-acknowledgement interaction before it returns
 an armed receipt; hook code cannot assert either outcome after the decision.
 
 Each receipt is one-shot and follows
-`Prepared → Armed → Consuming → Committed | Conflict | Discarded`. Replay,
+`Prepared → Armed → Consuming → Committed | Conflict | Discarded`. The strict
+ledger lock and generation check precede Consuming publication; a failed
+pre-promotion acquisition remains discardable. Explicit reconciliation of a
+Consuming receipt either recovers its exact durable commit or abandons a proven
+missing transition. It never authorizes execution. Replay,
 command drift, expiry, a different family/session/process, an executable
 replacement, or a durable identity mismatch refuses. Zsh and fish consume at
 the line-acceptance boundary before native handoff; notification-only preexec
@@ -119,6 +126,40 @@ cleanly** — never fails — when a prerequisite is missing:
   those tests are `#[ignore]`d stubs today.
 
 ## Current coverage
+
+Development test success is distinct from installed candidate certification.
+`scripts/certify-shell-package.py` takes a release tar/zip, its extracted binary,
+and the compiled `shell_conformance` harness. It verifies that the binary bytes
+match the package, initializes only that binary's embedded hook bundle in a
+disposable home, and runs the available native Bash/Zsh/Fish PTY suites. It fails
+if initialization selects external hooks, any requested shell is unavailable,
+a required test skips, or an assertion fails. Package, binary, harness, hook and
+shell identities, OS details, test names and logs are recorded in the JSON report.
+
+```sh
+python3 scripts/certify-shell-package.py \
+  --package /absolute/path/tirith-candidate.tar.gz \
+  --binary /absolute/path/extracted/tirith \
+  --harness /absolute/path/target/debug/deps/shell_conformance-HASH \
+  --report /absolute/path/shell-certification.json
+```
+
+The harness accepts paired `TIRITH_CERTIFY_BINARY` and
+`TIRITH_CERTIFY_HOOK_DIR` overrides for a prepared candidate; explicit invalid or
+partial overrides fail. `TIRITH_CERTIFY_SHELLS` lists mandatory shell families,
+with exact executable paths pinned by `TIRITH_CERTIFY_BASH`,
+`TIRITH_CERTIFY_ZSH` and `TIRITH_CERTIFY_FISH`. These variables affect test code
+only. Ordinary development runs retain optional prerequisites.
+
+The resulting supported state applies only to the measured package and covered
+interactive modes. Native Windows PowerShell, Unix PowerShell, Nushell and actual
+agent-host invocation remain explicitly unavailable in this runner. Their
+configuration files and mocked hook events cannot extend its certification.
+A separate [native Claude host checkpoint](next-cycle/claude-native-evidence.md)
+records actual host invocation with a scripted loopback provider, exact matcher
+scope, and observed launch/timeout failure boundaries.
+The block fixtures use local inert pipelines plus allowed-once controls so
+network failure cannot masquerade as successful interception.
 
 | Shell / mode | Invariants covered | Status |
 |--------------|--------------------|--------|
@@ -244,9 +285,9 @@ and a modern Bash PTY.
 
 ## Follow-up
 
-- **zsh / PowerShell / nushell PTY conformance.** The harness is
+- **PowerShell / nushell PTY conformance.** The harness is
   shell-agnostic; each shell needs a spawn helper and its delivery quirks
-  encoded (zsh `zle` widget, PowerShell PSReadLine handler, nushell hook
+  encoded (PowerShell PSReadLine handler, nushell hook
   model). Tracked as M0.1 follow-up; placeholder `#[ignore]`d tests mark the
   gap. PowerShell PTY coverage can validate preflight delivery, but cannot turn
   the intentionally unsupported strict receipt into an execution-proof claim.

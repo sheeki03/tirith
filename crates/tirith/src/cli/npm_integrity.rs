@@ -16,7 +16,7 @@
 //! 1. validate `--project` (a usage error exits 2 and does nothing else);
 //! 2. read and hash `package-lock.json`, then walk `node_modules`: local reads
 //!    only, no process and no network;
-//! 2b. the PROJECT CONFIG gate: the audit child's working directory is the
+//!    The PROJECT CONFIG gate: the audit child's working directory is the
 //!    audited project, and npm reads `<cwd>/.npmrc` above the user and global
 //!    config, so any effective project setting returns Partial and spawns
 //!    nothing;

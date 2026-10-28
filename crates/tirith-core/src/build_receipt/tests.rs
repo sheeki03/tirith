@@ -677,7 +677,7 @@ fn a_vanished_file_is_refused_rather_than_skipped() {
     assert!(matches!(error, TreeScanError::Changed(path) if path == "gone.txt"));
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[test]
 fn a_same_size_in_place_mutation_during_streaming_is_refused() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -693,6 +693,109 @@ fn a_same_size_in_place_mutation_during_streaming_is_refused() {
     let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
         .expect_err("same-size mutation must invalidate the file generation");
     assert!(matches!(error, TreeScanError::Changed(path) if path == "changing.bin"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_same_size_in_place_writer_is_denied_during_windows_hashing() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("changing.bin");
+    let original = vec![b'A'; 128 * 1024];
+    std::fs::write(&path, &original).expect("write original");
+    let expected = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("stable original");
+    let mutate = path.clone();
+    let observed = Rc::new(Cell::new(false));
+    let attempted = Rc::clone(&observed);
+    FILE_HASH_CHUNK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let error = std::fs::write(&mutate, vec![b'B'; 128 * 1024])
+                .expect_err("the native read lease must deny the writer");
+            assert_eq!(error.raw_os_error(), Some(32), "ERROR_SHARING_VIOLATION");
+            attempted.set(true);
+        }));
+    });
+    let actual = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("a denied write leaves the original file stable");
+    assert!(
+        observed.get(),
+        "the real write attempt must occur between chunks"
+    );
+    assert_eq!(actual.digest, expected.digest);
+    assert_eq!(actual.files[0].sha256, sha256_hex(&original));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    std::fs::write(&path, vec![b'B'; 128 * 1024]).expect("hash completion releases the lease");
+    let changed = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("a later complete generation can be scanned");
+    assert_ne!(changed.digest, actual.digest);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_preexisting_windows_writer_refuses_the_tree_scan_and_releases_handles() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("busy.bin");
+    std::fs::write(&path, b"original bytes").unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("an existing writer must prevent a stable digest");
+    assert!(matches!(error, TreeScanError::Io(_)));
+    drop(writer);
+    assert!(scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default()).is_ok());
+    std::fs::write(&path, b"later content!").expect("both success and refusal release leases");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_preexisting_windows_writable_mapping_refuses_the_tree_scan() {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+        MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    };
+    struct Mapping {
+        view: MEMORY_MAPPED_VIEW_ADDRESS,
+        _handle: OwnedHandle,
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            unsafe {
+                UnmapViewOfFile(self.view);
+            }
+        }
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("mapped.bin");
+    std::fs::write(&path, b"original bytes").unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let handle =
+        unsafe { CreateFileMappingW(writer.as_raw_handle(), null(), PAGE_READWRITE, 0, 0, null()) };
+    assert!(!handle.is_null() && handle != INVALID_HANDLE_VALUE);
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let view = unsafe { MapViewOfFile(owned.as_raw_handle(), FILE_MAP_WRITE, 0, 0, 0) };
+    assert!(!view.Value.is_null());
+    let mapping = Mapping {
+        view,
+        _handle: owned,
+    };
+    drop(writer);
+    unsafe {
+        mapping.view.Value.cast::<u8>().write(b'm');
+    }
+    let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("closing the writer must not hide its live writable mapping");
+    assert!(matches!(error, TreeScanError::Io(_)));
+    drop(mapping);
+    assert!(scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default()).is_ok());
 }
 
 #[cfg(any(unix, windows))]
