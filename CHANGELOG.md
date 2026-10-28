@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-10-16
+## [0.5.0] - 2026-10-29
 
 This release removes `tirith-core` library API (see Removed), so it is `0.5.0`, not a `0.4.x` patch. Agent adapters installed by 0.4.x are not rewritten by a binary upgrade and do not enforce approval requirements: re-run `tirith setup <host> --force` for each agent host, from each project directory for project-scope adapters (`tirith doctor` lists outdated adapters at user scope and for the project it runs in, from any directory inside that project). A `~/.zshenv` guard is refreshed only by `tirith setup <host> --force --install-zshenv`. A refreshed Claude Code or VS Code adapter no longer approves a command Tirith warns about; the host's own permission prompt decides (see Changed).
 
