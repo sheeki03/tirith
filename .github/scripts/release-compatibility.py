@@ -9,8 +9,11 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tarfile
-import tomllib
 import zipfile
+
+# The tag-only release job runs this with the runner image's default python3
+# (3.10 on ubuntu-22.04), so it must not need tomllib or hashlib.file_digest
+# (both 3.11). The enforcement-check job runs its tests on that image.
 
 ASSET = "release-compatibility.json"
 ARCHIVE_CAP = 64 * 1024 * 1024
@@ -42,8 +45,26 @@ STATE_CONTRACTS = {
 }
 
 
+def workspace_version(manifest: str) -> str:
+    # Same reading as the workflow's awk resolvers: the one version key in the
+    # [workspace.package] table.
+    table = None
+    versions = []
+    for line in manifest.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            table = stripped
+        elif table == "[workspace.package]":
+            match = re.fullmatch(r'version\s*=\s*"([^"]+)"\s*(?:#.*)?', stripped)
+            if match:
+                versions.append(match.group(1))
+    if len(versions) != 1:
+        raise ValueError("cannot uniquely read the workspace release version")
+    return versions[0]
+
+
 def contract(root: Path, version: str) -> dict:
-    actual = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    actual = workspace_version((root / "Cargo.toml").read_text())
     if version != actual or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("release version must equal the workspace release version")
     policy = source_constant(root, "crates/tirith-core/src/policy_migrations.rs", "CURRENT_SCHEMA_VERSION")
@@ -87,8 +108,11 @@ def member_name(name: str) -> str:
 def archive_identity(path: Path, target: str) -> dict:
     if not path.is_file() or path.stat().st_size > ARCHIVE_CAP:
         raise ValueError(f"missing or oversized archive for {target}")
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        archive_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    archive_sha = digest.hexdigest()
     binary_name = "tirith.exe" if target.endswith("windows-msvc") else "tirith"
     binary = None
     names = set()
