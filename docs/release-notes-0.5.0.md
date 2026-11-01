@@ -254,6 +254,16 @@ every change in detail.
 - **Virtual filesystems** such as KDE kio-fuse no longer force fail-closed with
   a phantom repository policy
   ([#266](https://github.com/sheeki03/tirith/issues/266)).
+- **Prompts on macOS.** In zsh on macOS, a warning acknowledgement or approval
+  prompt (`strict_warn`, `approval_rules`, `warn_ack` overrides, escalation
+  rules) failed the moment it appeared and blocked the command, because
+  macOS's `poll()` does not support `/dev/tty`. Prompts now wait for your
+  answer ([#283](https://github.com/sheeki03/tirith/issues/283)). 0.4.2 has
+  the same problem; default settings never prompt.
+- **`TIRITH=0` in zsh.** When your policy allows the bypass, a bypassed
+  command no longer gets package-lookup warnings or a prompt on the zsh
+  receipt path, and sends no package names to the lookup services
+  ([#284](https://github.com/sheeki03/tirith/issues/284)).
 - Bash, zsh and fish start one Tirith process per execution-receipt step
   instead of up to three. `tirith status` and `tirith doctor` report whether the
   current terminal's loaded hook is current or stale, and
