@@ -154,7 +154,8 @@ _tirith_output() {
 }
 
 _tirith_escape_preview() {
-  printf '%q' -- "$1"
+  # zsh's printf takes no `--` after the format: it would print it as data.
+  builtin printf '%q' "$1"
 }
 
 # One protocol-v3 receipt operation (consume, discard or reconcile):
