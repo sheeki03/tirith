@@ -19,11 +19,19 @@ use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 /// applied per-rule severity overrides. Every late producer must use this seam
 /// so those findings cannot bypass policy or diverge between daemon and inline
 /// execution.
+///
+/// An honored bypass is an Allow that skipped analysis, so late findings are
+/// discarded rather than merged: they would re-raise the action of a command
+/// the policy let the user run unchecked, which then prompts or blocks on the
+/// receipt path (#284).
 pub fn merge_late_findings(
     verdict: &mut Verdict,
     mut findings: Vec<Finding>,
     policy: &crate::policy::Policy,
 ) {
+    if verdict.bypass_honored {
+        return;
+    }
     for finding in &mut findings {
         if let Some(override_severity) = policy.severity_override(&finding.rule_id) {
             finding.severity = override_severity;
@@ -2626,6 +2634,30 @@ mod tests {
 
         assert_eq!(verdict.findings[0].severity, Severity::Critical);
         assert_eq!(verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn late_findings_do_not_reopen_an_honored_bypass() {
+        // #284: runtime lookups merged into an honored TIRITH=0 bypass raised
+        // it to Warn, so strict_warn prompted for a command the user had
+        // already been allowed to run unchecked.
+        let mut verdict = Verdict::allow_fast(2, Timings::default());
+        verdict.bypass_requested = true;
+        verdict.bypass_available = true;
+        verdict.bypass_honored = true;
+
+        merge_late_findings(
+            &mut verdict,
+            vec![make_finding(
+                RuleId::PackageLookupIncomplete,
+                Severity::Medium,
+            )],
+            &crate::policy::Policy::default(),
+        );
+
+        assert_eq!(verdict.action, Action::Allow);
+        assert!(verdict.findings.is_empty());
+        assert!(verdict.bypass_honored);
     }
 
     #[test]

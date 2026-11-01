@@ -6271,6 +6271,150 @@ fn shell_execution_receipt_operations_use_cwd_over_the_process_directory() {
     );
 }
 
+/// An honored `TIRITH=0` bypass on the zsh receipt path is a plain allow.
+/// Runtime package lookups used to be merged into it afterwards, so under
+/// `strict_warn` the bypassed command still needed a warning acknowledgement
+/// and was blocked (#284).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shell_execution_receipt_honored_bypass_skips_runtime_findings() {
+    let isolated = tempfile::tempdir().expect("isolated receipt state");
+    let state_dir = isolated.path().join("state");
+    let workdir = isolated.path().join("work");
+    fs::create_dir(&workdir).expect("create working directory");
+    // A repository policy can never re-enable the bypass, so this is the
+    // user's own policy, as in the report.
+    let config_home = isolated.path().join("config");
+    fs::create_dir_all(config_home.join("tirith")).expect("create user policy directory");
+    fs::write(
+        config_home.join("tirith/policy.yaml"),
+        "allow_bypass_env: true\nstrict_warn: true\n",
+    )
+    .expect("write user policy");
+    let session_id = "cli-receipt-honored-bypass";
+    let shell_pid = std::process::id().to_string();
+    let isolated_cmd = || {
+        let mut cmd = tirith_isolated(session_id, &state_dir, &workdir);
+        cmd.env("HOME", isolated.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", isolated.path().join("data"))
+            .env("XDG_CACHE_HOME", isolated.path().join("cache"))
+            .env_remove("TIRITH");
+        // A warning acknowledgement must never reach the developer's terminal.
+        commands_without_controlling_terminal(&mut cmd);
+        cmd
+    };
+    let register = isolated_cmd()
+        .args(["__execution-receipt", "register", "--family", "zsh"])
+        .args(["--shell-pid", shell_pid.as_str()])
+        .output()
+        .expect("register zsh receipt capability");
+    assert!(
+        register.status.success(),
+        "registration failed: {}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let bearer = String::from_utf8(register.stdout)
+        .expect("bearer is UTF-8")
+        .trim()
+        .to_string();
+    let hook_env = |cmd: &mut Command| {
+        cmd.env("_TIRITH_RECEIPT_INSTANCE", &bearer)
+            .env("_TIRITH_RECEIPT_SHELL_PID", &shell_pid)
+            .env("_TIRITH_RECEIPT_FAMILY", "zsh");
+    };
+    // Check a command the way the zsh hook does. Offline, the package lookup
+    // completes from an empty cache and reports that it is incomplete.
+    let mint = |command: &str| {
+        let mut cmd = isolated_cmd();
+        hook_env(&mut cmd);
+        cmd.env("_TIRITH_HOOK", "1")
+            .args([
+                "check",
+                "--approval-check",
+                "--non-interactive",
+                "--interactive",
+                "--offline",
+                "--no-daemon",
+            ])
+            .args([
+                "--shell",
+                "posix",
+                "--execution-receipt",
+                "zsh",
+                "--",
+                command,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("mint shell execution receipt")
+    };
+
+    // Control: without the bypass the lookup finding is a warning, and
+    // strict_warn needs an acknowledgement no terminal can give. The policy
+    // has no approval rules, so the warning is the only interaction.
+    let unbypassed = mint("pip install requests");
+    let unbypassed_stderr = String::from_utf8_lossy(&unbypassed.stderr);
+    assert_eq!(
+        unbypassed.status.code(),
+        Some(1),
+        "the unbypassed command must need an acknowledgement: {unbypassed_stderr}"
+    );
+    assert!(
+        unbypassed.stdout.is_empty(),
+        "a blocked check must not return a receipt"
+    );
+    assert!(
+        unbypassed_stderr.contains("shell receipt interaction failed"),
+        "the control no longer needs a warning acknowledgement: {unbypassed_stderr}"
+    );
+
+    let command = "TIRITH=0 pip install requests";
+    let out = mint(command);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an honored bypass must arm a receipt without a prompt: {stderr}"
+    );
+    assert!(
+        !stderr.contains("package_lookup_incomplete"),
+        "an honored bypass must not report runtime findings: {stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("receipt frame is UTF-8");
+    let token = stdout
+        .strip_prefix("TIRITH_EXECUTION_RECEIPT=")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .filter(|token| token.len() == 64)
+        .unwrap_or_else(|| panic!("no receipt: {stdout:?} {stderr}"));
+
+    // Consume refreshes the decision, lookups included, and must agree.
+    let mut cmd = isolated_cmd();
+    hook_env(&mut cmd);
+    let mut child = cmd
+        .args(["__execution-receipt", "consume", "--cwd"])
+        .arg(&workdir)
+        .args(["--channel", "zsh"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn receipt consume");
+    child
+        .stdin
+        .take()
+        .expect("consume stdin")
+        .write_all(format!("{token}\n{command}").as_bytes())
+        .expect("send consume frame");
+    let consumed = child.wait_with_output().expect("wait for consume");
+    assert_eq!(
+        consumed.status.code(),
+        Some(0),
+        "consuming the bypassed receipt failed: {}",
+        String::from_utf8_lossy(&consumed.stderr)
+    );
+}
+
 /// Shell hooks take their per-shell session ID from `tirith __session-id`: a
 /// fresh, unpredictable UUID on every call (PowerShell and Nushell hooks had no
 /// random source of their own).

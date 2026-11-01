@@ -596,41 +596,45 @@ fn handle_request_with_analysis(
     // different policy if configuration changes during the request.
     let (mut verdict, policy) = analyze(&ctx);
 
-    let mut late_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
-        &req.input,
-        ctx.interactive_comments_reading().as_deref(),
-        shell_type,
-        &policy.threat_intel,
-        RuntimeThreatMode::Daemon,
-        if req.offline {
-            RuntimeThreatNetwork::CacheOnly
-        } else {
-            RuntimeThreatNetwork::Online
-        },
-    );
-
-    // Daemon-only: network-aware enrichment is too slow for the sync path.
-    // Skipped entirely when the CALLER asked for offline analysis (repo-0373):
-    // short-URL resolution is HTTP and the blocklist lookups are DNS, and the
-    // daemon's own process env cannot see the invoking shell's TIRITH_OFFLINE,
-    // so the decision arrives on the request. This mirrors the inline path's
-    // explicit cache-only runtime-enrichment mode.
-    if !req.offline {
-        // Engine findings carry the shortened-URL rule that drives redirect
-        // resolution. Runtime threat findings are a second input to the same
-        // bounded DNS pass so their URL evidence retains the old coverage.
-        let network_findings = enrich_with_network_checks(
-            &mut verdict.findings,
-            &late_findings,
-            &tirith_core::extract::extract_urls(&req.input, shell_type),
+    // An honored bypass skipped analysis, so it skips every late lookup too
+    // (#284).
+    if !verdict.bypass_honored {
+        let mut late_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            &req.input,
+            ctx.interactive_comments_reading().as_deref(),
+            shell_type,
+            &policy.threat_intel,
+            RuntimeThreatMode::Daemon,
+            if req.offline {
+                RuntimeThreatNetwork::CacheOnly
+            } else {
+                RuntimeThreatNetwork::Online
+            },
         );
-        late_findings.extend(network_findings);
-    }
 
-    // All post-engine producers meet policy at one final merge point. In
-    // particular, severity_overrides for AnalysisIncomplete now apply equally
-    // to daemon runtime and network enrichment.
-    tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
+        // Daemon-only: network-aware enrichment is too slow for the sync path.
+        // Skipped entirely when the CALLER asked for offline analysis (repo-0373):
+        // short-URL resolution is HTTP and the blocklist lookups are DNS, and the
+        // daemon's own process env cannot see the invoking shell's TIRITH_OFFLINE,
+        // so the decision arrives on the request. This mirrors the inline path's
+        // explicit cache-only runtime-enrichment mode.
+        if !req.offline {
+            // Engine findings carry the shortened-URL rule that drives redirect
+            // resolution. Runtime threat findings are a second input to the same
+            // bounded DNS pass so their URL evidence retains the old coverage.
+            let network_findings = enrich_with_network_checks(
+                &mut verdict.findings,
+                &late_findings,
+                &tirith_core::extract::extract_urls(&req.input, shell_type),
+            );
+            late_findings.extend(network_findings);
+        }
+
+        // All post-engine producers meet policy at one final merge point. In
+        // particular, severity_overrides for AnalysisIncomplete now apply equally
+        // to daemon runtime and network enrichment.
+        tirith_core::escalation::merge_late_findings(&mut verdict, late_findings, &policy);
+    }
 
     // Snapshot after enrichment, before paranoia filtering (ADR-13).
     let raw_findings = Some(verdict.findings.clone());

@@ -458,7 +458,9 @@ pub fn run(
 
     crate::cli::warn_repo_policy_neutralized(&policy);
 
-    if ran_locally {
+    // An honored bypass reaches here only on the receipt path. It skipped
+    // analysis, so it also skips the runtime lookups (#284).
+    if ran_locally && !raw_verdict.bypass_honored {
         let comment_reading = tirith_core::engine::interactive_comments_reading(
             cmd,
             shell_type,
@@ -2716,15 +2718,18 @@ pub(super) fn prepare_receipt_consumption_with_network(
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
-        command,
-        analysis.interactive_comments_reading().as_deref(),
-        context.shell(),
-        &policy.threat_intel,
-        RuntimeThreatMode::Inline,
-        network,
-    );
-    tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
+    // An honored bypass skipped analysis, so it skips the runtime lookups too.
+    if !raw_verdict.bypass_honored {
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            command,
+            analysis.interactive_comments_reading().as_deref(),
+            context.shell(),
+            &policy.threat_intel,
+            RuntimeThreatMode::Inline,
+            network,
+        );
+        tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
+    }
     if context.strict_warn_override() {
         policy.strict_warn = true;
     }
