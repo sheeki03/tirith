@@ -169,6 +169,7 @@ This release removes `tirith-core` library API (see Removed), so it is `0.5.0`, 
 - `tirith threat-db status` and `health` report source ages as unavailable, and `tirith threat-db update` prints a "source evidence HTTP 404" notice, until the v2 threat feed publishes source evidence; the signed database still updates.
 - In an interactive bash or zsh, a re-run behind a wrapper (`time !!`, `nohup !! &`, `nice !!`, `env !!`, `(!!)`) blocks as incomplete analysis. A history reference that copies words from an earlier, separately entered line (`!:2`) is checked as typed, because Tirith checks one line at a time.
 - A shell replaced with `exec zsh` or `exec bash` keeps the old shell's receipt registration and runs its hook in legacy mode (#281); open a new terminal instead. The fix is planned for 0.5.1.
+- In zsh and fish, when a package lookup that ran out of time at a warning prompt finishes before the command runs (typically the first install of a package on a slow connection), accepting the warning ends with "execution receipt could not be committed; command not executed — press Enter for a fresh check", because the command's final check no longer matches the one you accepted. Pressing Enter checks it again with the finished lookups. Nothing runs unchecked.
 
 ### Maintenance
 

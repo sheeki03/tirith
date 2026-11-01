@@ -400,6 +400,12 @@ every change in detail.
   `nohup !! &`, `(!!)`) blocks as incomplete analysis, and a history
   reference that copies words from an earlier, separately entered line
   (`!:2`) is checked as typed.
+- In zsh and fish, if a package lookup that ran out of time at a warning
+  prompt finishes before the command runs (typically the first install of a
+  package on a slow connection), accepting the warning can end with
+  "execution receipt could not be committed … press Enter for a fresh check".
+  Press Enter once: Tirith checks the command again with the finished
+  lookups. Nothing runs unchecked.
 - Source ages in `tirith threat-db status` and `health` stay unavailable, and
   `tirith threat-db update` prints a "source evidence HTTP 404" notice, until
   the v2 threat feed is enabled. The signed database still updates and
