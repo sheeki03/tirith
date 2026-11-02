@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789143585943,
+  "lastUpdate": 1793655357128,
   "repoUrl": "https://github.com/sheeki03/tirith",
   "entries": {
     "tirith benchmarks": [
@@ -5345,6 +5345,168 @@ window.BENCHMARK_DATA = {
             "name": "task_decision_projection",
             "value": 1011,
             "range": "± 1",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "36009418+sheeki03@users.noreply.github.com",
+            "name": "Sheeki",
+            "username": "sheeki03"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "474eb36e848db48df42dd3522900ebf1dfb938b3",
+          "message": "Merge pull request #250 from sheeki03/codex/next-cycle-foundations\n\nIntegrate the reviewed Tirith 0.5.0 release stack",
+          "timestamp": "2026-11-03T02:54:27+05:30",
+          "tree_id": "b80b4d8bf58fa41bcdb1892f904e688f5c4b71ae",
+          "url": "https://github.com/sheeki03/tirith/commit/474eb36e848db48df42dd3522900ebf1dfb938b3"
+        },
+        "date": 1793655356083,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "tier1_no_match",
+            "value": 513,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "tier1_match",
+            "value": 124,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_clean_command",
+            "value": 181691,
+            "range": "± 3572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_with_url",
+            "value": 712914,
+            "range": "± 4136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_complex_pipeline",
+            "value": 1061903,
+            "range": "± 22520",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "paste_analysis",
+            "value": 540297,
+            "range": "± 26733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_obfuscated_output",
+            "value": 34698,
+            "range": "± 209",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_clean",
+            "value": 95,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_ansi",
+            "value": 88,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_clean_command_full_analysis",
+            "value": 181245,
+            "range": "± 5024",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_benign",
+            "value": 20697,
+            "range": "± 214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing",
+            "value": 35910,
+            "range": "± 256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_with_cwd",
+            "value": 45579,
+            "range": "± 631",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_parse_state_changing_no_cwd_baseline",
+            "value": 19889,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "full_analysis_web3_with_cwd",
+            "value": 660263,
+            "range": "± 15967",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "npm_command_extract",
+            "value": 7090,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_envelope_decide",
+            "value": 1730,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "web3_guard_merge_repo_scoped",
+            "value": 2649,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "workflow_artifact_model",
+            "value": 21833,
+            "range": "± 254",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "byte_scan_hostile_64k",
+            "value": 884944,
+            "range": "± 8561",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "effect_inference_mixed_shell",
+            "value": 159959,
+            "range": "± 804",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "verdict_json_serialization",
+            "value": 788918,
+            "range": "± 8971",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "task_decision_projection",
+            "value": 1089,
+            "range": "± 8",
             "unit": "ns/iter"
           }
         ]
