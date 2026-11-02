@@ -5196,6 +5196,63 @@ fn shell_execution_receipt_registration_is_parent_bound_and_one_time() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn shell_execution_receipt_registration_replace_retires_stale_exec_image() {
+    let isolated = tempfile::tempdir().expect("isolated receipt registration state");
+    let state_dir = isolated.path().join("state");
+    let session_id = "cli-receipt-replace";
+    let shell_pid = std::process::id().to_string();
+    let register = |replace: bool| {
+        let mut command = tirith_isolated(session_id, &state_dir, isolated.path());
+        command.args([
+            "__execution-receipt",
+            "register",
+            "--family",
+            "zsh",
+            "--shell-pid",
+            shell_pid.as_str(),
+        ]);
+        if replace {
+            command.arg("--replace");
+        }
+        command.output().expect("register shell execution receipt")
+    };
+
+    let first = register(false);
+    assert!(
+        first.status.success(),
+        "direct child registration failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let bearer = String::from_utf8(first.stdout)
+        .expect("registration bearer must be UTF-8")
+        .trim()
+        .to_string();
+
+    let duplicate = register(false);
+    assert!(
+        !duplicate.status.success(),
+        "a live shell identity must not register twice without --replace"
+    );
+
+    let replacement = register(true);
+    assert!(
+        replacement.status.success(),
+        "--replace must succeed for an exec'd shell image: {}",
+        String::from_utf8_lossy(&replacement.stderr)
+    );
+    let replaced_bearer = String::from_utf8(replacement.stdout)
+        .expect("replacement bearer must be UTF-8")
+        .trim()
+        .to_string();
+    assert_eq!(replaced_bearer.len(), 64);
+    assert_ne!(
+        replaced_bearer, bearer,
+        "replacement must mint a new bearer rather than replay the old one"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn shell_execution_receipt_registration_rejects_unrelated_live_pid() {
     let isolated = tempfile::tempdir().expect("isolated receipt registration state");
     let state_dir = isolated.path().join("state");

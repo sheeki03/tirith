@@ -251,7 +251,7 @@ if status is-interactive
     if test $out_status -eq 0; and test $err_status -eq 0
         and test -n "$register_out"; and test -n "$register_err"
         command "$_TIRITH_BIN" __execution-receipt register \
-            --family fish --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
+            --family fish --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" --replace \
             >"$register_out" 2>"$register_err"
         read -g _TIRITH_RECEIPT_INSTANCE <"$register_out"
         if string match -rq '^[0-9a-f]{64}$' -- "$_TIRITH_RECEIPT_INSTANCE"

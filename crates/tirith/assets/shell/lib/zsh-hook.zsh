@@ -248,7 +248,7 @@ if [[ -o interactive ]] \
     # rejection and fall back honestly. The files already exist, so force the
     # redirects through a user's NOCLOBBER setting.
     if command "$_TIRITH_BIN" __execution-receipt register \
-         --family zsh --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" \
+         --family zsh --shell-pid "$_TIRITH_RECEIPT_SHELL_PID" --replace \
          >|"$_tirith_register_out" 2>|"$_tirith_register_err"; then
       :
     fi

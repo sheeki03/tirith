@@ -193,6 +193,12 @@ enum ExecutionReceiptAction {
         family: ShellHookFamilyArg,
         #[arg(long)]
         shell_pid: u32,
+        /// Retire a capability left behind by a previous image of this same
+        /// shell process (an `exec`'d shell never runs its exit hook) before
+        /// registering. Without this flag a second registration for a live
+        /// shell identity is still rejected.
+        #[arg(long)]
+        replace: bool,
     },
     /// Protocol-v1 compatibility tombstone; never returns a bearer.
     NewInstance,
@@ -7750,9 +7756,11 @@ fn run() {
     let exit_code = match cli.command {
         Commands::ExecutionReceiptInternal { action } => match action {
             ExecutionReceiptAction::Capability => cli::check::receipt_capability(),
-            ExecutionReceiptAction::Register { family, shell_pid } => {
-                cli::check::register_receipt_instance(shell_pid, family.into())
-            }
+            ExecutionReceiptAction::Register {
+                family,
+                shell_pid,
+                replace,
+            } => cli::check::register_receipt_instance(shell_pid, family.into(), replace),
             ExecutionReceiptAction::NewInstance => cli::check::new_receipt_instance(),
             ExecutionReceiptAction::Arm {
                 channel,
