@@ -363,7 +363,8 @@ Examples:
 POSIX commands may be supplied as multiple argv parts; Tirith quotes each part
 before analysis. Fish, PowerShell, and Cmd commands must be supplied as one
 already-formed string after `--` because POSIX quoting cannot preserve those
-grammars exactly.
+grammars exactly. An unknown option before the command is a usage error
+(exit 2); put a command that starts with `-` after `--`.
 
 Examples:
   tirith check -- 'curl https://example.com | bash'
@@ -392,6 +393,16 @@ Examples:
         /// Force interactive mode
         #[arg(long)]
         interactive: bool,
+
+        /// The interactive shell that runs the command does not treat a
+        /// word-start `#` as a comment (zsh with `interactivecomments` unset,
+        /// its default, or bash after `shopt -u interactive_comments`), so the
+        /// text after it runs. With `--interactive` and `--shell posix` the
+        /// command is also analyzed the way that shell reads it. The bash and
+        /// zsh hooks report the same with `_TIRITH_INTERACTIVE_COMMENTS=0` in
+        /// the environment; without either a word-start `#` starts a comment.
+        #[arg(long)]
+        no_interactive_comments: bool,
 
         /// Write approval metadata to a temp file and print its path to stdout.
         /// Used by shell hooks for the approval workflow.
@@ -461,9 +472,16 @@ Examples:
         #[arg(long)]
         card: Option<String>,
 
+        // No `allow_hyphen_values`: an option `check` does not know, placed
+        // before the command, is a usage error (exit 2, nothing on stdout)
+        // instead of the first word of the analysed command. A caller that
+        // passes a flag an older or newer tirith does not support must never
+        // get a verdict for a different command than the one it sent. A
+        // command that itself starts with `-` goes after `--`; everything
+        // after the first command word is still taken verbatim.
         /// The command to check. Fish, PowerShell, and Cmd require one
         /// already-formed string; multi-part reconstruction is POSIX-only.
-        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
     },
 
@@ -491,6 +509,16 @@ Examples:
         /// Force interactive mode
         #[arg(long)]
         interactive: bool,
+
+        /// The interactive shell the paste lands in does not treat a
+        /// word-start `#` as a comment (zsh with `interactivecomments` unset,
+        /// its default, or bash after `shopt -u interactive_comments`), so the
+        /// text after it runs. With `--interactive` and `--shell posix` the
+        /// paste is also analyzed the way that shell reads it. The bash and
+        /// zsh paste widgets report the same with
+        /// `_TIRITH_INTERACTIVE_COMMENTS=0` in the environment.
+        #[arg(long)]
+        no_interactive_comments: bool,
 
         /// Path to clipboard HTML for rich-text paste analysis
         #[arg(long)]
@@ -8310,6 +8338,7 @@ fn run() {
             json_schema,
             non_interactive,
             interactive,
+            no_interactive_comments,
             approval_check,
             execution_receipt,
             strict_warn,
@@ -8352,6 +8381,7 @@ fn run() {
                     json_schema.unwrap_or(3),
                     non_interactive,
                     interactive,
+                    cli::interactive_comments_reading(no_interactive_comments),
                     approval_check,
                     execution_receipt.map(tirith_core::execution_state::ShellReceiptChannel::from),
                     strict_warn,
@@ -8384,6 +8414,7 @@ fn run() {
             json,
             non_interactive,
             interactive,
+            no_interactive_comments,
             html,
             with_source,
         } => {
@@ -8393,6 +8424,7 @@ fn run() {
                 json,
                 non_interactive,
                 interactive,
+                cli::interactive_comments_reading(no_interactive_comments),
                 html.as_deref(),
                 with_source,
             )
@@ -10573,6 +10605,71 @@ mod help_category_tests {
             ])
             .is_ok());
             assert!(super::Cli::try_parse_from(["tirith", "pkg", "attest-npm"]).is_ok());
+        });
+    }
+
+    #[test]
+    fn check_rejects_unknown_options_before_the_command() {
+        with_large_cli_stack(|| {
+            use clap::Parser;
+            let parsed_command = |argv: &[&str]| match super::Cli::try_parse_from(argv) {
+                Ok(Cli {
+                    command: Commands::Check { cmd, json, .. },
+                    ..
+                }) => Ok((cmd, json)),
+                Ok(_) => panic!("{argv:?} parsed as another command"),
+                Err(error) => Err(error.kind()),
+            };
+            // An option `check` does not know is a usage error, never the
+            // first word of the analysed command (the Hermes plugin's
+            // capability probe relies on this), wherever it sits before
+            // the command and `--`.
+            for argv in [
+                &[
+                    "tirith",
+                    "check",
+                    "--json",
+                    "--non-interactive",
+                    "--shell",
+                    "posix",
+                    "--hermes-plugin-capability-probe",
+                ][..],
+                &["tirith", "check", "--offlin", "--", "curl", "x"],
+                &["tirith", "check", "--json", "--bogus=1", "--", "ls"],
+                &["tirith", "check", "-x", "--", "ls"],
+                &["tirith", "check", "-x"],
+            ] {
+                assert_eq!(
+                    parsed_command(argv),
+                    Err(clap::error::ErrorKind::UnknownArgument),
+                    "{argv:?}"
+                );
+            }
+            // A command that starts with `-` still reaches analysis after `--`.
+            assert_eq!(
+                parsed_command(&["tirith", "check", "--", "--weird", "-x"]),
+                Ok((vec!["--weird".to_string(), "-x".to_string()], false))
+            );
+            // After the first command word every later word belongs to the
+            // command, including ones spelled like `check` options.
+            assert_eq!(
+                parsed_command(&["tirith", "check", "curl", "-fsSL", "https://x", "--json"]),
+                Ok((
+                    ["curl", "-fsSL", "https://x", "--json"]
+                        .map(str::to_string)
+                        .to_vec(),
+                    false
+                ))
+            );
+            assert_eq!(
+                parsed_command(&["tirith", "check", "--json", "--", "ls", "--", "-la"]),
+                Ok((["ls", "--", "-la"].map(str::to_string).to_vec(), true))
+            );
+            // Stdin form (no command words) still parses.
+            assert_eq!(
+                parsed_command(&["tirith", "check", "--json", "--shell", "posix"]),
+                Ok((Vec::new(), true))
+            );
         });
     }
 

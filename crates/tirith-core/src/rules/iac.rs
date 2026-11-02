@@ -20,6 +20,7 @@
 //! rules additionally require `context_guard_enabled` + an operator-labeled
 //! context (`policy.context_labels`).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::context_detect::{self, Provider};
@@ -157,9 +158,16 @@ fn check_segments(
     mut dirs: DirTracker,
 ) -> Vec<Finding> {
     // Code the other inputs may run (a nested body's startup file, a trap)
-    // can define `tirith` as well as `cd`.
-    let tirith_may_be_rebound =
-        dirs.hazard == CdHazard::Rebind || tirith_lookup_may_be_rebound(segments, shell);
+    // can define `tirith` as well as `cd`. The global lookup scan matters
+    // only if a segment could record a plan: without such a candidate every
+    // check_plan_chained_before is already None. Use the same candidate
+    // parser, without restricting it to an authorizing separator or scope.
+    // Directory and apply-word hazards still run for every segment below.
+    let tirith_may_be_rebound = dirs.hazard == CdHazard::Rebind
+        || (segments
+            .iter()
+            .any(|seg| check_plan_recorded_path(seg).is_some())
+            && tirith_lookup_may_be_rebound(segments, shell));
     let and_only = and_only_through(segments);
     let scopes = compound_scopes(segments, shell);
     let mut findings = Vec::new();
@@ -757,7 +765,7 @@ fn input_effects(input: &str, shell: ShellType) -> InputEffects {
 fn runs_in_child_process(seg: &tokenize::Segment, shell: ShellType) -> bool {
     seg.command
         .as_deref()
-        .is_some_and(|cmd| CHILD_RUNNERS.contains(&command_basename(cmd, shell).as_str()))
+        .is_some_and(|cmd| CHILD_RUNNERS.contains(&command_basename(cmd, shell).as_ref()))
 }
 
 /// `true` when the segment's command starts the program it runs (a nested
@@ -782,7 +790,7 @@ fn starts_child_elsewhere(seg: &tokenize::Segment, shell: ShellType) -> bool {
             && word.chars().skip(1).any(|c| letters.contains(&c))
     };
     let any_arg = |pred: &dyn Fn(&str) -> bool| args.iter().any(|arg| pred(arg));
-    match command_basename(cmd, shell).as_str() {
+    match command_basename(cmd, shell).as_ref() {
         "env" => any_arg(&|a| short_option_with(a, &['C']) || a.starts_with("--chdir")),
         "sudo" => any_arg(&|a| {
             short_option_with(a, &['D', 'i']) || a.starts_with("--chdir") || a == "--login"
@@ -820,7 +828,7 @@ fn starts_child_on_other_filesystem(seg: &tokenize::Segment, shell: ShellType) -
     ];
     seg.command
         .as_deref()
-        .is_some_and(|cmd| RUNNERS.contains(&command_basename(cmd, shell).as_str()))
+        .is_some_and(|cmd| RUNNERS.contains(&command_basename(cmd, shell).as_ref()))
 }
 
 /// Where a nested shell body starts, from the effects of the other
@@ -946,7 +954,7 @@ const CHILD_RUNNERS: &[&str] = &[
 /// lower-cased (`decoded`).
 struct SegmentText<'a> {
     raw: &'a str,
-    stripped: String,
+    stripped: Cow<'a, str>,
     decoded_raw: String,
     words: Vec<String>,
     decoded: Vec<String>,
@@ -969,10 +977,13 @@ impl<'a> SegmentText<'a> {
     }
 
     /// `needle` (lower case) occurs in any form, ignoring ASCII case.
+    /// Unchanged forms need no second scan of the same bytes.
     fn names(&self, needle: &str) -> bool {
         contains_ignore_ascii_case(self.raw, needle)
-            || contains_ignore_ascii_case(&self.stripped, needle)
-            || contains_ignore_ascii_case(&self.decoded_raw, needle)
+            || (self.stripped != self.raw && contains_ignore_ascii_case(&self.stripped, needle))
+            || (self.decoded_raw != self.raw
+                && self.decoded_raw.as_str() != self.stripped.as_ref()
+                && contains_ignore_ascii_case(&self.decoded_raw, needle))
             || self.decoded.iter().any(|w| w.contains(needle))
     }
 
@@ -1362,16 +1373,29 @@ fn runs_fish_init_command(words: &[String]) -> bool {
 /// `raw` with backslash-newline continuations removed and then every quote
 /// and escape character dropped (`CD''PATH`, `C"D"PATH`, `CD\` + newline +
 /// `PATH` all become `CDPATH`).
-fn without_quoting(raw: &str) -> String {
-    without_continuations(raw)
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
-        .collect()
+fn without_quoting(raw: &str) -> Cow<'_, str> {
+    let text = without_continuations(raw);
+    if text.contains(['\'', '"', '\\', '`', '^', '$']) {
+        Cow::Owned(
+            text.chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
+                .collect(),
+        )
+    } else {
+        text
+    }
 }
 
-/// `text` with backslash-newline line continuations removed.
-fn without_continuations(text: &str) -> String {
-    text.replace("\\\r\n", "").replace("\\\n", "")
+/// `text` with backslash-newline line continuations removed. Borrow unchanged
+/// input: directory and lookup checks revisit these views for each segment.
+fn without_continuations(text: &str) -> Cow<'_, str> {
+    let mut text = Cow::Borrowed(text);
+    for continuation in ["\\\r\n", "\\\n"] {
+        if text.contains(continuation) {
+            text = Cow::Owned(text.replace(continuation, ""));
+        }
+    }
+    text
 }
 
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
@@ -1774,7 +1798,7 @@ fn chdir_option(tool: IacTool, pre_verb: &[String]) -> Result<Option<PathBuf>, (
 
 /// The IaC tool a segment runs as its command, if any.
 fn iac_tool(seg: &tokenize::Segment, shell: ShellType) -> Option<IacTool> {
-    match command_basename(seg.command.as_deref()?, shell).as_str() {
+    match command_basename(seg.command.as_deref()?, shell).as_ref() {
         "terraform" => Some(IacTool::Terraform),
         "pulumi" => Some(IacTool::Pulumi),
         "tofu" => Some(IacTool::Tofu),
@@ -2195,17 +2219,25 @@ fn strip_outer_quotes(s: &str) -> &str {
     }
 }
 
-fn command_basename(cmd: &str, shell: ShellType) -> String {
+fn command_basename(cmd: &str, shell: ShellType) -> Cow<'_, str> {
     let unq = strip_outer_quotes(cmd);
     let basename = match shell {
         ShellType::PowerShell | ShellType::Cmd => unq.rsplit(['/', '\\']).next().unwrap_or(unq),
         _ => unq.rsplit('/').next().unwrap_or(unq),
     };
-    let lower = basename.to_lowercase();
-    lower
-        .strip_suffix(".exe")
-        .map(str::to_string)
-        .unwrap_or(lower)
+    if basename
+        .bytes()
+        .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
+    {
+        return Cow::Borrowed(basename.strip_suffix(".exe").unwrap_or(basename));
+    }
+    // Keep Unicode lowercasing for non-ASCII names, and remove the suffix
+    // in place rather than allocating another copy of an owned basename.
+    let mut lower = basename.to_lowercase();
+    if lower.ends_with(".exe") {
+        lower.truncate(lower.len() - ".exe".len());
+    }
+    Cow::Owned(lower)
 }
 
 #[cfg(test)]
@@ -2221,6 +2253,63 @@ mod tests {
         let key = format!("{provider}:{ctx}");
         p.context_labels.insert(key, "critical".to_string());
         p
+    }
+
+    #[test]
+    fn normalization_views_preserve_text() {
+        for raw in [
+            "",
+            "terraform apply p",
+            "résumé tfplan",
+            "CD''PATH",
+            "C\"D\"PATH",
+            "CD\\PATH",
+            "$'\\x43DPATH'",
+            "c`d ^$",
+            "CD\\\nPATH",
+            "CD\\\r\nPATH",
+            "CD\\\\\r\n\nPATH",
+            "CD\\\n\\\r\nPATH",
+        ] {
+            let continued = raw.replace("\\\r\n", "").replace("\\\n", "");
+            let stripped: String = continued
+                .chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`' | '^' | '$'))
+                .collect();
+            assert_eq!(without_continuations(raw).as_ref(), continued, "{raw:?}");
+            assert_eq!(without_quoting(raw).as_ref(), stripped, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn command_basenames_preserve_case_folding() {
+        for shell in [
+            ShellType::Posix,
+            ShellType::Fish,
+            ShellType::PowerShell,
+            ShellType::Cmd,
+        ] {
+            for cmd in [
+                "",
+                "terraform",
+                "/bin/terraform.exe",
+                "'C:\\bin\\Terraform.EXE'",
+                "\"/bin/TOFU.EXE\"",
+                "/bin/KSH.EXE",
+                "/bin/ǅ.EXE",
+            ] {
+                let unq = strip_outer_quotes(cmd);
+                let basename = match shell {
+                    ShellType::PowerShell | ShellType::Cmd => {
+                        unq.rsplit(['/', '\\']).next().unwrap_or(unq)
+                    }
+                    _ => unq.rsplit('/').next().unwrap_or(unq),
+                };
+                let lower = basename.to_lowercase();
+                let expected = lower.strip_suffix(".exe").unwrap_or(&lower);
+                assert_eq!(command_basename(cmd, shell).as_ref(), expected, "{cmd:?}");
+            }
+        }
     }
 
     #[test]
@@ -3926,6 +4015,11 @@ mod tests {
             "e=ev; e+=al; p='('; p+=')'; : ${ $e \"tirith$p { :; }\"; }; tirith iac check-plan tfplan && terraform apply tfplan",
             "z='a[$'; z+='{ e'; z+='val \"$s\"; }]'; (( z )); tirith iac check-plan tfplan && terraform apply tfplan",
             "n=PA; n+=TH; export \"$n=/tmp/x\"; tirith iac check-plan tfplan && terraform apply tfplan",
+            // Even a later segment can rebind tirith before another loop
+            // iteration. A real earlier candidate must keep the global
+            // lookup scan, including its decoded/quoted hazard detection.
+            "tirith iac check-plan tfplan && terraform apply tfplan; alias tirith=true",
+            "tirith iac check-plan tfplan && terraform apply tfplan; a''lias ti''rith=true",
         ] {
             let found = rules(input);
             assert!(

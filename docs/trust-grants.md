@@ -66,6 +66,22 @@ them), blocklisted entries stay in `trust.json`, and malformed records are kept
 for repair. Migrate a matching legacy entry before adding or shortening its new
 counterpart; otherwise the permanent legacy copy would still apply.
 
+Migration lists every entry it leaves in `trust.json` (`skipped` in JSON). A
+0.4.x entry with a `*` after a host, such as `registry.example.com/*`, never
+matched anything, because `*` is a wildcard only as a leading `*.` label.
+`trust list`, `trust explain` and `trust migrate` show it as `invalid` with the
+reason `wildcard_never_matches` and the commands that replace it. Nothing
+converts it for you; run them yourself if you want the host grant:
+
+```sh
+tirith trust remove 'registry.example.com/*' --rule docker_untrusted_registry --scope user
+tirith trust add registry.example.com --broad --rule docker_untrusted_registry
+```
+
+`tirith policy validate` warns about the same shape in a policy `allowlist` or
+`allowlist_rules` entry, and about any `*` in a `blocklist` entry (blocklist
+entries match as plain substrings), naming the entry to use instead.
+
 ## Limits
 
 - An effective grant is only an eligible exception. Blocklists and other

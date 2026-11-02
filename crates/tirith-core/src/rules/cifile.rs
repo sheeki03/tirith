@@ -524,11 +524,20 @@ fn analyze_shell_line_depth(
 
     let nested = crate::extract::executable_substitution_scan(line, shell);
     analysis.incomplete |= nested.gap.is_some();
+    // A best-effort body (a fish wrapper child) may add a pipe-to-shell
+    // finding, never an analysis gap: neither its own coverage nor the depth
+    // or body budget it would need marks the line incomplete.
     if depth >= 8 {
-        analysis.incomplete |= !nested.bodies.is_empty();
+        analysis.incomplete |= nested.bodies.iter().any(|body| !body.best_effort);
     } else {
-        for body in nested.bodies {
+        // Required bodies spend the shared budget first.
+        let mut bodies = nested.bodies;
+        bodies.sort_by_key(|body| body.best_effort);
+        for body in bodies {
             if !budget.consume(body.input.len()) {
+                if body.best_effort {
+                    continue;
+                }
                 analysis.incomplete = true;
                 break;
             }
@@ -537,7 +546,7 @@ fn analyze_shell_line_depth(
             }
             let child = analyze_shell_line_depth(&body.input, body.shell, depth + 1, budget, seen);
             analysis.curl_pipe_shell |= child.curl_pipe_shell;
-            analysis.incomplete |= child.incomplete;
+            analysis.incomplete |= !body.best_effort && child.incomplete;
         }
     }
 

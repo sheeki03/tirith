@@ -63,7 +63,9 @@ class Predicates(unittest.TestCase):
         self.write_record()
         self.document = {"organization_note": "preserve-managed-browser-fixture",
                          **copy.deepcopy(HARNESS.BALANCED), "protection_profile": copy.deepcopy(HARNESS.SELECTION)}
-        self.effective = {"scope": "org", "source_path": str(self.path),
+        # The CLI projects home-like paths; TMPDIR may itself be below /home/<x>
+        # or /Users/<x>, so expect the projection rather than the raw path.
+        self.effective = {"scope": "org", "source_path": HARNESS.expected_public_policy_path(self.path),
                           "policy": copy.deepcopy(HARNESS.BALANCED),
                           "resolution": {"effective_profile": copy.deepcopy(HARNESS.SELECTION), "policy_is_redacted_display": True}}
     def write_record(self):

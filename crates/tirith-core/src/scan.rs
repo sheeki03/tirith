@@ -1402,6 +1402,7 @@ fn scan_candidate_at(
         // irrelevant.
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
 
     let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);
@@ -1566,6 +1567,7 @@ pub fn scan_stdin(content: &str, raw_bytes: &[u8]) -> FileScanResult {
         // irrelevant.
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
 
     let (verdict, pdf_coverage) = engine::analyze_file_with_pdf_coverage(&ctx);

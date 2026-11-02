@@ -13,7 +13,9 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         shell: ShellType::Posix,
         scan_context: ScanContext::Exec,
         raw_bytes: None,
-        interactive: true,
+        // The URL is an argument, not a line an interactive shell reads, so
+        // nothing history-expands it (`https://example.com/#!/page`).
+        interactive: false,
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
@@ -25,6 +27,7 @@ pub fn run(url: &str, json: bool, explain: bool) -> i32 {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     let (verdict, policy) = engine::analyze_returning_policy(&ctx);

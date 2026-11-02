@@ -23,6 +23,7 @@ fn analyze(input: &str) -> Verdict {
         clipboard_source: ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     })
 }
 

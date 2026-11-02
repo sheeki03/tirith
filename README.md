@@ -161,7 +161,7 @@ Nothing. Zero output. You forget tirith is running.
 | **Steganography defense** | Invisible whitespace encoding (12 Unicode space variants), Mongolian Vowel Separator, Hangul Filler characters, math alphanumeric substitution, defenses against st3gg-style text steganography |
 | **Pipe-to-shell** | `curl \| bash`, `wget \| sh`, `httpie \| sh`, `xh \| sh`, `python <(curl ...)`, `eval $(wget ...)`, plus many wrapper, decode, and indirection paths |
 | **Base64 decode-execute** | `base64 -d \| bash`, `python -c "exec(b64decode(...))"`, `powershell -EncodedCommand`, decode chains through sudo/env wrappers |
-| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, env var uploads (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil |
+| **Data exfiltration** | `curl -d @/etc/passwd`, `curl -T ~/.ssh/id_rsa`, `wget --post-file`, uploads of project secret files (`.env`, `.env.production`, `secrets.yaml`), env var uploads in request bodies (`$AWS_SECRET_ACCESS_KEY`), command substitution exfil. A credential in a request header (`-H "Authorization: Bearer $TOKEN"`) is treated as authentication, like `--user` |
 | **Code file scanning** | Obfuscated payloads (`eval(atob(...))`), dynamic code execution (`exec(b64decode(...))`), secret exfiltration via `fetch`/`requests.post` in JS/Python files |
 | **Credential detection** | AWS keys, GitHub PATs, Stripe/Slack/SendGrid/Anthropic/GCP/npm tokens, private key blocks, plus entropy-based generic secret detection |
 | **Post-compromise behavior** | Process memory scraping (`/proc/*/mem`), Docker remote privilege escalation, credential file sweeps, calibrated against TeamPCP and UNC1069 post-compromise tooling |
@@ -266,9 +266,10 @@ contains, and attests.
   presence of a config file.
 - **Host-hook failure behavior:** Grok Build, Cline, and OpenHands allow the
   tool when their hook process crashes or times out. Tirith's adapter denies on
-  its own errors by default, but it cannot make a host honor a process that did
-  not return. Re-run setup if a pinned interpreter moves and test the real host
-  after every upgrade.
+  its own errors by default, and the generated hooks deny when their pinned
+  Python interpreter has moved (unless `TIRITH_FAIL_OPEN=1`), but Tirith cannot
+  make a host honor a process that did not return. Re-run setup if a pinned
+  interpreter moves and test the real host after every upgrade.
 - **Prime Agent IPython is source-level extraction:** the guard covers shell
   escapes/magics and common `os`, `subprocess`, and `pty.spawn` forms, but it is
   not a Python runtime sandbox. A wrapper defined in an earlier cell,
@@ -868,9 +869,9 @@ See `mcp/clients/` for the host-specific guides that are available.
 **GitHub Action** with SARIF upload to GitHub Security tab:
 
 ```yaml
-- uses: sheeki03/tirith@v0.4.2
+- uses: sheeki03/tirith@v0.5.0
   with:
-    version: 0.4.2
+    version: 0.5.0
     fail_on: high
     sarif: true
 ```
@@ -1302,7 +1303,7 @@ Disable: `export TIRITH_LOG=0`
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives
 - [Compatibility](docs/compatibility.md), stable vs experimental surface
-- [0.4.2 release notes](docs/release-notes-0.4.2.md), what the current patch release changes, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the 0.4 line's highlights, limitations, and publication contract
+- [0.5.0 release notes](docs/release-notes-0.5.0.md), what the current release changes and how to upgrade, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the platform boundaries and publication contract it builds on
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager

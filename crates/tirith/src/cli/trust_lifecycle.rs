@@ -338,6 +338,12 @@ fn show_human(value: &Value) {
             if row["requires_migration"] == true {
                 eprintln!("  Legacy grant has no stable ID; use tirith trust migrate --scope user before editing expiry.");
             }
+            if let Some(remedy) = row["remedy"].as_str() {
+                eprintln!("  {remedy}.");
+            }
+        }
+        if let Some(issue) = value["target_issue"].as_str() {
+            eprintln!("Target pattern: {issue}");
         }
     } else {
         eprintln!(
@@ -359,6 +365,24 @@ fn show_human(value: &Value) {
                     row["pattern"].as_str().unwrap_or("[redacted]"),
                     row["rule_id"].as_str().unwrap_or("all rules")
                 );
+            }
+        }
+        if let Some(skipped) = value["skipped"].as_array().filter(|rows| !rows.is_empty()) {
+            eprintln!(
+                "{} legacy entr{} left in place (migration does not convert them):",
+                skipped.len(),
+                if skipped.len() == 1 { "y" } else { "ies" }
+            );
+            for row in skipped {
+                eprintln!(
+                    "  {}  rule={}  {}",
+                    row["pattern"].as_str().unwrap_or("[invalid record]"),
+                    row["rule_id"].as_str().unwrap_or("all rules"),
+                    row["state_reason"].as_str().unwrap_or("unknown")
+                );
+                if let Some(remedy) = row["remedy"].as_str() {
+                    eprintln!("    {remedy}.");
+                }
             }
         }
         if let Some(note) = value["note"].as_str() {
@@ -542,11 +566,31 @@ struct Row {
     requires_migration: bool,
     broad: bool,
     reason: Option<String>,
+    /// What the operator can run or edit to replace an entry that never
+    /// matches (CORE-5). Never applied automatically.
+    remedy: Option<String>,
 }
 
 impl Row {
     fn project(&self, context: &Context) -> Value {
-        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v))})
+        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v)),"remedy":self.projected_remedy(context)})
+    }
+    /// The remedy as printed. Output is redacted, so a remedy that embeds a
+    /// pattern holding redacted text (`http://user:pw@host/*`) would name an
+    /// entry that does not exist; such a remedy names the store to edit
+    /// instead, and keeps only the parts that survive redaction unchanged.
+    fn projected_remedy(&self, context: &Context) -> Option<String> {
+        let remedy = self.remedy.as_deref()?;
+        let pattern = self.pattern.as_deref()?;
+        if context.redact(pattern) == pattern {
+            return Some(context.redact(remedy));
+        }
+        Some(redacted_wildcard_remedy(
+            pattern,
+            self.rule_id.as_deref(),
+            self.source,
+            context,
+        ))
     }
     /// Whether this row still trusts `target` for the queried rule. Unlike the
     /// runtime [`TrustGrant::matches`] (one finding, one rule), callers here
@@ -591,6 +635,134 @@ fn grant_row(grant: &TrustGrant, context: &Context) -> Row {
         broad: tirith_core::policy::classify_trust_pattern(&grant.pattern).is_broad()
             || grant.rule_id.is_none(),
         reason: grant.reason.clone(),
+        remedy: None,
+    }
+}
+
+/// The replacement for a legacy entry whose pattern has a `*` outside a
+/// leading `*.` label (#271). 0.4.x stored such patterns, but they never
+/// matched anything, so nothing is converted automatically: the operator
+/// removes the dead entry and, if wanted, adds the host grant explicitly.
+///
+/// Repository content (`.tirith/trust.json`, `.tirith/allowlist`) is inactive
+/// and attacker-influenced, so its remedy only removes the entry and never
+/// suggests a grant for a host the repository chose.
+fn misplaced_wildcard_remedy(pattern: &str, rule_id: Option<&str>, source: &str) -> Option<String> {
+    use tirith_core::safe_command::shell_single_quote as quote;
+    if !tirith_core::policy::has_misplaced_wildcard(pattern) {
+        return None;
+    }
+    let host = tirith_core::policy::misplaced_wildcard_host(pattern);
+    let lead = "'*' is a wildcard only as a leading '*.' label, so this entry never matched";
+    let rule_arg = match rule_id {
+        Some(rule) => format!(" --rule {}", quote(rule)?),
+        None => String::new(),
+    };
+    match source {
+        "legacy_user" => {}
+        "legacy_repo" => {
+            return Some(format!(
+                "{lead}; remove it with `tirith trust remove {}{rule_arg} --scope repo` \
+                 (repository trust is inactive; add an operator grant with --scope project \
+                 only for a host you chose)",
+                quote(pattern)?
+            ));
+        }
+        "repository_allowlist" => {
+            return Some(format!(
+                "{lead}; repository allowlists are ignored, so remove it from .tirith/allowlist"
+            ));
+        }
+        // Operator policy (user or organization policy, user allowlist file).
+        _ => {
+            return Some(match host {
+                Some(host) => format!(
+                    "{lead}; replace '{pattern}' with '{host}' (that host and its subdomains) \
+                     where it is listed, or list the exact URL or image"
+                ),
+                None => format!(
+                    "{lead}; replace '{pattern}' with the host or the exact URL or image where \
+                     it is listed"
+                ),
+            });
+        }
+    }
+    let remove = format!(
+        "tirith trust remove {}{rule_arg} --scope user",
+        quote(pattern)?
+    );
+    Some(match host {
+        Some(host) => {
+            let add_rule = match rule_id {
+                Some(rule) => format!("--rule {}", quote(rule)?),
+                None => "--rule RULE_ID".to_string(),
+            };
+            let all_rules = if rule_id.is_none() {
+                " (the old entry covered every rule; --all-rules in place of --rule keeps that)"
+            } else {
+                ""
+            };
+            format!(
+                "{lead}; remove it with `{remove}`, then trust the host with \
+                 `tirith trust add {} --broad {add_rule}`{all_rules}",
+                quote(host)?
+            )
+        }
+        None => format!(
+            "{lead}; remove it with `{remove}`, then trust the exact URL or image, or a host \
+             with --broad"
+        ),
+    })
+}
+
+/// [`misplaced_wildcard_remedy`] for a pattern that output redaction changes:
+/// no printed command can name the entry, so it says which store to edit. A
+/// host grant is offered only when the host and rule print unchanged.
+fn redacted_wildcard_remedy(
+    pattern: &str,
+    rule_id: Option<&str>,
+    source: &str,
+    context: &Context,
+) -> String {
+    use tirith_core::safe_command::shell_single_quote as quote;
+    let lead = "'*' is a wildcard only as a leading '*.' label, so this entry never matched; \
+                its pattern holds text Tirith redacts in output, so no command here can name it";
+    let host = tirith_core::policy::misplaced_wildcard_host(pattern)
+        .filter(|host| context.redact(host) == *host);
+    let printable_rule = rule_id.filter(|rule| context.redact(rule) == *rule);
+    match source {
+        "legacy_user" => {
+            let grant = host.and_then(|host| {
+                let rule = match (rule_id, printable_rule) {
+                    (Some(_), Some(rule)) => format!("--rule {}", quote(rule)?),
+                    _ => "--rule RULE_ID".to_string(),
+                };
+                Some(format!(
+                    ", then trust the host with `tirith trust add {} --broad {rule}`",
+                    quote(host)?
+                ))
+            });
+            format!(
+                "{lead}; delete it from trust.json in the Tirith config directory{}",
+                grant.unwrap_or_default()
+            )
+        }
+        "legacy_repo" => format!(
+            "{lead}; delete it from .tirith/trust.json (repository trust is inactive; add an \
+             operator grant with --scope project only for a host you chose)"
+        ),
+        "repository_allowlist" => format!(
+            "{lead}; repository allowlists are ignored, so remove it from .tirith/allowlist"
+        ),
+        _ => match host {
+            Some(host) => format!(
+                "{lead}; replace it with '{host}' (that host and its subdomains) where it is \
+                 listed, or list the exact URL or image"
+            ),
+            None => format!(
+                "{lead}; replace it with the host or the exact URL or image where it is listed"
+            ),
+        },
     }
 }
 
@@ -607,16 +779,26 @@ fn legacy_row(value: &Value, source: &'static str, scope: &'static str, policy: 
         .get("ttl_expires")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let valid = pattern
+    let valid_rule = match value.get("rule_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(rule)) => tirith_core::policy::validate_trust_pattern(rule).is_ok(),
+        _ => false,
+    };
+    let valid = valid_rule
+        && pattern
+            .as_deref()
+            .is_some_and(|pattern| tirith_core::policy::validate_trust_pattern(pattern).is_ok());
+    // A 0.4.x `host/*` entry is invalid for one specific, fixable reason.
+    let remedy = pattern
         .as_deref()
-        .is_some_and(|pattern| tirith_core::policy::validate_trust_pattern(pattern).is_ok())
-        && match value.get("rule_id") {
-            None | Some(Value::Null) => true,
-            Some(Value::String(rule)) => tirith_core::policy::validate_trust_pattern(rule).is_ok(),
-            _ => false,
-        };
+        .filter(|_| valid_rule)
+        .and_then(|pattern| misplaced_wildcard_remedy(pattern, rule_id.as_deref(), source));
     let (state, state_reason) = if !valid {
-        (GrantState::Invalid, "invalid_pattern_or_rule")
+        if remedy.is_some() {
+            (GrantState::Invalid, "wildcard_never_matches")
+        } else {
+            (GrantState::Invalid, "invalid_pattern_or_rule")
+        }
     } else {
         match trust_grants::expiry_value(value.get("ttl_expires"), Utc::now()) {
             Expiry::Invalid => (GrantState::Invalid, "invalid_expiry"),
@@ -651,11 +833,14 @@ fn legacy_row(value: &Value, source: &'static str, scope: &'static str, policy: 
         expires_at,
         state,
         state_reason,
-        requires_migration: source == "legacy_user",
+        // `trust migrate` keeps an invalid entry where it is, so pointing an
+        // invalid row at migration would loop.
+        requires_migration: source == "legacy_user" && state != GrantState::Invalid,
         reason: value
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_string),
+        remedy,
     }
 }
 
@@ -687,6 +872,7 @@ fn rows(context: &Context, scope: &str) -> Result<Vec<Row>, String> {
                     requires_migration: false,
                     broad: false,
                     reason: None,
+                    remedy: None,
                 }),
             }
         }
@@ -850,9 +1036,17 @@ fn explain_value(context: &mut Context, target: &str, scope: &str) -> Result<Val
         .filter(|row| row.state == GrantState::Effective && row.matches(pattern, rule))
         .map(|row| row.project(context))
         .collect();
+    // A pattern `trust add` would refuse (for example `host/*`) gets the same
+    // explanation here, even when no recorded entry carries it.
+    let target_issue = selected
+        .is_none()
+        .then(|| tirith_core::policy::validate_trust_pattern(pattern).err())
+        .flatten()
+        .map(|issue| context.redact(&issue));
     Ok(json!({"schema_version":1,"kind":"trust_explanation",
             "selected_grant_id":selected.and_then(|row| row.id.as_deref()),
             "target":context.redact(pattern),"rule_id":rule.map(|rule| context.redact(rule)),
+            "target_issue":target_issue,
             "grants":grants,"matching_effective_grants":effective_grants,
             "target_matches_blocklist":context.snapshot.policy.is_blocklisted(pattern),
             "semantics":"trust_eligibility_only","command_evaluated":false,
@@ -1116,11 +1310,17 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
     let (path, before, mut store) = read_store(&context.config)?;
     let mut migrated = Vec::new();
     let mut retained = Vec::new();
+    // Every entry left behind is reported, with its remedy when it has one,
+    // so a dead 0.4.x `host/*` grant is not left in place silently.
+    let mut skipped = Vec::new();
     let mut invalid_retained = 0usize;
     let mut overridden_retained = 0usize;
     let mut expired_dropped = 0usize;
     for value in legacy["entries"].as_array().unwrap() {
         let row = legacy_row(value, "legacy_user", "user", &context.snapshot.policy);
+        if matches!(row.state, GrantState::Invalid | GrantState::Overridden) {
+            skipped.push(row.project(context));
+        }
         match row.state {
             GrantState::Invalid => {
                 invalid_retained += 1;
@@ -1157,7 +1357,7 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
     }
     if migrated.is_empty() && expired_dropped == 0 {
         return Ok(
-            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":0}),
+            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":0,"skipped":skipped}),
         );
     }
     legacy["entries"] = Value::Array(retained);
@@ -1175,7 +1375,7 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
     }
     let operation_id = perform(context, OperationKind::AddTrust, changes)?;
     Ok(
-        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":expired_dropped,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
+        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":expired_dropped,"skipped":skipped,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
     )
 }
 
@@ -2119,6 +2319,230 @@ mod tests {
         let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
         assert_eq!(again["state"], "unchanged");
         assert_eq!(saved().grants.len(), 1);
+    }
+
+    /// CORE-5: a 0.4.x `host/*` entry never matched. List, explain and migrate
+    /// name the exact remedy instead of a generic "invalid" plus a pointer to
+    /// a migration that leaves the entry behind, and nothing converts it to a
+    /// broader grant on the operator's behalf.
+    #[test]
+    fn legacy_wildcard_entries_report_the_remedy_and_are_never_converted() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let entries = json!({"version":1,"entries":[
+            {"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"},
+            {"pattern":"https://cdn.example.org/team/*","rule_id":null},
+            {"pattern":"*registry.example.net","rule_id":"docker_untrusted_registry"},
+            {"pattern":"https://mirror.example/x","rule_id":"shortened_url"},
+        ]});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let mut context = Context::capture().unwrap();
+        let listed = list_value(&mut context, None, true, "user").unwrap();
+        let row = |pattern: &str| {
+            listed["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["pattern"] == pattern)
+                .unwrap_or_else(|| panic!("{pattern}: {listed}"))
+                .clone()
+        };
+        let registry = row("registry.example.com/*");
+        assert_eq!(registry["state"], "invalid");
+        assert_eq!(registry["state_reason"], "wildcard_never_matches");
+        assert_eq!(registry["requires_migration"], false);
+        let remedy = registry["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains(
+                "`tirith trust remove 'registry.example.com/*' --rule 'docker_untrusted_registry' --scope user`"
+            ),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains(
+                "`tirith trust add 'registry.example.com' --broad --rule 'docker_untrusted_registry'`"
+            ),
+            "{remedy}"
+        );
+        let cdn = row("https://cdn.example.org/team/*");
+        let remedy = cdn["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("`tirith trust remove 'https://cdn.example.org/team/*' --scope user`"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("`tirith trust add 'cdn.example.org' --broad --rule RULE_ID`"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("--all-rules"), "{remedy}");
+        let no_host = row("*registry.example.net");
+        assert_eq!(no_host["state_reason"], "wildcard_never_matches");
+        let remedy = no_host["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("then trust the exact URL or image"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("trust add"), "{remedy}");
+        let valid = row("https://mirror.example/x");
+        assert_eq!(valid["state"], "effective");
+        assert_eq!(valid["requires_migration"], true);
+        assert!(valid["remedy"].is_null());
+
+        let explained = explain_value(&mut context, "registry.example.com/*", "all").unwrap();
+        assert!(explained["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["state_reason"] == "wildcard_never_matches"
+                && row["remedy"].as_str().is_some()));
+        assert!(explained["target_issue"]
+            .as_str()
+            .unwrap()
+            .contains("'registry.example.com' with --broad"));
+        let clean = explain_value(&mut context, "https://mirror.example/x", "all").unwrap();
+        assert!(clean["target_issue"].is_null());
+
+        let migrated = migrate_value(&mut context, "user").unwrap();
+        assert_eq!(migrated["state"], "completed");
+        assert_eq!(migrated["migrated_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(migrated["invalid_retained"], 3);
+        let skipped = migrated["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 3, "{migrated}");
+        assert!(skipped.iter().all(|row| row["remedy"].as_str().is_some()));
+        // Nothing was widened: the new store holds only the valid exact grant,
+        // and the dead entries stay where the operator can remove them.
+        let store = saved();
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(store.decode(0).unwrap().pattern, "https://mirror.example/x");
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert_eq!(legacy["entries"].as_array().unwrap().len(), 3);
+
+        // A repeat migration is a no-op that still names what it left behind.
+        let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
+        assert_eq!(again["state"], "unchanged");
+        assert_eq!(again["skipped"].as_array().unwrap().len(), 3);
+    }
+
+    /// A pattern that output redaction changes cannot appear in a printed
+    /// command: the remedy names the store to edit, and keeps the host grant.
+    #[test]
+    fn wildcard_remedy_never_prints_a_redacted_pattern_as_a_command() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let entries = json!({"version":1,"entries":[
+            {"pattern":"http://user:pw@mirror.example.net:8443/pkgs/*","rule_id":"plain_http_to_sink"},
+            {"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"},
+        ]});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let mut context = Context::capture().unwrap();
+        let listed = list_value(&mut context, None, true, "user").unwrap();
+        let rows = listed["grants"].as_array().unwrap();
+        let credential = rows
+            .iter()
+            .find(|row| row["rule_id"] == "plain_http_to_sink")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(credential["state_reason"], "wildcard_never_matches");
+        let pattern = credential["pattern"].as_str().unwrap();
+        assert!(!pattern.contains("pw"), "{pattern}");
+        let remedy = credential["remedy"].as_str().unwrap();
+        assert!(!remedy.contains("trust remove"), "{remedy}");
+        assert!(!remedy.contains("pw"), "{remedy}");
+        assert!(remedy.contains("trust.json"), "{remedy}");
+        assert!(
+            remedy.contains(
+                "`tirith trust add 'mirror.example.net' --broad --rule 'plain_http_to_sink'`"
+            ),
+            "{remedy}"
+        );
+        // A pattern redaction leaves alone keeps the exact commands.
+        let plain = rows
+            .iter()
+            .find(|row| row["pattern"] == "registry.example.com/*")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert!(plain["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("tirith trust remove 'registry.example.com/*'"));
+    }
+
+    /// Repository and policy rows get a remedy that fits where they live.
+    #[test]
+    fn wildcard_remedy_follows_the_entry_source() {
+        let policy = Policy::default();
+        let repo = legacy_row(
+            &json!({"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"}),
+            "legacy_repo",
+            "repo",
+            &policy,
+        );
+        let remedy = repo.remedy.unwrap();
+        assert!(
+            remedy.contains(
+                "`tirith trust remove 'registry.example.com/*' --rule 'docker_untrusted_registry' --scope repo`"
+            ),
+            "{remedy}"
+        );
+        // Repository content never gets a ready-made grant for its own host.
+        assert!(!remedy.contains("trust add"), "{remedy}");
+        assert!(!repo.requires_migration);
+        let repo_list = legacy_row(
+            &json!({"pattern":"registry.example.com/*"}),
+            "repository_allowlist",
+            "repo",
+            &policy,
+        );
+        let remedy = repo_list.remedy.unwrap();
+        assert!(
+            remedy.contains("remove it from .tirith/allowlist"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("'registry.example.com'"), "{remedy}");
+        let resolved = legacy_row(
+            &json!({"pattern":"registry.example.com/*"}),
+            "resolved_policy",
+            "policy",
+            &policy,
+        );
+        let remedy = resolved.remedy.unwrap();
+        assert!(
+            remedy.contains("replace 'registry.example.com/*' with 'registry.example.com'"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("tirith trust"), "{remedy}");
+        // An invalid rule keeps the generic reason: the pattern is not the
+        // only defect, so the host grant would not be the whole fix.
+        let bad_rule = legacy_row(
+            &json!({"pattern":"registry.example.com/*","rule_id":7}),
+            "legacy_user",
+            "user",
+            &policy,
+        );
+        assert_eq!(bad_rule.state_reason, "invalid_pattern_or_rule");
+        assert!(bad_rule.remedy.is_none());
+        // A quote in a hand-edited pattern cannot break out of the command.
+        let quoted = legacy_row(
+            &json!({"pattern":"registry.example.com/it's/*","rule_id":"docker_untrusted_registry"}),
+            "legacy_user",
+            "user",
+            &policy,
+        );
+        assert!(quoted
+            .remedy
+            .unwrap()
+            .contains("remove 'registry.example.com/it'\\''s/*'"));
     }
 
     #[test]

@@ -491,6 +491,7 @@ impl TeamRolloutService {
                             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
                         cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                        interactive_comments: true,
                     },
                     &baseline,
                     tirith_core::escalation::CallerContext::Cli,

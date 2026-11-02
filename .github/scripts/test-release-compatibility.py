@@ -6,7 +6,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 from unittest.mock import patch
-import tomllib
+import re
 import unittest
 import zipfile
 
@@ -14,7 +14,8 @@ SPEC = importlib.util.spec_from_file_location("compatibility", Path(__file__).wi
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+# Runs on the release runner's python3 (3.10), so no tomllib here either.
+VERSION = re.search(r'^\[workspace\.package\]\nversion = "([^"]+)"$', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
 
 
 class PublicationTests(unittest.TestCase):
@@ -47,6 +48,15 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(result, MODULE.build(ROOT, self.artifacts, VERSION))
         with self.assertRaisesRegex(ValueError, "workspace"):
             MODULE.build(ROOT, self.artifacts, "999.0.0")
+
+    def test_workspace_version_is_read_only_from_the_workspace_package_table(self):
+        self.assertEqual(MODULE.workspace_version((ROOT / "Cargo.toml").read_text()), VERSION)
+        manifest = '[package]\nversion = "9.9.9"\n\n[workspace.package]\nedition = "2021"\nversion = "1.2.3"  # release\n\n[dependencies]\nversion = "8.8.8"\n'
+        self.assertEqual(MODULE.workspace_version(manifest), "1.2.3")
+        for broken in ('[package]\nversion = "1.2.3"\n',
+                       '[workspace.package]\nversion = "1.2.3"\nversion = "1.2.4"\n'):
+            with self.subTest(broken=broken), self.assertRaisesRegex(ValueError, "uniquely"):
+                MODULE.workspace_version(broken)
 
     def test_state_contract_is_bound_to_persisted_format_source(self):
         result = MODULE.contract(ROOT, VERSION)

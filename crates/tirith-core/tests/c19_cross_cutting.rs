@@ -1152,10 +1152,17 @@ struct ReachabilityFixture {
     expected_rules: Vec<String>,
     #[serde(default)]
     raw_bytes: Vec<u8>,
+    /// `false`: read the way a shell without comment recognition runs it.
+    #[serde(default = "comments_recognised")]
+    interactive_comments: bool,
 }
 
 fn posix() -> String {
     "posix".to_string()
+}
+
+fn comments_recognised() -> bool {
+    true
 }
 
 /// The public half of the engine's central sensitive-asset Tier-1 gate.
@@ -1279,7 +1286,11 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 &fixture.raw_bytes
             };
             let byte_scan = tirith_core::extract::scan_bytes(bytes);
-            let byte_triggered = byte_scan.has_bidi_controls
+            // Mirrors the engine's exec byte trigger (`exec_bidi_triggered`),
+            // which includes raw terminal control bytes.
+            let byte_triggered = byte_scan.has_ansi_escapes
+                || byte_scan.has_control_chars
+                || byte_scan.has_bidi_controls
                 || byte_scan.has_zero_width
                 || byte_scan.has_unicode_tags
                 || byte_scan.has_variation_selectors
@@ -1294,8 +1305,33 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 shell,
             );
             let asset_triggered = public_sensitive_asset_gate(&fixture.input);
+            // A nested body the scanner cannot resolve (`eval "$X"`, a
+            // non-literal emitter under `eval`) is its own gate trigger: the
+            // block comes from incomplete analysis, not from PATTERN_TABLE.
+            let body_triggered = engine::exec_executable_body_triggered(&fixture.input, shell);
+            // An interactive shell's history reference (`!#:1`, `^old^new`)
+            // rewrites the line before it runs; the engine analyzes this
+            // fixture as interactive input below.
+            let history_triggered =
+                engine::history_expansion_triggered(&fixture.input, shell, ScanContext::Exec, true);
+            // A word-start `#` that an interactive shell without comment
+            // recognition reads as a word character, for a fixture analyzed
+            // that way below.
+            let comments_triggered = engine::interactive_comments_triggered(
+                &fixture.input,
+                shell,
+                ScanContext::Exec,
+                true,
+                fixture.interactive_comments,
+            );
 
-            if !(byte_triggered || regex_triggered || asset_triggered) {
+            if !(byte_triggered
+                || regex_triggered
+                || asset_triggered
+                || body_triggered
+                || history_triggered
+                || comments_triggered)
+            {
                 missed.push(format!("{file_name}:{}", fixture.name));
             }
 
@@ -1319,6 +1355,7 @@ fn every_rule_a_fixture_proves_can_fire_is_reachable_in_exec_context() {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: fixture.interactive_comments,
             };
             let verdict = engine::analyze(&ctx);
             if verdict.tier_reached < 3 {
@@ -1512,6 +1549,7 @@ fn no_rendered_surface_carries_a_raw_secret() {
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                     python_inspect_inherited: false,
                     cdpath_inherited: false,
+                    interactive_comments: true,
                 };
                 let verdict = engine::analyze(&ctx);
                 cells += 1;
@@ -1705,6 +1743,7 @@ fn no_benign_fixture_produces_a_high_or_critical_finding() {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: fixture.interactive_comments,
             };
             let verdict = engine::analyze(&ctx);
             for finding in &verdict.findings {

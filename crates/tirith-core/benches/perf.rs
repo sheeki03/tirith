@@ -33,6 +33,7 @@ fn context(input: &str, scan_context: ScanContext) -> AnalysisContext {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     }
 }
 
@@ -95,6 +96,7 @@ fn bench_full_analysis_clean(c: &mut Criterion) {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -119,6 +121,7 @@ fn bench_full_analysis_url(c: &mut Criterion) {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -143,6 +146,7 @@ fn bench_full_analysis_complex(c: &mut Criterion) {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             black_box(engine::analyze(&ctx));
         })
@@ -170,6 +174,7 @@ fn bench_paste_analysis(c: &mut Criterion) {
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
                 python_inspect_inherited: false,
                 cdpath_inherited: false,
+                interactive_comments: true,
             };
             black_box(engine::analyze(&ctx));
         })

@@ -84,13 +84,52 @@ pub(crate) struct PosixReadings {
     /// between `$`, `<` or `>` and `(` (or `$` and `{`). The shells disagree
     /// about where such a `${...}` or `$(...)` starts or ends.
     pub dollars_differ: bool,
+    /// With `without_comments` only: every word-start `#` the tokenizer would
+    /// read as the start of a comment (outside quotes, `$'...'` and `${...}`,
+    /// and not after a backslash), including those in text such a comment
+    /// would have hidden.
+    pub comment_starts: Vec<PosixCommentStart>,
+    /// Input, not a reading: take each such `#` as a literal word character
+    /// and keep reading, the way an interactive zsh without
+    /// `interactivecomments` does, recording it in `comment_starts`.
+    pub without_comments: bool,
+}
+
+/// A word-start `#` that starts a comment (see
+/// [`PosixReadings::comment_starts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PosixCommentStart {
+    /// Byte offset of the `#`.
+    pub offset: usize,
+    /// It sits inside a `<(...)`, `>(...)` or zsh `=(...)` process
+    /// substitution, whose body bash and zsh parse as a separate string,
+    /// recognising comments there even when the interactive line does not.
+    pub in_process_substitution: bool,
 }
 
 /// [`PosixReadings`] for `input`. The text is read the way bash reads its
 /// `$'...'` strings; up to the first `$'...'` that holds an escaped quote,
 /// dash reads it the same way.
 pub(crate) fn posix_readings(input: &str) -> PosixReadings {
-    let mut readings = PosixReadings::default();
+    read_posix(input, PosixReadings::default())
+}
+
+/// The word-start `#`s of `input` that start a comment where the shell
+/// recognises comments, read the way an interactive shell that does not
+/// recognise them reads the text: each such `#` is a literal word character,
+/// so the text after it is live and its own `#`s count too.
+pub(crate) fn posix_comment_starts_without_comments(input: &str) -> Vec<PosixCommentStart> {
+    read_posix(
+        input,
+        PosixReadings {
+            without_comments: true,
+            ..PosixReadings::default()
+        },
+    )
+    .comment_starts
+}
+
+fn read_posix(input: &str, mut readings: PosixReadings) -> PosixReadings {
     let limits = TokenizeLimits {
         max_segments: 0,
         max_words_per_segment: 0,
@@ -234,6 +273,15 @@ fn tokenize_posix(
     // between leaves both in place (`$\` + newline + `(cmd)` is `$(cmd)`).
     let mut previous: Option<(char, usize)> = None;
     let mut dollar_run = 0usize;
+    // With `readings.without_comments` only, for its comment starts:
+    // `paren_depth` from before each open `<(`, `>(` or zsh `=(` process
+    // substitution opened, and the index just past a `=` read at the start of
+    // a word (zsh's `=(...)`).
+    let mut process_substitution_parens: Vec<usize> = Vec::new();
+    let mut word_start_equals_end: Option<usize> = None;
+    let without_comments = readings
+        .as_deref()
+        .is_some_and(|readings| readings.without_comments);
 
     while i < len {
         let ch = chars[i];
@@ -431,6 +479,20 @@ fn tokenize_posix(
                     i += 1;
                     continue;
                 }
+                if without_comments {
+                    if let Some((readings, offset)) =
+                        readings.as_deref_mut().zip(byte_offsets.get(i))
+                    {
+                        readings.comment_starts.push(PosixCommentStart {
+                            offset: *offset,
+                            in_process_substitution: !process_substitution_parens.is_empty(),
+                        });
+                    }
+                    current.push(ch);
+                    at_word_start = false;
+                    i += 1;
+                    continue;
+                }
                 // Comments are not argv and syntax inside them cannot affect
                 // delimiter depth. Leave the newline for the normal segment
                 // boundary arm so the following command is still analyzed.
@@ -460,6 +522,7 @@ fn tokenize_posix(
                 match backtick.take() {
                     Some((parens, braces, double_quoted)) => {
                         paren_depth = parens;
+                        process_substitution_parens.retain(|depth| *depth < paren_depth);
                         brace_scopes.truncate(braces);
                         brace_paren_depth.truncate(braces);
                         while double_quoted_parens
@@ -489,6 +552,12 @@ fn tokenize_posix(
                 continue;
             }
             '(' => {
+                if without_comments
+                    && (matches!(before, Some('<' | '>'))
+                        || (before == Some('=') && word_start_equals_end == Some(i)))
+                {
+                    process_substitution_parens.push(paren_depth);
+                }
                 paren_depth = paren_depth.saturating_add(1);
                 current.push(ch);
                 at_word_start = true;
@@ -504,6 +573,7 @@ fn tokenize_posix(
                 && backtick.is_none_or(|(parens, _, _)| paren_depth > parens) =>
             {
                 paren_depth -= 1;
+                process_substitution_parens.retain(|depth| *depth < paren_depth);
                 if double_quoted_parens.last() == Some(&paren_depth) {
                     double_quoted_parens.pop();
                     in_double = true;
@@ -554,6 +624,14 @@ fn tokenize_posix(
                 brace_paren_depth.pop();
                 current.push(ch);
                 at_word_start = !embedded_in_word;
+                i += 1;
+                continue;
+            }
+            // POSIX `>|` is the clobbering output redirection (`curl … >| f`
+            // writes the file `f`), not a pipe into `f`. fish has no `>|`.
+            '|' if top_level && posix && ends_with_unescaped_char(&current, '>', '\\') => {
+                current.push(ch);
+                at_word_start = true;
                 i += 1;
                 continue;
             }
@@ -663,6 +741,9 @@ fn tokenize_posix(
                 continue;
             }
             _ => {
+                if without_comments && ch == '=' && at_word_start {
+                    word_start_equals_end = Some(i + 1);
+                }
                 current.push(ch);
                 at_word_start = match ch {
                     ' ' | '\t' | '\n' => true,
@@ -1943,6 +2024,9 @@ fn push_segment_impl(
         } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Posix
         {
             posix_command_and_args(words)
+        } else if preserve_posix_word_data && segments.single_quote_style == SingleQuoteStyle::Fish
+        {
+            fish_command_and_args(words)
         } else {
             // Skip leading `VAR=VALUE` assignments.
             let first_non_assign = words.iter().position(|w| !is_env_assignment(w));
@@ -1986,7 +2070,7 @@ fn push_segment_impl(
 /// arguments still see it; rules that read argv by position see the shell's
 /// argv, as for a trailing redirection. Inside `[[ ... ]]` and `(( ... ))`
 /// `<` and `>` compare, so those words are left as they are.
-fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+pub(crate) fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     use crate::escalation::{shell_redirection_suffix, shell_redirection_token};
 
     let Some(first) = words.iter().position(|word| !is_env_assignment(word)) else {
@@ -1997,11 +2081,26 @@ fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
         let args = words[first + 1..].to_vec();
         return (Some(words[first].clone()), args);
     }
+    command_and_args_past_redirections(words, shell_redirection_token, shell_redirection_suffix)
+}
 
+/// Fish also takes a redirection joined to a word out of argv
+/// (`sh>/dev/null` runs `sh`), with its own quoting and substitution syntax.
+fn fish_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
+    use crate::escalation::{fish_redirection_suffix, fish_redirection_token};
+
+    command_and_args_past_redirections(words, fish_redirection_token, fish_redirection_suffix)
+}
+
+fn command_and_args_past_redirections(
+    words: Vec<String>,
+    redirection_token: fn(&str) -> Option<bool>,
+    redirection_suffix: fn(&str) -> Option<(&str, bool)>,
+) -> (Option<String>, Vec<String>) {
     let mut split = Vec::with_capacity(words.len());
     for word in words {
-        if shell_redirection_token(&word).is_none() {
-            if let Some((prefix, _)) = shell_redirection_suffix(&word) {
+        if redirection_token(&word).is_none() {
+            if let Some((prefix, _)) = redirection_suffix(&word) {
                 let at = prefix.len();
                 split.push(word[..at].to_owned());
                 split.push(word[at..].to_owned());
@@ -2016,7 +2115,7 @@ fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     let mut redirections = Vec::new();
     let mut words = split.into_iter();
     while let Some(word) = words.next() {
-        if let Some(target_is_separate) = shell_redirection_token(&word) {
+        if let Some(target_is_separate) = redirection_token(&word) {
             redirections.push(word);
             if target_is_separate {
                 redirections.extend(words.next());
@@ -2034,6 +2133,16 @@ fn posix_command_and_args(words: Vec<String>) -> (Option<String>, Vec<String>) {
     }
     args.extend(redirections);
     (command, args)
+}
+
+/// A `NAME=VALUE` operand of the `env` utility. GNU and BSD `env` set every
+/// leading operand after their options that contains `=`, whatever the name
+/// (`env 'npm_config_@scope:registry=http://host/' npm install` sets that
+/// variable, which npm reads, and runs `npm`), while a shell assignment
+/// ([`is_env_assignment`]) needs an identifier. A word that starts with `=`
+/// (which `env` rejects) or with `-` (an option) is not one.
+pub fn is_env_wrapper_assignment(word: &str) -> bool {
+    !word.starts_with(['-', '=']) && word.contains('=')
 }
 
 /// Check if a word looks like a shell environment variable assignment (NAME=VALUE).
@@ -3766,9 +3875,37 @@ mod tests {
             assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
             assert_eq!(segs[0].args, *args, "{input:?}");
         }
-        // Fish keeps its word reading.
-        let fish = tokenize("sh>/dev/null", ShellType::Fish);
-        assert_eq!(fish[0].command.as_deref(), Some("sh>/dev/null"));
+        // Fish reads a joined redirection the same way, with fish quoting:
+        // a single-quoted string accepts `\'`, a backtick is an ordinary
+        // byte, and `>(cmd)` redirects to the file the substitution names.
+        let fish: &[(&str, &str, &[&str])] = &[
+            ("sh>/dev/null", "sh", &[">/dev/null"]),
+            ("sh 2>/dev/null", "sh", &["2>/dev/null"]),
+            ("bash&>/dev/null", "bash", &["&>/dev/null"]),
+            ("sh2>/dev/null", "sh2", &[">/dev/null"]),
+            ("sh>(pwd)", "sh", &[">(pwd)"]),
+            (
+                "echo 'it\\'s'>/dev/null",
+                "echo",
+                &["'it\\'s'", ">/dev/null"],
+            ),
+            ("echo s(pwd)>/dev/null", "echo", &["s(pwd)", ">/dev/null"]),
+        ];
+        for (input, command, args) in fish {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs.len(), 1, "{input:?} -> {segs:?}");
+            assert_eq!(segs[0].command.as_deref(), Some(*command), "{input:?}");
+            assert_eq!(segs[0].args, *args, "{input:?}");
+        }
+        for (input, command, args) in [
+            ("'sh>/dev/null'", "'sh>/dev/null'", &[] as &[&str]),
+            ("sh\\>/dev/null", "sh\\>/dev/null", &[]),
+            ("echo 'a\\'>b'", "echo", &["'a\\'>b'"]),
+        ] {
+            let segs = tokenize(input, ShellType::Fish);
+            assert_eq!(segs[0].command.as_deref(), Some(command), "{input:?}");
+            assert_eq!(segs[0].args, args, "{input:?}");
+        }
     }
 
     #[test]

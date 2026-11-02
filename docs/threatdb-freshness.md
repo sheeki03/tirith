@@ -19,7 +19,7 @@ Both include a `freshness` object:
 | `revision_age_seconds` | Age of the exact source commit used in this database. A months-old unchanged upstream is not automatically lagging. |
 | `observation_age_seconds` | Age of the last upstream comparison included in this generation. It does not claim that upstream is still unchanged today. |
 | `known_upstream_lag_seconds` | Difference between the observed upstream commit time and the published source commit time. Unknown when no matching observation exists. |
-| `upstream_commits_ahead` | How many commits the verified upstream comparison is ahead. |
+| `upstream_commits_ahead` | How many commits the verified upstream comparison is ahead. Unknown when GitHub could not compare the published pin with the observed upstream commit; `known_upstream_lag_seconds` still comes from the commit times. |
 | `reviewed_pin_adoption_required` | The observed upstream differs from the published pin and needs review before adoption. It does not say that a review was opened or approved. |
 | `lag_exceeds_reviewed_budget` | The observed lag exceeds the per-source budget in the reviewed pin manifest. |
 | `accepted`, `rejected`, `accepted_fraction` | Parser outcomes when the database was compiled. They measure coverage, not completeness or effectiveness. |

@@ -146,6 +146,7 @@ fn context(input: &str, cwd: &std::path::Path) -> AnalysisContext {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     }
 }
 fn verify_counter() {

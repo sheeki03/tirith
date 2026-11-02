@@ -73,8 +73,9 @@ non-exported `TIRITH_STATUS` shell variable for exactly that — see
 for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
 output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
 
-To recover full protection after a degrade, restart your shell (and see
-"Persistent safe mode" below if it keeps happening).
+To recover full protection after a degrade, open a new terminal or start a
+child shell (not `exec "$SHELL"`, see below), and see "Persistent safe mode"
+below if it keeps happening.
 
 ## Execution receipts unavailable or degraded
 
@@ -193,12 +194,14 @@ brew info tirith
 hash -r
 ```
 
-Then refresh materialized hooks and restart shell:
+Then refresh materialized hooks and open a new terminal:
 
 ```bash
 rm -rf ~/.local/share/tirith/shell
-exec zsh   # or exec bash / restart terminal
 ```
+
+Do not use `exec zsh` or `exec bash` for this: the replaced shell keeps the
+old shell's receipt registration and runs in legacy mode (#281).
 
 ## Wrong `tirith` binary on PATH
 
@@ -414,6 +417,19 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 1. Run `tirith check --format json -- "your command"` and check `timings_ms`
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
+
+## Long scripts and analysis limits
+
+tirith analyzes a checked command completely up to fixed limits: 1 MiB of shell
+text, 16384 shell words, 4096 commands, 96 KiB or 4096 words per simple
+command, and 256 nested bodies (substitutions, groups, wrapper, function and
+shell-fed heredoc bodies) totalling 256 KiB per level. An agent's batch script
+of a few hundred to a few thousand lines and a heredoc file write of several
+thousand lines fit. Past a limit, the unexamined part is blocked as
+`analysis_incomplete` ("Command exceeds Tirith's analysis size limits" or
+"Command analysis exceeded its work budget") instead of being treated as clean,
+so a destructive command cannot hide after it. Split such a script into several
+checked commands.
 
 ## Numeric curl destinations and ports
 

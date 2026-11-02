@@ -243,7 +243,8 @@ fn has_incomplete_quoting(input: &str, shell: ShellType) -> bool {
     let mut single = false;
     let mut double = false;
     let mut escaped = false;
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
             continue;
@@ -253,7 +254,10 @@ fn has_incomplete_quoting(input: &str, shell: ShellType) -> bool {
             ShellType::Cmd => '^',
             ShellType::Posix | ShellType::Fish => '\\',
         };
-        if ch == escape && !single {
+        // fish also escapes `\'` and `\\` inside single quotes.
+        let fish_single_escape =
+            shell == ShellType::Fish && matches!(chars.peek(), Some('\'' | '\\'));
+        if ch == escape && (!single || fish_single_escape) {
             escaped = true;
         } else if ch == '"' && !single {
             double = !double;
@@ -6899,7 +6903,9 @@ fn environment_body_may_mutate(
         if scan.gap.is_some() {
             return true;
         }
-        for body in scan.bodies {
+        // A best-effort body is a fish wrapper child: a separate process that
+        // cannot change this shell's environment.
+        for body in scan.bodies.into_iter().filter(|body| !body.best_effort) {
             if *remaining_bodies == 0 {
                 return true;
             }

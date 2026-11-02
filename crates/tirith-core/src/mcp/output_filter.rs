@@ -1388,6 +1388,7 @@ fn is_injection_seed_rule(rule_id: RuleId) -> bool {
         | RuleId::DeleteThenForcePush
         | RuleId::MassFileDeletion
         | RuleId::AnalysisIncomplete
+        | RuleId::PackageLookupIncomplete
         | RuleId::PythonInstalledIntegrityViolation
         | RuleId::PythonStartupHookSuspicious
         | RuleId::PythonStartupHookCrossRuntime
