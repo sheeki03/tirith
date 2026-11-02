@@ -133,7 +133,6 @@ set -g _TIRITH_RECEIPT_SHELL_PID 123
 set -g _TIRITH_RECEIPT_FAMILY fish
 set -g _TIRITH_BIN {exe}
 set -g _TIRITH_ENV_BIN /usr/bin/env
-set -g _TIRITH_SH_BIN /bin/sh
 set -gx TIRITH_TRACE_TEST_CALLS {call_path}
 function _tirith_verification_state
     builtin printf 'tirith-loaded-shell-v1\\n{LOADED_STATE}\\nprotocol=3 protection=blocks bypass=1\\n'
@@ -160,7 +159,6 @@ _TIRITH_RECEIPT_SHELL_PID=123
 _TIRITH_RECEIPT_FAMILY={family}
 _TIRITH_BIN={exe}
 _TIRITH_ENV_BIN=/usr/bin/env
-_TIRITH_SH_BIN=/bin/sh
 TIRITH_TRACE_TEST_CALLS={call_path}
 export TIRITH_TRACE_TEST_CALLS
 _tirith_verification_state() {{ builtin printf 'tirith-loaded-shell-v1\\n{LOADED_STATE}\\nprotocol=3 protection=blocks bypass=1\\n'; }}
@@ -178,28 +176,26 @@ builtin printf 'TIRITH_TEST_RESULT=%s\\n' "$test_result"
     return setup
 
 
-def run_case(family, shell, tree, function, trace, operation_exit=0, ack_exit=0):
+def run_case(family, shell, tree, function, trace, operation=None, operation_exit=0):
     source = (tree / FILES[family]).read_text()
     definition = extract(source, family, function)
     if family == "bash":
         definition = "\n".join([
             extract(source, family, "_tirith_trace_preserve_status"),
+            extract(source, family, "_tirith_untraced_begin"),
+            extract(source, family, "_tirith_untraced_run"),
             extract(source, family, function + "_untraced"), definition,
         ])
-    if function != "_tirith_verification_probe":
-        ack_name = "_tirith_receipt_acknowledge_untraced" if family == "bash" else "_tirith_receipt_acknowledge_at"
-        definition += "\n" + extract(source, family, ack_name)
     if function == "_tirith_verification_probe":
         invocation = f"{function} start"
     elif family == "bash":
-        invocation = f"{function} bash-preexec ordinary-test-token"
-        if function == "_tirith_receipt_consume":
+        invocation = f"{function} {operation} bash-preexec ordinary-test-token"
+        if operation == "consume":
             invocation += " true"
     else:
-        invocation = f"{function} ordinary-test-token"
-        if function == "_tirith_receipt_consume_at":
+        invocation = f"{function} {operation} ordinary-test-token /"
+        if operation == "consume":
             invocation += " true"
-        invocation += " /"
     admission = {"passed": False}
     with retained_directory(prefix="tirith-shell-trace-", admission=admission) as temp:
         directory = pathlib.Path(temp)
@@ -209,16 +205,15 @@ def run_case(family, shell, tree, function, trace, operation_exit=0, ack_exit=0)
             "#!/bin/sh\n"
             "test \"$_TIRITH_RECEIPT_INSTANCE\" = " + shlex.quote(CAPABILITY) + " || exit 91\n"
             "printf '%s\\n' \"$2\" >> \"$TIRITH_TRACE_TEST_CALLS\"\n"
-            "if test \"$2\" = acknowledge; then exit " + str(ack_exit) + "; fi\n"
             "exit " + str(operation_exit) + "\n"
         )
         executable.chmod(0o700)
         script = body(family, definition, invocation, executable, calls, trace)
         result = run_native("trace-helper", [shell, "-c", script], directory,
                             {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(directory), "LC_ALL": "C"}, 10)
-        expected_calls = ["start"] if function == "_tirith_verification_probe" else [function.split("_receipt_")[1].split("_")[0]]
-        if function != "_tirith_verification_probe" and operation_exit == 0:
-            expected_calls.append("acknowledge")
+        # One launch per operation: Tirith retires a receipt itself, so no
+        # separate `acknowledge` call follows a successful operation.
+        expected_calls = ["start"] if function == "_tirith_verification_probe" else [operation]
         invoked = calls.exists() and calls.read_text().splitlines() == expected_calls
         output = result.stdout + result.stderr
         expected_state = "on" if trace else "off"
@@ -233,7 +228,7 @@ def run_case(family, shell, tree, function, trace, operation_exit=0, ack_exit=0)
         }
         admission["passed"] = all(checks.values())
         return {"shell": shell, "family": family, "source": str(tree.relative_to(ROOT)),
-                "function": function, "trace": trace, "operation_exit": operation_exit, "ack_exit": ack_exit,
+                "function": function, "operation": operation, "trace": trace, "operation_exit": operation_exit,
                 "passed": all(checks.values()), "checks": checks}
 
 
@@ -318,21 +313,21 @@ def main():
     failures = 0
     cases = 0
     values = []
-    snapshots = {p: owner_runtime().file_sha(p) for p in [pathlib.Path(__file__), ROOT / "tools/qualification/mixed_audit_native.py", *[ROOT / tree / file for tree in ("shell/lib", "crates/tirith/assets/shell/lib") for file in FILES.values()], *[pathlib.Path(path) for _, path in available]]}
+    snapshots = {p: owner_runtime().file_sha(p) for p in [pathlib.Path(__file__), ROOT / "tools/qualification/mixed_audit_native.py", *[ROOT / "crates/tirith/assets/shell/lib" / file for file in FILES.values()], *[pathlib.Path(path) for _, path in available]]}
     for family, shell in available:
-        functions = ["_tirith_verification_probe"]
-        functions += [f"_tirith_receipt_{kind}{'' if family == 'bash' else '_at'}"
-                      for kind in ["consume", "reconcile", "discard"]]
-        for tree in [ROOT / "shell/lib", ROOT / "crates/tirith/assets/shell/lib"]:
-            for function in functions:
+        # The embedded hook directory is the single hook source; the top-level
+        # `shell` path is only a symlink to it.
+        for tree in [ROOT / "crates/tirith/assets/shell/lib"]:
+            plans = [("_tirith_verification_probe", None, 0)]
+            plans += [("_tirith_receipt_call", operation, operation_exit)
+                      for operation in ["consume", "reconcile", "discard"] for operation_exit in [0, 7]]
+            for function, operation, operation_exit in plans:
                 for trace in [False, True]:
-                    outcomes = [(0, 0)] if function == "_tirith_verification_probe" else [(0, 0), (0, 99), (7, 0)]
-                    for operation_exit, ack_exit in outcomes:
-                        value = run_case(family, shell, tree, function, trace, operation_exit, ack_exit)
-                        print(json.dumps(value), flush=True)
-                        values.append(value)
-                        cases += 1
-                        failures += not value["passed"]
+                    value = run_case(family, shell, tree, function, trace, operation, operation_exit)
+                    print(json.dumps(value), flush=True)
+                    values.append(value)
+                    cases += 1
+                    failures += not value["passed"]
             for trace in [False, True]:
                 for inherited in [False, True]:
                     value = run_registration(family, shell, tree, trace, inherited)

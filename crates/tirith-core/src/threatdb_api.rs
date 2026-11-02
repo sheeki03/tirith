@@ -268,7 +268,7 @@ fn package_incomplete_finding(
         return None;
     }
     Some(Finding {
-        rule_id: RuleId::AnalysisIncomplete,
+        rule_id: RuleId::PackageLookupIncomplete,
         severity: Severity::Medium,
         title: "Package threat intelligence could not be completed".to_string(),
         description: format!(
@@ -484,8 +484,26 @@ pub fn enrich_command_with_network(
     mode: RuntimeThreatMode,
     network: RuntimeThreatNetwork,
 ) -> Vec<Finding> {
+    enrich_command_readings_with_network(input, None, shell, config, mode, network)
+}
+
+/// [`enrich_command_with_network`] over every reading the engine analyzed:
+/// the command as typed and, when the analysis also read it the way an
+/// interactive shell without comment recognition runs it, that reading
+/// ([`crate::engine::interactive_comments_reading`]). The packages and URLs
+/// of both are looked up together, each once, so `echo hi #; npm install
+/// <pkg>` looks up the package that shell installs. The typed reading is
+/// always enriched; the other only adds to it.
+pub fn enrich_command_readings_with_network(
+    input: &str,
+    interactive_comments_reading: Option<&str>,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+) -> Vec<Finding> {
     enrich_command_with_cache(
-        input,
+        &readings(input, interactive_comments_reading),
         shell,
         config,
         mode,
@@ -494,16 +512,25 @@ pub fn enrich_command_with_network(
     )
 }
 
+/// The input as typed, then the interactive-comments reading when there is
+/// one.
+fn readings<'a>(input: &'a str, interactive_comments_reading: Option<&'a str>) -> Vec<&'a str> {
+    std::iter::once(input)
+        .chain(interactive_comments_reading)
+        .collect()
+}
+
 /// One explicit read phase, with no network, cache publication or eviction.
 /// Complete refers to configured enrichment, not arbitrary command safety.
 pub(crate) fn capture_cached_enrichment(
     input: &str,
+    interactive_comments_reading: Option<&str>,
     shell: ShellType,
     config: &ThreatIntelConfig,
     captured_at: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<Finding>, bool) {
     let findings = enrich_command_with_cache(
-        input,
+        &readings(input, interactive_comments_reading),
         shell,
         config,
         RuntimeThreatMode::Inline,
@@ -513,14 +540,17 @@ pub(crate) fn capture_cached_enrichment(
             Duration::from_millis(500),
         ),
     );
-    let complete = !findings
-        .iter()
-        .any(|finding| finding.rule_id == RuleId::AnalysisIncomplete);
+    let complete = !findings.iter().any(|finding| {
+        matches!(
+            finding.rule_id,
+            RuleId::AnalysisIncomplete | RuleId::PackageLookupIncomplete
+        )
+    });
     (findings, complete)
 }
 
 fn enrich_command_with_cache(
-    input: &str,
+    inputs: &[&str],
     shell: ShellType,
     config: &ThreatIntelConfig,
     mode: RuntimeThreatMode,
@@ -532,15 +562,27 @@ fn enrich_command_with_cache(
         return Vec::new();
     }
 
-    let segments = crate::tokenize::tokenize(input, shell);
-    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
-    // exists precisely so a consumer whose output is a security decision can see
-    // that the package list was cut. Discarding it made a runtime verdict read
-    // as a complete assessment of a command it had only partly looked at.
-    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
-    let extraction_truncated = extracted.truncated;
-    let packages = extracted.packages;
-    let urls = extract::extract_urls(input, shell);
+    let mut extraction_truncated = false;
+    let mut packages = Vec::new();
+    let mut urls = Vec::new();
+    for input in inputs {
+        // Issue #264: `N=npm; "$N" install pkg` is enriched exactly like the
+        // literal `npm install pkg` it is proven to run.
+        let literal_view = crate::extract::posix_variable_command_literal_view(input, shell);
+        let input = literal_view.as_deref().unwrap_or(input);
+        let segments = crate::tokenize::tokenize(input, shell);
+        // `extract_packages_detail_for_shell`, not the bare variant: the detail
+        // form exists precisely so a consumer whose output is a security
+        // decision can see that the package list was cut. Discarding it made a
+        // runtime verdict read as a complete assessment of a command it had
+        // only partly looked at.
+        let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
+        extraction_truncated |= extracted.truncated;
+        // Repeats across readings are looked up once (`deduplicate_packages`,
+        // and the URL candidate set below).
+        packages.extend(extracted.packages);
+        urls.extend(extract::extract_urls(input, shell));
+    }
     let backend = LivePackageThreatBackend { network, cache };
     let (mut findings, package_budget_truncated) =
         enrich_packages_with_backend(packages, config, mode.timeout(), &backend);
@@ -981,6 +1023,36 @@ fn query_osv(
 struct DepsPackageResponse {
     #[serde(default)]
     versions: Vec<DepsPackageVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_published_at_secs: Option<i64>,
+}
+
+impl DepsPackageResponse {
+    fn bound_versions(&mut self) {
+        self.default_version = None;
+        self.first_published_at_secs = None;
+        if self.versions.len() > MAX_DECODED_ITEMS {
+            // Retain semantic metadata, not an arbitrary replacement record.
+            // Moving a late default avoids copying; the original prefix stays
+            // readable by older cache readers without losing its oldest entry.
+            self.first_published_at_secs = self
+                .versions
+                .iter()
+                .filter_map(|version| version.published_at.as_deref())
+                .filter_map(parse_rfc3339_secs)
+                .min();
+            if let Some(index) = self.versions.iter().position(|version| version.is_default) {
+                if index >= MAX_DECODED_ITEMS {
+                    self.default_version = Some(std::mem::take(
+                        &mut self.versions[index].version_key.version,
+                    ));
+                }
+            }
+            self.versions.truncate(MAX_DECODED_ITEMS);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1041,7 +1113,7 @@ fn deps_package(
             Ok(response) => response,
             Err(error) => return LookupOutcome::Incomplete(error),
         };
-    response.versions.truncate(MAX_DECODED_ITEMS);
+    response.bound_versions();
     store_cache("deps-package", &cache_key, &response);
     LookupOutcome::Complete(response)
 }
@@ -1059,7 +1131,8 @@ fn resolve_default_version(
                 .versions
                 .into_iter()
                 .find(|version| version.is_default)
-                .map(|version| version.version_key.version),
+                .map(|version| version.version_key.version)
+                .or(package.default_version),
         ),
         LookupOutcome::Unsupported => LookupOutcome::Unsupported,
         LookupOutcome::Incomplete(error) => LookupOutcome::Incomplete(error),
@@ -1149,14 +1222,18 @@ fn collect_package_metadata(
     let mut incomplete = Vec::new();
     let first_release_days = match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(response) => response
-            .versions
-            .iter()
-            .filter_map(|version| version.published_at.as_deref())
-            .filter_map(parse_rfc3339_secs)
-            .min()
+            .first_published_at_secs
+            .or_else(|| {
+                response
+                    .versions
+                    .iter()
+                    .filter_map(|version| version.published_at.as_deref())
+                    .filter_map(parse_rfc3339_secs)
+                    .min()
+            })
             .map(|first_seen| {
                 let now = cache.now as i64;
-                ((now - first_seen).max(0)) / 86_400
+                now.saturating_sub(first_seen).max(0) / 86_400
             }),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -1779,6 +1856,123 @@ mod tests {
     }
 
     #[test]
+    fn bounded_package_cache_preserves_default_version_resolution() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        for (name, defaults, expected) in [
+            ("late-default", vec![MAX_DECODED_ITEMS + 16], Some("1.64.0")),
+            (
+                "boundary-default",
+                vec![MAX_DECODED_ITEMS - 1],
+                Some("1.64.0"),
+            ),
+            (
+                "first-default",
+                vec![0, MAX_DECODED_ITEMS + 16],
+                Some("1.64.0"),
+            ),
+            ("no-default", vec![], None),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: if defaults.contains(&index) {
+                                "1.64.0".into()
+                            } else {
+                                format!("0.{index}.0")
+                            },
+                        },
+                        published_at: None,
+                        is_default: defaults.contains(&index),
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            // Preserve the first default's meaning even if malformed upstream
+            // metadata designates a different later version as default too.
+            if name == "first-default" {
+                response.versions[MAX_DECODED_ITEMS + 16]
+                    .version_key
+                    .version = "2.0.0".into();
+            }
+            response.bound_versions();
+            store_cache(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &response,
+            );
+            let cache = CacheReadContext::new(unix_now(), Duration::from_secs(5));
+            let result = resolve_default_version(
+                Ecosystem::Npm,
+                name,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            match result {
+                LookupOutcome::Complete(version) => {
+                    assert_eq!(version.as_deref(), expected, "{name}");
+                }
+                other => panic!("bounded cache must remain usable for {name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_package_cache_preserves_package_age_with_a_late_default() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let now = parse_rfc3339_secs("2026-01-15T00:00:00Z").unwrap() as u64;
+        for (name, oldest_index) in [
+            ("oldest-boundary", MAX_DECODED_ITEMS - 1),
+            ("oldest-beyond-prefix", MAX_DECODED_ITEMS + 8),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: format!("1.{index}.0"),
+                        },
+                        published_at: Some(if index == oldest_index {
+                            "2000-01-01T00:00:00Z".into()
+                        } else {
+                            "2026-01-01T00:00:00Z".into()
+                        }),
+                        is_default: index == MAX_DECODED_ITEMS + 16,
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            response.bound_versions();
+            write_cache_fixture(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &serde_json::json!({"fetched_at": now, "value": response}).to_string(),
+            );
+            let cache = CacheReadContext::new(now, Duration::from_secs(5));
+            let metadata = collect_package_metadata(
+                Ecosystem::Npm,
+                name,
+                None,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            let signal = metadata.signal.expect("cached package age");
+            assert_eq!(
+                signal.first_release_days,
+                Some((now as i64 - parse_rfc3339_secs("2000-01-01T00:00:00Z").unwrap()) / 86_400),
+                "{name}",
+            );
+            assert!(
+                !signal.is_suspicious(),
+                "established package cannot become new: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn bounded_cache_capture_reuses_first_hit_and_miss_without_writes() {
         let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
         let path = write_cache_fixture(
@@ -1895,6 +2089,7 @@ mod tests {
         assert!(!directory.exists());
         let (findings, complete) = capture_cached_enrichment(
             "pip install missing-package==1.0.0",
+            None,
             ShellType::Posix,
             &config,
             chrono::Utc::now(),
@@ -1945,6 +2140,9 @@ mod tests {
             clipboard_html: None,
             card_ref: None,
             clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+            interactive_comments: true,
         };
         let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
             context,
@@ -1995,6 +2193,93 @@ mod tests {
             .explanation
             .gaps
             .contains(&crate::evaluation::EvidenceGap::DetectorPolicyChanged));
+    }
+
+    /// `echo hi #; pip install <pkg>` in an interactive shell without comment
+    /// recognition installs the package, so enrichment of that reading looks
+    /// it up; the typed reading alone holds only a comment. Both runtime
+    /// paths read it: inline enrichment and a frozen capture.
+    #[test]
+    fn enrichment_also_reads_the_interactive_comments_reading() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let name = "tirith-hidden-behind-hash";
+        store_cache(
+            "osv",
+            &format!("pypi:{name}:1"),
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-HIDDEN-FIXTURE".into(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+        store_cache("kev", "active", &Vec::<String>::new());
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        };
+        let typed = format!("echo hi #; pip install {name}==1.0.0");
+        let reading = |interactive_comments| {
+            crate::engine::interactive_comments_reading(
+                &typed,
+                ShellType::Posix,
+                crate::extract::ScanContext::Exec,
+                true,
+                interactive_comments,
+            )
+        };
+        assert_eq!(
+            reading(true),
+            None,
+            "comments recognised: no second reading"
+        );
+        let reading = reading(false).expect("the reading without comments");
+        let osv = |findings: &[Finding]| {
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+        };
+        let enrich = |reading: Option<&str>| {
+            enrich_command_readings_with_network(
+                &typed,
+                reading,
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        assert!(!osv(&enrich(None)));
+        let both = enrich(Some(&reading));
+        assert!(osv(&both), "{both:?}");
+        let plain = format!("pip install {name}==1.0.0");
+        assert_eq!(
+            enrich_command_readings_with_network(
+                &plain,
+                Some(&plain),
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+            .count(),
+            1,
+            "a package both readings hold is looked up once"
+        );
+        let (captured, _) = capture_cached_enrichment(
+            &typed,
+            Some(&reading),
+            ShellType::Posix,
+            &config,
+            chrono::Utc::now(),
+        );
+        assert!(osv(&captured), "{captured:?}");
     }
 
     #[derive(Default)]
@@ -2389,6 +2674,7 @@ mod tests {
 
     #[test]
     fn enrich_command_returns_empty_when_all_apis_disabled() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = ThreatIntelConfig {
             osv_enabled: false,
             deps_dev_enabled: false,
@@ -2475,7 +2761,7 @@ mod tests {
                 "later package was starved for {command}: {findings:?}"
             );
             assert!(findings.iter().any(|finding| {
-                finding.rule_id == RuleId::AnalysisIncomplete
+                finding.rule_id == RuleId::PackageLookupIncomplete
                     && finding.description.contains("slow-pkg")
                     && finding
                         .description
@@ -2494,7 +2780,7 @@ mod tests {
             &failed,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding.description.contains("OSV lookup transport failed")
                 && finding.description.contains("not evidence")
         }));
@@ -2513,7 +2799,7 @@ mod tests {
             &unsatisfied,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("registry default does not satisfy constraint")
@@ -2536,7 +2822,7 @@ mod tests {
             &backend,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("default-version resolution deadline exhausted")
@@ -2605,7 +2891,7 @@ mod tests {
         );
 
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("OSV lookup was skipped by offline mode")
@@ -2616,6 +2902,109 @@ mod tests {
                     .description
                     .contains("offline mode forbids DNS and HTTP")
         }));
+    }
+
+    /// A package lookup that could not be completed (here: offline with no
+    /// cached answer) is its own Medium rule, a warning rather than a block,
+    /// and never the High `analysis_incomplete` that unanalyzable command
+    /// structure produces. It still marks the enrichment as incomplete.
+    #[test]
+    fn package_lookup_gaps_have_their_own_rule_id_and_stay_medium() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: true,
+            ..ThreatIntelConfig::default()
+        };
+        for input in [
+            "pip install tirith-offline-command-fixture",
+            "npm install tirith-offline-npm-fixture@9.9.9",
+        ] {
+            let findings = enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            );
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::PackageLookupIncomplete
+                        && finding.severity == Severity::Medium
+                }),
+                "{input}: {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+            assert_eq!(
+                crate::verdict::action_from_findings(&findings),
+                crate::verdict::Action::Warn,
+                "{input}"
+            );
+            let (_, complete) = capture_cached_enrichment(
+                input,
+                None,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                chrono::Utc::now(),
+            );
+            assert!(!complete, "{input}");
+        }
+    }
+
+    /// Issue #264: a package manager named through a proven literal variable is
+    /// enriched exactly like the literal command, so indirection cannot skip
+    /// runtime package intelligence.
+    #[test]
+    fn variable_named_package_manager_is_enriched_like_the_literal() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            ..ThreatIntelConfig::default()
+        };
+        let enrich = |input: &str| {
+            enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        for (literal, indirect) in [
+            (
+                "P=pip; pip install tirith-offline-command-fixture==9.9.9",
+                r#"P=pip; "$P" install tirith-offline-command-fixture==9.9.9"#,
+            ),
+            (
+                "N=npm; npm install tirith-offline-npm-fixture@9.9.9",
+                r#"N=npm; "${N}" install tirith-offline-npm-fixture@9.9.9"#,
+            ),
+        ] {
+            let literal_findings = enrich(literal);
+            assert!(
+                literal_findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::PackageLookupIncomplete),
+                "{literal}: {literal_findings:?}"
+            );
+            let describe = |findings: &[Finding]| {
+                findings
+                    .iter()
+                    .map(|finding| (finding.rule_id, finding.description.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                describe(&enrich(indirect)),
+                describe(&literal_findings),
+                "{indirect}"
+            );
+        }
     }
 
     /// Runtime enrichment has three independent caps and every one of them used

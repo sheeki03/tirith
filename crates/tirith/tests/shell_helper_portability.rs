@@ -204,9 +204,11 @@ _tirith_preexec 3 1 'echo changed_command'
         );
         let output = run(&shell, "bash", root.path(), false, &script);
         assert_eq!(fs::read_to_string(history_log).unwrap(), "read\nread\n");
+        // Sourcing asks the pinned binary once for this shell's session ID;
+        // after that, only the drifted user line reaches `check`.
         assert_eq!(
             fs::read_to_string(check_log).unwrap(),
-            "check --shell posix --warn-only -- _tirith_preexec_prompt_begin\n"
+            "__session-id\ncheck --shell posix --warn-only -- _tirith_preexec_prompt_begin\n"
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("DRIFT_BLOCKED"));
     }
@@ -409,5 +411,51 @@ builtin printf 'STATUS=%s\nENTER_UNCHANGED\n' "$TIRITH_STATUS"
             String::from_utf8_lossy(&output.stderr).contains("hooks disabled"),
             "{family}: expected an explicit startup warning"
         );
+    }
+}
+
+/// A pinned binary older than the hooks (the hooks support one: they fall
+/// back to the legacy flow when the receipt capability probe fails) must keep
+/// its own protection. 0.4.1 reads an unknown `check` flag before `--` as the
+/// start of the checked command and allows `curl ... | sh`, and rejects one on
+/// `paste` as a usage error, so the bash and zsh hooks report their
+/// interactive-comments option only through `_TIRITH_INTERACTIVE_COMMENTS`,
+/// which an older binary ignores: never as a flag, and on every `check` and
+/// `paste` call.
+#[test]
+fn hooks_report_comment_recognition_without_a_new_flag() {
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shell/lib");
+    for hook in ["zsh-hook.zsh", "bash-hook.bash"] {
+        let source = fs::read_to_string(lib.join(hook)).expect("read hook");
+        assert!(
+            !source.contains("--no-interactive-comments"),
+            "{hook}: an older binary rejects or misreads this flag"
+        );
+        // Logical commands: continuation lines joined.
+        let mut commands = Vec::new();
+        let mut current = String::new();
+        for line in source.lines() {
+            match line.strip_suffix('\\') {
+                Some(head) => current.push_str(head),
+                None => {
+                    current.push_str(line);
+                    commands.push(std::mem::take(&mut current));
+                }
+            }
+        }
+        let calls: Vec<&String> = commands
+            .iter()
+            .filter(|command| {
+                command.contains("\"$_TIRITH_BIN\" check ")
+                    || command.contains("\"$_TIRITH_BIN\" paste ")
+            })
+            .collect();
+        assert!(calls.len() >= 4, "{hook}: {calls:#?}");
+        for call in calls {
+            assert!(
+                call.contains("_TIRITH_INTERACTIVE_COMMENTS=\"$comment_reading\""),
+                "{hook}: a check or paste call must report the option: {call}"
+            );
+        }
     }
 }

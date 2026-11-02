@@ -297,17 +297,37 @@ impl ConnectionWitness {
         self.input.revalidate()
     }
     /// Private cache/review binding, not a public hash or authorization token.
+    ///
+    /// It is persisted in the enrollment record, so it binds only facts that
+    /// stay stable while the selection is unchanged: the configuration scope,
+    /// the exact record bytes and the file's own stable identity (its index
+    /// plus, on Linux, its birth time; see `native::Facts::stable_identity`),
+    /// so a replacement file is a new selection even when it reuses a freed
+    /// inode number. Modification and change times, permission bits and device
+    /// numbers are not bound: `touch`, `chmod` or a reboot that renumbers a
+    /// filesystem must not invalidate an enrollment. Live retained-handle
+    /// checks still use the full native generation through [`Self::revalidate`].
     pub fn private_selection_commitment(&self) -> Result<PrivateCommitment, ConnectionError> {
         self.revalidate()?;
-        let bytes = serde_json::to_vec(&(
-            self.scope.to_str().ok_or(ConnectionError::UnsafeStorage)?,
-            self.input.parents.private_identity(),
-            format!("{:?}", self.input.generation),
+        Self::selection_commitment(
+            &self.scope,
+            self.input.generation.as_ref(),
             self.input.bytes.as_deref(),
+        )
+    }
+    fn selection_commitment(
+        scope: &Path,
+        generation: Option<&native::Facts>,
+        bytes: Option<&[u8]>,
+    ) -> Result<PrivateCommitment, ConnectionError> {
+        let bytes = serde_json::to_vec(&(
+            scope.to_str().ok_or(ConnectionError::UnsafeStorage)?,
+            generation.map(native::Facts::stable_identity),
+            bytes,
         ))
         .map_err(|_| ConnectionError::InvalidInput)?;
         Ok(PrivateCommitment::of(
-            "tirith.team.selected-connection.v1",
+            "tirith.team.selected-connection.v3",
             &bytes,
         ))
     }
@@ -434,10 +454,7 @@ impl PreparedConnection {
         })
     }
     pub fn revalidate(&self) -> Result<(), ConnectionError> {
-        let now: u64 = chrono::Utc::now()
-            .timestamp_millis()
-            .try_into()
-            .map_err(|_| ConnectionError::AuthenticationFailed)?;
+        let now = crate::util::now_ms().ok_or(ConnectionError::AuthenticationFailed)?;
         self.caps
             .validate(now)
             .map_err(|_| ConnectionError::AuthenticationFailed)?;
@@ -481,6 +498,87 @@ impl PreparedConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// ext4 hands a freed inode number to the next file created, so a
+    /// same-bytes replacement can carry the old index. Its birth time differs,
+    /// and the persisted commitment binds it.
+    #[test]
+    fn a_replacement_that_reuses_the_file_index_is_a_new_selection() {
+        let scope = Path::new("/home/user/.config/tirith");
+        let bytes = Some(b"identical connection bytes".as_slice());
+        let commit = |facts: &native::Facts| {
+            ConnectionWitness::selection_commitment(scope, Some(facts), bytes).unwrap()
+        };
+        let original = native::Facts::for_test(42, Some((1_700_000_000, 5)));
+        assert_eq!(
+            commit(&original),
+            commit(&native::Facts::for_test(42, Some((1_700_000_000, 5))))
+        );
+        let reused_index = native::Facts::for_test(42, Some((1_700_000_100, 7)));
+        assert_ne!(commit(&original), commit(&reused_index));
+        let new_index = native::Facts::for_test(43, Some((1_700_000_000, 5)));
+        assert_ne!(commit(&original), commit(&new_index));
+        // Where no birth time exists the index alone is bound, as before.
+        assert_ne!(
+            commit(&native::Facts::for_test(42, None)),
+            commit(&native::Facts::for_test(43, None))
+        );
+    }
+    /// The birth time the commitment binds is read from the live file on
+    /// Linux and Android, including musl builds, and it does not move with
+    /// `touch`. The file lives under the build directory (a real disk), not
+    /// in `/tmp`, which can be a tmpfs. There is no silent skip: a missing
+    /// birth time on Linux, or on Android from API level 30, fails this test
+    /// (R4.9). Below API level 30 statx may not be called, and the birth time
+    /// must be `None`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_birth_time_is_bound_and_survives_touch() {
+        let build_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let dir = tempfile::tempdir_in(build_dir).unwrap();
+        let path = dir.path().join("connection.json");
+        std::fs::write(&path, b"bytes").unwrap();
+        let file = File::open(&path).unwrap();
+        let (_, birth) = native::Facts::for_live_test(&file).stable_identity();
+        if !native::statx_may_be_called() {
+            assert_eq!(birth, None);
+            return;
+        }
+        let birth = birth.unwrap_or_else(|| {
+            panic!(
+                "no birth time for {}: statx(STATX_BTIME) must provide one on Linux and \
+                 Android (glibc, musl and bionic alike); without it a same-bytes \
+                 replacement that reuses the inode is not a new selection",
+                path.display()
+            )
+        });
+        // glibc std reads the same statx field, so linux-gnu commitments are
+        // unchanged by reading it directly.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let since = file
+                .metadata()
+                .unwrap()
+                .created()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            assert_eq!(birth, (since.as_secs(), since.subsec_nanos()));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            native::Facts::for_live_test(&file).stable_identity().1,
+            Some(birth)
+        );
+    }
     fn record() -> Record {
         Record {
             schema_version: SCHEMA_VERSION,
@@ -604,6 +702,7 @@ mod tests {
         }
         #[test]
         fn retained_input_detects_same_size_rewrite() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -613,6 +712,7 @@ mod tests {
         }
         #[test]
         fn retained_input_detects_same_bytes_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -640,6 +740,7 @@ mod tests {
         }
         #[test]
         fn private_inputs_reject_symlink_hardlink_shared_mode_fifo_and_size() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let path = root.path().join("token");
             private_file(&path, &[b'a'; 64]);
@@ -661,6 +762,7 @@ mod tests {
         }
         #[test]
         fn private_parent_and_mutated_ancestor_refuse() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = root();
             let parent = root.path().join("team-policy");
             std::fs::create_dir(&parent).unwrap();

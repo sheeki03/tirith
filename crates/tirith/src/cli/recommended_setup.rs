@@ -8,7 +8,7 @@ pub fn run(
     plan_only: bool,
     json: bool,
 ) -> i32 {
-    use super::setup::recommended::{RecommendedSetup, SelectedAgent, SetupScope};
+    use super::setup::recommended::RecommendedSetup;
     use super::setup::shell_service::ShellKind;
     use tirith_core::protection_profiles::ProtectionProfile;
     let id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -17,24 +17,21 @@ pub fn run(
         let shell = shell.map(ShellKind::parse).transpose()?;
         let profile = ProtectionProfile::parse(profile.unwrap_or("balanced"))
             .ok_or("unknown personal protection profile")?;
-        let agents = agents
-            .iter()
-            .map(|agent| match agent.as_str() {
-                "claude-code" => Ok(SelectedAgent::ClaudeCode),
-                "codex" => Ok(SelectedAgent::Codex),
-                "cursor" => Ok(SelectedAgent::Cursor),
-                "windsurf" => Ok(SelectedAgent::Windsurf),
-                _ => Err("unknown selected agent".to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if agents.iter().any(|agent| agent != "claude-code") {
+            return Err("unknown selected agent".to_string());
+        }
+        if agents.len() > 1 {
+            return Err(
+                "duplicate agent selections are ambiguous; select each supported host once".into(),
+            );
+        }
         let cwd = std::env::current_dir().map_err(|_| "current project is unavailable")?;
         super::setup::recommended::prepare(
             &id,
             RecommendedSetup {
-                scope: SetupScope::User,
                 shell,
                 profile,
-                agents,
+                claude_code: !agents.is_empty(),
             },
             cwd.to_str(),
             dry_run,

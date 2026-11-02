@@ -701,6 +701,7 @@ mod tests {
 
     #[test]
     fn verify_returns_mismatch_for_non_known_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No network request — the host parse fails first, and a present but
         // unrecognized claimed repository is a Mismatch, not Unverifiable.
         let v = verify("https://example.com/owner/repo", Ecosystem::Npm, "p");
@@ -710,6 +711,7 @@ mod tests {
 
     #[test]
     fn verify_returns_unverifiable_for_unsupported_ecosystem() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No manifest filename for Docker — Unverifiable, not a panic.
         let v = verify(
             "https://github.com/owner/repo",

@@ -43,10 +43,7 @@ impl ProtectionEvidence {
         Self,
     ) {
         let mut observation = proof.into_current_observation();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or(0);
+        let now = tirith_core::util::now_ms().unwrap_or(0);
         if observation.status
             == tirith_core::execution_state::ShellVerificationStatus::ObservedBlocking
             && (observation.observed_unix_ms.is_none_or(|at| at > now)
@@ -184,12 +181,14 @@ mod tests {
     }
     #[test]
     fn absent_exported_signal_does_not_prove_missing_activation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let evidence = ProtectionEvidence::configuration("off", true, true);
         assert_eq!(evidence.state, ProtectionState::Configured);
         assert!(!evidence.verified_blocking);
     }
     #[test]
     fn inherited_blocking_even_with_configuration_cannot_verify() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let evidence = ProtectionEvidence::configuration("guarded", true, true);
         assert_eq!(evidence.state, ProtectionState::Configured);
         assert!(!evidence.verified_blocking);
@@ -197,6 +196,7 @@ mod tests {
     }
     #[test]
     fn public_report_dto_cannot_promote_current_or_saved_success() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut observation = observation();
         for status in [
             ShellVerificationStatus::Pending,
@@ -217,6 +217,7 @@ mod tests {
     }
     #[test]
     fn disposable_or_unauthenticated_result_cannot_certify_the_caller() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut value = observation();
         value.scope = "disposable_child_only";
         assert!(!ProtectionEvidence::from_report(&value).verified_blocking);

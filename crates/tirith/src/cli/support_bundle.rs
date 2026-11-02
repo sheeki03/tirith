@@ -29,9 +29,7 @@ impl Selection {
         for values in [&self.operation_ids, &self.incident_ids] {
             let mut seen = BTreeSet::new();
             for id in values {
-                if !uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == *id)
-                    || !seen.insert(id)
-                {
+                if !tirith_core::util::is_uuid(id) || !seen.insert(id) {
                     return Err("bundle selections must be unique canonical UUIDs".into());
                 }
             }
@@ -68,7 +66,6 @@ fn preview_with_snapshot(
                 service
                     .as_ref()
                     .and_then(|service| service.read_status(id).ok()),
-                super::selfupdate::lifecycle_operations::support_status(id).ok(),
             ));
         }
     }
@@ -77,31 +74,25 @@ fn preview_with_snapshot(
     } else {
         let path =
             tirith_core::audit::audit_log_path().ok_or("audit history location is unavailable")?;
-        Some(HistoryReader::new(path).query(
-            None,
+        // Newest records first: a selected incident is usually recent, and a
+        // forward read of the suffix would stop after its oldest 500 records.
+        Some(HistoryReader::new(path).recent(
             HistoryFilter::default(),
             500,
-            std::env::var("TIRITH_LOG").ok().as_deref() != Some("0"),
+            tirith_core::audit::logging_enabled(),
         )?)
     };
     let patterns = captured_policy_dlp_patterns_or(&snapshot.policy.dlp_custom_patterns);
     let compiled = CompiledCustomPatterns::new_silent(&patterns);
     let mut operations = Vec::new();
-    for (id, status, lifecycle) in selected_operations {
-        let entry = match (status, lifecycle) {
-            (Some(status), None) => {
+    for (id, status) in selected_operations {
+        let entry = match status {
+            Some(status) => {
                 let mut content = super::profile::status_projection(&status, &compiled)?;
                 redact_home(&mut content, home.as_deref());
                 bounded_entry("operation", id, content)
             }
-            (None, Some(status)) => {
-                let mut content = serde_json::to_value(status)
-                    .map_err(|_| "cannot project selected lifecycle operation")?;
-                redact_lifecycle(&mut content, &compiled);
-                redact_home(&mut content, home.as_deref());
-                bounded_entry("operation", id, content)
-            }
-            _ => json!({"kind":"operation", "id":id, "availability":"unavailable",
+            None => json!({"kind":"operation", "id":id, "availability":"unavailable",
                 "detail":"The selected private operation was absent, unreadable, or ambiguous; it was not reconciled or replayed."}),
         };
         operations.push(entry);
@@ -199,23 +190,6 @@ fn preview_with_snapshot(
     Ok((report, snapshot))
 }
 
-fn redact_lifecycle(value: &mut Value, compiled: &CompiledCustomPatterns) {
-    // UUIDs, phases, action enums, and timestamps remain protocol fields. Only
-    // selected human-readable evidence receives display redaction.
-    for pointer in [
-        "/operation/preview/current_version",
-        "/operation/preview/candidate_version",
-        "/operation/preview/evidence",
-        "/operation/preview/issues",
-        "/operation/next_action",
-        "/selected_failure_detail",
-    ] {
-        if let Some(content) = value.pointer_mut(pointer) {
-            tirith_core::redact::redact_json_strings(content, compiled);
-        }
-    }
-}
-
 fn bounded_entry(kind: &str, id: &str, content: Value) -> Value {
     if serde_json::to_vec_pretty(&content).map_or(true, |bytes| bytes.len() > 16 * 1024) {
         json!({"kind":kind,"id":id,"availability":"withheld_output_limit"})
@@ -242,7 +216,7 @@ fn save(
     cwd: Option<&str>,
 ) -> Result<PathBuf, String> {
     use super::setup::change_plan::{
-        Edit, JobState, MutationService, OperationKind, RequestedChange,
+        Edit, JobState, MutationService, OperationKind, PlanRequest, RequestedChange,
     };
     let root = tirith_core::policy::state_dir().ok_or("private state directory is unavailable")?;
     let dir = root.join("support");
@@ -256,8 +230,7 @@ fn save(
     // The original capture binds the privacy rules used by the report. A policy
     // change refuses publication instead of trying to redact an already altered
     // string under a different policy. The shared writer also enforces task scope.
-    service.plan_with_preimages_and_intent(
-        &id,
+    let request = PlanRequest::change(
         OperationKind::ExportSupport,
         vec![RequestedChange {
             target: path.clone(),
@@ -266,15 +239,12 @@ fn save(
             activation: false,
             description: "Save the selected redacted support report locally".into(),
         }],
-        snapshot,
-        &std::collections::BTreeMap::from([(path.clone(), None)]),
-        &json!({"kind":"support_export_v1","selection":selection,"cwd":cwd,"report":report}),
-    )?;
+    )
+    .preimages(std::collections::BTreeMap::from([(path.clone(), None)]))
+    .intent(&json!({"kind":"support_export_v1","selection":selection,"cwd":cwd,"report":report}))?;
+    service.submit(&id, snapshot, request)?;
     let status = service.apply(&id, snapshot)?;
-    if !matches!(
-        status.state,
-        JobState::Completed | JobState::CompletedWithRecovery
-    ) {
+    if status.state != JobState::Completed {
         return Err(format!(
             "support export did not complete; inspect saved operation {id}"
         ));
@@ -353,21 +323,6 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn lifecycle_selection_redacts_evidence_and_preserves_protocol() {
-        let mut value = json!({"operation":{"operation_id":"id","phase":"cancelled","action":"update",
-            "preview":{"current_version":"private-version","candidate_version":"private-candidate","evidence":"private-evidence","issues":["private-issue"]},
-            "next_action":"private-instruction","published":false},"selected_failure_detail":"private-detail"});
-        redact_lifecycle(
-            &mut value,
-            &CompiledCustomPatterns::new_silent(&[".+".into()]),
-        );
-        assert!(!value.to_string().contains("private-"));
-        assert_eq!(value["operation"]["operation_id"], "id");
-        assert_eq!(value["operation"]["phase"], "cancelled");
-        assert_eq!(value["operation"]["action"], "update");
-        assert_eq!(value["operation"]["published"], false);
-    }
     #[test]
     fn selection_rejects_paths_duplicate_ids_and_excess_work() {
         assert!(Selection {

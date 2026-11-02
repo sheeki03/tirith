@@ -150,9 +150,12 @@ operator will meet it.
 3. **Task effect inference covers only the Web3 shell grammar,** so nearly every
    ordinary SHELL command reads as incomplete. `action_incomplete_analysis: block`
    under `mode: enforce` refuses those at the five boundaries that submit a shell
-   envelope, and changes nothing at the four package and config-write boundaries,
-   which always assess as complete. Documented in the module, in the threat
-   model, in the cookbook, and pinned by a fixture.
+   envelope, and also refuses the narrative actions that MCP tool calls the
+   gateway cannot model, `tirith verify-self`, `tirith update --dry-run` and the
+   dashboard's ThreatDB refresh submit. It changes nothing at config writes,
+   `tirith fetch`, or a real `tirith update` or rollback, which always assess as
+   complete. Documented in the module, in the threat model, in the cookbook, and
+   pinned by a fixture.
 4. **The browser baseline is signed but not anchored** in the audit hash chain,
    and **Chrome's `Secure Preferences` MAC is not verified.**
 5. **The build, deployment, and npm receipts are not anchored** in the audit
@@ -178,9 +181,10 @@ operator will meet it.
    are parsed, validated, and merged, but no rule reads them. `approves_web3`
    has no caller, and `command-card create` cannot author a Web3 card. Wiring
    either is a behaviour change and belongs to its own slice.
-10. **Only `gateway_forward` records task-gate decisions.** `is_recordable()`
-    has a single production caller, so the other eight owned boundaries write
-    nothing in observe or enforce mode and cannot be measured by a burn-in.
+10. **Two owned boundaries record no task-gate decisions.** Seven of the nine
+    write the assessments that `is_recordable()` accepts; `config_write` and
+    `capsule_preset_run` write nothing in observe or enforce mode and cannot be
+    measured by a burn-in.
 
 ## Verification
 

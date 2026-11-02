@@ -77,9 +77,7 @@ use std::marker::PhantomData;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-use crate::artifact::resolver::ResolverRequest;
 use crate::effects::{BoundaryCapability, CommandEffectKind};
-use crate::package_approval::VerifiedPackageApproval;
 use crate::task::{
     assign_provenance, decide_with_boundary_effects_and_context, decide_with_verified_evidence,
     decision_projection, infer_effects_detailed_with_context,
@@ -101,18 +99,16 @@ pub enum OwnedBoundary {
     /// The MCP gateway is about to register a pending request and write the
     /// call upstream.
     GatewayForward,
-    /// `tirith pkg approve` is about to run the resolver: PATH lookup,
-    /// quarantine creation, DNS, and artifact download.
+    /// `tirith pkg approve` running the pip resolver. Not reached: approve
+    /// refuses before any resolver work. The token stays so task receipts, MCP
+    /// schemas, and policies that name it keep parsing.
     PackageApproval,
-    /// `tirith pkg install` is about to run the same resolver network.
+    /// `tirith pkg install` running the pip resolver. Not reached: install
+    /// refuses first. Kept as a wire token, like [`Self::PackageApproval`].
     PackageResolve,
-    /// `tirith pkg install` is about to checkpoint the target environment and
-    /// prepare the contained install.
+    /// `tirith pkg install` preparing a contained install. Not reached: install
+    /// refuses first. Kept as a wire token, like [`Self::PackageApproval`].
     PackageInstallPreparation,
-    /// Retained local npm bytes become inert files under a held new tree.
-    LocalPackageMaterialization,
-    /// Fresh exact-tree confirmation or delete-only recovery authorization.
-    LocalPackageRecovery,
     /// `tirith install <manager>` is about to contact a registry.
     PackageManagerNetwork,
     /// `tirith install <manager>` is about to spawn the package manager.
@@ -130,7 +126,9 @@ pub enum OwnedBoundary {
     /// contact the fixed Tirith release origin.
     VerifySelf,
     /// `tirith update` is about to contact the fixed release origin and perform
-    /// a retained, paired binary/helper update or rollback transaction.
+    /// a retained, paired binary/helper update or rollback transaction, or the
+    /// dashboard's "Refresh threat DB now" is about to refresh the threat
+    /// database (`authorize_threatdb_refresh` in the CLI).
     SelfUpdate,
     /// `tirith capsule run --preset untrusted-project` is about to copy an
     /// untrusted project into a held ephemeral directory and launch the
@@ -147,8 +145,6 @@ impl OwnedBoundary {
             Self::PackageApproval => "package_approval",
             Self::PackageResolve => "package_resolve",
             Self::PackageInstallPreparation => "package_install_preparation",
-            Self::LocalPackageMaterialization => "local_package_materialization",
-            Self::LocalPackageRecovery => "local_package_recovery",
             Self::PackageManagerNetwork => "package_manager_network",
             Self::PackageManagerExecution => "package_manager_execution",
             Self::RemoteScriptRun => "remote_script_run",
@@ -450,14 +446,8 @@ macro_rules! boundary_markers {
 
 boundary_markers!(
     (GatewayForwardBoundary, GatewayForward),
-    (PackageApprovalBoundary, PackageApproval),
     (PackageResolveBoundary, PackageResolve),
     (PackageInstallPreparationBoundary, PackageInstallPreparation),
-    (
-        LocalPackageMaterializationBoundary,
-        LocalPackageMaterialization
-    ),
-    (LocalPackageRecoveryBoundary, LocalPackageRecovery),
     (PackageManagerNetworkBoundary, PackageManagerNetwork),
     (PackageManagerExecutionBoundary, PackageManagerExecution),
     (RemoteScriptRunBoundary, RemoteScriptRun),
@@ -476,8 +466,6 @@ mod approval_boundary_sealed {
 /// and turn `RequireApproval` into `Allow`.
 pub trait ApprovalCapableBoundary: BoundaryMarker + approval_boundary_sealed::Sealed {}
 
-impl approval_boundary_sealed::Sealed for PackageInstallPreparationBoundary {}
-impl ApprovalCapableBoundary for PackageInstallPreparationBoundary {}
 impl approval_boundary_sealed::Sealed for PackageManagerExecutionBoundary {}
 impl ApprovalCapableBoundary for PackageManagerExecutionBoundary {}
 
@@ -490,76 +478,6 @@ struct BoundaryApprovalEvidence<B: ApprovalCapableBoundary> {
     nonce: String,
     not_after: Option<DateTime<Utc>>,
     marker: PhantomData<fn() -> B>,
-}
-
-/// Opaque, non-cloneable capability returned only from a cryptographically
-/// verified native-authority package approval. It is bound to both the final
-/// plan digest and the exact install-preparation operation.
-pub struct PackageInstallApprovalChannel {
-    evidence: BoundaryApprovalEvidence<PackageInstallPreparationBoundary>,
-}
-
-/// Canonical preparation operation for one already-resolved, expiry-independent
-/// install plan. It is derived entirely from signed-plan fields; callers cannot
-/// add an unrelated action while retaining the same operation identity.
-pub fn package_install_plan_envelope(
-    requested_plan: &crate::artifact::install::InstallPlanDigest,
-) -> Result<TaskEnvelopeInput, BoundaryAuthorizationError> {
-    let requested = crate::package_approval::expiry_independent_plan(requested_plan)
-        .map_err(|_| BoundaryAuthorizationError::ApprovalMismatch)?;
-    let mut source = unattributed_source();
-    source.content = format!(
-        "tirith-package-install-plan:v2:sha256:{}",
-        requested.plan_digest
-    );
-    Ok(TaskEnvelopeInput {
-        task_id: None,
-        sources: vec![source],
-        actions: vec![ProposedAction::PackageInstall {
-            ecosystem: "pip".to_string(),
-            package: format!("plan-sha256:{}", requested.plan_digest),
-        }],
-        requested_effects: BTreeSet::new(),
-    })
-}
-
-impl PackageInstallApprovalChannel {
-    /// Consume opaque proof minted only after schema-v2 signature, authority,
-    /// freshness, and exact-plan verification, and bind it to the final typed
-    /// preparation operation. No boolean or self-consistent digest can mint this
-    /// channel.
-    pub fn from_native_authority(
-        approval: VerifiedPackageApproval,
-        operation: &BoundaryOperation<'_>,
-    ) -> Result<Self, BoundaryAuthorizationError> {
-        let expected_envelope = package_install_plan_envelope(approval.requested_plan())?;
-        let expected_operation = BoundaryOperation {
-            boundary: OwnedBoundary::PackageInstallPreparation,
-            envelope: &expected_envelope,
-            adapter: IngressAdapter::Unattributed,
-            boundary_effects: BTreeSet::new(),
-        };
-        if operation_binding_digest(operation) != operation_binding_digest(&expected_operation) {
-            return Err(BoundaryAuthorizationError::ApprovalMismatch);
-        }
-        let not_after = DateTime::parse_from_rfc3339(approval.expires_at())
-            .map_err(|_| BoundaryAuthorizationError::ApprovalMismatch)?
-            .with_timezone(&Utc);
-        let channel_binding_sha256 = approval_channel_binding(&serde_json::json!({
-            "channel": "native_package_approval_v2",
-            "authority_key_id": approval.authority_key_id(),
-            "approved_plan_digest": approval.approved_plan_digest(),
-            "requested_plan_digest": approval.requested_plan_digest(),
-            "approved_expiry": approval.expires_at(),
-        }));
-        Ok(Self {
-            evidence: approval_evidence_for::<PackageInstallPreparationBoundary>(
-                operation,
-                channel_binding_sha256,
-                Some(not_after),
-            )?,
-        })
-    }
 }
 
 /// Which real package-manager confirmation channel produced an approval.
@@ -653,6 +571,9 @@ fn confirm_package_manager_tty(prompt: &str) -> Result<(), BoundaryAuthorization
     }
 }
 
+/// Test-only evidence minter. Production evidence comes only from
+/// [`PackageManagerApprovalChallenge::confirm_cli`].
+#[cfg(test)]
 fn approval_evidence_for<B: ApprovalCapableBoundary>(
     operation: &BoundaryOperation<'_>,
     channel_binding_sha256: String,
@@ -740,7 +661,6 @@ pub struct PendingBoundaryAuthorization<B: BoundaryMarker> {
     approval_satisfied: bool,
     approval_not_after: Option<DateTime<Utc>>,
     operation_binding_sha256: String,
-    task_gate_sha256: String,
     marker: PhantomData<fn() -> B>,
 }
 
@@ -888,7 +808,6 @@ impl<B: BoundaryMarker> PendingBoundaryAuthorization<B> {
         }
         Ok(ReservedBoundaryAuthorization {
             operation_binding_sha256,
-            task_gate_sha256: self.task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -938,7 +857,6 @@ impl<B: BoundaryMarker> PendingBoundaryAuthorization<B> {
         }
         Ok(TaskBoundaryPermit {
             operation_binding_sha256: self.operation_binding_sha256,
-            task_gate_sha256: self.task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -962,7 +880,6 @@ enum ReservedReplayAuthorization {
 #[must_use = "a reserved task authorization must be committed or aborted"]
 pub struct ReservedBoundaryAuthorization<B: BoundaryMarker> {
     operation_binding_sha256: String,
-    task_gate_sha256: String,
     boundary_operation_sha256: BTreeSet<String>,
     verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1092,7 +1009,6 @@ impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
         }
         let ReservedBoundaryAuthorization {
             operation_binding_sha256,
-            task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -1120,7 +1036,6 @@ impl<B: BoundaryMarker> ReservedBoundaryAuthorization<B> {
         }
         Ok(TaskBoundaryPermit {
             operation_binding_sha256,
-            task_gate_sha256,
             boundary_operation_sha256,
             verified_receipts,
             not_after,
@@ -1143,17 +1058,6 @@ impl<B: ApprovalCapableBoundary> PendingBoundaryAuthorization<B> {
         self.approval_satisfied = true;
         self.approval_not_after = earliest_deadline(self.approval_not_after, evidence.not_after);
         Ok(self)
-    }
-}
-
-impl PendingBoundaryAuthorization<PackageInstallPreparationBoundary> {
-    /// Attach a native-authority-verified package-install channel capability.
-    /// No boolean or operation-only evidence API exists.
-    pub fn with_package_install_approval(
-        self,
-        approval: PackageInstallApprovalChannel,
-    ) -> Result<Self, BoundaryAuthorizationError> {
-        self.attach_approval(approval.evidence)
     }
 }
 
@@ -1180,7 +1084,6 @@ impl PendingBoundaryAuthorization<PackageManagerExecutionBoundary> {
 #[must_use = "the task boundary permit must be consumed by its side-effect API"]
 pub struct TaskBoundaryPermit<B: BoundaryMarker> {
     operation_binding_sha256: String,
-    task_gate_sha256: String,
     boundary_operation_sha256: BTreeSet<String>,
     verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1193,7 +1096,6 @@ pub struct TaskBoundaryPermit<B: BoundaryMarker> {
 /// before it happens.
 pub struct TaskBoundaryEffectLease<B: BoundaryMarker> {
     operation_binding_sha256: String,
-    task_gate_sha256: String,
     _boundary_operation_sha256: BTreeSet<String>,
     _verified_receipts: usize,
     not_after: Option<DateTime<Utc>>,
@@ -1201,20 +1103,6 @@ pub struct TaskBoundaryEffectLease<B: BoundaryMarker> {
 }
 
 impl<B: BoundaryMarker> TaskBoundaryEffectLease<B> {
-    pub fn authorize_effect_for_gate_at(
-        &self,
-        operation: &BoundaryOperation<'_>,
-        gate: &TaskGatePolicy,
-        now: DateTime<Utc>,
-    ) -> Result<(), BoundaryAuthorizationError> {
-        if self.task_gate_sha256 != gate_digest(gate) {
-            return Err(BoundaryAuthorizationError::InvalidTrustedContext(
-                "task_gate_changed",
-            ));
-        }
-        self.authorize_effect_at(operation, now)
-    }
-
     pub fn authorize_effect_at(
         &self,
         operation: &BoundaryOperation<'_>,
@@ -1233,22 +1121,6 @@ impl<B: BoundaryMarker> TaskBoundaryEffectLease<B> {
 }
 
 impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
-    /// Consume only when this is the exact policy gate that issued the permit.
-    /// Operation equality alone cannot prove provenance was required/enforced.
-    pub fn into_effect_lease_for_gate_at(
-        self,
-        operation: &BoundaryOperation<'_>,
-        gate: &TaskGatePolicy,
-        now: DateTime<Utc>,
-    ) -> Result<TaskBoundaryEffectLease<B>, BoundaryAuthorizationError> {
-        if self.task_gate_sha256 != gate_digest(gate) {
-            return Err(BoundaryAuthorizationError::InvalidTrustedContext(
-                "task_gate_changed",
-            ));
-        }
-        self.into_effect_lease_at(operation, now)
-    }
-
     pub fn binds_operation(&self, operation: &BoundaryOperation<'_>) -> bool {
         operation.boundary == B::BOUNDARY
             && self.operation_binding_sha256 == operation_binding_digest(operation)
@@ -1269,7 +1141,6 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
     ) -> Self {
         Self {
             operation_binding_sha256: operation_binding_digest(operation),
-            task_gate_sha256: gate_digest(&TaskGatePolicy::default()),
             boundary_operation_sha256: BTreeSet::new(),
             verified_receipts: 0,
             not_after: Some(not_after),
@@ -1294,7 +1165,6 @@ impl<B: BoundaryMarker> TaskBoundaryPermit<B> {
     ) -> Result<TaskBoundaryEffectLease<B>, BoundaryAuthorizationError> {
         let lease = TaskBoundaryEffectLease {
             operation_binding_sha256: self.operation_binding_sha256,
-            task_gate_sha256: self.task_gate_sha256,
             _boundary_operation_sha256: self.boundary_operation_sha256,
             _verified_receipts: self.verified_receipts,
             not_after: self.not_after,
@@ -1351,7 +1221,6 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
                 assessment,
                 PendingReplayAuthorization::NotRequired,
                 self.operation_binding_sha256,
-                gate_digest(&self.gate),
             );
         }
 
@@ -1383,7 +1252,6 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
             assessment,
             PendingReplayAuthorization::Required(evidence),
             self.operation_binding_sha256,
-            gate_digest(&self.gate),
         )
     }
 
@@ -1400,20 +1268,10 @@ impl<B: BoundaryMarker> BoundaryAuthorizationChallenge<B> {
     }
 }
 
-fn gate_digest(gate: &TaskGatePolicy) -> String {
-    crate::command_card::sha256_hex(
-        crate::audit::canonical_json_for_hash(
-            &serde_json::json!({"domain":"tirith-task-gate-permit-v1","gate":gate}),
-        )
-        .as_bytes(),
-    )
-}
-
 fn pending_from_assessment<B: BoundaryMarker>(
     assessment: BoundaryAssessment,
     replay: PendingReplayAuthorization,
     operation_binding_sha256: String,
-    task_gate_sha256: String,
 ) -> Result<PendingBoundaryAuthorization<B>, BoundaryAuthorizationError> {
     let approval_required = match &assessment.outcome {
         BoundaryOutcome::Allow => false,
@@ -1438,7 +1296,6 @@ fn pending_from_assessment<B: BoundaryMarker>(
         approval_satisfied: false,
         approval_not_after: None,
         operation_binding_sha256,
-        task_gate_sha256,
         marker: PhantomData,
     })
 }
@@ -1899,125 +1756,6 @@ pub fn fetch_cloaking_operation_binding(
     })
 }
 
-/// Stable identity of the held package-install target selected before resolver
-/// or checkpoint side effects. The path itself is represented by a digest so a
-/// task receipt never exposes a local filesystem name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackageTargetIdentity {
-    target_path_sha256: String,
-    parent_identity: String,
-    target_component: String,
-}
-
-impl PackageTargetIdentity {
-    pub fn new(
-        target_path_sha256: impl Into<String>,
-        parent_identity: impl Into<String>,
-        target_component: impl Into<String>,
-    ) -> Self {
-        Self {
-            target_path_sha256: target_path_sha256.into(),
-            parent_identity: parent_identity.into(),
-            target_component: target_component.into(),
-        }
-    }
-}
-
-/// The complete package request that an owned resolver or checkpoint boundary
-/// must bind. Keeping the resolver request by reference prevents a caller from
-/// accidentally authorizing only its displayed requirements while omitting
-/// indexes or resolver allowances.
-pub struct PackageOperationBinding<'a> {
-    ecosystem: &'a str,
-    request: &'a ResolverRequest,
-    artifact_origins: &'a [String],
-    target: &'a PackageTargetIdentity,
-}
-
-impl<'a> PackageOperationBinding<'a> {
-    pub fn new(
-        ecosystem: &'a str,
-        request: &'a ResolverRequest,
-        artifact_origins: &'a [String],
-        target: &'a PackageTargetIdentity,
-    ) -> Self {
-        Self {
-            ecosystem,
-            request,
-            artifact_origins,
-            target,
-        }
-    }
-}
-
-/// A package argv larger than the task-envelope action ceiling cannot be
-/// represented exactly and is therefore rejected rather than truncated.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum PackageEnvelopeError {
-    #[error(
-        "package request has {provided} requirements, exceeding the exact authorization limit of {max}"
-    )]
-    TooManyRequirements { provided: usize, max: usize },
-}
-
-/// Build the exact envelope for a package operation. Every requirement remains
-/// a visible action, while the unattributed source carries only a
-/// domain-separated digest of the canonical full request projection: raw
-/// requirements, registry/index endpoints, broker-only artifact origins,
-/// resolver allowances, and held target identity.
-pub fn package_envelope(
-    binding: &PackageOperationBinding<'_>,
-) -> Result<TaskEnvelopeInput, PackageEnvelopeError> {
-    if binding.request.requirements.len() > crate::task::MAX_ACTIONS {
-        return Err(PackageEnvelopeError::TooManyRequirements {
-            provided: binding.request.requirements.len(),
-            max: crate::task::MAX_ACTIONS,
-        });
-    }
-
-    let allowances = &binding.request.allowances;
-    let projection = serde_json::json!({
-        "binding_version": 1,
-        "ecosystem": binding.ecosystem,
-        "requirements": binding.request.requirements,
-        "index_urls": binding.request.index_urls,
-        "artifact_origins": binding.artifact_origins,
-        "resolver_allowances": {
-            "allow_sdist": allowances.allow_sdist,
-            "allow_vcs": allowances.allow_vcs,
-            "allow_editable": allowances.allow_editable,
-            "allow_local_path": allowances.allow_local_path,
-            "allow_direct_url": allowances.allow_direct_url,
-            "allow_untrusted_tool": allowances.allow_untrusted_tool,
-        },
-        "target": {
-            "path_sha256": binding.target.target_path_sha256,
-            "parent_identity": binding.target.parent_identity,
-            "component": binding.target.target_component,
-        },
-    });
-    let binding_sha256 = crate::command_card::sha256_hex(
-        crate::audit::canonical_json_for_hash(&projection).as_bytes(),
-    );
-    let mut source = unattributed_source();
-    source.content = format!("tirith-package-operation:v1:sha256:{binding_sha256}");
-
-    Ok(TaskEnvelopeInput {
-        task_id: None,
-        sources: vec![source],
-        actions: binding
-            .request
-            .requirements
-            .iter()
-            .map(|package| ProposedAction::PackageInstall {
-                ecosystem: binding.ecosystem.to_string(),
-                package: package.clone(),
-            })
-            .collect(),
-        requested_effects: BTreeSet::new(),
-    })
-}
-
 /// Complete, privacy-preserving identity of a Tirith-owned configuration write.
 /// The path remains visible as the action so effect inference can classify
 /// sensitive destinations; every other binding is represented only by its
@@ -2404,6 +2142,7 @@ mod tests {
 
     #[test]
     fn the_default_policy_allows_and_records_nothing_to_refuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("cast send 0xabc --private-key 0xdead");
         let assessment = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         assert_eq!(assessment.outcome, BoundaryOutcome::Allow);
@@ -2412,6 +2151,7 @@ mod tests {
 
     #[test]
     fn cloaking_boundary_binds_the_exact_url_and_ordered_probe_set() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let probes = [("browser", "Browser/1"), ("bot", "Bot/1")];
         let binding = fetch_cloaking_operation_binding("https://example.com/a", &probes).unwrap();
         let operation = binding.operation();
@@ -2439,6 +2179,7 @@ mod tests {
 
     #[test]
     fn cloaking_boundary_has_no_require_approval_bypass() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut binding =
             fetch_cloaking_operation_binding("https://example.com", &[("bot", "Bot/1")]).unwrap();
         binding.envelope.actions.push(ProposedAction::Narrative {
@@ -2462,28 +2203,8 @@ mod tests {
     }
 
     #[test]
-    fn package_envelope_rejects_a_thirty_third_requirement_instead_of_truncating() {
-        let request = ResolverRequest {
-            requirements: (0..=crate::task::MAX_ACTIONS)
-                .map(|index| format!("package-{index}==1.0"))
-                .collect(),
-            index_urls: vec!["https://index.example/simple".to_string()],
-            allowances: Default::default(),
-        };
-        let target = PackageTargetIdentity::new("ab".repeat(32), "linux-devino-v1:1:2", "target");
-        let binding = PackageOperationBinding::new("pip", &request, &[], &target);
-
-        assert_eq!(
-            package_envelope(&binding).unwrap_err(),
-            PackageEnvelopeError::TooManyRequirements {
-                provided: crate::task::MAX_ACTIONS + 1,
-                max: crate::task::MAX_ACTIONS,
-            }
-        );
-    }
-
-    #[test]
     fn boundary_effects_widen_the_inferred_set_but_never_grant() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("echo hello");
         let mut operation = operation(&envelope);
         operation.boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2503,6 +2224,7 @@ mod tests {
 
     #[test]
     fn required_approval_is_a_refusal_where_no_human_gate_exists() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = TaskGatePolicy {
             mode: TaskGateMode::Enforce,
             action_incomplete_analysis: Web3GuardAction::RequireApproval,
@@ -2523,6 +2245,7 @@ mod tests {
 
     #[test]
     fn the_projection_says_it_is_not_diagnostic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls");
         let assessment = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         let projection = assessment.projection();
@@ -2533,6 +2256,7 @@ mod tests {
 
     #[test]
     fn tightening_only_removes_capabilities() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
         spec.network = crate::capsule::NetworkPolicy::AllowListedDomains {
             domains: ["example.test".to_string()].into_iter().collect(),
@@ -2552,6 +2276,7 @@ mod tests {
 
     #[test]
     fn tightening_never_raises_an_already_lower_resource_ceiling() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut spec = crate::capsule::CapsuleSpec::locked_down();
         spec.resources.cpu_seconds = Some(5);
         spec.resources.memory_bytes = None;
@@ -2573,6 +2298,7 @@ mod tests {
     /// twice equals applying it once, and no dimension is ever raised.
     #[test]
     fn tightening_is_monotone_and_idempotent_over_every_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let every_effect: BTreeSet<CommandEffectKind> = [
             CommandEffectKind::PackageInstall,
             CommandEffectKind::PersistenceChange,
@@ -2631,6 +2357,7 @@ mod tests {
     /// is exactly the property a future preset change could silently break.
     #[test]
     fn tightening_the_untrusted_project_preset_never_widens_it() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let base = tempfile::tempdir().expect("tempdir");
         let project = base.path().join("held-copy");
         std::fs::create_dir(&project).expect("create held copy");
@@ -2653,6 +2380,7 @@ mod tests {
 
     #[test]
     fn the_ceiling_binding_changes_with_the_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls");
         let off = evaluate(&operation(&envelope), &TaskGatePolicy::default());
         let on = evaluate(&operation(&envelope), &enforcing());
@@ -2686,6 +2414,7 @@ mod tests {
 
     #[test]
     fn public_challenge_exposes_and_verifies_the_same_safe_projections() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects: BTreeSet<CommandEffectKind> =
@@ -2727,6 +2456,7 @@ mod tests {
 
     #[test]
     fn mixed_source_adapters_are_bound_per_source_in_one_challenge() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let action_identities = vec!["pkg:left-pad".to_string(), "pkg:is-even".to_string()];
@@ -2770,6 +2500,7 @@ mod tests {
 
     #[test]
     fn typed_approval_is_required_before_lazy_receiptless_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls -la");
         let document = TaskEnvelopeDocument {
             version: 1,
@@ -2826,6 +2557,7 @@ mod tests {
 
     #[test]
     fn approval_expiry_is_intersected_into_the_final_effect_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = shell_envelope("ls -la");
         let document = TaskEnvelopeDocument {
             version: 1,
@@ -2880,6 +2612,7 @@ mod tests {
 
     #[test]
     fn strict_v2_decision_consumes_one_atomic_batch_before_minting_a_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -2951,6 +2684,7 @@ mod tests {
 
     #[test]
     fn operation_mismatch_is_rejected_before_any_replay_state_is_consumed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -3009,6 +2743,7 @@ mod tests {
 
     #[test]
     fn strict_v2_rejects_cross_action_boundary_and_task_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -3123,6 +2858,7 @@ mod tests {
 
     #[test]
     fn v1_and_missing_v2_receipts_fail_only_when_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope = TaskEnvelopeInput {
             task_id: Some("legacy-task".to_string()),
             sources: vec![TaskSourceInput {
@@ -3180,6 +2916,7 @@ mod tests {
 
     #[test]
     fn required_replay_store_failure_never_mints_a_permit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -3225,6 +2962,7 @@ mod tests {
 
     #[test]
     fn typed_permit_rechecks_earliest_receipt_expiry_at_effect() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let gate = provenance_gate();
         let enforcement = enforcement(&gate);
         let boundary_effects = [CommandEffectKind::NetworkEgress].into_iter().collect();
@@ -3268,72 +3006,5 @@ mod tests {
                 ReplayStoreError::Expired
             ))
         ));
-    }
-}
-
-#[cfg(test)]
-mod exact_gate_lease_tests {
-    use super::*;
-    fn operation(envelope: &TaskEnvelopeInput) -> BoundaryOperation<'_> {
-        BoundaryOperation {
-            boundary: OwnedBoundary::LocalPackageRecovery,
-            envelope,
-            adapter: IngressAdapter::Unattributed,
-            boundary_effects: BTreeSet::new(),
-        }
-    }
-    #[test]
-    fn gate_binding_survives_direct_and_reserved_consumption_and_revalidation() {
-        let _state = tirith_test_support::GlobalStateGuard::new().unwrap();
-        let envelope = TaskEnvelopeInput {
-            actions: vec![ProposedAction::ConfigWrite {
-                path: "/tmp/held-operation".into(),
-            }],
-            ..TaskEnvelopeInput::default()
-        };
-        let op = operation(&envelope);
-        let gate = TaskGatePolicy::default();
-        let pending = || {
-            prepare_locally_derived_boundary_authorization::<LocalPackageRecoveryBoundary>(
-                &op,
-                &gate,
-                &TaskAnalysisContext::default(),
-            )
-            .unwrap()
-        };
-        let mut changed = gate.clone();
-        changed.mode = TaskGateMode::Enforce;
-        for reserved in [false, true] {
-            let permit = if reserved {
-                pending()
-                    .reserve_default_for_operation(&op, Utc::now())
-                    .unwrap()
-                    .commit_at_effect(&op, Utc::now())
-                    .unwrap()
-            } else {
-                pending().consume_default(Utc::now()).unwrap()
-            };
-            assert!(permit
-                .into_effect_lease_for_gate_at(&op, &changed, Utc::now())
-                .is_err());
-            let permit = if reserved {
-                pending()
-                    .reserve_default_for_operation(&op, Utc::now())
-                    .unwrap()
-                    .commit_at_effect(&op, Utc::now())
-                    .unwrap()
-            } else {
-                pending().consume_default(Utc::now()).unwrap()
-            };
-            let lease = permit
-                .into_effect_lease_for_gate_at(&op, &gate, Utc::now())
-                .unwrap();
-            lease
-                .authorize_effect_for_gate_at(&op, &gate, Utc::now())
-                .unwrap();
-            assert!(lease
-                .authorize_effect_for_gate_at(&op, &changed, Utc::now())
-                .is_err());
-        }
     }
 }

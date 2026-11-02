@@ -590,6 +590,7 @@ mod tests {
 
     #[test]
     fn privileged_run_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("docker run --privileged alpine", ShellType::Posix, &policy);
         assert!(
@@ -602,6 +603,7 @@ mod tests {
 
     #[test]
     fn execution_wrappers_do_not_hide_container_boundaries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "sudo docker run --privileged alpine",
@@ -621,6 +623,7 @@ mod tests {
 
     #[test]
     fn ambiguous_wrapper_around_container_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "sudo --future-option value docker run --privileged alpine",
@@ -634,6 +637,7 @@ mod tests {
 
     #[test]
     fn execution_wrapper_does_not_hide_labeled_container_exec() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy
             .context_labels
@@ -646,6 +650,7 @@ mod tests {
 
     #[test]
     fn privileged_true_form_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run --privileged=true alpine",
@@ -659,6 +664,7 @@ mod tests {
 
     #[test]
     fn global_options_with_split_and_attached_values_reach_subcommand() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "docker --context prod run --privileged alpine",
@@ -697,6 +703,7 @@ mod tests {
 
     #[test]
     fn unresolved_global_option_grammar_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "podman --future-global value run --privileged alpine",
@@ -717,6 +724,7 @@ mod tests {
 
     #[test]
     fn known_benign_global_option_forms_remain_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for command in [
             "podman --db-backend sqlite run --rm alpine",
@@ -736,6 +744,7 @@ mod tests {
 
     #[test]
     fn non_privileged_run_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("docker run --rm alpine echo ok", ShellType::Posix, &policy);
         assert!(
@@ -748,6 +757,7 @@ mod tests {
 
     #[test]
     fn docker_sock_bind_mount_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine",
@@ -764,6 +774,7 @@ mod tests {
 
     #[test]
     fn equivalent_sensitive_bind_paths_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         for source in [
             "/var/run//docker.sock",
@@ -796,6 +807,7 @@ mod tests {
 
     #[test]
     fn ssh_dir_bind_mount_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run -v ~/.ssh:/root/.ssh:ro alpine",
@@ -809,6 +821,7 @@ mod tests {
 
     #[test]
     fn aws_dir_bind_mount_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run --volume=~/.aws:/root/.aws alpine",
@@ -822,6 +835,7 @@ mod tests {
 
     #[test]
     fn mount_type_bind_source_etc_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run --mount type=bind,source=/etc,target=/host/etc alpine",
@@ -835,6 +849,7 @@ mod tests {
 
     #[test]
     fn benign_bind_mount_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run -v /home/me/data:/data alpine",
@@ -851,6 +866,7 @@ mod tests {
 
     #[test]
     fn exec_prod_container_fires_when_labeled() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut labels = BTreeMap::new();
         labels.insert("container:payments-prod".to_string(), "prod".to_string());
         let policy = Policy {
@@ -873,6 +889,7 @@ mod tests {
 
     #[test]
     fn exec_unlabeled_container_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy {
             context_guard_enabled: true,
             ..Policy::default()
@@ -888,6 +905,7 @@ mod tests {
 
     #[test]
     fn exec_guard_off_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut labels = BTreeMap::new();
         labels.insert("container:payments-prod".to_string(), "prod".to_string());
         let policy = Policy {
@@ -905,6 +923,7 @@ mod tests {
 
     #[test]
     fn podman_alias_recognized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check("podman run --privileged alpine", ShellType::Posix, &policy);
         assert!(findings
@@ -914,6 +933,7 @@ mod tests {
 
     #[test]
     fn non_docker_leader_short_circuits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "kubectl exec payments -- /bin/sh",
@@ -925,6 +945,7 @@ mod tests {
 
     #[test]
     fn etc_subpath_bind_mount_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "docker run -v /etc/secrets:/etc/secrets alpine",

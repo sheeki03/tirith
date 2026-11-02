@@ -479,6 +479,7 @@ mod tests {
 
     #[test]
     fn webhook_redirects_never_replay_custom_headers_or_body() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
             let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             redirect_target.set_nonblocking(true).unwrap();

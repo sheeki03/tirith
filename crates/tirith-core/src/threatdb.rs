@@ -31,9 +31,6 @@
 
 pub mod operations;
 
-#[path = "threatdb/materialization_source.rs"]
-pub(crate) mod materialization_source;
-
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4295,6 +4292,7 @@ mod tests {
     /// writer changes.
     #[test]
     fn frozen_v1_blob_still_loads() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let db = ThreatDb::from_bytes(FROZEN_V1_DB.to_vec(), 0).expect("frozen v1 blob must load");
         assert_eq!(db.stats().format_version, 1);
         assert_eq!(db.stats().build_sequence, 7);

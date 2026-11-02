@@ -2137,6 +2137,7 @@ mod tests {
 
     #[test]
     fn write_lockfile_creates_tirith_dir_and_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let lock_path = repo.path().join(".tirith").join(MCP_LOCK_FILENAME);
         let inventory = mcp_lock::build_inventory(repo.path());
@@ -2152,6 +2153,7 @@ mod tests {
 
     #[test]
     fn write_lockfile_is_idempotent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2171,6 +2173,7 @@ mod tests {
 
     #[test]
     fn write_lockfile_refuses_direct_secret_without_clobbering_existing_baseline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2203,6 +2206,7 @@ mod tests {
 
     #[test]
     fn lock_for_root_preserves_unchanged_descriptor_approval() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2267,6 +2271,7 @@ mod tests {
 
     #[test]
     fn verify_exits_zero_when_inventory_matches_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_mcp();
         let code = verify_for_root(repo.path(), false);
         assert_eq!(code, 0, "no drift → exit 0");
@@ -2274,6 +2279,7 @@ mod tests {
 
     #[test]
     fn verify_exits_one_when_server_added() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_mcp();
         // Add a server — the inventory has now drifted.
         fs::write(
@@ -2290,6 +2296,7 @@ mod tests {
 
     #[test]
     fn rejected_config_refuses_lock_and_keeps_verify_nonzero_even_with_override() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         fs::write(repo.path().join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
 
@@ -2343,6 +2350,7 @@ mod tests {
 
     #[test]
     fn verify_exits_zero_when_env_value_rotated() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // V8 records only env-name presence, so value rotation is intentionally
         // unobservable and does not produce drift.
         let repo = tempdir().unwrap();
@@ -2372,6 +2380,7 @@ mod tests {
 
     #[test]
     fn verify_exits_two_when_lockfile_missing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No lockfile is a usage error, not drift.
         let repo = tempdir().unwrap();
         fs::write(
@@ -2385,6 +2394,7 @@ mod tests {
 
     #[test]
     fn verify_exits_two_when_lockfile_malformed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let lockdir = repo.path().join(".tirith");
         fs::create_dir_all(&lockdir).unwrap();
@@ -2395,6 +2405,7 @@ mod tests {
 
     #[test]
     fn verify_with_json_exits_zero_when_inventory_matches() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_mcp();
         let code = verify_for_root(repo.path(), true);
         assert_eq!(code, 0);
@@ -2402,6 +2413,7 @@ mod tests {
 
     #[test]
     fn diff_always_exits_zero_even_when_drift_present() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_mcp();
         fs::write(
             repo.path().join(".mcp.json"),
@@ -2417,6 +2429,7 @@ mod tests {
 
     #[test]
     fn diff_no_drift_exits_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_mcp();
         let code = diff_for_root(repo.path(), false);
         assert_eq!(code, 0);
@@ -2424,6 +2437,7 @@ mod tests {
 
     #[test]
     fn diff_exits_two_when_lockfile_missing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No-lockfile is a usage error even for the informational verb.
         let repo = tempdir().unwrap();
         let code = diff_for_root(repo.path(), false);
@@ -2458,6 +2472,7 @@ mod tests {
 
     #[test]
     fn policy_init_writes_example_file_with_lockfile_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0, "policy init must succeed: exit code {code}");
@@ -2489,6 +2504,7 @@ mod tests {
 
     #[test]
     fn policy_init_is_deterministic_for_same_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two runs against the same lockfile produce a byte-identical file.
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), false, false);
@@ -2508,6 +2524,7 @@ mod tests {
 
     #[test]
     fn policy_init_refuses_to_overwrite_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), false, false);
         assert_eq!(code, 0);
@@ -2523,6 +2540,7 @@ mod tests {
 
     #[test]
     fn policy_init_overwrites_with_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_server_and_tools();
         let example_path = repo.path().join(".tirith").join("mcp-policy.yaml.example");
         // Pre-create a sentinel that --force must overwrite.
@@ -2538,6 +2556,7 @@ mod tests {
 
     #[test]
     fn policy_init_handles_missing_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No lockfile — still writes a header-only scaffold and exits 0.
         let repo = tempdir().unwrap();
         let code = policy_init_for_root(repo.path(), false, false);
@@ -2554,6 +2573,7 @@ mod tests {
 
     #[test]
     fn policy_init_fails_on_unparseable_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An unparseable lockfile IS fatal — we cannot tell what to list.
         let repo = tempdir().unwrap();
         let lock_dir = repo.path().join(".tirith");
@@ -2568,6 +2588,7 @@ mod tests {
 
     #[test]
     fn policy_init_handles_lockfile_with_no_servers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A lockfile listing zero servers still emits a template form.
         let repo = tempdir().unwrap();
         let inventory = mcp_lock::build_inventory(repo.path());
@@ -2587,6 +2608,7 @@ mod tests {
 
     #[test]
     fn policy_init_redacts_hostile_server_name() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A hostile server name must NOT inject raw bytes into the example file
         // (which would inject when the operator `cat`s it) — yaml_safe_scalar
         // quotes-and-escapes them.
@@ -2630,6 +2652,7 @@ mod tests {
 
     #[test]
     fn policy_init_json_format_outputs_structured_preview() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = repo_with_locked_server_and_tools();
         let code = policy_init_for_root(repo.path(), true, false);
         assert_eq!(code, 0);
@@ -3058,6 +3081,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mutation_lock_refuses_symlinked_directory_without_outside_creation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join(".tirith")).unwrap();
@@ -3068,6 +3092,7 @@ mod tests {
 
     #[test]
     fn mutation_lock_policy_deny_creates_no_directory_or_lock() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let mut policy = policy::Policy::default();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
@@ -3088,6 +3113,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mutation_lock_refuses_a_final_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         let config = root.path().join(".tirith");
@@ -3105,6 +3131,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mutation_lock_and_data_capability_cannot_split_after_parent_swap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         let displaced = root.path().join(".tirith-displaced");
@@ -3126,6 +3153,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mutation_lock_remains_serialized_after_legacy_sidecar_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let first = acquire_mutation_lock(root.path()).unwrap();
         let config = root.path().join(".tirith");

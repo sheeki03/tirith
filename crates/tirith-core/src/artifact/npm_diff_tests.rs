@@ -18,6 +18,7 @@ fn changed(old: &NpmInspection) -> NpmInspection {
 
 #[test]
 fn identical_artifact_is_not_a_release_change_even_when_filename_changes() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = old.clone();
     new.artifact.filename = "copied-fixture.tgz".to_owned();
@@ -31,6 +32,7 @@ fn identical_artifact_is_not_a_release_change_even_when_filename_changes() {
 
 #[test]
 fn benign_rebuild_and_minification_preserve_identity_without_inventing_risk() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     let member = new
@@ -54,6 +56,7 @@ fn benign_rebuild_and_minification_preserve_identity_without_inventing_risk() {
 
 #[test]
 fn newly_observed_capability_requires_compatible_complete_analysis() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     new.files
@@ -94,6 +97,7 @@ fn newly_observed_capability_requires_compatible_complete_analysis() {
 
 #[test]
 fn coverage_or_limit_changes_cannot_be_reported_as_new_execution_behavior() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     new.coverage.static_analysis_complete = false;
@@ -130,6 +134,7 @@ fn coverage_or_limit_changes_cannot_be_reported_as_new_execution_behavior() {
 
 #[test]
 fn scripts_native_members_and_command_entry_changes_remain_direct_byte_evidence() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     let metadata = new.metadata.as_mut().unwrap();
@@ -178,6 +183,7 @@ fn scripts_native_members_and_command_entry_changes_remain_direct_byte_evidence(
 
 #[test]
 fn unchanged_transport_with_changed_analysis_never_emits_package_deltas() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = old.clone();
     new.analyzer_version = "npm-static-next".to_owned();
@@ -194,6 +200,7 @@ fn unchanged_transport_with_changed_analysis_never_emits_package_deltas() {
 
 #[test]
 fn incomplete_or_unknown_schema_inputs_cannot_claim_a_complete_release_comparison() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     new.schema_version += 1;
@@ -220,6 +227,7 @@ fn incomplete_or_unknown_schema_inputs_cannot_claim_a_complete_release_compariso
 
 #[test]
 fn name_changes_are_labelled_and_delta_outputs_are_bounded() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let old = base();
     let mut new = changed(&old);
     new.artifact.name = Some("another-package".to_owned());

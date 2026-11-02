@@ -14,7 +14,7 @@ use tirith_core::trust_grants::{
 };
 
 use super::setup::change_plan::{
-    Edit, JobState, MutationService, OperationKind, OperationStatus, RequestedChange,
+    Edit, JobState, MutationService, OperationKind, OperationStatus, PlanRequest, RequestedChange,
 };
 
 struct Context {
@@ -33,6 +33,15 @@ impl Context {
     }
 
     fn capture_at(cwd: Option<&str>) -> Result<Self, String> {
+        Self::capture_at_with(cwd, |cwd| {
+            EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime)
+        })
+    }
+
+    fn capture_at_with(
+        cwd: Option<&str>,
+        resolve: impl FnOnce(Option<&str>) -> EffectivePolicySnapshot,
+    ) -> Result<Self, String> {
         if cwd.is_some_and(|value| !Path::new(value).is_absolute()) {
             return Err("trust service project scope must be absolute".into());
         }
@@ -47,7 +56,7 @@ impl Context {
         let cwd = Some(resolved_cwd.as_str());
         let config =
             tirith_core::policy::config_dir().ok_or("cannot locate operator configuration")?;
-        let snapshot = EffectivePolicySnapshot::resolve(cwd, ResolutionMode::Runtime);
+        let snapshot = resolve(cwd);
         let project = ProjectIdentity::capture(cwd).ok();
         let patterns =
             CompiledCustomPatterns::new(&tirith_core::policy::captured_policy_dlp_patterns_or(
@@ -137,6 +146,29 @@ impl TrustService {
         })
     }
 
+    /// For read-only callers (list, explain) that already resolved the policy
+    /// without a network request. Output is redacted with the snapshot's DLP
+    /// patterns plus `extra_patterns`. Only a fully resolving `capture` may
+    /// back a prepare or apply.
+    pub(crate) fn capture_read_only(
+        cwd: Option<&str>,
+        snapshot: EffectivePolicySnapshot,
+        extra_patterns: &[String],
+    ) -> Result<Self, String> {
+        let _capture = PolicyDiagnosticCapture::start();
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(
+            &snapshot.policy.dlp_custom_patterns,
+        );
+        tirith_core::policy::freeze_captured_policy_dlp_patterns(extra_patterns);
+        let context = Context::capture_at_with(cwd, |_| snapshot)?;
+        let diagnostics =
+            tirith_core::policy::drain_captured_policy_diagnostics_for_output(&context.patterns);
+        Ok(Self {
+            context,
+            diagnostics,
+        })
+    }
+
     pub(crate) fn list(
         &mut self,
         rule: Option<&str>,
@@ -203,8 +235,9 @@ impl TrustService {
             if value.get("no_op").and_then(Value::as_bool) != Some(true) {
                 return Err("trust preparation did not produce an operation outcome".into());
             }
-            let status = service
-                .complete_noop_with_intent(operation_id, kind, &self.context.snapshot, &intent)
+            let status = PlanRequest::no_op(kind)
+                .intent(&intent)
+                .and_then(|request| service.submit(operation_id, &self.context.snapshot, request))
                 .map_err(|error| self.context.redact(&error))?;
             return self.project_plan(&status);
         }
@@ -305,6 +338,12 @@ fn show_human(value: &Value) {
             if row["requires_migration"] == true {
                 eprintln!("  Legacy grant has no stable ID; use tirith trust migrate --scope user before editing expiry.");
             }
+            if let Some(remedy) = row["remedy"].as_str() {
+                eprintln!("  {remedy}.");
+            }
+        }
+        if let Some(issue) = value["target_issue"].as_str() {
+            eprintln!("Target pattern: {issue}");
         }
     } else {
         eprintln!(
@@ -326,6 +365,24 @@ fn show_human(value: &Value) {
                     row["pattern"].as_str().unwrap_or("[redacted]"),
                     row["rule_id"].as_str().unwrap_or("all rules")
                 );
+            }
+        }
+        if let Some(skipped) = value["skipped"].as_array().filter(|rows| !rows.is_empty()) {
+            eprintln!(
+                "{} legacy entr{} left in place (migration does not convert them):",
+                skipped.len(),
+                if skipped.len() == 1 { "y" } else { "ies" }
+            );
+            for row in skipped {
+                eprintln!(
+                    "  {}  rule={}  {}",
+                    row["pattern"].as_str().unwrap_or("[invalid record]"),
+                    row["rule_id"].as_str().unwrap_or("all rules"),
+                    row["state_reason"].as_str().unwrap_or("unknown")
+                );
+                if let Some(remedy) = row["remedy"].as_str() {
+                    eprintln!("    {remedy}.");
+                }
             }
         }
         if let Some(note) = value["note"].as_str() {
@@ -387,6 +444,53 @@ fn same_rule(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 
+/// `trust remove` selection: no `--rule` selects every rule of the pattern;
+/// `--rule` selects that rule with the same case-insensitive identity as `add`.
+fn removal_rule_matches(own: Option<&str>, requested: Option<&str>) -> bool {
+    requested.is_none() || same_rule(own, requested)
+}
+
+/// Make a revocation fit the trust store size cap. Revoking normally keeps the
+/// record as a tombstone (`revoked_at`), which grows the store; when even the
+/// compact form would then pass the read cap, the newly revoked records are
+/// deleted instead, so a revocation is never refused: the store was read under
+/// the same cap, and `perform` writes a shrinking change compactly when the
+/// indented form would not fit.
+fn fit_revocations(store: &mut TrustGrantStore, revoked: &[usize]) {
+    let fits = serde_json::to_string(&*store)
+        .is_ok_and(|text| text.len() as u64 <= trust_grants::STORE_READ_CAP);
+    if fits {
+        return;
+    }
+    let mut revoked = revoked.to_vec();
+    revoked.sort_unstable();
+    revoked.dedup();
+    for index in revoked.into_iter().rev() {
+        if index < store.grants.len() {
+            store.grants.remove(index);
+        }
+    }
+}
+
+/// Serialize a trust store for writing. Stores are written indented; a
+/// revocation, `remove` or `gc` (which only ever shrink the store) falls back to
+/// the compact form when the indented one would pass the 1 MiB read cap, so a
+/// store kept compact on disk can always be revoked from or pruned.
+fn store_text(after: &Value, shrinking: bool) -> Result<Option<String>, String> {
+    let fits = |text: &String| text.len() as u64 <= trust_grants::STORE_READ_CAP;
+    let pretty = serde_json::to_string_pretty(after).map_err(|_| "cannot serialize grant edit")?;
+    if fits(&pretty) {
+        return Ok(Some(pretty));
+    }
+    if shrinking {
+        let compact = serde_json::to_string(after).map_err(|_| "cannot serialize grant edit")?;
+        if fits(&compact) {
+            return Ok(Some(compact));
+        }
+    }
+    Ok(None)
+}
+
 fn perform(
     context: &Context,
     kind: OperationKind,
@@ -397,6 +501,17 @@ fn perform(
     let mut expected = BTreeMap::new();
     let mut requests = Vec::new();
     for (target, root, before, after) in changes {
+        // Every trust store is read with a 1 MiB cap; a larger file would make
+        // the whole store unreadable, so refuse instead of writing it.
+        let Some(text) = store_text(&after, matches!(kind, OperationKind::RevokeTrust))? else {
+            return Err(format!(
+                "trust store {} would exceed its 1 MiB size limit; run tirith trust gc --scope all to prune expired grants and old revocations, or revoke grants you no longer need",
+                target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        };
         super::preflight_config_write_authorization(
             &root,
             &target,
@@ -409,9 +524,7 @@ fn perform(
         requests.push(RequestedChange {
             target,
             scope_root: root,
-            edit: Edit::WholeFile(
-                serde_json::to_string_pretty(&after).map_err(|_| "cannot serialize grant edit")?,
-            ),
+            edit: Edit::WholeFile(text),
             activation: true,
             description: "Update selected operator trust grants".into(),
         });
@@ -421,26 +534,16 @@ fn perform(
         .plan_only
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut request = PlanRequest::change(kind, requests).preimages(expected);
     if let Some(intent) = &context.intent {
-        service.plan_with_preimages_and_intent(
-            &id,
-            kind,
-            requests,
-            &context.snapshot,
-            &expected,
-            intent,
-        )?;
-    } else {
-        service.plan_with_preimages(&id, kind, requests, &context.snapshot, &expected)?;
+        request = request.intent(intent)?;
     }
+    service.submit(&id, &context.snapshot, request)?;
     if context.plan_only.is_some() {
         return Ok(id);
     }
     let status = service.apply(&id, &context.snapshot)?;
-    if !matches!(
-        status.state,
-        JobState::Completed | JobState::CompletedWithRecovery
-    ) {
+    if status.state != JobState::Completed {
         return Err(format!(
             "trust operation {} requires attention: {:?}; inspect tirith policy operation status",
             id, status.state
@@ -463,12 +566,37 @@ struct Row {
     requires_migration: bool,
     broad: bool,
     reason: Option<String>,
+    /// What the operator can run or edit to replace an entry that never
+    /// matches (CORE-5). Never applied automatically.
+    remedy: Option<String>,
 }
 
 impl Row {
     fn project(&self, context: &Context) -> Value {
-        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v))})
+        json!({"id":self.id,"pattern":self.pattern.as_deref().map(|v| context.redact(v)),"rule_id":self.rule_id.as_deref().map(|v| context.redact(v)),"source":self.source,"scope":self.scope,"project_root":self.project_root.as_deref().map(|v| context.redact(v)),"expires_at":self.expires_at.as_deref().filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok()),"state":self.state,"state_reason":self.state_reason,"requires_migration":self.requires_migration,"broad":self.broad,"reason":self.reason.as_deref().map(|v| context.redact(v)),"remedy":self.projected_remedy(context)})
     }
+    /// The remedy as printed. Output is redacted, so a remedy that embeds a
+    /// pattern holding redacted text (`http://user:pw@host/*`) would name an
+    /// entry that does not exist; such a remedy names the store to edit
+    /// instead, and keeps only the parts that survive redaction unchanged.
+    fn projected_remedy(&self, context: &Context) -> Option<String> {
+        let remedy = self.remedy.as_deref()?;
+        let pattern = self.pattern.as_deref()?;
+        if context.redact(pattern) == pattern {
+            return Some(context.redact(remedy));
+        }
+        Some(redacted_wildcard_remedy(
+            pattern,
+            self.rule_id.as_deref(),
+            self.source,
+            context,
+        ))
+    }
+    /// Whether this row still trusts `target` for the queried rule. Unlike the
+    /// runtime [`TrustGrant::matches`] (one finding, one rule), callers here
+    /// list residual trust: `rule = None` means "any rule", so a rule-scoped
+    /// row that covers the target is included. Rule IDs compare
+    /// case-insensitively.
     fn matches(&self, target: &str, rule: Option<&str>) -> bool {
         self.pattern
             .as_deref()
@@ -507,6 +635,134 @@ fn grant_row(grant: &TrustGrant, context: &Context) -> Row {
         broad: tirith_core::policy::classify_trust_pattern(&grant.pattern).is_broad()
             || grant.rule_id.is_none(),
         reason: grant.reason.clone(),
+        remedy: None,
+    }
+}
+
+/// The replacement for a legacy entry whose pattern has a `*` outside a
+/// leading `*.` label (#271). 0.4.x stored such patterns, but they never
+/// matched anything, so nothing is converted automatically: the operator
+/// removes the dead entry and, if wanted, adds the host grant explicitly.
+///
+/// Repository content (`.tirith/trust.json`, `.tirith/allowlist`) is inactive
+/// and attacker-influenced, so its remedy only removes the entry and never
+/// suggests a grant for a host the repository chose.
+fn misplaced_wildcard_remedy(pattern: &str, rule_id: Option<&str>, source: &str) -> Option<String> {
+    use tirith_core::safe_command::shell_single_quote as quote;
+    if !tirith_core::policy::has_misplaced_wildcard(pattern) {
+        return None;
+    }
+    let host = tirith_core::policy::misplaced_wildcard_host(pattern);
+    let lead = "'*' is a wildcard only as a leading '*.' label, so this entry never matched";
+    let rule_arg = match rule_id {
+        Some(rule) => format!(" --rule {}", quote(rule)?),
+        None => String::new(),
+    };
+    match source {
+        "legacy_user" => {}
+        "legacy_repo" => {
+            return Some(format!(
+                "{lead}; remove it with `tirith trust remove {}{rule_arg} --scope repo` \
+                 (repository trust is inactive; add an operator grant with --scope project \
+                 only for a host you chose)",
+                quote(pattern)?
+            ));
+        }
+        "repository_allowlist" => {
+            return Some(format!(
+                "{lead}; repository allowlists are ignored, so remove it from .tirith/allowlist"
+            ));
+        }
+        // Operator policy (user or organization policy, user allowlist file).
+        _ => {
+            return Some(match host {
+                Some(host) => format!(
+                    "{lead}; replace '{pattern}' with '{host}' (that host and its subdomains) \
+                     where it is listed, or list the exact URL or image"
+                ),
+                None => format!(
+                    "{lead}; replace '{pattern}' with the host or the exact URL or image where \
+                     it is listed"
+                ),
+            });
+        }
+    }
+    let remove = format!(
+        "tirith trust remove {}{rule_arg} --scope user",
+        quote(pattern)?
+    );
+    Some(match host {
+        Some(host) => {
+            let add_rule = match rule_id {
+                Some(rule) => format!("--rule {}", quote(rule)?),
+                None => "--rule RULE_ID".to_string(),
+            };
+            let all_rules = if rule_id.is_none() {
+                " (the old entry covered every rule; --all-rules in place of --rule keeps that)"
+            } else {
+                ""
+            };
+            format!(
+                "{lead}; remove it with `{remove}`, then trust the host with \
+                 `tirith trust add {} --broad {add_rule}`{all_rules}",
+                quote(host)?
+            )
+        }
+        None => format!(
+            "{lead}; remove it with `{remove}`, then trust the exact URL or image, or a host \
+             with --broad"
+        ),
+    })
+}
+
+/// [`misplaced_wildcard_remedy`] for a pattern that output redaction changes:
+/// no printed command can name the entry, so it says which store to edit. A
+/// host grant is offered only when the host and rule print unchanged.
+fn redacted_wildcard_remedy(
+    pattern: &str,
+    rule_id: Option<&str>,
+    source: &str,
+    context: &Context,
+) -> String {
+    use tirith_core::safe_command::shell_single_quote as quote;
+    let lead = "'*' is a wildcard only as a leading '*.' label, so this entry never matched; \
+                its pattern holds text Tirith redacts in output, so no command here can name it";
+    let host = tirith_core::policy::misplaced_wildcard_host(pattern)
+        .filter(|host| context.redact(host) == *host);
+    let printable_rule = rule_id.filter(|rule| context.redact(rule) == *rule);
+    match source {
+        "legacy_user" => {
+            let grant = host.and_then(|host| {
+                let rule = match (rule_id, printable_rule) {
+                    (Some(_), Some(rule)) => format!("--rule {}", quote(rule)?),
+                    _ => "--rule RULE_ID".to_string(),
+                };
+                Some(format!(
+                    ", then trust the host with `tirith trust add {} --broad {rule}`",
+                    quote(host)?
+                ))
+            });
+            format!(
+                "{lead}; delete it from trust.json in the Tirith config directory{}",
+                grant.unwrap_or_default()
+            )
+        }
+        "legacy_repo" => format!(
+            "{lead}; delete it from .tirith/trust.json (repository trust is inactive; add an \
+             operator grant with --scope project only for a host you chose)"
+        ),
+        "repository_allowlist" => format!(
+            "{lead}; repository allowlists are ignored, so remove it from .tirith/allowlist"
+        ),
+        _ => match host {
+            Some(host) => format!(
+                "{lead}; replace it with '{host}' (that host and its subdomains) where it is \
+                 listed, or list the exact URL or image"
+            ),
+            None => format!(
+                "{lead}; replace it with the host or the exact URL or image where it is listed"
+            ),
+        },
     }
 }
 
@@ -523,16 +779,26 @@ fn legacy_row(value: &Value, source: &'static str, scope: &'static str, policy: 
         .get("ttl_expires")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let valid = pattern
+    let valid_rule = match value.get("rule_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(rule)) => tirith_core::policy::validate_trust_pattern(rule).is_ok(),
+        _ => false,
+    };
+    let valid = valid_rule
+        && pattern
+            .as_deref()
+            .is_some_and(|pattern| tirith_core::policy::validate_trust_pattern(pattern).is_ok());
+    // A 0.4.x `host/*` entry is invalid for one specific, fixable reason.
+    let remedy = pattern
         .as_deref()
-        .is_some_and(|pattern| tirith_core::policy::validate_trust_pattern(pattern).is_ok())
-        && match value.get("rule_id") {
-            None | Some(Value::Null) => true,
-            Some(Value::String(rule)) => tirith_core::policy::validate_trust_pattern(rule).is_ok(),
-            _ => false,
-        };
+        .filter(|_| valid_rule)
+        .and_then(|pattern| misplaced_wildcard_remedy(pattern, rule_id.as_deref(), source));
     let (state, state_reason) = if !valid {
-        (GrantState::Invalid, "invalid_pattern_or_rule")
+        if remedy.is_some() {
+            (GrantState::Invalid, "wildcard_never_matches")
+        } else {
+            (GrantState::Invalid, "invalid_pattern_or_rule")
+        }
     } else {
         match trust_grants::expiry_value(value.get("ttl_expires"), Utc::now()) {
             Expiry::Invalid => (GrantState::Invalid, "invalid_expiry"),
@@ -567,11 +833,14 @@ fn legacy_row(value: &Value, source: &'static str, scope: &'static str, policy: 
         expires_at,
         state,
         state_reason,
-        requires_migration: source == "legacy_user",
+        // `trust migrate` keeps an invalid entry where it is, so pointing an
+        // invalid row at migration would loop.
+        requires_migration: source == "legacy_user" && state != GrantState::Invalid,
         reason: value
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_string),
+        remedy,
     }
 }
 
@@ -603,6 +872,7 @@ fn rows(context: &Context, scope: &str) -> Result<Vec<Row>, String> {
                     requires_migration: false,
                     broad: false,
                     reason: None,
+                    remedy: None,
                 }),
             }
         }
@@ -766,9 +1036,17 @@ fn explain_value(context: &mut Context, target: &str, scope: &str) -> Result<Val
         .filter(|row| row.state == GrantState::Effective && row.matches(pattern, rule))
         .map(|row| row.project(context))
         .collect();
+    // A pattern `trust add` would refuse (for example `host/*`) gets the same
+    // explanation here, even when no recorded entry carries it.
+    let target_issue = selected
+        .is_none()
+        .then(|| tirith_core::policy::validate_trust_pattern(pattern).err())
+        .flatten()
+        .map(|issue| context.redact(&issue));
     Ok(json!({"schema_version":1,"kind":"trust_explanation",
             "selected_grant_id":selected.and_then(|row| row.id.as_deref()),
             "target":context.redact(pattern),"rule_id":rule.map(|rule| context.redact(rule)),
+            "target_issue":target_issue,
             "grants":grants,"matching_effective_grants":effective_grants,
             "target_matches_blocklist":context.snapshot.policy.is_blocklisted(pattern),
             "semantics":"trust_eligibility_only","command_evaluated":false,
@@ -1000,6 +1278,7 @@ fn revoke_value(context: &mut Context, id: &str) -> Result<Value, String> {
     }
     grant.revoked_at = Some(Utc::now().to_rfc3339());
     store.replace(index, &grant)?;
+    fit_revocations(&mut store, &[index]);
     let operation_id = perform(
         context,
         OperationKind::RevokeTrust,
@@ -1031,11 +1310,37 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
     let (path, before, mut store) = read_store(&context.config)?;
     let mut migrated = Vec::new();
     let mut retained = Vec::new();
+    // Every entry left behind is reported, with its remedy when it has one,
+    // so a dead 0.4.x `host/*` grant is not left in place silently.
+    let mut skipped = Vec::new();
+    let mut invalid_retained = 0usize;
+    let mut overridden_retained = 0usize;
+    let mut expired_dropped = 0usize;
     for value in legacy["entries"].as_array().unwrap() {
         let row = legacy_row(value, "legacy_user", "user", &context.snapshot.policy);
-        if row.state == GrantState::Invalid {
-            retained.push(value.clone());
-            continue;
+        if matches!(row.state, GrantState::Invalid | GrantState::Overridden) {
+            skipped.push(row.project(context));
+        }
+        match row.state {
+            GrantState::Invalid => {
+                invalid_retained += 1;
+                retained.push(value.clone());
+                continue;
+            }
+            // Enforcement already ignores an expired legacy entry; dropping it
+            // keeps applicability identical and never re-issues it as a grant.
+            GrantState::Expired => {
+                expired_dropped += 1;
+                continue;
+            }
+            // A blocklisted entry stays in the legacy store exactly as 0.4.2
+            // sees it, instead of becoming a newly created grant.
+            GrantState::Overridden => {
+                overridden_retained += 1;
+                retained.push(value.clone());
+                continue;
+            }
+            _ => {}
         }
         let grant = TrustGrant {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1050,31 +1355,27 @@ fn migrate_value(context: &mut Context, scope: &str) -> Result<Value, String> {
         store.insert(&grant)?;
         migrated.push(grant.id);
     }
-    if migrated.is_empty() {
+    if migrated.is_empty() && expired_dropped == 0 {
         return Ok(
-            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":retained.len()}),
+            json!({"schema_version":1,"kind":"trust_migration","state":"unchanged","no_op":true,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":0,"skipped":skipped}),
         );
     }
-    let retained_count = retained.len();
     legacy["entries"] = Value::Array(retained);
     // Remove legacy applicability before activating the new envelope. An
     // interrupted migration can temporarily narrow trust, never globalize
     // or extend a project/expiring grant. The journal supports recovery.
-    let operation_id = perform(
-        context,
-        OperationKind::AddTrust,
-        vec![
-            (legacy_path, legacy_root, legacy_before, legacy),
-            (
-                path,
-                context.config.clone(),
-                before,
-                serde_json::to_value(store).unwrap(),
-            ),
-        ],
-    )?;
+    let mut changes = vec![(legacy_path, legacy_root, legacy_before, legacy)];
+    if !migrated.is_empty() {
+        changes.push((
+            path,
+            context.config.clone(),
+            before,
+            serde_json::to_value(store).unwrap(),
+        ));
+    }
+    let operation_id = perform(context, OperationKind::AddTrust, changes)?;
     Ok(
-        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":retained_count,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
+        json!({"schema_version":1,"kind":"trust_migration","state":"completed","operation_id":operation_id,"migrated_ids":migrated,"invalid_retained":invalid_retained,"overridden_retained":overridden_retained,"expired_dropped":expired_dropped,"skipped":skipped,"note":"Migrated grants keep user-global scope and expiry. 0.4.2 ignores them; downgrade removes these exceptions rather than broadening them."}),
     )
 }
 
@@ -1087,6 +1388,7 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
         let mut removed = 0usize;
         if scope != "repo" {
             let (path, before, mut store) = read_store(&context.config)?;
+            let mut revoked = Vec::new();
             for (index, decoded) in store.records().into_iter().enumerate() {
                 let Ok(mut grant) = decoded else {
                     continue;
@@ -1100,15 +1402,17 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
                 };
                 if scope_matches
                     && grant.pattern == pattern
-                    && rule.is_none_or(|rule| grant.rule_id.as_deref() == Some(rule))
+                    && removal_rule_matches(grant.rule_id.as_deref(), rule)
                     && grant.revoked_at.is_none()
                 {
                     grant.revoked_at = Some(Utc::now().to_rfc3339());
                     store.replace(index, &grant)?;
+                    revoked.push(index);
                     removed += 1;
                 }
             }
             if removed > 0 {
+                fit_revocations(&mut store, &revoked);
                 changes.push((
                     path,
                     context.config.clone(),
@@ -1126,7 +1430,7 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
                 let len = entries.len();
                 entries.retain(|entry| {
                     !(entry["pattern"].as_str() == Some(pattern)
-                        && rule.is_none_or(|rule| entry["rule_id"].as_str() == Some(rule)))
+                        && removal_rule_matches(entry["rule_id"].as_str(), rule))
                 });
                 let count = len - entries.len();
                 removed += count;
@@ -1146,6 +1450,86 @@ pub fn remove(pattern: &str, rule: Option<&str>, scope: &str) -> i32 {
     })
 }
 
+/// Revoked records stay as tombstones this long, so a retried `trust revoke`
+/// or `trust explain <id>` still resolves them; later `trust gc` prunes them.
+const REVOKED_RETENTION_DAYS: i64 = 30;
+/// `trust gc` compacts the grant store to at most this size (three quarters
+/// of the read cap) by also pruning the oldest younger tombstones.
+const STORE_COMPACT_BYTES: usize = trust_grants::STORE_READ_CAP as usize / 4 * 3;
+
+/// Raw records `trust gc` keeps, and how many it pruned. Among the selected
+/// valid grants it prunes expired ones and revocations older than the
+/// retention window; while the store is still above [`STORE_COMPACT_BYTES`]
+/// it also prunes the oldest remaining revocations. Active grants and
+/// undecodable records are never pruned.
+fn prune_grants(
+    store: &TrustGrantStore,
+    now: chrono::DateTime<Utc>,
+    selected: impl Fn(&TrustGrant) -> bool,
+) -> (Vec<Value>, usize) {
+    let retention = chrono::Duration::days(REVOKED_RETENTION_DAYS);
+    let mut keep = Vec::new();
+    let mut tombstones = Vec::new();
+    let mut pruned = 0usize;
+    for (raw, decoded) in store.grants.iter().zip(store.records()) {
+        let Some(grant) = decoded.ok().filter(|grant| selected(grant)) else {
+            keep.push(Some(raw.clone()));
+            continue;
+        };
+        if matches!(
+            trust_grants::expiry(grant.expires_at.as_deref(), now),
+            Expiry::Expired
+        ) {
+            pruned += 1;
+            continue;
+        }
+        let revoked = grant
+            .revoked_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        match revoked {
+            Some(revoked)
+                if revoked
+                    .checked_add_signed(retention)
+                    .is_none_or(|end| end <= now) =>
+            {
+                pruned += 1;
+            }
+            Some(revoked) => {
+                tombstones.push((revoked, keep.len()));
+                keep.push(Some(raw.clone()));
+            }
+            None => keep.push(Some(raw.clone())),
+        }
+    }
+    let size = |records: &[Option<Value>]| {
+        let grants: Vec<&Value> = records.iter().flatten().collect();
+        serde_json::to_string_pretty(
+            &json!({"schema_version":store.schema_version,"grants":grants}),
+        )
+        .map_or(usize::MAX, |text| text.len())
+    };
+    let mut excess = size(&keep).saturating_sub(STORE_COMPACT_BYTES);
+    if excess > 0 {
+        tombstones.sort();
+        for (_, index) in tombstones {
+            if excess == 0 {
+                break;
+            }
+            // A record's standalone size never exceeds what removing it
+            // saves from the indented store, so this cannot undershoot.
+            let saved = keep[index]
+                .take()
+                .and_then(|raw| serde_json::to_string_pretty(&raw).ok())
+                .map_or(0, |text| text.len());
+            excess = excess.saturating_sub(saved);
+            pruned += 1;
+        }
+    }
+    (keep.into_iter().flatten().collect(), pruned)
+}
+
 pub fn gc(scope: &str, json_output: bool) -> i32 {
     run(json_output, |context| {
         if !matches!(scope, "user" | "repo" | "project" | "all") {
@@ -1155,32 +1539,19 @@ pub fn gc(scope: &str, json_output: bool) -> i32 {
         let mut pruned = 0usize;
         if scope != "repo" {
             let (path, before, mut store) = read_store(&context.config)?;
-            let records = store.records();
-            let mut keep = Vec::new();
-            for (raw, decoded) in store.grants.into_iter().zip(records) {
-                let remove = decoded.ok().is_some_and(|grant| {
-                    let selected = scope == "all"
-                        || match (&grant.scope, scope) {
-                            (GrantScope::User, "user") => true,
-                            (GrantScope::Project { project }, "project") => {
-                                Some(project) == context.project.as_ref()
-                            }
-                            _ => false,
-                        };
-                    selected
-                        && matches!(
-                            trust_grants::expiry(grant.expires_at.as_deref(), Utc::now()),
-                            Expiry::Expired
-                        )
-                });
-                if remove {
-                    pruned += 1;
-                } else {
-                    keep.push(raw);
-                }
-            }
-            store.grants = keep;
-            if pruned > 0 {
+            let (keep, count) = prune_grants(&store, Utc::now(), |grant| {
+                scope == "all"
+                    || match (&grant.scope, scope) {
+                        (GrantScope::User, "user") => true,
+                        (GrantScope::Project { project }, "project") => {
+                            Some(project) == context.project.as_ref()
+                        }
+                        _ => false,
+                    }
+            });
+            if count > 0 {
+                pruned += count;
+                store.grants = keep;
                 changes.push((
                     path,
                     context.config.clone(),
@@ -1680,5 +2051,611 @@ mod tests {
         assert_eq!(value["command_evaluated"], false);
         assert!(!value.to_string().contains("mirror.example"));
         assert!(explain_value(&mut context, &selected.id, "user").is_err());
+    }
+
+    fn user_grant(pattern: &str, rule: Option<&str>) -> TrustGrant {
+        TrustGrant {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern: pattern.into(),
+            rule_id: rule.map(str::to_string),
+            scope: GrantScope::User,
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: None,
+            revoked_at: None,
+            reason: None,
+        }
+    }
+
+    fn write_grants(grants: &[TrustGrant]) {
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let mut store = TrustGrantStore::default();
+        for grant in grants {
+            store.insert(grant).unwrap();
+        }
+        std::fs::write(
+            config.join(trust_grants::STORE_FILE),
+            serde_json::to_vec(&store).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn residual_trust_listings_include_rule_scoped_grants_for_any_rule_queries() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let target = "https://mirror.example/install.sh";
+        let all_rules = user_grant(target, None);
+        let broad = user_grant("mirror.example", Some("pipe_to_interpreter"));
+        write_grants(&[all_rules.clone(), broad.clone()]);
+        let ids = |value: &Value| -> Vec<String> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        // Rows: `None` asks "any rule", a named rule compares case-insensitively.
+        let context = Context::capture().unwrap();
+        let row = grant_row(&broad, &context);
+        assert!(row.matches(target, None));
+        assert!(row.matches(target, Some("PIPE_TO_INTERPRETER")));
+        assert!(!row.matches(target, Some("shortened_url")));
+
+        // Revoking the all-rules grant still reports the rule-scoped broad grant.
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &all_rules.id).unwrap();
+        assert_eq!(
+            ids(&revoked["remaining_grants"]),
+            vec![broad.id.clone()],
+            "{revoked}"
+        );
+        // `trust remove` without --rule reports it too.
+        let mut context = Context::capture().unwrap();
+        assert_eq!(
+            ids(&Value::Array(remaining(&context, target, None).unwrap())),
+            vec![broad.id.clone()]
+        );
+        // `trust explain <url>` lists the broad grant that covers the URL.
+        let explained =
+            explain_value(&mut context, "https://mirror.example/other.sh", "all").unwrap();
+        assert_eq!(
+            ids(&explained["matching_effective_grants"]),
+            vec![broad.id.clone()],
+            "{explained}"
+        );
+        assert!(ids(&explained["grants"]).contains(&broad.id));
+    }
+
+    #[test]
+    fn revocation_is_never_refused_by_the_store_size_cap() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        let store_path = config.join(trust_grants::STORE_FILE);
+        let compact_len = |grants: &[TrustGrant]| {
+            let mut store = TrustGrantStore::default();
+            for grant in grants {
+                store.insert(grant).unwrap();
+            }
+            serde_json::to_vec(&store).unwrap().len()
+        };
+        let cap = trust_grants::STORE_READ_CAP as usize;
+        // Only active grants, written compactly (hand-edited, `jq -c`, config
+        // management): just under the cap, so the indented form is far over
+        // it and there is no room for a `revoked_at` tombstone either way.
+        let mut grants = Vec::new();
+        let mut estimate = compact_len(&[]);
+        while estimate < cap - 4_000 {
+            let grant = TrustGrant {
+                reason: Some("x".repeat(100)),
+                ..user_grant(
+                    &format!("https://mirror.example/{}", grants.len()),
+                    Some("shortened_url"),
+                )
+            };
+            estimate += serde_json::to_vec(&grant).unwrap().len() + 1;
+            grants.push(grant);
+        }
+        let pad = cap - 10 - compact_len(&grants);
+        grants.last_mut().unwrap().reason = Some("x".repeat(100 + pad));
+        assert_eq!(compact_len(&grants), cap - 10);
+        let first = grants[0].clone();
+        let second = grants[1].clone();
+        let third = grants[2].clone();
+        let present = |id: &str| {
+            saved()
+                .records()
+                .into_iter()
+                .flatten()
+                .find(|grant| grant.id == id)
+        };
+        let effective = |target: &str| {
+            let explained = explain_value(&mut Context::capture().unwrap(), target, "all").unwrap();
+            // The target itself is still trusted by an effective grant.
+            usize::from(
+                explained["matching_effective_grants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["pattern"] == target),
+            )
+        };
+        let size = || std::fs::metadata(&store_path).unwrap().len();
+
+        // `trust remove` at the cap: the record is deleted instead of tombstoned.
+        write_grants(&grants);
+        assert_eq!(effective(&third.pattern), 1);
+        assert_eq!(remove(&third.pattern, None, "user"), 0);
+        assert!(present(&third.id).is_none());
+        assert_eq!(effective(&third.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+
+        // `trust revoke` at the cap, same store again.
+        write_grants(&grants);
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &first.id).unwrap();
+        assert_eq!(revoked["state"], "revoked", "{revoked}");
+        assert!(
+            present(&first.id).is_none(),
+            "a revocation that cannot fit as a tombstone deletes the record"
+        );
+        assert_eq!(effective(&first.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+        // With room again, a revocation keeps its tombstone.
+        let revoked = revoke_value(&mut Context::capture().unwrap(), &second.id).unwrap();
+        assert_eq!(revoked["state"], "revoked", "{revoked}");
+        assert!(present(&second.id).unwrap().revoked_at.is_some());
+        assert_eq!(effective(&second.pattern), 0);
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+
+        // `trust gc` prunes an expired grant from the same compact store.
+        // (Shorten the last reason by the bytes the expiry adds, so the
+        // written store stays at cap - 10.)
+        let mut expiring = grants.clone();
+        expiring[3].expires_at = Some("2020-01-01T00:00:00Z".into());
+        let grown = compact_len(&expiring) - (cap - 10);
+        let last = expiring.last_mut().unwrap();
+        let reason = last.reason.as_mut().unwrap();
+        reason.truncate(reason.len() - grown);
+        assert_eq!(compact_len(&expiring), cap - 10);
+        write_grants(&expiring);
+        assert_eq!(gc("user", true), 0);
+        assert!(present(&expiring[3].id).is_none());
+        assert!(present(&first.id).is_some());
+        assert!(size() <= trust_grants::STORE_READ_CAP, "{}", size());
+
+        // A compact legacy trust.json near the cap: `trust remove` succeeds.
+        std::fs::remove_file(&store_path).unwrap();
+        let legacy = config.join("trust.json");
+        let entry = |index: usize| json!({"pattern":format!("https://legacy.example/{index}"),"rule_id":"shortened_url","added":"2026-01-01T00:00:00Z","source":"cli"});
+        let mut entries = Vec::new();
+        let mut estimate = 0;
+        while estimate < cap - 1_000 {
+            estimate += serde_json::to_vec(&entry(entries.len())).unwrap().len() + 1;
+            entries.push(entry(entries.len()));
+        }
+        let written = serde_json::to_vec(&json!({"version":1,"entries":entries})).unwrap();
+        assert!(written.len() <= cap, "{}", written.len());
+        std::fs::write(&legacy, &written).unwrap();
+        assert_eq!(effective("https://legacy.example/5"), 1);
+        assert_eq!(remove("https://legacy.example/5", None, "user"), 0);
+        assert_eq!(effective("https://legacy.example/5"), 0);
+        assert_eq!(effective("https://legacy.example/6"), 1);
+        let legacy_size = std::fs::metadata(&legacy).unwrap().len();
+        assert!(legacy_size <= trust_grants::STORE_READ_CAP, "{legacy_size}");
+    }
+
+    #[test]
+    fn remove_matches_rules_case_insensitively_like_add() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        let target = "https://mirror.example/install.sh";
+        write_grants(&[user_grant(target, Some("pipe_to_interpreter"))]);
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&json!({"version":1,"entries":[{"pattern":"https://mirror.example/legacy","rule_id":"shortened_url","added":"2026-01-01T00:00:00Z","source":"cli"}]})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remove(target, Some("PIPE_TO_INTERPRETER"), "user"), 0);
+        assert!(saved().decode(0).unwrap().revoked_at.is_some());
+        assert_eq!(
+            remove(
+                "https://mirror.example/legacy",
+                Some("Shortened_URL"),
+                "user"
+            ),
+            0
+        );
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert!(legacy["entries"].as_array().unwrap().is_empty());
+        assert_eq!(remove(target, Some("shortened_url"), "user"), 1);
+    }
+
+    #[test]
+    fn migration_skips_expired_and_blocklisted_legacy_entries() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("policy.yaml"),
+            "blocklist:\n  - blocked.example\n",
+        )
+        .unwrap();
+        let active = trust_grants::expiry_from_ttl("7d", Utc::now()).unwrap();
+        let blocked = json!({"pattern":"https://blocked.example/x","rule_id":"shortened_url"});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&json!({"version":1,"entries":[
+                {"pattern":"https://mirror.example/active","rule_id":"shortened_url","ttl_expires":active},
+                {"pattern":"https://mirror.example/expired","rule_id":"shortened_url","ttl_expires":"2020-01-01T00:00:00Z"},
+                blocked,
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut context = Context::capture().unwrap();
+        assert!(context
+            .snapshot
+            .policy
+            .is_blocklisted("https://blocked.example/x"));
+        let value = migrate_value(&mut context, "user").unwrap();
+        assert_eq!(value["state"], "completed");
+        assert_eq!(value["migrated_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(value["expired_dropped"], 1);
+        assert_eq!(value["overridden_retained"], 1);
+        assert_eq!(value["invalid_retained"], 0);
+        let store = saved();
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(
+            store.decode(0).unwrap().pattern,
+            "https://mirror.example/active"
+        );
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert_eq!(legacy["entries"], json!([blocked]));
+        // Only the retained blocklisted entry is left: a second run changes nothing.
+        let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
+        assert_eq!(again["state"], "unchanged");
+        assert_eq!(saved().grants.len(), 1);
+    }
+
+    /// CORE-5: a 0.4.x `host/*` entry never matched. List, explain and migrate
+    /// name the exact remedy instead of a generic "invalid" plus a pointer to
+    /// a migration that leaves the entry behind, and nothing converts it to a
+    /// broader grant on the operator's behalf.
+    #[test]
+    fn legacy_wildcard_entries_report_the_remedy_and_are_never_converted() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let entries = json!({"version":1,"entries":[
+            {"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"},
+            {"pattern":"https://cdn.example.org/team/*","rule_id":null},
+            {"pattern":"*registry.example.net","rule_id":"docker_untrusted_registry"},
+            {"pattern":"https://mirror.example/x","rule_id":"shortened_url"},
+        ]});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let mut context = Context::capture().unwrap();
+        let listed = list_value(&mut context, None, true, "user").unwrap();
+        let row = |pattern: &str| {
+            listed["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["pattern"] == pattern)
+                .unwrap_or_else(|| panic!("{pattern}: {listed}"))
+                .clone()
+        };
+        let registry = row("registry.example.com/*");
+        assert_eq!(registry["state"], "invalid");
+        assert_eq!(registry["state_reason"], "wildcard_never_matches");
+        assert_eq!(registry["requires_migration"], false);
+        let remedy = registry["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains(
+                "`tirith trust remove 'registry.example.com/*' --rule 'docker_untrusted_registry' --scope user`"
+            ),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains(
+                "`tirith trust add 'registry.example.com' --broad --rule 'docker_untrusted_registry'`"
+            ),
+            "{remedy}"
+        );
+        let cdn = row("https://cdn.example.org/team/*");
+        let remedy = cdn["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("`tirith trust remove 'https://cdn.example.org/team/*' --scope user`"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("`tirith trust add 'cdn.example.org' --broad --rule RULE_ID`"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("--all-rules"), "{remedy}");
+        let no_host = row("*registry.example.net");
+        assert_eq!(no_host["state_reason"], "wildcard_never_matches");
+        let remedy = no_host["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("then trust the exact URL or image"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("trust add"), "{remedy}");
+        let valid = row("https://mirror.example/x");
+        assert_eq!(valid["state"], "effective");
+        assert_eq!(valid["requires_migration"], true);
+        assert!(valid["remedy"].is_null());
+
+        let explained = explain_value(&mut context, "registry.example.com/*", "all").unwrap();
+        assert!(explained["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["state_reason"] == "wildcard_never_matches"
+                && row["remedy"].as_str().is_some()));
+        assert!(explained["target_issue"]
+            .as_str()
+            .unwrap()
+            .contains("'registry.example.com' with --broad"));
+        let clean = explain_value(&mut context, "https://mirror.example/x", "all").unwrap();
+        assert!(clean["target_issue"].is_null());
+
+        let migrated = migrate_value(&mut context, "user").unwrap();
+        assert_eq!(migrated["state"], "completed");
+        assert_eq!(migrated["migrated_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(migrated["invalid_retained"], 3);
+        let skipped = migrated["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 3, "{migrated}");
+        assert!(skipped.iter().all(|row| row["remedy"].as_str().is_some()));
+        // Nothing was widened: the new store holds only the valid exact grant,
+        // and the dead entries stay where the operator can remove them.
+        let store = saved();
+        assert_eq!(store.grants.len(), 1);
+        assert_eq!(store.decode(0).unwrap().pattern, "https://mirror.example/x");
+        let legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("trust.json")).unwrap())
+                .unwrap();
+        assert_eq!(legacy["entries"].as_array().unwrap().len(), 3);
+
+        // A repeat migration is a no-op that still names what it left behind.
+        let again = migrate_value(&mut Context::capture().unwrap(), "user").unwrap();
+        assert_eq!(again["state"], "unchanged");
+        assert_eq!(again["skipped"].as_array().unwrap().len(), 3);
+    }
+
+    /// A pattern that output redaction changes cannot appear in a printed
+    /// command: the remedy names the store to edit, and keeps the host grant.
+    #[test]
+    fn wildcard_remedy_never_prints_a_redacted_pattern_as_a_command() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let entries = json!({"version":1,"entries":[
+            {"pattern":"http://user:pw@mirror.example.net:8443/pkgs/*","rule_id":"plain_http_to_sink"},
+            {"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"},
+        ]});
+        std::fs::write(
+            config.join("trust.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let mut context = Context::capture().unwrap();
+        let listed = list_value(&mut context, None, true, "user").unwrap();
+        let rows = listed["grants"].as_array().unwrap();
+        let credential = rows
+            .iter()
+            .find(|row| row["rule_id"] == "plain_http_to_sink")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(credential["state_reason"], "wildcard_never_matches");
+        let pattern = credential["pattern"].as_str().unwrap();
+        assert!(!pattern.contains("pw"), "{pattern}");
+        let remedy = credential["remedy"].as_str().unwrap();
+        assert!(!remedy.contains("trust remove"), "{remedy}");
+        assert!(!remedy.contains("pw"), "{remedy}");
+        assert!(remedy.contains("trust.json"), "{remedy}");
+        assert!(
+            remedy.contains(
+                "`tirith trust add 'mirror.example.net' --broad --rule 'plain_http_to_sink'`"
+            ),
+            "{remedy}"
+        );
+        // A pattern redaction leaves alone keeps the exact commands.
+        let plain = rows
+            .iter()
+            .find(|row| row["pattern"] == "registry.example.com/*")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert!(plain["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("tirith trust remove 'registry.example.com/*'"));
+    }
+
+    /// Repository and policy rows get a remedy that fits where they live.
+    #[test]
+    fn wildcard_remedy_follows_the_entry_source() {
+        let policy = Policy::default();
+        let repo = legacy_row(
+            &json!({"pattern":"registry.example.com/*","rule_id":"docker_untrusted_registry"}),
+            "legacy_repo",
+            "repo",
+            &policy,
+        );
+        let remedy = repo.remedy.unwrap();
+        assert!(
+            remedy.contains(
+                "`tirith trust remove 'registry.example.com/*' --rule 'docker_untrusted_registry' --scope repo`"
+            ),
+            "{remedy}"
+        );
+        // Repository content never gets a ready-made grant for its own host.
+        assert!(!remedy.contains("trust add"), "{remedy}");
+        assert!(!repo.requires_migration);
+        let repo_list = legacy_row(
+            &json!({"pattern":"registry.example.com/*"}),
+            "repository_allowlist",
+            "repo",
+            &policy,
+        );
+        let remedy = repo_list.remedy.unwrap();
+        assert!(
+            remedy.contains("remove it from .tirith/allowlist"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("'registry.example.com'"), "{remedy}");
+        let resolved = legacy_row(
+            &json!({"pattern":"registry.example.com/*"}),
+            "resolved_policy",
+            "policy",
+            &policy,
+        );
+        let remedy = resolved.remedy.unwrap();
+        assert!(
+            remedy.contains("replace 'registry.example.com/*' with 'registry.example.com'"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("tirith trust"), "{remedy}");
+        // An invalid rule keeps the generic reason: the pattern is not the
+        // only defect, so the host grant would not be the whole fix.
+        let bad_rule = legacy_row(
+            &json!({"pattern":"registry.example.com/*","rule_id":7}),
+            "legacy_user",
+            "user",
+            &policy,
+        );
+        assert_eq!(bad_rule.state_reason, "invalid_pattern_or_rule");
+        assert!(bad_rule.remedy.is_none());
+        // A quote in a hand-edited pattern cannot break out of the command.
+        let quoted = legacy_row(
+            &json!({"pattern":"registry.example.com/it's/*","rule_id":"docker_untrusted_registry"}),
+            "legacy_user",
+            "user",
+            &policy,
+        );
+        assert!(quoted
+            .remedy
+            .unwrap()
+            .contains("remove 'registry.example.com/it'\\''s/*'"));
+    }
+
+    #[test]
+    fn gc_prunes_old_revocations_and_keeps_recent_tombstones_and_active_grants() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let now = Utc::now();
+        let ago = |days: i64| (now - chrono::Duration::days(days)).to_rfc3339();
+        let active = user_grant("https://mirror.example/active", Some("shortened_url"));
+        let recent = TrustGrant {
+            revoked_at: Some(ago(1)),
+            ..user_grant("https://mirror.example/recent", Some("shortened_url"))
+        };
+        let old = TrustGrant {
+            revoked_at: Some(ago(REVOKED_RETENTION_DAYS + 1)),
+            ..user_grant("https://mirror.example/old", Some("shortened_url"))
+        };
+        let expired = TrustGrant {
+            expires_at: Some(ago(1)),
+            ..user_grant("https://mirror.example/expired", Some("shortened_url"))
+        };
+        write_grants(&[active.clone(), recent.clone(), old, expired]);
+        assert_eq!(gc("user", true), 0);
+        let ids: Vec<String> = saved()
+            .records()
+            .into_iter()
+            .map(|grant| grant.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec![active.id.clone(), recent.id.clone()]);
+        // A recent tombstone still answers an idempotent revoke.
+        assert_eq!(revoke(&recent.id, true), 0);
+        let stored: Value = serde_json::to_value(saved()).unwrap();
+        assert!(
+            stored.get("entries").is_none(),
+            "0.4.2 readers must still see no global entries"
+        );
+    }
+
+    #[test]
+    fn near_cap_store_is_compacted_by_gc_and_never_written_past_the_read_cap() {
+        let _state = GlobalStateGuard::new().unwrap();
+        let now = Utc::now();
+        let active = user_grant("https://mirror.example/active", Some("shortened_url"));
+        let mut grants = vec![active.clone()];
+        let mut serialized = 0usize;
+        let mut minutes = 0i64;
+        while serialized <= trust_grants::STORE_READ_CAP as usize - 2_000 {
+            minutes += 1;
+            let grant = TrustGrant {
+                revoked_at: Some((now - chrono::Duration::minutes(minutes)).to_rfc3339()),
+                reason: Some("x".repeat(400)),
+                ..user_grant(
+                    &format!("https://mirror.example/{minutes}"),
+                    Some("shortened_url"),
+                )
+            };
+            serialized += serde_json::to_string_pretty(&grant).unwrap().len() + 8;
+            grants.push(grant);
+        }
+        write_grants(&grants);
+        let config = tirith_core::policy::config_dir().unwrap();
+        let before = std::fs::read(config.join(trust_grants::STORE_FILE)).unwrap();
+        // An add that would push the store past its read cap is refused, untouched.
+        let big = "x".repeat(4_000);
+        let refused = add_value(
+            &mut Context::capture().unwrap(),
+            "https://mirror.example/new",
+            Some("shortened_url"),
+            None,
+            true,
+            false,
+            false,
+            Some(&big),
+            "user",
+        )
+        .unwrap_err();
+        assert!(refused.contains("1 MiB size limit"), "{refused}");
+        assert_eq!(
+            std::fs::read(config.join(trust_grants::STORE_FILE)).unwrap(),
+            before
+        );
+        // gc keeps every tombstone younger than the retention window except
+        // the oldest ones it needs to drop to get back under the compaction mark.
+        assert_eq!(gc("all", true), 0);
+        let size = std::fs::metadata(config.join(trust_grants::STORE_FILE))
+            .unwrap()
+            .len() as usize;
+        assert!(size <= STORE_COMPACT_BYTES, "{size}");
+        let kept = saved();
+        let ids: Vec<String> = kept
+            .records()
+            .into_iter()
+            .map(|grant| grant.unwrap().id)
+            .collect();
+        assert!(ids.contains(&active.id));
+        assert!(ids.contains(&grants[1].id), "the newest tombstone is kept");
+        assert!(
+            !ids.contains(&grants.last().unwrap().id),
+            "the oldest tombstone is pruned"
+        );
+        assert!(ids.len() < grants.len());
+        assert_eq!(
+            add(
+                "https://mirror.example/new",
+                Some("shortened_url"),
+                None,
+                true,
+                false,
+                false,
+                None,
+                "user",
+                true
+            ),
+            0
+        );
     }
 }

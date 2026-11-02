@@ -1,6 +1,6 @@
 //! Bounded effect hints for Python packaging and Cargo workflows.
 //!
-//! Grammar and qualification contract: docs/next-cycle/task-command-families.md.
+//! Grammar and limits: docs/internals.md, "Task command families".
 //! Nothing here can produce a complete analysis. Interpreter startup, build
 //! backends, build.rs/proc macros, package entrypoints and configuration remain
 //! unanalyzed, including when flags claim offline or dry-run behavior.

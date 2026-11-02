@@ -98,6 +98,7 @@ mod tests {
 
     #[test]
     fn retained_audit_handle_refuses_rebound_path_and_hardlinks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("log.jsonl");
         fs::write(&path, "old").unwrap();

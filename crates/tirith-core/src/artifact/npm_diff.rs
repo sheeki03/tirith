@@ -394,10 +394,7 @@ fn capabilities(inspection: &NpmInspection) -> BTreeSet<(String, NpmCapability)>
 }
 
 fn valid_sha(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::util::is_lower_hex(value, 64)
 }
 
 fn valid_bounds(inspection: &NpmInspection) -> bool {

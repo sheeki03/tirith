@@ -1,5 +1,6 @@
 //! Explicit local selection only. Enrollment/fetch/report are separate services.
 use super::setup::{self, fs_helpers::FileUpdate, TransactionOutcome};
+use super::team_shared::{error, id, network_allowed};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -79,19 +80,6 @@ pub enum StorageOutcome {
     SavedWithRecovery,
 }
 const NOTICE:&str="A saved connection does not enable team policy, enroll this device, or prove policy adoption. Personal protection does not require a team connection. Separate enrollment is unchanged.";
-fn error(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
-fn network_allowed() -> Result<(), String> {
-    if super::offline_env_active() {
-        Err("team authority contact is disabled by offline mode".into())
-    } else {
-        Ok(())
-    }
-}
-fn id(value: &str) -> Result<Id, String> {
-    Id::parse(value).map_err(|_| "a canonical non-nil connection UUID is required".into())
-}
 fn replacement_allowed(
     current: Option<&Id>,
     expected: Option<&Id>,

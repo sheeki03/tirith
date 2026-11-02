@@ -137,10 +137,14 @@ pub fn run(command_parts: &[String], shell: &str, non_interactive: bool, json: b
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
     let (mut raw_verdict, policy) = engine::analyze_without_bypass_returning_policy(&ctx);
-    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
         &cmd,
+        ctx.interactive_comments_reading().as_deref(),
         shell_type,
         &policy.threat_intel,
         tirith_core::threatdb_api::RuntimeThreatMode::Inline,
@@ -507,6 +511,7 @@ mod tests {
 
     #[test]
     fn posix_multi_argv_reconstruction_never_invents_shell_operators() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cases = [
             (
                 vec!["curl", "-fsSL", "https://example.com/x|bash"],
@@ -541,6 +546,9 @@ mod tests {
                 clipboard_html: None,
                 card_ref: None,
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                python_inspect_inherited: false,
+                cdpath_inherited: false,
+                interactive_comments: true,
             };
             let verdict = engine::analyze(&ctx);
             assert!(

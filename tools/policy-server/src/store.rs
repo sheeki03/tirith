@@ -13,7 +13,7 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tirith_core::policy_team::*;
 
@@ -33,13 +33,8 @@ CREATE TABLE reports (client TEXT PRIMARY KEY REFERENCES clients(id), id TEXT NO
 PRAGMA user_version=1;";
 
 pub fn unix_ms() -> Result<u64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ErrorCode::StorageUnavailable)?
-        .as_millis();
-    u64::try_from(now)
-        .ok()
-        .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+    tirith_core::util::now_ms()
+        .filter(|value| *value > 0)
         .ok_or(ErrorCode::StorageUnavailable)
 }
 fn sql<T>(result: rusqlite::Result<T>) -> Result<T> {
@@ -974,7 +969,7 @@ impl Store {
             OsRng
                 .try_fill_bytes(&mut entropy)
                 .map_err(|_| ErrorCode::StorageUnavailable)?;
-            let token: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+            let token = tirith_core::util::hex(&entropy);
             let credential = Id::new();
             let hash = token_hash(&token)?;
             fs(private_fs::write_new_secret(

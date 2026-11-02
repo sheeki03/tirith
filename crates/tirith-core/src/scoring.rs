@@ -345,6 +345,8 @@ pub fn is_threat_intel_rule(rule_id: RuleId) -> bool {
         | RuleId::MassFileDeletion
         // A2: scan-coverage incompleteness, not a threat-DB indicator.
         | RuleId::AnalysisIncomplete
+        // A runtime package lookup that did not complete is not an indicator.
+        | RuleId::PackageLookupIncomplete
         // B5: installed-distribution integrity, correlated from artifact signals,
         // not a threat-DB indicator.
         | RuleId::PythonInstalledIntegrityViolation
@@ -604,6 +606,7 @@ mod tests {
 
     #[test]
     fn note_only_card_findings_do_not_change_score() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R11 #3: a note-only Info finding must not inflate the score
         // (lone note scores 0; alongside real findings it adds nothing).
         for note in [

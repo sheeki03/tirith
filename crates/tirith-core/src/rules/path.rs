@@ -150,6 +150,7 @@ mod tests {
 
     #[test]
     fn percent_encoded_cyrillic_fires_non_ascii_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // repo-0329: %D0%B0 is Cyrillic small A; the raw path is pure ASCII, so
         // only the decoded view can see the non-ASCII content.
         let findings = check(&unparsed_url(), None, Some("/inst%D0%B0ll"));
@@ -170,6 +171,7 @@ mod tests {
 
     #[test]
     fn percent_encoded_homoglyph_fires_homoglyph_in_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // "login" with a percent-encoded Cyrillic o (U+043E): l%D0%BEgin.
         let findings = check(&unparsed_url(), None, Some("/l%D0%BEgin"));
         assert!(
@@ -182,12 +184,14 @@ mod tests {
 
     #[test]
     fn clean_ascii_path_fires_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check(&unparsed_url(), None, Some("/install/setup.sh"));
         assert!(findings.is_empty(), "got {findings:?}");
     }
 
     #[test]
     fn invalid_percent_utf8_is_conservatively_flagged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A truncated UTF-8 sequence decodes to U+FFFD, which the non-ASCII
         // check sees: malformed encodings fail closed.
         let findings = check(&unparsed_url(), None, Some("/x%D0y"));
@@ -199,6 +203,7 @@ mod tests {
 
     #[test]
     fn double_encoding_fires_once_from_raw_or_normalized() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Raw-only: the view's repeated-encoding marker fires DoubleEncoding.
         let findings = check(&unparsed_url(), None, Some("/x%252Fy"));
         let count = findings
@@ -223,6 +228,7 @@ mod tests {
 
     #[test]
     fn literal_non_ascii_still_fires_without_double_firing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A literal (unencoded) Cyrillic path fires once via the raw scan; the
         // identical decoded view adds nothing.
         let findings = check(&unparsed_url(), None, Some("/caf\u{00E9}"));

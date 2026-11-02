@@ -26,6 +26,15 @@ impl Id {
         }
         Ok(Self(value.into()))
     }
+    /// Any UUID spelling except nil, kept in the canonical form `parse`
+    /// requires. For identities given on a command line.
+    pub fn normalize(value: &str) -> Result<Self, ErrorCode> {
+        let id = uuid::Uuid::parse_str(value).map_err(|_| ErrorCode::InvalidRequest)?;
+        if id.is_nil() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        Ok(Self(id.to_string()))
+    }
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }

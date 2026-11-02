@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write as _};
+use std::path::Path;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -151,6 +152,7 @@ pub fn run(
     json_schema: u8,
     non_interactive: bool,
     interactive_flag: bool,
+    interactive_comments: bool,
     approval_check: bool,
     execution_receipt: Option<ShellReceiptChannel>,
     strict_warn: bool,
@@ -249,6 +251,9 @@ pub fn run(
     // Must run before any early return so hooks calling `--approval-check` still
     // trigger updates. `--offline`/`TIRITH_OFFLINE` makes this a guaranteed no-op.
     crate::cli::threatdb_cmd::maybe_background_update(offline);
+    // Same contract for an enrolled team policy cache: a detached, rate-limited
+    // sync child; this command never waits for the team server.
+    crate::cli::team_enrollment::maybe_background_refresh(offline);
 
     let session_id = tirith_core::session::resolve_session_id();
 
@@ -273,9 +278,13 @@ pub fn run(
             shell_name,
             cwd.as_deref(),
             interactive,
+            interactive_comments,
             offline,
         ) {
-            if let Some(ref raw_findings) = resp.raw_findings {
+            // A daemon that predates `interactive_comments` ignores it; its
+            // verdict lacks that reading, so analyze locally instead.
+            let reading_supported = interactive_comments || resp.interactive_comments_read;
+            if let Some(raw_findings) = resp.raw_findings.as_ref().filter(|_| reading_supported) {
                 let raw_action_parsed = resp
                     .raw_action
                     .as_deref()
@@ -308,10 +317,13 @@ pub fn run(
                     None,
                 )
             } else {
-                // Pre-upgrade daemon without raw-findings support — run locally.
-                eprintln!(
-                    "tirith: daemon does not support raw findings — falling back to local analysis"
-                );
+                // Pre-upgrade daemon without raw-findings support (or without
+                // the `--no-interactive-comments` reading) — run locally.
+                if reading_supported {
+                    eprintln!(
+                        "tirith: daemon does not support raw findings — falling back to local analysis"
+                    );
+                }
                 let ctx = AnalysisContext {
                     input: cmd.to_string(),
                     shell: shell_type,
@@ -325,6 +337,9 @@ pub fn run(
                     clipboard_html: None,
                     card_ref: card.clone(),
                     clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                    python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                    cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                    interactive_comments,
                 };
                 let (v, p) = engine::analyze_returning_policy(&ctx);
                 (v, Some(p))
@@ -343,6 +358,9 @@ pub fn run(
                 clipboard_html: None,
                 card_ref: card.clone(),
                 clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+                python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+                cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+                interactive_comments,
             };
             let (v, p) = engine::analyze_returning_policy(&ctx);
             (v, Some(p))
@@ -361,6 +379,9 @@ pub fn run(
             clipboard_html: None,
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         let (v, p) = if execution_receipt.is_some() {
             // A durable receipt must freeze every effective policy overlay even
@@ -397,14 +418,59 @@ pub fn run(
             Some(event_id),
             &policy.dlp_custom_patterns,
         );
+        // Machine callers require the ordinary channel output for an honored
+        // bypass. The approval-check channel (the zshenv guard, legacy shell
+        // hooks) expects a no-approval metadata file path on stdout, exactly
+        // as for any other non-approval verdict; without it the caller sees
+        // missing metadata and blocks the command it was told to allow.
+        if approval_check {
+            match tirith_core::approval::write_no_approval_file() {
+                Ok(path) => println!("{}", path.display()),
+                Err(e) => {
+                    eprintln!("tirith: failed to write approval file: {e}");
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        // JSON callers (agent adapters, the Hermes plugin) require the
+        // ordinary envelope; an honored bypass is `action: allow` with
+        // `bypass_honored: true` and no approval requirement.
+        if json {
+            let empty: [tirith_core::safe_command::SafeSuggestion; 0] = [];
+            let recovery = (json_schema == 4)
+                .then(|| tirith_core::recovery::for_command(&raw_verdict, cmd, shell_type));
+            if output::write_json_with_recovery(
+                &raw_verdict,
+                &policy.dlp_custom_patterns,
+                suggest_safe_command.then_some(empty.as_slice()),
+                recovery.as_ref(),
+                false,
+                std::io::stdout().lock(),
+            )
+            .is_err()
+            {
+                eprintln!("tirith: failed to write JSON output");
+            }
+        }
         return 0;
     }
 
     crate::cli::warn_repo_policy_neutralized(&policy);
 
-    if ran_locally {
-        let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
+    // An honored bypass reaches here only on the receipt path. It skipped
+    // analysis, so it also skips the runtime lookups (#284).
+    if ran_locally && !raw_verdict.bypass_honored {
+        let comment_reading = tirith_core::engine::interactive_comments_reading(
             cmd,
+            shell_type,
+            ScanContext::Exec,
+            interactive,
+            interactive_comments,
+        );
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            cmd,
+            comment_reading.as_deref(),
             shell_type,
             &policy.threat_intel,
             RuntimeThreatMode::Inline,
@@ -502,10 +568,11 @@ pub fn run(
                 return 1;
             }
         };
-        match execution_state::create_shell_execution_receipt(
+        match execution_state::create_shell_execution_receipt_with_comment_reading(
             prepared,
             channel,
             interactive,
+            interactive_comments,
             strict_warn,
             Duration::from_secs(ttl_secs),
         ) {
@@ -563,7 +630,9 @@ pub fn run(
     // traverses the whole cwd (seconds on large dirs) and hooks need fast responses.
     if interactive
         && effective.action != Action::Block
-        && tirith_core::checkpoint::should_auto_checkpoint(cmd)
+        && (tirith_core::checkpoint::should_auto_checkpoint(cmd)
+            || tirith_core::extract::posix_variable_command_literal_view(cmd, shell_type)
+                .is_some_and(|view| tirith_core::checkpoint::should_auto_checkpoint(&view)))
     {
         if let Some(cwd_val) = &cwd {
             let cwd_owned = cwd_val.clone();
@@ -718,6 +787,9 @@ pub fn run(
             clipboard_html: None,
             card_ref: card.clone(),
             clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+            python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+            cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+            interactive_comments,
         };
         if ran_locally {
             tirith_core::safe_command::suggest_verified_for_cli_inline_with_policy_session_and_network(
@@ -757,6 +829,7 @@ pub fn run(
             &policy.dlp_custom_patterns,
             suggestions_opt,
             recovery.as_ref(),
+            effective.action == Action::Warn && (strict_warn || policy.strict_warn),
             std::io::stdout().lock(),
         )
         .is_err()
@@ -1700,23 +1773,6 @@ type SigpipePublicationGuard = SigpipeDeliveryGuard;
 #[cfg(target_os = "macos")]
 type SigpipePublicationGuard = SigpipeDescriptorGuard;
 
-/// One nonblocking pipe write under the existing scoped SIGPIPE protection.
-/// Callers poll before entering: Darwin's descriptor-policy mutex must never
-/// cover a readiness wait. Preserve EPIPE/WouldBlock for the framing caller.
-#[cfg(unix)]
-pub(crate) fn write_pipe_sigpipe_safe(writer: &mut File, bytes: &[u8]) -> std::io::Result<usize> {
-    let mut guard =
-        SigpipePublicationGuard::begin(writer.as_raw_fd()).map_err(std::io::Error::other)?;
-    let result = writer.write(bytes);
-    match (result, guard.finish()) {
-        (result, Ok(())) => result,
-        (Ok(_), Err(error)) => Err(std::io::Error::other(error)),
-        (Err(error), Err(signal_error)) => Err(std::io::Error::other(format!(
-            "pipe write: {error}; {signal_error}"
-        ))),
-    }
-}
-
 #[cfg(unix)]
 fn write_stdout_line_sigpipe_safe(line: &str) -> Result<(), String> {
     let mut guard = SigpipePublicationGuard::begin(libc::STDOUT_FILENO)?;
@@ -2233,70 +2289,123 @@ fn wait_for_prompt_input(
     signal_fd: RawFd,
     deadline: Option<Instant>,
 ) -> std::io::Result<PromptWaitOutcome> {
-    let mut transient_valid_nvals = 0_u8;
     wait_for_prompt_input_with(deadline, |timeout_ms| {
-        let mut descriptors = [
-            libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: signal_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout_ms) };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if result == 0 {
-            return Ok(PromptWaitOutcome::TimedOut);
-        }
-        if descriptors[1].revents & libc::POLLNVAL != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "owned-prompt signal descriptor became invalid",
-            ));
-        }
-        if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            // Leave the byte queued. `with_controlling_tty` drains it only after
-            // restoring termios, then restores the prior disposition and raises
-            // the original signal.
-            return Ok(PromptWaitOutcome::Signal);
-        }
-        if descriptors[0].revents & libc::POLLNVAL != 0 {
-            let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            let is_tty = descriptor_flags >= 0 && unsafe { libc::isatty(fd) } == 1;
-            if is_tty && transient_valid_nvals < 32 {
-                // Darwin PTYs can transiently report POLLNVAL while the
-                // controlling session settles even though the descriptor is
-                // still open and isatty succeeds. Revalidate and retry with a
-                // hard cap; never spin forever or accept a replaced/non-TTY fd.
-                transient_valid_nvals += 1;
-                std::thread::sleep(Duration::from_millis(1));
-                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
-            }
-            let descriptor_state = if descriptor_flags >= 0 {
-                format!("open with flags {descriptor_flags:#x}, isatty={}", is_tty)
-            } else {
-                format!("closed: {}", std::io::Error::last_os_error())
-            };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("controlling-terminal descriptor became invalid ({descriptor_state})"),
-            ));
-        }
-        transient_valid_nvals = 0;
-        if descriptors[0].revents & libc::POLLIN != 0 {
-            return Ok(PromptWaitOutcome::Input);
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "controlling terminal closed before a response was entered",
-        ))
+        wait_for_prompt_input_once(fd, signal_fd, timeout_ms)
     })
+}
+
+/// One bounded wait for either a terminal byte or a relayed signal.
+/// `timeout_ms` is -1 for no deadline. A ready signal descriptor wins over
+/// terminal input, so a signal always aborts the prompt. Leave its byte
+/// queued: `with_controlling_tty` drains it only after restoring termios,
+/// then restores the prior disposition and raises the original signal.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn wait_for_prompt_input_once(
+    fd: RawFd,
+    signal_fd: RawFd,
+    timeout_ms: i32,
+) -> std::io::Result<PromptWaitOutcome> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: signal_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout_ms) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if result == 0 {
+        return Ok(PromptWaitOutcome::TimedOut);
+    }
+    if descriptors[1].revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owned-prompt signal descriptor became invalid",
+        ));
+    }
+    if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        return Ok(PromptWaitOutcome::Signal);
+    }
+    if descriptors[0].revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "controlling-terminal descriptor became invalid",
+        ));
+    }
+    if descriptors[0].revents & libc::POLLIN != 0 {
+        return Ok(PromptWaitOutcome::Input);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "controlling terminal closed before a response was entered",
+    ))
+}
+
+/// Darwin's poll(2) does not support character devices: on a descriptor
+/// opened from `/dev/tty` it reports POLLNVAL on every call, although the
+/// descriptor is open and isatty succeeds (#283). select(2) supports them.
+/// A hung-up terminal selects as readable, and the caller's read then
+/// returns 0 and fails closed.
+#[cfg(target_os = "macos")]
+fn wait_for_prompt_input_once(
+    fd: RawFd,
+    signal_fd: RawFd,
+    timeout_ms: i32,
+) -> std::io::Result<PromptWaitOutcome> {
+    // FD_SET indexes a fixed-size bitmap without a bounds check.
+    let in_range = |descriptor: RawFd| {
+        usize::try_from(descriptor).is_ok_and(|descriptor| descriptor < libc::FD_SETSIZE)
+    };
+    if !in_range(fd) || !in_range(signal_fd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prompt descriptor is outside the select(2) range",
+        ));
+    }
+    let mut readable = unsafe { std::mem::zeroed::<libc::fd_set>() };
+    unsafe {
+        libc::FD_ZERO(&mut readable);
+        libc::FD_SET(fd, &mut readable);
+        libc::FD_SET(signal_fd, &mut readable);
+    }
+    let mut timeout = (timeout_ms >= 0).then(|| libc::timeval {
+        tv_sec: libc::time_t::from(timeout_ms / 1000),
+        tv_usec: (timeout_ms % 1000) * 1000,
+    });
+    let timeout_ptr = timeout.as_mut().map_or(std::ptr::null_mut(), |timeout| {
+        timeout as *mut libc::timeval
+    });
+    let result = unsafe {
+        libc::select(
+            fd.max(signal_fd) + 1,
+            &mut readable,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            timeout_ptr,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if result == 0 {
+        return Ok(PromptWaitOutcome::TimedOut);
+    }
+    if unsafe { libc::FD_ISSET(signal_fd, &readable) } {
+        return Ok(PromptWaitOutcome::Signal);
+    }
+    if unsafe { libc::FD_ISSET(fd, &readable) } {
+        return Ok(PromptWaitOutcome::Input);
+    }
+    Err(std::io::Error::other(
+        "select reported readiness for no prompt descriptor",
+    ))
 }
 
 #[cfg(unix)]
@@ -2469,7 +2578,32 @@ pub fn arm_receipt(
     1
 }
 
-pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
+/// Run a receipt operation in the working directory its hook bound the receipt
+/// to. `--cwd` replaces the hook's former `sh -c 'cd …; exec tirith …'` hop, so
+/// Tirith stays the shell's direct child with one process launch. A directory
+/// that cannot be entered fails exactly like that silenced `cd` did: exit 1
+/// without a diagnostic. The receipt's sealed working-directory binding is
+/// still checked against the directory actually entered.
+fn enter_receipt_cwd(cwd: Option<&Path>) -> Result<(), i32> {
+    match cwd {
+        Some(cwd) => std::env::set_current_dir(cwd).map_err(|_| 1),
+        None => Ok(()),
+    }
+}
+
+/// Retire a receipt whose terminal outcome this process just observed. Hooks
+/// used to send a separate `acknowledge` call after every successful consume,
+/// discard or reconcile; doing it here saves that process launch. It stays best
+/// effort: a failed retirement never changes the operation's own result, and an
+/// unretired receipt still answers reconciliation and refuses replay.
+fn retire_receipt_best_effort(token: &str, channel: ShellReceiptChannel) {
+    let _ = execution_state::acknowledge_shell_execution_receipt(token, channel);
+}
+
+pub fn discard_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2485,7 +2619,10 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
         }
     };
     match execution_state::discard_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
+        Ok(()) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to discard shell execution receipt: {error}");
             1
@@ -2493,31 +2630,19 @@ pub fn discard_receipt(channel: ShellReceiptChannel) -> i32 {
     }
 }
 
-pub fn acknowledge_receipt(channel: ShellReceiptChannel) -> i32 {
-    let bytes = match read_receipt_stdin() {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    let token = match parse_receipt_token_frame(&bytes) {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("tirith: {error}");
-            return 1;
-        }
-    };
-    match execution_state::acknowledge_shell_execution_receipt(token, channel) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("tirith: failed to acknowledge shell execution receipt: {error}");
-            1
-        }
-    }
+/// `__execution-receipt acknowledge` from a hook loaded before this binary
+/// retired receipts itself. The preceding consume/discard/reconcile already did
+/// the work, so succeed without reading or trusting anything. The token frame
+/// is drained so an older hook's writer never sees a broken pipe.
+pub fn acknowledge_receipt_compat() -> i32 {
+    let _ = read_receipt_stdin();
+    0
 }
 
-pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn reconcile_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2537,7 +2662,10 @@ pub fn reconcile_receipt(channel: ShellReceiptChannel) -> i32 {
         channel,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(true) => 0,
+        Ok(true) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Ok(false) => 1,
         Err(error) => {
             eprintln!("tirith: failed to reconcile shell execution receipt: {error}");
@@ -2584,17 +2712,24 @@ pub(super) fn prepare_receipt_consumption_with_network(
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: context.interactive_comments(),
     };
     let (mut raw_verdict, mut policy) = engine::analyze_force_full_returning_policy(&analysis);
     raw_verdict.agent_origin = Some(tirith_core::agent_origin::resolve_cli_origin(true));
-    let runtime_findings = tirith_core::threatdb_api::enrich_command_with_network(
-        command,
-        context.shell(),
-        &policy.threat_intel,
-        RuntimeThreatMode::Inline,
-        network,
-    );
-    tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
+    // An honored bypass skipped analysis, so it skips the runtime lookups too.
+    if !raw_verdict.bypass_honored {
+        let runtime_findings = tirith_core::threatdb_api::enrich_command_readings_with_network(
+            command,
+            analysis.interactive_comments_reading().as_deref(),
+            context.shell(),
+            &policy.threat_intel,
+            RuntimeThreatMode::Inline,
+            network,
+        );
+        tirith_core::escalation::merge_late_findings(&mut raw_verdict, runtime_findings, &policy);
+    }
     if context.strict_warn_override() {
         policy.strict_warn = true;
     }
@@ -2610,7 +2745,10 @@ pub(super) fn prepare_receipt_consumption_with_network(
     )
 }
 
-pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
+pub fn consume_receipt(channel: ShellReceiptChannel, cwd: Option<&Path>) -> i32 {
+    if let Err(code) = enter_receipt_cwd(cwd) {
+        return code;
+    }
     let bytes = match read_receipt_stdin() {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -2646,7 +2784,10 @@ pub fn consume_receipt(channel: ShellReceiptChannel) -> i32 {
         prepared,
         execution_state::DEFAULT_GATE_LOCK_TIMEOUT,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            retire_receipt_best_effort(token, channel);
+            0
+        }
         Err(error) => {
             eprintln!("tirith: failed to consume shell execution receipt: {error}");
             1
@@ -3003,6 +3144,7 @@ mod receipt_interaction_tests {
     #[cfg(unix)]
     #[test]
     fn terminal_mode_guard_restores_full_mode_on_restore_and_unwind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::fd::FromRawFd as _;
 
         let mut master = -1;
@@ -3440,6 +3582,172 @@ mod receipt_interaction_tests {
         );
     }
 
+    /// Re-run `test_name` from this test binary as a child whose controlling
+    /// terminal is a fresh PTY, as the shell hook runs `tirith check`. The
+    /// parent keeps only the master side.
+    #[cfg(unix)]
+    fn spawn_controlling_tty_child(
+        test_name: &str,
+        child_env: &str,
+        child_mode: &str,
+    ) -> (File, std::process::Child) {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let opened = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            opened,
+            0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0,
+                "set PTY close-on-exec: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut command =
+            Command::new(std::env::current_exe().expect("locate current unit-test executable"));
+        command
+            .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+            .env(child_env, child_mode)
+            .stdin(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdin"),
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
+            .spawn()
+            .expect("spawn controlling-terminal prompt child");
+        drop(slave);
+        (master, child)
+    }
+
+    /// The prompt must wait on `/dev/tty` itself. On Darwin, poll(2) reported
+    /// POLLNVAL for that descriptor on every call, so every prompt failed
+    /// closed about 32 ms after it appeared (#283).
+    #[cfg(unix)]
+    #[test]
+    fn owned_prompt_waits_for_a_late_answer_and_for_its_deadline() {
+        const CHILD_ENV: &str = "TIRITH_TEST_OWNED_PROMPT_WAIT_CHILD";
+        const READY_MARKER: &str = "TIRITH_WAIT_PROMPT_READY";
+        const TEST_NAME: &str = "cli::check::receipt_interaction_tests::owned_prompt_waits_for_a_late_answer_and_for_its_deadline";
+
+        if let Some(mode) = std::env::var_os(CHILD_ENV) {
+            let timeout = (mode == "deadline").then(|| Duration::from_millis(300));
+            let resolution =
+                with_controlling_tty(|tty| tty.prompt(&format!("{READY_MARKER} [y/N] "), timeout));
+            println!("TIRITH_PROMPT_RESULT={resolution:?}");
+            return;
+        }
+
+        use std::io::Read as _;
+
+        for (mode, answer, expected) in [
+            ("answer", Some(b"y\n".as_slice()), "Ok(Accepted)"),
+            ("deadline", None, "Ok(TimedOut)"),
+        ] {
+            let (mut master, mut child) = spawn_controlling_tty_child(TEST_NAME, CHILD_ENV, mode);
+            if let Err(error) = wait_for_pty_marker(
+                &mut master,
+                &mut child,
+                READY_MARKER.as_bytes(),
+                Duration::from_secs(5),
+            ) {
+                drop(master);
+                let cleanup = reap_after_pty_close_or_force(&mut child);
+                let stderr = take_child_stderr(&mut child);
+                panic!("{mode}: {error}; cleanup state: {cleanup}; child stderr: {stderr}");
+            }
+            if let Some(answer) = answer {
+                // Type well after the prompt began waiting, as a person does.
+                std::thread::sleep(Duration::from_millis(250));
+                if let Err(error) = master.write_all(answer) {
+                    drop(master);
+                    let cleanup = reap_after_pty_close_or_force(&mut child);
+                    let mut stdout = String::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        let _ = pipe.read_to_string(&mut stdout);
+                    }
+                    let stderr = take_child_stderr(&mut child);
+                    panic!(
+                        "{mode}: type the prompt answer: {error}; cleanup state: {cleanup}; child stdout: {stdout}; child stderr: {stderr}"
+                    );
+                }
+            }
+            // Keep draining the master as a terminal emulator does: restoring
+            // the terminal mode waits for the echoed answer to be read.
+            let drained = wait_for_pty_marker(
+                &mut master,
+                &mut child,
+                b"TIRITH_UNREACHABLE_DIAGNOSTIC_MARKER",
+                Duration::from_secs(5),
+            )
+            .expect_err("diagnostic marker must remain absent");
+            // Draining ends when the child exits or its PTY side closes.
+            assert!(
+                !drained.starts_with("PTY marker was not observed"),
+                "{mode}: {drained}"
+            );
+            let status = match wait_for_child_exit(&mut child, Duration::from_secs(5)) {
+                Ok(status) => status,
+                Err(error) => {
+                    drop(master);
+                    let cleanup = reap_after_pty_close_or_force(&mut child);
+                    let stderr = take_child_stderr(&mut child);
+                    panic!("{mode}: {error}; cleanup state: {cleanup}; child stderr: {stderr}");
+                }
+            };
+            let mut stdout = String::new();
+            child
+                .stdout
+                .take()
+                .expect("prompt child stdout")
+                .read_to_string(&mut stdout)
+                .expect("read prompt child stdout");
+            let stderr = take_child_stderr(&mut child);
+            assert!(
+                status.success(),
+                "{mode}: prompt child failed with {status}; stdout={stdout}; stderr={stderr}"
+            );
+            assert!(
+                stdout.contains(&format!("TIRITH_PROMPT_RESULT={expected}")),
+                "{mode}: expected {expected}; stdout={stdout}; stderr={stderr}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn closed_stdout_rolls_back_without_default_sigpipe_termination() {
@@ -3546,6 +3854,7 @@ mod contextual_display_tests {
 
     #[test]
     fn display_cooldown_requires_every_client_authority() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let finding = finding();
         let urls = tirith_core::extract::extract_urls(
             "curl http://0x7f.0x/path; wget http://0x7f.0x/path",

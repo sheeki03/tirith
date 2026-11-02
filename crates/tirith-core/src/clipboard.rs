@@ -176,16 +176,7 @@ pub fn source_file_nonempty() -> bool {
 /// Lowercase-hex SHA-256 of `bytes` — the single source of truth for the
 /// clipboard-content hash (Greptile R1 #6) so the record, the rule, and the CLI
 /// displays can never drift apart.
-pub fn content_sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
-}
+pub use crate::util::sha256_hex as content_sha256_hex;
 
 /// Failure modes for clipboard access. `NoBackend` is the soft-fail path —
 /// callers degrade (empty envelope, exit 0 in JSON mode), never panic.
@@ -286,6 +277,7 @@ mod tests {
 
     #[test]
     fn source_record_roundtrips_from_disk() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         std::fs::write(
@@ -302,6 +294,7 @@ mod tests {
 
     #[test]
     fn source_record_optional_fields_default() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `#[serde(default)]` fields let a minimal/older record still parse.
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
@@ -317,6 +310,7 @@ mod tests {
 
     #[test]
     fn source_record_absent_is_none_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         // File never created — fail-safe to None.
@@ -326,6 +320,7 @@ mod tests {
 
     #[test]
     fn source_record_malformed_is_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         std::fs::write(&path, b"this is not json").unwrap();
@@ -337,6 +332,7 @@ mod tests {
 
     #[test]
     fn source_file_nonempty_reflects_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         assert!(!source_file_nonempty_at(&path));
@@ -346,6 +342,7 @@ mod tests {
 
     #[test]
     fn source_file_nonempty_rejects_a_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R7: a directory at the path (non-zero len() on some
         // filesystems) must NOT count as a non-empty record — the reader only
         // accepts a regular file, so the fast-path probe must too.

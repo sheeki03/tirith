@@ -45,7 +45,7 @@
 //! # The tree digest
 //!
 //! [`scan_tree`] is the load-bearing primitive. It is modelled on the reviewed
-//! `artifact::resolver::attest_pip_trees` binding (domain-separated prefix,
+//! pip-tree attestation of the retired package resolver (domain-separated prefix,
 //! caps folded into the digest, sorted length-prefixed relative paths, mode,
 //! size, no-follow open, post-open re-stat, exact-length read plus a one-byte
 //! grow probe) but is cross-platform, built on retained directory capabilities,

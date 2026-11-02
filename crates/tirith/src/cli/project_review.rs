@@ -32,15 +32,7 @@ fn present(report: &ProjectReview, scope: &Path) -> Result<Value, String> {
     let mut value = report.projection(&patterns)?;
     let diagnostics = tirith_core::policy::drain_captured_policy_diagnostics_for_output(&compiled);
     value["redaction"] = json!({"source":"trusted_local_policy","remote_policy":"unavailable_offline","effective_runtime_policy":false});
-    value["diagnostics"] = json!(diagnostics
-        .into_iter()
-        .take(16)
-        .map(|text| if text.len() > 1024 {
-            "[withheld: diagnostic exceeds output limit]".to_string()
-        } else {
-            text
-        })
-        .collect::<Vec<_>>());
+    value["diagnostics"] = json!(super::bounded_diagnostics(diagnostics, 16, str::to_string).0);
     Ok(value)
 }
 
@@ -86,7 +78,7 @@ pub(crate) fn inspect_retained(
 
 pub(crate) fn revalidate(id: &str, cwd: Option<&str>) -> Result<Value, String> {
     let _capture = PolicyDiagnosticCapture::start();
-    if !uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id) {
+    if !tirith_core::util::is_uuid(id) {
         return Err("report ID must be a canonical UUID".into());
     }
     let root = project_root(cwd)?;

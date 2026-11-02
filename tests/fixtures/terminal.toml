@@ -550,3 +550,66 @@ input = "/tmp/backup_\u0441\u0435\u0440\u0432\u0435\u0440.log"
 context = "paste"
 expected_action = "allow"
 expected_rules = []
+
+# ── 0.5.0 fix round C2: terminal control bytes in commands (exec) ───────────
+# Agent integrations submit every command through `tirith check`, so the
+# paste path's ANSI/control-byte rules apply to exec input too. CRLF line
+# endings and a trailing CR stay exempt, as on the paste path.
+[[fixture]]
+name = "osc52_clipboard_write_in_command"
+min_milestone = 1
+input = "echo -e \"\u001b]52;c;ZWNobyBoaQ==\u0007\""
+context = "exec"
+expected_action = "block"
+expected_rules = ["ansi_escapes", "control_chars"]
+
+[[fixture]]
+name = "hidden_text_sgr_in_command"
+min_milestone = 1
+input = "echo hi\u001b[8m hidden\u001b[0m"
+context = "exec"
+expected_action = "block"
+expected_rules = ["ansi_escapes"]
+
+[[fixture]]
+name = "carriage_return_overwrite_in_command"
+min_milestone = 1
+input = "ls\rrm -rf ~"
+context = "exec"
+expected_action = "block"
+expected_rules = ["control_chars"]
+
+[[fixture]]
+name = "cursor_save_restore_escape_in_command"
+min_milestone = 1
+input = "echo safe\u001b7rm -rf ~\u001b8"
+context = "exec"
+expected_action = "block"
+expected_rules = ["ansi_escapes"]
+
+[[fixture]]
+name = "crlf_line_endings_in_command_allowed"
+min_milestone = 1
+input = "echo a\r\necho b\r\n"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["control_chars", "ansi_escapes"]
+
+[[fixture]]
+name = "trailing_carriage_return_in_command_allowed"
+min_milestone = 1
+input = "ls -la\r"
+context = "exec"
+expected_action = "allow"
+expected_rules = []
+forbidden_rules = ["control_chars"]
+
+[[fixture]]
+name = "cursor_save_restore_escape_paste"
+min_milestone = 1
+input = "echo safe\u001b7rm -rf ~\u001b8"
+context = "paste"
+expected_action = "block"
+expected_rules = ["ansi_escapes"]
+raw_bytes = [101, 99, 104, 111, 32, 115, 97, 102, 101, 27, 55, 114, 109, 32, 45, 114, 102, 32, 126, 27, 56]

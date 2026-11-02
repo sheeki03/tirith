@@ -61,6 +61,7 @@ struct StatusSnapshot {
     audit_recording: super::audit_health::AuditHealth,
     shell_target: serde_json::Value,
     approval: super::package_approval_authority::PackageApprovalAvailability,
+    hook_freshness: super::hook_freshness::HookFreshnessReport,
 }
 
 impl StatusSnapshot {
@@ -82,6 +83,7 @@ impl StatusSnapshot {
                 serde_json::Value::Null
             },
             approval: super::package_approval_authority::availability(),
+            hook_freshness: super::hook_freshness::gather(),
         }
     }
 
@@ -144,6 +146,7 @@ impl StatusResult {
             "satisfied": !self.require_verified_blocking || evidence.verified_blocking,
         });
         out["package_approval"] = serde_json::json!(self.snapshot.approval);
+        out["hook_freshness"] = serde_json::json!(self.snapshot.hook_freshness);
         out
     }
 
@@ -175,6 +178,9 @@ impl StatusResult {
         println!("  pkg approval: {} (optional)", approval.state);
         println!("    {}", approval.detail);
         println!("    {}", approval.next_action);
+        for line in self.snapshot.hook_freshness.human_lines() {
+            println!("  {line}");
+        }
         println!();
         if evidence.verified_blocking {
             println!("tirith: blocking observed in this caller shell; evidence is limited to the authenticated diagnostic sequence");
@@ -290,6 +296,7 @@ mod tests {
 
     #[test]
     fn human_policy_path_reuses_frozen_dlp_after_escape_removal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
         tirith_core::policy::freeze_captured_policy_dlp_patterns(&["private-project".into()]);
         for path in [
@@ -331,6 +338,9 @@ mod tests {
         assert_eq!(value["protection_evidence"]["verified_blocking"], false);
         assert_eq!(value["requirement"]["satisfied"], false);
         assert_eq!(status.exit_code, 1);
+        // The loaded-hook readout is additive and never a blocking proof.
+        assert_eq!(value["hook_freshness"]["blocking_proof"], false);
+        assert!(value["hook_freshness"]["this_shell"].is_string());
     }
 
     /// A deterministic, "not installed" [`ThreatDbStatus`] used as a functional

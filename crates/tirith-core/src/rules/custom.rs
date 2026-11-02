@@ -440,6 +440,7 @@ mod tests {
 
     #[test]
     fn test_check_matches_in_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rules = vec![make_rule(
             "corp",
             r"internal\.corp\.example\.com",
@@ -459,6 +460,7 @@ mod tests {
 
     #[test]
     fn test_check_no_match_wrong_context() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rules = vec![make_rule("corp", r"internal\.corp", &["exec"])];
         let compiled = compile_rules(&rules);
 
@@ -468,6 +470,7 @@ mod tests {
 
     #[test]
     fn test_check_no_match_when_pattern_absent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rules = vec![make_rule("corp", r"internal\.corp", &["exec"])];
         let compiled = compile_rules(&rules);
 
@@ -540,6 +543,7 @@ mod tests {
 
     #[test]
     fn test_any_semantic_only_dsl_rules_classification() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Tier-1 gating guard (CodeRabbit M13 PR #132): fixes context to Exec and
         // varies the clause (the context-aware case is a separate test).
 
@@ -846,6 +850,7 @@ mod tests {
 
     #[test]
     fn test_compile_all_command_and_file_is_dropped_as_unsatisfiable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 round-9 R9-1: `all(command.*, file.*)` mixes contexts
         // that never co-occur (empty intersection), so it can never match and is
         // dropped even with both contexts declared.
@@ -1026,6 +1031,7 @@ mod tests {
 
     #[test]
     fn test_regex_check_ignores_dsl_rules() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rule = make_dsl_rule("dsl-only", WhenClause::CommandUsesSudo(true), &["exec"]);
         let compiled = compile_rules(&[rule]);
         // The regex `check` path must never match a DSL rule.

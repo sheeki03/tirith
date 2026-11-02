@@ -8,6 +8,9 @@ use tirith_core::mcp::dispatcher::DispatcherOptions;
 /// through the output-direction analyzer. The CLI enables it by default and
 /// requires an explicit unsafe compatibility flag to turn it off.
 pub fn run(sanitize_tool_output: bool) -> i32 {
+    // An enrolled team policy cache is refreshed in the background, as by
+    // `tirith check`, for as long as the server runs.
+    crate::cli::team_enrollment::start_server_background_refresh();
     let stdin = BufReader::new(io::stdin());
     let stdout = io::stdout();
     let stderr = io::stderr();

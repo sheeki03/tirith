@@ -118,6 +118,7 @@ mod tests {
 
     #[test]
     fn display_installed_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let loc = SubjectLocation::installed("/venv/lib/site-packages/x.py");
         assert_eq!(loc.to_string(), "/venv/lib/site-packages/x.py");
     }

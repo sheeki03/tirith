@@ -56,18 +56,6 @@ impl DirectoryIdentity {
         Ok(result)
     }
 
-    /// Private live-process handoff evidence, never browser output or durable
-    /// authority. Original handles MUST remain held until the receiver captures
-    /// matching objects; after both close, inode/file-ID reuse invalidates proof.
-    pub(crate) fn private_handoff_identity(&self) -> Result<serde_json::Value, String> {
-        self.revalidate()?;
-        Ok(serde_json::json!({
-            "requested": self.requested, "canonical": self.canonical,
-            "private_leaf": self.private_leaf,
-            "ancestors": self.held.iter().map(|held| held.identity).collect::<Vec<_>>()
-        }))
-    }
-
     /// Validate an existing operator-owned leaf before tightening its ordinary
     /// read permissions. Never repair another owner's directory, a writable
     /// shared directory, or a Darwin ACL that would survive private mode bits.
@@ -96,8 +84,7 @@ impl DirectoryIdentity {
                 self.private_leaf && index + 1 == self.held.len(),
                 index + 1 < self.held.len(),
             )?;
-            if native::identity(&before.file)? != before.identity || before.identity != now.identity
-            {
+            if identity(&before.file)? != before.identity || before.identity != now.identity {
                 return Err(
                     "private control directory identity changed; reopen the dashboard".into(),
                 );
@@ -107,13 +94,19 @@ impl DirectoryIdentity {
     }
 }
 
+/// The identity of an open object (Unix device/inode, Windows volume/file
+/// index), shared with the core contained-file primitives.
+fn identity(file: &File) -> Result<(u64, u64), String> {
+    tirith_core::util::file_identity(file).map_err(|_| "cannot inspect native file identity".into())
+}
+
 fn capture_directories(path: &Path, private_leaf: bool) -> Result<Vec<HeldDirectory>, String> {
     let files = native::open_chain(path)?;
     let mut held = Vec::with_capacity(files.len());
     let count = files.len();
     for (index, file) in files.into_iter().enumerate() {
         native::validate_directory(&file, private_leaf && index + 1 == count, index + 1 < count)?;
-        let identity = native::identity(&file)?;
+        let identity = identity(&file)?;
         held.push(HeldDirectory { file, identity });
     }
     Ok(held)
@@ -158,15 +151,6 @@ impl BinaryIdentity {
         Self::capture_with_empty_input(path, true)
     }
 
-    /// Apply a caller's smaller bound to the opened file before hashing it.
-    /// A preceding pathname size check cannot close a replacement race.
-    pub(crate) fn capture_input_capped(path: &Path, cap: u64) -> Result<Self, String> {
-        if cap == 0 || cap > 512 * 1024 * 1024 {
-            return Err("invalid retained input size limit".into());
-        }
-        Self::capture_with_limit(path, true, cap)
-    }
-
     fn capture_with_empty_input(path: &Path, allow_empty: bool) -> Result<Self, String> {
         Self::capture_with_limit(path, allow_empty, 512 * 1024 * 1024)
     }
@@ -209,14 +193,6 @@ impl BinaryIdentity {
     }
     pub fn sha256(&self) -> &str {
         &self.sha256
-    }
-
-    /// Private anonymous-pipe evidence under simultaneous retained handles.
-    pub(crate) fn private_handoff_identity(&self) -> Result<serde_json::Value, String> {
-        self.revalidate()?;
-        Ok(
-            serde_json::json!({"path": self.path, "generation": self.generation, "sha256": self.sha256}),
-        )
     }
 
     pub fn revalidate(&self) -> Result<(), String> {
@@ -456,13 +432,6 @@ mod native {
         Err("control directory ACL verification is unsupported on this platform".into())
     }
 
-    pub fn identity(file: &File) -> Result<(u64, u64), String> {
-        let metadata = file
-            .metadata()
-            .map_err(|_| "cannot inspect native file identity")?;
-        Ok((metadata.dev(), metadata.ino()))
-    }
-
     pub fn generation(file: &File) -> Result<Generation, String> {
         let metadata = file
             .metadata()
@@ -569,14 +538,6 @@ mod native {
         Ok(info)
     }
 
-    pub fn identity(file: &File) -> Result<(u64, u64), String> {
-        let info = information(file)?;
-        Ok((
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        ))
-    }
-
     pub fn generation(file: &File) -> Result<Generation, String> {
         let info = information(file)?;
         if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
@@ -595,7 +556,7 @@ mod native {
         }
         .map_err(|_| "cannot inspect binary change generation")?;
         Ok(Generation {
-            identity: identity(file)?,
+            identity: super::identity(file)?,
             size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
             links: u64::from(info.nNumberOfLinks),
             modified: (basic.LastWriteTime, 0),
@@ -614,9 +575,6 @@ mod native {
     pub fn validate_directory(_: &File, _: bool, _: bool) -> Result<(), String> {
         Err("directory permissions are unsupported".into())
     }
-    pub fn identity(_: &File) -> Result<(u64, u64), String> {
-        Err("native file identity is unsupported".into())
-    }
     pub fn generation(_: &File) -> Result<Generation, String> {
         Err("native file generation is unsupported".into())
     }
@@ -628,24 +586,20 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn capped_input_identity_checks_the_opened_generation_before_hashing() {
+    fn input_identity_checks_the_opened_generation_before_hashing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small-private-input");
         std::fs::write(&path, b"1234").unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 3).is_err());
-        let held = BinaryIdentity::capture_input_capped(&path, 4).unwrap();
+        let held = BinaryIdentity::capture_input(&path).unwrap();
         assert_eq!(held.sha256(), format!("{:x}", Sha256::digest(b"1234")));
         drop(held);
-        assert!(BinaryIdentity::capture_input_capped(&path, 0).is_err());
-        assert!(BinaryIdentity::capture_input_capped(&path, 512 * 1024 * 1024 + 1).is_err());
         std::fs::write(&path, b"").unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 4).is_ok());
+        assert!(BinaryIdentity::capture_input(&path).is_ok());
         assert!(
             BinaryIdentity::capture(&path).is_err(),
             "binary emptiness contract is unchanged"
         );
-        std::fs::write(&path, vec![b'x'; 4097]).unwrap();
-        assert!(BinaryIdentity::capture_input_capped(&path, 4096).is_err());
         // A sparse oversized executable must refuse before hashing, with a
         // useful size diagnosis instead of an indistinguishable open failure.
         File::create(&path)
@@ -661,6 +615,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn binary_guard_detects_replacement_and_same_size_in_place_edits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("binary");
         std::fs::write(&path, b"original bytes").unwrap();
@@ -682,6 +637,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn binary_guard_excludes_in_place_writes_and_detects_atomic_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("binary");
         std::fs::write(&path, b"original bytes").unwrap();
@@ -800,6 +756,7 @@ mod tests {
 
         #[test]
         fn directory_guards_deny_delete_access_on_leaf_and_ancestors_until_release() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             for private in [true, false] {
                 let temp = tempfile::tempdir().unwrap();
                 let scope = temp.path().canonicalize().unwrap();
@@ -838,6 +795,7 @@ mod tests {
 
         #[test]
         fn directory_guard_refuses_a_preexisting_delete_access_handle() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             for held_ancestor in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let scope = temp.path().canonicalize().unwrap();
@@ -859,6 +817,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn private_directory_rejects_unsafe_modes_and_rebound_ancestors() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("control");
@@ -881,6 +840,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn directory_alias_retargeting_and_private_mode_drift_refuse() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("one");

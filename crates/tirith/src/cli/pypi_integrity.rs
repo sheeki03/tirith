@@ -632,6 +632,7 @@ mod tests {
 
     #[test]
     fn url_is_normalized_and_encoded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let url = integrity_provenance_url(
             "https://pypi.org/integrity",
             "Sample.Project",
@@ -653,6 +654,7 @@ mod tests {
 
     #[test]
     fn url_segment_encoding_contains_no_path_breakout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A component containing a slash must be percent-encoded into its segment,
         // not expand the path. `url::Url`'s path_segments_mut guarantees this.
         let url = integrity_provenance_url("https://pypi.org/integrity", "demo", "1.0", "a/b.whl");
@@ -784,6 +786,7 @@ mod tests {
 
     #[test]
     fn production_client_rejects_connect_time_private_rebind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::error::Error as _;
 
         let url = "http://rebind.example.test/integrity/demo/1.0/demo.whl/provenance";
@@ -833,6 +836,7 @@ mod tests {
 
     #[test]
     fn fetch_rejects_credentials_in_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let res = fetch_provenance_at("https://user:pass@pypi.org/integrity/x/1/x.whl/provenance");
         assert!(matches!(res, Err(FetchError::Transport(_))));
     }

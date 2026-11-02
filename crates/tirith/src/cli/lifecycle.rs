@@ -9,7 +9,7 @@ use tirith_core::selfupdate::SemVer;
 
 #[path = "lifecycle_formats.rs"]
 mod stored_formats;
-pub(crate) use stored_formats::PersistedFormats;
+pub(crate) use stored_formats::{PersistedFormats, STATE_CONTRACT_VERSION};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct VersionObservation {
@@ -41,6 +41,7 @@ pub(crate) struct CompatibilityFacts {
     pub mcp_lock_read_versions: Vec<u32>,
     pub legacy_trust_read_versions: Vec<u32>,
     pub scoped_grant_read_versions: Vec<u32>,
+    pub state_contract_version: u32,
     pub persisted_formats: PersistedFormats,
     pub persisted_inventory_scope: &'static str,
     pub operation_journal_version: u32,
@@ -70,6 +71,17 @@ pub(crate) struct LifecycleFacts {
     /// This process only. The control service separately owns its live jobs.
     pub active_jobs_in_this_process: usize,
     pub compatibility: CompatibilityFacts,
+}
+
+/// The inherited `TIRITH_INTEGRATION_VERSION`, parsed and bounded like
+/// `loaded_integration`. Unverified: any parent process can set it.
+pub(crate) fn inherited_integration_version() -> Option<String> {
+    loaded_integration(
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("TIRITH_INTEGRATION_VERSION").ok().as_deref(),
+        None,
+    )
+    .version
 }
 
 fn loaded_integration(
@@ -292,6 +304,7 @@ pub(super) fn gather(
             mcp_lock_read_versions: (4..=tirith_core::mcp_lock::MCP_LOCK_FORMAT_VERSION).collect(),
             legacy_trust_read_versions: vec![1],
             scoped_grant_read_versions: vec![tirith_core::trust_grants::STORE_VERSION],
+            state_contract_version: STATE_CONTRACT_VERSION,
             persisted_formats: PersistedFormats::current(),
             persisted_inventory_scope: stored_formats::INVENTORY_SCOPE,
             operation_journal_version: 1,

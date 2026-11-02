@@ -751,6 +751,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ssh_private_key_loose_perms_flags_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -787,6 +788,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ssh_private_key_0600_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -801,6 +803,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn aws_credentials_loose_perms_flags_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let aws = dir.path().join(".aws");
         std::fs::create_dir_all(&aws).unwrap();
@@ -815,6 +818,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kubeconfig_group_readable_flags_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let kube = dir.path().join(".kube");
         std::fs::create_dir_all(&kube).unwrap();
@@ -832,6 +836,7 @@ mod tests {
 
     #[test]
     fn npmrc_plaintext_token_flags_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".npmrc"),
@@ -850,6 +855,7 @@ mod tests {
 
     #[test]
     fn npmrc_env_reference_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".npmrc"),
@@ -863,6 +869,7 @@ mod tests {
 
     #[test]
     fn pypirc_plaintext_password_flags_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".pypirc"),
@@ -876,6 +883,7 @@ mod tests {
 
     #[test]
     fn pypirc_token_placeholder_username_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         // `__token__` username with NO literal password → not a leak.
         std::fs::write(dir.path().join(".pypirc"), "[pypi]\nusername = __token__\n").unwrap();
@@ -886,6 +894,7 @@ mod tests {
 
     #[test]
     fn gitconfig_store_helper_flags_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".gitconfig"),
@@ -903,6 +912,7 @@ mod tests {
 
     #[test]
     fn gitconfig_keychain_helper_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".gitconfig"),
@@ -916,6 +926,7 @@ mod tests {
 
     #[test]
     fn ssh_config_unsafe_include_flags_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -931,6 +942,7 @@ mod tests {
 
     #[test]
     fn ssh_config_local_include_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let ssh = dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh).unwrap();
@@ -943,6 +955,7 @@ mod tests {
 
     #[test]
     fn shell_history_with_secret_flags_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         // AKIA-prefixed access key is a high-confidence provider pattern.
         std::fs::write(
@@ -961,6 +974,7 @@ mod tests {
 
     #[test]
     fn clean_shell_history_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join(".zsh_history"),
@@ -975,6 +989,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn env_world_readable_in_repo_flags_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let env_file = repo.path().join(".env");
@@ -993,6 +1008,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn env_locked_down_in_repo_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let env_file = repo.path().join(".env.local");
@@ -1005,6 +1021,7 @@ mod tests {
 
     #[test]
     fn db_dump_in_repo_flags_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         std::fs::write(repo.path().join("backup.sql"), b"-- dump\n").unwrap();
@@ -1023,6 +1040,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_world_readable_env_is_flagged() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A world-readable `.env` reached via symlink must be flagged (follows
         // the link through `path.is_file()` for leaf candidates).
         let home = tempdir().unwrap();
@@ -1044,6 +1062,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_dir_is_not_descended() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A symlink-to-dir must NOT be descended (loop/escape prevention).
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
@@ -1060,6 +1079,7 @@ mod tests {
 
     #[test]
     fn repo_walk_skips_node_modules_and_git() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = tempdir().unwrap();
         let repo = tempdir().unwrap();
         let nm = repo.path().join("node_modules").join("pkg");
@@ -1078,6 +1098,7 @@ mod tests {
 
     #[test]
     fn empty_home_yields_no_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let findings = scan_with_root(dir.path(), None);
         assert!(findings.is_empty());

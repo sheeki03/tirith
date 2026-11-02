@@ -1408,6 +1408,7 @@ mod platform {
 
         #[test]
         fn contained_read_rejects_visible_rename_at_post_read_seam() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let destination = root.path().join("state.json");
             let replacement = root.path().join("replacement.json");
@@ -1442,6 +1443,7 @@ mod platform {
 
         #[test]
         fn contained_read_rejects_same_size_mutation_during_streaming() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let destination = root.path().join("state.json");
             std::fs::write(&destination, b"first generation").unwrap();
@@ -1484,6 +1486,7 @@ mod platform {
 
         #[test]
         fn atomic_write_refuses_special_destinations_without_replacing_them() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let fifo = root.path().join("out.fifo");
             let socket = root.path().join("out.socket");
@@ -1536,6 +1539,7 @@ mod platform {
 
         #[test]
         fn checked_atomic_write_refuses_fifo_swap_at_final_publication_seam() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let destination = root.path().join("out.bin");
             std::fs::write(&destination, b"original").unwrap();
@@ -1558,6 +1562,7 @@ mod platform {
 
         #[test]
         fn checked_atomic_write_refuses_regular_identity_swap() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let destination = root.path().join("out.bin");
             std::fs::write(&destination, b"original").unwrap();
@@ -1576,6 +1581,7 @@ mod platform {
 
         #[test]
         fn checked_atomic_write_safely_detaches_hardlink_added_at_final_seam() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let root = tempfile::tempdir().unwrap();
             let destination = root.path().join("out.bin");
             let alias = root.path().join("alias.bin");
@@ -1594,6 +1600,7 @@ mod platform {
 
         #[test]
         fn atomic_write_stays_under_retained_parent_after_visible_parent_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join("parent");
@@ -1619,6 +1626,7 @@ mod platform {
 
         #[test]
         fn checked_atomic_write_refuses_parent_swap_at_final_publication_seam() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join("parent");
@@ -1646,6 +1654,7 @@ mod platform {
 
         #[test]
         fn parent_mutation_lock_survives_replaceable_sidecar_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join(".tirith");
@@ -2922,6 +2931,7 @@ mod platform {
 
         #[test]
         fn atomic_write_stays_under_held_parent_after_visible_parent_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join("parent");
@@ -2964,6 +2974,7 @@ mod platform {
 
         #[test]
         fn parent_mutation_lock_cannot_be_replaced_while_held() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join(".tirith");
@@ -2980,6 +2991,7 @@ mod platform {
 
         #[test]
         fn directory_creation_stays_under_held_parent_after_visible_parent_replacement() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             let parent = root.join("parent");
@@ -3023,6 +3035,7 @@ mod retained_child_tests {
 
     #[test]
     fn regular_file_creation_and_update_remain_supported() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("state.json");
         let writer = ContainedAtomicFile::prepare(root.path(), &destination, false).unwrap();
@@ -3036,6 +3049,7 @@ mod retained_child_tests {
 
     #[test]
     fn existing_hardlinked_regular_file_is_safely_detached() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("state.json");
         let alias = root.path().join("alias.json");
@@ -3051,6 +3065,7 @@ mod retained_child_tests {
 
     #[test]
     fn observed_regular_file_update_and_stale_refusal_remain_supported() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("state.json");
         std::fs::write(&destination, b"first").unwrap();
@@ -3086,6 +3101,7 @@ mod retained_child_tests {
 
     #[test]
     fn retained_absent_directory_creates_and_publishes_child_after_authorization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cards");
         let cache_capability = ContainedAtomicFile::prepare(root.path(), &cache, false).unwrap();

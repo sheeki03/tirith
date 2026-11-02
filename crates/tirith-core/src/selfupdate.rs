@@ -797,6 +797,7 @@ mod tests {
 
     #[test]
     fn release_target_matches_the_compilation_target_exactly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         if let Some(release_target) = release_target_triple() {
             assert_eq!(release_target, env!("TIRITH_BUILD_TARGET"));
         }

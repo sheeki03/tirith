@@ -52,6 +52,9 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: false,
+        cdpath_inherited: false,
+        interactive_comments: true,
     };
     engine::analyze(&ctx)
 }

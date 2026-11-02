@@ -1,5 +1,5 @@
 use crate::parse::UrlLike;
-use crate::rules::shared::is_loopback_host;
+use crate::rules::shared::{is_loopback_host, is_rfc1918_ipv4_host};
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run transport rules against a parsed URL.
@@ -19,7 +19,18 @@ pub(crate) fn check_with_raw_url(
     check_plain_http_to_sink(url, in_sink_context, &mut findings);
     check_shortened_url(url, &mut findings);
 
-    if matches!(url, UrlLike::SchemelessHostPath { .. }) && in_sink_context {
+    // A schemeless loopback operand (`curl localhost:3000`) reaches this
+    // machine whichever scheme the client picks, so the scheme ambiguity this
+    // rule reports cannot be exploited from the network (the same reasoning as
+    // the loopback exemption of `check_plain_http_to_sink`).
+    // The operand as typed must spell the loopback authority literally: a
+    // numeric shorthand such as curl's empty-hex `0x7f.0x` is a DNS name to
+    // curl even though a URL parser normalizes it to 127.0.0.0.
+    let schemeless_loopback = raw_url
+        .or(url.raw_host())
+        .is_some_and(crate::rules::shared::literal_loopback_destination);
+    if matches!(url, UrlLike::SchemelessHostPath { .. }) && in_sink_context && !schemeless_loopback
+    {
         findings.push(Finding {
             rule_id: RuleId::SchemelessToSink,
             severity: Severity::Medium,
@@ -69,9 +80,28 @@ fn check_plain_http_to_sink(url: &UrlLike, in_sink: bool, findings: &mut Vec<Fin
                     return;
                 }
             }
+            // A LAN address (RFC 1918), spelled as one, is reachable only from
+            // the local network, so tampering needs a foothold on that network
+            // (`0xC0A80114` and other spellings stay High). Medium
+            // keeps plain-HTTP homelab and dev-box requests visible without
+            // blocking them; content piped from such a host into an
+            // interpreter is still blocked by the pipe-to-interpreter rules,
+            // and every other host (link-local included) stays High.
+            // `raw_host` is the host as typed; `host` is normalized, which
+            // turns `0xC0A80114` into `192.168.1.20`.
+            let severity = if url.host().is_some_and(|host| {
+                is_rfc1918_ipv4_host(host)
+                    && url
+                        .raw_host()
+                        .is_some_and(|raw| raw.eq_ignore_ascii_case(host))
+            }) {
+                Severity::Medium
+            } else {
+                Severity::High
+            };
             findings.push(Finding {
                 rule_id: RuleId::PlainHttpToSink,
-                severity: Severity::High,
+                severity,
                 title: "Plain HTTP URL in execution context".to_string(),
                 description: format!(
                     "URL '{}' uses unencrypted HTTP and is being passed to a command that downloads or executes content. An attacker on the network could modify the content.",
@@ -116,6 +146,25 @@ fn strip_quotes_simple(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Lower an [`RuleId::InsecureTlsFlags`] finding for a request that provably
+/// stays on this machine (every destination a literal loopback authority,
+/// nothing that can reroute it; decided by the command rules). Without a
+/// network path there is no attacker in the middle, so the flag is reported at
+/// Low severity (a warning at the paranoia levels that show Low findings)
+/// instead of blocking.
+pub(crate) fn downgrade_insecure_tls_for_loopback(finding: &mut Finding) {
+    if finding.rule_id != RuleId::InsecureTlsFlags {
+        return;
+    }
+    finding.severity = Severity::Low;
+    finding.title = "Insecure TLS flag on a loopback request".to_string();
+    finding.description = format!(
+        "{} The request only reaches this machine (a loopback address with no proxy or \
+         address override), so no network attacker can intercept it.",
+        finding.description
+    );
 }
 
 /// Check command arguments for insecure TLS flags according to the resolved
@@ -385,6 +434,7 @@ mod tests {
 
     #[test]
     fn wrapped_curl_cluster_uses_resolved_client_grammar() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (command, shell) in [
             (
                 "env MODE=safe curl -skL https://example.com/archive.tgz",
@@ -410,8 +460,42 @@ mod tests {
         }
     }
 
+    /// Plain HTTP to a LAN address spelled as a dotted quad is Medium; any
+    /// other spelling of the same address, and every non-RFC 1918 host,
+    /// stays High.
+    #[test]
+    fn plain_http_is_medium_only_for_a_dotted_quad_lan_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let severity = |raw: &str| {
+            check(&crate::parse::parse_url(raw), true)
+                .into_iter()
+                .find(|finding| finding.rule_id == RuleId::PlainHttpToSink)
+                .map(|finding| finding.severity)
+        };
+        for raw in [
+            "http://192.168.1.20/",
+            "http://10.0.0.5:8080/health",
+            "http://user@172.16.0.1/x",
+        ] {
+            assert_eq!(severity(raw), Some(Severity::Medium), "{raw}");
+        }
+        for raw in [
+            "http://0xC0A80114/",
+            "http://3232235796/",
+            "http://0300.0250.1.24/",
+            "http://192.168.1.020/",
+            "http://169.254.169.254/",
+            "http://[fd00:ec2::254]/",
+            "http://203.0.113.7/",
+            "http://lan.example/",
+        ] {
+            assert_eq!(severity(raw), Some(Severity::High), "{raw}");
+        }
+    }
+
     #[test]
     fn plain_http_loopback_suppressed_regardless_of_host_casing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PlainHttpToSink must NOT fire for a loopback host in sink context. The
         // url crate already lowercases the host of a Standard http URL, but the
         // suppression now relies on is_loopback_host being case-insensitive

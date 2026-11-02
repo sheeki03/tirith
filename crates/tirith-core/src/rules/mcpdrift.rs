@@ -812,6 +812,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_on_non_lockfile_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A file with the right name elsewhere must not trigger.
         let v = check(
             r#"{"format_version":4,"inventory_hash":"x","configs":[],"servers":[]}"#,
@@ -824,6 +825,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_inventory_matches_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Clean repo: lockfile matches the computed inventory → no finding.
         let repo = tempdir().unwrap();
         write_config(
@@ -842,6 +844,7 @@ mod tests {
 
     #[test]
     fn check_fires_when_server_added_to_config_after_lockfile() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // One server, lockfile committed; then add a second server (config drifts).
         let repo = tempdir().unwrap();
         write_config(
@@ -872,6 +875,7 @@ mod tests {
 
     #[test]
     fn check_ignores_env_value_rotation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // V8 records only env-name presence, so rotating the credential does
         // not create drift or expose a reusable verifier in the lockfile.
         let repo = tempdir().unwrap();
@@ -908,6 +912,7 @@ mod tests {
 
     #[test]
     fn check_fires_when_lockfile_is_malformed_json() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A malformed lockfile is itself a finding (same RuleId/severity, distinct
         // description) — else an attacker could hide a surface change behind a broken lockfile.
         let repo = tempdir().unwrap();
@@ -956,6 +961,7 @@ mod tests {
 
     #[test]
     fn unparseable_finding_does_not_echo_serde_json_message() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Privacy: `serde_json::Error`'s `Display` can echo the offending JSON value, so a
         // secret-shaped value in the lockfile must NOT reach the finding (category + line/col only).
         let repo = tempdir().unwrap();
@@ -1033,6 +1039,7 @@ mod tests {
 
     #[test]
     fn check_fires_on_lockfile_with_unknown_schema_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Valid JSON but wrong schema must also surface — same verification-impossible mode.
         let repo = tempdir().unwrap();
         write_config(
@@ -1059,6 +1066,7 @@ mod tests {
 
     #[test]
     fn check_ignores_url_userinfo_rotation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // V8 records only that URL userinfo exists. Rotating those credentials
         // therefore stays clean, and no secret bytes reach a finding.
         let repo = tempdir().unwrap();
@@ -1101,6 +1109,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_no_lockfile_layout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Path has parent and grandparent but is not `<x>/.tirith/mcp.lock`.
         let path = PathBuf::from("some/other/mcp.lock");
         let findings = check(
@@ -1117,6 +1126,7 @@ mod tests {
 
     #[test]
     fn trusted_server_suppresses_drift_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A trusted server's drift (here, dropped from config) is filtered out → no finding.
         let repo = tempdir().unwrap();
         write_config(
@@ -1143,6 +1153,7 @@ mod tests {
 
     #[test]
     fn untrusted_server_still_drifts_when_others_are_trusted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two drifts (trusted + untrusted); only the untrusted one surfaces.
         let repo = tempdir().unwrap();
         write_config(
@@ -1195,6 +1206,7 @@ mod tests {
 
     #[test]
     fn unparseable_lockfile_still_fires_even_with_trusted_servers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Trust can't silence a malformed lockfile — it couldn't be parsed to know which
         // servers it concerns.
         let repo = tempdir().unwrap();
@@ -1216,6 +1228,7 @@ mod tests {
 
     #[test]
     fn lockfile_recording_disallowed_tool_fires_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A lockfile-recorded tool outside `mcp_allowed_tools` → High finding naming it.
         let repo = tempdir().unwrap();
         write_config(
@@ -1253,6 +1266,7 @@ mod tests {
 
     #[test]
     fn lockfile_within_allowed_tools_fires_no_disallowed_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Every recorded tool is allowed → no disallowed-tool finding (and no drift).
         let repo = tempdir().unwrap();
         write_config(
@@ -1279,6 +1293,7 @@ mod tests {
 
     #[test]
     fn explicit_allowlist_fails_when_live_descriptors_were_never_approved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1309,6 +1324,7 @@ mod tests {
 
     #[test]
     fn allowlist_checks_approved_live_descriptor_names_not_only_static_tools() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1342,6 +1358,7 @@ mod tests {
 
     #[test]
     fn approved_live_empty_set_satisfies_an_explicit_empty_allowlist() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1364,6 +1381,7 @@ mod tests {
 
     #[test]
     fn server_not_in_mcp_allowed_tools_is_unconstrained() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A server not keyed in `mcp_allowed_tools` is unconstrained — no finding.
         let repo = tempdir().unwrap();
         write_config(
@@ -1392,6 +1410,7 @@ mod tests {
 
     #[test]
     fn drift_with_disallowed_added_tool_upgrades_to_high_severity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A `Changed` drift adding a disallowed tool upgrades the drift Medium→High.
         let repo = tempdir().unwrap();
         write_config(
@@ -1433,6 +1452,7 @@ mod tests {
 
     #[test]
     fn drift_with_only_allowed_added_tool_stays_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A `Changed` drift adding an allowed tool stays Medium.
         let repo = tempdir().unwrap();
         write_config(
@@ -1473,6 +1493,7 @@ mod tests {
 
     #[test]
     fn empty_allowed_tools_for_server_forbids_any_new_tool() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // An empty allow-list (`[]`) forbids ANY tool — every new tool is out-of-set.
         let repo = tempdir().unwrap();
         write_config(
@@ -1511,6 +1532,7 @@ mod tests {
 
     #[test]
     fn added_server_with_disallowed_tool_upgrades_to_high_severity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Lockfile has no servers; the config then adds "newcomer" with a disallowed tool.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
@@ -1548,6 +1570,7 @@ mod tests {
 
     #[test]
     fn added_server_with_only_allowed_static_tools_is_high_without_live_baseline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Static declarations cannot prove a newly-added server's live surface;
         // an explicit allow-list therefore fails closed until approval.
         let repo = tempdir().unwrap();
@@ -1584,6 +1607,7 @@ mod tests {
 
     #[test]
     fn added_server_unlisted_in_mcp_allowed_tools_stays_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A new server unlisted in `mcp_allowed_tools` is unconstrained → drifts but Medium.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
@@ -1622,6 +1646,7 @@ mod tests {
 
     #[test]
     fn added_server_with_empty_allowed_tools_and_any_tool_is_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A new server under an empty `[]` allow-list exposing ANY tool escalates to High.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
@@ -1658,6 +1683,7 @@ mod tests {
 
     #[test]
     fn added_server_with_no_static_tools_is_high_until_live_empty_set_is_approved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Omitted static tools do not prove that the server exposes none live.
         let repo = tempdir().unwrap();
         write_config(repo.path(), ".mcp.json", r#"{ "mcpServers": {} }"#);
@@ -1694,6 +1720,7 @@ mod tests {
 
     #[test]
     fn unparseable_finding_version_mismatch_arm_names_versions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A v999 lockfile surfaces as a `McpServerDrift` naming the schema-version case.
         let repo = tempdir().unwrap();
         let lockdir = repo.path().join(".tirith");
@@ -1736,6 +1763,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_only_tirith_directory_present() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression (CodeRabbit cid 3292118206): the old `.tirith/` admit arm was
         // tautological (the lockfile lives inside `.tirith/`), defeating F9. After the fix,
         // a root whose ONLY signal is `.tirith/` (no `.git`, no MCP probe) must NOT admit.
@@ -1778,6 +1806,7 @@ mod tests {
 
     #[test]
     fn check_returns_empty_when_repo_root_has_no_markers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F9: a derived repo root with NO `.git`/`.tirith` admit signal and NO MCP probe
         // (a non-existent layout) has nothing for `looks_like_repo_root` to admit on.
         let non_existent =
@@ -1813,6 +1842,7 @@ mod tests {
 
     #[test]
     fn check_admits_when_git_marker_present() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A `.git/` directory is an admit signal — drift fires normally (the common case).
         let repo = tempdir().unwrap();
         fs::create_dir_all(repo.path().join(".git")).unwrap();
@@ -1854,6 +1884,7 @@ mod tests {
 
     #[test]
     fn trusted_server_does_not_bypass_mcp_allowed_tools() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A trusted server recording a tool outside its allow-list still fires the
         // lockfile-side finding (trust suppresses drift only).
         let repo = tempdir().unwrap();
@@ -1895,6 +1926,7 @@ mod tests {
 
     #[test]
     fn trusted_server_cannot_hide_new_disallowed_tool_drift() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         write_config(
             repo.path(),
@@ -1931,6 +1963,7 @@ mod tests {
 
     #[test]
     fn trusted_server_without_mcp_allowed_tools_still_silent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Trust still suppresses when the server has NO `mcp_allowed_tools` entry — nothing
         // to enforce, so no finding fires.
         let repo = tempdir().unwrap();
@@ -1959,6 +1992,7 @@ mod tests {
 
     #[test]
     fn both_trusted_and_untrusted_fire_lockfile_side_when_both_have_allow_lists() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // PR #121 item 8 — Both servers have an explicit (empty) allow-list. Trust no longer
         // bypasses the lockfile-side finding, so BOTH servers' offending tools must appear.
         let repo = tempdir().unwrap();
@@ -2011,6 +2045,7 @@ mod tests {
 
     #[test]
     fn removed_server_with_disallowed_tools_in_lockfile_stays_medium() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Lockfile records "s" with disallowed tool "evil"...
         let repo = tempdir().unwrap();
         write_config(
@@ -2068,6 +2103,7 @@ mod tests {
 
     #[test]
     fn check_emits_two_findings_when_lockfile_records_disallowed_tools_and_drift_present() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // "s" with tool "read" (allowed), recorded in the lockfile.
         let repo = tempdir().unwrap();
         write_config(

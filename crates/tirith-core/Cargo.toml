@@ -15,7 +15,7 @@ categories = ["development-tools"]
 # Compatibility-only feature name retained for downstream manifests. Artifact
 # and member SHA-256 lookups are a security control and are compiled
 # unconditionally; disabling default features must never remove known-malicious
-# blocking from the artifact firewall.
+# blocking from artifact inspection.
 default = []
 artifact-hash-lookup = []
 # Enables hermetic, per-instance DNS lookup injection for cross-crate network
@@ -46,8 +46,6 @@ etcetera = { workspace = true }
 home = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
-# Mutual one-request Unix activation transport; already in the locked closure.
-hmac = "0.12.1"
 # Lowercase-hex decode for the artifact / file SHA-256 known-malicious lookup
 # (the `[u8; 32]` keys the v2 threat-DB hash indices take). Tiny, permissive
 # (MIT OR Apache-2.0), already in the dependency closure. Used only by
@@ -115,7 +113,6 @@ rust-mcp-schema = { version = "0.10", default-features = false, features = ["202
 # (verified in the PR-0 spike); the consuming code (C2) bounds size/depth/branch/
 # $ref/regex/cache/error. License MIT.
 jsonschema = { version = "0.46", default-features = false }
-walkdir = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -165,6 +162,8 @@ windows = { version = "0.62", default-features = false, features = [
 # compile-errors outside linux-x86_64, so keep that dependency gated to the only
 # architecture where `capsule::linux::apply_seccomp` uses it. AArch64 uses a
 # separately reviewed seccompiler policy with a native kernel capability probe.
+# Both architectures use seccompiler directly for the shared clone policy
+# (`capsule/linux/clone_policy.rs`: clone flag table + clone3 ENOSYS filter).
 # Other architectures still report no raw-network enforcement.
 # Proven to resolve + build on MSRV 1.83. Licenses: landlock MIT/Apache-2.0,
 # extrasafe MIT.
@@ -174,7 +173,7 @@ landlock = "0.4"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 extrasafe = "0.5"
 
-[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 seccompiler = { version = "0.4", default-features = false }
 
 # arboard has no Android backend. The clipboard wrapper reports NoBackend
@@ -192,7 +191,6 @@ tirith-test-support = { workspace = true }
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-rand = "0.9.2"
 
 [[bench]]
 name = "perf"

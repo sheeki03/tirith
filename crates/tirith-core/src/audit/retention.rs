@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
+use crate::util::sha256_hex;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -205,7 +206,7 @@ impl RotationPlan {
         let checkpoint = signed_json(
             serde_json::json!({
                 "schema_version":1,"kind":"audit-segment-checkpoint","operation_id":operation_id,
-                "log_sha256":sha256,"log_bytes":bytes,"head_sha256":head.as_ref().map(|value| hex(value)),
+                "log_sha256":sha256,"log_bytes":bytes,"head_sha256":head.as_ref().map(|value| sha256_hex(value)),
                 "tail_hash":tail,"lines":report.total_lines,"signing_expected":original_signed,
                 "verification":"verified-before-rotation","created_at":chrono::Utc::now().to_rfc3339()
             }),
@@ -216,7 +217,7 @@ impl RotationPlan {
                 "schema_version":1,"entry_type":"audit_rotation","event":"segment_rotated",
                 "timestamp":chrono::Utc::now().to_rfc3339(),"session_id":"retention",
                 "action":"recorded","command_redacted":"","rule_ids":[],
-                "prev_hash":null,"checkpoint_id":operation_id,"checkpoint_sha256":hex(&checkpoint),
+                "prev_hash":null,"checkpoint_id":operation_id,"checkpoint_sha256":sha256_hex(&checkpoint),
                 "archived_log_sha256":sha256,"archived_lines":report.total_lines
             }),
             original_signed || super::audit_signing_configured(),
@@ -232,7 +233,7 @@ impl RotationPlan {
         // This is intentionally not a HeadReceipt. Every compatible old writer
         // rejects it instead of appending during a crash-recovery window.
         let barrier = serde_json::to_vec(&serde_json::json!({
-            "schema_version":1,"rotation_in_progress":operation_id,"checkpoint_sha256":hex(&checkpoint)
+            "schema_version":1,"rotation_in_progress":operation_id,"checkpoint_sha256":sha256_hex(&checkpoint)
         })).map_err(err)?;
         if SigningInputs::capture() != signing_inputs {
             return Err("audit signing inputs changed while planning".into());
@@ -259,8 +260,8 @@ impl RotationPlan {
         serde_json::to_vec(&serde_json::json!({"kind":"retained-audit-write-v1",
             "operation_id":self.operation_id,"mutation":mutation,
             "original_sha256":self.original_sha256,"original_bytes":self.original_bytes,
-            "genesis_sha256":hex(&self.genesis),"genesis_bytes":self.genesis.len(),
-            "checkpoint_sha256":hex(&self.checkpoint)}))
+            "genesis_sha256":sha256_hex(&self.genesis),"genesis_bytes":self.genesis.len(),
+            "checkpoint_sha256":sha256_hex(&self.checkpoint)}))
         .map_err(err)
     }
 
@@ -562,9 +563,6 @@ fn hash_log(file: &mut File) -> Result<(u64, String), String> {
     Ok((total, format!("{:x}", hash.finalize())))
 }
 
-fn hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -623,7 +621,7 @@ mod tests {
         fn verify_archive(&mut self, plan: &RotationPlan) -> Result<(), String> {
             let (bytes, head, checkpoint) = self.archive.as_ref().ok_or("archive unavailable")?;
             if bytes.len() as u64 != plan.original_bytes
-                || hex(bytes) != plan.original_sha256
+                || sha256_hex(bytes) != plan.original_sha256
                 || head != &plan.original_head
                 || checkpoint != &plan.checkpoint
             {

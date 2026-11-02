@@ -1,6 +1,5 @@
 //! Authenticated caller-shell diagnostic adapter. Raw loaded definitions travel
 //! over bounded stdin, are hashed in memory, and are never persisted or printed.
-use sha2::{Digest as _, Sha256};
 use tirith_core::execution_state::{
     self, ShellReceiptChannel, ShellVerificationHookDecision, ShellVerificationProbe,
     ShellVerificationStatus,
@@ -15,8 +14,7 @@ pub(crate) fn exact_probe(command: &str) -> bool {
     let Some((id, kind)) = rest.split_once(' ') else {
         return false;
     };
-    matches!(kind, "allowed" | "blocked" | "status")
-        && uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string() == id)
+    matches!(kind, "allowed" | "blocked" | "status") && tirith_core::util::is_uuid(id)
 }
 
 fn fingerprint(bytes: &[u8]) -> Result<String, String> {
@@ -42,7 +40,7 @@ fn fingerprint(bytes: &[u8]) -> Result<String, String> {
             "caller shell is off, warn-only, degraded or lacks strict blocking state".into(),
         );
     }
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(tirith_core::util::sha256_hex(bytes))
 }
 
 pub(super) fn read_fingerprint() -> Result<String, String> {

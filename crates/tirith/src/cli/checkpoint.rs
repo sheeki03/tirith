@@ -808,6 +808,7 @@ mod tests {
 
     #[test]
     fn checkpoint_trigger_display_strips_terminal_injection_before_truncating() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let rendered = super::checkpoint_trigger_for_human(concat!(
             "npm install pkgSTART",
             "\x1b]52;c;aGVsbG8=\x07",

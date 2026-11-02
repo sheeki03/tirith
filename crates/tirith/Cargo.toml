@@ -96,28 +96,14 @@ toml_edit = { workspace = true }
 # (2.x, deflate only); already in the lockfile, no new transitive resolution.
 # License: MIT.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Synchronous loopback HTTP server for `tirith dashboard serve` (M13 ch3).
-# Bound to 127.0.0.1 ONLY; never exposed off-host.
-tiny_http = { workspace = true }
 # M14 (IDE Extensions) — `tirith lsp` runs a Language Server over stdio so an
 # editor extension can surface tirith diagnostics inline. tower-lsp re-exports
 # `lsp-types`; we use that re-export (`tower_lsp::lsp_types`) so the protocol
 # types can never drift from the version tower-lsp was built against. Bin-crate
 # only — tirith-core stays LSP-agnostic.
 tower-lsp = "0.20"
-# Capsule egress broker (Stack E, `capsule_proxy.rs`). A loopback-only CONNECT
-# broker — NOT the security boundary — that the OS sandbox backend funnels
-# outbound traffic through. hyper 1 + hyper-util + http-body-util give us an
-# async HTTP/1 server for the broker loop on top of the tokio runtime that already
-# lives in this crate (tirith-core stays async-free). All three proven on MSRV
-# 1.83 in the PR-0 spike. Licenses: MIT.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
 
 [dev-dependencies]
-# Strict bounded USTAR fixture admission only; already in the workspace lock.
-flate2 = "1"
 tirith-core = { workspace = true, features = ["test-network-seams"] }
 tirith-test-support = { workspace = true }
 mockito = "1"

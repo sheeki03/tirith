@@ -408,6 +408,7 @@ mod tests {
 
     #[test]
     fn cross_shell_powershell_wrapper_reaches_powershell_rules() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(check(
             "pwsh -Command 'Add-MpPreference -ExclusionPath C:\\Temp'",
             ShellType::Posix,
@@ -445,6 +446,7 @@ mod tests {
 
     #[test]
     fn dormant_and_quoted_scriptblocks_do_not_execute() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for input in [
             "$block = { Add-MpPreference -ExclusionPath C:\\Temp }",
             "Write-Output '{ Add-MpPreference -ExclusionPath C:\\Temp }'",

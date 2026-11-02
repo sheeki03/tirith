@@ -59,7 +59,7 @@ $names = @(
     'no_change_request_remains_immutable_after_policy_drift',
     'trickled_body_hits_overall_deadline_without_saving_a_plan',
     'explicit_project_review_is_inert_and_revalidates_retained_files',
-    'failed_lifecycle_apply_retry_returns_saved_state_without_starting_work',
+    'threatdb_refresh_is_a_guarded_write_and_lifecycle_writes_are_gone',
     'browser_npm_inspection_and_comparison_are_project_scoped_and_inert',
     'real_service_reports_writer_failure_even_when_no_history_record_was_saved'
 )

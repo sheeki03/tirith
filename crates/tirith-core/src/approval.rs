@@ -637,6 +637,7 @@ mod tests {
 
     #[test]
     fn write_approval_file_cleans_up_stale_leaks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: leaked `tirith-approval-*.env` files older than the TTL
         // must be removed on the next write, but fresh files (a concurrent hook
         // may be reading them) and unrelated files must be left alone.

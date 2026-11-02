@@ -59,7 +59,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sha2::{Digest as _, Sha256};
 use tirith_core::policy::Policy;
 use tirith_core::provenance::npm::{
     self as core_npm, InstalledInventory, NpmAssessment, NpmAttestOutcome, NpmAuditEnvironment,
@@ -852,12 +851,7 @@ fn auth_source_metadata_identity(metadata: &fs::Metadata) -> String {
     )
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
+use tirith_core::util::sha256_hex as hex_sha256;
 
 // ---------------------------------------------------------------------------
 // 6. Trusted executable resolution
@@ -1037,9 +1031,8 @@ fn spec_for(args: Vec<std::ffi::OsString>, limits: ChildLimits) -> ChildSpec {
 
 /// Probe `npm --version` under a short budget.
 ///
-/// Structure copied from `artifact::resolver`'s `capture_bound_tool_version`
-/// (which is `#[cfg(unix)]` and module-private, so it cannot be called): a
-/// short timeout, a bounded output, and an exhaustive [`ChildOutcome`] match so
+/// Structure copied from the retired package resolver's bound-tool version
+/// probe: a short timeout, a bounded output, and an exhaustive [`ChildOutcome`] match so
 /// no failure mode silently becomes an empty version.
 fn probe_version(launcher: &Launcher) -> Result<String, String> {
     launcher.revalidate_auxiliary()?;
@@ -1679,6 +1672,7 @@ mod tests {
 
     #[test]
     fn a_missing_project_directory_is_a_usage_error_not_a_partial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let error = resolve_project(Some(Path::new("/definitely/not/a/directory/for/c17")))
             .expect_err("a non-directory must be refused");
         assert!(error.contains("--project"), "{error}");

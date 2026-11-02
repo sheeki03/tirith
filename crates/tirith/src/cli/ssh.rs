@@ -529,6 +529,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         update_policy_guard_key(&path, true).unwrap();
@@ -538,6 +539,7 @@ mod tests {
 
     #[test]
     fn update_policy_guard_key_replaces_existing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(
@@ -555,6 +557,7 @@ mod tests {
 
     #[test]
     fn reattach_user_with_prefix() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(
             reattach_user(Some("root"), "host.example.com"),
             "root@host.example.com"
@@ -573,6 +576,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_refuses_symlinked_containing_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let repo = root.path().join("repo");
@@ -593,6 +597,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_refuses_symlinked_final_component() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");
@@ -616,6 +621,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_policy_guard_key_aborts_on_non_regular_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempdir().unwrap();
         let dir = root.path().join("repo").join(".tirith");
         let path = dir.join("policy.yaml");

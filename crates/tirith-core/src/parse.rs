@@ -260,11 +260,72 @@ pub(crate) fn curl_empty_hex_dns_host(raw_host: &str) -> Option<String> {
     Some(decoded)
 }
 
+/// The second reading of a curl empty-hex DNS name. curl 8.7.1 resolves the
+/// spelling as a DNS name, but builds that hand it to a libc resolver read it
+/// with `inet_aton`, which (like WHATWG) accepts an empty `0x` component as 0.
+/// Policy evaluates both readings: deny if either matches, allow only if both do.
+pub(crate) fn curl_empty_hex_numeric_reading(raw_host: &str) -> Option<std::net::Ipv4Addr> {
+    let decoded = curl_empty_hex_dns_host(raw_host)?;
+    match url::Host::parse(&decoded) {
+        Ok(url::Host::Ipv4(address)) => Some(address),
+        _ => None,
+    }
+}
+
 /// Apply the client exception only to a completely validated authority. This
 /// also separates an accepted empty port without loosening hostname feed or
 /// network-list validation, which use the bare-host helper above.
 pub(crate) fn curl_empty_hex_dns_url_host(raw: &str) -> Option<String> {
-    curl_empty_hex_dns_host(validated_raw_authority(raw)?.host)
+    let normalized = normalize_curl_url(raw)?;
+    curl_empty_hex_dns_host(validated_raw_authority(normalized.as_ref())?.host)
+}
+
+/// The leading scheme and slash count in a curl URL operand, without allocation.
+pub(crate) fn curl_scheme_separator(raw: &str) -> Option<(usize, usize)> {
+    let colon = raw.find(':')?;
+    let scheme = &raw[..colon];
+    let mut characters = scheme.chars();
+    if !characters.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        || !characters.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let rest = &raw[colon + 1..];
+    let slashes = rest.bytes().take_while(|byte| *byte == b'/').count();
+    if !(1..=3).contains(&slashes) {
+        return None;
+    }
+    Some((colon, slashes))
+}
+
+/// Normalize only a curl URL operand's scheme separator. Network URLs accept
+/// one through three slashes; file URLs keep their local-path semantics.
+/// Generic URL and SCP parsing deliberately do not use this client view.
+pub(crate) fn normalize_curl_url(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let (colon, slashes) = curl_scheme_separator(raw)?;
+    let scheme = &raw[..colon];
+    let rest = &raw[colon + 1..];
+    if scheme.eq_ignore_ascii_case("file") {
+        return (slashes >= 2).then_some(std::borrow::Cow::Borrowed(raw));
+    }
+    let network_scheme = [
+        "http", "https", "ftp", "ftps", "scp", "sftp", "ssh", "ws", "wss", "socks4", "socks4a",
+        "socks5", "socks5h", "gopher", "gophers", "dict", "imap", "imaps", "ldap", "ldaps", "mqtt",
+        "pop3", "pop3s", "rtsp", "smb", "smbs", "smtp", "smtps", "telnet", "tftp",
+    ]
+    .iter()
+    .any(|candidate| scheme.eq_ignore_ascii_case(candidate));
+    if slashes == 2 {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+    if !network_scheme || rest.get(slashes..)?.starts_with(['?', '#']) {
+        return None;
+    }
+    let mut normalized = String::with_capacity(raw.len() + 2 - slashes);
+    normalized.push_str(&raw[..colon + 1]);
+    normalized.push_str("//");
+    normalized.push_str(&rest[slashes..]);
+    Some(std::borrow::Cow::Owned(normalized))
 }
 
 /// Extract the raw host from a URL string BEFORE IDNA normalization (handles

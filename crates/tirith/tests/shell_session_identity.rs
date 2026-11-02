@@ -217,18 +217,17 @@ fn check(family: &str, file: &str) {
         return;
     };
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = crate_root.join("../../shell/lib").join(file);
-    let embedded = crate_root.join("assets/shell/lib").join(file);
-    assert_eq!(fs::read(&source).unwrap(), fs::read(&embedded).unwrap());
+    // The embedded hook directory is the single hook source; the top-level
+    // `shell` path is only a symlink to it (and may not be materialized on a
+    // Windows checkout).
+    let hook = crate_root.join("assets/shell/lib").join(file);
     // Eight concurrently live children receive one multiplexer-style ID.
-    // Both installed-byte copies and inherited load-marker cases participate.
+    // Both inherited load-marker cases participate.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut starts = Vec::new();
-    for hook in [&source, &embedded] {
-        for inherited_guard in [false, true] {
-            for _ in 0..2 {
-                starts.push(start(&binary, family, hook, inherited_guard));
-            }
+    for inherited_guard in [false, true] {
+        for _ in 0..4 {
+            starts.push(start(&binary, family, &hook, inherited_guard));
         }
     }
     // PowerShell intentionally returns before initialization in a

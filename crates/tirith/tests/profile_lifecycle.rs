@@ -98,14 +98,8 @@ fn reset_preserves_custom_settings_and_undo_preserves_unrelated_edits() {
         &state,
         &["policy", "operation", id, "--action", "undo", "--json"],
     ));
-    assert_eq!(
-        undone["state"],
-        if cfg!(windows) {
-            "undone-with-recovery"
-        } else {
-            "undone"
-        }
-    );
+    assert_eq!(undone["state"], "undone");
+    assert_eq!(undone["recovery"], cfg!(windows));
     let undone: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(
@@ -225,14 +219,8 @@ fn explicit_equal_profile_setting_survives_later_profile_reset() {
         &state,
         &["policy", "setting", "strict_warn", "true", "--json"],
     ));
-    assert_eq!(
-        changed["state"],
-        if cfg!(windows) {
-            "completed-with-recovery"
-        } else {
-            "completed"
-        }
-    );
+    assert_eq!(changed["state"], "completed");
+    assert_eq!(changed["recovery"], cfg!(windows));
     let document: serde_yaml::Value =
         serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(!document["protection_profile"]["owned_fields"]
@@ -351,14 +339,8 @@ fn personal_setting_undo_preserves_unrelated_changes_and_typed_limits() {
             "--json",
         ],
     ));
-    assert_eq!(
-        undone["state"],
-        if cfg!(windows) {
-            "undone-with-recovery"
-        } else {
-            "undone"
-        }
-    );
+    assert_eq!(undone["state"], "undone");
+    assert_eq!(undone["recovery"], cfg!(windows));
     let document: serde_yaml::Value =
         serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(document["strict_warn"], true);
@@ -394,15 +376,291 @@ fn empty_personal_document_accepts_a_typed_setting_without_shadowing() {
         &state,
         &["policy", "setting", "strict_warn", "true", "--json"],
     ));
-    assert_eq!(
-        changed["state"],
-        if cfg!(windows) {
-            "completed-with-recovery"
-        } else {
-            "completed"
-        }
-    );
+    assert_eq!(changed["state"], "completed");
+    assert_eq!(changed["recovery"], cfg!(windows));
     assert!(!path.with_file_name("policy.yaml").exists());
     let doc: serde_yaml::Value = serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(doc["strict_warn"], true);
+}
+
+#[test]
+fn profile_and_setting_edits_keep_comments_and_undo_restores_exact_bytes() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# My tirith policy -- keep these notes\n\n# Why: I review every pipe.\nstrict_warn: false   # set by hand\n\ncustom_operator_note: 'keep my quoting'\nseverity_overrides:\n  # chosen after an incident\n  non_standard_port: HIGH\n";
+    std::fs::write(&path, original).unwrap();
+
+    let profile = success(run(&state, &["policy", "profile", "balanced", "--json"]));
+    let after_profile = std::fs::read_to_string(&path).unwrap();
+    for kept in [
+        "# My tirith policy -- keep these notes\n\n# Why: I review every pipe.\n",
+        "custom_operator_note: 'keep my quoting'\nseverity_overrides:\n  # chosen after an incident\n  non_standard_port: HIGH\n",
+    ] {
+        assert!(after_profile.contains(kept), "{after_profile}");
+    }
+    let setting = success(run(
+        &state,
+        &["policy", "setting", "strict_warn", "true", "--json"],
+    ));
+    let after_setting = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after_setting.contains("\nstrict_warn: true   # set by hand\n"),
+        "{after_setting}"
+    );
+    assert!(
+        after_setting.contains("# My tirith policy -- keep these notes\n"),
+        "{after_setting}"
+    );
+
+    let undo = |id: &Value| {
+        success(run(
+            &state,
+            &[
+                "policy",
+                "operation",
+                id.as_str().unwrap(),
+                "--action",
+                "undo",
+                "--json",
+            ],
+        ))
+    };
+    undo(&setting["operation_id"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), after_profile);
+    undo(&profile["operation_id"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn setting_under_a_flow_style_parent_is_refused_with_a_diff_and_no_write() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // The credential sorts right before `scan` in the normalized document; the
+    // refusal must show the owned field only, never neighbouring values.
+    let original = "# compact on purpose\npolicy_server_api_key: sk-live-SECRET123abc\n\
+                    scan: {require_complete: false}\n";
+    std::fs::write(&path, original).unwrap();
+    let output = run(
+        &state,
+        &["policy", "setting", "scan_require_complete", "true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cannot change `scan.require_complete` in place"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\n- "), "{stderr}");
+    assert!(
+        stderr.contains("\n+   require_complete: true\n"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("SECRET123"), "{stderr}");
+    assert!(!stderr.contains("policy_server"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A preview must not promise a change the real run refuses: `--dry-run` runs
+/// the same in-place preflight as the plan and reports the same refusal.
+#[test]
+fn dry_run_reports_the_in_place_refusal_the_real_run_would_hit() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let cases: [(&str, &[&str], &str); 2] = [
+        (
+            "severity_overrides: {shortened_url: low}\n",
+            &[
+                "policy",
+                "setting",
+                "rule_severity",
+                "high",
+                "--rule",
+                "plain_http_to_sink",
+            ],
+            "cannot change `severity_overrides.plain_http_to_sink` in place",
+        ),
+        (
+            "action_overrides: {shortened_url: warn}\n",
+            &["policy", "profile", "strict"],
+            "cannot change `action_overrides.",
+        ),
+    ];
+    for (original, args, refusal) in cases {
+        std::fs::write(&path, original).unwrap();
+        for extra in [
+            &["--dry-run", "--json"][..],
+            &["--dry-run"][..],
+            &["--json"][..],
+        ] {
+            let mut command = args.to_vec();
+            command.extend_from_slice(extra);
+            let output = run(&state, &command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{command:?}: {stderr}");
+            assert!(stderr.contains(refusal), "{command:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "{command:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+    // A block-style file still previews and applies normally.
+    std::fs::write(&path, "severity_overrides:\n  shortened_url: low\n").unwrap();
+    let preview = success(run(
+        &state,
+        &[
+            "policy",
+            "setting",
+            "rule_severity",
+            "high",
+            "--rule",
+            "plain_http_to_sink",
+            "--dry-run",
+            "--json",
+        ],
+    ));
+    assert_eq!(preview["kind"], "personal_setting_preview");
+    let preview = success(run(
+        &state,
+        &["policy", "profile", "strict", "--dry-run", "--json"],
+    ));
+    assert_eq!(preview["kind"], "profile_preview");
+}
+
+/// Without `--json`, `policy setting` prints human text, never the JSON object.
+#[test]
+fn setting_without_json_prints_human_text() {
+    let state = state();
+    let human = |args: &[&str]| {
+        let output = run(&state, args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            serde_json::from_str::<Value>(&stdout).is_err(),
+            "human mode printed JSON: {stdout}"
+        );
+        stdout
+    };
+    let preview = human(&["policy", "setting", "strict_warn", "true", "--dry-run"]);
+    assert!(
+        preview.starts_with("Setting preview (not applied): strict_warn: (unset) -> true\n"),
+        "{preview}"
+    );
+    let applied = human(&["policy", "setting", "strict_warn", "true"]);
+    assert!(applied.starts_with("Operation "), "{applied}");
+    assert!(applied.contains(": completed"), "{applied}");
+    assert!(
+        applied.contains("  Inspect: tirith policy operation "),
+        "{applied}"
+    );
+    let unchanged = human(&["policy", "setting", "strict_warn", "true"]);
+    assert!(unchanged.starts_with("Operation "), "{unchanged}");
+    assert!(unchanged.contains("  No settings changed"), "{unchanged}");
+    // `--json` keeps the machine-readable object.
+    let json = success(run(
+        &state,
+        &["policy", "setting", "strict_warn", "true", "--json"],
+    ));
+    assert_eq!(json["no_op"], true);
+}
+
+/// A policy file saved with a UTF-8 byte-order mark (PowerShell 5.1
+/// `Set-Content -Encoding UTF8`, older Notepad) is edited in place like any
+/// other block-style file, and undo restores the exact bytes. The mark is kept
+/// unless serde_yaml (and so the policy loader) could not read the edited
+/// file with it: a mark right before several keys reads as several documents.
+#[test]
+fn byte_order_mark_policy_is_edited_in_place_and_undo_restores_exact_bytes() {
+    let state = state();
+    let path = tirith_core::policy::config_dir()
+        .unwrap()
+        .join("policy.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let undo = |id: &Value| {
+        success(run(
+            &state,
+            &[
+                "policy",
+                "operation",
+                id.as_str().unwrap(),
+                "--action",
+                "undo",
+                "--json",
+            ],
+        ))
+    };
+    let loads = || {
+        let output = run(&state, &["policy", "validate"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    for original in ["\u{feff}# mine\nparanoia: 2\n", "\u{feff}paranoia: 2\n"] {
+        std::fs::write(&path, original).unwrap();
+        let setting = success(run(
+            &state,
+            &["policy", "setting", "paranoia", "3", "--json"],
+        ));
+        let after_setting = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after_setting,
+            original.replace("paranoia: 2", "paranoia: 3")
+        );
+        loads();
+
+        let preview = success(run(
+            &state,
+            &["policy", "profile", "balanced", "--dry-run", "--json"],
+        ));
+        assert_eq!(preview["kind"], "profile_preview");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_setting);
+        let profile = success(run(&state, &["policy", "profile", "balanced", "--json"]));
+        let after_profile = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_profile.matches('\u{feff}').count() <= 1,
+            "{after_profile:?}"
+        );
+        assert_eq!(
+            after_profile.matches("paranoia:").count(),
+            1,
+            "{after_profile:?}"
+        );
+        if original.contains("# mine") {
+            assert!(
+                after_profile.starts_with("\u{feff}# mine\n"),
+                "{after_profile:?}"
+            );
+        }
+        loads();
+
+        undo(&profile["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_setting);
+        undo(&setting["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let reset = success(run(
+            &state,
+            &["policy", "setting", "paranoia", "reset", "--json"],
+        ));
+        let after_reset = std::fs::read_to_string(&path).unwrap();
+        assert!(after_reset.starts_with('\u{feff}'), "{after_reset:?}");
+        assert!(!after_reset.contains("paranoia"), "{after_reset:?}");
+        loads();
+        undo(&reset["operation_id"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 }

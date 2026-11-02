@@ -74,6 +74,44 @@ const VERDICT_IDLE: Duration = Duration::from_secs(60);
 /// reset against.
 const MARKER_MAX: Duration = Duration::from_secs(90);
 
+/// `status` of every shell execution receipt left in the isolated store.
+/// Hooks no longer send a separate `acknowledge` call: a successful consume
+/// retires its receipt in the same Tirith process, so no receipt may be left
+/// in the `committed` state once its command has run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receipt_statuses(env: &IsolatedEnv) -> Vec<String> {
+    let directory = env.state_home.join("tirith/sessions/execution-receipts");
+    let mut statuses = Vec::new();
+    for entry in std::fs::read_dir(directory).expect("receipt directory") {
+        let path = entry.expect("receipt directory entry").path();
+        if path.extension().and_then(|part| part.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read receipt");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt JSON");
+        statuses.push(
+            value["state"]["status"]
+                .as_str()
+                .expect("receipt state status")
+                .to_owned(),
+        );
+    }
+    statuses
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_consumed_receipts_are_retired(env: &IsolatedEnv, shell: &str) {
+    let statuses = receipt_statuses(env);
+    assert!(
+        statuses.iter().any(|status| status == "acknowledged"),
+        "{shell}: the executed line's receipt must be retired by consume itself: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "committed"),
+        "{shell}: no consumed receipt may be left unretired: {statuses:?}"
+    );
+}
+
 /// Return `(confirmed, unresolved)` from the newest valid fixed-slot ledger.
 /// This independently verifies that a PTY command crossed the durable receipt
 /// boundary instead of merely exercising the hook's legacy fallback.
@@ -391,7 +429,10 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
         "printf 'true' | bash && touch '{}'",
         marker.display()
     ));
-    sess.expect_any(&["BLOCKED", "getvet.sh", "tirith run"], VERDICT_IDLE);
+    sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
     sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
     let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
     assert_eq!(
@@ -760,6 +801,9 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "bash");
     sess.close();
 
     assert_eq!(
@@ -1262,6 +1306,9 @@ fn fish_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "fish");
     sess.close();
 
     assert_eq!(
@@ -1269,6 +1316,67 @@ fn fish_allowed_command_executes_exactly_once() {
         1,
         "fish: allowed command must execute exactly once, marker held: {body:?}"
     );
+}
+
+#[test]
+fn fish_multiline_commands_and_loops_execute_once() {
+    let mut env = IsolatedEnv::new();
+    let lines = env.workdir.join("fish_multiline.txt");
+    let loop_marker = env.workdir.join("fish_loop.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let commands = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'SECOND\\n' >> '{}'",
+        lines.display(),
+        lines.display()
+    );
+    session.send_raw(format!("\x1b[200~{commands}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&lines, "SECOND", MARKER_MAX);
+    assert_eq!(body, "FIRST\nSECOND\n");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+
+    let loop_command = format!(
+        "for item in one two\nprintf '%s\\n' $item >> '{}'\nend",
+        loop_marker.display()
+    );
+    session.send_raw(format!("\x1b[200~{loop_command}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&loop_marker, "two", MARKER_MAX);
+    assert_eq!(body, "one\ntwo\n");
+    assert_consumed_receipts_are_retired(&env, "fish multiline");
+    session.close();
+}
+
+#[test]
+fn fish_multiline_block_checks_entire_buffer_before_execution() {
+    let mut env = IsolatedEnv::new();
+    let first = env.workdir.join("fish_multiline_first.txt");
+    let blocked = env.workdir.join("fish_multiline_blocked.txt");
+    let control = env.workdir.join("fish_multiline_control.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let command = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'true' | bash; and touch '{}'",
+        first.display(),
+        blocked.display()
+    );
+    session.send_raw(format!("\x1b[200~{command}\x1b[201~\r").as_bytes());
+    session.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    session.send_line(&format!("printf 'AFTER\\n' >> '{}'", control.display()));
+    assert_eq!(wait_for_marker(&control, "AFTER", MARKER_MAX), "AFTER\n");
+    session.close();
+    assert!(
+        !first.exists(),
+        "no prefix of a blocked multiline buffer may run"
+    );
+    assert!(!blocked.exists(), "blocked second line must not run");
 }
 
 /// Issue #188: Fish completion must remain an editor-only action. Completing an
@@ -1382,7 +1490,7 @@ fn fish_blocked_command_does_not_execute() {
     // since the hook's `tirith check` subprocess emits nothing until it returns
     // — `wait_idle` would return mid-subprocess, the no-output race).
     let out = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
     );
     sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
@@ -1395,7 +1503,9 @@ fn fish_blocked_command_does_not_execute() {
     sess.close();
 
     assert!(
-        out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
+        out.contains("BLOCKED")
+            || out.contains("tirith check --suggest")
+            || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
     );
     // The verdict surfaced only after `tirith check` returned, so the hook has
@@ -1757,17 +1867,20 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         1,
         "zsh warned command must execute exactly once"
     );
+    assert_consumed_receipts_are_retired(&env, "zsh");
 
     sess.send_line(&format!(
         "printf 'true' | sh; touch '{}'",
         blocked.display()
     ));
     let output = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
     );
     assert!(
-        output.contains("BLOCKED") || output.contains("getvet.sh") || output.contains("tirith run"),
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
         "zsh blocked command must surface a Tirith verdict, got:\n{output}"
     );
     assert!(!blocked.exists(), "zsh blocked command must not execute");
@@ -1781,6 +1894,61 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         unresolved,
         baseline_unresolved + 2,
         "only the allowed and warned zsh lines may enter shell-boundary history"
+    );
+    sess.close();
+}
+
+/// zsh runs the text after a word-start `#` unless `interactivecomments` is
+/// set, and `zsh -f -i` leaves it unset (zsh's default). The hook reports the
+/// option at every check, so a pipe to `sh` hidden behind `#` is blocked and
+/// nothing on the line runs; after `setopt interactivecomments` in the same
+/// session the `#` starts a comment again and only the text before it runs.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_hook_reads_hash_text_by_the_live_interactivecomments_option() {
+    let mut env = IsolatedEnv::new();
+    let hidden = env.workdir.join("zsh_hash_hidden.txt");
+    let visible = env.workdir.join("zsh_hash_visible.txt");
+    let mut sess = match zsh_session(&mut env) {
+        Some(session) => session,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+
+    sess.send_line(&format!(
+        "print -r -- hi #; printf 'true' | sh; touch '{}'",
+        hidden.display()
+    ));
+    let output = sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    assert!(
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
+        "the text after `#` must be checked while interactivecomments is unset, got:\n{output}"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!hidden.exists(), "a blocked line must not run");
+    sess.clear_buffer();
+
+    sess.send_line("setopt interactivecomments");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    sess.send_line(&format!(
+        "print -r -- RAN >> '{}' #; printf 'true' | sh; touch '{}'",
+        visible.display(),
+        hidden.display()
+    ));
+    let body = wait_for_marker(&visible, "RAN", MARKER_MAX);
+    assert_eq!(count_occurrences(&body, "RAN"), 1, "{body:?}");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !hidden.exists(),
+        "with interactivecomments set the text after `#` is a comment and must not run"
     );
     sess.close();
 }

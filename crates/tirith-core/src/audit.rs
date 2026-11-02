@@ -18,7 +18,6 @@ use base64::Engine as _;
 #[cfg(test)]
 use fs2::FileExt;
 use serde::{Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::verdict::Verdict;
 
@@ -32,7 +31,6 @@ const MAX_AUDIT_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_AUDIT_LOG_LINES: usize = 1_000_000;
 const MAX_AUDIT_PROBLEMS: usize = 256;
 const MAX_AUDIT_PROBLEM_BYTES: usize = 4 * 1024;
-const MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES: usize = 1024 * 1024;
 
 fn audit_diagnostics_enabled() -> bool {
     matches!(
@@ -316,8 +314,8 @@ impl AuditEntry {
 
     /// Projection used only by the private append path before chain-owned
     /// `prev_hash`/`sig` values are injected. No caller-owned string is exempted:
-    /// exact artifact digests are injected later through the private typed
-    /// [`TrustedArtifactReceiptDetail`] capability.
+    /// exact receipt digests are injected later through the private typed
+    /// [`TrustedCapsuleReceiptDetail`] capability.
     fn chain_source_privacy_projection(&self) -> Self {
         let mut projected = self.privacy_projection();
         // Chain fields are owned exclusively by `append_to_audit_log`; never
@@ -386,13 +384,13 @@ enum AuditWrite {
 }
 
 /// A digest whose provenance was checked against a saved, content-addressed
-/// [`crate::receipt::ArtifactScanReceipt`]. The bytes are private and there is no
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]. The bytes are private and there is no
 /// public syntax-only constructor, so a lowercase 64-hex caller string cannot
 /// acquire durable-log trust merely by looking like SHA-256.
 #[derive(Clone)]
-struct TrustedArtifactDigest([u8; 32]);
+struct TrustedReceiptDigest([u8; 32]);
 
-impl TrustedArtifactDigest {
+impl TrustedReceiptDigest {
     fn from_verified_hex(value: &str) -> Option<Self> {
         if !is_lowercase_sha256(value) {
             return None;
@@ -415,22 +413,10 @@ impl TrustedArtifactDigest {
     }
 }
 
-/// Private append capability for the only free-form audit detail whose exact
-/// digest bytes must survive privacy projection. Construction independently
-/// reloads the just-saved receipt and recomputes its content address; raw string
-/// shape alone is never sufficient.
-struct TrustedArtifactReceiptDetail {
-    receipt_id: TrustedArtifactDigest,
-    content_sha256: TrustedArtifactDigest,
-}
-
 /// Read a just-saved receipt back under the same private-file contract its
 /// writer promised, so a digest capability is only ever minted from bytes that
-/// are still owner-only, regular, unlinked, and bounded.
-///
-/// Shared by the install-receipt and capsule-run-receipt anchors because both
-/// persist through [`crate::util::write_file_atomic_0600`]; `kind` only shapes
-/// the diagnostic wording, never the checks.
+/// are still owner-only, regular, unlinked, and bounded. `kind` only shapes the
+/// diagnostic wording, never the checks.
 fn read_owner_only_receipt_bytes(
     path: &std::path::Path,
     cap: usize,
@@ -467,82 +453,38 @@ fn read_owner_only_receipt_bytes(
     Ok(bytes)
 }
 
-impl TrustedArtifactReceiptDetail {
-    fn from_recorded_receipt(receipt_id: &str, content_sha256: &str) -> Result<Self, String> {
-        if !is_lowercase_sha256(receipt_id) {
-            return Err("artifact receipt id is not a canonical sha256 digest".to_string());
-        }
-        let path = crate::policy::data_dir()
-            .ok_or_else(|| "artifact receipt digest has no trusted saved receipt".to_string())?
-            .join("receipts")
-            .join(format!("{receipt_id}.json"));
-        let bytes =
-            read_owner_only_receipt_bytes(&path, MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES, "artifact")?;
-        let receipt: crate::receipt::ArtifactScanReceipt = serde_json::from_slice(&bytes)
-            .map_err(|_| "saved artifact receipt is invalid".to_string())?;
-        let computed = receipt.compute_content_hash();
-        if receipt.receipt_id != receipt_id
-            || !receipt.content_hash_matches()
-            || computed != content_sha256
-        {
-            return Err(
-                "artifact receipt digest does not match the saved canonical receipt".to_string(),
-            );
-        }
-        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
-            .ok_or_else(|| "artifact receipt id is not a canonical sha256 digest".to_string())?;
-        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
-            .ok_or_else(|| "artifact receipt hash is not a canonical sha256 digest".to_string())?;
-        Ok(Self {
-            receipt_id,
-            content_sha256,
-        })
-    }
-
-    fn render(&self) -> String {
-        format!(
-            "{} sha256:{}",
-            self.receipt_id.to_hex(),
-            self.content_sha256.to_hex()
-        )
-    }
-}
-
 /// The private receipt-detail capabilities the chain writer accepts, each bound
 /// to the ONE `entry_type` it may appear on. Binding the entry type to the
-/// capability (rather than checking one hard-coded string) is what keeps a
-/// capsule digest from being written onto an install-receipt line, or the
-/// reverse, when a third receipt kind is added later.
+/// capability (rather than checking one hard-coded string) is what keeps one
+/// receipt kind's digest from being written onto another kind's line when a
+/// second receipt kind is added. (The package-install `artifact_receipt`
+/// writer was removed with the package firewall; existing lines still verify
+/// as ordinary chain entries.)
 enum TrustedReceiptDetail<'a> {
-    Artifact(&'a TrustedArtifactReceiptDetail),
     CapsuleRun(&'a TrustedCapsuleReceiptDetail),
 }
 
 impl TrustedReceiptDetail<'_> {
     fn entry_type(&self) -> &'static str {
         match self {
-            Self::Artifact(_) => "artifact_receipt",
             Self::CapsuleRun(_) => "capsule_run_receipt",
         }
     }
 
     fn render(&self) -> String {
         match self {
-            Self::Artifact(detail) => detail.render(),
             Self::CapsuleRun(detail) => detail.render(),
         }
     }
 }
 
-/// The same private append capability for a C14 capsule-run receipt.
-///
-/// A sibling rather than a widening of [`TrustedArtifactReceiptDetail`]: the two
-/// receipts have different schemas and live in different directories, so one
-/// constructor that deserialized "whichever parses" would let an install receipt
-/// be anchored as a capsule run or the reverse.
+/// Private append capability for the only free-form audit detail whose exact
+/// digest bytes must survive privacy projection: a C14 capsule-run receipt.
+/// Construction independently reloads the just-saved receipt and recomputes its
+/// content address; raw string shape alone is never sufficient.
 struct TrustedCapsuleReceiptDetail {
-    receipt_id: TrustedArtifactDigest,
-    content_sha256: TrustedArtifactDigest,
+    receipt_id: TrustedReceiptDigest,
+    content_sha256: TrustedReceiptDigest,
 }
 
 impl TrustedCapsuleReceiptDetail {
@@ -569,9 +511,9 @@ impl TrustedCapsuleReceiptDetail {
                 "capsule receipt digest does not match the saved canonical receipt".to_string(),
             );
         }
-        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
+        let receipt_id = TrustedReceiptDigest::from_verified_hex(receipt_id)
             .ok_or_else(|| "capsule receipt id is not a canonical sha256 digest".to_string())?;
-        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
+        let content_sha256 = TrustedReceiptDigest::from_verified_hex(content_sha256)
             .ok_or_else(|| "capsule receipt hash is not a canonical sha256 digest".to_string())?;
         Ok(Self {
             receipt_id,
@@ -598,10 +540,10 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
 fn append_to_audit_log_inner(
     entry: &AuditEntry,
     log_path: Option<PathBuf>,
-    trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
+    trusted_receipt_detail: Option<TrustedReceiptDetail<'_>>,
 ) -> AuditWrite {
     let path = log_path.or_else(default_log_path);
-    let result = append_to_audit_log_unobserved(entry, path.clone(), trusted_artifact_detail);
+    let result = append_to_audit_log_unobserved(entry, path.clone(), trusted_receipt_detail);
     if let (AuditWrite::Failed(_), Some(path)) = (&result, path.as_ref()) {
         health::record_append_failure(path);
     }
@@ -611,9 +553,9 @@ fn append_to_audit_log_inner(
 fn append_to_audit_log_unobserved(
     entry: &AuditEntry,
     log_path: Option<PathBuf>,
-    trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
+    trusted_receipt_detail: Option<TrustedReceiptDetail<'_>>,
 ) -> AuditWrite {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
+    if !logging_enabled() {
         return AuditWrite::Skipped;
     }
 
@@ -814,9 +756,9 @@ fn append_to_audit_log_unobserved(
     // public rendering path, but the mutable entry used for chaining and
     // signing is itself made privacy-safe before any hash is derived.
     let mut entry = entry.chain_source_privacy_projection();
-    if let Some(detail) = trusted_artifact_detail {
+    if let Some(detail) = trusted_receipt_detail {
         if entry.entry_type != detail.entry_type() {
-            let reason = "trusted artifact detail used for a non-receipt audit entry".to_string();
+            let reason = "trusted receipt detail used for a non-receipt audit entry".to_string();
             audit_diagnostic(format!("tirith: audit: {reason}"));
             let _ = fs2::FileExt::unlock(&file);
             return AuditWrite::Failed(reason);
@@ -1044,11 +986,7 @@ fn canon_write(v: &serde_json::Value, out: &mut String) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
+use crate::util::sha256_hex;
 
 /// Hash of one audit line: parse JSON, drop `sig`, canonicalize, sha256-hex.
 /// `None` if the line is not valid JSON (a legacy/corrupt line yields no hash
@@ -1506,29 +1444,20 @@ fn sign_canonical(canonical: &[u8]) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
 }
 
-/// Whether ed25519 audit signing is available right now: a `config_dir()`
-/// signing key exists AND passes the same ownership/permission gate the chain
-/// signer uses. The D6 receipt path consults this to decide whether its
-/// hash-chain anchor is cryptographically SIGNED ("mandatory for `pkg install`")
-/// or only chained ("tamper-evident"). It performs no I/O beyond stat+read of the
-/// key, exactly like a single [`sign_canonical`] attempt would.
-pub fn audit_signing_available() -> bool {
-    audit_signing_secret().is_some()
-}
-
 /// Canonical JSON of `value` for content-hashing/signing: object keys sorted
 /// recursively, compact, no insignificant whitespace, so re-serializing the same
-/// logical value reproduces identical bytes. Exposed for the D6
-/// [`crate::receipt::ArtifactScanReceipt`] so its content hash and the chain
-/// anchor share ONE canonicalizer with the audit chain (a divergent second
-/// canonicalizer would let a receipt hash drift from what the chain recorded).
+/// logical value reproduces identical bytes. Exposed so receipt content hashes
+/// (for example [`crate::receipt::ArtifactScanReceipt`] and
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]) and the chain anchor share ONE
+/// canonicalizer with the audit chain (a divergent second canonicalizer would let
+/// a receipt hash drift from what the chain recorded).
 pub fn canonical_json_for_hash(value: &serde_json::Value) -> String {
     canonical_json_string(value)
 }
 
 /// Sign `canonical` bytes with the ed25519 audit key, returning the base64
-/// signature, or `None` when no usable signing key is configured. Exposed so the
-/// D6 receipt's OPTIONAL detached signature is produced by the same key + routine
+/// signature, or `None` when no usable signing key is configured. Exposed so a
+/// receipt's OPTIONAL detached signature is produced by the same key + routine
 /// as the audit chain, never a second key path.
 pub fn sign_canonical_bytes(canonical: &[u8]) -> Option<String> {
     sign_canonical(canonical)
@@ -2091,15 +2020,14 @@ pub fn log_trust_change(
     }
 }
 
-/// The outcome of anchoring a D6 [`crate::receipt::ArtifactScanReceipt`] in the
-/// audit hash-chain.
+/// The outcome of anchoring a receipt (a C14
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]) in the audit hash-chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptAnchor {
     /// The receipt's content hash was appended to the chain. `signed` is true when
-    /// the entry carries an ed25519 signature (the chain is signed): a SIGNED
-    /// anchor is "mandatory for `pkg install`"; an unsigned one is only
-    /// "tamper-evident" (hash-chained). The chain `prev_hash` link makes either
-    /// detectable on edit.
+    /// the entry carries an ed25519 signature (the chain is signed); an unsigned
+    /// one is only "tamper-evident" (hash-chained). The chain `prev_hash` link
+    /// makes either detectable on edit.
     Recorded { signed: bool },
     /// The anchor was intentionally not written (`TIRITH_LOG=0` or no log path).
     /// NOT an error, but it means there is no chain record of this receipt.
@@ -2109,105 +2037,10 @@ pub enum ReceiptAnchor {
     Failed(String),
 }
 
-/// Anchor a D6 [`crate::receipt::ArtifactScanReceipt`] in the audit hash-chain.
-///
-/// This records ONE `entry_type = "artifact_receipt"` line whose content binds the
-/// receipt's `receipt_id` and `content_sha256` (plus the install verdict's action
-/// and rule ids) into the tamper-evident chain via [`append_to_audit_log`], so the
-/// receipt inherits the same `prev_hash` chaining, optional ed25519 signature, and
-/// head-receipt truncation anchor as every verdict line. The receipt FILE is the
-/// authoritative artifact; this chain line is the anchor that makes a later edit or
-/// deletion of the receipt detectable.
-///
-/// No secrets are recorded here: only a digest pair independently proven against
-/// the saved content-addressed receipt, the verdict action, and the verdict rule
-/// ids (the [`crate::receipt`] builder already redacted everything the receipt
-/// itself carries). `detail` carries a compact `"<id> sha256:<hash>"` so a human
-/// reading the raw log can tie the line back to the saved receipt.
-///
-/// Returns a [`ReceiptAnchor`] telling the caller whether the line was written and,
-/// if so, whether it was ed25519-SIGNED: the signal a `pkg install` surface uses
-/// to enforce that a signed anchor is mandatory (vs. the default "tamper-evident"
-/// wording when signing is not configured).
-#[must_use = "the caller must know whether the receipt was anchored (and signed) in the chain"]
-pub(crate) fn log_artifact_scan_receipt(
-    receipt_id: &str,
-    content_sha256: &str,
-    verdict_action: &str,
-    verdict_rule_ids: &[String],
-) -> ReceiptAnchor {
-    // Preserve the ordinary logging-off/no-destination behavior without trying
-    // to establish a trust capability that will never reach a durable sink.
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
-        return ReceiptAnchor::Skipped;
-    }
-    let trusted_detail =
-        match TrustedArtifactReceiptDetail::from_recorded_receipt(receipt_id, content_sha256) {
-            Ok(detail) => detail,
-            Err(reason) => return ReceiptAnchor::Failed(reason),
-        };
-    let entry = AuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
-        // The verdict the receipt records its install gated on. Drives nothing for a
-        // non-verdict entry; it is here so the chain line is self-describing.
-        action: privacy_project_audit_text(verdict_action),
-        rule_ids: verdict_rule_ids
-            .iter()
-            .map(|rule_id| privacy_project_audit_text(rule_id))
-            .collect(),
-        command_redacted: String::new(),
-        bypass_requested: false,
-        bypass_honored: false,
-        interactive: false,
-        policy_path: None,
-        event_id: None,
-        tier_reached: 3,
-        entry_type: "artifact_receipt".to_string(),
-        event: None,
-        integration: None,
-        hook_type: None,
-        // Injected only after the ordinary privacy projection, through the
-        // private `trusted_detail` capability below.
-        detail: None,
-        elapsed_ms: None,
-        raw_action: None,
-        raw_rule_ids: None,
-        trust_pattern: None,
-        trust_rule_id: None,
-        trust_action: None,
-        trust_ttl_expires: None,
-        trust_scope: None,
-        // An install receipt is an operator/tool action, not an agent-attributed
-        // command, so no synthetic origin.
-        agent_origin: None,
-        manifest_allowed_match: None,
-        prev_hash: None,
-        sig: None,
-    };
-
-    match append_to_audit_log_inner(
-        &entry,
-        None,
-        Some(TrustedReceiptDetail::Artifact(&trusted_detail)),
-    ) {
-        // The serialized line carries `sig` iff the chain signed it; detect that
-        // without re-parsing by checking for the field. (A signed log always
-        // produces a non-empty `"sig":"..."`.)
-        AuditWrite::Written(line) => ReceiptAnchor::Recorded {
-            signed: line_is_signed(&line),
-        },
-        AuditWrite::Skipped => ReceiptAnchor::Skipped,
-        AuditWrite::Failed(reason) => ReceiptAnchor::Failed(reason),
-    }
-}
-
 /// Anchor a C14 [`crate::capsule_receipt::CapsuleRunReceipt`] in the audit hash
 /// chain.
 ///
-/// A sibling of [`log_artifact_scan_receipt`], deliberately not a widening of
-/// it: an install receipt attests a verdict over artifacts and carries rule ids,
-/// while a capsule run attests a containment outcome and carries none. This
+/// A capsule run attests a containment outcome and carries no rule ids. This
 /// records ONE `entry_type = "capsule_run_receipt"` line binding the receipt's
 /// content address, so a later edit or deletion of the saved receipt is
 /// detectable against the (optionally ed25519-signed) chain.
@@ -2221,7 +2054,7 @@ pub(crate) fn log_capsule_run_receipt(
     content_sha256: &str,
     status: &str,
 ) -> ReceiptAnchor {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+    if !logging_enabled() || default_log_path().is_none() {
         return ReceiptAnchor::Skipped;
     }
     let trusted_detail =
@@ -2276,7 +2109,7 @@ pub(crate) fn log_capsule_run_receipt(
 }
 
 /// Whether a serialized audit line carries a non-empty ed25519 `sig`. Used by
-/// [`log_artifact_scan_receipt`] to report whether the receipt's chain anchor was
+/// [`log_capsule_run_receipt`] to report whether the receipt's chain anchor was
 /// signed without re-deriving the key state.
 fn line_is_signed(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line.trim())
@@ -2291,6 +2124,11 @@ fn default_log_path() -> Option<PathBuf> {
 
 /// Public accessor for the audit log path (so out-of-crate readers need not
 /// hard-code `data_dir()/log.jsonl`).
+/// Whether audit logging is on (`TIRITH_LOG=0` turns it off).
+pub fn logging_enabled() -> bool {
+    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0")
+}
+
 pub fn audit_log_path() -> Option<PathBuf> {
     default_log_path()
 }
@@ -2354,29 +2192,12 @@ mod tests {
         }
     }
 
-    fn write_sample_artifact_receipt() -> String {
-        let receipt = crate::receipt::ArtifactScanReceipt::new(
-            "0.3.3".to_string(),
-            "a".repeat(64),
-            7,
-            "uv pip install example".to_string(),
-            "uv 0.4.0".to_string(),
-            "pip 24.0".to_string(),
-            crate::receipt::CapsuleReceipt {
-                backend_id: "test".to_string(),
-                coverage: crate::capsule::CapsuleCoverage::NONE,
-            },
-            vec!["b".repeat(64)],
-            None,
-            crate::receipt::VerdictSummary {
-                action: "Block".to_string(),
-                rule_ids: vec!["ArtifactKnownMalicious".to_string()],
-                finding_count: 1,
-            },
-        );
-        let directory = crate::policy::data_dir()
-            .expect("isolated data directory")
-            .join("receipts");
+    // Only the Unix-only signed-anchor test needs a saved receipt.
+    #[cfg(unix)]
+    fn write_sample_capsule_receipt() -> String {
+        let receipt = crate::capsule_receipt::sample_contained_receipt();
+        let directory =
+            crate::capsule_receipt::capsule_receipts_dir().expect("isolated data directory");
         std::fs::create_dir_all(&directory).unwrap();
         crate::util::write_file_atomic_0600(
             &directory.join(format!("{}.json", receipt.receipt_id)),
@@ -2588,12 +2409,7 @@ mod tests {
         log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope)
             .expect("append trust audit entry");
         assert!(matches!(
-            log_artifact_scan_receipt(
-                &bare_scalar,
-                &bare_scalar,
-                &action,
-                std::slice::from_ref(&rule_id)
-            ),
+            log_capsule_run_receipt(&bare_scalar, &bare_scalar, &action),
             ReceiptAnchor::Failed(_)
         ));
 
@@ -2605,8 +2421,8 @@ mod tests {
         assert!(!persisted.contains(&canary), "{persisted}");
         assert!(persisted.contains("REDACTED"), "{persisted}");
         assert!(
-            !persisted.contains("\"entry_type\":\"artifact_receipt\""),
-            "untrusted digest input must not produce an artifact anchor: {persisted}"
+            !persisted.contains("\"entry_type\":\"capsule_run_receipt\""),
+            "untrusted digest input must not produce a receipt anchor: {persisted}"
         );
         for (index, line) in persisted.lines().enumerate().skip(1) {
             let value: serde_json::Value = serde_json::from_str(line).expect("chained audit line");
@@ -4594,15 +4410,15 @@ mod tests {
         global_state.remove_env("XDG_CONFIG_HOME");
     }
 
-    /// The D6 chain anchor: when audit signing is configured, the
-    /// `artifact_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
-    /// reports `signed: true` (the "mandatory for `pkg install`" signal); the chain
-    /// then verifies with the matching public key.
+    /// The receipt chain anchor: when audit signing is configured, the
+    /// `capsule_run_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
+    /// reports `signed: true`; the chain then verifies with the matching public
+    /// key.
     #[test]
     // Unix-only: signing the anchor requires writing the audit log (taking the fs2
     // lock), which is unavailable on a Windows append handle.
     #[cfg(unix)]
-    fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
+    fn receipt_anchor_is_signed_when_signing_enabled() {
         let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         // Isolate BOTH the data dir (so the anchor lands in our temp log) and the
@@ -4623,19 +4439,14 @@ mod tests {
         std::fs::write(cfg.join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         assert!(
-            audit_signing_available(),
+            audit_signing_secret().is_some(),
             "the planted key must make signing available"
         );
 
         // The exact digest capability comes from a saved canonical receipt, not
         // from accepting an arbitrary lowercase-hex string by shape.
-        let receipt_hash = write_sample_artifact_receipt();
-        let anchor = log_artifact_scan_receipt(
-            &receipt_hash,
-            &receipt_hash,
-            "Block",
-            &["ArtifactKnownMalicious".to_string()],
-        );
+        let receipt_hash = write_sample_capsule_receipt();
+        let anchor = log_capsule_run_receipt(&receipt_hash, &receipt_hash, "contained");
         assert_eq!(
             anchor,
             ReceiptAnchor::Recorded { signed: true },
@@ -4644,7 +4455,7 @@ mod tests {
 
         let log_path = audit_log_path().expect("log path");
         let body = std::fs::read_to_string(&log_path).unwrap();
-        assert!(body.contains("\"entry_type\":\"artifact_receipt\""));
+        assert!(body.contains("\"entry_type\":\"capsule_run_receipt\""));
         assert!(
             body.contains(&format!("{receipt_hash} sha256:{receipt_hash}")),
             "typed receipt hashes must survive the free-form privacy projection"

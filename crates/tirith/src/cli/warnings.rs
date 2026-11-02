@@ -564,6 +564,7 @@ mod tests {
 
     #[test]
     fn test_hidden_only_session_at_threshold_shows_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let w = SessionWarnings {
             session_id: "test".to_string(),
             session_start: "2026-04-05T00:00:00Z".to_string(),

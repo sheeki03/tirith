@@ -10,6 +10,7 @@ fn private_options(address: &str) -> EndpointOptions {
 
 #[test]
 fn explicit_private_endpoint_pins_never_relax_tls_or_allow_metadata() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for address in ["10.1.2.3", "127.0.0.1", "100.64.3.2", "fd00::1", "::1"] {
         assert!(endpoint("https://policy.example/team", &private_options(address)).is_ok());
     }
@@ -100,6 +101,7 @@ fn response(value: &impl Serialize) -> Vec<u8> {
 
 #[test]
 fn actual_transport_binds_current_policy_authority_and_fixed_route() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let binding = binding();
     let value = PolicyDocument {
         schema_version: SCHEMA_VERSION,
@@ -125,6 +127,7 @@ fn actual_transport_binds_current_policy_authority_and_fixed_route() {
 
 #[test]
 fn live_status_refuses_a_replayed_old_fleet_snapshot() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let binding = binding();
     let value = FleetStatus {
         schema_version: SCHEMA_VERSION,
@@ -148,6 +151,7 @@ fn live_status_refuses_a_replayed_old_fleet_snapshot() {
 
 #[test]
 fn malformed_publication_success_is_unknown_and_never_retried() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let binding = binding();
     let request = PublicationRequest {
         schema_version: SCHEMA_VERSION,
@@ -175,6 +179,7 @@ fn malformed_publication_success_is_unknown_and_never_retried() {
 
 #[test]
 fn publication_response_cannot_substitute_the_expected_revision() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let binding = binding();
     let request = PublicationRequest {
         schema_version: SCHEMA_VERSION,
@@ -214,6 +219,7 @@ fn publication_response_cannot_substitute_the_expected_revision() {
 
 #[test]
 fn actual_report_receipt_must_match_credential_client_and_sequence() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let binding = binding();
     let client_id = Id::new();
     let request = ClientReportRequest {

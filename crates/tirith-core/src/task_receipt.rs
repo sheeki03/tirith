@@ -86,8 +86,6 @@ enum OwnedBoundaryProjectionV1 {
     PackageApproval,
     PackageResolve,
     PackageInstallPreparation,
-    LocalPackageMaterialization,
-    LocalPackageRecovery,
     PackageManagerNetwork,
     PackageManagerExecution,
     RemoteScriptRun,
@@ -105,8 +103,6 @@ impl From<OwnedBoundary> for OwnedBoundaryProjectionV1 {
             OwnedBoundary::PackageApproval => Self::PackageApproval,
             OwnedBoundary::PackageResolve => Self::PackageResolve,
             OwnedBoundary::PackageInstallPreparation => Self::PackageInstallPreparation,
-            OwnedBoundary::LocalPackageMaterialization => Self::LocalPackageMaterialization,
-            OwnedBoundary::LocalPackageRecovery => Self::LocalPackageRecovery,
             OwnedBoundary::PackageManagerNetwork => Self::PackageManagerNetwork,
             OwnedBoundary::PackageManagerExecution => Self::PackageManagerExecution,
             OwnedBoundary::RemoteScriptRun => Self::RemoteScriptRun,
@@ -126,10 +122,6 @@ impl From<OwnedBoundaryProjectionV1> for OwnedBoundary {
             OwnedBoundaryProjectionV1::PackageApproval => Self::PackageApproval,
             OwnedBoundaryProjectionV1::PackageResolve => Self::PackageResolve,
             OwnedBoundaryProjectionV1::PackageInstallPreparation => Self::PackageInstallPreparation,
-            OwnedBoundaryProjectionV1::LocalPackageMaterialization => {
-                Self::LocalPackageMaterialization
-            }
-            OwnedBoundaryProjectionV1::LocalPackageRecovery => Self::LocalPackageRecovery,
             OwnedBoundaryProjectionV1::PackageManagerNetwork => Self::PackageManagerNetwork,
             OwnedBoundaryProjectionV1::PackageManagerExecution => Self::PackageManagerExecution,
             OwnedBoundaryProjectionV1::RemoteScriptRun => Self::RemoteScriptRun,
@@ -2325,14 +2317,6 @@ mod tests {
     #[test]
     fn every_owned_boundary_has_one_stable_receipt_projection() {
         let cases = [
-            (
-                OwnedBoundary::LocalPackageMaterialization,
-                "local_package_materialization",
-            ),
-            (
-                OwnedBoundary::LocalPackageRecovery,
-                "local_package_recovery",
-            ),
             (OwnedBoundary::GatewayForward, "gateway_forward"),
             (OwnedBoundary::PackageApproval, "package_approval"),
             (OwnedBoundary::PackageResolve, "package_resolve"),
@@ -2589,6 +2573,7 @@ mod tests {
 
     #[test]
     fn v2_rejects_empty_acquisition_and_unsafe_identifiers() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let action = ProposedAction::Narrative {
             text: "diagnostic".to_string(),
         };
@@ -3240,6 +3225,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replay_store_subprocess_helper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(root) = std::env::var_os("TIRITH_TEST_RECEIPT_REPLAY_ROOT") else {
             return;
         };
@@ -3353,6 +3339,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replay_consumption_and_pruning_expire_at_equality() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let expected = projection();
         let (receipt, keys) = signed_receipt(&expected, now() - TimeDelta::hours(1), now());
         let validated = verify_receipt_v2(
@@ -3538,6 +3525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn full_store_never_evicts_a_live_receipt() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("replay");
         ensure_secure_directory(&root).unwrap();

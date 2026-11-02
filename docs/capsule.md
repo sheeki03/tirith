@@ -31,14 +31,14 @@ inputs throughout execution against another process owned by the same user.
 Read-only mounts and initial digest checks alone do not establish that guarantee.
 The command refuses before resolver execution, network access, quarantine writes,
 checkpoint creation, or package execution. `--yes`, `--allow-degraded`, sudo, and
-administrator access do not enable it. The hidden private-input launcher also
-refuses before creating a namespace or starting its target.
+administrator access do not enable it. The private-input launcher itself was
+removed, so no code path can start a package with private named inputs.
 
 This restriction applies to contained package execution. `tirith package inspect`
 and `tirith pkg verify-env` remain available; the latter verifies an existing
-environment without launching pip. `tirith pkg approve` remains subject to its
-separate approval-authority and platform requirements and never installs; an
-approval cannot bypass this execution refusal. Ordinary capsules and command
+environment without launching pip. `tirith pkg approve` checks its native
+approval authority and then refuses with the same reason; it records no
+approval, because nothing could redeem one. Ordinary capsules and command
 protection retain their existing platform and coverage requirements.
 
 ### The untrusted-project preset

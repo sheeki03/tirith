@@ -11,7 +11,6 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 pub const PROVENANCE_LIMIT: u64 = 1024 * 1024;
 pub const SOURCE_IDS: [&str; 3] = [
@@ -26,9 +25,32 @@ pub struct UpstreamObservation {
     pub pinned_commit: String,
     pub candidate_commit: String,
     pub candidate_timestamp: String,
-    pub ahead_by: u64,
+    /// `None` when GitHub could not compare the pin with the candidate; the
+    /// commit timestamps still give the lag.
+    pub ahead_by: Option<u64>,
+    /// Why GitHub could not compare them, e.g. `github_http_422`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_unavailable: Option<String>,
     pub max_lag_hours: u64,
     pub review_required: bool,
+}
+
+impl UpstreamObservation {
+    /// An unchanged pin is zero commits behind; a moved one is either counted
+    /// or explains why GitHub could not count it.
+    fn comparison_consistent(&self) -> bool {
+        match (self.ahead_by, self.comparison_unavailable.as_deref()) {
+            (Some(ahead), None) => (ahead != 0) == self.review_required,
+            (None, Some(reason)) => {
+                self.review_required
+                    && (1..=64).contains(&reason.len())
+                    && reason.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,10 +69,7 @@ fn timestamp(value: &str) -> Result<u64, String> {
 }
 
 fn digest(value: &str, bytes: usize) -> bool {
-    value.len() == bytes * 2
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::util::is_lower_hex(value, bytes * 2)
 }
 
 impl UpstreamObservations {
@@ -69,7 +88,7 @@ impl UpstreamObservations {
                 || timestamp(&item.candidate_timestamp)? > checked
                 || !(1..=8760).contains(&item.max_lag_hours)
                 || item.review_required != (item.pinned_commit != item.candidate_commit)
-                || (item.ahead_by != 0) != item.review_required
+                || !item.comparison_consistent()
             {
                 return Err(format!("inconsistent upstream observation for {source}"));
             }
@@ -185,7 +204,7 @@ pub fn verify_source_evidence(
         ("source_transaction_sha256", &source_bytes),
         ("compiler_metadata_sha256", &compiler_bytes),
     ] {
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = crate::util::sha256_hex(bytes);
         if sidecar[field].as_str() != Some(actual.as_str()) {
             return Err(format!("source evidence {field} integrity mismatch"));
         }
@@ -265,7 +284,7 @@ pub fn source_freshness(document: &Value, built: u64, now: u64) -> Result<Freshn
                 let lag = upstream.saturating_sub(revised);
                 row.observation_age_seconds = now.checked_sub(checked);
                 row.known_upstream_lag_seconds = Some(lag);
-                row.upstream_commits_ahead = Some(observation.ahead_by);
+                row.upstream_commits_ahead = observation.ahead_by;
                 row.reviewed_pin_adoption_required = Some(observation.review_required);
                 row.lag_exceeds_reviewed_budget = Some(lag > observation.max_lag_hours * 3600);
                 report.clock_skew |= checked > now;
@@ -274,6 +293,18 @@ pub fn source_freshness(document: &Value, built: u64, now: u64) -> Result<Freshn
         report.sources.push(row);
     }
     Ok(report)
+}
+
+/// Total attempts `send_with_retry` makes (one request plus two retries).
+const MAX_ATTEMPTS: u32 = 3;
+
+/// How long one attempt may wait for response headers: an equal share of what
+/// is left for the attempts still allowed, so a stalled first attempt leaves
+/// budget for a retry; the last attempt gets everything that remains. It does
+/// not bound the body: reqwest's request timeout is a total deadline covering
+/// the body, so the request itself keeps the whole remaining budget.
+fn attempt_timeout(remaining: Duration, attempt: u32) -> Duration {
+    remaining / MAX_ATTEMPTS.saturating_sub(attempt).max(1)
 }
 
 /// Retry only transient status codes; caller still validates identity, schema,
@@ -285,7 +316,7 @@ pub fn retry_delay(
     remaining: Duration,
     now: u64,
 ) -> Option<Duration> {
-    if attempt >= 2 || !matches!(status, 408 | 429 | 500 | 502 | 503 | 504) {
+    if attempt + 1 >= MAX_ATTEMPTS || !matches!(status, 408 | 429 | 500 | 502 | 503 | 504) {
         return None;
     }
     let seconds = match retry_after {
@@ -329,7 +360,7 @@ pub fn send_with_retry(
         let next = request
             .try_clone()
             .ok_or("transport request cannot be retried safely")?;
-        let result = next.timeout(remaining).send();
+        let result = send_within(next.timeout(remaining), attempt_timeout(remaining, attempt));
         let (status, retry_after) = match &result {
             Ok(response) => (
                 response.status().as_u16(),
@@ -338,7 +369,7 @@ pub fn send_with_retry(
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok()),
             ),
-            Err(error) if error.is_timeout() => (503, None),
+            Err(SendFailure::TimedOut) => (503, None),
             Err(_) => (0, None),
         };
         let now = std::time::SystemTime::now()
@@ -357,16 +388,44 @@ pub fn send_with_retry(
             attempt += 1;
             continue;
         }
-        // No reqwest Display here: it may include a supplemental feed API key.
-        return result.map_err(|error| {
-            if error.is_timeout() {
-                "transport timed out".into()
-            } else if error.is_connect() {
-                "connection or server identity failed".into()
-            } else {
-                "transport request failed".into()
+        return result.map_err(|failure| {
+            match failure {
+                SendFailure::TimedOut => "transport timed out",
+                SendFailure::Connect => "connection or server identity failed",
+                SendFailure::Other => "transport request failed",
             }
+            .into()
         });
+    }
+}
+
+/// Why one attempt produced no response. No reqwest error is kept: its
+/// Display may include a supplemental feed API key.
+enum SendFailure {
+    TimedOut,
+    Connect,
+    Other,
+}
+
+/// Sends `request` and waits at most `header_wait` for the response headers.
+/// The request carries its own total timeout, which also governs the body the
+/// caller reads later. A send that misses `header_wait` is abandoned on its
+/// thread, which ends by that total timeout at the latest.
+fn send_within(
+    request: reqwest::blocking::RequestBuilder,
+    header_wait: Duration,
+) -> Result<reqwest::blocking::Response, SendFailure> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(request.send());
+    });
+    match receiver.recv_timeout(header_wait) {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_timeout() => Err(SendFailure::TimedOut),
+        Ok(Err(error)) if error.is_connect() => Err(SendFailure::Connect),
+        Ok(Err(_)) => Err(SendFailure::Other),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(SendFailure::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(SendFailure::Other),
     }
 }
 
@@ -375,6 +434,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn fixture() -> (Value, UpstreamObservations) {
         let mut sources = BTreeMap::new();
@@ -387,7 +447,8 @@ mod tests {
                     pinned_commit: "a".repeat(40),
                     candidate_commit: "a".repeat(40),
                     candidate_timestamp: "2020-01-01T00:00:00Z".into(),
-                    ahead_by: 0,
+                    ahead_by: Some(0),
+                    comparison_unavailable: None,
                     max_lag_hours: 48,
                     review_required: false,
                 },
@@ -408,11 +469,12 @@ mod tests {
 
     #[test]
     fn old_unchanged_upstream_is_current_and_pending_adoption_is_separate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (mut document, mut observations) = fixture();
         let row = observations.sources.get_mut(SOURCE_IDS[0]).unwrap();
         row.candidate_commit = "b".repeat(40);
         row.candidate_timestamp = "2025-12-31T00:00:00Z".into();
-        row.ahead_by = 3;
+        row.ahead_by = Some(3);
         row.review_required = true;
         document["compiler_parse"]["upstream_observations"] =
             serde_json::to_value(observations).unwrap();
@@ -438,7 +500,55 @@ mod tests {
     }
 
     #[test]
+    fn uncomparable_upstream_still_reports_timestamp_lag() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let (mut document, observations) = fixture();
+        // The shape threatdb_source_pins.py writes when GitHub answers 422.
+        let mut value = serde_json::to_value(observations).unwrap();
+        value["sources"][SOURCE_IDS[1]] = json!({
+            "pinned_commit": "a".repeat(40),
+            "candidate_commit": "c".repeat(40),
+            "candidate_timestamp": "2020-01-04T00:00:00Z",
+            "ahead_by": null,
+            "comparison_unavailable": "github_http_422",
+            "max_lag_hours": 48,
+            "review_required": true,
+        });
+        document["compiler_parse"]["upstream_observations"] = value.clone();
+        let now = timestamp("2026-01-02T00:00:00Z").unwrap();
+        let report = source_freshness(&document, now - 3600, now).unwrap();
+        let row = report
+            .sources
+            .iter()
+            .find(|row| row.source == SOURCE_IDS[1])
+            .unwrap();
+        assert_eq!(row.known_upstream_lag_seconds, Some(3 * 86400));
+        assert_eq!(row.upstream_commits_ahead, None);
+        assert_eq!(row.reviewed_pin_adoption_required, Some(true));
+        assert_eq!(row.lag_exceeds_reviewed_budget, Some(true));
+        let reparsed: UpstreamObservations = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reparsed).unwrap(), value);
+
+        for (field, bad) in [
+            ("comparison_unavailable", Value::Null),
+            ("ahead_by", json!(2)),
+            ("comparison_unavailable", json!("GitHub said: no")),
+            ("comparison_unavailable", json!("")),
+        ] {
+            let mut broken = value.clone();
+            broken["sources"][SOURCE_IDS[1]][field] = bad;
+            let parsed: UpstreamObservations = serde_json::from_value(broken).unwrap();
+            assert!(parsed.validate().is_err(), "{field} accepted");
+        }
+        let mut unchanged = value;
+        unchanged["sources"][SOURCE_IDS[0]]["comparison_unavailable"] = json!("github_http_422");
+        let parsed: UpstreamObservations = serde_json::from_value(unchanged).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
     fn missing_observation_is_unknown_and_future_timestamp_is_not_fresh() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (document, _) = fixture();
         let report = source_freshness(&document, 200, 100).unwrap();
         assert!(report.clock_skew);
@@ -451,6 +561,7 @@ mod tests {
 
     #[test]
     fn source_evidence_refuses_incomplete_coverage_and_inconsistent_observations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (mut document, observations) = fixture();
         document["compiler_parse"]["upstream_observations"] =
             serde_json::to_value(observations).unwrap();
@@ -470,6 +581,7 @@ mod tests {
 
     #[test]
     fn source_signature_binds_database_and_canonical_source_and_counts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let (document, _) = fixture();
         let key = SigningKey::from_bytes(&[29; 32]);
         let mut source = document.clone();
@@ -540,7 +652,95 @@ mod tests {
     }
 
     #[test]
+    fn attempt_timeout_leaves_budget_for_the_allowed_retries() {
+        let budget = Duration::from_secs(30);
+        assert_eq!(attempt_timeout(budget, 0), Duration::from_secs(10));
+        assert_eq!(attempt_timeout(budget, 1), Duration::from_secs(15));
+        assert_eq!(attempt_timeout(budget, 2), budget);
+        assert_eq!(attempt_timeout(budget, 7), budget);
+    }
+
+    /// A first attempt that never answers must not consume the whole budget:
+    /// the retry happens and its answer is returned.
+    #[test]
+    fn stalled_first_attempt_is_retried_within_the_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // First connection: read the request, never answer, hold it open.
+            let (mut stalled, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stalled.read(&mut buffer);
+            // Second connection: answer immediately.
+            let (mut answered, _) = listener.accept().unwrap();
+            let _ = answered.read(&mut buffer);
+            answered
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .unwrap();
+            drop(stalled);
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = send_with_retry(
+            client.get(format!("http://{address}/manifest")),
+            Duration::from_secs(4),
+        )
+        .expect("the retry must run after a stalled first attempt");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.text().unwrap(), "ok");
+        server.join().unwrap();
+    }
+
+    /// The per-attempt share bounds only the wait for response headers: a
+    /// healthy response whose body takes longer than that share, but less
+    /// than the whole budget, is read in full.
+    #[test]
+    fn slow_body_may_use_the_whole_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            // 4 bytes over ~2.4 s: longer than budget / 3, shorter than the budget.
+            for byte in b"slow" {
+                std::thread::sleep(Duration::from_millis(600));
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = send_with_retry(
+            client.get(format!("http://{address}/threatdb.bin")),
+            Duration::from_secs(5),
+        )
+        .expect("headers arrive at once");
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response
+            .bytes()
+            .expect("the body may take longer than one attempt's share");
+        assert_eq!(&body[..], b"slow");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn retry_transport_refuses_mutations_before_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = reqwest::blocking::Client::new();
         let error = send_with_retry(client.post("https://example.com/"), Duration::from_secs(1))
             .unwrap_err();

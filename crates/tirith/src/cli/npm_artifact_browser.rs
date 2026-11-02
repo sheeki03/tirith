@@ -104,6 +104,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn browser_refuses_a_rebound_project_even_when_archive_bytes_are_identical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().canonicalize().unwrap();
         let root = parent.join("project");
@@ -123,6 +124,7 @@ mod tests {
 
     #[test]
     fn browser_artifacts_refuse_escaping_paths_and_do_not_create_parents() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let anchor = ContainedAtomicFile::prepare(&root, &root.join("anchor"), false).unwrap();
@@ -141,6 +143,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn browser_artifacts_refuse_linked_parent_and_leaf() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let anchor = ContainedAtomicFile::prepare(&root, &root.join("anchor"), false).unwrap();

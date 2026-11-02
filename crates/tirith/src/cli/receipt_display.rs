@@ -110,26 +110,55 @@ mod tests {
     use super::*;
     use tirith_core::receipt::{CapsuleReceipt, VerdictSummary};
 
+    /// A schema-v2 `private_verified` artifact-scan receipt as the removed package
+    /// install wrote it: `fields` plus the stamped schema, engine build, timestamp
+    /// and content-addressed id. Artifact hashes are sorted like the old writer did.
+    fn artifact_receipt_fixture(mut fields: serde_json::Value) -> ArtifactScanReceipt {
+        let object = fields.as_object_mut().expect("receipt fixture fields");
+        object.insert("schema".into(), serde_json::json!(2));
+        object.insert("receipt_id".into(), serde_json::json!(""));
+        object.insert(
+            "engine_build_sha".into(),
+            serde_json::json!(tirith_core::receipt::engine_build_sha()),
+        );
+        object.insert(
+            "publication_state".into(),
+            serde_json::json!("private_verified"),
+        );
+        object.insert(
+            "timestamp".into(),
+            serde_json::json!(chrono::Utc::now().to_rfc3339()),
+        );
+        if let Some(serde_json::Value::Array(hashes)) = object.get_mut("artifact_sha256") {
+            hashes.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            hashes.dedup();
+        }
+        let mut receipt: ArtifactScanReceipt =
+            serde_json::from_value(fields).expect("receipt fixture deserializes");
+        receipt.receipt_id = receipt.compute_content_hash();
+        receipt
+    }
+
     fn artifact_receipt() -> ArtifactScanReceipt {
-        ArtifactScanReceipt::new(
-            "0.4.2".into(),
-            "c".repeat(64),
-            9,
-            "uv pinned-private-index".into(),
-            "0.8.22".into(),
-            "25.1".into(),
-            CapsuleReceipt {
+        artifact_receipt_fixture(serde_json::json!({
+            "tirith_version": "0.4.2",
+            "policy_hash": "c".repeat(64),
+            "threat_db_sequence": 9,
+            "resolver_command": "uv pinned-private-index",
+            "resolver_version": "0.8.22",
+            "package_manager_version": "25.1",
+            "capsule": CapsuleReceipt {
                 backend_id: "landlock-seccomp".into(),
                 coverage: tirith_core::capsule::CapsuleCoverage::NONE,
             },
-            vec!["b".repeat(64)],
-            None,
-            VerdictSummary {
+            "artifact_sha256": vec!["b".repeat(64)],
+            "post_install_record": null,
+            "verdict": VerdictSummary {
                 action: "Allow".into(),
                 rule_ids: vec![],
                 finding_count: 0,
             },
-        )
+        }))
     }
 
     fn download_receipt() -> Receipt {

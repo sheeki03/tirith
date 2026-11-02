@@ -332,6 +332,32 @@ pub fn is_tainted_at(store: &Path, path: &Path, cwd: Option<&Path>) -> Option<Ta
     None
 }
 
+/// The latest entry whose path ends with `tail` at a path-component boundary
+/// (`tail` starts with `/`; a stored Windows `\` counts as `/`). Stored paths
+/// are normalized, so `tail` must have no empty, `.` or `..` component. For an
+/// executed file whose directory is unknown, such as a command word with an
+/// inherited-variable directory: any tainted file of that name may be the one
+/// that runs. An incompletely read store answers "unknown" (fail safe), as
+/// [`is_tainted_at`] does.
+pub fn tainted_entry_with_path_suffix_at(store: &Path, tail: &str) -> Option<TaintEntry> {
+    if !tail.starts_with('/') || tail.len() < 2 {
+        return None;
+    }
+    let (entries, complete) = cached_entries(store);
+    if let Some(found) = entries
+        .into_iter()
+        .rev()
+        .find(|entry| entry.path.replace('\\', "/").ends_with(tail))
+    {
+        return Some(found);
+    }
+    if !complete {
+        warn_incomplete_store_once(store);
+        return Some(unknown_taint_entry(tail));
+    }
+    None
+}
+
 /// Synthetic [`TaintEntry`] for the fail-safe "store unreadable, taint unknown"
 /// case: the queried `path` plus a labelled origin, no source fields.
 fn unknown_taint_entry(path: &str) -> TaintEntry {
@@ -594,6 +620,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new("/work/repo");
         let key = normalize_key(Path::new("./install.sh"), Some(cwd));
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
@@ -602,6 +629,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_resolves_parent_components() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new("/work/repo/sub");
         let key = normalize_key(Path::new("../install.sh"), Some(cwd));
         assert_eq!(key, PathBuf::from("/work/repo/install.sh"));
@@ -610,6 +638,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_key_keeps_absolute_untouched() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = normalize_key(Path::new("/tmp/x/./y"), Some(Path::new("/work")));
         assert_eq!(key, PathBuf::from("/tmp/x/y"));
     }
@@ -620,6 +649,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_relative_against_cwd_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new(r"C:\work\repo");
         let from_rel = normalize_key(Path::new(r".\install.sh"), Some(cwd));
         let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
@@ -629,6 +659,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_resolves_parent_components_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = Path::new(r"C:\work\repo\sub");
         let from_rel = normalize_key(Path::new(r"..\install.sh"), Some(cwd));
         let from_abs = normalize_key(Path::new(r"C:\work\repo\install.sh"), None);
@@ -638,6 +669,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalize_key_keeps_absolute_untouched_windows() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `.`-component normalization is idempotent: the dotted and clean forms
         // of the same absolute path must produce the same key.
         let dotted = normalize_key(Path::new(r"C:\tmp\x\.\y"), Some(Path::new(r"C:\work")));

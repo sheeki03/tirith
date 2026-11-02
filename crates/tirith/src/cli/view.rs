@@ -418,6 +418,7 @@ mod tests {
 
     #[test]
     fn blocked_view_output_never_echoes_supported_secret_bytes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = format!("0x{}1", "0".repeat(63));
         let content = format!("PRIVATE_KEY={secret}\n");
         let mut state = OutputAnalyzerState::default();
@@ -498,6 +499,7 @@ mod tests {
 
     #[test]
     fn view_clean_file_exits_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"hello world\n").unwrap();
         let code = run(Some(f.path()), DEFAULT_MAX_BYTES, false);
@@ -506,6 +508,7 @@ mod tests {
 
     #[test]
     fn view_osc52_flags_findings_and_strips_sequence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"before\x1b]52;c;aGVsbG8=\x07after\n").unwrap();
         // We can't easily capture stdout here; just assert the exit code.

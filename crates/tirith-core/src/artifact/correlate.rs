@@ -474,6 +474,7 @@ mod tests {
 
     #[test]
     fn no_signals_yields_no_findings() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         let findings = correlate_inspection_findings(&inspection, &[], None);
         assert!(findings.is_empty());
@@ -481,6 +482,7 @@ mod tests {
 
     #[test]
     fn executing_line_plus_danger_fires_suspicious() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         let loc = SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/boot.pth");
         inspection.signals.push(ArtifactSignal {
@@ -504,6 +506,7 @@ mod tests {
 
     #[test]
     fn untrusted_path_alone_does_not_fire_suspicious() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A non-executing path-add alone is not promoted to a Block.
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         inspection.signals.push(ArtifactSignal {
@@ -518,6 +521,7 @@ mod tests {
 
     #[test]
     fn cross_runtime_startup_edge_fires_critical() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
         let from = SubjectLocation::member("demo-1.0-py3-none-any.whl", "demo/boot.pth");
         // A startup signal must be present (the correlation gates on the signal set
@@ -544,6 +548,7 @@ mod tests {
 
     #[test]
     fn unlisted_executable_member_fires_integrity_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut inspection = wheel_inspection("demo-1.0-cp311-cp311-linux_x86_64.whl");
         inspection.signals.push(ArtifactSignal {
             kind: ArtifactSignalKind::UnlistedInstalledFile,
@@ -564,6 +569,7 @@ mod tests {
 
     #[test]
     fn native_findings_are_folded_in() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let inspection = wheel_inspection("demo-1.0-cp311-cp311-linux_x86_64.whl");
         let native = Finding {
             rule_id: RuleId::NativeImportExecutionChain,
@@ -585,6 +591,7 @@ mod tests {
 
     #[test]
     fn known_malicious_not_emitted_without_db() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // With no DB threaded the seam cannot match: no ArtifactKnownMalicious
         // finding is produced even from a populated inspection.
         let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
@@ -660,6 +667,7 @@ mod tests {
 
         #[test]
         fn artifact_sha_match_fires_critical() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let db = malicious_db();
             // The wheel's whole-file hash equals the malicious artifact record.
             let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
@@ -676,6 +684,7 @@ mod tests {
 
         #[test]
         fn member_sha_match_fires_critical() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let db = malicious_db();
             // A bundled member's content hash equals the malicious file record; the
             // whole-artifact hash is unrelated (NOT the 0xAA artifact record, which
@@ -710,6 +719,7 @@ mod tests {
 
         #[test]
         fn unrelated_hashes_do_not_match() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             let db = malicious_db();
             // Neither the artifact hash nor any member hash is in the DB.
             let mut inspection = wheel_inspection("demo-1.0-py3-none-any.whl");
@@ -730,6 +740,7 @@ mod tests {
 
         #[test]
         fn empty_db_yields_no_false_positive() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             // `check_file_sha256` (and the artifact index) are present but empty: no
             // match, no finding — the PR-I "absent/empty -> no false positive" gate.
             let db = empty_db();
@@ -751,6 +762,7 @@ mod tests {
 
         #[test]
         fn malformed_hex_hash_is_skipped_not_panicked() {
+            let _shared_state = tirith_test_support::SharedStateGuard::acquire();
             // A subject hash that is not valid 32-byte hex must be skipped (no panic,
             // no match), and a valid member hash still resolves.
             let db = malicious_db();

@@ -73,8 +73,9 @@ non-exported `TIRITH_STATUS` shell variable for exactly that — see
 for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
 output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
 
-To recover full protection after a degrade, restart your shell (and see
-"Persistent safe mode" below if it keeps happening).
+To recover full protection after a degrade, open a new terminal or start a
+child shell (not `exec "$SHELL"`, see below), and see "Persistent safe mode"
+below if it keeps happening.
 
 ## Execution receipts unavailable or degraded
 
@@ -117,7 +118,7 @@ compound command executed.
 
 **Who this affects.** zsh and fish. Bash is not affected: on the same failure it
 calls `_tirith_degrade_to_preexec` and keeps working in warn-only mode
-(`shell/lib/bash-hook.bash:2277-2281`). PowerShell has no strict receipt channel
+(`_tirith_enter` in `crates/tirith/assets/shell/lib/bash-hook.bash`). PowerShell has no strict receipt channel
 and is not affected either.
 
 **Symptom.** Every command you press Enter on is refused with
@@ -146,11 +147,11 @@ runs the tirith binary, and fails closed when that fails. A full or read-only
 `TMPDIR` makes `mktemp` fail, so the block happens without the binary ever being
 consulted.
 
-- zsh: `shell/lib/zsh-hook.zsh:314` and `:354` for the accept-line widget,
-  `:578` and `:595` for the bracketed-paste widget.
-- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:198-212`)
-  returns 1, and both the protocol-v3 and legacy branches then block
-  (`:434` and `:457`); the paste widget does the same at `:356`. Unlike bash,
+- zsh: `_tirith_accept_line` (the accept-line widget) and `_tirith_bracketed_paste`
+  (the bracketed-paste widget) in `crates/tirith/assets/shell/lib/zsh-hook.zsh`.
+- fish: `_tirith_v3_new_capture_file` (in `crates/tirith/assets/shell/lib/fish-hook.fish`)
+  returns 1, and both the protocol-v3 and preflight branches of
+  `_tirith_check_command` then block; the paste widget does the same. Unlike bash,
   fish has no degrade path.
 
 Failing closed is right for an ANALYSIS failure. It is the wrong answer for an
@@ -193,12 +194,14 @@ brew info tirith
 hash -r
 ```
 
-Then refresh materialized hooks and restart shell:
+Then refresh materialized hooks and open a new terminal:
 
 ```bash
 rm -rf ~/.local/share/tirith/shell
-exec zsh   # or exec bash / restart terminal
 ```
+
+Do not use `exec zsh` or `exec bash` for this: the replaced shell keeps the
+old shell's receipt registration and runs in legacy mode (#281).
 
 ## Wrong `tirith` binary on PATH
 
@@ -414,6 +417,19 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 1. Run `tirith check --format json -- "your command"` and check `timings_ms`
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
+
+## Long scripts and analysis limits
+
+tirith analyzes a checked command completely up to fixed limits: 1 MiB of shell
+text, 16384 shell words, 4096 commands, 96 KiB or 4096 words per simple
+command, and 256 nested bodies (substitutions, groups, wrapper, function and
+shell-fed heredoc bodies) totalling 256 KiB per level. An agent's batch script
+of a few hundred to a few thousand lines and a heredoc file write of several
+thousand lines fit. Past a limit, the unexamined part is blocked as
+`analysis_incomplete` ("Command exceeds Tirith's analysis size limits" or
+"Command analysis exceeded its work budget") instead of being treated as clean,
+so a destructive command cannot hide after it. Split such a script into several
+checked commands.
 
 ## Numeric curl destinations and ports
 

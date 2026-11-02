@@ -160,7 +160,7 @@ limit is structural rather than a claim in prose.
 Note the gap between `inferred_effects` and `allowed_effects` in that output.
 Six effects were inferred from the two actions; one survived, because the
 envelope's `requested_effects` was `["network_egress"]` and `decide` intersects
-the two (`crates/tirith-core/src/task.rs:792-800`). That is rule 3 above
+the two (`decide` in `crates/tirith-core/src/task.rs`). That is rule 3 above
 working: asking for less narrows, and asking for more is ignored.
 
 Exit codes:
@@ -223,7 +223,7 @@ policy that tries to LOOSEN the mode is refused and reported as neutralized by
 ```yaml
 task_gate:
   mode: enforce
-  action_incomplete_analysis: block   # refuses unmodelled shell at 5 of 9 boundaries
+  action_incomplete_analysis: block   # refuses unmodelled shell and narrative actions
 ```
 
 Because effect inference models only the Web3 shell grammar, nearly every
@@ -232,27 +232,36 @@ do not understand", and today tirith does not understand general shell.
 
 It does not follow that this refuses everything. The action applies only when
 the assessment is incomplete
-(`crates/tirith-core/src/task_boundary.rs:325-330`), and completeness depends on
-the action kind: `ProposedAction::PackageInstall` and `ProposedAction::ConfigWrite`
-leave `complete = true` (`crates/tirith-core/src/task.rs:638-652`), while the
-`Shell` arm derives it from the Web3 grammar (`:633-636`). Checked directly, a
+(`outcome_for` in `crates/tirith-core/src/task_boundary.rs`), and completeness
+depends on the action kind: in `infer_effects_detailed_with_context`
+(`crates/tirith-core/src/task.rs`) the `ProposedAction::PackageInstall` and
+`ProposedAction::ConfigWrite` arms leave `complete = true`, the `Narrative` arm
+sets it to false, and the `Shell` arm derives it from the Web3 grammar. Checked directly, a
 one-action `package_install` envelope returns `"complete": true`, a
 `config_write` envelope returns `"complete": true`, and
 `{"shell":{"command":"pip install requests"}}` returns `"complete": false`.
 
-So the setting bites at exactly the five boundaries that submit a shell
-envelope (`capsule_preset_run`, `remote_script_run`, `gateway_forward`,
-`package_manager_network`, and `package_manager_execution`) and is a no-op at
-the four that submit package or config-write envelopes (`package_approval`,
-`package_resolve`, `package_install_preparation`, `config_write`).
+So the setting refuses unmodelled shell at the five boundaries that submit a
+shell envelope (`capsule_preset_run`, `remote_script_run`, `gateway_forward`,
+`package_manager_network`, and `package_manager_execution`). It also refuses
+the narrative actions that `gateway_forward` (MCP tool calls it cannot model),
+`verify_self` and `self_update` submit when the operation names no destination
+file: `tirith verify-self`, `tirith update --dry-run` and the dashboard's
+"Refresh threat DB now". It changes nothing at `config_write`, at
+`fetch_cloaking` (the probe envelope has no action), or at a real
+`tirith update` or rollback, which submit a config-write envelope for the
+binary they replace.
 These assessment results do not qualify the package execution backend.
 `tirith pkg install` currently refuses on every host with
 `private_input_execution_unqualified`, before resolver, quarantine, checkpoint,
 or package execution. The refusal applies regardless of `task_gate.mode`,
 `action_incomplete_analysis`, existing approvals, confirmation flags, or elevation.
 
-`tirith pkg approve` and tirith-owned config writes retain their existing
-native authority and policy requirements. Local `tirith package inspect`,
+`tirith pkg approve` refuses with the same reason after its native-authority
+check. The `package_approval`, `package_resolve`, and
+`package_install_preparation` tokens are kept only so receipts, schemas and
+policies that name them keep parsing; no code evaluates them. Tirith-owned config writes retain their existing
+policy requirements. Local `tirith package inspect`,
 `pkg verify-env`, ordinary `tirith check`, and shell protection remain available
 under their existing policies.
 
@@ -260,39 +269,42 @@ under their existing policies.
 `effects_denied_for_untrusted_sources` is the blunter control. But `block` is a
 usable protection for the five shell boundaries, not a switch that breaks the
 product, and an operator who wants unmodelled shell to fail closed there should
-know the option is open. Read the next section before choosing the alternative.
+know the option is open. Under `block`, `tirith verify-self`,
+`tirith update --dry-run` and the dashboard's ThreatDB refresh are refused too;
+`tirith update` itself is not. Read the next section before choosing the
+alternative.
 
 ### `effects_denied_for_untrusted_sources` denies unconditionally
 
 The name reads as though it discriminates by origin. At tirith-owned boundaries
 it cannot: `SourceKind::is_trusted` returns `false` for every kind
-(`crates/tirith-core/src/task.rs:71-73`), and every boundary attributes its
-operation to `IngressAdapter::Unattributed`, because an argv is just an argv and
-an MCP client is just a pipe. `allowed_effects`
-(`crates/tirith-core/src/web3_policy.rs:451`) therefore filters the named effect
+(`crates/tirith-core/src/task.rs`), and the boundaries attribute their
+operation to `IngressAdapter::Unattributed` (`verify_self` and `self_update` use
+`IngressAdapter::OperatorIngest` with an `unknown` source, which is equally
+untrusted), because an argv is just an argv and an MCP client is just a pipe.
+`allowed_effects` (`crates/tirith-core/src/web3_policy.rs`) therefore filters the named effect
 out of every call, including commands the operator typed personally.
 
 With `mode: enforce` and
 `effects_denied_for_untrusted_sources: [policy_change, package_install]`,
-`tirith pkg approve pip requests` refuses before any network or install step,
-and `tirith policy init` cannot write `.tirith/policy.yaml`. The same policy at
-`mode: observe` allows both. Choose this field for what it is: a host-wide
+`tirith policy init` cannot write `.tirith/policy.yaml`. The same policy at
+`mode: observe` allows it. Choose this field for what it is: a host-wide
 switch that turns the named effect off at every owned boundary.
 
 ## Where the gate actually enforces
 
-Nine tirith-owned irreversible transitions, and nowhere else:
+These tirith-owned irreversible transitions, and nowhere else:
 
 | Boundary | Evaluated immediately before |
 |---|---|
 | `gateway_forward` | the MCP gateway registers a pending request and writes upstream |
-| `package_approval` | `tirith pkg approve` runs the resolver |
-| `package_resolve` | `tirith pkg install` runs the same resolver network |
-| `package_install_preparation` | the target environment is checkpointed and the contained install is prepared |
 | `package_manager_network` | `tirith install <manager>` contacts a registry |
 | `package_manager_execution` | the package manager is spawned |
 | `remote_script_run` | `tirith run <url>` or `tirith install url <URL>` downloads and launches |
+| `fetch_cloaking` | `tirith fetch` or its MCP tool runs the cloaking probe set |
 | `config_write` | a tirith-owned config file is published by rename |
+| `verify_self` | `tirith verify-self` creates private state and contacts the release origin |
+| `self_update` | `tirith update` contacts the release origin and updates or rolls back, or the dashboard's "Refresh threat DB now" refreshes the threat database |
 | `capsule_preset_run` | `capsule run --preset untrusted-project` copies or spawns anything |
 
 Four properties, each pinned by a test:
@@ -305,10 +317,11 @@ Four properties, each pinned by a test:
 - **Observe mode withholds nothing.** It must not raise a verdict to `warn` to
   note a denial, because the gateway converts `warn` into a hard deny whenever
   `warn_action` is `deny`, which is its default. It is called "recording" mode,
-  but only `gateway_forward` actually writes a record:
-  `BoundaryAssessment::is_recordable()` has one production caller
-  (`crates/tirith/src/cli/gateway.rs:3214`), so the other eight boundaries
-  decide and write nothing in any mode.
+  but not every boundary writes a record: `gateway_forward`, `fetch_cloaking`,
+  `remote_script_run`, `package_manager_network`, `package_manager_execution`,
+  `verify_self` and `self_update` write the assessments that
+  `BoundaryAssessment::is_recordable()` accepts, while `config_write` and
+  `capsule_preset_run` decide and write nothing in any mode.
 - **Each gate precedes its own irreversible step.** Every integration test runs
   its command twice: once with the gate off, to prove the boundary is reachable,
   and once enforcing, to prove the same evidence is gone. Asserting only the

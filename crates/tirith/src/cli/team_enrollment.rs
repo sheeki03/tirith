@@ -2,8 +2,11 @@
 //! A saved cache is never projected as Applied. Only full Runtime resolution can
 //! prepare an Applied self-report, and its exact request precedes every POST.
 use super::setup::{self, fs_helpers::FileUpdate, TransactionOutcome};
+use super::team_shared::{error, id, network_allowed, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tirith_core::policy::{BoundedRuntimePolicyInputs, PolicyDiagnosticCapture};
 use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
@@ -15,7 +18,8 @@ use tirith_core::policy_team_connection::{
     ConnectionWitness, SelectedConnection, TeamRecord, TeamRecordWitness,
 };
 use tirith_core::policy_team_enrollment::{
-    EnrollmentWriteIntent, FetchedTeamPolicy, TeamEnrollment, TeamRuntimeEvidence,
+    CacheState, CacheStatus, EnrollmentWriteIntent, FetchedTeamPolicy, TeamEnrollment,
+    TeamRuntimeEvidence,
 };
 
 #[derive(clap::Args, Deserialize)]
@@ -110,6 +114,9 @@ pub enum Action {
         options: SelectedRequest,
         #[arg(long)]
         json: bool,
+        /// Internal: quiet single-flight sync started by `tirith check`
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Withdraw the exact activation offline, even when its cache is stale
     Disable {
@@ -130,25 +137,6 @@ pub enum Action {
 }
 const NOTICE: &str = "Team policy is optional and off until explicit activation. A cached policy is an offline input, not proof of the server's current revision or a fleet Applied report. Activation and sync do not send reports.";
 const REPORT_NOTICE: &str = "Reports are authenticated client self-reports after full local Runtime resolution, not independent enforcement attestation. Retry preserves the exact request. Explicit local abandonment archives its unknown server outcome; it does not cancel a request or prove no commit.";
-fn error(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-fn id(value: &str) -> Result<Id, String> {
-    Id::parse(value).map_err(|_| "a canonical nonzero UUID is required".into())
-}
-fn now_ms() -> Result<u64, String> {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .map_err(|_| "local clock is unavailable".into())
-}
-fn network_allowed() -> Result<(), String> {
-    if super::offline_env_active() {
-        Err("team authority contact is disabled by offline mode".into())
-    } else {
-        Ok(())
-    }
-}
 fn selected(expected: &Id) -> Result<Arc<ConnectionWitness>, String> {
     let selection = Arc::new(SelectedConnection::capture_current().map_err(error)?);
     if selection.connection_id() != Some(expected) {
@@ -239,10 +227,13 @@ impl TeamEnrollmentService {
         let selection_id = SelectedConnection::capture_current()
             .ok()
             .and_then(|c| c.connection_id().cloned());
+        let now = now_ms().ok();
+        let mut cache = None;
         let (state, activation, evidence) = match TeamEnrollment::capture_current() {
             Err(_) => ("storage_unavailable", None, None),
             Ok(witness) if !witness.configured() => ("off", None, None),
             Ok(witness) => {
+                cache = now.and_then(|now| witness.cache_status(now));
                 let activation = witness.activation_id().cloned();
                 if activation.is_none() {
                     ("malformed", activation, None)
@@ -269,6 +260,9 @@ impl TeamEnrollmentService {
         Ok(
             json!({"schema_version":1,"state":state,"activation_id":activation,
             "selected_connection_id":selection_id,"runtime_evidence":evidence,
+            "offline_cache":cache.zip(now).map(|(cache, now)| {
+                offline_cache_projection(&cache, now, state == "ready_offline_cache")
+            }),
             "report":report_status(),"local_write":"observed","execution_permitted":false,"notice":NOTICE}),
         )
     }
@@ -956,7 +950,297 @@ fn report_result(
         "local_write":local,"failure_code":failure,"execution_permitted":false,"notice":REPORT_NOTICE})
 }
 
+/// A background refresh is claimed at most once per this interval, whatever
+/// its outcome, so an unreachable server is not retried on every command.
+const REFRESH_CLAIM_INTERVAL_MS: u64 = 15 * 60 * 1000;
+const REFRESH_CLAIM_LOCK: &str = "team-policy-refresh.lock";
+const REFRESH_CLAIM_FILE: &str = "team-policy-refresh-claimed-at";
+const REFRESH_SYNC_LOCK: &str = "team-policy-sync.lock";
+static REFRESH_GATE: RefreshGate = RefreshGate(AtomicU64::new(0));
+
+/// In-process limit on refresh attempts: at most one per claim interval. A
+/// one-shot command such as `tirith check` therefore tries once; the
+/// long-running MCP server and gateway try again every interval.
+struct RefreshGate(AtomicU64);
+impl RefreshGate {
+    /// Whether this process may attempt a refresh at `now`; a pass reserves
+    /// the next interval. A reservation from the future (the clock moved back
+    /// by more than an interval) does not suppress refresh.
+    fn try_pass(&self, now: u64) -> bool {
+        let mut next = self.0.load(Ordering::Relaxed);
+        loop {
+            if now < next && next - now <= REFRESH_CLAIM_INTERVAL_MS {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                next,
+                now.saturating_add(REFRESH_CLAIM_INTERVAL_MS),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => next = actual,
+            }
+        }
+    }
+}
+
+/// Called from `tirith check`. When the enrolled team cache is an hour old,
+/// start a detached `enrollment sync --background` child and return at once:
+/// the command never waits for the network. Offline mode, no enrollment, a
+/// recent claim or a busy claim lock all make this a no-op.
+pub(crate) fn maybe_background_refresh(offline_flag: bool) {
+    let _ = start_background_refresh(offline_flag);
+}
+
+/// Called once by the long-running MCP server and gateway, which have no
+/// `--offline` flag (`TIRITH_OFFLINE=1` still disables it). The first attempt
+/// runs now; a background thread then repeats the same rate-limited attempt
+/// every claim interval for the life of the process and reaps each child, so
+/// a server that runs for days keeps its team cache fresh. Requests are never
+/// delayed: the thread only sleeps, checks and spawns.
+pub(crate) fn start_server_background_refresh() {
+    let first = start_background_refresh(false);
+    let _ = std::thread::Builder::new()
+        .name("tirith-team-refresh".into())
+        .spawn(move || {
+            let interval = std::time::Duration::from_millis(REFRESH_CLAIM_INTERVAL_MS);
+            let mut child = first;
+            loop {
+                if let Some(running) = child.take() {
+                    reap_refresh_child(running, interval);
+                }
+                std::thread::sleep(interval);
+                child = start_background_refresh(false);
+            }
+        });
+}
+
+/// Wait up to `limit` for a refresh child, then kill it if it still runs, and
+/// reap it. A sync bounds its own network requests, but a child stuck anyway
+/// (a hung filesystem, a stopped process) must not end the server's refreshes.
+/// The sync replaces the enrollment by an atomic compare-and-swap write, so a
+/// killed child leaves the last good cache in place.
+fn reap_refresh_child(mut child: std::process::Child, limit: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn start_background_refresh(offline_flag: bool) -> Option<std::process::Child> {
+    if offline_flag || super::offline_env_active() {
+        return None;
+    }
+    let now = now_ms().ok()?;
+    if !REFRESH_GATE.try_pass(now) {
+        return None;
+    }
+    let target = TeamEnrollment::background_refresh_target(now)?;
+    let state = tirith_core::policy::state_dir()?;
+    if !claim_background_refresh(&state, now) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(background_sync_args(
+            target.connection_id(),
+            target.activation_id(),
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Composition checks use the home directory, not whichever repository
+    // the triggering command ran in.
+    if let Some(home) = home::home_dir() {
+        command.current_dir(home);
+    }
+    command.spawn().ok()
+}
+
+/// Additive `offline_cache` status field: how Runtime treats the cached team
+/// policy now, the deadlines, and a one-line human summary. Offline facts
+/// only; Runtime applies the same rules itself. `runtime_ready` is false when
+/// Runtime refuses the enrollment. For an expired, future, missing or invalid
+/// cache that refusal is the cache state itself, so the per-state cause is
+/// reported unchanged. For a cache that is usable by age (fresh or grace) the
+/// refusal has another cause (a competing authority, a replaced connection, a
+/// malformed record): `runtime_refused` is then set and nothing is enforced,
+/// so `enforced`/`fails_closed`/`summary` must say so.
+fn offline_cache_projection(cache: &CacheStatus, now: u64, runtime_ready: bool) -> Value {
+    let left = |until: u64| until.saturating_sub(now);
+    let grace_hours = cache.grace_ms.map(|grace| grace / 3_600_000);
+    let sync =
+        "run `tirith policy team enrollment sync` (IDs above) when the team server is reachable";
+    let (time_left_ms, summary) = match cache.state {
+        CacheState::Fresh => {
+            let left = left(cache.fresh_until_unix_ms);
+            (
+                Some(left),
+                format!(
+                    "team policy cache is fresh (fetched {} ago); it is enforced for {} more{}, then an offline grace period of {}h begins.",
+                    duration(now.saturating_sub(cache.fetched_unix_ms)),
+                    duration(left),
+                    if cache.refresh_due {
+                        " and a background refresh is due"
+                    } else {
+                        ""
+                    },
+                    grace_hours.unwrap_or(0)
+                ),
+            )
+        }
+        CacheState::Grace => {
+            let left = cache.grace_until_unix_ms.map_or(0, left);
+            (
+                Some(left),
+                format!(
+                    "team policy cache is stale ({} old) but inside its {}h offline grace period: the last-known-good team policy is enforced for {} more, then every command is blocked (fail closed); {sync}.",
+                    duration(now.saturating_sub(cache.fetched_unix_ms)),
+                    grace_hours.unwrap_or(0),
+                    duration(left)
+                ),
+            )
+        }
+        CacheState::Expired => (
+            Some(0),
+            format!(
+                "team policy cache expired after its {}h offline grace period: every command is blocked (fail closed) until a sync succeeds; {sync}.",
+                grace_hours.unwrap_or(0)
+            ),
+        ),
+        CacheState::FutureTimestamp => (
+            None,
+            format!("team policy cache has a future fetch time (the clock moved back): every command is blocked (fail closed); {sync}."),
+        ),
+        CacheState::Missing | CacheState::Invalid => (
+            None,
+            format!(
+                "team policy cache is {}: every command is blocked (fail closed); {sync}.",
+                cache.state.as_str()
+            ),
+        ),
+    };
+    let enforced = runtime_ready && cache.state.enforced();
+    let refused = !runtime_ready && cache.state.enforced();
+    let (time_left_ms, summary) = if !refused {
+        (time_left_ms, summary)
+    } else {
+        (
+            None,
+            format!(
+                "team policy cache is {} by age, but Runtime refuses the enrollment (a competing policy authority such as TIRITH_SERVER_URL/TIRITH_API_KEY, an organization policy or a legacy policy_server_url, or a changed connection or enrollment record): every command is blocked (fail closed) until that is resolved; then {sync}.",
+                cache.state.as_str()
+            ),
+        )
+    };
+    json!({
+        "state": cache.state.as_str(),
+        "runtime_refused": refused,
+        "enforced": enforced,
+        "fails_closed": !enforced,
+        "fetched_unix_ms": cache.fetched_unix_ms,
+        "fresh_until_unix_ms": cache.fresh_until_unix_ms,
+        "grace_hours": grace_hours,
+        "grace_until_unix_ms": cache.grace_until_unix_ms,
+        "time_left_ms": time_left_ms,
+        "refresh_due": cache.refresh_due,
+        "summary": summary,
+    })
+}
+
+/// "2d 3h", "5h 12m" or "7m".
+fn duration(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn background_sync_args(connection: &Id, activation: &Id) -> Vec<String> {
+    [
+        "policy",
+        "team",
+        "enrollment",
+        "sync",
+        "--background",
+        "--expected-connection-id",
+        connection.as_str(),
+        "--expected-activation-id",
+        activation.as_str(),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Rate limit shared by every process of this user: under a non-blocking
+/// lock, grant a claim only when none was granted in the last interval.
+fn claim_background_refresh(state: &Path, now: u64) -> bool {
+    use super::setup::fs_helpers::{ensure_private_directory, try_lock_operation};
+    if !state.exists() && ensure_private_directory(state, state).is_err() {
+        return false;
+    }
+    let Ok(Some(_lock)) = try_lock_operation(&state.join(REFRESH_CLAIM_LOCK), state) else {
+        return false;
+    };
+    let claim = state.join(REFRESH_CLAIM_FILE);
+    if std::fs::symlink_metadata(&claim).is_ok_and(|m| !m.is_file()) {
+        return false;
+    }
+    let last = std::fs::read_to_string(&claim)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    // A claim from the future (clock moved back) does not suppress refresh.
+    if last.is_some_and(|last| last <= now && now - last < REFRESH_CLAIM_INTERVAL_MS) {
+        return false;
+    }
+    std::fs::write(&claim, now.to_string()).is_ok()
+}
+
+/// The detached child: one sync at a time, no output. The sync itself is the
+/// explicit compare-and-swap path, so it cannot recreate a withdrawn
+/// activation or rebind a changed connection.
+fn run_background_sync(options: SelectedRequest) -> i32 {
+    let Some(state) = tirith_core::policy::state_dir() else {
+        return 1;
+    };
+    let _lock = match super::setup::fs_helpers::try_lock_operation(
+        &state.join(REFRESH_SYNC_LOCK),
+        &state,
+    ) {
+        Ok(Some(lock)) => lock,
+        _ => return 0,
+    };
+    let _diagnostics = PolicyDiagnosticCapture::start_silent();
+    match TeamEnrollmentService::capture(None).and_then(|service| service.sync(options)) {
+        Ok(value) if value.get("saved_bytes_confirmed") == Some(&Value::Bool(true)) => 0,
+        _ => 1,
+    }
+}
+
 pub(crate) fn run(action: Action) -> i32 {
+    if let Action::Sync {
+        options,
+        background: true,
+        ..
+    } = action
+    {
+        return run_background_sync(options);
+    }
     let json_output = match &action {
         Action::Repair { json, .. }
         | Action::Abandon { json, .. }
@@ -1035,6 +1319,13 @@ pub(crate) fn run(action: Action) -> i32 {
             let emitted = if json_output {
                 super::write_json_stdout(&value, "cannot write team enrollment result")
             } else {
+                if let Some(summary) = value
+                    .get("offline_cache")
+                    .and_then(|cache| cache.get("summary"))
+                    .and_then(Value::as_str)
+                {
+                    eprintln!("tirith policy team enrollment: {summary}");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&value)

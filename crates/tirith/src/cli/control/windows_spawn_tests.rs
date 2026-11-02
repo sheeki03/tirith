@@ -70,6 +70,7 @@ fn fixture_child(cwd: &Path) -> FixtureChild {
 #[test]
 #[ignore = "inert child fixture; invoked only by the owned spawn tests"]
 fn native_service_spawn_probe() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // A normal --ignored run must not consume another parallel test's context.
     let args: Vec<_> = std::env::args().collect();
     if !args

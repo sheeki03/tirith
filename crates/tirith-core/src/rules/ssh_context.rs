@@ -498,6 +498,7 @@ mod tests {
 
     #[test]
     fn empty_labels_silences_rule() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = Policy::default();
         let findings = check(
             "ssh prod-host 'sudo systemctl restart payments'",
@@ -509,6 +510,7 @@ mod tests {
 
     #[test]
     fn disabled_context_guard_silences_ssh_labels() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = policy_with_label("prod-host", "critical");
         policy.context_guard_enabled = false;
         let findings = check(
@@ -521,6 +523,7 @@ mod tests {
 
     #[test]
     fn execution_wrappers_do_not_hide_ssh() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         for command in [
             "env ssh prod-host 'systemctl restart payments'",
@@ -540,6 +543,7 @@ mod tests {
 
     #[test]
     fn ambiguous_wrapper_around_ssh_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "sudo --future-option value ssh prod-host 'systemctl restart payments'",
@@ -553,6 +557,7 @@ mod tests {
 
     #[test]
     fn host_lookup_is_case_insensitive_and_ignores_dns_root_dot() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod.example", "critical");
         let findings = check(
             "ssh Alice@PROD.EXAMPLE. 'systemctl restart payments'",
@@ -568,6 +573,7 @@ mod tests {
 
     #[test]
     fn destructive_inner_command_blocks_labeled_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh prod-host 'sudo systemctl restart payments'",
@@ -584,6 +590,7 @@ mod tests {
 
     #[test]
     fn every_local_and_remote_segment_is_classified() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         for command in [
             "true; ssh prod-host 'systemctl restart payments'",
@@ -602,6 +609,7 @@ mod tests {
 
     #[test]
     fn remote_command_option_is_preserved_and_classified() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         for command in [
             r#"ssh -oRemoteCommand='systemctl restart payments' prod-host"#,
@@ -620,6 +628,7 @@ mod tests {
 
     #[test]
     fn unknown_remote_command_fails_conservatively_on_critical_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         for command in [
             "ssh -oRemoteCommand=custom-deployer prod-host",
@@ -635,6 +644,7 @@ mod tests {
 
     #[test]
     fn positional_unknown_command_is_not_blocked_on_a_critical_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Counterpart to the `-o RemoteCommand=` case above. A positional
         // command that classifies as Unknown is an ordinary project script, and
         // this rule blocks at High, so firing here would refuse every
@@ -660,6 +670,7 @@ mod tests {
 
     #[test]
     fn bare_ssh_to_labeled_host_emits_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check("ssh prod-host", ShellType::Posix, &policy);
         assert_eq!(findings.len(), 1);
@@ -672,6 +683,7 @@ mod tests {
 
     #[test]
     fn ssh_to_unlabeled_host_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh dev-host 'sudo systemctl restart x'",
@@ -683,6 +695,7 @@ mod tests {
 
     #[test]
     fn ls_inner_command_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check("ssh prod-host 'ls'", ShellType::Posix, &policy);
         assert!(
@@ -693,6 +706,7 @@ mod tests {
 
     #[test]
     fn dash_t_flag_is_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh -t prod-host 'sudo rm -rf /var/log/foo'",
@@ -708,6 +722,7 @@ mod tests {
 
     #[test]
     fn dash_tt_flag_is_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh -tt prod-host 'sudo systemctl stop payments'",
@@ -719,6 +734,7 @@ mod tests {
 
     #[test]
     fn flag_with_value_is_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh -i /tmp/key -p 2222 prod-host 'sudo systemctl restart payments'",
@@ -730,6 +746,7 @@ mod tests {
 
     #[test]
     fn glued_flag_value_is_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh -i/tmp/key prod-host 'sudo rm -rf /tmp/foo'",
@@ -741,6 +758,7 @@ mod tests {
 
     #[test]
     fn user_at_host_resolves_to_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check(
             "ssh root@prod-host 'sudo rm -rf /tmp/x'",
@@ -752,6 +770,7 @@ mod tests {
 
     #[test]
     fn user_at_host_prefers_user_at_host_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A critical exact user@host label wins over noncritical bare inventory.
         let mut policy = Policy::default();
         let mut labels = BTreeMap::new();
@@ -774,6 +793,7 @@ mod tests {
 
     #[test]
     fn noncritical_exact_label_cannot_shadow_critical_bare_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy
             .ssh_host_labels
@@ -796,6 +816,7 @@ mod tests {
 
     #[test]
     fn split_and_attached_user_options_preserve_exact_label_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = Policy::default();
         policy
             .ssh_host_labels
@@ -824,6 +845,7 @@ mod tests {
 
     #[test]
     fn non_critical_label_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "staging");
         let findings = check(
             "ssh prod-host 'sudo systemctl restart payments'",
@@ -835,6 +857,7 @@ mod tests {
 
     #[test]
     fn non_ssh_leader_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = policy_with_label("prod-host", "critical");
         let findings = check("rsync prod-host:/srv/data /tmp/", ShellType::Posix, &policy);
         assert!(findings.is_empty());

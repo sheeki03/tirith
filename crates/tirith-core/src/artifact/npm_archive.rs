@@ -15,7 +15,6 @@ use std::io::{self, Read};
 
 use flate2::bufread::GzDecoder;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 #[path = "npm_signals.rs"]
@@ -251,27 +250,14 @@ impl NpmInspection {
 /// it must not compute an identity with a second path read. Reads at most the
 /// compressed cap plus one byte, even for a non-terminating reader.
 pub fn read_npm_tarball<R: Read>(reader: R, filename: &str, limits: &NpmLimits) -> NpmInspection {
-    read_npm_tarball_impl(reader, filename, limits, false, false).0
-}
-
-/// Private install-preparation seam. Complete root metadata is returned only
-/// alongside the inspection derived from the same bounded, validated stream.
-pub(crate) fn read_npm_tarball_with_manifest<R: Read>(
-    reader: R,
-    filename: &str,
-    limits: &NpmLimits,
-) -> (NpmInspection, Option<Vec<u8>>) {
-    let (inspection, manifest, _) = read_npm_tarball_impl(reader, filename, limits, true, false);
-    (inspection, manifest)
+    read_npm_tarball_impl(reader, filename, limits)
 }
 
 fn read_npm_tarball_impl<R: Read>(
     mut reader: R,
     filename: &str,
     limits: &NpmLimits,
-    capture_manifest: bool,
-    capture_payload: bool,
-) -> (NpmInspection, Option<Vec<u8>>, Option<ValidatedNpmPayload>) {
+) -> NpmInspection {
     let limits = limits.bounded();
     let mut inspection = NpmInspection {
         schema_version: NPM_INSPECTION_SCHEMA_VERSION,
@@ -308,7 +294,7 @@ fn read_npm_tarball_impl<R: Read>(
                 None,
                 "Compressed input exceeds the configured limit; exact identity is unavailable.",
             ));
-            return (inspection, None, None);
+            return inspection;
         }
         Err(_) => {
             inspection.refuse(problem(
@@ -316,10 +302,10 @@ fn read_npm_tarball_impl<R: Read>(
                 None,
                 "The complete input could not be read; exact identity is unavailable.",
             ));
-            return (inspection, None, None);
+            return inspection;
         }
     };
-    inspection.artifact.sha256 = Some(hex::encode(Sha256::digest(&compressed)));
+    inspection.artifact.sha256 = Some(crate::util::sha256_hex(&compressed));
     inspection.artifact.compressed_bytes = Some(compressed.len() as u64);
     let ratio_cap = compressed.len().saturating_mul(limits.compression_ratio);
     let decoded_cap = limits.decompressed_bytes.min(ratio_cap);
@@ -339,7 +325,7 @@ fn read_npm_tarball_impl<R: Read>(
                 )
             };
             inspection.refuse(problem(kind, None, message));
-            return (inspection, None, None);
+            return inspection;
         }
         Err(_) => {
             inspection.refuse(problem(
@@ -347,7 +333,7 @@ fn read_npm_tarball_impl<R: Read>(
                 None,
                 "Invalid or truncated gzip stream, including its checksum trailer.",
             ));
-            return (inspection, None, None);
+            return inspection;
         }
     };
     if !decoder.into_inner().is_empty() {
@@ -356,13 +342,13 @@ fn read_npm_tarball_impl<R: Read>(
             None,
             "Concatenated gzip members and trailing compressed data are unsupported.",
         ));
-        return (inspection, None, None);
+        return inspection;
     }
     let members = match parse_tar(&decoded, &limits) {
         Ok(members) => members,
         Err(issue) => {
             inspection.refuse(issue);
-            return (inspection, None, None);
+            return inspection;
         }
     };
     inspection.archive_state = NpmArchiveState::Accepted;
@@ -373,77 +359,13 @@ fn read_npm_tarball_impl<R: Read>(
         .map(|member| NpmFile {
             path: member.path.clone(),
             size: member.bytes.len() as u64,
-            sha256: hex::encode(Sha256::digest(member.bytes)),
+            sha256: crate::util::sha256_hex(member.bytes),
             executable: member.executable,
             kind: member.kind,
         })
         .collect();
     signals::inspect_members(&members, &mut inspection);
-    // This private capture comes from the exact already-validated member walk.
-    // It is withheld whenever root metadata is absent, invalid or over budget.
-    // Public inspection reports never carry these raw manifest bytes.
-    let manifest = (capture_manifest && inspection.coverage.metadata_complete).then(|| {
-        members
-            .iter()
-            .find(|member| member.path == "package/package.json")
-            .expect("complete metadata requires the unique root member")
-            .bytes
-            .to_vec()
-    });
-    // The full gzip trailer, every tar header and both terminators have passed
-    // before this private index is made available. No extraction callback runs
-    // during parsing. Offsets come from that very same accepted member walk.
-    let payload = if capture_payload && inspection.coverage.metadata_complete {
-        let entries = members
-            .iter()
-            .map(|member| PayloadIndex {
-                path: member.path.clone(),
-                offset: member.offset,
-                len: member.bytes.len(),
-                kind: member.kind,
-            })
-            .collect();
-        drop(members);
-        Some(ValidatedNpmPayload { decoded, entries })
-    } else {
-        None
-    };
-    (inspection, manifest, payload)
-}
-
-/// Crate-private retained data, never reconstructed from an inspection DTO.
-/// It has no serde/Clone or public constructor and carries no write authority.
-pub(crate) struct ValidatedNpmPayload {
-    decoded: Vec<u8>,
-    entries: Vec<PayloadIndex>,
-}
-struct PayloadIndex {
-    path: String,
-    offset: usize,
-    len: usize,
-    kind: NpmFileKind,
-}
-pub(crate) struct NpmPayloadMember<'a> {
-    pub(crate) path: &'a str,
-    pub(crate) bytes: &'a [u8],
-    pub(crate) kind: NpmFileKind,
-}
-impl ValidatedNpmPayload {
-    pub(crate) fn members(&self) -> impl ExactSizeIterator<Item = NpmPayloadMember<'_>> {
-        self.entries.iter().map(|entry| NpmPayloadMember {
-            path: &entry.path,
-            bytes: &self.decoded[entry.offset..entry.offset + entry.len],
-            kind: entry.kind,
-        })
-    }
-}
-pub(crate) fn capture_npm_payload(
-    compressed: &[u8],
-    limits: &NpmLimits,
-) -> (NpmInspection, Option<ValidatedNpmPayload>) {
-    let (inspection, _, payload) =
-        read_npm_tarball_impl(compressed, "retained-npm.tgz", limits, false, true);
-    (inspection, payload)
+    inspection
 }
 
 fn read_capped(reader: &mut impl Read, cap: usize) -> io::Result<Option<Vec<u8>>> {
@@ -475,7 +397,6 @@ pub(crate) fn bounded_text(text: &str, cap: usize) -> String {
 pub(crate) struct Member<'a> {
     pub path: String,
     pub bytes: &'a [u8],
-    offset: usize,
     pub executable: bool,
     pub kind: NpmFileKind,
 }
@@ -591,7 +512,6 @@ fn parse_tar<'a>(bytes: &'a [u8], limits: &NpmLimits) -> Result<Vec<Member<'a>>,
             .map(|n| n / 512 * 512)
             .ok_or_else(corrupt)?;
         let next = offset.checked_add(padded).ok_or_else(corrupt)?;
-        let body_offset = offset;
         let body = bytes.get(offset..end).ok_or_else(corrupt)?;
         let padding = bytes.get(end..next).ok_or_else(corrupt)?;
         if padding.iter().any(|b| *b != 0) {
@@ -683,7 +603,6 @@ fn parse_tar<'a>(bytes: &'a [u8], limits: &NpmLimits) -> Result<Vec<Member<'a>>,
         members.push(Member {
             path,
             bytes: body,
-            offset: body_offset,
             executable,
             kind,
         });
