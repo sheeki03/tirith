@@ -424,6 +424,7 @@ mod tests {
 
     #[test]
     fn graph_format_resolution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert_eq!(GraphFormat::resolve(false, false), GraphFormat::Human);
         assert_eq!(GraphFormat::resolve(true, false), GraphFormat::Json);
         assert_eq!(GraphFormat::resolve(false, true), GraphFormat::Dot);
@@ -540,12 +541,14 @@ mod tests {
 
     #[test]
     fn empty_wheel_set_is_usage_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let code = run(GraphTarget::Wheels(Vec::new()), GraphFormat::Json);
         assert_eq!(code, 2);
     }
 
     #[test]
     fn installed_graph_over_real_dist_infos() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Build a minimal env tree with two distributions, one of which duplicates a
         // path the other owns, and confirm the graph composes the ownership + the
         // duplicate-owner cross-link from the SAME B5 primitive the integrity check
@@ -586,6 +589,7 @@ mod tests {
 
     #[test]
     fn installed_graph_empty_env_is_empty_graph() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A directory with no site-packages produces an empty (but valid) graph, not
         // a panic. The repo MCP surface may add nodes when the tests run inside the
         // tirith repo, so assert the absence of distribution nodes specifically.
@@ -664,6 +668,7 @@ mod tests {
     /// the pure->native anomaly stays visible, but incomplete native analysis blocks.
     #[test]
     fn run_diff_unparseable_pure_to_native_blocks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let so: &[u8] = b"\x7fELF\x02\x01\x01\x00 tiny native body";
@@ -680,6 +685,7 @@ mod tests {
     /// `pkg diff` over an honest point release (same shape) returns 0.
     #[test]
     fn run_diff_clean_release_is_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 2\n")]);
@@ -691,6 +697,7 @@ mod tests {
     /// panic.
     #[test]
     fn run_diff_bad_input_is_usage_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 1\n")]);
         let missing = dir.path().join("nope.whl");

@@ -195,6 +195,117 @@ pub fn is_loopback_host(host: &str) -> bool {
         || host.ends_with(".localhost")
 }
 
+/// A socket destination host that names this machine: `localhost`, an IPv4
+/// loopback or unspecified address (`127.0.0.0/8`, `0.0.0.0`) in any spelling
+/// the WHATWG host parser shares with `inet_aton` (`127.1`, `0x7f.1`), or IPv6
+/// `::1` / `::` / an IPv4-mapped loopback, bracketed or bare. Narrower than
+/// [`is_loopback_host`]: a `*.localhost` name and any other DNS name (including
+/// `127.0.0.1.example`, which a resolver may map anywhere) are remote, because
+/// the data-flow sinks that use this decide whether bytes can leave the host.
+pub fn is_local_machine_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = host.parse::<std::net::Ipv6Addr>() {
+        return local_ipv6(address);
+    }
+    match url::Host::parse(host) {
+        Ok(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+        Ok(url::Host::Domain(domain)) => domain == "localhost",
+        _ => false,
+    }
+}
+
+fn local_ipv6(address: std::net::Ipv6Addr) -> bool {
+    address.is_loopback()
+        || address.is_unspecified()
+        || address
+            .to_ipv4_mapped()
+            .is_some_and(|mapped| mapped.is_loopback() || mapped.is_unspecified())
+}
+
+/// A URL-client destination operand whose authority is spelled literally as
+/// this machine: `localhost`, a dotted-quad `127.x.y.z` or `0.0.0.0`, or a
+/// bracketed `[::1]` / `[::]` / IPv4-mapped loopback, with at most a numeric
+/// port, after an optional `http`, `https`, `ftp`, `ftps`, `ws` or `wss`
+/// scheme. The authority may hold nothing else (no userinfo, escapes,
+/// backslashes or numeric shorthand), so curl, wget and the WHATWG parser all
+/// read the same host and none of them can be steered elsewhere by syntax.
+pub fn literal_loopback_destination(destination: &str) -> bool {
+    let rest = match destination.split_once("://") {
+        Some((scheme, rest)) => {
+            if !["http", "https", "ftp", "ftps", "ws", "wss"]
+                .iter()
+                .any(|candidate| scheme.eq_ignore_ascii_case(candidate))
+            {
+                return false;
+            }
+            rest
+        }
+        None => destination,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty()
+        || !authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'[' | b']'))
+    {
+        return false;
+    }
+    let numeric_port =
+        |port: &str| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((inner, after)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(numeric_port)) {
+            return false;
+        }
+        return inner.parse::<std::net::Ipv6Addr>().is_ok_and(local_ipv6);
+    }
+    let host = match authority.split_once(':') {
+        Some((host, port)) if numeric_port(port) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
+}
+
+/// An RFC 1918 private IPv4 address in dotted-quad form (`10.0.0.0/8`,
+/// `172.16.0.0/12`, `192.168.0.0/16`): a LAN host. Loopback, link-local
+/// (`169.254.0.0/16`, where cloud metadata services live), IPv6 and every
+/// other spelling of an address (`0xC0A80114`, `3232235796`) are not.
+pub fn is_rfc1918_ipv4_host(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+        let octets = ip.octets();
+        octets[0] == 10
+            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+            || (octets[0] == 192 && octets[1] == 168)
+    })
+}
+
+/// True when `raw` (a URL or a bare destination operand such as
+/// `10.0.0.5:9200/x`) spells its host exactly as `host` (ASCII
+/// case-insensitive). URL parsers normalize other spellings of an address
+/// (`0xC0A80114`, `3232235796`, `0300.0250.1.24` all become `192.168.1.20`),
+/// and those obfuscated spellings must not inherit the plain LAN treatment.
+pub fn raw_destination_spells_host(raw: &str, host: &str) -> bool {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, rest)| rest);
+    let spelled = match host_port.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
+        _ => host_port,
+    };
+    spelled.eq_ignore_ascii_case(host)
+}
+
 /// Canonical "critical" criticality labels for the M8 context/SSH/IaC/container
 /// rules; a label outside this set never fires. Centralised to avoid the
 /// four-copy drift hazard (PR-127 review #7). Case-insensitive, whitespace-trimmed.
@@ -321,6 +432,125 @@ mod tests {
         // A non-loopback IPv4 address is not local.
         assert!(!is_loopback_host("10.0.0.1"));
         assert!(!is_loopback_host("128.0.0.1"));
+    }
+
+    #[test]
+    fn local_machine_hosts_exclude_dns_names() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "127.0.0.1",
+            "127.1",
+            "0x7f.1",
+            "2130706433",
+            "0.0.0.0",
+            "::1",
+            "[::1]",
+            "::",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(is_local_machine_host(host), "{host}");
+        }
+        for host in [
+            "",
+            "localhost.",
+            "app.localhost",
+            "127.evil.example",
+            "127.0.0.1.evil.example",
+            "10.0.0.1",
+            "[::2]",
+            "evil.example",
+        ] {
+            assert!(!is_local_machine_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn literal_loopback_destinations_are_plain_authorities() {
+        for destination in [
+            "http://localhost:3000/debug",
+            "HTTP://LOCALHOST/x",
+            "https://127.0.0.1:8443/",
+            "http://127.0.0.1",
+            "http://[::1]:3000/x?y#z",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0:8080",
+            "localhost:3000/debug",
+            "127.0.0.1:8080/api",
+            "localhost",
+        ] {
+            assert!(literal_loopback_destination(destination), "{destination}");
+        }
+        for destination in [
+            "http://localhost@evil.example/",
+            "http://localhost:80@evil.example/",
+            r"http://localhost\@evil.example/",
+            "http://evil.example#@localhost",
+            "http://localhost.evil.example/",
+            "http://127.0.0.1.evil.example/",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://%6cocalhost/",
+            "http://localhost:/",
+            "http://localhost:3000:4000/",
+            "http://[::2]/",
+            "http://192.168.1.5/",
+            "gopher://localhost/",
+            "file://localhost/etc/passwd",
+            "",
+            "//localhost/",
+        ] {
+            assert!(!literal_loopback_destination(destination), "{destination}");
+        }
+    }
+
+    #[test]
+    fn rfc1918_hosts_are_only_dotted_private_ipv4() {
+        for host in ["10.0.0.5", "172.16.0.1", "172.31.255.254", "192.168.1.20"] {
+            assert!(is_rfc1918_ipv4_host(host), "{host}");
+        }
+        for host in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "127.0.0.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.169.0.1",
+            "8.8.8.8",
+            "0xC0A80114",
+            "3232235796",
+            "fd00:ec2::254",
+            "10.0.0.5.evil.example",
+            "lan.example",
+        ] {
+            assert!(!is_rfc1918_ipv4_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn raw_destination_spelling_must_match_the_host() {
+        for raw in [
+            "http://192.168.1.20/",
+            "http://192.168.1.20:8080/health",
+            "https://user@192.168.1.20/x?y#z",
+            "192.168.1.20",
+            "192.168.1.20:9200/_cat/indices",
+            "HTTP://192.168.1.20",
+        ] {
+            assert!(raw_destination_spells_host(raw, "192.168.1.20"), "{raw}");
+        }
+        for raw in [
+            "http://0xC0A80114/",
+            "http://3232235796/",
+            "http://0300.0250.1.24/",
+            "http://192.168.1.020/",
+            "http://192.168.1.20./",
+            "http://192.168.1.20.evil.example/",
+            "0xc0a80114/x",
+        ] {
+            assert!(!raw_destination_spells_host(raw, "192.168.1.20"), "{raw}");
+        }
     }
 
     #[test]

@@ -775,6 +775,7 @@ mod tests {
 
     #[test]
     fn enforcing_network_denial_never_reaches_the_network_sink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let calls = std::cell::Cell::new(0usize);
         let gate = crate::web3_policy::TaskGatePolicy {
             mode: crate::web3_policy::TaskGateMode::Enforce,
@@ -795,6 +796,7 @@ mod tests {
 
     #[test]
     fn off_and_observe_preserve_cloaking_probe_execution() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for mode in [
             crate::web3_policy::TaskGateMode::Off,
             crate::web3_policy::TaskGateMode::Observe,
@@ -820,6 +822,7 @@ mod tests {
 
     #[test]
     fn recordable_assessments_reach_the_explicit_audit_sink_once() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let calls = std::cell::Cell::new(0usize);
         let audits = std::cell::RefCell::new(Vec::new());
         let gate = crate::web3_policy::TaskGatePolicy {
@@ -850,6 +853,7 @@ mod tests {
 
     #[test]
     fn denied_assessment_is_audited_and_retained_without_network() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let calls = std::cell::Cell::new(0usize);
         let audits = std::cell::RefCell::new(Vec::new());
         let gate = crate::web3_policy::TaskGatePolicy {
@@ -882,6 +886,7 @@ mod tests {
 
     #[test]
     fn effect_lease_expiry_after_dns_refuses_before_socket_dispatch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let binding = crate::task_boundary::fetch_cloaking_operation_binding(
@@ -962,6 +967,7 @@ mod tests {
 
     #[test]
     fn test_production_client_rejects_connect_time_private_rebind() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::error::Error as _;
 
         let url = "http://rebind.example.test/cloaking";
@@ -1003,6 +1009,7 @@ mod tests {
     /// `is_connect()` is set, which is exactly the loop's break condition.
     #[test]
     fn test_classify_connect_refusal_short_circuits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
@@ -1034,6 +1041,7 @@ mod tests {
     /// Security, PR #139). Assert it classifies as `Other` so the loop keeps probing.
     #[test]
     fn test_response_timeout_does_not_short_circuit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Read as _;
         use std::net::TcpListener;
 

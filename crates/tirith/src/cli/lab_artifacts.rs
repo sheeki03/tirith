@@ -446,6 +446,7 @@ mod tests {
 
     #[test]
     fn every_fixture_token_round_trips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for f in ArtifactFixture::all() {
             let token = f.as_str();
             assert_eq!(
@@ -459,6 +460,7 @@ mod tests {
 
     #[test]
     fn every_fixture_materializes_to_existing_wheels() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         for f in ArtifactFixture::all() {
             let sub = dir.path().join(f.as_str());
@@ -489,6 +491,7 @@ mod tests {
 
     #[test]
     fn fixtures_are_inert_no_routable_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // No fixture may embed a routable host: every network-shaped string uses
         // the reserved example.invalid domain (RFC 6761) or no host at all.
         let dir = tempfile::tempdir().unwrap();
@@ -531,6 +534,7 @@ mod tests {
 
     #[test]
     fn native_so_triages_to_the_execution_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The synthetic .so must satisfy the full native conjunction so the
         // native_chain_wheel fixture blocks: object parses it, sees the PyInit
         // export + undefined posix_spawn import + the runtime/sibling corroboration.

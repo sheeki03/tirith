@@ -280,12 +280,14 @@ mod tests {
 
     #[test]
     fn test_suggest_close_typo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = suggest("pipe_to_interpeter");
         assert_eq!(s, Some("pipe_to_interpreter"));
     }
 
     #[test]
     fn test_suggest_no_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = suggest("zzzzzzzzzzzzz");
         assert!(s.is_none());
     }

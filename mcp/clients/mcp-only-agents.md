@@ -19,13 +19,64 @@ host has loaded the artifact and honors its documented refusal contract.
 Three of these hosts fail **open** on their own side: Grok Build, Cline, and
 OpenHands all let the tool run when a hook errors or times out. Tirith's adapter
 is fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
-cannot compensate for a host that ignores a crashed hook. Prime Agent and OMP
+cannot compensate for a host that ignores a crashed hook. The Cline and
+OpenHands wrappers, and the Gemini CLI, Kiro and Copilot CLI hook commands,
+check that the pinned Python interpreter still exists and answer with the
+host's deny when it does not (unless `TIRITH_FAIL_OPEN=1`), so a moved
+interpreter does not silently switch the guard off. Prime Agent and OMP
 block when a handler throws, so a guard crash fails closed there.
 
 Every setup command stores the validated absolute path of the running `tirith`
 binary. Existing unrelated configuration is preserved, writes are contained
 and transactional, changed files receive a backup, user-level files are kept
 private, and `--dry-run`, `--force`, and repeat runs are supported.
+
+## Hook and plugin decision contract
+
+Every installed hook or plugin passes the command to `tirith check --json` and
+applies the same rules; only the host's deny shape differs (a JSON decision, a
+`{block: true}` return, or exit 2):
+
+- Exit 0 from tirith: allow (the host's own rules apply), unless the JSON
+  has `requires_approval: true`, then deny.
+- Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
+- Exit 2: warn. A warning is never an approval: by default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) the hook answers exactly as for a clean
+  command, with no permission decision (Grok Build: no stdout, findings on
+  stderr; Cline: `cancel: false` with the findings in `contextModification`;
+  OpenHands: the findings in `additionalContext`, no `decision`). Set
+  `TIRITH_HOOK_WARN_ACTION=deny` to block. `ask` asks the user where the host
+  has a confirmation prompt (Claude Code, VS Code, Cursor, Copilot CLI) and is
+  denied with interactive-shell guidance elsewhere. Any other value blocks and
+  names the valid values (`allow`, `ask`, `deny`).
+- `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
+  or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
+  `TIRITH_FAIL_OPEN`. Agent hooks have no channel to collect approval or
+  acknowledgement; retry the command from a Tirith-protected interactive shell.
+- Exit 3 (mandatory warning acknowledgement): always deny.
+- Exit 4 (deferred block from `TIRITH_DEFER=1` / `tirith check --defer`,
+  recorded for `tirith pending`): always deny, regardless of
+  `TIRITH_FAIL_OPEN`.
+- Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
+  2: checker error -- deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
+- Any other exit code, timeout, or missing binary: deny unless
+  `TIRITH_FAIL_OPEN=1`.
+
+`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
+deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
+hooks run non-interactively) exits 0 with `"action": "allow"`,
+`"bypass_honored": true` and `"requires_approval": false`, so the hook allows
+it. Because the hook runs on the agent's behalf, that grant extends to the
+agent itself: it can prefix `TIRITH=0` to any command and skip every check,
+including blocks, `approval_rules` and `strict_warn`. Enable
+`allow_bypass_env_noninteractive` only for trusted automation.
+
+After upgrading the tirith binary, re-run `tirith setup <tool> --force` with
+the same `--scope` you used originally, so installed hooks and plugins pick up
+the new checks. `tirith doctor` flags an installed adapter that differs from
+the current embedded asset.
 
 ## Supported clients
 

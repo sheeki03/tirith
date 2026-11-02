@@ -3075,6 +3075,7 @@ mod tests {
 
     #[test]
     fn a_package_installed_but_absent_from_the_lockfile_is_unaccounted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
@@ -3098,6 +3099,7 @@ mod tests {
 
     #[test]
     fn no_audit_report_makes_every_registry_package_not_audited() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
@@ -3113,6 +3115,7 @@ mod tests {
 
     #[test]
     fn a_git_dependency_stays_explicit_rather_than_being_dropped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut git = registry_entry("node_modules/g", "g", "1.0.0");
         git.source = NpmSourceKind::Git;
         git.registry_host = None;
@@ -3134,6 +3137,7 @@ mod tests {
 
     #[test]
     fn absence_from_every_audit_bucket_is_not_audited() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
@@ -3157,6 +3161,7 @@ mod tests {
 
     #[test]
     fn a_capped_inventory_reports_a_coverage_gap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],
@@ -3204,6 +3209,7 @@ mod tests {
     /// calling that "its registry signature verified" is a claim npm never made.
     #[test]
     fn neither_installed_nor_uninstalled_omissions_are_signature_verified() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![
@@ -3247,6 +3253,7 @@ mod tests {
     /// buckets is not evidence there either.
     #[test]
     fn a_non_public_registry_host_is_never_signature_verified_by_omission() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut entry = registry_entry("node_modules/internal", "internal", "1.0.0");
         entry.registry_host = Some("npm.internal.example".to_string());
         let lockfile = NpmLockfile {
@@ -3271,6 +3278,7 @@ mod tests {
     /// different bytes than the ones this project installs.
     #[test]
     fn a_verified_result_from_a_divergent_registry_is_not_a_verified_package() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/chalk", "chalk", "5.4.1")],
@@ -3304,6 +3312,7 @@ mod tests {
     /// over-applying a reported failure is safer than dropping it.
     #[test]
     fn verified_membership_requires_exact_location_identity_and_registry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/chalk", "chalk", "5.4.1")],
@@ -3373,6 +3382,7 @@ mod tests {
     /// only negative outcome this command has into its most positive one.
     #[test]
     fn an_audit_finding_that_matches_nothing_still_reaches_the_ledger() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/chalk", "chalk", "5.4.1")],
@@ -3412,6 +3422,7 @@ mod tests {
     /// npm's buckets, so npm's verdict about it would otherwise vanish.
     #[test]
     fn an_audit_finding_for_a_non_registry_entry_is_not_swallowed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut workspace = registry_entry("node_modules/semver", "semver", "7.8.5");
         workspace.source = NpmSourceKind::Workspace;
         workspace.registry_host = None;
@@ -3448,6 +3459,7 @@ mod tests {
     /// verdict for it matters most.
     #[test]
     fn an_unaccounted_installed_package_honours_npms_verdict() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/chalk", "chalk", "5.4.1")],
@@ -3811,6 +3823,7 @@ mod tests {
 
     #[test]
     fn a_partial_receipt_records_the_reason_and_still_validates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let lockfile = NpmLockfile {
             lockfile_version: 3,
             entries: vec![registry_entry("node_modules/a", "a", "1.0.0")],

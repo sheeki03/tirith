@@ -7,7 +7,7 @@
 > capability contract. Use the [README](README.md),
 > [changelog](CHANGELOG.md), [capability matrix](docs/capability-matrix.md),
 > [enforcement coverage](docs/enforcement-coverage.md), and
-> [0.4.2 release notes](docs/release-notes-0.4.2.md) for current behavior.
+> [0.5.0 release notes](docs/release-notes-0.5.0.md) for current behavior.
 
 > Browsers solved homograph attacks years ago. Terminals haven't. tirith is the browser-equivalent safety net for the terminal.
 
@@ -415,7 +415,7 @@ Applied to every URL found in a command or paste:
 | Raw IP address | WARN | `http://185.234.xx.xx/install.sh`. No legitimate installer uses a raw IP. |
 | Non-standard port | WARN | Known domain with unexpected port: `https://github.com:8443/...`. |
 | Trailing dot / whitespace | WARN | `github.com.` or `github.com\t` — resolves differently than expected. |
-| Lookalike TLD | WARN | `.zip`, `.mov` and other new TLDs that resemble file extensions (social engineering vector). |
+| Lookalike TLD | WARN | `.zip`, `.mov` and `.run`, TLDs that read as file names (social engineering vector). The developer TLDs `.app` and `.dev` are not flagged. |
 
 **Path/query checks (separate from hostname, different defaults):**
 

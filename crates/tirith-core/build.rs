@@ -45,6 +45,10 @@ struct PrivKeyPattern {
 }
 
 fn main() {
+    // Preserve the full Cargo target, including libc/ABI, for release selection.
+    // OS + architecture alone would silently map musl builds onto GNU archives.
+    let target = env::var("TARGET").expect("Cargo supplies the compilation target");
+    println!("cargo:rustc-env=TIRITH_BUILD_TARGET={target}");
     let out_dir = env::var("OUT_DIR").unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     // Data files live under the crate dir so they ship in the crate tarball.
@@ -342,7 +346,7 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "pipe_to_interpreter",
         tier1_exec_fragments: &[
-            r"(?i)\|[&\s]*(?:\S*(?:sudo|env|command|exec|nohup)\S*\s+|/\S*/?)*(?:\S+\s+)*\S*(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|mksh|python[23]?|node|deno|bun|perl|ruby|php|lua|tclsh|elixir|rscript|pwsh|iex|invoke-expression|cmd)",
+            r"(?i)\|[&\s]*(?:\S*(?:sudo|env|command|exec|nohup)\S*\s+|/\S*/?)*(?:\S+\s+)*\S*(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|mksh|python[23]?|pypy|node|deno|bun|perl|ruby|php|lua|tclsh|elixir|rscript|pwsh|iex|invoke-expression|cmd)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Pipe output to an interpreter (| bash, | sudo bash, | iex, etc.)",
@@ -510,6 +514,9 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         // anchored so they match code syntax, not a bare shell word (`eval x`,
         // `systemctl` do not match).
         tier1_exec_fragments: &[
+            // The other inline download sources have source-command entries.
+            // BSD fetch can use a schemeless operand, so no :// marker is required.
+            r"\bfetch['\x22]?\s",
             r"\bexec\s*\(",
             r"\beval\s*\(",
             r"\bsystem\s*\(",
@@ -538,10 +545,22 @@ const PATTERN_TABLE: &[PatternEntry] = &[
             // PHP-capable primitives rather than changing other languages'
             // case semantics in the precise rule.
             r"(?i:\b(?:system|popen|shell_exec|passthru|proc_open)\s*\()",
+            // A program attached to its inline flag inside one quoted word
+            // (`perl '-esystem("id")'`, `python3 '-cexec(...)'`) puts flag
+            // letters right before the marker, where the `\b` anchors above
+            // cannot match. Same markers, preceded by a dash-letter run.
+            r"(?i:-[a-z0-9]*[a-z](?:exec|eval|system|popen|function|shell_exec|passthru|proc_open|execsync|spawn(?:sync)?)\s*\()",
+            r"(?i:-[a-z0-9]*[a-z](?:subprocess|child_process|pty\.spawn|socket\.socket|urllib|urlopen|requests\.|http\.client|httplib|io::socket|net::|lwp::))",
+            // perl and ruby join every -e/-E program with newlines, so a
+            // marker can be split across two programs
+            // (`perl -e 'system' -e '("id")'`). Any perl/ruby word followed by
+            // two inline-flag-shaped words reaches the joined-program check.
+            r"(?s:\b(?:perl|ruby).*-[A-Za-z0-9]*[eE].*\s['\x22]?-[A-Za-z0-9]*[eE])",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Inline-interpreter suspicious payload markers (python -c/node -e/... \
-                with exec/subprocess/network) — PR3",
+                with exec/subprocess/network), attached-flag and split perl/ruby \
+                program shapes — PR3",
     },
     PatternEntry {
         id: "cargo_vet",
@@ -1109,6 +1128,8 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
     ("threat_safe_browsing", "ThreatSafeBrowsing"),
+    // Runtime package lookup could not be completed (threatdb_api, post-engine).
+    ("package_lookup_incomplete", "PackageLookupIncomplete"),
     // Package reputation rules (M6 ch6).
     ("package_not_found_in_registry", "PackageNotFoundInRegistry"),
     (
@@ -1413,8 +1434,9 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     // B8 wheel structurally rejected by the hardened reader (path traversal, encrypted
     // member, CRC mismatch, duplicate-path collision); synthesized by `package inspect`.
     ("wheel_structurally_rejected", "WheelStructurallyRejected"),
-    // D3 package-firewall download-vs-expected hash mismatch (externally
-    // triggered by `artifact::firewall` re-hashing a quarantine blob; no fixture).
+    // D3 package-firewall download-vs-expected hash mismatch. Its only emitter
+    // (the quarantine re-hash in the removed pip firewall) is gone; the rule id
+    // stays so policies and audit readers that name it keep parsing. No fixture.
     (
         "artifact_download_integrity_mismatch",
         "ArtifactDownloadIntegrityMismatch",

@@ -1,6 +1,10 @@
 //! Filesystem helpers for `tirith setup` — atomic writes, hook scripts,
 //! directory validation, CLI subprocess runner, and backup management.
 
+#[path = "fs_retention_unix.rs"]
+mod retention;
+pub(crate) use retention::{open_existing_in_place, InPlaceLease};
+
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
@@ -100,6 +104,15 @@ fn scoped_parent(
     scope_root: &Path,
     create: bool,
 ) -> Result<Option<ScopedParent>, String> {
+    scoped_parent_with_creation_mode(path, scope_root, create, 0o755)
+}
+
+fn scoped_parent_with_creation_mode(
+    path: &Path,
+    scope_root: &Path,
+    create: bool,
+    creation_mode: libc::mode_t,
+) -> Result<Option<ScopedParent>, String> {
     let path = absolute(path)?;
     let root = absolute(scope_root)?;
     let components = relative_components(&path, &root)?;
@@ -133,7 +146,8 @@ fn scoped_parent(
         match open_dir_at(&dir, &component) {
             Ok(next) => dir = next,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), 0o755) };
+                let rc =
+                    unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), creation_mode) };
                 let created = rc == 0;
                 if rc < 0 {
                     let mkdir_error = std::io::Error::last_os_error();
@@ -583,6 +597,13 @@ fn errno_slot() -> Option<*mut libc::c_int> {
 }
 
 fn directory_names(directory: &fs::File) -> Result<Vec<CString>, String> {
+    directory_names_bounded(directory, usize::MAX).map(|(names, _)| names)
+}
+
+fn directory_names_bounded(
+    directory: &fs::File,
+    limit: usize,
+) -> Result<(Vec<CString>, bool), String> {
     let dot = c".";
     // `dup` would share the directory-stream offset with the long-lived
     // capability. Re-open `.` relative to that capability so every scan gets
@@ -634,13 +655,44 @@ fn directory_names(directory: &fs::File) -> Result<Vec<CString>, String> {
                     std::io::Error::from_raw_os_error(readdir_errno)
                 ));
             }
-            return Ok(names);
+            return Ok((names, false));
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
         if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            if names.len() == limit {
+                if unsafe { libc::closedir(stream) } < 0 {
+                    return Err("cannot close bounded private directory inventory".into());
+                }
+                return Ok((names, true));
+            }
             names.push(name.to_owned());
         }
     }
+}
+
+pub(crate) fn private_directory_names(
+    directory: &Path,
+    scope: &Path,
+    limit: usize,
+) -> Result<(Vec<OsString>, bool), String> {
+    let Some(parent) = scoped_parent(&directory.join(".inventory"), scope, false)? else {
+        return Ok((Vec::new(), false));
+    };
+    let metadata = parent
+        .dir
+        .metadata()
+        .map_err(|_| "cannot inspect private journal directory")?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err("journal inventory requires a private current-user-owned directory".into());
+    }
+    let (names, limited) = directory_names_bounded(&parent.dir, limit)?;
+    Ok((
+        names
+            .into_iter()
+            .map(|name| OsStr::from_bytes(name.to_bytes()).to_owned())
+            .collect(),
+        limited,
+    ))
 }
 
 fn normalize_tombstone_name(
@@ -707,6 +759,20 @@ pub(crate) struct PlatformSnapshot {
 }
 
 impl PlatformSnapshot {
+    /// Validate privacy from the same retained-handle generation as the bytes.
+    /// An absent destination is safe for a new private publication.
+    pub(crate) fn require_private(&self) -> Result<(), String> {
+        if let SnapshotGeneration::Present(generation) = &self.generation {
+            if generation.owner != unsafe { libc::geteuid() }
+                || generation.links != 1
+                || self.mode.is_none_or(|mode| mode & 0o077 != 0)
+            {
+                return Err("private file must be current-user-owned, single-link and inaccessible to other users".into());
+            }
+        }
+        Ok(())
+    }
+
     fn absent() -> Self {
         Self {
             bytes: None,
@@ -719,6 +785,18 @@ impl PlatformSnapshot {
 fn snapshot_from_parent(
     parent: &ScopedParent,
     display_path: &Path,
+) -> Result<PlatformSnapshot, String> {
+    snapshot_from_parent_capped(
+        parent,
+        display_path,
+        super::fs_transaction::MAX_SETUP_FILE_BYTES,
+    )
+}
+
+fn snapshot_from_parent_capped(
+    parent: &ScopedParent,
+    display_path: &Path,
+    limit: usize,
 ) -> Result<PlatformSnapshot, String> {
     // A non-cooperating writer may mutate while we read. Retry a bounded
     // number of times until the same handle has stable generation metadata
@@ -768,17 +846,17 @@ fn snapshot_from_parent(
                 before.nlink()
             ));
         }
-        if before.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 {
+        if before.len() > limit as u64 {
             return Err(format!(
                 "{} exceeds setup file limit of {} bytes",
                 display_path.display(),
-                super::fs_transaction::MAX_SETUP_FILE_BYTES
+                limit
             ));
         }
 
         let mut bytes = Vec::with_capacity(before.len() as usize);
         (&mut file)
-            .take(super::fs_transaction::MAX_SETUP_FILE_BYTES as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| {
                 format!(
@@ -786,11 +864,11 @@ fn snapshot_from_parent(
                     display_path.display()
                 )
             })?;
-        if bytes.len() > super::fs_transaction::MAX_SETUP_FILE_BYTES {
+        if bytes.len() > limit {
             return Err(format!(
                 "{} exceeds setup file limit of {} bytes",
                 display_path.display(),
-                super::fs_transaction::MAX_SETUP_FILE_BYTES
+                limit
             ));
         }
         let after = file.metadata().map_err(|error| {
@@ -826,6 +904,23 @@ pub(crate) fn read_snapshot_scoped(
     snapshot_from_parent(&parent, path)
 }
 
+/// Read through the retained native boundary with a caller-selected smaller cap.
+/// No parents are created. The normal snapshot still carries privacy and generation proof.
+pub(crate) fn read_snapshot_scoped_capped(
+    path: &Path,
+    scope_root: &Path,
+    limit: usize,
+) -> Result<PlatformSnapshot, String> {
+    let Some(parent) = scoped_parent(path, scope_root, false)? else {
+        return Ok(PlatformSnapshot::absent());
+    };
+    snapshot_from_parent_capped(
+        &parent,
+        path,
+        limit.min(super::fs_transaction::MAX_SETUP_FILE_BYTES),
+    )
+}
+
 /// Read a setup-managed text file through the same root-confined, no-follow
 /// boundary used for writes. Missing files or parents return `None` without
 /// creating directories; unsafe components are errors even for dry runs and
@@ -840,10 +935,28 @@ pub fn read_to_string_scoped(path: &Path, scope_root: &Path) -> Result<Option<St
         .transpose()
 }
 
-/// Return whether a destination's complete parent chain currently exists and
-/// is safe beneath `scope_root`, without creating anything.
-pub fn parent_exists_scoped(path: &Path, scope_root: &Path) -> Result<bool, String> {
-    scoped_parent(path, scope_root, false).map(|parent| parent.is_some())
+/// Create a private journal directory using the same no-follow parent walk as
+/// setup files. Permissions are changed through the held directory descriptor.
+pub(crate) fn ensure_private_directory(path: &Path, scope_root: &Path) -> Result<(), String> {
+    // Private callers never briefly expose a new directory under a permissive
+    // umask. Ordinary setup parent creation retains its separate 0755 contract.
+    let parent =
+        scoped_parent_with_creation_mode(&path.join(".journal-entry"), scope_root, true, 0o700)?
+            .ok_or("cannot create private journal directory")?;
+    let metadata = parent.dir.metadata().map_err(|e| e.to_string())?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("private journal directory is not owned by the current operator".into());
+    }
+    if unsafe { libc::fchmod(parent.dir.as_raw_fd(), 0o700) } != 0 {
+        return Err(format!(
+            "make journal directory private: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    parent
+        .dir
+        .sync_all()
+        .map_err(|e| format!("sync private journal directory: {e}"))
 }
 
 /// Write `content` to `path` atomically via temp+rename.
@@ -879,6 +992,50 @@ pub(crate) struct PlatformLock {
     _anchor: fs::File,
 }
 
+impl Drop for PlatformLock {
+    fn drop(&mut self) {
+        // A duplicated or fork-inherited descriptor can outlive this owner.
+        // Closing only our descriptor would retain the same open-file-description
+        // lock until every copy closes (O_CLOEXEC takes effect only at exec).
+        let _ = fs2::FileExt::unlock(&self._anchor);
+    }
+}
+
+/// Per-operation execution lock, separate from the writer lock. It prevents an
+/// apply/undo pair or two workers from interleaving one durable operation.
+pub(crate) fn try_lock_operation(
+    path: &Path,
+    scope: &Path,
+) -> Result<Option<PlatformLock>, String> {
+    let parent =
+        scoped_parent(path, scope, false)?.ok_or("operation journal directory is missing")?;
+    let fd = unsafe {
+        libc::openat(
+            parent.dir.as_raw_fd(),
+            parent.name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open private operation lock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("operation lock ownership or file identity is unsafe".into());
+    }
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(PlatformLock { _anchor: file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!("lock operation: {error}")),
+    }
+}
+
 pub(crate) struct PlatformTransaction {
     parent: ScopedParent,
     path: PathBuf,
@@ -888,17 +1045,22 @@ pub(crate) struct PlatformTransaction {
 
 impl PlatformTransaction {
     pub(crate) fn lock(_path: &Path, scope_root: &Path) -> Result<PlatformLock, String> {
-        // NOTE: this wait is unbounded. The anchor is `/`, so any local process
-        // that flocks it can stall setup indefinitely. A deadline is the right
-        // answer, but the bound has to be chosen against real contention: the
-        // `/` anchor already serializes every setup transaction, and the test
-        // suite alone spends ~23s waiting here, so a bound picked by intuition
-        // trades a hang for a spurious failure. Left blocking until that number
-        // is measured.
+        Self::lock_for(_path, scope_root, super::fs_transaction::SETUP_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn lock_for(
+        _path: &Path,
+        scope_root: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<PlatformLock, String> {
         let anchor = open_lock_anchor(scope_root)?;
-        anchor
-            .lock_exclusive()
-            .map_err(|error| format!("lock setup scope without creating a lock file: {error}"))?;
+        super::fs_transaction::wait_for_lock(timeout, || match anchor.try_lock_exclusive() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(format!(
+                "lock setup scope without creating a lock file: {error}"
+            )),
+        })?;
         Ok(PlatformLock { _anchor: anchor })
     }
 
@@ -939,12 +1101,74 @@ impl PlatformTransaction {
     }
 
     pub(crate) fn validate_snapshot(&self, expected: &PlatformSnapshot) -> Result<(), String> {
-        let live = self.read_snapshot()?;
+        let limit = expected.bytes.as_ref().map_or(0, Vec::len);
+        let live = snapshot_from_parent_capped(&self.parent, &self.path, limit)?;
         if &live != expected {
             return Err(format!(
                 "{} changed while setup was preparing the update; no changes were published",
                 self.path.display()
             ));
+        }
+        Ok(())
+    }
+
+    /// Fixed exact private-file disconnect; does not enumerate or remove siblings.
+    pub(crate) fn delete_private_expected(
+        &self,
+        expected: &PlatformSnapshot,
+        cap: usize,
+    ) -> Result<(), String> {
+        if cap == 0
+            || expected
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > cap)
+        {
+            return Err("private deletion input exceeds its fixed bound".into());
+        }
+        expected.require_private()?;
+        if expected.bytes.is_none() {
+            return Err("disconnect requires a present file".into());
+        }
+        self.validate_snapshot(expected)?;
+        let fd = unsafe {
+            libc::openat(
+                self.parent.dir.as_raw_fd(),
+                self.parent.name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err("cannot retain exact disconnect object".into());
+        }
+        let held = unsafe { fs::File::from_raw_fd(fd) };
+        let m = held
+            .metadata()
+            .map_err(|_| "cannot inspect disconnect object")?;
+        if !m.is_file()
+            || SnapshotGeneration::Present(FileGeneration::from_metadata(&m)) != expected.generation
+        {
+            return Err("disconnect object changed".into());
+        }
+        self.validate_snapshot(expected)?;
+        if unsafe { libc::unlinkat(self.parent.dir.as_raw_fd(), self.parent.name.as_ptr(), 0) } != 0
+        {
+            return Err("cannot remove selected connection".into());
+        }
+        // A non-cooperating owner-UID writer is not locked by flock. Detect an
+        // unexpected name/object transition; never retry deletion on that name.
+        if held
+            .metadata()
+            .map_err(|_| "disconnect outcome unavailable")?
+            .nlink()
+            != 0
+        {
+            return Err("disconnect outcome is uncertain; inspect status".into());
+        }
+        self.sync_parent()?;
+        let after = snapshot_from_parent_capped(&self.parent, &self.path, 0)?;
+        if after.bytes.is_some() {
+            return Err("connection was replaced after disconnect".into());
         }
         Ok(())
     }
@@ -1940,7 +2164,9 @@ pub fn write_hook_script(
                 action = Action::FixMode;
                 return Ok(FileUpdate::write_text(content.to_string(), 0o755).with_exact_mode());
             }
-            if !force {
+            // An empty file holds no content to preserve. Undo of a journaled step
+            // that created the hook leaves exactly such a placeholder.
+            if !force && !existing.is_empty() {
                 if dry_run {
                     action = Action::WouldError;
                     return Ok(FileUpdate::unchanged());
@@ -2205,6 +2431,52 @@ fn run_cli_bounded<S: AsRef<OsStr>>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_lock_owner_releases_even_with_a_retained_descriptor_copy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let directory = tempfile::tempdir().unwrap();
+        let scope = directory.path();
+        let path = scope.join("operation.lock");
+        let first = super::try_lock_operation(&path, scope).unwrap().unwrap();
+        // try_clone has the same open-file-description semantics as a forked
+        // child's inherited descriptor, without a process or timing dependency.
+        let retained = first._anchor.try_clone().unwrap();
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(first);
+        let next = super::try_lock_operation(&path, scope)
+            .unwrap()
+            .expect("the owner releases its lock before inherited copies close");
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(retained);
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_none());
+        drop(next);
+        assert!(super::try_lock_operation(&path, scope).unwrap().is_some());
+    }
+
+    #[test]
+    fn smaller_snapshot_cap_is_enforced_before_read_and_preserves_private_proof() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("annotation.json");
+        std::fs::write(&path, b"12345").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::read_snapshot_scoped_capped(&path, root.path(), 4).is_err());
+        let exact = super::read_snapshot_scoped_capped(&path, root.path(), 5).unwrap();
+        exact.require_private().unwrap();
+        assert_eq!(exact.bytes.as_deref(), Some(&b"12345"[..]));
+        std::os::unix::fs::symlink(&path, root.path().join("linked")).unwrap();
+        assert!(
+            super::read_snapshot_scoped_capped(&root.path().join("linked"), root.path(), 5)
+                .is_err()
+        );
+        let absent = root.path().join("missing/entry");
+        assert!(super::read_snapshot_scoped_capped(&absent, root.path(), 5)
+            .unwrap()
+            .bytes
+            .is_none());
+        assert!(!absent.parent().unwrap().exists());
+    }
     use super::super::fs_transaction::{transactional_update_with_hook, FileUpdate, TestStage};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -2254,6 +2526,7 @@ mod tests {
 
     #[test]
     fn cli_runner_preserves_short_legitimate_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
@@ -2269,6 +2542,7 @@ mod tests {
 
     #[test]
     fn cli_runner_rejects_output_over_its_bound() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let shell =
             tirith_core::trusted_child::TrustedExecutable::from_absolute(Path::new("/bin/sh"), &[])
                 .unwrap();
@@ -2295,6 +2569,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         atomic_write(&path, dir.path(), "hello", 0o644).unwrap();
@@ -2305,6 +2580,7 @@ mod tests {
 
     #[test]
     fn atomic_write_refuses_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.txt");
         fs::write(&target, "original").unwrap();
@@ -2320,6 +2596,7 @@ mod tests {
 
     #[test]
     fn atomic_write_preserves_permissions() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("strict.txt");
         fs::write(&path, "old").unwrap();
@@ -2334,6 +2611,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_skip_on_same_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "#!/bin/bash\necho hi").unwrap();
@@ -2344,6 +2622,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_errors_on_different_content_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "old content").unwrap();
@@ -2354,7 +2633,22 @@ mod tests {
     }
 
     #[test]
+    fn write_hook_script_replaces_an_empty_placeholder_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sh");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_hook_script(&path, dir.path(), "new content", false, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
     fn write_hook_script_overwrites_with_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hook.sh");
         fs::write(&path, "old content").unwrap();
@@ -2368,6 +2662,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_refuses_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.sh");
         fs::write(&target, "original").unwrap();
@@ -2381,6 +2676,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_rejects_hardlinked_destination_without_touching_external_link() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let external_path = external.path().join("shared-hook.sh");
@@ -2411,6 +2707,7 @@ mod tests {
 
     #[test]
     fn write_hook_script_refuses_symlinked_parent_even_when_content_matches() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("hook.sh"), "expected").unwrap();
@@ -2433,6 +2730,7 @@ mod tests {
 
     #[test]
     fn atomic_write_refuses_symlinked_parent_and_leaves_outside_untouched() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let linked_parent = dir.path().join("hooks");
@@ -2451,6 +2749,7 @@ mod tests {
 
     #[test]
     fn transaction_parent_swap_stays_bound_to_the_retained_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let parent = root.path().join("hooks");
@@ -2497,6 +2796,7 @@ mod tests {
 
     #[test]
     fn atomic_write_rejects_destination_outside_scope() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let path = outside.path().join("config.json");
@@ -2509,6 +2809,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_nested_components_without_following_links() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("one").join("two").join("config.json");
 
@@ -2544,6 +2845,7 @@ mod tests {
 
     #[test]
     fn provenance_bound_backup_retention_keeps_exactly_five() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2562,6 +2864,7 @@ mod tests {
 
     #[test]
     fn backup_and_temp_retention_remain_bounded_over_the_same_lifecycle() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2595,6 +2898,7 @@ mod tests {
 
     #[test]
     fn failed_backup_transactions_return_their_slots_without_exceeding_the_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2642,6 +2946,7 @@ mod tests {
 
     #[test]
     fn backup_retirement_never_scrubs_a_pathname_swap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2673,6 +2978,7 @@ mod tests {
 
     #[test]
     fn backup_retention_never_touches_unproven_prefix_lookalikes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2698,6 +3004,7 @@ mod tests {
 
     #[test]
     fn backup_retention_rejects_a_fully_bound_file_without_creation_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -2731,6 +3038,7 @@ mod tests {
 
     #[test]
     fn successful_updates_reuse_unix_tombstones_with_a_bound_of_five() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         for index in 0..20 {
@@ -2757,6 +3065,7 @@ mod tests {
 
     #[test]
     fn temp_retention_never_reuses_or_scrubs_prefix_only_lookalikes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let forged = root
@@ -2777,6 +3086,7 @@ mod tests {
 
     #[test]
     fn backup_uses_locked_snapshot_content_and_restrictive_mode() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, "secret-data").unwrap();
@@ -2792,6 +3102,7 @@ mod tests {
 
     #[test]
     fn backup_generation_is_revalidated_before_commit() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -2816,6 +3127,7 @@ mod tests {
 
     #[test]
     fn transaction_backup_and_retention_refuse_symlinked_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let linked = root.path().join("configs");
@@ -2853,6 +3165,7 @@ mod tests {
 
     #[test]
     fn dry_run_is_read_only_and_does_not_create_lock_or_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing/config.json");
         let outcome = transactional_update(&path, root.path(), true, |_| {
@@ -2898,6 +3211,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_accepts_exact_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("exact-cap.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES);
@@ -2911,6 +3225,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_rejects_cap_plus_one_before_live_side_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing").join("too-large.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
@@ -2925,6 +3240,7 @@ mod tests {
 
     #[test]
     fn drifted_transform_is_recomputed_and_capped_before_artifacts() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "base").unwrap();
@@ -2956,6 +3272,7 @@ mod tests {
 
     #[test]
     fn transformed_payload_rejects_cap_plus_one_in_dry_run_without_side_effects() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("missing").join("too-large.json");
         let payload = "x".repeat(super::super::fs_transaction::MAX_SETUP_FILE_BYTES + 1);
@@ -2969,6 +3286,7 @@ mod tests {
 
     #[test]
     fn precreated_regular_and_symlink_backup_names_are_never_overwritten() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "original").unwrap();
@@ -2989,27 +3307,35 @@ mod tests {
 
     #[test]
     fn non_cooperating_generation_change_is_rejected_and_temp_is_scrubbed() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config.json");
-        fs::write(&path, "before").unwrap();
-        let result = transactional_update_with_hook(
-            &path,
-            root.path(),
-            |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
-            |stage| {
-                if stage == TestStage::TempSynced {
-                    fs::write(&path, "editor-change").unwrap();
-                }
-                Ok(())
-            },
-        );
-        assert!(result.unwrap_err().contains("changed while setup"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "editor-change");
-        assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        for (editor_bytes, expected_refusal) in [
+            ("editor", "changed while setup"),
+            ("editor-change", "exceeds setup file limit of 6 bytes"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.json");
+            fs::write(&path, "before").unwrap();
+            let result = transactional_update_with_hook(
+                &path,
+                root.path(),
+                |_| Ok(FileUpdate::write_text("ours".into(), 0o644)),
+                |stage| {
+                    if stage == TestStage::TempSynced {
+                        fs::write(&path, editor_bytes).unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            let refusal = result.unwrap_err();
+            assert!(refusal.contains(expected_refusal), "{refusal}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), editor_bytes);
+            assert!(nonempty(temporary_setup_paths(root.path())).is_empty());
+        }
     }
 
     #[test]
     fn swapped_temp_is_rejected_without_deleting_the_replacement() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3038,6 +3364,7 @@ mod tests {
 
     #[test]
     fn destination_swap_after_validation_is_detected_and_competitor_is_restored() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let original_hold = root.path().join("original-held-by-writer");
@@ -3077,6 +3404,7 @@ mod tests {
 
     #[test]
     fn temp_swap_after_validation_never_publishes_attacker_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let held_prepared = root.path().join("prepared-held-by-writer");
@@ -3127,6 +3455,7 @@ mod tests {
 
     #[test]
     fn expected_absent_race_never_overwrites_new_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let result = transactional_update_with_hook(
@@ -3146,6 +3475,7 @@ mod tests {
 
     #[test]
     fn publication_failure_rolls_back_only_its_backup_and_temp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3168,6 +3498,7 @@ mod tests {
 
     #[test]
     fn failure_after_temp_sync_scrubs_temp_and_transaction_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3191,6 +3522,7 @@ mod tests {
 
     #[test]
     fn guard_cleanup_failure_is_propagated_with_the_primary_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3216,6 +3548,7 @@ mod tests {
 
     #[test]
     fn displaced_scrub_failure_returns_written_with_recovery_never_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3232,6 +3565,7 @@ mod tests {
 
     #[test]
     fn retention_cleanup_failure_returns_written_with_recovery_never_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "zero").unwrap();
@@ -3250,6 +3584,7 @@ mod tests {
 
     #[test]
     fn swapped_backup_cleanup_scrubs_only_the_held_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let held_backup = root.path().join("held-original-backup");
@@ -3284,6 +3619,7 @@ mod tests {
 
     #[test]
     fn post_publication_durability_failure_keeps_recovery_backup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         fs::write(&path, "before").unwrap();
@@ -3306,6 +3642,7 @@ mod tests {
 
     #[test]
     fn installed_name_swap_before_completion_is_detected_without_deleting_attacker() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
         let moved_install = root.path().join("writer-moved-install");
@@ -3344,6 +3681,7 @@ mod tests {
 
     #[test]
     fn subprocess_lock_child() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let Some(role) = std::env::var_os("TIRITH_SETUP_LOCK_CHILD_ROLE") else {
             return;
         };
@@ -3468,6 +3806,7 @@ mod tests {
 
     #[test]
     fn cooperative_transactions_serialize_and_recompute() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.txt");
         fs::write(&path, "base").unwrap();
@@ -3496,6 +3835,7 @@ mod tests {
 
     #[test]
     fn same_content_hook_mode_fix_is_atomic_and_dry_run_is_non_mutating() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("hook.sh");
         fs::write(&path, "hook").unwrap();

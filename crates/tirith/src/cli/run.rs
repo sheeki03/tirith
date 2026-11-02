@@ -276,7 +276,11 @@ fn build_run_json(
         "exit_code": exit_code,
     });
     append_run_policy_diagnostics(&mut value, compiled);
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Run,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 
@@ -295,7 +299,11 @@ fn build_run_error_json(
         "error": error,
     });
     append_run_policy_diagnostics(&mut value, compiled);
-    tirith_core::redact::redact_json_strings(&mut value, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Run,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(value)
 }
 
@@ -755,6 +763,7 @@ mod tests {
 
     #[test]
     fn receipt_json_uses_the_monotonic_nested_policy_dlp_union() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let canary = "C02_LATE_RUNNER_POLICY_CANARY";
         let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
         tirith_core::policy::freeze_captured_policy_dlp_patterns(&[]);
@@ -935,6 +944,7 @@ mod tests {
 
     #[test]
     fn run_json_captures_policy_diagnostics_inside_the_bounded_error_envelope() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let custom = "C02_RUN_POLICY_CANARY";
         let github = format!("ghp_{}", "a1B2c3D4".repeat(5));
         let source = format!(
@@ -1128,6 +1138,7 @@ mod tests {
 
     #[test]
     fn run_capsule_specs_require_supervised_wall_clock_and_output_limits() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (surface, spec) in [
             ("reviewed file", super::reviewed_file_capsule_spec()),
             ("forced stdin", super::forced_stdin_capsule_spec()),

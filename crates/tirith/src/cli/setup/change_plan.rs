@@ -1,0 +1,4624 @@
+//! Typed, restartable file mutations. Public previews contain metadata only;
+//! private journals hold payloads/preimages and authorization replay guards.
+//! HTTP callers select stored plan IDs; they must never accept paths or file
+//! contents from a browser and turn them into `RequestedChange` values.
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tirith_core::policy_rollout::{ImpactReport, RolloutScope};
+use tirith_core::policy_snapshot::{EffectivePolicySnapshot, PrivatePolicyReplayGuard};
+
+use super::fs_helpers;
+use super::fs_transaction::{FileUpdate, TransactionOutcome, MAX_SETUP_FILE_BYTES};
+
+const SCHEMA: u32 = 1;
+const MAX_STEPS: usize = 64;
+const MAX_ACTIVE_JOBS: usize = 4;
+const JOB_TIMEOUT: Duration = Duration::from_secs(300);
+static ACTIVE_JOBS: AtomicUsize = AtomicUsize::new(0);
+static WORKER_RESERVATIONS: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, JobAction>>> =
+    OnceLock::new();
+
+fn worker_reservations() -> &'static Mutex<std::collections::BTreeMap<PathBuf, JobAction>> {
+    WORKER_RESERVATIONS.get_or_init(|| Mutex::new(Default::default()))
+}
+
+struct WorkerPermit {
+    path: PathBuf,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        worker_reservations()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.path);
+        ACTIVE_JOBS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn active_job_count() -> usize {
+    ACTIVE_JOBS.load(Ordering::Acquire)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum OperationKind {
+    SetProfile,
+    SetManagedProfile,
+    RecordFeedback,
+    ExportSupport,
+    ExportAudit,
+    DeleteAuditSegment,
+    RecommendedSetup,
+    RotateAudit,
+    SetPersonalSetting,
+    ImportPolicy,
+    AddTrust,
+    RevokeTrust,
+    SetupShell,
+    SetupIntegration,
+    RemoveIntegration,
+}
+
+impl OperationKind {
+    fn changes_policy(self) -> bool {
+        matches!(
+            self,
+            Self::SetProfile
+                | Self::SetManagedProfile
+                | Self::RecommendedSetup
+                | Self::SetPersonalSetting
+                | Self::ImportPolicy
+                | Self::AddTrust
+                | Self::RevokeTrust
+        )
+    }
+}
+
+pub(super) fn preflight_target(
+    kind: OperationKind,
+    root: &Path,
+    target: &Path,
+    policy: &EffectivePolicySnapshot,
+) -> Result<(), String> {
+    if kind == OperationKind::SetManagedProfile {
+        crate::cli::managed_policy::authorize_target(root, target, policy).map_err(refresh)?;
+    }
+    crate::cli::preflight_config_write_authorization(
+        root,
+        target,
+        true,
+        &policy.policy,
+        kind.changes_policy(),
+    )
+    .map_err(|error| refresh(error.to_string()))
+}
+
+pub(super) fn authorize_publication(
+    kind: OperationKind,
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+    policy: &EffectivePolicySnapshot,
+) -> Result<(), String> {
+    use tirith_core::config_write::ConfigWritePermit;
+    use tirith_core::task_boundary::{BoundaryOperation, ConfigWriteBoundary, OwnedBoundary};
+    if kind == OperationKind::SetManagedProfile {
+        crate::cli::managed_policy::authorize_target(root, target, policy).map_err(refresh)?;
+    }
+    let envelope = ConfigWritePermit::operation_envelope_for(
+        root,
+        target,
+        bytes,
+        true,
+        &policy.policy.enforcement_projection_hash(),
+        kind.changes_policy(),
+    )
+    .map_err(|error| refresh(error.to_string()))?;
+    let operation = BoundaryOperation {
+        boundary: OwnedBoundary::ConfigWrite,
+        envelope: &envelope,
+        adapter: tirith_core::task::IngressAdapter::Unattributed,
+        boundary_effects: ConfigWritePermit::boundary_effects_for(kind.changes_policy()),
+    };
+    let pending = tirith_core::task_boundary::prepare_locally_derived_boundary_authorization::<
+        ConfigWriteBoundary,
+    >(
+        &operation,
+        &policy.policy.task_gate,
+        &tirith_core::task_analysis::TaskAnalysisContext::default(),
+    )
+    .map_err(|error| {
+        refresh(format!(
+            "task gate refused configuration publication: {error}"
+        ))
+    })?;
+    let permit = pending
+        .consume_default_for_operation(&operation, chrono::Utc::now())
+        .map_err(|error| {
+            refresh(format!(
+                "task gate refused configuration publication: {error}"
+            ))
+        })?;
+    if !permit.binds_operation(&operation) {
+        return Err(refresh("configuration publication authorization changed"));
+    }
+    Ok(())
+}
+
+/// A programmatic request from an allowlisted CLI operation. Deliberately not
+/// Deserialize: browser API routes must derive targets and edits server-side.
+#[derive(Serialize)]
+pub(crate) struct RequestedChange {
+    pub target: PathBuf,
+    pub scope_root: PathBuf,
+    pub edit: Edit,
+    /// Inactive assets are staged first; activation references are applied last.
+    pub activation: bool,
+    pub description: String,
+}
+
+#[derive(Serialize)]
+pub(crate) enum Edit {
+    AuditRotation(tirith_core::audit::retention::RotationPlan),
+    AuditSegment(super::audit_segments::SegmentPlan),
+    WholeFile(String),
+    /// A whole file published with the exact executable mode `tirith setup`
+    /// uses for hook scripts (0755 on Unix).
+    ExecutableFile(String),
+    ClaudeHandler(super::claude_config::OwnedClaudeHandler),
+    PrivateFile(String),
+    #[cfg(test)]
+    JsonField {
+        pointer: String,
+        value: Option<Value>,
+    },
+    YamlFields(std::collections::BTreeMap<String, Option<Value>>),
+    ShellHook {
+        block: Option<String>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum OwnedEdit {
+    ClaudeHandler(super::claude_config::OwnedClaudeHandler),
+    AuditRotation(tirith_core::audit::retention::RotationPlan),
+    AuditSegment(super::audit_segments::SegmentPlan),
+    /// Owned fields of one document. `original` holds the exact planned
+    /// preimage so undo can restore it byte for byte while the file still holds
+    /// exactly what apply wrote.
+    Compound {
+        original: Option<String>,
+        edits: Vec<OwnedEdit>,
+    },
+    PrivateFile {
+        before: Option<String>,
+        after: String,
+    },
+    WholeFile {
+        before: Option<String>,
+        after: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        executable: bool,
+    },
+    Field {
+        yaml: bool,
+        pointer: String,
+        before: Option<Value>,
+        after: Option<Value>,
+    },
+    ShellHook {
+        before: Option<String>,
+        after: Option<String>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Step {
+    target: PathBuf,
+    scope_root: PathBuf,
+    edit: OwnedEdit,
+    activation: bool,
+    description: String,
+    state: StepState,
+    /// The last publication of this step (apply or compensation) retained
+    /// platform recovery material; reset by every later publication.
+    #[serde(default, skip_serializing_if = "is_false")]
+    recovery: bool,
+    scope_identity: ScopeIdentity,
+    /// Authority inputs need full-document bindings: an unrelated policy key
+    /// may itself alter authorization even when our owned leaf is unchanged.
+    authority_document: Option<AuthorityDocument>,
+    /// A new undo decision may retain unrelated edits made after apply. Once
+    /// captured, its complete generation is immutable across compensation.
+    undo_document: Option<AuthorityDocument>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AuthorityDocument {
+    before: Option<String>,
+    after: Option<String>,
+    compensation: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ScopeIdentity {
+    anchor: PathBuf,
+    canonical: PathBuf,
+    device_inode: Option<(u64, u64)>,
+}
+
+impl ScopeIdentity {
+    fn capture(root: &Path) -> Result<Self, String> {
+        let mut anchor = root.to_path_buf();
+        while !anchor.exists() {
+            if !anchor.pop() {
+                return Err("cannot identify mutation scope".into());
+            }
+        }
+        let canonical = anchor.canonicalize().map_err(|e| e.to_string())?;
+        let metadata = std::fs::metadata(&anchor).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() {
+            return Err("mutation scope anchor is not a directory".into());
+        }
+        #[cfg(unix)]
+        let device_inode = {
+            use std::os::unix::fs::MetadataExt;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(windows)]
+        let device_inode = Some(fs_helpers::directory_identity(&canonical)?);
+        #[cfg(not(any(unix, windows)))]
+        let device_inode = None;
+        Ok(Self {
+            anchor,
+            canonical,
+            device_inode,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let current = Self::capture(&self.anchor)?;
+        if current.anchor != self.anchor
+            || current.canonical != self.canonical
+            || current.device_inode != self.device_inode
+        {
+            return Err(refresh("mutation scope directory was moved or replaced"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StepState {
+    Pending,
+    Applying,
+    Applied,
+    Compensating,
+    Compensated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum JobState {
+    Planned,
+    Running,
+    CancelRequested,
+    Cancelled,
+    PartiallyApplied,
+    Completed,
+    RefreshRequired,
+    RecoveryRequired,
+    Undone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum JobAction {
+    Apply,
+    Undo,
+}
+
+impl JobAction {
+    fn already_finished(self, state: JobState) -> bool {
+        match self {
+            Self::Apply => state.completed() || state == JobState::Cancelled,
+            Self::Undo => state == JobState::Undone,
+        }
+    }
+}
+
+impl JobState {
+    fn completed(self) -> bool {
+        matches!(self, Self::Completed | Self::Undone)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Journal {
+    schema_version: u32,
+    operation_id: String,
+    kind: OperationKind,
+    operator: String,
+    client_version: String,
+    payload_digest: String,
+    request_digest: String,
+    caller_intent_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    no_op: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    impact_review: Option<ImpactReport>,
+    policy_identity: String,
+    authorization: PrivatePolicyReplayGuard,
+    external_authorization: PrivatePolicyReplayGuard,
+    resolution_cwd: Option<String>,
+    undo_external_authorization: Option<PrivatePolicyReplayGuard>,
+    shell_precondition: Option<super::shell_service::ShellPrecondition>,
+    created_at: u64,
+    updated_at: u64,
+    state: JobState,
+    active_action: Option<JobAction>,
+    detail: Option<String>,
+    steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StepStatus {
+    pub target: PathBuf,
+    pub description: String,
+    pub activation: bool,
+    pub state: StepState,
+    /// The step's last publication retained platform recovery material.
+    pub recovery: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OperationStatus {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub kind: OperationKind,
+    pub client_version: String,
+    pub policy_identity: String,
+    pub state: JobState,
+    /// A completed apply or undo retained platform recovery material; inspect
+    /// the operation before cleanup.
+    pub recovery: bool,
+    pub no_op: bool,
+    pub irreversible: bool,
+    pub active_action: Option<JobAction>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub detail: Option<String>,
+    pub steps: Vec<StepStatus>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecentOperations {
+    pub schema_version: u32,
+    pub operations: Vec<OperationStatus>,
+    pub coverage: OperationCoverage,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OperationCoverage {
+    pub entries_examined: usize,
+    pub records_examined: usize,
+    pub invalid_names: usize,
+    pub unreadable_records: usize,
+    pub scan_limited: bool,
+    pub results_limited: bool,
+    pub running_requires_status_reconciliation: bool,
+}
+
+impl Journal {
+    /// Recovery is a property of the finished apply or undo only: every
+    /// publication rewrites its step's flag, and Pending steps never carry it.
+    fn recovery(&self) -> bool {
+        self.state.completed() && self.steps.iter().any(|step| step.recovery)
+    }
+
+    fn public(&self) -> OperationStatus {
+        OperationStatus {
+            schema_version: self.schema_version,
+            operation_id: self.operation_id.clone(),
+            kind: self.kind,
+            client_version: self.client_version.clone(),
+            policy_identity: self.policy_identity.clone(),
+            state: self.state,
+            recovery: self.recovery(),
+            no_op: self.no_op,
+            irreversible: self.kind == OperationKind::DeleteAuditSegment,
+            active_action: matches!(self.state, JobState::Running | JobState::CancelRequested)
+                .then_some(self.active_action)
+                .flatten(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            detail: self.detail.clone(),
+            steps: self
+                .steps
+                .iter()
+                .map(|step| StepStatus {
+                    target: step.target.clone(),
+                    description: step.description.clone(),
+                    activation: step.activation,
+                    state: step.state,
+                    recovery: step.recovery,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MutationService {
+    root: PathBuf,
+    scope: PathBuf,
+    operator: String,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+fn refresh(reason: impl std::fmt::Display) -> String {
+    format!("refresh-required: {reason}")
+}
+fn digest(value: &impl Serialize) -> Result<String, String> {
+    let mut canonical = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    canonical.sort_all_objects();
+    let bytes = serde_json::to_vec(&canonical).map_err(|e| e.to_string())?;
+    Ok(tirith_core::util::sha256_hex(&bytes))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn validate_review(
+    review: &Option<ImpactReport>,
+    id: &str,
+    kind: OperationKind,
+    identity: &str,
+) -> Result<(), String> {
+    let Some(review) = review else {
+        return if kind == OperationKind::SetManagedProfile {
+            Err("managed profile operations require a bound impact review".into())
+        } else {
+            Ok(())
+        };
+    };
+    uuid::Uuid::parse_str(id).map_err(|_| "review operation ID must be a UUID")?;
+    if !matches!(
+        (kind, review.scope),
+        (OperationKind::SetProfile, RolloutScope::PersonalUser)
+            | (OperationKind::SetManagedProfile, RolloutScope::LocalManaged)
+    ) || review.candidate_id.as_str() != id
+        || review.baseline_policy_identity.as_str() != identity
+    {
+        return Err(
+            "impact review does not match its profile authority, operation and baseline".into(),
+        );
+    }
+    // Also enforces the 256 KiB attachment limit.
+    review.validate_stored()
+}
+
+/// Requests and payloads share one binding: a no-change intent is
+/// domain-separated by its policy scope, then any attached review is bound.
+fn bind_digest(
+    original: String,
+    no_op: bool,
+    policy: &EffectivePolicySnapshot,
+    review: &Option<ImpactReport>,
+) -> Result<String, String> {
+    let bound = if no_op {
+        digest(&("tirith-noop-v1", &original, policy.resolution_cwd()))?
+    } else {
+        original
+    };
+    match review {
+        Some(review) => digest(&("tirith-impact-review-v1", bound, review)),
+        None => Ok(bound),
+    }
+}
+
+fn same_request(record: &Journal, request_digest: &str, caller_intent: Option<&str>) -> bool {
+    if record.client_version != env!("CARGO_PKG_VERSION") {
+        return false;
+    }
+    match caller_intent {
+        Some(intent) => record.caller_intent_digest.as_deref() == Some(intent),
+        None => record.caller_intent_digest.is_none() && record.request_digest == request_digest,
+    }
+}
+
+pub(crate) type Preimages = std::collections::BTreeMap<PathBuf, Option<String>>;
+
+/// A concurrently committed journal for the same operator, kind, scope and
+/// request is a replay of `record`, not a different payload.
+fn replays(existing: &Journal, record: &Journal) -> bool {
+    existing.operator == record.operator
+        && existing.kind == record.kind
+        && existing.resolution_cwd == record.resolution_cwd
+        && same_request(
+            existing,
+            &record.request_digest,
+            record.caller_intent_digest.as_deref(),
+        )
+}
+
+/// One durable operation request: the owned changes (or an accepted no-change
+/// intent) plus everything the journal binds before any destination changes.
+pub(crate) struct PlanRequest {
+    kind: OperationKind,
+    requests: Vec<RequestedChange>,
+    /// Exact caller preimages travel with their prepared owned transformations.
+    preimages: Preimages,
+    intent: Option<Value>,
+    shell_precondition: Option<super::shell_service::ShellPrecondition>,
+    no_op: bool,
+    impact_review: Option<ImpactReport>,
+}
+
+impl PlanRequest {
+    pub(crate) fn change(kind: OperationKind, requests: Vec<RequestedChange>) -> Self {
+        Self {
+            kind,
+            requests,
+            preimages: Preimages::new(),
+            intent: None,
+            shell_precondition: None,
+            no_op: false,
+            impact_review: None,
+        }
+    }
+
+    /// An accepted no-change intent. A retry cannot turn this UUID into a
+    /// later mutation after configuration drift or a lost response.
+    pub(crate) fn no_op(kind: OperationKind) -> Self {
+        Self {
+            no_op: true,
+            ..Self::change(kind, Vec::new())
+        }
+    }
+
+    /// Bind transformations derived from an earlier caller read to those exact
+    /// owned preimages. Unrelated fields may change without invalidating them.
+    pub(crate) fn preimages(mut self, preimages: Preimages) -> Self {
+        self.preimages = preimages;
+        self
+    }
+
+    /// Intent must include every caller choice and scope; it is serialized
+    /// only into a private digest, never a second metadata file.
+    pub(crate) fn intent(mut self, intent: &impl Serialize) -> Result<Self, String> {
+        self.intent = Some(serde_json::to_value(intent).map_err(|e| e.to_string())?);
+        Ok(self)
+    }
+
+    pub(crate) fn shell(mut self, precondition: super::shell_service::ShellPrecondition) -> Self {
+        self.shell_precondition = Some(precondition);
+        self
+    }
+
+    /// Atomically bind a canonical diagnostic review to the immutable change.
+    /// Review fields cannot grant authorization and are never replacement input.
+    pub(crate) fn review(mut self, review: Option<ImpactReport>) -> Self {
+        self.impact_review = review;
+        self
+    }
+}
+
+impl MutationService {
+    pub(crate) fn current() -> Result<Self, String> {
+        let target = crate::cli::shell_target::resolve_for_shell("unknown")?;
+        crate::cli::shell_target::require_personal_writer(&target)?;
+        let scope =
+            tirith_core::policy::state_dir().ok_or("cannot resolve operation journal directory")?;
+        if !scope.is_absolute()
+            || scope
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(
+                "operation state directory must be absolute without parent traversal".into(),
+            );
+        }
+        let operator = format!(
+            "{:?}:{}",
+            target.operator_uid,
+            target.operator_home.display()
+        );
+        Ok(Self {
+            root: scope.join("operations"),
+            scope,
+            operator,
+        })
+    }
+
+    fn path(&self, operation_id: &str) -> Result<PathBuf, String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            return Err(
+                "operation ID must be 1–128 ASCII letters, digits, hyphens or underscores".into(),
+            );
+        }
+        Ok(self.root.join(format!("{operation_id}.json")))
+    }
+
+    fn read(&self, operation_id: &str) -> Result<Journal, String> {
+        let path = self.path(operation_id)?;
+        let snapshot = fs_helpers::read_snapshot_scoped(&path, &self.scope)?;
+        snapshot.require_private()?;
+        let bytes = snapshot.bytes.as_deref().ok_or("operation not found")?;
+        let record: Journal = serde_json::from_slice(bytes)
+            .map_err(|_| "operation journal is malformed; retain it for recovery")?;
+        if record.schema_version != SCHEMA
+            || record.operation_id != operation_id
+            || record.operator != self.operator
+        {
+            return Err("operation journal schema, ID or operator does not match".into());
+        }
+        validate_review(
+            &record.impact_review,
+            operation_id,
+            record.kind,
+            &record.policy_identity,
+        )?;
+        Ok(record)
+    }
+
+    /// A bounded, read-only inventory for a reopened browser. Persisted Running
+    /// rows require the explicit status route to reconcile worker liveness.
+    pub(crate) fn recent_statuses(&self, limit: usize) -> Result<RecentOperations, String> {
+        if !(1..=50).contains(&limit) {
+            return Err("recent operation limit must be 1–50".into());
+        }
+        let started = Instant::now();
+        let (names, truncated) =
+            fs_helpers::private_directory_names(&self.root, &self.scope, 1024)?;
+        let mut coverage = OperationCoverage {
+            entries_examined: names.len(),
+            records_examined: 0,
+            invalid_names: 0,
+            unreadable_records: 0,
+            scan_limited: truncated,
+            results_limited: false,
+            running_requires_status_reconciliation: false,
+        };
+        let mut operations = Vec::new();
+        let mut read_bytes = 0usize;
+        for name in names {
+            if read_bytes >= 16 * 1024 * 1024 || started.elapsed() >= Duration::from_secs(1) {
+                coverage.scan_limited = true;
+                break;
+            }
+            let Some(id) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+            else {
+                coverage.invalid_names += 1;
+                continue;
+            };
+            coverage.records_examined += 1;
+            let result = (|| {
+                let snapshot = fs_helpers::read_snapshot_scoped(&self.path(id)?, &self.scope)?;
+                snapshot.require_private()?;
+                let bytes = snapshot.bytes.as_deref().ok_or("operation disappeared")?;
+                read_bytes = read_bytes.saturating_add(bytes.len());
+                let record: Journal =
+                    serde_json::from_slice(bytes).map_err(|_| "invalid operation record")?;
+                if record.schema_version != SCHEMA
+                    || record.operation_id != id
+                    || record.operator != self.operator
+                {
+                    return Err("operation record identity does not match".to_owned());
+                }
+                Ok(record)
+            })();
+            match result {
+                Ok(status) => operations.push(status),
+                Err(_) => coverage.unreadable_records += 1,
+            }
+        }
+        operations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.operation_id.cmp(&a.operation_id))
+        });
+        coverage.results_limited = operations.len() > limit;
+        operations.truncate(limit);
+        coverage.running_requires_status_reconciliation = operations.iter().any(|operation| {
+            matches!(
+                operation.state,
+                JobState::Running | JobState::CancelRequested
+            )
+        });
+        let operations = operations.iter().map(Journal::public).collect();
+        Ok(RecentOperations {
+            schema_version: 1,
+            operations,
+            coverage,
+        })
+    }
+
+    fn update(
+        &self,
+        operation_id: &str,
+        mut update: impl FnMut(&mut Journal) -> Result<(), String>,
+    ) -> Result<Journal, String> {
+        let path = self.path(operation_id)?;
+        let mut result = None;
+        fs_helpers::transactional_update(&path, &self.scope, false, |snapshot| {
+            snapshot.require_private()?;
+            let text = snapshot.text(&path)?.ok_or("operation not found")?;
+            let mut record: Journal =
+                serde_json::from_str(text).map_err(|_| "operation journal is malformed")?;
+            if record.schema_version != SCHEMA
+                || record.operation_id != operation_id
+                || record.operator != self.operator
+            {
+                return Err("operation journal identity does not match".into());
+            }
+            update(&mut record)?;
+            record.updated_at = now();
+            let bytes = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+            result = Some(record);
+            Ok(FileUpdate::write_text(bytes, 0o600))
+        })?;
+        result.ok_or_else(|| "operation journal update produced no result".into())
+    }
+
+    /// Persist a reviewable immutable payload before any destination is changed.
+    /// Reusing an ID with different operator/kind/payload is rejected.
+    #[cfg(test)]
+    pub(crate) fn plan(
+        &self,
+        operation_id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        self.submit(operation_id, policy, PlanRequest::change(kind, requests))
+    }
+
+    /// The single entry point that publishes an operation journal.
+    pub(crate) fn submit(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+        request: PlanRequest,
+    ) -> Result<OperationStatus, String> {
+        if request.shell_precondition.is_some()
+            && !matches!(
+                request.kind,
+                OperationKind::SetupShell
+                    | OperationKind::RemoveIntegration
+                    | OperationKind::RecommendedSetup
+            )
+        {
+            return Err("shell preconditions require a shell setup/removal operation".into());
+        }
+        if request.no_op && request.impact_review.is_none() {
+            // A replayed no-change intent returns its terminal record before
+            // any fresh validation; a review-bound one is checked by plan_inner.
+            uuid::Uuid::parse_str(operation_id).map_err(|_| "operation ID must be a UUID")?;
+            if let Some(intent) = &request.intent {
+                if let Some(status) = self.status_for_intent(operation_id, request.kind, intent)? {
+                    let record = self.read(operation_id)?;
+                    if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
+                        return Err(
+                            "operation ID already belongs to a different policy scope".into()
+                        );
+                    }
+                    return Ok(status);
+                }
+            }
+        }
+        let caller_intent_digest = request
+            .intent
+            .as_ref()
+            .map(|intent| self.intent_digest(request.kind, intent))
+            .transpose()?;
+        self.plan_inner(operation_id, policy, request, caller_intent_digest)
+    }
+
+    /// Look up an already prepared high-level request before generating IDs or
+    /// relative deadlines. Intent must include every caller choice and scope;
+    /// it is serialized only into a private digest, never a second metadata file.
+    pub(crate) fn status_for_intent(
+        &self,
+        operation_id: &str,
+        kind: OperationKind,
+        intent: &impl Serialize,
+    ) -> Result<Option<OperationStatus>, String> {
+        let path = self.path(operation_id)?;
+        if fs_helpers::read_to_string_scoped(&path, &self.scope)?.is_none() {
+            return Ok(None);
+        }
+        let record = self.read(operation_id)?;
+        let expected = self.intent_digest(kind, intent)?;
+        if record.kind != kind
+            || record.client_version != env!("CARGO_PKG_VERSION")
+            || record.caller_intent_digest.as_deref() != Some(expected.as_str())
+        {
+            return Err("operation ID already belongs to a different caller intent, scope or client version".into());
+        }
+        self.status(operation_id).map(Some)
+    }
+
+    fn intent_digest(
+        &self,
+        kind: OperationKind,
+        intent: &impl Serialize,
+    ) -> Result<String, String> {
+        digest(&(
+            "tirith-caller-intent-v1",
+            &self.operator,
+            env!("CARGO_PKG_VERSION"),
+            kind,
+            intent,
+        ))
+    }
+
+    /// A typed, validated projection; private preimages and input digests never
+    /// escape through this route. Replays retain the originally accepted review.
+    pub(crate) fn impact_review(&self, operation_id: &str) -> Result<Option<ImpactReport>, String> {
+        let record = self.read(operation_id)?;
+        validate_review(
+            &record.impact_review,
+            operation_id,
+            record.kind,
+            &record.policy_identity,
+        )?;
+        Ok(record.impact_review)
+    }
+
+    fn plan_inner(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+        request: PlanRequest,
+        caller_intent_digest: Option<String>,
+    ) -> Result<OperationStatus, String> {
+        let PlanRequest {
+            kind,
+            requests,
+            preimages: expected_documents,
+            intent: _,
+            shell_precondition,
+            no_op,
+            impact_review,
+        } = request;
+        let expected_documents = &expected_documents;
+        if expected_documents.iter().any(|(path, document)| {
+            !requests.iter().any(|request| &request.target == path)
+                || document
+                    .as_ref()
+                    .is_some_and(|text| text.len() > MAX_SETUP_FILE_BYTES)
+        }) {
+            return Err(
+                "expected preimage is oversized or does not belong to a planned target".into(),
+            );
+        }
+        let path = self.path(operation_id)?;
+        let request_digest = bind_digest(
+            digest(&(
+                kind,
+                &self.operator,
+                env!("CARGO_PKG_VERSION"),
+                &requests,
+                expected_documents,
+                &shell_precondition,
+            ))?,
+            no_op,
+            policy,
+            &impact_review,
+        )?;
+        if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
+            let record: Journal = serde_json::from_str(&existing)
+                .map_err(|_| "existing operation journal is malformed")?;
+            if record.schema_version != SCHEMA
+                || record.operation_id != operation_id
+                || record.operator != self.operator
+                || record.kind != kind
+                || record.resolution_cwd.as_deref() != policy.resolution_cwd()
+                || !same_request(&record, &request_digest, caller_intent_digest.as_deref())
+            {
+                return Err("operation ID already belongs to a different operator, kind or immutable payload".into());
+            }
+            return Ok(record.public());
+        }
+        validate_review(&impact_review, operation_id, kind, &policy.identity)?;
+        policy.revalidate_for_mutation().map_err(refresh)?;
+        let shell_inputs = shell_precondition
+            .as_ref()
+            .map(|value| value.retain())
+            .transpose()
+            .map_err(refresh)?;
+        if no_op
+            && (!requests.is_empty()
+                || !expected_documents.is_empty()
+                || caller_intent_digest.is_none())
+        {
+            return Err(
+                "a no-change operation must contain only an immutable caller intent".into(),
+            );
+        }
+        if (!no_op && requests.is_empty()) || requests.len() > MAX_STEPS {
+            return Err(format!("operation requires 1–{MAX_STEPS} steps"));
+        }
+        let mut steps = Vec::with_capacity(requests.len());
+        for request in requests {
+            if !request.target.is_absolute()
+                || !request.scope_root.is_absolute()
+                || !request.target.starts_with(&request.scope_root)
+                || request
+                    .target
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("mutation target must be an absolute contained path".into());
+            }
+            if request.target.starts_with(&self.root) {
+                return Err("an operation cannot edit its own journal".into());
+            }
+            preflight_target(kind, &request.scope_root, &request.target, policy)?;
+            if steps
+                .iter()
+                .any(|step: &Step| step.target == request.target)
+            {
+                return Err("combine changes to one file into a single owned step".into());
+            }
+            if let Edit::AuditRotation(plan) = request.edit {
+                if kind != OperationKind::RotateAudit || plan.operation_id() != operation_id {
+                    return Err("audit rotation requires its exact typed operation ID".into());
+                }
+                if super::audit_service::observe(&plan, &request.target, &request.scope_root)?
+                    != tirith_core::audit::retention::RotationState::Original
+                {
+                    return Err(refresh("audit history changed before planning"));
+                }
+                steps.push(Step {
+                    scope_identity: ScopeIdentity::capture(&request.scope_root)?,
+                    target: request.target,
+                    scope_root: request.scope_root,
+                    edit: OwnedEdit::AuditRotation(plan),
+                    activation: true,
+                    description: request.description,
+                    state: StepState::Pending,
+                    recovery: false,
+                    authority_document: None,
+                    undo_document: None,
+                });
+                continue;
+            }
+            if let Edit::AuditSegment(plan) = request.edit {
+                if plan.kind() != kind || plan.operation_id() != operation_id {
+                    return Err("audit segment operation identity changed".into());
+                }
+                plan.validate_target(&request.target, &request.scope_root)?;
+                if plan.observe()? != super::audit_segments::SegmentState::Original {
+                    return Err(refresh("segment files changed before planning"));
+                }
+                steps.push(Step {
+                    scope_identity: ScopeIdentity::capture(&request.scope_root)?,
+                    target: request.target,
+                    scope_root: request.scope_root,
+                    edit: OwnedEdit::AuditSegment(plan),
+                    activation: true,
+                    description: request.description,
+                    state: StepState::Pending,
+                    recovery: false,
+                    authority_document: None,
+                    undo_document: None,
+                });
+                continue;
+            }
+            if matches!(&request.edit, Edit::PrivateFile(_)) {
+                fs_helpers::read_snapshot_scoped(&request.target, &request.scope_root)?
+                    .require_private()?;
+            }
+            let live = fs_helpers::read_to_string_scoped(&request.target, &request.scope_root)?;
+            let before = expected_documents
+                .get(&request.target)
+                .cloned()
+                .unwrap_or(live);
+            let edit = match request.edit {
+                Edit::AuditRotation(_) | Edit::AuditSegment(_) => {
+                    unreachable!("handled by retained audit backend")
+                }
+                Edit::WholeFile(after) => OwnedEdit::WholeFile {
+                    before,
+                    after,
+                    executable: false,
+                },
+                Edit::ExecutableFile(after) => OwnedEdit::WholeFile {
+                    before,
+                    after,
+                    executable: true,
+                },
+                Edit::ClaudeHandler(handler) => {
+                    if kind != OperationKind::RecommendedSetup {
+                        return Err("Claude handler edits require a recommended setup plan".into());
+                    }
+                    // The fixed personal destination only: the current
+                    // operator's home and its `.claude/settings.json`.
+                    let operator = crate::cli::shell_target::resolve_for_shell("unknown")?;
+                    crate::cli::shell_target::require_personal_writer(&operator)?;
+                    if request.scope_root != operator.operator_home
+                        || request.target
+                            != super::claude_config::personal_settings_path(&operator.operator_home)
+                    {
+                        return Err(
+                            "Claude handler target is not the fixed personal settings destination"
+                                .into(),
+                        );
+                    }
+                    super::claude_config::personal_activation_allowed(
+                        &request.scope_root,
+                        before.as_deref(),
+                    )
+                    .map_err(refresh)?;
+                    if !handler.matches(before.as_deref(), false)? {
+                        return Err(refresh("Claude handler preimage changed before planning"));
+                    }
+                    OwnedEdit::ClaudeHandler(handler)
+                }
+                Edit::PrivateFile(after) => OwnedEdit::PrivateFile { before, after },
+                #[cfg(test)]
+                Edit::JsonField { pointer, value } => {
+                    let document = parse_document(before.as_deref(), false)?;
+                    validate_pointer(&pointer)?;
+                    OwnedEdit::Field {
+                        yaml: false,
+                        before: document.pointer(&pointer).cloned(),
+                        pointer,
+                        after: value,
+                    }
+                }
+                Edit::YamlFields(values) => capture_fields(before.as_deref(), true, values)?,
+                Edit::ShellHook { block } => {
+                    if let Some(block) = &block {
+                        validate_hook_payload(block)?;
+                    }
+                    OwnedEdit::ShellHook {
+                        before: hook_block(before.as_deref().unwrap_or_default())?,
+                        after: block,
+                    }
+                }
+            };
+            let scope_identity = ScopeIdentity::capture(&request.scope_root)?;
+            let mut step = Step {
+                scope_identity,
+                target: request.target,
+                scope_root: request.scope_root,
+                edit,
+                activation: request.activation,
+                description: request.description,
+                state: StepState::Pending,
+                recovery: false,
+                authority_document: None,
+                undo_document: None,
+            };
+            // Preflight the actual resulting document and size before journaling.
+            let current = read_step(&step)?;
+            let transformed = transform(&step.edit, current.as_deref(), false)?;
+            if transformed
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_SETUP_FILE_BYTES)
+            {
+                return Err("planned output exceeds setup file limit".into());
+            }
+            if kind == OperationKind::SetManagedProfile
+                || policy.input_revisions.iter().any(|input| {
+                    input
+                        .source
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| Path::new(path) == step.target)
+                })
+            {
+                let after = transformed.or(current.clone());
+                let compensation = if kind == OperationKind::SetManagedProfile {
+                    current.clone()
+                } else {
+                    transform(&step.edit, after.as_deref(), true)?.or(after.clone())
+                };
+                step.authority_document = Some(AuthorityDocument {
+                    before: current.clone(),
+                    after,
+                    compensation,
+                });
+            }
+            steps.push(step);
+        }
+        steps.sort_by_key(|step| step.activation);
+        // The digest includes private owned preimages and payload, never public output.
+        let payload_digest = bind_digest(
+            digest(&(
+                kind,
+                &self.operator,
+                env!("CARGO_PKG_VERSION"),
+                &steps,
+                &shell_precondition,
+            ))?,
+            no_op,
+            policy,
+            &impact_review,
+        )?;
+        let record = Journal {
+            schema_version: SCHEMA,
+            operation_id: operation_id.into(),
+            kind,
+            operator: self.operator.clone(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            payload_digest,
+            request_digest,
+            caller_intent_digest,
+            no_op,
+            impact_review,
+            policy_identity: policy.identity.clone(),
+            authorization: policy.private_replay_guard(),
+            external_authorization: policy.private_external_inputs_guard(
+                &steps.iter().map(|step| step.target.clone()).collect(),
+            ),
+            resolution_cwd: policy.resolution_cwd().map(str::to_owned),
+            undo_external_authorization: None,
+            shell_precondition,
+            created_at: now(),
+            updated_at: now(),
+            state: if no_op {
+                JobState::Completed
+            } else {
+                JobState::Planned
+            },
+            active_action: None,
+            detail: no_op.then(|| {
+                "No settings changed; this operation ID retains the accepted intent".into()
+            }),
+            steps,
+        };
+        fs_helpers::ensure_private_directory(&self.root, &self.scope)?;
+        fs_helpers::transactional_update_checked(
+            &path,
+            &self.scope,
+            false,
+            |snapshot| {
+                snapshot.require_private()?;
+                if let Some(text) = snapshot.text(&path)? {
+                    let old: Journal = serde_json::from_str(text)
+                        .map_err(|_| "existing operation journal is malformed")?;
+                    if !replays(&old, &record) {
+                        return Err("operation ID already belongs to a different operator, kind or immutable payload".into());
+                    }
+                    return Ok(FileUpdate::unchanged());
+                }
+                Ok(FileUpdate::write_text(
+                    serde_json::to_string(&record).map_err(|e| e.to_string())?,
+                    0o600,
+                ))
+            },
+            || {
+                // A concurrent identical planner may already have committed
+                // this journal and even finished applying it. That is replay,
+                // not fresh authorization of the old preimages.
+                if let Some(existing) = fs_helpers::read_to_string_scoped(&path, &self.scope)? {
+                    let existing: Journal = serde_json::from_str(&existing)
+                        .map_err(|_| "existing operation journal is malformed")?;
+                    if replays(&existing, &record) {
+                        return Ok(());
+                    }
+                    return Err(
+                        "operation ID already belongs to a different immutable payload".into(),
+                    );
+                }
+                policy.revalidate_for_mutation().map_err(refresh)?;
+                validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs.as_ref())
+                    .map_err(refresh)?;
+                validate_claude_activation(&record).map_err(refresh)?;
+                for step in &record.steps {
+                    preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
+                    step.scope_identity.validate()?;
+                    if step.backend().locks_own_generation() {
+                        // Plan is only a preview. Apply rechecks exact bytes under
+                        // the native log lock before any archive or active write.
+                        continue;
+                    }
+                    let current = read_step(step)?;
+                    if !owned_matches(&step.edit, current.as_deref(), false)? {
+                        return Err(refresh("owned field changed before plan publication"));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.status(operation_id)
+    }
+
+    pub(super) fn rotation_plan(
+        &self,
+        operation_id: &str,
+    ) -> Result<tirith_core::audit::retention::RotationPlan, String> {
+        let record = self.read(operation_id)?;
+        if record.kind != OperationKind::RotateAudit || !record.state.completed() {
+            return Err("source must be a completed recorded rotation".into());
+        }
+        record
+            .steps
+            .iter()
+            .find_map(|step| match &step.edit {
+                OwnedEdit::AuditRotation(plan) => Some(plan.clone()),
+                _ => None,
+            })
+            .ok_or("rotation journal has no retained segment payload".into())
+    }
+
+    /// Read the private persisted result without crash reconciliation or writes.
+    pub(crate) fn read_status(&self, operation_id: &str) -> Result<OperationStatus, String> {
+        self.read(operation_id).map(|record| record.public())
+    }
+
+    pub(crate) fn status(&self, operation_id: &str) -> Result<OperationStatus, String> {
+        let record = self.read(operation_id)?;
+        if matches!(record.state, JobState::Running | JobState::CancelRequested) {
+            let lock_path = self.path(operation_id)?.with_extension("execution-lock");
+            if let Some(_lock) = fs_helpers::try_lock_operation(&lock_path, &self.scope)? {
+                let record = self.read(operation_id)?;
+                if matches!(record.state, JobState::Running | JobState::CancelRequested) {
+                    return Ok(self.update(operation_id, |record| {
+                        record.state = JobState::RecoveryRequired;
+                        record.detail = Some("worker ended without a terminal journal result; inspect owned postconditions before retry or undo".into());
+                        Ok(())
+                    })?.public());
+                }
+                return Ok(record.public());
+            }
+        }
+        Ok(record.public())
+    }
+
+    pub(crate) fn cancel(&self, operation_id: &str) -> Result<OperationStatus, String> {
+        Ok(self
+            .update(operation_id, |record| {
+                if !record.state.completed() && record.state != JobState::Cancelled {
+                    record.state = if record
+                        .steps
+                        .iter()
+                        .all(|step| step.state == StepState::Pending)
+                    {
+                        JobState::Cancelled
+                    } else {
+                        JobState::CancelRequested
+                    };
+                }
+                Ok(())
+            })?
+            .public())
+    }
+
+    /// File-only replay is idempotent: after an interrupted journal write, owned
+    /// postconditions are checked before any further publication. No subprocess
+    /// or network side effect is hidden in this service.
+    pub(crate) fn apply(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        let record = self.read(operation_id)?;
+        if record.no_op {
+            return Ok(record.public());
+        }
+        let lock_path = self.path(operation_id)?.with_extension("execution-lock");
+        let Some(_execution_lock) = fs_helpers::try_lock_operation(&lock_path, &self.scope)? else {
+            return self.status(operation_id);
+        };
+        self.apply_locked(operation_id, policy)
+    }
+
+    /// The caller retains the execution lock on this thread. Authorization and
+    /// all journal state changes occur only after that lock has been acquired.
+    /// Authorization runs once before the step loop and again at every step's
+    /// commit boundary (inside its publication lock), never fewer.
+    fn apply_locked(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        let started = Instant::now();
+        let record = self.read(operation_id)?;
+        if record.state.completed() || record.state == JobState::Cancelled {
+            return Ok(record.public());
+        }
+        let shell_inputs = match record
+            .shell_precondition
+            .as_ref()
+            .map(|value| value.retain())
+            .transpose()
+        {
+            Ok(inputs) => inputs,
+            Err(error) => return self.refuse_apply(operation_id, refresh(error)),
+        };
+        let phase = Phase::Apply(shell_inputs.as_ref());
+        if record.undo_external_authorization.is_some() {
+            return Err(refresh(
+                "undo has begun; finish recovery or create a new plan",
+            ));
+        }
+        let refreshed = record
+            .steps
+            .iter()
+            .any(|step| step.state != StepState::Pending)
+            .then(|| policy.refresh_runtime());
+        let initial_policy = refreshed.as_ref().unwrap_or(policy);
+        if let Err(error) = self.authorize(&record, initial_policy, phase, None) {
+            return self.refuse_apply(operation_id, error);
+        }
+        let record = self.read(operation_id)?;
+        if record.state.completed() || record.state == JobState::Cancelled {
+            return Ok(record.public());
+        }
+        if record.client_version != env!("CARGO_PKG_VERSION") {
+            return Err(refresh("client changed; create a compatible plan"));
+        }
+        if self.all_postconditions(&record)? {
+            return Ok(self
+                .update(operation_id, |record| {
+                    let recovery = record.steps.iter().any(|s| {
+                        s.state == StepState::Applying
+                            || (s.state == StepState::Applied && s.recovery)
+                    });
+                    record.state = JobState::Completed;
+                    record.detail = recovery.then(|| "owned postconditions are present; an interrupted publication/journal boundary requires retained-recovery review".into());
+                    for step in &mut record.steps {
+                        step.state = StepState::Applied;
+                        step.recovery = recovery;
+                    }
+                    Ok(())
+                })?
+                .public());
+        }
+        self.update(operation_id, |record| {
+            if !matches!(
+                record.state,
+                JobState::CancelRequested | JobState::Cancelled
+            ) {
+                record.state = JobState::Running;
+                record.active_action = Some(JobAction::Apply);
+            }
+            Ok(())
+        })?;
+        for index in 0..record.steps.len() {
+            let live = self.read(operation_id)?;
+            if matches!(live.state, JobState::Cancelled | JobState::CancelRequested)
+                || started.elapsed() >= JOB_TIMEOUT
+            {
+                return Ok(self
+                    .update(operation_id, |record| {
+                        let applied = record.steps.iter().any(|s| s.state == StepState::Applied);
+                        record.state = if applied {
+                            JobState::PartiallyApplied
+                        } else {
+                            JobState::Cancelled
+                        };
+                        record.detail = Some(
+                            if started.elapsed() >= JOB_TIMEOUT {
+                                "job deadline reached"
+                            } else {
+                                "cancelled before the next publication"
+                            }
+                            .into(),
+                        );
+                        Ok(())
+                    })?
+                    .public());
+            }
+            let step = live.steps[index].clone();
+            if step.state == StepState::Applied {
+                continue;
+            }
+            // Resolve after prior owned publications and outside the retained
+            // filesystem writer lock. Revalidation callbacks never do network.
+            let refreshed_step = live
+                .steps
+                .iter()
+                .any(|step| step.state != StepState::Pending)
+                .then(|| policy.refresh_runtime());
+            let step_policy = refreshed_step.as_ref().unwrap_or(initial_policy);
+            self.update(operation_id, |record| {
+                record.steps[index].state = StepState::Applying;
+                Ok(())
+            })?;
+            let except = step.backend().locks_own_generation().then_some(index);
+            let outcome = step
+                .backend()
+                .publish(&step, live.kind, step_policy, false, &mut || {
+                    let current = self.read(operation_id)?;
+                    if matches!(
+                        current.state,
+                        JobState::Cancelled | JobState::CancelRequested
+                    ) {
+                        return Err("operation cancellation requested before publication".into());
+                    }
+                    if started.elapsed() >= JOB_TIMEOUT {
+                        return Err("operation deadline reached before publication".into());
+                    }
+                    self.authorize(&current, step_policy, phase, except)
+                });
+            match outcome {
+                Ok(outcome) => {
+                    self.update(operation_id, |record| {
+                        record.steps[index].state = StepState::Applied;
+                        record.steps[index].recovery =
+                            outcome == TransactionOutcome::WrittenWithRecovery;
+                        Ok(())
+                    })?;
+                }
+                Err(error) => {
+                    return Ok(self
+                        .update(operation_id, |record| {
+                            record.state = if error.starts_with("refresh-required:") {
+                                JobState::RefreshRequired
+                            } else if error == "operation cancellation requested before publication"
+                            {
+                                if record.steps.iter().any(|s| {
+                                    matches!(s.state, StepState::Applying | StepState::Applied)
+                                }) {
+                                    JobState::PartiallyApplied
+                                } else {
+                                    JobState::Cancelled
+                                }
+                            } else {
+                                JobState::RecoveryRequired
+                            };
+                            record.detail = Some(error.clone());
+                            Ok(())
+                        })?
+                        .public());
+                }
+            }
+        }
+        Ok(self
+            .update(operation_id, |record| {
+                record.state = JobState::Completed;
+                record.detail = None;
+                Ok(())
+            })?
+            .public())
+    }
+
+    /// The one authorization decision for apply and undo. `except` names a step
+    /// whose backend rechecks its own generation under its native lock.
+    fn authorize(
+        &self,
+        record: &Journal,
+        policy: &EffectivePolicySnapshot,
+        phase: Phase<'_>,
+        except: Option<usize>,
+    ) -> Result<(), String> {
+        match phase {
+            Phase::Apply(shell_inputs) => {
+                validate_shell_lease(record.shell_precondition.as_ref(), shell_inputs)
+                    .map_err(refresh)?;
+                validate_claude_activation(record).map_err(refresh)?;
+                if let Some(review) = &record.impact_review {
+                    let age = chrono::Utc::now()
+                        .signed_duration_since(review.evaluated_at)
+                        .num_seconds();
+                    if !(0..tirith_core::policy_rollout::EVIDENCE_MAX_AGE_SECONDS).contains(&age) {
+                        return Err(refresh(
+                            "policy impact review is stale or future-dated; prepare fresh evidence",
+                        ));
+                    }
+                }
+                if record.operator != self.operator {
+                    return Err(refresh("operator changed"));
+                }
+            }
+            Phase::Undo => {
+                if let Some(precondition) = &record.shell_precondition {
+                    precondition.validate_undo().map_err(refresh)?;
+                }
+                if matches!(
+                    record.state,
+                    JobState::CancelRequested | JobState::Cancelled
+                ) {
+                    return Err("undo cancellation requested before publication".into());
+                }
+            }
+        }
+        policy.revalidate_for_mutation().map_err(refresh)?;
+        if record.resolution_cwd.as_deref() != policy.resolution_cwd() {
+            return Err(refresh("policy resolution scope changed"));
+        }
+        let excluded = record
+            .steps
+            .iter()
+            .map(|step| step.target.clone())
+            .collect();
+        let external = policy.private_external_inputs_guard(&excluded);
+        match phase {
+            Phase::Apply(_) if record.external_authorization != external => {
+                return Err(refresh("external policy inputs changed since planning"));
+            }
+            Phase::Undo if record.undo_external_authorization.as_ref() != Some(&external) => {
+                return Err(refresh("external policy inputs changed since undo began"));
+            }
+            _ => {}
+        }
+        self.validate_owned_generations(record, except)?;
+        for step in &record.steps {
+            preflight_target(record.kind, &step.scope_root, &step.target, policy)?;
+        }
+        Ok(())
+    }
+
+    fn refuse_apply(&self, operation_id: &str, error: String) -> Result<OperationStatus, String> {
+        Ok(self
+            .update(operation_id, |record| {
+                record.state = JobState::RefreshRequired;
+                record.detail = Some(error.clone());
+                Ok(())
+            })?
+            .public())
+    }
+
+    fn validate_owned_generations(
+        &self,
+        record: &Journal,
+        except: Option<usize>,
+    ) -> Result<(), String> {
+        let undo_started = record.undo_external_authorization.is_some();
+        for (index, step) in record.steps.iter().enumerate() {
+            step.scope_identity.validate()?;
+            let backend = step.backend();
+            if except == Some(index) && backend.locks_own_generation() {
+                continue;
+            }
+            backend.check_generation(step, undo_started)?;
+        }
+        Ok(())
+    }
+
+    fn capture_undo_documents(
+        &self,
+        record: &Journal,
+    ) -> Result<Vec<Option<AuthorityDocument>>, String> {
+        record
+            .steps
+            .iter()
+            .map(|step| {
+                step.scope_identity.validate()?;
+                step.backend().undo_baseline(step, record.kind)
+            })
+            .collect()
+    }
+
+    fn all_postconditions(&self, record: &Journal) -> Result<bool, String> {
+        for step in &record.steps {
+            step.scope_identity.validate()?;
+            if !step.backend().applied(step)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Undo touches only owned fields that still equal their planned generation.
+    /// A new file's compensation is an empty file; deletion is deliberately not
+    /// inferred from a pathname, preserving later unrelated content safely.
+    pub(crate) fn undo(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        let record = self.read(operation_id)?;
+        if record.kind == OperationKind::DeleteAuditSegment {
+            return Err(
+                "segment deletion is irreversible; checkpoint and deletion record remain".into(),
+            );
+        }
+        if record.no_op {
+            return Ok(record.public());
+        }
+        let lock_path = self.path(operation_id)?.with_extension("execution-lock");
+        let _execution_lock = fs_helpers::try_lock_operation(&lock_path, &self.scope)?
+            .ok_or("operation is already applying or undoing; wait for its result")?;
+        self.undo_locked(operation_id, policy)
+    }
+
+    /// Like apply: the undo decision is authorized once before the step loop
+    /// and again at every compensation's commit boundary.
+    fn undo_locked(
+        &self,
+        operation_id: &str,
+        policy: &EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        let started = Instant::now();
+        let record = self.read(operation_id)?;
+        if record.no_op || matches!(record.state, JobState::Undone | JobState::Cancelled) {
+            return Ok(record.public());
+        }
+        let refreshed = record
+            .undo_external_authorization
+            .is_some()
+            .then(|| policy.refresh_runtime());
+        let initial_policy = refreshed.as_ref().unwrap_or(policy);
+        if let Some(precondition) = &record.shell_precondition {
+            precondition.validate_undo().map_err(refresh)?;
+        }
+        initial_policy.revalidate_for_mutation().map_err(refresh)?;
+        if record.resolution_cwd.as_deref() != initial_policy.resolution_cwd() {
+            return Err(refresh("policy resolution scope changed"));
+        }
+        let undo_documents = if record.undo_external_authorization.is_some() {
+            self.validate_owned_generations(&record, None)?;
+            None
+        } else {
+            Some(self.capture_undo_documents(&record)?)
+        };
+        for step in &record.steps {
+            preflight_target(record.kind, &step.scope_root, &step.target, initial_policy)?;
+        }
+        let record = self.read(operation_id)?;
+        if record.state == JobState::Undone {
+            return Ok(record.public());
+        }
+        // Undo starts a new authorization decision, then pins external inputs
+        // for every compensation and restart. Own restored inputs may rebase.
+        let excluded = record
+            .steps
+            .iter()
+            .map(|step| step.target.clone())
+            .collect();
+        let guard = initial_policy.private_external_inputs_guard(&excluded);
+        initial_policy.revalidate_for_mutation().map_err(refresh)?;
+        self.update(operation_id, |record| {
+            if matches!(
+                record.state,
+                JobState::CancelRequested | JobState::Cancelled
+            ) {
+                return Err("undo cancellation requested before publication".into());
+            }
+            if record.undo_external_authorization.is_none() {
+                let documents = undo_documents
+                    .as_ref()
+                    .ok_or("undo baseline was not captured")?;
+                if documents.len() != record.steps.len() {
+                    return Err(refresh("undo step set changed"));
+                }
+                for (step, document) in record.steps.iter_mut().zip(documents) {
+                    step.undo_document = document.clone();
+                }
+                record.undo_external_authorization = Some(guard.clone());
+            }
+            record.state = JobState::Running;
+            record.active_action = Some(JobAction::Undo);
+            Ok(())
+        })?;
+        for index in (0..record.steps.len()).rev() {
+            let live = self.read(operation_id)?;
+            let step = live.steps[index].clone();
+            if matches!(step.state, StepState::Pending | StepState::Compensated) {
+                continue;
+            }
+            let refreshed_step = live
+                .steps
+                .iter()
+                .any(|step| matches!(step.state, StepState::Compensating | StepState::Compensated))
+                .then(|| policy.refresh_runtime());
+            let step_policy = refreshed_step.as_ref().unwrap_or(initial_policy);
+            let outcome = (|| {
+                if started.elapsed() >= JOB_TIMEOUT {
+                    return Err("undo deadline reached before the next compensation".into());
+                }
+                self.update(operation_id, |record| {
+                    record.steps[index].state = StepState::Compensating;
+                    Ok(())
+                })?;
+                let except = step.backend().locks_own_generation().then_some(index);
+                step.backend()
+                    .publish(&step, live.kind, step_policy, true, &mut || {
+                        if started.elapsed() >= JOB_TIMEOUT {
+                            return Err("undo deadline reached before publication".into());
+                        }
+                        self.authorize(&self.read(operation_id)?, step_policy, Phase::Undo, except)
+                    })
+            })();
+            match outcome {
+                Ok(outcome) => {
+                    self.update(operation_id, |record| {
+                        record.steps[index].state = StepState::Compensated;
+                        record.steps[index].recovery =
+                            outcome == TransactionOutcome::WrittenWithRecovery;
+                        Ok(())
+                    })?;
+                }
+                Err(error) => {
+                    self.update(operation_id, |record| {
+                        record.state = JobState::RecoveryRequired;
+                        record.detail = Some(error.clone());
+                        Ok(())
+                    })?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(self
+            .update(operation_id, |record| {
+                let recovery = record
+                    .steps
+                    .iter()
+                    .any(|step| step.state == StepState::Compensated && step.recovery);
+                record.state = JobState::Undone;
+                record.detail = recovery
+                    .then(|| "undo completed with retained platform recovery material".into());
+                Ok(())
+            })?
+            .public())
+    }
+
+    /// Bounded worker admission keeps long work out of HTTP request handlers.
+    /// Excess requests are rejected explicitly; no unbounded pending queue.
+    pub(crate) fn apply_async(
+        &self,
+        operation_id: String,
+        policy: EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        self.spawn_job(operation_id, policy, false)
+    }
+
+    pub(crate) fn undo_async(
+        &self,
+        operation_id: String,
+        policy: EffectivePolicySnapshot,
+    ) -> Result<OperationStatus, String> {
+        if self.read(&operation_id)?.kind == OperationKind::DeleteAuditSegment {
+            return Err(
+                "segment deletion is irreversible; checkpoint and deletion record remain".into(),
+            );
+        }
+        self.spawn_job(operation_id, policy, true)
+    }
+
+    fn spawn_job(
+        &self,
+        operation_id: String,
+        policy: EffectivePolicySnapshot,
+        undo: bool,
+    ) -> Result<OperationStatus, String> {
+        let action = if undo {
+            JobAction::Undo
+        } else {
+            JobAction::Apply
+        };
+        let path = self.path(&operation_id)?;
+        let permit = {
+            let mut reservations = worker_reservations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(active) = reservations.get(&path) {
+                if *active != action {
+                    return Err("a different action is already active for this operation".into());
+                }
+                let current = self.read(&operation_id)?.public();
+                // The first worker has reserved capacity but may not have
+                // published acceptance yet. Do not return an old terminal or
+                // Planned response as if it represented admitted work.
+                if current.active_action == Some(action) || action.already_finished(current.state) {
+                    return Ok(current);
+                }
+                return Err(
+                    "operation admission is in progress; poll its status before retrying".into(),
+                );
+            }
+            let current = self.read(&operation_id)?.public();
+            if current.no_op || action.already_finished(current.state) {
+                return Ok(current);
+            }
+            if ACTIVE_JOBS.load(Ordering::Acquire) >= MAX_ACTIVE_JOBS {
+                return Err(
+                    "operation worker capacity reached; retry after an active job completes".into(),
+                );
+            }
+            reservations.insert(path.clone(), action);
+            ACTIVE_JOBS.fetch_add(1, Ordering::AcqRel);
+            WorkerPermit { path }
+        };
+        let service = self.clone();
+        let (ready, accepted) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("tirith-mutation".into())
+            .spawn(move || {
+                let _permit = permit;
+                // Native Windows mutex ownership belongs to the thread that
+                // waits on it. Acquire and release it inside this worker.
+                let lock_path = match service.path(&operation_id) {
+                    Ok(path) => path.with_extension("execution-lock"),
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                let _execution_lock = match fs_helpers::try_lock_operation(&lock_path, &service.scope) {
+                    Ok(Some(lock)) => lock,
+                    Ok(None) => {
+                        let result = service.read(&operation_id).and_then(|record| {
+                            if !matches!(record.state, JobState::Running | JobState::CancelRequested) {
+                                Err("operation admission is in progress; poll its status before retrying".into())
+                            } else if record.active_action.is_some_and(|active| active != action) {
+                                Err("a different action is already active for this operation".into())
+                            } else {
+                                Ok(record.public())
+                            }
+                        });
+                        let _ = ready.send(result);
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                let record = match service.read(&operation_id) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                if action.already_finished(record.state) || record.state == JobState::Cancelled {
+                    let _ = ready.send(Ok(record.public()));
+                    return;
+                }
+                let admission = service.update(&operation_id, |record| {
+                    if !matches!(record.state, JobState::CancelRequested | JobState::Cancelled) {
+                        record.state = JobState::Running;
+                    }
+                    record.active_action = Some(action);
+                    Ok(())
+                });
+                let admitted = match admission {
+                    Ok(record) => record.public(),
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready.send(Ok(admitted));
+                #[cfg(test)]
+                after_worker_admission_for_test(&operation_id);
+                let outcome = match action {
+                    JobAction::Apply => service.apply_locked(&operation_id, &policy),
+                    JobAction::Undo => service.undo_locked(&operation_id, &policy),
+                };
+                if let Err(error) = outcome {
+                    // This worker still owns the execution lock. A failed
+                    // duplicate or opposing admission never writes this state.
+                    let _ = service.update(&operation_id, |record| {
+                        if !record.state.completed() && record.state != JobState::Cancelled {
+                            record.state = if record.state == JobState::CancelRequested {
+                                JobState::PartiallyApplied
+                            } else if error.starts_with("refresh-required:") {
+                                JobState::RefreshRequired
+                            } else {
+                                JobState::RecoveryRequired
+                            };
+                            record.detail = Some(error.clone());
+                        }
+                        Ok(())
+                    });
+                }
+            })
+            .map_err(|e| format!("cannot start operation worker: {e}"))?;
+        accepted.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+            "operation admission response timed out; inspect its status before retrying".to_owned()
+        })?
+    }
+}
+
+#[cfg(test)]
+struct WorkerTestPause {
+    receiver: std::sync::mpsc::Receiver<()>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+static WORKER_TEST_GATES: OnceLock<Mutex<std::collections::BTreeMap<String, WorkerTestPause>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn after_worker_admission_for_test(id: &str) {
+    let gate = WORKER_TEST_GATES
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .unwrap()
+        .remove(id);
+    if let Some(gate) = gate {
+        let _ = gate.receiver.recv_timeout(gate.timeout);
+    }
+}
+
+/// Only the explicitly selected native service fixture needs a gate longer
+/// than the production updater's ten-second drain deadline. Ordinary unit
+/// worker gates retain their original ten-second cap.
+#[cfg(all(test, unix))]
+pub(crate) struct ServiceFixtureWorkerGate {
+    id: String,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(all(test, unix))]
+impl ServiceFixtureWorkerGate {
+    pub(crate) fn new(id: &str) -> Self {
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().to_string(), id);
+        let (release, gate) = std::sync::mpsc::channel();
+        let previous = WORKER_TEST_GATES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .unwrap()
+            .insert(
+                id.into(),
+                WorkerTestPause {
+                    receiver: gate,
+                    timeout: Duration::from_secs(30),
+                },
+            );
+        assert!(previous.is_none(), "fixture operation gate already exists");
+        Self {
+            id: id.into(),
+            release: Some(release),
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        WORKER_TEST_GATES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for ServiceFixtureWorkerGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn capture_fields(
+    text: Option<&str>,
+    yaml: bool,
+    values: std::collections::BTreeMap<String, Option<Value>>,
+) -> Result<OwnedEdit, String> {
+    if values.is_empty() || values.len() > MAX_STEPS {
+        return Err("owned field group must contain 1–64 fields".into());
+    }
+    let document = parse_document(text, yaml)?;
+    let pointers: Vec<_> = values.keys().collect();
+    for pointer in &pointers {
+        validate_pointer(pointer)?;
+        if pointers
+            .iter()
+            .any(|other| other != pointer && other.starts_with(&format!("{pointer}/")))
+        {
+            return Err("owned field pointers must not overlap".into());
+        }
+    }
+    Ok(OwnedEdit::Compound {
+        original: text.map(str::to_owned),
+        edits: values
+            .into_iter()
+            .map(|(pointer, after)| OwnedEdit::Field {
+                yaml,
+                before: document.pointer(&pointer).cloned(),
+                pointer,
+                after,
+            })
+            .collect(),
+    })
+}
+
+/// Run the plan's in-place preflight for owned YAML fields against a captured
+/// preimage without journaling anything, so a preview reports the same
+/// refusal (or size limit) the real plan would hit on the unchanged file.
+pub(crate) fn preflight_yaml_fields(
+    text: Option<&str>,
+    fields: &std::collections::BTreeMap<String, Option<Value>>,
+) -> Result<(), String> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let edit = capture_fields(text, true, fields.clone())?;
+    if transform(&edit, text, false)?.is_some_and(|s| s.len() > MAX_SETUP_FILE_BYTES) {
+        return Err("planned output exceeds setup file limit".into());
+    }
+    Ok(())
+}
+
+fn validate_pointer(pointer: &str) -> Result<(), String> {
+    if !pointer.starts_with('/')
+        || pointer == "/"
+        || pointer
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part.contains('~'))
+    {
+        return Err(
+            "owned field pointer must name nonempty object keys without escape ambiguity".into(),
+        );
+    }
+    Ok(())
+}
+fn parse_document(text: Option<&str>, yaml: bool) -> Result<Value, String> {
+    let Some(text) = text.filter(|s| !s.trim().is_empty()) else {
+        return Ok(serde_json::json!({}));
+    };
+    if yaml {
+        serde_yaml::from_str(text).map_err(|_| "target is not a valid YAML object".into())
+    } else {
+        serde_json::from_str(text).map_err(|_| "target is not a valid JSON object".into())
+    }
+}
+fn set_field(document: &mut Value, pointer: &str, value: &Option<Value>) -> Result<(), String> {
+    let keys: Vec<_> = pointer.split('/').skip(1).collect();
+    let mut parent = document;
+    for key in &keys[..keys.len() - 1] {
+        let object = parent
+            .as_object_mut()
+            .ok_or_else(|| refresh("owned field parent is no longer an object"))?;
+        parent = object
+            .entry((*key).to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    let object = parent
+        .as_object_mut()
+        .ok_or_else(|| refresh("owned field parent is no longer an object"))?;
+    let key = *keys.last().ok_or("missing field key")?;
+    if let Some(value) = value {
+        object.insert(key.into(), value.clone());
+    } else {
+        object.remove(key);
+    }
+    Ok(())
+}
+
+use super::shell_profile::BEGIN_MARKER as BEGIN;
+/// The single current-version managed block, if any. Only the exact v1 BEGIN
+/// line is owned here; the shell service binds whole files for other versions.
+fn hook_block(text: &str) -> Result<Option<String>, String> {
+    use super::shell_profile::MarkerError;
+    let blocks = super::shell_profile::hook_blocks_matching(text, |line| line == BEGIN).map_err(
+        |error| {
+            refresh(match error {
+                MarkerError::NestedBegin => "multiple/nested managed shell blocks",
+                MarkerError::EndWithoutBegin => "unpaired shell END marker",
+                MarkerError::MissingEnd => "unpaired shell BEGIN marker",
+            })
+        },
+    )?;
+    match blocks.as_slice() {
+        [] => Ok(None),
+        [(start, end)] => Ok(Some(text[*start..*end].to_owned())),
+        _ => Err(refresh("multiple/nested managed shell blocks")),
+    }
+}
+fn validate_hook_payload(block: &str) -> Result<(), String> {
+    if hook_block(block)?.as_deref() != Some(block) {
+        return Err("shell payload must be exactly one managed hook block".into());
+    }
+    Ok(())
+}
+fn read_step(step: &Step) -> Result<Option<String>, String> {
+    let snapshot = fs_helpers::read_snapshot_scoped(&step.target, &step.scope_root)?;
+    if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
+        snapshot.require_private()?;
+    }
+    snapshot
+        .bytes
+        .map(|bytes| String::from_utf8(bytes).map_err(|_| "owned file is not UTF-8".into()))
+        .transpose()
+}
+
+fn step_update(step: &Step, text: String) -> FileUpdate {
+    // Claude settings and hook scripts use the same modes as `tirith setup
+    // claude-code` (0644 for new settings, exactly 0755 for the hook script).
+    let mode = match &step.edit {
+        OwnedEdit::ClaudeHandler(_) => 0o644,
+        OwnedEdit::WholeFile {
+            executable: true, ..
+        } => 0o755,
+        _ => 0o600,
+    };
+    let update = FileUpdate::write_text(text, mode).with_backup(true);
+    #[cfg(unix)]
+    if matches!(
+        &step.edit,
+        OwnedEdit::PrivateFile { .. }
+            | OwnedEdit::WholeFile {
+                executable: true,
+                ..
+            }
+    ) {
+        return update.with_exact_mode();
+    }
+    update
+}
+
+fn segment_state_matches(step: StepState, state: super::audit_segments::SegmentState) -> bool {
+    use super::audit_segments::SegmentState as S;
+    match step {
+        StepState::Pending => state == S::Original,
+        StepState::Applying | StepState::Compensating => true,
+        StepState::Applied => state == S::Applied,
+        StepState::Compensated => state == S::Original,
+    }
+}
+
+fn audit_state_matches(
+    step: StepState,
+    state: tirith_core::audit::retention::RotationState,
+) -> bool {
+    use tirith_core::audit::retention::RotationState as R;
+    match step {
+        StepState::Pending => state == R::Original,
+        StepState::Applying => !matches!(state, R::Restored),
+        StepState::Applied => matches!(state, R::Applied | R::AppliedWithAdditionalRecords),
+        StepState::Compensating => !matches!(state, R::AppliedWithAdditionalRecords),
+        StepState::Compensated => matches!(state, R::Original | R::Restored),
+    }
+}
+
+/// Which authorization decision a recheck belongs to. Apply binds the planned
+/// external inputs and live shell lease; undo binds the inputs pinned when
+/// undo began.
+#[derive(Clone, Copy)]
+enum Phase<'a> {
+    Apply(Option<&'a super::shell_service::RetainedShellInputs>),
+    Undo,
+}
+
+/// How one journaled step observes, publishes and compensates its target.
+/// Owned file edits publish through the shared file transaction; audit
+/// rotations and segment plans publish through their own native log lock and
+/// recheck their exact generation there.
+trait StepBackend {
+    /// Native backends recheck their own generation under their lock, so the
+    /// commit-time authorization excludes their step (and planning defers to
+    /// apply instead of comparing a preview).
+    fn locks_own_generation(&self) -> bool {
+        false
+    }
+    /// The observed generation agrees with the journaled step state.
+    fn check_generation(&self, step: &Step, undo_started: bool) -> Result<(), String>;
+    /// Apply's owned postcondition already holds.
+    fn applied(&self, step: &Step) -> Result<bool, String>;
+    /// Validate a new undo decision and capture its whole-document baseline.
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String>;
+    /// Publish apply (or compensation) with `authorize` rerun at the commit
+    /// boundary, inside the publication lock.
+    fn publish(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String>;
+}
+
+impl Step {
+    fn backend(&self) -> &dyn StepBackend {
+        match &self.edit {
+            OwnedEdit::AuditRotation(plan) => plan,
+            OwnedEdit::AuditSegment(plan) => plan,
+            _ => &FileEdit,
+        }
+    }
+}
+
+/// Every owned edit of one document (fields, hook blocks, whole files).
+struct FileEdit;
+
+impl StepBackend for FileEdit {
+    fn check_generation(&self, step: &Step, undo_started: bool) -> Result<(), String> {
+        let current = read_step(step)?;
+        let authority = if undo_started {
+            step.undo_document
+                .as_ref()
+                .or(step.authority_document.as_ref())
+        } else {
+            step.authority_document.as_ref()
+        };
+        let accepts = |after| -> Result<bool, String> {
+            if let Some(authority) = authority {
+                Ok(current
+                    == if after {
+                        authority.after.clone()
+                    } else {
+                        authority.before.clone()
+                    })
+            } else {
+                owned_matches(&step.edit, current.as_deref(), after)
+            }
+        };
+        let valid = match step.state {
+            StepState::Pending => accepts(false)?,
+            StepState::Applied => accepts(true)?,
+            StepState::Applying => accepts(false)? || accepts(true)?,
+            StepState::Compensated | StepState::Compensating => {
+                let compensated = if let Some(authority) = authority {
+                    current == authority.compensation
+                } else if matches!(
+                    &step.edit,
+                    OwnedEdit::WholeFile { before: None, .. }
+                        | OwnedEdit::PrivateFile { before: None, .. }
+                ) {
+                    current.as_deref() == Some("")
+                } else {
+                    accepts(false)?
+                };
+                compensated || (step.state == StepState::Compensating && accepts(true)?)
+            }
+        };
+        if !valid {
+            return Err(refresh(
+                "owned generation or authorization document changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        owned_matches(&step.edit, read_step(step)?.as_deref(), true)
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        let current = read_step(step)?;
+        if kind == OperationKind::SetManagedProfile {
+            let authority = step
+                .authority_document
+                .as_ref()
+                .ok_or_else(|| refresh("managed operation lacks its authority document"))?;
+            let unchanged = match step.state {
+                StepState::Pending => current == authority.before,
+                StepState::Applying => current == authority.before || current == authority.after,
+                StepState::Applied => current == authority.after,
+                _ => false,
+            };
+            if !unchanged {
+                return Err(refresh(
+                    "newer managed authority document prevents rollback",
+                ));
+            }
+        }
+        let valid = match step.state {
+            StepState::Pending => owned_matches(&step.edit, current.as_deref(), false)?,
+            StepState::Applying => {
+                owned_matches(&step.edit, current.as_deref(), false)?
+                    || owned_matches(&step.edit, current.as_deref(), true)?
+            }
+            StepState::Applied => owned_matches(&step.edit, current.as_deref(), true)?,
+            _ => false,
+        };
+        if !valid {
+            return Err(refresh("owned fields changed before undo authorization"));
+        }
+        let compensation = if kind == OperationKind::SetManagedProfile {
+            step.authority_document
+                .as_ref()
+                .ok_or_else(|| refresh("managed operation lacks its authority document"))?
+                .before
+                .clone()
+        } else if step.state == StepState::Pending {
+            current.clone()
+        } else {
+            transform(&step.edit, current.as_deref(), true)?.or(current.clone())
+        };
+        Ok(Some(AuthorityDocument {
+            before: current.clone(),
+            after: current,
+            compensation,
+        }))
+    }
+
+    fn publish(
+        &self,
+        step: &Step,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        super::fs_transaction::transactional_update_authorized(
+            &step.target,
+            &step.scope_root,
+            false,
+            |snapshot| {
+                if matches!(&step.edit, OwnedEdit::PrivateFile { .. }) {
+                    snapshot.require_private()?;
+                }
+                if undo && kind == OperationKind::SetManagedProfile {
+                    let document = step
+                        .undo_document
+                        .as_ref()
+                        .ok_or_else(|| refresh("managed rollback lacks its captured document"))?;
+                    let restored = document.compensation.as_deref().ok_or_else(|| {
+                        refresh("managed rollback cannot remove its authority file")
+                    })?;
+                    let current = snapshot.text(&step.target)?;
+                    if current == Some(restored) {
+                        return Ok(FileUpdate::unchanged());
+                    }
+                    if current != document.after.as_deref() {
+                        return Err(refresh(
+                            "newer managed authority document prevents rollback",
+                        ));
+                    }
+                    // Whole-document generation checks authorize restoring
+                    // the original bytes, including absent keys and comments.
+                    return Ok(step_update(step, restored.to_owned()));
+                }
+                match transform(&step.edit, snapshot.text(&step.target)?, undo)? {
+                    Some(text) => Ok(step_update(step, text)),
+                    None => Ok(FileUpdate::unchanged()),
+                }
+            },
+            authorize,
+            |bytes| authorize_publication(kind, &step.scope_root, &step.target, bytes, policy),
+        )
+    }
+}
+
+impl StepBackend for tirith_core::audit::retention::RotationPlan {
+    fn locks_own_generation(&self) -> bool {
+        true
+    }
+
+    fn check_generation(&self, step: &Step, _undo_started: bool) -> Result<(), String> {
+        let observed = super::audit_service::observe(self, &step.target, &step.scope_root)?;
+        if !audit_state_matches(step.state, observed) {
+            return Err(refresh("audit generation changed"));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        use tirith_core::audit::retention::RotationState as R;
+        Ok(matches!(
+            super::audit_service::observe(self, &step.target, &step.scope_root)?,
+            R::Applied | R::AppliedWithAdditionalRecords
+        ))
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        let observed = super::audit_service::observe(self, &step.target, &step.scope_root)?;
+        if !audit_state_matches(step.state, observed)
+            || observed
+                == tirith_core::audit::retention::RotationState::AppliedWithAdditionalRecords
+        {
+            return Err(refresh("later audit records prevent compensation"));
+        }
+        Ok(None)
+    }
+
+    fn publish(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        super::audit_service::mutate(
+            self,
+            &step.target,
+            &step.scope_root,
+            policy,
+            undo,
+            authorize,
+        )
+    }
+}
+
+impl StepBackend for super::audit_segments::SegmentPlan {
+    fn locks_own_generation(&self) -> bool {
+        true
+    }
+
+    fn check_generation(&self, step: &Step, _undo_started: bool) -> Result<(), String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        if !segment_state_matches(step.state, self.observe()?) {
+            return Err(refresh("owned segment generation changed"));
+        }
+        Ok(())
+    }
+
+    fn applied(&self, step: &Step) -> Result<bool, String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        Ok(self.observe()? == super::audit_segments::SegmentState::Applied)
+    }
+
+    fn undo_baseline(
+        &self,
+        step: &Step,
+        _kind: OperationKind,
+    ) -> Result<Option<AuthorityDocument>, String> {
+        self.validate_target(&step.target, &step.scope_root)?;
+        if self.irreversible() {
+            return Err(
+                "segment deletion is irreversible; checkpoint and deletion record remain".into(),
+            );
+        }
+        if !segment_state_matches(step.state, self.observe()?) {
+            return Err(refresh("owned exported segment changed before undo"));
+        }
+        Ok(None)
+    }
+
+    fn publish(
+        &self,
+        _step: &Step,
+        _kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        undo: bool,
+        authorize: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TransactionOutcome, String> {
+        self.mutate(policy, undo, authorize)
+    }
+}
+
+fn validate_shell_lease(
+    expected: Option<&super::shell_service::ShellPrecondition>,
+    held: Option<&super::shell_service::RetainedShellInputs>,
+) -> Result<(), String> {
+    match (expected, held) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(held)) => held.revalidate_for(expected),
+        _ => Err("shell input lease is missing or does not match the operation".into()),
+    }
+}
+
+/// Apply-time Claude host boundary: repeated by every apply authorization so a
+/// managed policy, configuration-directory override or manual hook disable
+/// that appears after planning refuses before any step (including the inactive
+/// hook script) is staged. Undo never runs this; compensation stays possible.
+fn validate_claude_activation(record: &Journal) -> Result<(), String> {
+    for step in &record.steps {
+        if matches!(step.edit, OwnedEdit::ClaudeHandler(_)) {
+            let current = fs_helpers::read_to_string_scoped(&step.target, &step.scope_root)?;
+            super::claude_config::personal_activation_allowed(
+                &step.scope_root,
+                current.as_deref(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn owned_matches(edit: &OwnedEdit, current: Option<&str>, after: bool) -> Result<bool, String> {
+    Ok(match edit {
+        OwnedEdit::ClaudeHandler(handler) => handler.matches(current, after)?,
+        OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_) => {
+            return Err("audit rotation requires the retained native log backend".into())
+        }
+        OwnedEdit::Compound { edits, .. } => {
+            let mut matches = true;
+            for edit in edits {
+                matches &= owned_matches(edit, current, after)?;
+            }
+            matches
+        }
+        OwnedEdit::WholeFile {
+            before,
+            after: output,
+            ..
+        }
+        | OwnedEdit::PrivateFile {
+            before,
+            after: output,
+        } => {
+            if after {
+                current == Some(output.as_str())
+            } else {
+                current == before.as_deref()
+            }
+        }
+        OwnedEdit::Field {
+            yaml,
+            pointer,
+            before,
+            after: output,
+        } => {
+            let value = parse_document(current, *yaml)?.pointer(pointer).cloned();
+            value
+                == if after {
+                    output.clone()
+                } else {
+                    before.clone()
+                }
+        }
+        OwnedEdit::ShellHook {
+            before,
+            after: output,
+        } => {
+            hook_block(current.unwrap_or_default())?
+                == if after {
+                    output.clone()
+                } else {
+                    before.clone()
+                }
+        }
+    })
+}
+fn transform(
+    edit: &OwnedEdit,
+    current: Option<&str>,
+    undo: bool,
+) -> Result<Option<String>, String> {
+    if let OwnedEdit::ClaudeHandler(handler) = edit {
+        return handler.transform(current, undo);
+    }
+    // New-file undo deliberately publishes an empty compensation rather than
+    // deleting a pathname. Recognize that exact result on crash retry after the
+    // journal's Compensating state has accepted its owned generation.
+    if undo
+        && current == Some("")
+        && matches!(
+            edit,
+            OwnedEdit::WholeFile { before: None, .. } | OwnedEdit::PrivateFile { before: None, .. }
+        )
+    {
+        return Ok(None);
+    }
+    if owned_matches(edit, current, !undo)? {
+        return Ok(None);
+    }
+    if !owned_matches(edit, current, undo)? {
+        return Err(refresh(
+            "owned field changed since planning; unrelated edits were preserved",
+        ));
+    }
+    let output = match edit {
+        OwnedEdit::ClaudeHandler(handler) => return handler.transform(current, undo),
+        OwnedEdit::AuditRotation(_) | OwnedEdit::AuditSegment(_) => {
+            return Err("audit rotation cannot use a file replacement".into())
+        }
+        OwnedEdit::Compound { original, edits } => {
+            // Exact-bytes undo: the file still holds exactly what applying the
+            // fields to the planned preimage writes, so restore that preimage.
+            if let (true, Some(original)) = (undo, original) {
+                if transform_fields(edits, original, false).ok().as_deref() == current {
+                    return Ok(Some(original.clone()));
+                }
+            }
+            transform_fields(edits, current.unwrap_or_default(), undo)?
+        }
+        OwnedEdit::WholeFile { before, after, .. } | OwnedEdit::PrivateFile { before, after } => {
+            if undo {
+                before.clone().unwrap_or_default()
+            } else {
+                after.clone()
+            }
+        }
+        OwnedEdit::Field {
+            yaml,
+            pointer,
+            before,
+            after,
+        } => {
+            let value = if undo { before } else { after };
+            if *yaml {
+                // Edit only the owned field's lines; comments, blank lines, key
+                // order and quoting elsewhere are kept, or the edit is refused.
+                super::yaml_edit::set_field(current.unwrap_or_default(), pointer, value.as_ref())?
+            } else {
+                let mut document = parse_document(current, false)?;
+                set_field(&mut document, pointer, value)?;
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?
+                )
+            }
+        }
+        OwnedEdit::ShellHook { before, after } => {
+            let old = if undo { after } else { before };
+            let replacement = if undo { before } else { after };
+            let mut text = current.unwrap_or_default().to_owned();
+            if let Some(old) = old {
+                text = text.replacen(old, replacement.as_deref().unwrap_or_default(), 1);
+            } else if let Some(replacement) = replacement {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(replacement);
+            }
+            text
+        }
+    };
+    Ok(Some(output))
+}
+
+fn transform_fields(edits: &[OwnedEdit], text: &str, undo: bool) -> Result<String, String> {
+    let mut output = text.to_owned();
+    for edit in edits {
+        if let Some(next) = transform(edit, Some(&output), undo)? {
+            output = next;
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::shell_profile::END_MARKER as END;
+    use super::*;
+    use crate::cli::test_harness::with_fake_env;
+    use tirith_core::policy_snapshot::ResolutionMode;
+
+    const EXPECTED_COMPLETED: JobState = JobState::Completed;
+    const EXPECTED_UNDONE: JobState = JobState::Undone;
+    /// Windows publication retains platform recovery material.
+    const EXPECTED_RECOVERY: bool = cfg!(windows);
+
+    type Plan = Result<OperationStatus, String>;
+    fn noop(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+    ) -> Plan {
+        service.submit(id, policy, PlanRequest::no_op(kind).intent(intent)?)
+    }
+    fn noop_reviewed(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+        review: ImpactReport,
+    ) -> Plan {
+        let request = PlanRequest::no_op(kind)
+            .intent(intent)?
+            .review(Some(review));
+        service.submit(id, policy, request)
+    }
+    fn change_with_preimages(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        policy: &EffectivePolicySnapshot,
+        preimages: &Preimages,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests).preimages(preimages.clone());
+        service.submit(id, policy, request)
+    }
+    fn change_with_intent(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        policy: &EffectivePolicySnapshot,
+        preimages: &Preimages,
+        intent: &impl Serialize,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests)
+            .preimages(preimages.clone())
+            .intent(intent)?;
+        service.submit(id, policy, request)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn change_reviewed(
+        service: &MutationService,
+        id: &str,
+        kind: OperationKind,
+        requests: Vec<RequestedChange>,
+        preimages: &Preimages,
+        policy: &EffectivePolicySnapshot,
+        intent: &impl Serialize,
+        review: ImpactReport,
+    ) -> Plan {
+        let request = PlanRequest::change(kind, requests)
+            .preimages(preimages.clone())
+            .intent(intent)?
+            .review(Some(review));
+        service.submit(id, policy, request)
+    }
+
+    #[test]
+    fn plan_request_intent_digest_matches_the_serialized_caller_intent() {
+        // `PlanRequest::intent` stores the intent as a JSON value; the journal
+        // digest must stay exactly the digest of the caller's typed intent.
+        let service = MutationService {
+            scope: PathBuf::from("/fixture"),
+            root: PathBuf::from("/fixture/operations"),
+            operator: "fixture-user".into(),
+        };
+        let intent = (
+            "user",
+            Some("/project"),
+            30u32,
+            serde_json::json!({"b": 1, "a": [2]}),
+        );
+        let stored = serde_json::to_value(intent.clone()).unwrap();
+        assert_eq!(
+            service
+                .intent_digest(OperationKind::SetProfile, &intent)
+                .unwrap(),
+            service
+                .intent_digest(OperationKind::SetProfile, &stored)
+                .unwrap()
+        );
+    }
+
+    fn fixture(home: &Path) -> MutationService {
+        MutationService {
+            scope: home.to_path_buf(),
+            root: home.join("private-operations"),
+            operator: "fixture-user".into(),
+        }
+    }
+    fn policy() -> EffectivePolicySnapshot {
+        EffectivePolicySnapshot::resolve(None, ResolutionMode::Runtime)
+    }
+    fn field_request(home: &Path, value: &str) -> RequestedChange {
+        RequestedChange {
+            target: home.join("settings.json"),
+            scope_root: home.to_path_buf(),
+            edit: Edit::JsonField {
+                pointer: "/tirith/profile".into(),
+                value: Some(Value::String(value.into())),
+            },
+            activation: true,
+            description: "Set the personal profile".into(),
+        }
+    }
+
+    fn deny_policy_changes() -> PathBuf {
+        let path = PathBuf::from(std::env::var_os("TIRITH_POLICY_ROOT").unwrap())
+            .join(".tirith/policy.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n",
+        )
+        .unwrap();
+        path
+    }
+
+    fn gate_worker(id: &str) -> std::sync::mpsc::Sender<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        WORKER_TEST_GATES
+            .get_or_init(|| Mutex::new(Default::default()))
+            .lock()
+            .unwrap()
+            .insert(
+                id.into(),
+                WorkerTestPause {
+                    receiver: gate,
+                    timeout: Duration::from_secs(10),
+                },
+            );
+        release
+    }
+
+    fn wait_for_workers(expected: usize) {
+        let started = Instant::now();
+        while active_job_count() != expected {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "worker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn async_admission_is_durable_idempotent_and_opposing_actions_do_not_corrupt_it() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            service
+                .plan(
+                    "admission",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy(),
+                )
+                .unwrap();
+            let baseline = active_job_count();
+            let release = gate_worker("admission");
+            let admitted = service.apply_async("admission".into(), policy()).unwrap();
+            assert_eq!(admitted.state, JobState::Running);
+            assert_eq!(admitted.active_action, Some(JobAction::Apply));
+            assert_eq!(
+                service.status("admission").unwrap().state,
+                JobState::Running
+            );
+            assert_eq!(active_job_count(), baseline + 1);
+            let duplicate = service.apply_async("admission".into(), policy()).unwrap();
+            assert_eq!(duplicate.state, JobState::Running);
+            assert_eq!(active_job_count(), baseline + 1);
+            assert!(service.undo_async("admission".into(), policy()).is_err());
+            // An invalid duplicate cannot replace the running worker's policy.
+            let mut invalid = policy();
+            invalid.policy.paranoia = 3;
+            assert_eq!(
+                service.apply("admission", &invalid).unwrap().state,
+                JobState::Running
+            );
+            assert_eq!(service.read("admission").unwrap().state, JobState::Running);
+            release.send(()).unwrap();
+            wait_for_workers(baseline);
+            assert_eq!(
+                service.status("admission").unwrap().state,
+                JobState::Completed
+            );
+
+            let release = gate_worker("admission");
+            let admitted = service.undo_async("admission".into(), policy()).unwrap();
+            assert_eq!(admitted.state, JobState::Running);
+            assert_eq!(admitted.active_action, Some(JobAction::Undo));
+            assert_eq!(
+                service
+                    .undo_async("admission".into(), policy())
+                    .unwrap()
+                    .state,
+                JobState::Running
+            );
+            assert!(service.apply_async("admission".into(), policy()).is_err());
+            assert_eq!(service.read("admission").unwrap().state, JobState::Running);
+            release.send(()).unwrap();
+            wait_for_workers(baseline);
+            assert_eq!(service.status("admission").unwrap().state, EXPECTED_UNDONE);
+        });
+    }
+
+    #[test]
+    fn cancellation_after_worker_admission_prevents_first_publication() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            service
+                .plan(
+                    "admission-cancel",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy(),
+                )
+                .unwrap();
+            let baseline = active_job_count();
+            let release = gate_worker("admission-cancel");
+            assert_eq!(
+                service
+                    .apply_async("admission-cancel".into(), policy())
+                    .unwrap()
+                    .state,
+                JobState::Running
+            );
+            assert_eq!(
+                service.cancel("admission-cancel").unwrap().state,
+                JobState::Cancelled
+            );
+            release.send(()).unwrap();
+            wait_for_workers(baseline);
+            assert!(!home.join("settings.json").exists());
+            assert_eq!(
+                service.status("admission-cancel").unwrap().state,
+                JobState::Cancelled
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_mode_drift_refuses_apply_and_undo_and_empty_compensation_is_reusable() {
+        use std::os::unix::fs::PermissionsExt;
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let target = home.join("private-feedback.json");
+            let request = |text: &str| RequestedChange {
+                target: target.clone(),
+                scope_root: home.into(),
+                edit: Edit::PrivateFile(text.into()),
+                activation: false,
+                description: "Private annotation".into(),
+            };
+            let snapshot = policy();
+            std::fs::write(&target, "before").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            service
+                .plan(
+                    "private-first",
+                    OperationKind::RecordFeedback,
+                    vec![request("first")],
+                    &snapshot,
+                )
+                .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let refused = service.apply("private-first", &snapshot);
+            assert!(refused.is_err() || refused.unwrap().state == JobState::RefreshRequired);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+            std::fs::remove_file(&target).unwrap();
+            service
+                .plan(
+                    "private-second",
+                    OperationKind::RecordFeedback,
+                    vec![request("second")],
+                    &snapshot,
+                )
+                .unwrap();
+            assert_eq!(
+                service.apply("private-second", &snapshot).unwrap().state,
+                EXPECTED_COMPLETED
+            );
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(service.undo("private-second", &snapshot).is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            service.undo("private-second", &snapshot).unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+            service
+                .plan(
+                    "private-third",
+                    OperationKind::RecordFeedback,
+                    vec![request("third")],
+                    &snapshot,
+                )
+                .unwrap();
+            service.apply("private-third", &snapshot).unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "third");
+        });
+    }
+
+    fn impact_fixture(id: &str, snapshot: &EffectivePolicySnapshot) -> ImpactReport {
+        use tirith_core::policy_rollout::{self, CandidateCoverage, ImpactRequest, RecordId};
+        policy_rollout::review(ImpactRequest {
+            id: RecordId::new(),
+            candidate_id: policy_rollout::record_id(id).unwrap(),
+            scope: RolloutScope::PersonalUser,
+            baseline: snapshot,
+            candidate: &snapshot.policy,
+            candidate_coverage: CandidateCoverage::EffectivePolicy,
+            workflows: &[],
+            exceptions: &[],
+            exception_inventory_complete: true,
+            clients: &[],
+            now: chrono::Utc::now(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn impact_attachment_binds_the_exact_personal_or_managed_authority_kind() {
+        with_fake_env(true, |_, _| {
+            let snapshot = policy();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut report = impact_fixture(&id, &snapshot);
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetProfile,
+                &snapshot.identity
+            )
+            .is_ok());
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            report.scope = RolloutScope::LocalManaged;
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_ok());
+            assert!(validate_review(
+                &Some(report.clone()),
+                &id,
+                OperationKind::SetProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            assert!(validate_review(
+                &None,
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+            report.scope = RolloutScope::RemoteManaged;
+            assert!(validate_review(
+                &Some(report),
+                &id,
+                OperationKind::SetManagedProfile,
+                &snapshot.identity
+            )
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn impact_attachment_is_immutable_for_change_and_noop_replays() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let snapshot = policy();
+            for no_op in [false, true] {
+                let id = uuid::Uuid::new_v4().to_string();
+                let review = impact_fixture(&id, &snapshot);
+                let report_id = review.id.as_str().to_owned();
+                if no_op {
+                    noop_reviewed(
+                        &service,
+                        &id,
+                        OperationKind::SetProfile,
+                        &snapshot,
+                        &"balanced",
+                        review,
+                    )
+                    .unwrap();
+                } else {
+                    change_reviewed(
+                        &service,
+                        &id,
+                        OperationKind::SetProfile,
+                        vec![field_request(home, "strict")],
+                        &Default::default(),
+                        &snapshot,
+                        &"balanced",
+                        review,
+                    )
+                    .unwrap();
+                }
+                let mut refreshed = policy();
+                refreshed.identity = uuid::Uuid::new_v4().to_string();
+                let new_review = impact_fixture(&id, &refreshed);
+                noop_reviewed(
+                    &service,
+                    &id,
+                    OperationKind::SetProfile,
+                    &refreshed,
+                    &"balanced",
+                    new_review,
+                )
+                .unwrap();
+                assert_eq!(
+                    service.impact_review(&id).unwrap().unwrap().id.as_str(),
+                    report_id
+                );
+                assert_eq!(service.read_status(&id).unwrap().no_op, no_op);
+                assert!(noop_reviewed(
+                    &service,
+                    &id,
+                    OperationKind::SetProfile,
+                    &snapshot,
+                    &"different",
+                    impact_fixture(&id, &snapshot)
+                )
+                .is_err());
+            }
+            assert!(!home.join("settings.json").exists());
+        });
+    }
+
+    #[test]
+    fn invalid_review_binding_never_publishes_a_journal() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let snapshot = policy();
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut report = impact_fixture(&id, &snapshot);
+            report.scope = RolloutScope::RemoteManaged;
+            assert!(noop_reviewed(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &snapshot,
+                &"same",
+                report
+            )
+            .is_err());
+            assert!(!service.path(&id).unwrap().exists());
+            let report = impact_fixture(&uuid::Uuid::new_v4().to_string(), &snapshot);
+            assert!(noop_reviewed(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &snapshot,
+                &"same",
+                report
+            )
+            .is_err());
+            assert!(!service.path(&id).unwrap().exists());
+        });
+    }
+
+    #[test]
+    fn no_op_intent_remains_terminal_after_drift_and_cannot_be_repurposed() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let snapshot = policy();
+            let id = uuid::Uuid::new_v4().to_string();
+            let intent = ("user", "balanced");
+            let accepted =
+                noop(&service, &id, OperationKind::SetProfile, &snapshot, &intent).unwrap();
+            assert!(accepted.no_op);
+            assert_eq!(accepted.state, JobState::Completed);
+            assert!(accepted.steps.is_empty());
+            assert!(!home.join("settings.json").exists());
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("policy.yaml"), "fail_mode: closed\n").unwrap();
+            let refreshed = policy();
+            let retry = change_with_intent(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                vec![field_request(home, "would-be-a-new-write")],
+                &refreshed,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
+            assert!(retry.no_op);
+            assert_eq!(retry.created_at, accepted.created_at);
+            assert_eq!(retry.policy_identity, accepted.policy_identity);
+            assert!(noop(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                &refreshed,
+                &("user", "strict")
+            )
+            .is_err());
+            assert!(change_with_intent(
+                &service,
+                &id,
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &refreshed,
+                &Default::default(),
+                &("user", "strict")
+            )
+            .is_err());
+            let baseline = active_job_count();
+            assert!(service.apply(&id, &refreshed).unwrap().no_op);
+            assert!(service.undo(&id, &refreshed).unwrap().no_op);
+            assert!(service.undo_async(id.clone(), refreshed).unwrap().no_op);
+            assert_eq!(active_job_count(), baseline);
+            assert!(!home.join("settings.json").exists());
+            assert!(!service
+                .path(&id)
+                .unwrap()
+                .with_extension("execution-lock")
+                .exists());
+            assert!(service.read_status(&id).unwrap().no_op);
+        });
+    }
+
+    #[test]
+    fn no_op_requires_uuid_and_binds_scope_even_when_intent_omits_it() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            assert!(noop(
+                &service,
+                "not-a-uuid",
+                OperationKind::SetProfile,
+                &policy(),
+                &"same"
+            )
+            .is_err());
+            assert!(!service.root.exists());
+            let id = uuid::Uuid::new_v4().to_string();
+            noop(&service, &id, OperationKind::SetProfile, &policy(), &"same").unwrap();
+            let scoped = EffectivePolicySnapshot::resolve(home.to_str(), ResolutionMode::Runtime);
+            assert!(noop(&service, &id, OperationKind::SetProfile, &scoped, &"same").is_err());
+        });
+    }
+
+    #[test]
+    fn caller_intent_retries_keep_first_generated_payload_and_reject_changed_scope() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let policy = policy();
+            let intent = ("user-scope", "add-grant", "30d");
+            assert!(service
+                .status_for_intent("intent", OperationKind::AddTrust, &intent)
+                .unwrap()
+                .is_none());
+            change_with_intent(
+                &service,
+                "intent",
+                OperationKind::AddTrust,
+                vec![field_request(home, "first-generated-uuid-and-expiry")],
+                &policy,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
+            let original = service.read("intent").unwrap().payload_digest;
+            change_with_intent(
+                &service,
+                "intent",
+                OperationKind::AddTrust,
+                vec![field_request(home, "regenerated-uuid-and-expiry")],
+                &policy,
+                &Default::default(),
+                &intent,
+            )
+            .unwrap();
+            assert_eq!(service.read("intent").unwrap().payload_digest, original);
+            assert!(service
+                .status_for_intent(
+                    "intent",
+                    OperationKind::AddTrust,
+                    &("another-project", "add-grant", "30d")
+                )
+                .is_err());
+            assert_eq!(
+                service.apply("intent", &policy).unwrap().state,
+                JobState::Completed
+            );
+            assert!(std::fs::read_to_string(home.join("settings.json"))
+                .unwrap()
+                .contains("first-generated"));
+            assert_eq!(
+                service
+                    .status_for_intent("intent", OperationKind::AddTrust, &intent)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Completed
+            );
+        });
+    }
+
+    #[test]
+    fn recent_operations_are_bounded_private_metadata_and_do_not_reconcile_by_writing() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            assert!(service.recent_statuses(0).is_err());
+            assert!(service.recent_statuses(51).is_err());
+            assert!(service.recent_statuses(10).unwrap().operations.is_empty());
+            assert!(!service.root.exists());
+            let id = uuid::Uuid::new_v4().to_string();
+            service
+                .plan(
+                    &id,
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "private-payload-not-for-listing")],
+                    &policy(),
+                )
+                .unwrap();
+            service
+                .update(&id, |record| {
+                    record.state = JobState::Running;
+                    Ok(())
+                })
+                .unwrap();
+            let second = uuid::Uuid::new_v4().to_string();
+            service
+                .plan(
+                    &second,
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "other-private-payload")],
+                    &policy(),
+                )
+                .unwrap();
+            std::fs::write(service.root.join("not-an-operation.json"), "not a record").unwrap();
+            let original = std::fs::read(service.path(&id).unwrap()).unwrap();
+            let listed = service.recent_statuses(10).unwrap();
+            assert_eq!(listed.operations.len(), 2);
+            assert!(listed.coverage.invalid_names > 0);
+            assert!(listed.coverage.running_requires_status_reconciliation);
+            assert_eq!(std::fs::read(service.path(&id).unwrap()).unwrap(), original);
+            let public = serde_json::to_string(&listed).unwrap();
+            for private in [
+                "private-payload",
+                "external_authorization",
+                "caller_intent_digest",
+                "undo_document",
+            ] {
+                assert!(!public.contains(private), "leaked {private}");
+            }
+            let limited = service.recent_statuses(1).unwrap();
+            assert_eq!(limited.operations.len(), 1);
+            assert!(limited.coverage.results_limited);
+        });
+    }
+
+    #[test]
+    fn concurrent_same_intent_preparation_publishes_one_immutable_payload() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let policy = policy();
+            let intent = ("user-scope", "30d");
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    change_with_intent(
+                        &service,
+                        "intent-race",
+                        OperationKind::AddTrust,
+                        vec![field_request(home, "first")],
+                        &policy,
+                        &Default::default(),
+                        &intent,
+                    )
+                });
+                let second = scope.spawn(|| {
+                    change_with_intent(
+                        &service,
+                        "intent-race",
+                        OperationKind::AddTrust,
+                        vec![field_request(home, "second")],
+                        &policy,
+                        &Default::default(),
+                        &intent,
+                    )
+                });
+                first.join().unwrap().unwrap();
+                second.join().unwrap().unwrap();
+            });
+            let original = service.read("intent-race").unwrap().payload_digest;
+            assert_eq!(
+                service.apply("intent-race", &policy).unwrap().state,
+                JobState::Completed
+            );
+            assert_eq!(
+                service.read("intent-race").unwrap().payload_digest,
+                original
+            );
+        });
+    }
+
+    fn migration_fixture(
+        home: &Path,
+    ) -> (MutationService, EffectivePolicySnapshot, PathBuf, PathBuf) {
+        let config = tirith_core::policy::config_dir().unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("policy.yaml"), "fail_mode: open\n").unwrap();
+        let legacy = config.join("trust.json");
+        let grants = config.join("trust-grants.json");
+        std::fs::write(
+            &legacy,
+            r#"{"entries":[{"pattern":"trusted.example.test","rule_id":"pipe_to_shell"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&grants, r#"{"schema_version":1,"grants":[]}"#).unwrap();
+        let policy = policy();
+        let service = fixture(home);
+        let changes = vec![
+            RequestedChange {
+                target: legacy.clone(),
+                scope_root: config.clone(),
+                edit: Edit::JsonField {
+                    pointer: "/entries".into(),
+                    value: Some(serde_json::json!([])),
+                },
+                activation: false,
+                description: "Remove migrated legacy grant".into(),
+            },
+            RequestedChange {
+                target: grants.clone(),
+                scope_root: config,
+                edit: Edit::JsonField {
+                    pointer: "/grants".into(),
+                    value: Some(serde_json::json!([{
+                        "id": "c1be9ee4-7b03-4e9e-86db-ac11b2a962b1", "pattern": "trusted.example.test",
+                        "rule_id": "pipe_to_shell", "scope": {"kind":"user"}, "created_at":"2026-01-01T00:00:00Z"
+                    }])),
+                },
+                activation: true,
+                description: "Activate scoped grant".into(),
+            },
+        ];
+        service
+            .plan("migration", OperationKind::AddTrust, changes, &policy)
+            .unwrap();
+        (service, policy, legacy, grants)
+    }
+
+    #[test]
+    fn policy_reading_two_file_migration_and_undo_rebase_only_owned_generations() {
+        with_fake_env(true, |home, _| {
+            let (service, original, legacy, grants) = migration_fixture(home);
+            let result = service.apply("migration", &original).unwrap();
+            assert_eq!(result.state, EXPECTED_COMPLETED, "{:?}", result.detail);
+            assert_eq!(result.recovery, EXPECTED_RECOVERY);
+            assert!(result
+                .steps
+                .iter()
+                .all(|step| step.recovery == EXPECTED_RECOVERY));
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&legacy).unwrap()).unwrap()
+                    ["entries"],
+                serde_json::json!([])
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&grants).unwrap()).unwrap()
+                    ["grants"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let undone = service.undo("migration", &policy()).unwrap();
+            assert_eq!(undone.state, EXPECTED_UNDONE);
+            assert_eq!(undone.recovery, EXPECTED_RECOVERY);
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&legacy).unwrap()).unwrap()
+                    ["entries"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&grants).unwrap()).unwrap()
+                    ["grants"],
+                serde_json::json!([])
+            );
+        });
+    }
+
+    #[test]
+    fn rebase_refuses_external_policy_drift_after_partial_publication() {
+        with_fake_env(true, |home, _| {
+            let (service, original, legacy, grants) = migration_fixture(home);
+            let journal = service.read("migration").unwrap();
+            let first = &journal.steps[0];
+            let text = fs_helpers::read_to_string_scoped(&first.target, &first.scope_root).unwrap();
+            let published = transform(&first.edit, text.as_deref(), false)
+                .unwrap()
+                .unwrap();
+            std::fs::write(&legacy, published).unwrap();
+            service
+                .update("migration", |journal| {
+                    journal.steps[0].state = StepState::Applying;
+                    journal.state = JobState::Running;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                service.status("migration").unwrap().state,
+                JobState::RecoveryRequired
+            );
+            std::fs::write(
+                tirith_core::policy::config_dir()
+                    .unwrap()
+                    .join("policy.yaml"),
+                "fail_mode: closed\n",
+            )
+            .unwrap();
+            let result = service.apply("migration", &original).unwrap();
+            assert_eq!(result.state, JobState::RefreshRequired);
+            assert!(result.detail.unwrap().contains("external policy inputs"));
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&grants).unwrap()).unwrap()
+                    ["grants"],
+                serde_json::json!([])
+            );
+        });
+    }
+
+    #[test]
+    fn rebase_cannot_hide_unrelated_authority_edits_inside_owned_file() {
+        with_fake_env(true, |home, _| {
+            let (service, _, legacy, grants) = migration_fixture(home);
+            let mut document: Value =
+                serde_json::from_str(&std::fs::read_to_string(&legacy).unwrap()).unwrap();
+            document["unrelated_authority_metadata"] = serde_json::json!("changed");
+            std::fs::write(&legacy, serde_json::to_string(&document).unwrap()).unwrap();
+            let result = service.apply("migration", &policy()).unwrap();
+            assert_eq!(result.state, JobState::RefreshRequired);
+            assert!(result
+                .detail
+                .unwrap()
+                .contains("authorization document changed"));
+            assert_eq!(
+                serde_json::from_str::<Value>(&std::fs::read_to_string(&grants).unwrap()).unwrap()
+                    ["grants"],
+                serde_json::json!([])
+            );
+        });
+    }
+
+    #[test]
+    fn status_distinguishes_live_worker_lock_from_crashed_running_journal() {
+        with_fake_env(true, |home, _| {
+            let (service, _, _, _) = migration_fixture(home);
+            service
+                .update("migration", |record| {
+                    record.state = JobState::Running;
+                    Ok(())
+                })
+                .unwrap();
+            let lock_path = service
+                .path("migration")
+                .unwrap()
+                .with_extension("execution-lock");
+            std::thread::scope(|threads| {
+                let (ready, waiting) = std::sync::mpsc::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                let scope = &service.scope;
+                let lock_path = &lock_path;
+                let worker = threads.spawn(move || {
+                    let _lock = fs_helpers::try_lock_operation(lock_path, scope)
+                        .unwrap()
+                        .unwrap();
+                    ready.send(()).unwrap();
+                    let _ = held.recv_timeout(Duration::from_secs(10));
+                });
+                waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(
+                    service.status("migration").unwrap().state,
+                    JobState::Running
+                );
+                release.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            assert_eq!(
+                service.status("migration").unwrap().state,
+                JobState::RecoveryRequired
+            );
+        });
+    }
+
+    #[test]
+    fn task_gate_denial_precedes_journal_and_destination_side_effects() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            deny_policy_changes();
+            let policy = policy();
+            let error = service
+                .plan(
+                    "denied",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy,
+                )
+                .unwrap_err();
+            assert!(error.contains("task gate"), "{error}");
+            assert!(!service.root.exists());
+            assert!(!home.join("settings.json").exists());
+        });
+    }
+
+    #[test]
+    fn changed_task_policy_blocks_apply_and_undo_before_destination_changes() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let policy = policy();
+            service
+                .plan(
+                    "recheck",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy,
+                )
+                .unwrap();
+            let denied_path = deny_policy_changes();
+            let denied = self::policy();
+            let result = service.apply("recheck", &denied).unwrap();
+            assert_eq!(result.state, JobState::RefreshRequired);
+            assert!(result
+                .detail
+                .unwrap()
+                .contains("external policy inputs changed since planning"));
+            assert!(!home.join("settings.json").exists());
+            // Coordination may create its private lock before authorization;
+            // no destination or applied step may change on a denied request.
+            assert!(service
+                .read("recheck")
+                .unwrap()
+                .steps
+                .iter()
+                .all(|step| step.state == StepState::Pending));
+            std::fs::remove_file(&denied_path).unwrap();
+            let fresh = self::policy();
+            service
+                .plan(
+                    "undo-recheck",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &fresh,
+                )
+                .unwrap();
+            assert_eq!(
+                service.apply("undo-recheck", &fresh).unwrap().state,
+                JobState::Completed
+            );
+            let original = std::fs::read(home.join("settings.json")).unwrap();
+            deny_policy_changes();
+            let error = service.undo("undo-recheck", &self::policy()).unwrap_err();
+            assert!(error.contains("task gate"), "{error}");
+            assert_eq!(std::fs::read(home.join("settings.json")).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn commit_boundary_rechecks_authorization_changed_by_an_earlier_step() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let root = PathBuf::from(std::env::var_os("TIRITH_POLICY_ROOT").unwrap());
+            std::fs::create_dir_all(root.join(".tirith")).unwrap();
+            let policy = policy();
+            // Step 0 (staged first) publishes a policy denying policy changes;
+            // only the commit-time recheck of step 1 can observe it.
+            service
+                .plan(
+                    "commit-recheck",
+                    OperationKind::SetProfile,
+                    vec![
+                        RequestedChange {
+                            target: root.join(".tirith/policy.yaml"),
+                            scope_root: root.clone(),
+                            edit: Edit::WholeFile(
+                                "task_gate:\n  mode: enforce\n  effects_denied_for_untrusted_sources: [policy_change]\n"
+                                    .into(),
+                            ),
+                            activation: false,
+                            description: "Stage a policy".into(),
+                        },
+                        field_request(home, "strict"),
+                    ],
+                    &policy,
+                )
+                .unwrap();
+            let result = service.apply("commit-recheck", &policy).unwrap();
+            assert_eq!(
+                result.state,
+                JobState::RefreshRequired,
+                "{:?}",
+                result.detail
+            );
+            assert!(result
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("refresh-required:")));
+            assert_eq!(result.steps[0].state, StepState::Applied);
+            assert_ne!(result.steps[1].state, StepState::Applied);
+            assert!(!home.join("settings.json").exists());
+        });
+    }
+
+    #[test]
+    fn caller_bound_preimages_reject_owned_edits_before_plan_capture() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let old = r#"{"tirith":{"profile":"balanced"}}"#;
+            let expected = std::collections::BTreeMap::from([(
+                home.join("settings.json"),
+                Some(old.to_owned()),
+            )]);
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"manual"}}"#,
+            )
+            .unwrap();
+            let error = change_with_preimages(
+                &service,
+                "caller-race",
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &policy(),
+                &expected,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("refresh-required:"), "{error}");
+            assert!(std::fs::read_to_string(home.join("settings.json"))
+                .unwrap()
+                .contains("manual"));
+            assert!(!service.path("caller-race").unwrap().exists());
+        });
+    }
+
+    #[test]
+    fn caller_bound_preimages_preserve_unrelated_edits_before_plan_capture() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let old = r#"{"tirith":{"profile":"balanced"}}"#;
+            let expected = std::collections::BTreeMap::from([(
+                home.join("settings.json"),
+                Some(old.to_owned()),
+            )]);
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"balanced"},"editor":"new"}"#,
+            )
+            .unwrap();
+            let authorization = policy();
+            change_with_preimages(
+                &service,
+                "caller-unrelated",
+                OperationKind::SetProfile,
+                vec![field_request(home, "strict")],
+                &authorization,
+                &expected,
+            )
+            .unwrap();
+            assert_eq!(
+                service
+                    .apply("caller-unrelated", &authorization)
+                    .unwrap()
+                    .state,
+                EXPECTED_COMPLETED
+            );
+            let result: Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(result["editor"], "new");
+            assert_eq!(result["tirith"]["profile"], "strict");
+        });
+    }
+
+    #[test]
+    fn owned_field_updates_preserve_unrelated_concurrent_edits() {
+        let edit = OwnedEdit::Field {
+            yaml: false,
+            pointer: "/tirith/profile".into(),
+            before: Some(Value::String("balanced".into())),
+            after: Some(Value::String("strict".into())),
+        };
+        let current = r#"{"tirith":{"profile":"balanced","new_setting":42},"editor":"changed"}"#;
+        let result: Value =
+            serde_json::from_str(&transform(&edit, Some(current), false).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(result["editor"], "changed");
+        assert_eq!(result["tirith"]["new_setting"], 42);
+        assert_eq!(result["tirith"]["profile"], "strict");
+        assert!(
+            transform(&edit, Some(r#"{"tirith":{"profile":"other"}}"#), false)
+                .unwrap_err()
+                .starts_with("refresh-required:")
+        );
+    }
+
+    #[test]
+    fn undo_refuses_changed_owned_field_but_preserves_other_fields() {
+        let edit = OwnedEdit::Field {
+            yaml: false,
+            pointer: "/tirith".into(),
+            before: Some(Value::Bool(false)),
+            after: Some(Value::Bool(true)),
+        };
+        let output = transform(&edit, Some(r#"{"tirith":true,"new":"keep"}"#), true)
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["tirith"], false);
+        assert_eq!(value["new"], "keep");
+        assert!(transform(&edit, Some(r#"{"tirith":"changed"}"#), true).is_err());
+    }
+
+    #[test]
+    fn managed_hook_edits_preserve_manual_lines_and_fail_on_ambiguous_markers() {
+        let block = format!("{BEGIN}\neval \"$(tirith init --shell bash)\"\n{END}\n");
+        let edit = OwnedEdit::ShellHook {
+            before: None,
+            after: Some(block.clone()),
+        };
+        let activated = transform(&edit, Some("# manual\n"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(activated, format!("# manual\n{block}"));
+        assert_eq!(
+            transform(&edit, Some(&activated), true).unwrap().unwrap(),
+            "# manual\n"
+        );
+        assert!(hook_block(&format!("{block}{block}")).is_err());
+        assert!(hook_block(&format!("{BEGIN}\nno end")).is_err());
+    }
+
+    #[test]
+    fn plan_restart_apply_and_identical_retry_have_one_effect() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let initial = policy();
+            let preview = service
+                .plan(
+                    "retry-1",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &initial,
+                )
+                .unwrap();
+            assert_eq!(preview.state, JobState::Planned);
+            assert!(!home.join("settings.json").exists());
+            let fresh = policy();
+            assert_ne!(initial.identity, fresh.identity);
+            let result = service.apply("retry-1", &fresh).unwrap();
+            assert_eq!(result.state, JobState::Completed);
+            let generation = std::fs::metadata(home.join("settings.json"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let retry = service
+                .plan(
+                    "retry-1",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy(),
+                )
+                .unwrap();
+            assert_eq!(retry.state, JobState::Completed);
+            assert_eq!(
+                service.apply("retry-1", &policy()).unwrap().state,
+                JobState::Completed
+            );
+            assert_eq!(
+                std::fs::metadata(home.join("settings.json"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                generation
+            );
+            assert!(service
+                .plan(
+                    "retry-1",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "balanced")],
+                    &policy()
+                )
+                .is_err());
+            assert!(service
+                .plan(
+                    "retry-1",
+                    OperationKind::SetupShell,
+                    vec![field_request(home, "strict")],
+                    &policy()
+                )
+                .is_err());
+            let mut other_operator = service.clone();
+            other_operator.operator = "someone-else".into();
+            assert!(other_operator.status("retry-1").is_err());
+        });
+    }
+
+    #[test]
+    fn concurrent_owned_edits_require_refresh_and_unrelated_edits_survive() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"balanced"}}"#,
+            )
+            .unwrap();
+            let authorization = policy();
+            service
+                .plan(
+                    "concurrent",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &authorization,
+                )
+                .unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"balanced"},"new":"keep"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                service.apply("concurrent", &authorization).unwrap().state,
+                EXPECTED_COMPLETED
+            );
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(value["new"], "keep");
+            service
+                .plan(
+                    "conflicting",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "balanced")],
+                    &policy(),
+                )
+                .unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"other"},"new":"keep"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                service.apply("conflicting", &policy()).unwrap().state,
+                JobState::RefreshRequired
+            );
+            assert!(std::fs::read_to_string(home.join("settings.json"))
+                .unwrap()
+                .contains("other"));
+        });
+    }
+
+    #[test]
+    fn cancellation_before_commit_never_changes_destination() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let authorization = policy();
+            service
+                .plan(
+                    "cancel",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &authorization,
+                )
+                .unwrap();
+            assert_eq!(service.cancel("cancel").unwrap().state, JobState::Cancelled);
+            assert_eq!(
+                service.apply("cancel", &authorization).unwrap().state,
+                JobState::Cancelled
+            );
+            assert!(!home.join("settings.json").exists());
+        });
+    }
+
+    #[test]
+    fn interrupted_publication_reconciles_without_rewriting_and_retains_uncertainty() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let authorization = policy();
+            service
+                .plan(
+                    "interrupted",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &authorization,
+                )
+                .unwrap();
+            service
+                .update("interrupted", |record| {
+                    record.state = JobState::Running;
+                    record.steps[0].state = StepState::Applying;
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"strict"},"other":"survives"}"#,
+            )
+            .unwrap();
+            let before = std::fs::read(home.join("settings.json")).unwrap();
+            let recovered = service.apply("interrupted", &authorization).unwrap();
+            assert_eq!(recovered.state, JobState::Completed);
+            assert!(recovered.recovery && recovered.steps.iter().all(|step| step.recovery));
+            assert_eq!(std::fs::read(home.join("settings.json")).unwrap(), before);
+            // The public flag and the journaled step flag describe only the
+            // latest publication: a clean compensation clears both.
+            let undone = service.undo("interrupted", &authorization).unwrap();
+            assert_eq!(undone.state, JobState::Undone, "{:?}", undone.detail);
+            assert_eq!(undone.recovery, EXPECTED_RECOVERY);
+            assert!(undone
+                .steps
+                .iter()
+                .all(|step| step.recovery == EXPECTED_RECOVERY));
+            let raw: Value = serde_json::from_slice(
+                &std::fs::read(service.path("interrupted").unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert!(raw["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["state"] == "compensated"
+                    && step.get("recovery").is_some() == EXPECTED_RECOVERY));
+        });
+    }
+
+    #[test]
+    fn undo_is_generation_checked_and_replayable() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"balanced"}}"#,
+            )
+            .unwrap();
+            service
+                .plan(
+                    "undo",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "strict")],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("undo", &policy()).unwrap();
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"tirith":{"profile":"strict"},"other":"keep"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                service.undo("undo", &policy()).unwrap().state,
+                EXPECTED_UNDONE
+            );
+            assert_eq!(
+                service.undo("undo", &policy()).unwrap().state,
+                EXPECTED_UNDONE
+            );
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(value["tirith"]["profile"], "balanced");
+            assert_eq!(value["other"], "keep");
+        });
+    }
+
+    #[test]
+    fn undo_authority_baseline_preserves_prior_unrelated_edits_and_rejects_later_drift() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let target = config.join("policy.yaml");
+            std::fs::write(&target, "fail_mode: open\n").unwrap();
+            let fields = std::collections::BTreeMap::from([(
+                "/fail_mode".into(),
+                Some(serde_json::json!("closed")),
+            )]);
+            service
+                .plan(
+                    "undo-policy",
+                    OperationKind::SetProfile,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: config.clone(),
+                        edit: Edit::YamlFields(fields.clone()),
+                        activation: true,
+                        description: "Change one owned policy field".into(),
+                    }],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("undo-policy", &policy()).unwrap();
+            std::fs::write(
+                &target,
+                "fail_mode: closed\nnote: keep this unrelated edit\n",
+            )
+            .unwrap();
+            assert_eq!(
+                service.undo("undo-policy", &policy()).unwrap().state,
+                EXPECTED_UNDONE
+            );
+            let restored: Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+            assert_eq!(restored["fail_mode"], "open");
+            assert_eq!(restored["note"], "keep this unrelated edit");
+
+            service
+                .plan(
+                    "undo-policy-drift",
+                    OperationKind::SetProfile,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: config,
+                        edit: Edit::YamlFields(fields),
+                        activation: true,
+                        description: "Change one owned policy field".into(),
+                    }],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("undo-policy-drift", &policy()).unwrap();
+            let captured = service.read("undo-policy-drift").unwrap();
+            let documents = service.capture_undo_documents(&captured).unwrap();
+            let snapshot = policy();
+            service
+                .update("undo-policy-drift", |record| {
+                    record.undo_external_authorization =
+                        Some(snapshot.private_external_inputs_guard(
+                            &std::iter::once(target.clone()).collect(),
+                        ));
+                    record.steps[0].undo_document = documents[0].clone();
+                    record.steps[0].state = StepState::Compensating;
+                    record.state = JobState::Running;
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(
+                &target,
+                "fail_mode: closed\nnote: changed after undo began\n",
+            )
+            .unwrap();
+            assert!(service.undo("undo-policy-drift", &policy()).is_err());
+            assert!(std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("changed after undo began"));
+        });
+    }
+
+    #[test]
+    fn yaml_field_edits_keep_comments_and_layout_and_undo_restores_exact_bytes() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let target = config.join("policy.yaml");
+            let original = "# My personal policy\n\nfail_mode: open   # keep it open for now\n\n# Overrides I chose\nseverity_overrides:\n  # quoted on purpose\n  'pipe_to_interpreter': medium\n\nparanoia: 2\n";
+            std::fs::write(&target, original).unwrap();
+            let fields = std::collections::BTreeMap::from([
+                ("/fail_mode".into(), Some(serde_json::json!("closed"))),
+                (
+                    "/severity_overrides/shortened_url".into(),
+                    Some(serde_json::json!("high")),
+                ),
+                ("/strict_warn".into(), Some(serde_json::json!(true))),
+            ]);
+            service
+                .plan(
+                    "keep-layout",
+                    OperationKind::SetProfile,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: config,
+                        edit: Edit::YamlFields(fields),
+                        activation: true,
+                        description: "Change owned policy fields".into(),
+                    }],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("keep-layout", &policy()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "# My personal policy\n\nfail_mode: closed   # keep it open for now\n\n# Overrides I chose\nseverity_overrides:\n  # quoted on purpose\n  'pipe_to_interpreter': medium\n  shortened_url: high\n\nparanoia: 2\nstrict_warn: true\n"
+            );
+            assert_eq!(
+                service.undo("keep-layout", &policy()).unwrap().state,
+                EXPECTED_UNDONE
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn yaml_field_undo_round_trips_exact_bytes_and_keeps_later_unrelated_edits() {
+        let fields = |pairs: &[(&str, Option<Value>)]| {
+            pairs
+                .iter()
+                .map(|(pointer, value)| ((*pointer).to_owned(), value.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let cases = [
+            (
+                "# crlf\r\nfail_mode: \"open\"\r\nseverity_overrides:\r\n  shortened_url: low\r\n",
+                fields(&[
+                    ("/fail_mode", Some(serde_json::json!("closed"))),
+                    ("/severity_overrides/shortened_url", None),
+                ]),
+            ),
+            (
+                "paranoia: 2   # mine\n\n# removed and re-added on undo\nstrict_warn: True\nzeta: 1\n",
+                fields(&[
+                    ("/strict_warn", None),
+                    ("/paranoia", Some(serde_json::json!(3))),
+                ]),
+            ),
+            (
+                "protection_profile:\n    name: balanced\n    version: 1\nscan:\n    require_complete: false # x\n",
+                fields(&[
+                    (
+                        "/protection_profile",
+                        Some(serde_json::json!({"name": "strict", "version": 1})),
+                    ),
+                    ("/scan/require_complete", Some(serde_json::json!(true))),
+                    ("/action_overrides/shortened_url", Some(serde_json::json!("warn"))),
+                ]),
+            ),
+        ];
+        for (original, values) in cases {
+            let edit = capture_fields(Some(original), true, values).unwrap();
+            let applied = transform(&edit, Some(original), false).unwrap().unwrap();
+            assert_ne!(applied, original);
+            assert_eq!(
+                transform(&edit, Some(&applied), true).unwrap().as_deref(),
+                Some(original),
+                "exact undo of {original:?}"
+            );
+            // After an unrelated later edit, undo restores only the owned
+            // fields and keeps the later edit and the file's layout.
+            let eol = if original.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let later = format!("{applied}# added later{eol}note: keep{eol}");
+            let undone = transform(&edit, Some(&later), true).unwrap().unwrap();
+            assert!(undone.contains(&format!("# added later{eol}note: keep{eol}")));
+            let restored: Value = serde_yaml::from_str(&undone).unwrap();
+            let mut expected: Value = serde_yaml::from_str(original).unwrap();
+            expected["note"] = serde_json::json!("keep");
+            if original.starts_with("protection_profile") {
+                // As before, removing an owned leaf keeps a parent that apply
+                // created, as an empty mapping.
+                expected["action_overrides"] = serde_json::json!({});
+            }
+            assert_eq!(restored, expected, "semantic undo of {original:?}");
+        }
+        // The new-file case still compensates to an empty mapping.
+        let edit = capture_fields(
+            None,
+            true,
+            fields(&[("/strict_warn", Some(serde_json::json!(true)))]),
+        )
+        .unwrap();
+        let applied = transform(&edit, None, false).unwrap().unwrap();
+        assert_eq!(applied, "strict_warn: true\n");
+        assert_eq!(
+            transform(&edit, Some(&applied), true).unwrap().as_deref(),
+            Some("{}\n")
+        );
+    }
+
+    /// A trailing `...` document-end marker and a multi-line flow collection
+    /// closing in the key column are edited in place (they used to refuse),
+    /// and undo restores the exact bytes, also field by field after an
+    /// unrelated later edit.
+    #[test]
+    fn yaml_field_undo_is_exact_around_a_document_end_marker_and_a_key_column_flow_closer() {
+        let values = || {
+            std::collections::BTreeMap::from([
+                ("/fail_mode".to_owned(), Some(serde_json::json!("closed"))),
+                ("/severity_overrides/shortened_url".to_owned(), None),
+                ("/strict_warn".to_owned(), Some(serde_json::json!(true))),
+            ])
+        };
+        for (original, expected) in [
+            (
+                "fail_mode: open  # mine\nseverity_overrides:\n  shortened_url: low\n...\n# end\n",
+                "fail_mode: closed  # mine\nseverity_overrides: {}\nstrict_warn: true\n...\n# end\n",
+            ),
+            (
+                "allowlist: [\n  \"a.example\"\n]\nfail_mode: open  # mine\nseverity_overrides:\n  shortened_url: low\n",
+                "allowlist: [\n  \"a.example\"\n]\nfail_mode: closed  # mine\nseverity_overrides: {}\nstrict_warn: true\n",
+            ),
+        ] {
+            let edit = capture_fields(Some(original), true, values()).unwrap();
+            let applied = transform(&edit, Some(original), false).unwrap().unwrap();
+            assert_eq!(applied, expected);
+            assert_eq!(
+                transform(&edit, Some(&applied), true).unwrap().as_deref(),
+                Some(original),
+                "exact undo of {original:?}"
+            );
+            let later = applied.replace("# mine", "# mine, edited later");
+            let undone = transform(&edit, Some(&later), true).unwrap().unwrap();
+            assert_eq!(
+                undone,
+                original.replace("# mine", "# mine, edited later"),
+                "field-wise undo of {original:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_field_plan_refuses_unsafe_in_place_edit_with_a_diff_and_changes_nothing() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let config = tirith_core::policy::config_dir().unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let target = config.join("policy.yaml");
+            let original = "# flow style parent\nseverity_overrides: {shortened_url: low}\n";
+            std::fs::write(&target, original).unwrap();
+            let Err(error) = service.plan(
+                "refuse-flow",
+                OperationKind::SetProfile,
+                vec![RequestedChange {
+                    target: target.clone(),
+                    scope_root: config,
+                    edit: Edit::YamlFields(std::collections::BTreeMap::from([(
+                        "/severity_overrides/plain_http_to_sink".into(),
+                        Some(serde_json::json!("high")),
+                    )])),
+                    activation: true,
+                    description: "Change one owned policy field".into(),
+                }],
+                &policy(),
+            ) else {
+                panic!("flow-style parent must be refused");
+            };
+            assert!(error.contains("in place"), "{error}");
+            assert!(error.contains("+   plain_http_to_sink: high"), "{error}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+            assert!(service.read("refuse-flow").is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    mod managed_undo_restart {
+        use super::*;
+        use crate::cli::test_harness::EnvGuard;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn resume_compensation(publication_finished: bool, later_edit: bool) {
+            with_fake_env(true, |home, _| {
+                let organization = home.join("organization");
+                let directory = organization.join(".tirith");
+                std::fs::create_dir_all(&directory).unwrap();
+                for path in [&organization, &directory] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let target = directory.join("policy.yml");
+                let original =
+                    "# retained organization comment\norganization_note: \"original spelling\"\n";
+                std::fs::write(&target, original).unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let _organization = EnvGuard::set("TIRITH_POLICY_ROOT", &organization);
+                let service = fixture(home);
+                let id = uuid::Uuid::new_v4().to_string();
+                let snapshot = policy();
+                let mut review = impact_fixture(&id, &snapshot);
+                review.scope = RolloutScope::LocalManaged;
+                let preimages =
+                    std::collections::BTreeMap::from([(target.clone(), Some(original.to_owned()))]);
+                let planned = change_reviewed(
+                    &service,
+                    &id,
+                    OperationKind::SetManagedProfile,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: directory,
+                        edit: Edit::YamlFields(std::collections::BTreeMap::from([
+                            (
+                                "/protection_profile/name".into(),
+                                Some(serde_json::json!("balanced")),
+                            ),
+                            (
+                                "/protection_profile/version".into(),
+                                Some(serde_json::json!(1)),
+                            ),
+                        ])),
+                        activation: true,
+                        description: "Set the selected organization profile".into(),
+                    }],
+                    &preimages,
+                    &snapshot,
+                    &serde_json::json!({"scope": "org", "profile": "balanced"}),
+                    review,
+                );
+                if unsafe { libc::geteuid() } == 0 || unsafe { libc::geteuid() != libc::getuid() } {
+                    assert!(planned.is_err());
+                    assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                    eprintln!("managed undo restart requires an ordinary owner; this host exercised privileged refusal only");
+                    return;
+                }
+                assert_eq!(planned.unwrap().state, JobState::Planned);
+                assert_eq!(
+                    service.apply(&id, &snapshot).unwrap().state,
+                    JobState::Completed
+                );
+                let applied = std::fs::read_to_string(&target).unwrap();
+                let document: serde_yaml::Value = serde_yaml::from_str(&applied).unwrap();
+                assert_eq!(document["protection_profile"]["name"], "balanced");
+                assert_ne!(applied, original);
+
+                // Retain the real new-plan undo baseline, then simulate a crash
+                // after Compensating was journaled but before its completion.
+                let journal = service.read(&id).unwrap();
+                let documents = service.capture_undo_documents(&journal).unwrap();
+                let authorization = policy();
+                let excluded = std::iter::once(target.clone()).collect();
+                service
+                    .update(&id, |record| {
+                        record.undo_external_authorization =
+                            Some(authorization.private_external_inputs_guard(&excluded));
+                        record.steps[0].undo_document = documents[0].clone();
+                        record.steps[0].state = StepState::Compensating;
+                        record.state = JobState::Running;
+                        record.active_action = Some(JobAction::Undo);
+                        Ok(())
+                    })
+                    .unwrap();
+                if publication_finished {
+                    std::fs::write(&target, original).unwrap();
+                }
+                if later_edit {
+                    let current = std::fs::read_to_string(&target).unwrap();
+                    std::fs::write(&target, format!("{current}# later managed generation\n"))
+                        .unwrap();
+                }
+                let retained_bytes = std::fs::read(&target).unwrap();
+                let retained_inode = std::fs::metadata(&target).unwrap().ino();
+                drop(service);
+
+                // A fresh service must recover solely from the private journal.
+                let reopened = fixture(home);
+                assert_eq!(
+                    reopened.read(&id).unwrap().steps[0].state,
+                    StepState::Compensating
+                );
+                let resumed = reopened.undo(&id, &policy());
+                if later_edit {
+                    assert!(resumed
+                        .unwrap_err()
+                        .contains("owned generation or authorization document changed"));
+                    assert_eq!(std::fs::read(&target).unwrap(), retained_bytes);
+                    assert_eq!(std::fs::metadata(&target).unwrap().ino(), retained_inode);
+                    assert_eq!(
+                        reopened.read(&id).unwrap().steps[0].state,
+                        StepState::Compensating
+                    );
+                    return;
+                }
+                assert_eq!(resumed.unwrap().state, JobState::Undone);
+                assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                if publication_finished {
+                    // Reconciliation must not rewrite the already-restored file.
+                    assert_eq!(std::fs::metadata(&target).unwrap().ino(), retained_inode);
+                }
+                let restored_inode = std::fs::metadata(&target).unwrap().ino();
+                assert_eq!(
+                    fixture(home).undo(&id, &policy()).unwrap().state,
+                    JobState::Undone
+                );
+                assert_eq!(std::fs::read(&target).unwrap(), original.as_bytes());
+                assert_eq!(std::fs::metadata(&target).unwrap().ino(), restored_inode);
+            });
+        }
+
+        #[test]
+        fn compensating_restart_before_publication_restores_exact_managed_bytes() {
+            resume_compensation(false, false);
+        }
+
+        #[test]
+        fn compensating_restart_after_publication_preserves_the_restored_generation() {
+            resume_compensation(true, false);
+        }
+
+        #[test]
+        fn compensating_restart_refuses_later_edits_to_applied_or_restored_documents() {
+            resume_compensation(false, true);
+            resume_compensation(true, true);
+        }
+    }
+
+    #[test]
+    fn interrupted_new_file_compensation_is_reconciled_without_rewriting() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let target = home.join("created.json");
+            service
+                .plan(
+                    "undo-crash",
+                    OperationKind::SetupIntegration,
+                    vec![RequestedChange {
+                        target: target.clone(),
+                        scope_root: home.to_path_buf(),
+                        edit: Edit::WholeFile("{\"managed\":true}\n".into()),
+                        activation: true,
+                        description: "Install managed integration".into(),
+                    }],
+                    &policy(),
+                )
+                .unwrap();
+            service.apply("undo-crash", &policy()).unwrap();
+            let authorization = policy();
+            let excluded = std::iter::once(target.clone()).collect();
+            service
+                .update("undo-crash", |record| {
+                    record.undo_external_authorization =
+                        Some(authorization.private_external_inputs_guard(&excluded));
+                    record.state = JobState::Running;
+                    record.steps[0].state = StepState::Compensating;
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(&target, "").unwrap();
+            assert_eq!(
+                service.undo("undo-crash", &policy()).unwrap().state,
+                JobState::Undone
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"");
+            assert_eq!(
+                service.undo("undo-crash", &policy()).unwrap().state,
+                JobState::Undone
+            );
+        });
+    }
+
+    #[test]
+    fn private_journal_material_never_appears_in_public_status() {
+        with_fake_env(true, |home, _| {
+            let service = fixture(home);
+            let preview = service
+                .plan(
+                    "private",
+                    OperationKind::SetProfile,
+                    vec![field_request(home, "secret-value-that-must-not-appear")],
+                    &policy(),
+                )
+                .unwrap();
+            let json = serde_json::to_string(&preview).unwrap();
+            for forbidden in [
+                "secret-value",
+                "authorization",
+                "payload_digest",
+                "request_digest",
+                "before",
+                "after",
+            ] {
+                assert!(!json.contains(forbidden), "{forbidden}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&service.root)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(service.path("private").unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn scope_replacement_invalidates_pending_operation() {
+        with_fake_env(true, |home, _| {
+            let project = home.join("project");
+            std::fs::create_dir(&project).unwrap();
+            let identity = ScopeIdentity::capture(&project).unwrap();
+            std::fs::rename(&project, home.join("old-project")).unwrap();
+            std::fs::create_dir(&project).unwrap();
+            assert!(identity.validate().is_err());
+        });
+    }
+
+    #[test]
+    fn shell_authorization_rejects_a_durable_precondition_without_live_inputs() {
+        let expected: super::super::shell_service::ShellPrecondition =
+            serde_json::from_value(serde_json::json!({
+                "shell":"bash", "home":"/operator", "uid":null,
+                "profiles":[], "inputs":[]
+            }))
+            .unwrap();
+        assert!(validate_shell_lease(Some(&expected), None).is_err());
+        validate_shell_lease(None, None).unwrap();
+    }
+}

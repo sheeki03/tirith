@@ -722,6 +722,7 @@ mod tests {
 
     #[test]
     fn missing_binary_reports_not_configured() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let result = run_with_timeout("this-binary-definitely-does-not-exist-xyzzy", &[]);
         assert!(
             matches!(result, Err(ContextDetectFailure::NotConfigured)),

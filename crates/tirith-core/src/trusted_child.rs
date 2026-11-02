@@ -40,6 +40,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+mod tmpfs_acl;
 #[cfg(windows)]
 mod windows;
 
@@ -1289,11 +1291,15 @@ fn validate_unix_owner_and_mode(
             });
         }
     }
-    reject_unix_extended_acl(path, directory).map_err(|reason| {
-        TrustedExecutableError::InvalidPath {
-            path: path.to_path_buf(),
-            reason,
-        }
+    // Only this caller has already admitted the exact metadata's owner/mode.
+    // Metadata-free ACL callers retain the strict unsupported-filesystem rule.
+    #[cfg(target_os = "linux")]
+    let acl_result = inspect_posix_acl(path, directory, Some(metadata));
+    #[cfg(not(target_os = "linux"))]
+    let acl_result = reject_unix_extended_acl(path, directory);
+    acl_result.map_err(|reason| TrustedExecutableError::InvalidPath {
+        path: path.to_path_buf(),
+        reason,
     })?;
     Ok(())
 }
@@ -1321,6 +1327,15 @@ pub fn validate_unix_trusted_path_acl(path: &Path, directory: bool) -> Result<()
 /// allow entry carrying a mutation right.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(), String> {
+    inspect_posix_acl(path, directory, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn inspect_posix_acl(
+    path: &Path,
+    directory: bool,
+    admitted_metadata: Option<&std::fs::Metadata>,
+) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1335,6 +1350,11 @@ pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(
     // One 4-byte header plus 8-byte entries; 64 KiB bounds hostile attribute
     // sizes far beyond any legitimate ACL.
     const MAX_ACL_BYTES: usize = 64 * 1024;
+
+    // Android's filesystem/LSM combinations are not part of the Linux tmpfs
+    // qualification. No unsupported-ACL exception is enabled there.
+    #[cfg(target_os = "android")]
+    let _ = admitted_metadata;
 
     let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "path contains an interior NUL while checking ACLs".to_string())?;
@@ -1360,6 +1380,15 @@ pub(crate) fn reject_unix_extended_acl(path: &Path, directory: bool) -> Result<(
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ENODATA) {
                 continue;
+            }
+            #[cfg(target_os = "linux")]
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                if let Some(admitted) = admitted_metadata {
+                    let attribute = std::ffi::CStr::from_bytes_with_nul(name)
+                        .map_err(|_| "invalid fixed POSIX ACL attribute name".to_string())?;
+                    tmpfs_acl::verify_absence(path, directory, admitted, attribute)?;
+                    continue;
+                }
             }
             // ERANGE lands here too: an attribute larger than the bound above
             // is not something this rule will vouch for.
@@ -1880,14 +1909,6 @@ pub struct ChildSpec {
     env: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
     limits: ChildLimits,
-    /// Additional already-open capabilities that a Linux child must retain.
-    ///
-    /// The caller owns these descriptors and must keep their backing handles live
-    /// until [`run`] returns. `run` validates each descriptor before spawning and
-    /// clears only `FD_CLOEXEC` in the child. This is intentionally narrower than
-    /// ambient descriptor inheritance: callers opt in one exact fd at a time.
-    #[cfg(target_os = "linux")]
-    inherited_fds: Vec<std::os::fd::RawFd>,
 }
 
 impl ChildSpec {
@@ -1904,8 +1925,6 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             limits,
-            #[cfg(target_os = "linux")]
-            inherited_fds: Vec::new(),
         }
     }
 
@@ -1913,6 +1932,27 @@ impl ChildSpec {
         self.env
             .push((name.as_ref().to_os_string(), value.as_ref().to_os_string()));
         self
+    }
+
+    /// Supply the native Windows installation directory required by legacy
+    /// .NET children. This opt-in method never inherits ambient SystemRoot,
+    /// PATH, PSModulePath, or any other process environment entry.
+    #[cfg(windows)]
+    pub fn with_windows_system_root(self) -> Result<Self, String> {
+        use ::windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let mut buffer = vec![0_u16; 32 * 1024];
+        // SAFETY: the API writes at most the supplied slice length.
+        let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err("native Windows system directory unavailable or oversized".to_string());
+        }
+        let value = OsString::from_wide(&buffer[..length]);
+        if !Path::new(&value).is_absolute() || buffer[..length].contains(&0) {
+            return Err("native Windows system directory is not absolute".to_string());
+        }
+        Ok(self.env("SystemRoot", value))
     }
 
     pub fn inherit_env(mut self, names: &[&str]) -> Self {
@@ -1926,19 +1966,6 @@ impl ChildSpec {
 
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Retain one exact Linux descriptor across the child exec boundary.
-    ///
-    /// This supports capability paths such as `/proc/self/fd/N` without asking a
-    /// child to dereference its parent's procfs entries (which Yama, hidepid, or a
-    /// procfs mount policy may forbid). The backing handle must outlive [`run`].
-    #[cfg(target_os = "linux")]
-    pub fn inherit_fd(mut self, fd: std::os::fd::RawFd) -> Self {
-        if !self.inherited_fds.contains(&fd) {
-            self.inherited_fds.push(fd);
-        }
         self
     }
 }
@@ -2015,11 +2042,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     if checked_timeout_deadline(spec.limits.timeout).is_none() {
         return timeout_deadline_overflow();
     }
-    if let Err(error) = executable.revalidate() {
-        return ChildOutcome::SpawnError(format!(
-            "trusted executable failed pre-spawn revalidation: {error}"
-        ));
-    }
     windows::run(executable, spec)
 }
 
@@ -2029,17 +2051,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
 pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
     if let Err(error) = executable.verify_identity() {
         return ChildOutcome::SpawnError(error.to_string());
-    }
-    #[cfg(target_os = "linux")]
-    for fd in &spec.inherited_fds {
-        // SAFETY: F_GETFD only inspects the caller-supplied descriptor number; no
-        // pointer is dereferenced. A negative/closed descriptor is rejected.
-        if *fd < 0 || unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
-            return ChildOutcome::SpawnError(format!(
-                "inherited capability descriptor {fd} is not open: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
     }
     #[cfg(target_os = "linux")]
     let bound_fd = executable.bound_launch_fd();
@@ -2080,10 +2091,7 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
         // content-bound launch also clears CLOEXEC on the already-sealed
         // descriptor so a shebang interpreter can reopen `/proc/self/fd/N`;
         // the child can observe that immutable descriptor but cannot change its
-        // sealed bytes. Explicit capability descriptors use the same narrow
-        // inheritance rule, preserving any descriptor flags other than CLOEXEC.
-        #[cfg(target_os = "linux")]
-        let inherited_fds = spec.inherited_fds.clone();
+        // sealed bytes.
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
@@ -2092,13 +2100,6 @@ pub fn run(executable: &TrustedExecutable, spec: &ChildSpec) -> ChildOutcome {
                 #[cfg(target_os = "linux")]
                 if let Some(fd) = bound_fd {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                #[cfg(target_os = "linux")]
-                for fd in &inherited_fds {
-                    let flags = libc::fcntl(*fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -3405,6 +3406,7 @@ mod unix_cleanup_tests {
 
     #[test]
     fn external_reap_before_direct_signal_never_reaches_child_kill() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let child_pid = 41_009;
         let mut observations = 0;
         let mut sends = 0;

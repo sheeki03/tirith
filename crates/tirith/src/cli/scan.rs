@@ -920,7 +920,11 @@ fn print_json_result(
         "dlp_redaction_incomplete": dlp_redaction_incomplete,
     });
     append_policy_diagnostics_json(&mut base, compiled);
-    tirith_core::redact::redact_json_strings(&mut base, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut base,
+        tirith_core::output_contract::Projection::DirectoryScan,
+        compiled,
+    );
     let mut projection = tirith_core::verdict::BoundedJsonProjection::new(base);
     for rank in 0..3 {
         for (file_index, file) in result.file_results.iter().enumerate() {
@@ -934,7 +938,11 @@ fn print_json_result(
                     "_projection_file_id": file_index,
                     "findings": [finding],
                 });
-                tirith_core::redact::redact_json_strings(&mut item, compiled);
+                tirith_core::output_contract::redact_projection(
+                    &mut item,
+                    tirith_core::output_contract::Projection::FileScan,
+                    compiled,
+                );
                 let _ = projection.push_array_item("files", item, 1);
             }
         }
@@ -950,7 +958,11 @@ fn print_json_result(
             for gap in &result.coverage_gaps {
                 let mut gap = serde_json::to_value(JsonCoverageGap::from(gap))
                     .unwrap_or(serde_json::Value::Null);
-                tirith_core::redact::redact_json_strings(&mut gap, compiled);
+                tirith_core::output_contract::redact_projection(
+                    &mut gap,
+                    tirith_core::output_contract::Projection::CoverageGap,
+                    compiled,
+                );
                 let _ = projection.push_array_item("coverage_gaps", gap, 1);
             }
         }
@@ -1008,10 +1020,6 @@ fn print_json_file_result(
                     &projected.location,
                     compiled,
                 );
-                if let Some(sha256) = projected.sha256.as_mut() {
-                    *sha256 =
-                        tirith_core::redact::redact_sanitize_redact_with_compiled(sha256, compiled);
-                }
                 projected
             })
             .collect(),
@@ -1021,7 +1029,11 @@ fn print_json_file_result(
     let output = match serde_json::to_value(output) {
         Ok(mut value) => {
             append_policy_diagnostics_json(&mut value, compiled);
-            tirith_core::redact::redact_json_strings(&mut value, compiled);
+            tirith_core::output_contract::redact_projection(
+                &mut value,
+                tirith_core::output_contract::Projection::FileScan,
+                compiled,
+            );
             tirith_core::verdict::bound_json_value_for_output(value)
         }
         Err(error) => {
@@ -1710,6 +1722,7 @@ mod tests {
 
     #[test]
     fn scan_json_carries_captured_policy_diagnostics_through_recursive_dlp() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = "C02_SCAN_POLICY_SECRET";
         let split = format!("{}\u{1b}[31m{}", &secret[..10], &secret[10..]);
         let patterns = vec![regex::escape(secret)];
@@ -1731,6 +1744,7 @@ mod tests {
 
     #[test]
     fn malformed_policy_diagnostic_has_human_json_sarif_redaction_parity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = "C02_SCAN_POLICY_PARITY_SECRET";
         let split = format!("bad\npolicy-{}\u{1b}[31m{}", &secret[..14], &secret[14..]);
         let patterns = vec![regex::escape(secret)];
@@ -1784,6 +1798,7 @@ mod tests {
 
     #[test]
     fn sarif_policy_diagnostics_are_counted_and_bounded() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
         let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
         for index in 0..(MAX_SARIF_POLICY_DIAGNOSTICS + 3) {
@@ -1826,6 +1841,7 @@ mod tests {
 
     #[test]
     fn sarif_single_long_policy_diagnostic_reports_byte_truncation() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _capture = tirith_core::policy::PolicyDiagnosticCapture::start();
         let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(&[]);
         let source = format!("one-long-malformed-policy-{}", "x".repeat(4_096));
@@ -1847,6 +1863,7 @@ mod tests {
 
     #[test]
     fn scan_human_policy_diagnostic_is_one_terminal_safe_line() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let secret = "C02_SCAN_HUMAN_SECRET";
         let source = format!("bad\npath\u{1b}[31m{secret}");
         let patterns = vec![regex::escape(secret)];
@@ -1869,6 +1886,7 @@ mod tests {
 
     #[test]
     fn missing_scan_target_anchors_policy_at_nearest_existing_ancestor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("target-repo");
         let existing = repo.join("nested");

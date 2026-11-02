@@ -7,6 +7,9 @@ post_install() {
   echo "  fish (~/.config/fish/config.fish):      tirith init --shell fish | source"
   echo ""
   echo "Then restart your terminal. Verify: tirith doctor"
+  echo "Package approval is disabled in this release: 'tirith pkg approve' issues no approvals and never elevates."
+  echo "The installed approval helper and sudo do not enable it; ordinary checks and shell protection remain available."
+  echo "Package execution remains disabled pending native qualification."
   echo ""
 }
 

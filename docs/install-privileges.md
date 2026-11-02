@@ -1,0 +1,101 @@
+# Installation and administrator privileges
+
+Install, update and use Tirith without sudo wherever you can. Ordinary checks,
+shell integration, agent setup and doctor never need sudo or administrator
+privileges. Only installing into a protected system directory or changing a
+system package database needs an administrator; sudo is one way to get that
+access, and an existing root session also works.
+
+| Channel | Install, update, and removal | Native package approval |
+| --- | --- | --- |
+| Debian / Ubuntu `.deb` | Administrator manages the system package database. No sudo dependency or suggestion. | The package ships an inert root-owned helper on x86_64 Linux. It refuses every operation; approval is disabled in this release. |
+| RPM | Administrator manages the system package database. No sudo dependency or suggestion. | The x86_64 package ships an inert helper that refuses every operation. |
+| AUR | Build as the normal user; package installation/removal needs an administrator. No sudo dependency or suggestion. | The x86_64 package ships an inert helper that refuses every operation. The aarch64 package has no helper. |
+| Shell installer | Defaults to the user's `~/.local/bin` and needs no elevation for a fresh install. An existing helper is updated as a protected pair. | `TIRITH_INSTALL_APPROVAL_HELPER=1` still installs the helper, but it enables nothing in this release; see below. |
+| Manual release archive | Copy the CLI into a user-writable directory without elevation. A protected system destination requires administrator access. | A helper copied into a home directory cannot issue approvals. |
+| Cargo | A user-owned Cargo prefix needs no elevation. Update with Cargo. | User-installed helper binaries are not trusted native authorities. |
+| npm | A user-owned npm prefix needs no elevation. A system prefix follows its filesystem permissions. Update with npm. | The npm packages do not install a privileged helper. |
+| Homebrew | Use the normal Homebrew account and package-manager update/removal commands. | The formula does not install a privileged helper. |
+| Nix | A user profile needs no sudo. System configuration changes follow the host's administrator policy. | The flake does not install a trusted helper into the fixed authority paths. |
+| mise / asdf | User-owned tool directories need no elevation; update/remove through the owning manager. | Extracting the archive into a tool directory does not install a trusted authority. |
+| Windows installer / Scoop | The installer uses LocalAppData and user PATH; Scoop defaults to a user install. | Native package-approval issuance is unsupported on Windows. |
+| Chocolatey | Follow the permissions of the Chocolatey installation, commonly an administrator-managed system prefix. The Tirith package does not request elevation itself. | Native package-approval issuance is unsupported on Windows. |
+| Docker | Image construction installs system dependencies; the released runtime runs as the `tirith` user and contains no sudo dependency. | The runtime image does not install the native authority. |
+
+## The package-approval helper on manual Linux installs
+
+Tirith never installs sudo, grants passwordless sudo access, creates a sudoers
+rule, starts an elevated approval service, or invokes the approval authority
+as part of ordinary command checks. The packaged helper has ordinary executable
+permissions, with no setuid/setgid bits. `tirith pkg approve` currently refuses
+after its native-authority check (contained package execution, the only
+consumer of approvals, is disabled), and the helper itself refuses every
+operation: it creates no key or authority directory and signs nothing.
+
+The shell installer accepts `TIRITH_INSTALL_APPROVAL_HELPER=0` (the default)
+or `TIRITH_INSTALL_APPROVAL_HELPER=1`. Other values are rejected. On a fresh
+x86_64 Linux installation, `0` installs only the CLI; checks and shell
+protection work. Set `1` when running the installer to also install the
+root-owned helper. That operation requires a root session or trusted
+`/usr/bin/sudo`, and it does not enable package approval in this release:
+`tirith pkg approve` refuses either way. The opt-in is rejected on platforms
+where the helper is not packaged.
+
+If the manual helper or its rollback state already exists under
+`/usr/local/libexec`, either setting preserves paired installation. Setting
+`0` cannot skip updating an existing helper. Removing or replacing a protected
+helper still requires administrator access.
+
+`tirith update` and `tirith update --rollback` keep a manual installation
+without helper state unprivileged. When helper state exists, they preserve the
+paired update and rollback checks. Package-managed installations are directed
+to their owning package manager instead of being overwritten by self-update.
+`tirith verify-self` verifies a manual CLI without requiring an optional helper;
+an installed manual helper, or a helper required by the Debian/RPM package,
+must still match the release.
+
+## Check the approval capability, set up, and clean up
+
+`tirith init` prints shell integration, and `tirith setup` writes the selected
+user/project integration files with ownership and symlink checks. They do not
+invoke sudo. A protected destination must be configured by its administrator.
+Doctor and ordinary command checks remain usable without the approval helper.
+
+`tirith status --json` and the full `tirith doctor --json` report the separate
+`package_approval` capability. `unavailable` means protected helper or sudo
+prerequisites are missing or untrusted; `unsupported` identifies other
+platforms. `available_on_explicit_request` means filesystem prerequisites are
+present, not that any approval was issued or administrator access was verified.
+All states report `automatic_elevation: false` and
+`ordinary_protection_requires_sudo: false`. `pkg approve` refuses missing native
+prerequisites before policy-server access, resolver execution, or quarantine
+work. When the prerequisites are present it refuses with
+`private_input_execution_unqualified` before any of that work. In every state
+the reported `detail` and `next_action` say that approve issues no approvals in
+this release and that installing sudo or the helper does not enable it.
+
+Uninstall the CLI with its owning package manager or remove its user-owned
+binary, then remove the shell/integration entries and user data. Only remove a
+shared privileged helper and `/etc/tirith/package-approval` after all
+installations using them are gone. The [uninstall guide](uninstall.md) lists
+the exact paths.
+
+## Limits
+
+- `tirith pkg approve` issues no approvals in this release. After its
+  native-authority check it refuses with `private_input_execution_unqualified`,
+  whatever the operator, session or privilege level. The packaged helper refuses
+  every operation, so installing sudo or the helper enables nothing.
+- Native package-approval issuance is unsupported on Windows, and the aarch64
+  AUR package has no helper. A helper copied into a home directory, or installed
+  by Cargo, npm, Homebrew, Nix, mise or asdf, is not a trusted native authority.
+- `TIRITH_INSTALL_APPROVAL_HELPER=1` needs a root session or a trusted
+  `/usr/bin/sudo` and is rejected where the helper is not packaged.
+  `TIRITH_INSTALL_APPROVAL_HELPER=0` cannot skip updating an existing helper.
+- Removing or replacing a protected helper needs administrator access. Remove a
+  shared helper and `/etc/tirith/package-approval` only after every installation
+  that uses them is gone.
+- `tirith update` never overwrites a package-managed installation; it prints the
+  owning package manager's command instead.
+- `available_on_explicit_request` means the filesystem prerequisites are
+  present, not that an approval was issued or administrator access was verified.

@@ -561,6 +561,7 @@ mod tests {
 
     #[test]
     fn osc52_emits_high_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.osc52.push(OutputOscHit {
             offset: 0,
@@ -574,6 +575,7 @@ mod tests {
 
     #[test]
     fn osc52_overflow_emits_explicit_high_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.osc_overflow.push(OutputOscOverflowHit {
             offset: 17,
@@ -594,6 +596,7 @@ mod tests {
 
     #[test]
     fn title_set_emits_info_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.title_set.push(OutputOscHit {
             offset: 0,
@@ -607,6 +610,7 @@ mod tests {
 
     #[test]
     fn screen_clear_emits_info_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.screen_clear.push(OutputOscHit {
             offset: 0,
@@ -619,6 +623,7 @@ mod tests {
 
     #[test]
     fn hyperlink_mismatch_fires_when_visible_text_is_a_different_host_url() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.hyperlinks.push(OutputHyperlinkHit {
             offset: 0,
@@ -636,6 +641,7 @@ mod tests {
 
     #[test]
     fn hyperlink_no_fire_when_visible_text_is_human_prose() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.hyperlinks.push(OutputHyperlinkHit {
             offset: 0,
@@ -653,6 +659,7 @@ mod tests {
 
     #[test]
     fn hyperlink_no_fire_when_hosts_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.hyperlinks.push(OutputHyperlinkHit {
             offset: 0,
@@ -670,6 +677,7 @@ mod tests {
 
     #[test]
     fn hyperlink_no_fire_when_visible_text_is_a_version_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: `parse_url_host` once accepted `v1.2.3` as a bare host.
         for label in ["v1.2.3", "1.0.0-alpha", "2.3.4", "release.1.0"] {
             let mut s = scan();
@@ -690,6 +698,7 @@ mod tests {
 
     #[test]
     fn hyperlink_fires_when_visible_text_is_a_raw_host_string() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Positive control: guards against over-rejecting the bare-host path.
         let mut s = scan();
         s.hyperlinks.push(OutputHyperlinkHit {
@@ -708,6 +717,7 @@ mod tests {
 
     #[test]
     fn sgr_fg_eq_bg_fires_hidden_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         // `\e[37;47m` — fg=white, bg=white (both basic 7).
         s.sgr.push(OutputSgrHit {
@@ -725,6 +735,7 @@ mod tests {
 
     #[test]
     fn sgr_fg_only_does_not_fire_hidden_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.sgr.push(OutputSgrHit {
             offset: 0,
@@ -741,6 +752,7 @@ mod tests {
 
     #[test]
     fn long_zero_width_run_fires_hidden_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut s = scan();
         s.zero_width_runs.push(OutputZeroWidthRun {
             offset: 0,

@@ -197,13 +197,16 @@ tirith diff https://install.example-cli.dev   # compare against patterns
 
 ### Manage trusted patterns
 
-Allow specific domains or URLs after review with TTL and rule scoping:
+Allow specific URLs or domains after review. Every grant needs `--rule RULE`
+(or an explicit `--all-rules`), a whole domain or wildcard also needs `--broad`,
+and grants expire after 30 days unless you pass `--ttl` or `--permanent`:
 
 ```bash
-tirith trust add example.com                              # permanent global
-tirith trust add example.com --ttl 7d                     # expires in 7 days
-tirith trust add example.com --rule pipe_to_interpreter   # rule-scoped
-tirith trust add example.com --scope repo                 # repo-scoped
+tirith trust add example.com/install.sh --rule pipe_to_interpreter   # exact URL, 30-day TTL
+tirith trust add example.com --broad --rule pipe_to_interpreter      # whole domain, one rule
+tirith trust add example.com --broad --rule shortened_url --ttl 7d   # expires in 7 days
+tirith trust add example.com --broad --all-rules --permanent --reason "reviewed mirror"
+tirith trust add example.com/install.sh --rule pipe_to_interpreter --scope project  # this checkout only
 tirith trust list                                          # show all entries
 tirith trust list --format json --expired                  # include expired
 tirith trust last                                          # trust from last trigger
@@ -244,7 +247,7 @@ tirith threat-db update --force  # force re-download
 tirith threat-db status          # show DB age and entry counts
 ```
 
-### Inspect and enforce Python packages
+### Inspect Python packages
 
 Inspect exact local artifacts without downloading them:
 
@@ -254,19 +257,17 @@ tirith package inspect --artifact-set ./downloaded-wheels
 tirith package inspect --installed ./.venv
 ```
 
-On x86_64 Linux, approve and install a hash-pinned pip plan through the native
-authority and containment capsule:
+Verify an existing environment and read the package receipts:
 
 ```bash
-tirith pkg trust-tool /absolute/path/to/static-uv
-tirith pkg approve pip requests==2.31.0 --target .tirith-pkg
-tirith pkg install pip requests==2.31.0 --target .tirith-pkg
-tirith pkg verify-env --target .tirith-pkg requests
+tirith pkg verify-env --target .venv requests
 tirith pkg receipt last
 ```
 
-Unsupported platforms refuse before pip starts. npm and Cargo are evidence
-surfaces, not enforcing package-firewall backends.
+Contained package installation is disabled in this release: `tirith pkg
+approve` and `tirith pkg install` refuse on every host with
+`private_input_execution_unqualified` and record no approval. npm and Cargo
+are evidence surfaces, not enforcing package-firewall backends.
 
 ### Explicit task, capsule, browser, and attestation workflows
 

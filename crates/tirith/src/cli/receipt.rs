@@ -1,151 +1,123 @@
+use super::receipt_display as display;
 use tirith_core::receipt::Receipt;
 
-fn print_no_receipts_hint() {
-    eprintln!("tirith: no download receipts found");
-    if let Some(dir) = tirith_core::policy::data_dir() {
-        eprintln!(
-            "  `tirith run` records download receipts under {}; shell execution receipts are a separate store",
-            dir.join("receipts").display()
-        );
-    }
+fn failure(error: &str) -> i32 {
+    eprintln!("tirith receipt: {error}");
+    1
+}
+
+fn saved() -> Result<Vec<Receipt>, &'static str> {
+    let mut receipts = display::list_download()?;
+    receipts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(receipts)
 }
 
 pub fn last(json: bool) -> i32 {
-    match Receipt::list() {
-        Ok(receipts) => {
-            if let Some(r) = receipts.first() {
-                if json {
-                    // Public DTO: credential-bearing URL userinfo is redacted
-                    // and local-machine metadata (cwd) omitted (repo-0415).
-                    if serde_json::to_writer_pretty(std::io::stdout().lock(), &r.public_view())
-                        .is_err()
-                    {
-                        eprintln!("tirith: failed to write JSON output");
-                        return 1;
-                    }
-                    println!();
-                } else {
-                    print_receipt(r);
-                }
-                0
-            } else {
-                print_no_receipts_hint();
-                1
+    let compiled = display::output_dlp();
+    match saved() {
+        Ok(receipts) => match receipts.first() {
+            Some(receipt) => {
+                let value = display::download(receipt, &compiled);
+                if let Err(error) = display::bounded(&value) { return failure(error); }
+                if json { i32::from(!display::write(&value)) }
+                else { print_receipt(&value); 0 }
             }
-        }
-        Err(e) => {
-            eprintln!("tirith: {e}");
-            1
-        }
+            None => failure("No download receipts found. `tirith run` records download receipts; shell execution receipts use a separate store."),
+        },
+        Err(error) => failure(error),
     }
 }
 
 pub fn list(json: bool) -> i32 {
-    match Receipt::list() {
+    let compiled = display::output_dlp();
+    match saved() {
         Ok(receipts) => {
+            let values: Vec<_> = receipts
+                .iter()
+                .map(|receipt| display::download(receipt, &compiled))
+                .collect();
+            let value = serde_json::Value::Array(values);
+            if let Err(error) = display::bounded(&value) {
+                return failure(error);
+            }
             if json {
-                let public: Vec<_> = receipts.iter().map(|r| r.public_view()).collect();
-                if serde_json::to_writer_pretty(std::io::stdout().lock(), &public).is_err() {
-                    eprintln!("tirith: failed to write JSON output");
-                    return 1;
-                }
-                println!();
-            } else if receipts.is_empty() {
-                print_no_receipts_hint();
-            } else {
-                for r in &receipts {
-                    eprintln!(
-                        "  {} {} ({} bytes) {}",
-                        tirith_core::receipt::short_hash(&r.sha256),
-                        super::sanitize_for_human_output(&r.url, false),
-                        r.size,
-                        r.timestamp
-                    );
-                }
+                return i32::from(!display::write(&value));
+            }
+            if receipts.is_empty() {
+                eprintln!("tirith: no download receipts found");
+            }
+            for row in value.as_array().expect("receipt list") {
+                eprintln!(
+                    "  {} {} ({} bytes) {}",
+                    tirith_core::receipt::short_hash(&display::text(row, "sha256")),
+                    display::text(row, "url"),
+                    row["size"],
+                    display::text(row, "timestamp")
+                );
             }
             0
         }
-        Err(e) => {
-            eprintln!("tirith: {e}");
-            1
-        }
+        Err(error) => failure(error),
     }
 }
 
 pub fn verify(sha256: &str, json: bool) -> i32 {
-    match Receipt::load(sha256) {
-        Ok(r) => match r.verify() {
-            Ok(valid) => {
-                if json {
-                    let out = serde_json::json!({
-                        "sha256": sha256,
-                        "valid": valid,
-                        // Same discipline as `last --json` / `list --json`:
-                        // stored URLs may carry userinfo and machine-readable
-                        // output must never re-emit credentials.
-                        "url": tirith_core::receipt::redact_url_userinfo(&r.url),
-                    });
-                    if serde_json::to_writer_pretty(std::io::stdout().lock(), &out).is_err() {
-                        eprintln!("tirith: failed to write JSON output");
-                        return 1;
+    let compiled = display::output_dlp();
+    let receipt = match display::load_download(sha256) {
+        Ok(receipt) => receipt,
+        Err(error) => return failure(error),
+    };
+    // Verification reads the original receipt, never its presentation clone.
+    match display::verify_download(&receipt) {
+        Ok(valid) => {
+            if json {
+                let projected = display::download(&receipt, &compiled);
+                let value =
+                    serde_json::json!({"sha256":sha256,"valid":valid,"url":projected["url"]});
+                if !display::write(&value) {
+                    return 1;
+                }
+            } else {
+                eprintln!(
+                    "tirith: receipt {} {}",
+                    tirith_core::receipt::short_hash(sha256),
+                    if valid {
+                        "verified OK"
+                    } else {
+                        "FAILED verification"
                     }
-                    println!();
-                } else if valid {
-                    eprintln!(
-                        "tirith: receipt {} verified OK",
-                        tirith_core::receipt::short_hash(sha256)
-                    );
-                } else {
-                    eprintln!(
-                        "tirith: receipt {} FAILED verification",
-                        tirith_core::receipt::short_hash(sha256)
-                    );
-                }
-                if valid {
-                    0
-                } else {
-                    1
-                }
+                );
             }
-            Err(e) => {
-                eprintln!("tirith: verify failed: {e}");
-                1
-            }
-        },
-        Err(e) => {
-            eprintln!("tirith: {e}");
-            1
+            i32::from(!valid)
         }
+        Err(error) => failure(&tirith_core::output::sanitize_human_field_with_compiled(
+            error, &compiled,
+        )),
     }
 }
 
-fn print_receipt(r: &Receipt) {
+fn print_receipt(receipt: &serde_json::Value) {
     eprintln!("tirith: receipt");
-    eprintln!(
-        "  url:       {}",
-        super::sanitize_for_human_output(&r.url, false)
-    );
-    if let Some(ref fu) = r.final_url {
-        eprintln!(
-            "  final_url: {}",
-            super::sanitize_for_human_output(fu, false)
-        );
+    for (label, key) in [
+        ("url", "url"),
+        ("final_url", "final_url"),
+        ("sha256", "sha256"),
+        ("analyzed", "analysis_method"),
+        ("privilege", "privilege"),
+        ("when", "timestamp"),
+    ] {
+        if !receipt[key].is_null() {
+            eprintln!("  {label}: {}", display::text(receipt, key));
+        }
     }
-    eprintln!("  sha256:    {}", r.sha256);
-    eprintln!("  size:      {} bytes", r.size);
-    eprintln!(
-        "  analyzed:  {}",
-        super::sanitize_for_human_output(&r.analysis_method, false)
-    );
-    eprintln!(
-        "  privilege: {}",
-        super::sanitize_for_human_output(&r.privilege, false)
-    );
-    eprintln!("  when:      {}", r.timestamp);
-    if !r.domains_referenced.is_empty() {
-        eprintln!(
-            "  domains:   {}",
-            super::sanitize_for_human_output(&r.domains_referenced.join(", "), false)
-        );
+    eprintln!("  size: {} bytes", receipt["size"]);
+    if let Some(domains) = receipt["domains_referenced"].as_array() {
+        let domains: Vec<_> = domains.iter().filter_map(|value| value.as_str()).collect();
+        if !domains.is_empty() {
+            eprintln!(
+                "  domains: {}",
+                super::sanitize_for_human_output(&domains.join(", "), false)
+            );
+        }
     }
 }

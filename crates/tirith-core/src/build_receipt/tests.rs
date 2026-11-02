@@ -177,6 +177,7 @@ fn an_empty_directory_is_bound_and_not_silently_dropped() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_at_a_leaf_or_at_a_directory_is_refused_and_never_followed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let secret = tempfile::tempdir().expect("tempdir");
     write(secret.path(), "id_rsa", "PRIVATE KEY BYTES\n");
 
@@ -209,6 +210,7 @@ fn a_symlink_at_a_leaf_or_at_a_directory_is_refused_and_never_followed() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_root_is_refused_before_anything_is_read() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let real = tempfile::tempdir().expect("tempdir");
     sample_tree(real.path());
     let holder = tempfile::tempdir().expect("tempdir");
@@ -223,6 +225,7 @@ fn a_symlinked_root_is_refused_before_anything_is_read() {
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_refused_rather_than_read() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let fifo = root.path().join("pipe");
@@ -248,6 +251,7 @@ fn a_fifo_is_refused_rather_than_read() {
 #[cfg(unix)]
 #[test]
 fn a_retained_tree_root_cannot_be_redirected_by_visible_root_replacement() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let holder = tempfile::tempdir().expect("tempdir");
     let visible = holder.path().join("tree");
     let displaced = holder.path().join("held-tree");
@@ -278,6 +282,7 @@ fn a_retained_tree_root_cannot_be_redirected_by_visible_root_replacement() {
 #[cfg(unix)]
 #[test]
 fn a_child_replaced_by_a_symlink_after_root_open_is_refused_not_followed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "sub/inside", "inside\n");
     let outside = tempfile::tempdir().expect("outside");
@@ -300,6 +305,7 @@ fn a_child_replaced_by_a_symlink_after_root_open_is_refused_not_followed() {
 
 #[test]
 fn names_added_after_the_initial_walk_are_refused_by_quiescence_reenumeration() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     for (added, changed_directory) in [("late.txt", "."), ("sub/late.txt", "sub")] {
         let root = tempfile::tempdir().expect("tempdir");
         write(root.path(), "keep.txt", "keep\n");
@@ -323,6 +329,7 @@ fn names_added_after_the_initial_walk_are_refused_by_quiescence_reenumeration() 
 
 #[test]
 fn an_excluded_name_can_materialize_after_the_walk_without_false_change() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "keep.txt", "keep\n");
     let capability = DirCapability::open_root(root.path()).expect("retain tree root");
@@ -341,6 +348,7 @@ fn an_excluded_name_can_materialize_after_the_walk_without_false_change() {
 
 #[test]
 fn a_case_folded_collision_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "README", "one\n");
     // A case-insensitive filesystem merges these two names, so the second write
@@ -368,6 +376,7 @@ fn a_case_folded_collision_is_refused() {
 
 #[test]
 fn a_unicode_normalization_collision_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     // The same word twice: once composed (U+00E9) and once decomposed
     // (e + U+0301). Both are assembled from escapes so the source file itself
@@ -401,6 +410,7 @@ fn a_unicode_normalization_collision_is_refused() {
 
 #[test]
 fn caps_refuse_rather_than_binding_a_prefix() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     for index in 0..8 {
         write(root.path(), &format!("f{index}.txt"), "x");
@@ -447,6 +457,7 @@ fn caps_refuse_rather_than_binding_a_prefix() {
 
 #[test]
 fn the_caps_are_folded_into_the_digest() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let wide = scan_tree(
@@ -520,6 +531,7 @@ fn fresh_hasher() -> DigestBuilder {
 
 #[test]
 fn a_file_larger_than_the_measured_size_is_refused_as_grown() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "a.txt", "0123456789");
     let real_mode = mode_of(&std::fs::metadata(root.path().join("a.txt")).expect("stat"));
@@ -537,6 +549,7 @@ fn a_file_larger_than_the_measured_size_is_refused_as_grown() {
 
 #[test]
 fn a_file_smaller_than_the_measured_size_is_refused_as_truncated() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "a.txt", "0123");
     let real_mode = mode_of(&std::fs::metadata(root.path().join("a.txt")).expect("stat"));
@@ -553,6 +566,7 @@ fn a_file_smaller_than_the_measured_size_is_refused_as_truncated() {
 #[cfg(unix)]
 #[test]
 fn a_file_whose_mode_no_longer_matches_is_refused_as_rebound() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "a.txt", "0123");
     let mut hasher = fresh_hasher();
@@ -567,6 +581,7 @@ fn a_file_whose_mode_no_longer_matches_is_refused_as_rebound() {
 
 #[test]
 fn a_file_rebound_to_another_inode_of_the_same_size_and_mode_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     // The decoy the attacker renames INTO place, and the file the walk measured.
     // Same length, same mode: length and mode compares alone accept the swap, so
@@ -666,6 +681,7 @@ fn make_windows_creation_and_write_times_match(source: &Path, destination: &Path
 
 #[test]
 fn a_vanished_file_is_refused_rather_than_skipped() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     let mut hasher = fresh_hasher();
     let error = hash_test_entry(
@@ -677,9 +693,10 @@ fn a_vanished_file_is_refused_rather_than_skipped() {
     assert!(matches!(error, TreeScanError::Changed(path) if path == "gone.txt"));
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[test]
 fn a_same_size_in_place_mutation_during_streaming_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("changing.bin");
     std::fs::write(&path, vec![b'A'; 128 * 1024]).expect("write original");
@@ -695,9 +712,115 @@ fn a_same_size_in_place_mutation_during_streaming_is_refused() {
     assert!(matches!(error, TreeScanError::Changed(path) if path == "changing.bin"));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_same_size_in_place_writer_is_denied_during_windows_hashing() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("changing.bin");
+    let original = vec![b'A'; 128 * 1024];
+    std::fs::write(&path, &original).expect("write original");
+    let expected = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("stable original");
+    let mutate = path.clone();
+    let observed = Rc::new(Cell::new(false));
+    let attempted = Rc::clone(&observed);
+    FILE_HASH_CHUNK_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let error = std::fs::write(&mutate, vec![b'B'; 128 * 1024])
+                .expect_err("the native read lease must deny the writer");
+            assert_eq!(error.raw_os_error(), Some(32), "ERROR_SHARING_VIOLATION");
+            attempted.set(true);
+        }));
+    });
+    let actual = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("a denied write leaves the original file stable");
+    assert!(
+        observed.get(),
+        "the real write attempt must occur between chunks"
+    );
+    assert_eq!(actual.digest, expected.digest);
+    assert_eq!(actual.files[0].sha256, sha256_hex(&original));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    std::fs::write(&path, vec![b'B'; 128 * 1024]).expect("hash completion releases the lease");
+    let changed = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect("a later complete generation can be scanned");
+    assert_ne!(changed.digest, actual.digest);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_preexisting_windows_writer_refuses_the_tree_scan_and_releases_handles() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("busy.bin");
+    std::fs::write(&path, b"original bytes").unwrap();
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("an existing writer must prevent a stable digest");
+    assert!(matches!(error, TreeScanError::Io(_)));
+    drop(writer);
+    assert!(scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default()).is_ok());
+    std::fs::write(&path, b"later content!").expect("both success and refusal release leases");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_preexisting_windows_writable_mapping_refuses_the_tree_scan() {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+        MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    };
+    struct Mapping {
+        view: MEMORY_MAPPED_VIEW_ADDRESS,
+        _handle: OwnedHandle,
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            unsafe {
+                UnmapViewOfFile(self.view);
+            }
+        }
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("mapped.bin");
+    std::fs::write(&path, b"original bytes").unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let handle =
+        unsafe { CreateFileMappingW(writer.as_raw_handle(), null(), PAGE_READWRITE, 0, 0, null()) };
+    assert!(!handle.is_null() && handle != INVALID_HANDLE_VALUE);
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let view = unsafe { MapViewOfFile(owned.as_raw_handle(), FILE_MAP_WRITE, 0, 0, 0) };
+    assert!(!view.Value.is_null());
+    let mapping = Mapping {
+        view,
+        _handle: owned,
+    };
+    drop(writer);
+    unsafe {
+        mapping.view.Value.cast::<u8>().write(b'm');
+    }
+    let error = scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default())
+        .expect_err("closing the writer must not hide its live writable mapping");
+    assert!(matches!(error, TreeScanError::Io(_)));
+    drop(mapping);
+    assert!(scan_tree(root.path(), &[], PrunedNames::None, TreeLimits::default()).is_ok());
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn a_file_with_an_external_hardlink_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let parent = tempfile::tempdir().expect("tempdir");
     let root = parent.path().join("source");
     std::fs::create_dir(&root).expect("source root");
@@ -716,6 +839,7 @@ fn a_file_with_an_external_hardlink_is_refused() {
 
 #[test]
 fn exclusion_count_and_aggregate_bytes_are_bounded_before_walking() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     write(root.path(), "one.txt", "one");
     let too_many = (0..=MAX_TREE_EXCLUSIONS)
@@ -746,6 +870,7 @@ fn exclusion_count_and_aggregate_bytes_are_bounded_before_walking() {
 
 #[test]
 fn git_the_output_root_and_the_receipt_destination_are_all_excluded() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     write(root.path(), "dist/index.html", "<html/>\n");
@@ -869,6 +994,7 @@ fn the_prune_rule_itself_is_folded_into_the_digest() {
 
 #[test]
 fn the_exclusion_set_is_folded_into_the_digest() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let bare = scan_tree(
@@ -1000,6 +1126,7 @@ fn clean_receipt() -> (tempfile::TempDir, BuildReceipt) {
 
 #[test]
 fn a_fresh_receipt_is_content_addressed_clean_and_valid() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     assert_eq!(receipt.status, AttestStatus::Clean);
     assert_eq!(receipt.receipt_id.len(), 64);
@@ -1012,6 +1139,7 @@ fn a_fresh_receipt_is_content_addressed_clean_and_valid() {
 
 #[test]
 fn receipt_validation_rejects_unbounded_or_noncanonical_exclusions() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     for exclusions in [
         (0..=MAX_TREE_EXCLUSIONS)
@@ -1035,6 +1163,7 @@ fn receipt_validation_rejects_unbounded_or_noncanonical_exclusions() {
 #[cfg(unix)]
 #[test]
 fn replacing_the_visible_source_after_its_scan_makes_the_receipt_partial() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let parent = tempfile::tempdir().expect("tempdir");
     let source = parent.path().join("source");
     let retained = parent.path().join("retained-source");
@@ -1077,6 +1206,7 @@ fn replacing_the_visible_source_after_its_scan_makes_the_receipt_partial() {
 
 #[test]
 fn receipt_tree_limits_cannot_raise_or_remove_the_schema_caps() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     type LimitMutation = (&'static str, fn(&mut TreeLimits));
 
     let (root, receipt) = clean_receipt();
@@ -1130,6 +1260,7 @@ fn receipt_tree_limits_cannot_raise_or_remove_the_schema_caps() {
 
 #[test]
 fn the_output_root_is_excluded_from_the_source_digest_by_assembly() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let source = receipt.subject.source_tree.expect("source tree");
     // README.md, src/main.rs, assets/logo.svg and nothing from dist or .git.
@@ -1149,6 +1280,7 @@ fn the_output_root_is_excluded_from_the_source_digest_by_assembly() {
 
 #[test]
 fn the_receipt_round_trips_and_every_field_is_bound_by_the_content_address() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     let json = receipt.to_json();
     let parsed = BuildReceipt::parse(&json).expect("a receipt round-trips");
@@ -1175,6 +1307,7 @@ fn the_receipt_round_trips_and_every_field_is_bound_by_the_content_address() {
 
 #[test]
 fn build_receipt_parsing_rejects_duplicate_members_before_validation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     let json = receipt.to_json();
     let duplicate = json.replacen(
@@ -1197,6 +1330,7 @@ fn build_receipt_parsing_rejects_duplicate_members_before_validation() {
 
 #[test]
 fn build_receipt_parsing_rejects_unknown_root_and_nested_members() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     let original: serde_json::Value =
         serde_json::from_str(&receipt.to_json()).expect("receipt JSON value");
@@ -1231,6 +1365,7 @@ fn build_receipt_parsing_rejects_unknown_root_and_nested_members() {
 
 #[test]
 fn build_receipt_publication_is_bounded_atomic_and_idempotent() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_fixture, receipt) = clean_receipt();
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("receipt.json");
@@ -1277,6 +1412,7 @@ fn build_receipt_publication_is_bounded_atomic_and_idempotent() {
 #[cfg(unix)]
 #[test]
 fn build_receipt_leaf_symlinks_and_special_files_are_refused_without_mutation() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     use std::os::unix::fs::FileTypeExt as _;
 
     let (_fixture, receipt) = clean_receipt();
@@ -1322,6 +1458,7 @@ fn build_receipt_leaf_symlinks_and_special_files_are_refused_without_mutation() 
 #[cfg(unix)]
 #[test]
 fn build_receipt_read_and_write_stay_under_the_retained_parent() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_fixture, receipt) = clean_receipt();
     let holder = tempfile::tempdir().expect("tempdir");
     let parent = holder.path().join("parent");
@@ -1353,6 +1490,7 @@ fn build_receipt_read_and_write_stay_under_the_retained_parent() {
 
 #[test]
 fn stripping_the_signature_fails_verification_instead_of_reading_as_unsigned() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, mut receipt) = clean_receipt();
     // Sign the way the audit chain would, then re-stamp the content address so
     // the receipt is internally the same as one produced on a machine with a
@@ -1412,6 +1550,7 @@ fn a_deployment_receipt_does_not_deserialize_as_a_build_receipt() {
 
 #[test]
 fn the_serialized_receipt_carries_no_argv_and_no_host_path() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let json = serde_json::to_string(&receipt).expect("serialize");
     assert!(json.contains("argv_digest"));
@@ -1428,6 +1567,7 @@ fn the_serialized_receipt_carries_no_argv_and_no_host_path() {
 
 #[test]
 fn a_clean_status_requires_both_trees_an_untruncated_manifest_and_no_refusal() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     for mutate in [
         (|r: &mut BuildReceipt| r.coverage.source_scanned = false) as fn(&mut _),
@@ -1449,6 +1589,7 @@ fn a_clean_status_requires_both_trees_an_untruncated_manifest_and_no_refusal() {
 
 #[test]
 fn an_unreadable_output_tree_produces_a_partial_receipt_not_a_clean_one() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let receipt = assembled(root.path(), &root.path().join("does-not-exist"));
@@ -1462,6 +1603,7 @@ fn an_unreadable_output_tree_produces_a_partial_receipt_not_a_clean_one() {
 
 #[test]
 fn a_receipt_that_drops_its_caveats_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, mut receipt) = clean_receipt();
     receipt.caveats.clear();
     receipt.receipt_id = receipt.compute_content_hash();
@@ -1701,6 +1843,7 @@ fn an_absent_execution_receipt_is_observed_and_says_so() {
 
 #[test]
 fn an_execution_receipt_that_does_not_prove_containment_makes_the_receipt_partial() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let output = root.path().join("dist");
@@ -1748,6 +1891,7 @@ fn an_execution_receipt_that_does_not_prove_containment_makes_the_receipt_partia
 
 #[test]
 fn an_unlinked_build_stays_clean_even_though_the_default_link_is_observed() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, receipt) = clean_receipt();
     assert!(!receipt.evidence.execution.linked);
     assert_eq!(
@@ -1767,6 +1911,7 @@ fn an_unlinked_build_stays_clean_even_though_the_default_link_is_observed() {
 
 #[test]
 fn verify_build_is_clean_on_an_unchanged_tree_and_mismatch_on_a_changed_one() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let output = root.path().join("dist");
 
@@ -1787,6 +1932,7 @@ fn verify_build_is_clean_on_an_unchanged_tree_and_mismatch_on_a_changed_one() {
 
 #[test]
 fn verify_build_is_partial_when_a_tree_cannot_be_re_read() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let verification = verify_build(
         &receipt,
@@ -1804,6 +1950,7 @@ fn verify_build_is_partial_when_a_tree_cannot_be_re_read() {
 
 #[test]
 fn verify_build_refuses_a_receipt_that_failed_its_own_integrity_rules() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, mut receipt) = clean_receipt();
     let output = root.path().join("dist");
     receipt.subject.argv_digest = "d".repeat(64);
@@ -1814,6 +1961,7 @@ fn verify_build_refuses_a_receipt_that_failed_its_own_integrity_rules() {
 
 #[test]
 fn verify_build_cannot_be_clean_over_a_receipt_that_was_itself_partial() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let root = tempfile::tempdir().expect("tempdir");
     sample_tree(root.path());
     let output = root.path().join("dist");
@@ -1834,6 +1982,7 @@ fn verify_build_cannot_be_clean_over_a_receipt_that_was_itself_partial() {
 
 #[test]
 fn a_receipt_bound_under_another_permission_model_is_partial_not_mismatch() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, mut receipt) = clean_receipt();
     let output = root.path().join("dist");
     let other = if ModeModel::host() == ModeModel::UnixPermissions {
@@ -1859,6 +2008,7 @@ fn a_receipt_bound_under_another_permission_model_is_partial_not_mismatch() {
 
 #[test]
 fn verify_build_refuses_a_receipt_whose_signature_does_not_verify() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let key = test_signing_key();
     let (root, mut receipt) = clean_receipt();
     let output = root.path().join("dist");
@@ -1915,6 +2065,7 @@ fn verify_build_refuses_a_receipt_whose_signature_does_not_verify() {
 
 #[test]
 fn verify_build_refuses_an_unsigned_receipt_on_an_installation_that_signs() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let output = root.path().join("dist");
     assert!(receipt.signature.is_none());
@@ -1938,6 +2089,7 @@ fn verify_build_refuses_an_unsigned_receipt_on_an_installation_that_signs() {
 
 #[test]
 fn verify_build_is_partial_when_a_signature_cannot_be_checked() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let key = test_signing_key();
     let (root, mut receipt) = clean_receipt();
     sign_build_receipt(&mut receipt, &key);
@@ -1969,6 +2121,7 @@ fn verify_build_is_partial_when_a_signature_cannot_be_checked() {
 
 #[test]
 fn verify_build_reports_the_exclusion_sets_and_the_covered_counts() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (root, receipt) = clean_receipt();
     let output = root.path().join("dist");
     let verification = verify_build(&receipt, root.path(), &output, unsigned_anchor());
@@ -1985,6 +2138,7 @@ fn verify_build_reports_the_exclusion_sets_and_the_covered_counts() {
 
 #[test]
 fn an_output_manifest_over_the_cap_is_refused_as_a_document() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let (_root, mut receipt) = clean_receipt();
     // A hand-edited receipt carrying more manifest entries than the schema can
     // produce is a request amplifier for `attest deployment`, so the document

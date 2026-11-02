@@ -10,7 +10,28 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+#[path = "hook_presence.rs"]
+mod hook_presence;
+#[cfg(unix)]
+use hook_presence::{hook_presence_key, presence_key, registered_presence};
+pub use hook_presence::{register_hook_presence, HookPresenceFamily};
+
+#[path = "shell_verification.rs"]
+mod shell_verification;
+pub use shell_verification::{
+    execute_shell_verification_probe, finish_shell_verification,
+    finish_shell_verification_authenticated, observe_shell_verification_hook,
+    start_shell_verification, ShellVerificationChallenge, ShellVerificationHookDecision,
+    ShellVerificationObservation, ShellVerificationProbe, ShellVerificationProof,
+    ShellVerificationStatus,
+};
+
 const RECEIPT_SCHEMA_VERSION: u32 = 3;
+// Schema 4 is only a caller-acknowledged, non-authorizing terminal record.
+// Active and recoverable unacknowledged records continue to use schema 3.
+const ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION: u32 = 4;
+pub const SHELL_RECEIPT_READ_VERSIONS: &[u32] =
+    &[RECEIPT_SCHEMA_VERSION, ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION];
 const LEGACY_RAW_COMMAND_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION: u32 = 2;
 const HOOK_CAPABILITY_SCHEMA_VERSION: u32 = 3;
@@ -109,6 +130,7 @@ pub struct ShellReceiptContext {
     shell: ShellType,
     channel: ShellReceiptChannel,
     interactive: bool,
+    interactive_comments: bool,
     strict_warn_override: bool,
 }
 
@@ -127,6 +149,13 @@ impl ShellReceiptContext {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// Whether the check that issued the receipt read the command with
+    /// comment recognition (`AnalysisContext::interactive_comments`).
+    /// Consumption re-analyzes with the same reading.
+    pub fn interactive_comments(&self) -> bool {
+        self.interactive_comments
     }
 
     pub fn strict_warn_override(&self) -> bool {
@@ -200,6 +229,25 @@ enum ReceiptState {
     Discarded {
         finished_unix_ms: u64,
     },
+    Acknowledged {
+        outcome: AcknowledgedReceiptOutcome,
+    },
+}
+
+/// Retain the exact terminal answer until garbage collection. Acknowledging an
+/// answer never authorizes execution, reconciliation of a conflict, or replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum AcknowledgedReceiptOutcome {
+    Committed {
+        observation: String,
+        evidence_id: String,
+        generation: u64,
+        finished_unix_ms: u64,
+    },
+    Discarded {
+        finished_unix_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,10 +290,28 @@ struct ShellReceipt {
     requires_warn_ack: bool,
     approval_fallback: Option<String>,
     interactive: bool,
+    /// `false` when the issuing check read the command for a shell that
+    /// does not treat a word-start `#` as a comment
+    /// (`--no-interactive-comments`); consumption re-analyzes it the same
+    /// way. Omitted while `true`, so a receipt it does not apply to (and one
+    /// written before it existed) keeps its exact stored form and seal.
+    #[serde(
+        default = "receipt_interactive_comments_default",
+        skip_serializing_if = "receipt_interactive_comments_is_default"
+    )]
+    interactive_comments: bool,
     strict_warn_override: bool,
     created_unix_ms: u64,
     expires_unix_ms: u64,
     state: ReceiptState,
+}
+
+fn receipt_interactive_comments_default() -> bool {
+    true
+}
+
+fn receipt_interactive_comments_is_default(interactive_comments: &bool) -> bool {
+    *interactive_comments
 }
 
 #[cfg(unix)]
@@ -313,8 +379,25 @@ struct ShellHookCapabilityAnchor {
     state: ShellHookCapabilityAnchorState,
 }
 
+/// Owns the advisory lock independently of duplicated descriptor lifetime.
+/// Construct immediately after acquisition so validation errors also release.
+struct ReceiptLock(File);
+
+impl std::ops::Deref for ReceiptLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for ReceiptLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 struct LockedReceipt {
-    _lock_file: File,
+    _lock_file: ReceiptLock,
     token: String,
     receipt_path: PathBuf,
     receipt_identity: FileIdentity,
@@ -363,15 +446,8 @@ fn token_sha256(token: &str) -> String {
     sha256_hex(token.as_bytes())
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
+#[cfg(unix)]
+use crate::util::hex as hex_lower;
 
 fn current_hook_instance(
     expected_channel: ShellReceiptChannel,
@@ -447,6 +523,12 @@ fn immutable_receipt_identity(receipt: &ShellReceipt) -> serde_json::Value {
     let identity_object = identity
         .as_object_mut()
         .expect("static receipt identity is an object");
+    if !receipt.interactive_comments {
+        identity_object.insert(
+            "interactive_comments".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
     if let Some(digest) = &receipt.cwd_sha256 {
         identity_object.insert(
             "cwd_sha256".to_string(),
@@ -476,11 +558,14 @@ fn secret_seal(token: &str, domain: &str, value: &serde_json::Value) -> String {
 #[cfg(unix)]
 #[derive(Debug)]
 enum ShellProcessLookupError {
+    // Only the Linux and macOS identity readers can report a vanished shell;
+    // other Unix targets (Android, the BSDs) refuse registration outright.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Missing,
     Rejected(String),
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_shell_pid(shell_pid: u32) -> Result<libc::pid_t, String> {
     if shell_pid <= 1 || shell_pid > libc::pid_t::MAX as u32 {
         return Err("shell receipt registration has an invalid shell PID".to_string());
@@ -858,9 +943,10 @@ fn capability_paths(
 ) -> Result<(PathBuf, PathBuf), String> {
     let directory = receipt_directory()?;
     // The anchor is intentionally process-scoped, rather than session-scoped.
-    // A nested interactive shell normally inherits TIRITH_SESSION_ID, but it
-    // has a different PID/start identity and therefore receives an independent
-    // one-time bearer. Family, session, and executable remain sealed inside the
+    // New hooks give nested interactive shells fresh session IDs. Even an
+    // older hook sharing an inherited ID has a different PID/start identity and
+    // receives an independent one-time bearer. Family, session, and executable
+    // remain sealed inside the
     // single record for this process so changing any of them cannot mint a
     // second bearer for the same live shell. An in-place `exec` deliberately
     // remains the same one-time identity: because the bearer is non-exported,
@@ -870,6 +956,51 @@ fn capability_paths(
         directory.join(format!(".hook-{key}.capability")),
         directory.join(format!(".hook-{key}.capability.lock")),
     ))
+}
+
+/// Capability use only inspects existing private directories. Provisioning and
+/// permission migration belong to explicit registration, never revalidation.
+#[cfg(unix)]
+fn existing_capability_paths(
+    effective_uid: u32,
+    shell_pid: u32,
+    shell_start_fingerprint: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let receipts = existing_receipt_directory(effective_uid)?
+        .ok_or_else(|| "existing shell capability directory is unavailable".to_string())?;
+    let key = capability_key(effective_uid, shell_pid, shell_start_fingerprint);
+    Ok((
+        receipts.join(format!(".hook-{key}.capability")),
+        receipts.join(format!(".hook-{key}.capability.lock")),
+    ))
+}
+
+/// The private receipt directory, or `None` when it (or its parent) was never
+/// provisioned. Never creates or repairs anything.
+#[cfg(unix)]
+fn existing_receipt_directory(effective_uid: u32) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = crate::policy::state_dir()
+        .ok_or_else(|| "cannot resolve existing shell capability state".to_string())?;
+    let sessions = root.join("sessions");
+    let receipts = sessions.join("execution-receipts");
+    for (directory, receipt_directory) in [(&sessions, false), (&receipts, true)] {
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("existing shell capability directory is unavailable".to_string()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != effective_uid
+            || metadata.mode() & 0o077 != 0
+            || (receipt_directory && metadata.mode() & 0o777 != 0o700)
+        {
+            return Err("existing shell capability directory is not private".to_string());
+        }
+    }
+    Ok(Some(receipts))
 }
 
 #[cfg(unix)]
@@ -962,7 +1093,7 @@ fn publish_capability_anchor(
 fn create_capability_anchor(
     path: &Path,
     prepared: &ShellHookCapabilityAnchor,
-) -> Result<File, String> {
+) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
@@ -981,6 +1112,7 @@ fn create_capability_anchor(
         })?;
     let identity = secure_regular_identity(&file, "shell hook capability anchor")?;
     lock_capability_file(&file)?;
+    let file = ReceiptLock(file);
     if path_identity(path, "shell hook capability anchor")? != identity {
         return Err("shell hook capability anchor changed while locked".to_string());
     }
@@ -991,12 +1123,12 @@ fn create_capability_anchor(
 }
 
 #[cfg(unix)]
-fn open_capability_anchor(path: &Path) -> Result<File, String> {
+fn open_capability_anchor(path: &Path) -> Result<ReceiptLock, String> {
     open_capability_anchor_for(path, RECEIPT_LOCK_TIMEOUT)
 }
 
 #[cfg(unix)]
-fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, String> {
+fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = OpenOptions::new()
@@ -1007,6 +1139,7 @@ fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, St
         .map_err(|error| format!("open shell hook capability anchor: {error}"))?;
     secure_regular_identity(&file, "shell hook capability anchor")?;
     lock_capability_file_for(&file, timeout)?;
+    let file = ReceiptLock(file);
     if path_identity(path, "shell hook capability anchor")?
         != secure_regular_identity(&file, "shell hook capability anchor")?
     {
@@ -1019,7 +1152,7 @@ fn open_capability_anchor_for(path: &Path, timeout: Duration) -> Result<File, St
 fn open_or_create_capability_anchor(
     path: &Path,
     prepared: &ShellHookCapabilityAnchor,
-) -> Result<(File, ShellHookCapabilityAnchor), String> {
+) -> Result<(ReceiptLock, ShellHookCapabilityAnchor), String> {
     match create_capability_anchor(path, prepared) {
         Ok(file) => Ok((file, prepared.clone())),
         Err(error) if error.contains("already has a protocol-v3 registration") => {
@@ -1042,7 +1175,7 @@ fn open_or_create_capability_anchor(
 }
 
 #[cfg(unix)]
-fn open_capability_registry_lock(directory: &Path) -> Result<File, String> {
+fn open_capability_registry_lock(directory: &Path) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     // The receipt directory is already a durable, owner-only identity shared
@@ -1071,6 +1204,7 @@ fn open_capability_registry_lock(directory: &Path) -> Result<File, String> {
         inode: metadata.ino(),
     };
     lock_capability_file(&file)?;
+    let file = ReceiptLock(file);
     let path_metadata = fs::symlink_metadata(directory).map_err(|error| {
         format!("inspect shell hook capability registry directory path: {error}")
     })?;
@@ -1754,6 +1888,250 @@ where
     }
 }
 
+/// Whether a live shell runs a hook registered by this Tirith executable.
+/// Loaded-hook evidence only: never interception or blocking proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFreshnessState {
+    /// Registered by this exact executable.
+    Current,
+    /// Registered by a different or since-replaced executable.
+    Stale,
+    /// No completed protocol-v3 registration (Bash, Zsh, Fish) or hook load
+    /// record (PowerShell, Nushell) for this shell.
+    Unregistered,
+    /// Not determinable (no shell identified, unsupported platform, or
+    /// unreadable state).
+    Unknown,
+}
+
+/// Which record a shell's hook writes when it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRegistration {
+    /// Bash, Zsh and Fish: the protocol-v3 receipt capability.
+    Capability,
+    /// PowerShell and Nushell: a hook load record, which carries no bearer.
+    Presence(HookPresenceFamily),
+}
+
+/// Read-only projection over the private hook capability and hook load
+/// records. Secrets and seals are neither needed nor read; records of dead or
+/// reused processes are ignored with the registry's own liveness test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HookFreshness {
+    pub this_shell: HookFreshnessState,
+    pub other_live_current: u32,
+    pub other_live_stale: u32,
+    pub scan_limited: bool,
+}
+
+impl HookFreshness {
+    fn unknown() -> Self {
+        Self {
+            this_shell: HookFreshnessState::Unknown,
+            other_live_current: 0,
+            other_live_stale: 0,
+            scan_limited: false,
+        }
+    }
+}
+
+/// `shell` is the caller's shell PID and the record its hook writes, when
+/// known. A capability lookup never accepts a load record, and a load-record
+/// lookup accepts only a record of the same family. Other live registered
+/// shells of this user (either kind) are counted separately. Never creates,
+/// repairs or locks state.
+pub fn hook_freshness(shell: Option<(u32, HookRegistration)>) -> HookFreshness {
+    #[cfg(not(unix))]
+    {
+        let _ = shell;
+        HookFreshness::unknown()
+    }
+    #[cfg(unix)]
+    {
+        match current_tirith_executable_identity() {
+            Ok(executable) => hook_freshness_for(shell, &executable),
+            Err(_) => HookFreshness::unknown(),
+        }
+    }
+}
+
+#[cfg(unix)]
+enum RegisteredHook {
+    Absent,
+    Invalid,
+    Live { current: bool },
+}
+
+#[cfg(unix)]
+fn registered_hook(
+    directory: &Path,
+    key: &str,
+    effective_uid: u32,
+    executable: &TirithExecutableIdentity,
+) -> RegisteredHook {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let capability_path = directory.join(format!(".hook-{key}.capability"));
+    let anchor_path = directory.join(format!(".hook-{key}.capability.lock"));
+    let capability = match fs::symlink_metadata(&capability_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+        Ok(_) => match read_capability(&capability_path) {
+            Ok((capability, _)) => capability,
+            Err(_) => return RegisteredHook::Invalid,
+        },
+    };
+    let live = matches!(
+        shell_process_identity(capability.shell_pid),
+        Ok(identity) if identity.effective_uid == capability.effective_uid
+            && identity.start_fingerprint == capability.shell_start_fingerprint
+    );
+    if !capability_key_matches_record(key, &capability)
+        || capability.effective_uid != effective_uid
+        || !live
+    {
+        return RegisteredHook::Invalid;
+    }
+    // A Prepared anchor is a registration that never delivered its bearer, so
+    // the shell runs without a protocol-v3 hook instance.
+    let anchor = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&anchor_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredHook::Absent
+        }
+        Err(_) => return RegisteredHook::Invalid,
+    };
+    if secure_regular_identity(&anchor, "shell hook capability anchor").is_err() {
+        return RegisteredHook::Invalid;
+    }
+    match read_capability_anchor(&anchor) {
+        Ok(anchor)
+            if matches!(anchor.state, ShellHookCapabilityAnchorState::Issued { .. })
+                && validate_capability_anchor_process(
+                    &anchor,
+                    capability.effective_uid,
+                    capability.shell_pid,
+                    &capability.shell_start_fingerprint,
+                )
+                .is_ok() => {}
+        Ok(_) => return RegisteredHook::Absent,
+        Err(_) => return RegisteredHook::Invalid,
+    }
+    RegisteredHook::Live {
+        current: capability.tirith_executable == *executable,
+    }
+}
+
+#[cfg(unix)]
+fn hook_freshness_for(
+    shell: Option<(u32, HookRegistration)>,
+    executable: &TirithExecutableIdentity,
+) -> HookFreshness {
+    let effective_uid = unsafe { libc::geteuid() };
+    let mut result = HookFreshness::unknown();
+    let this_key = shell.and_then(|(pid, registration)| match shell_process_identity(pid) {
+        Ok(identity) if identity.effective_uid == effective_uid => Some((
+            match registration {
+                HookRegistration::Capability => {
+                    capability_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+                HookRegistration::Presence(_) => {
+                    presence_key(effective_uid, pid, &identity.start_fingerprint)
+                }
+            },
+            registration,
+        )),
+        _ => None,
+    });
+    // Never-provisioned receipt state means no hook ever registered here, even
+    // when an unrelated session fallback created the parent directory.
+    let directory = match existing_receipt_directory(effective_uid) {
+        Ok(Some(directory)) => directory,
+        outcome => {
+            let never_provisioned = crate::policy::state_dir().is_some_and(|root| {
+                fs::symlink_metadata(root.join("sessions").join("execution-receipts"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            });
+            if this_key.is_some() && (outcome.is_ok() || never_provisioned) {
+                result.this_shell = HookFreshnessState::Unregistered;
+            }
+            return result;
+        }
+    };
+    if let Some((key, registration)) = &this_key {
+        let registered = match registration {
+            HookRegistration::Capability => {
+                registered_hook(&directory, key, effective_uid, executable)
+            }
+            HookRegistration::Presence(family) => {
+                registered_presence(&directory, key, effective_uid, executable, Some(*family))
+            }
+        };
+        result.this_shell = match registered {
+            RegisteredHook::Absent => HookFreshnessState::Unregistered,
+            RegisteredHook::Invalid => HookFreshnessState::Unknown,
+            RegisteredHook::Live { current: true } => HookFreshnessState::Current,
+            RegisteredHook::Live { current: false } => HookFreshnessState::Stale,
+        };
+    }
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return result;
+    };
+    // Each kind is bounded like its registry.
+    let (mut capabilities, mut load_records) = (0usize, 0usize);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let (key, presence) = if let Some(key) = hook_capability_key(name) {
+            (key, false)
+        } else if let Some(key) = hook_presence_key(name) {
+            (key, true)
+        } else {
+            continue;
+        };
+        if this_key.as_ref().is_some_and(|(this, registration)| {
+            this == key && matches!(registration, HookRegistration::Presence(_)) == presence
+        }) {
+            continue;
+        }
+        let examined = if presence {
+            &mut load_records
+        } else {
+            &mut capabilities
+        };
+        *examined += 1;
+        if *examined > MAX_HOOK_CAPABILITIES {
+            result.scan_limited = true;
+            break;
+        }
+        let registered = if presence {
+            registered_presence(&directory, key, effective_uid, executable, None)
+        } else {
+            registered_hook(&directory, key, effective_uid, executable)
+        };
+        if let RegisteredHook::Live { current } = registered {
+            if current {
+                result.other_live_current = result.other_live_current.saturating_add(1);
+            } else {
+                result.other_live_stale = result.other_live_stale.saturating_add(1);
+            }
+        }
+    }
+    result
+}
+
 /// Validate a protocol-v3 bearer against its live shell and executable
 /// identities. Receipt operations call this for every use; possession of an
 /// unregistered 64-hex string is never sufficient.
@@ -1763,9 +2141,27 @@ pub fn validate_shell_hook_instance(
     family: ShellHookFamily,
     session_id: &str,
 ) -> Result<(), String> {
+    validate_shell_hook_instance_inner(secret, shell_pid, family, session_id, true)
+}
+
+// A retained context already authenticated its session at creation. Its
+// revalidation must not invoke the session resolver's file-creating fallback.
+fn validate_shell_hook_instance_inner(
+    secret: &str,
+    shell_pid: u32,
+    family: ShellHookFamily,
+    session_id: &str,
+    resolve_current_session: bool,
+) -> Result<(), String> {
     #[cfg(not(unix))]
     {
-        let _ = (secret, shell_pid, family, session_id);
+        let _ = (
+            secret,
+            shell_pid,
+            family,
+            session_id,
+            resolve_current_session,
+        );
         return Err("strict shell execution receipts are unsupported on this platform".to_string());
     }
 
@@ -1773,7 +2169,11 @@ pub fn validate_shell_hook_instance(
     {
         validate_token(secret)
             .map_err(|_| "shell hook capability must be 256-bit lowercase hex".to_string())?;
-        validate_capability_session(session_id)?;
+        if resolve_current_session {
+            validate_capability_session(session_id)?;
+        } else if crate::session_warnings::session_state_path(session_id).is_none() {
+            return Err("shell hook capability has an invalid session id".to_string());
+        }
         let actual_parent_pid = unsafe { libc::getppid() };
         if actual_parent_pid <= 1 || shell_pid != actual_parent_pid as u32 {
             return Err(
@@ -1793,7 +2193,7 @@ pub fn validate_shell_hook_instance(
         }
         let executable_identity = current_tirith_executable_identity()?;
         let (capability_path, anchor_path) =
-            capability_paths(effective_uid, shell_pid, &shell_identity.start_fingerprint)?;
+            existing_capability_paths(effective_uid, shell_pid, &shell_identity.start_fingerprint)?;
         let _anchor = open_capability_anchor(&anchor_path)?;
         let anchor_identity = secure_regular_identity(&_anchor, "shell hook capability anchor")?;
         let anchor_record = read_capability_anchor(&_anchor)?;
@@ -1938,7 +2338,7 @@ fn receipt_directory() -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<File, String> {
+fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = OpenOptions::new();
@@ -1957,7 +2357,7 @@ fn open_receipt_lock(path: &Path, timeout: Duration, create: bool) -> Result<Fil
         .ok_or_else(|| "shell receipt lock deadline overflowed".to_string())?;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
+            Ok(()) => return Ok(ReceiptLock(file)),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err("timed out acquiring shell receipt lock".to_string());
@@ -1975,7 +2375,7 @@ fn receipt_registry_lock_path(directory: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
+fn open_receipt_registry_lock(directory: &Path) -> Result<ReceiptLock, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let path = receipt_registry_lock_path(directory);
@@ -2019,6 +2419,7 @@ fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
             Err(error) => return Err(format!("lock shell receipt registry: {error}")),
         }
     }
+    let file = ReceiptLock(file);
     if path_identity(&path, "shell receipt registry lock")? != identity {
         return Err("shell receipt registry lock changed while locked".to_string());
     }
@@ -2026,7 +2427,11 @@ fn open_receipt_registry_lock(directory: &Path) -> Result<File, String> {
 }
 
 #[cfg(not(unix))]
-fn open_receipt_lock(_path: &Path, _timeout: Duration, _create: bool) -> Result<File, String> {
+fn open_receipt_lock(
+    _path: &Path,
+    _timeout: Duration,
+    _create: bool,
+) -> Result<ReceiptLock, String> {
     Err("strict shell execution receipts are unsupported on this platform".to_string())
 }
 
@@ -2065,8 +2470,12 @@ fn read_receipt(_path: &Path) -> Result<(ShellReceipt, FileIdentity), String> {
 }
 
 fn validate_receipt(receipt: &ShellReceipt, token: &str) -> Result<(), String> {
-    if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
-        return Err("shell receipt schema is unsupported".to_string());
+    let acknowledged = matches!(receipt.state, ReceiptState::Acknowledged { .. });
+    if !matches!(
+        (receipt.schema_version, acknowledged),
+        (RECEIPT_SCHEMA_VERSION, false) | (ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION, true)
+    ) {
+        return Err("shell receipt schema/state combination is unsupported".to_string());
     }
     validate_receipt_common(receipt, token)
 }
@@ -2102,7 +2511,7 @@ fn validate_receipt_common(receipt: &ShellReceipt, token: &str) -> Result<(), St
         }
     }
     match receipt.schema_version {
-        RECEIPT_SCHEMA_VERSION => {
+        RECEIPT_SCHEMA_VERSION | ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION => {
             if receipt.cwd_sha256.is_some() {
                 return Err("current shell receipt retains a legacy raw-cwd digest".to_string());
             }
@@ -2133,7 +2542,9 @@ fn validate_receipt_common(receipt: &ShellReceipt, token: &str) -> Result<(), St
                 return Err("schema-v1 shell receipt contains a future command binding".to_string());
             }
         }
-        LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION | RECEIPT_SCHEMA_VERSION => {
+        LEGACY_RAW_CWD_RECEIPT_SCHEMA_VERSION
+        | RECEIPT_SCHEMA_VERSION
+        | ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION => {
             let command_binding = receipt
                 .command_binding_sha256
                 .as_deref()
@@ -2259,7 +2670,11 @@ fn validate_receipt_state(receipt: &ShellReceipt, token: &str) -> Result<(), Str
     };
 
     match &receipt.state {
-        ReceiptState::Prepared | ReceiptState::Discarded { .. } => Ok(()),
+        ReceiptState::Prepared
+        | ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => Ok(()),
         ReceiptState::Armed {
             approval,
             warn_ack_proof_sha256,
@@ -2294,6 +2709,14 @@ fn validate_receipt_state(receipt: &ShellReceipt, token: &str) -> Result<(), Str
             observation,
             evidence_id,
             ..
+        }
+        | ReceiptState::Acknowledged {
+            outcome:
+                AcknowledgedReceiptOutcome::Committed {
+                    observation,
+                    evidence_id,
+                    ..
+                },
         } => {
             if observation != receipt.channel.observation_tag() {
                 return Err("shell receipt committed observation changed".to_string());
@@ -2601,6 +3024,12 @@ fn receipt_is_cleanup_eligible(
     ) {
         return false;
     }
+    if receipt.schema_version == ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION {
+        // Only the bearer-authenticated, context-bound acknowledgement writer
+        // creates this format. Deletion grants no execution authority. As with
+        // age-based GC, this private-store scan cannot verify token-keyed seals.
+        return matches!(receipt.state, ReceiptState::Acknowledged { .. });
+    }
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
         return false;
     }
@@ -2621,6 +3050,7 @@ fn receipt_is_cleanup_eligible(
         | ReceiptState::Discarded { finished_unix_ms } => {
             finished_unix_ms.saturating_add(terminal_retention_ms) <= now
         }
+        ReceiptState::Acknowledged { .. } => false,
     }
 }
 
@@ -2831,9 +3261,38 @@ pub fn create_shell_execution_receipt(
     strict_warn_override: bool,
     ttl: Duration,
 ) -> Result<String, String> {
+    create_shell_execution_receipt_with_comment_reading(
+        prepared,
+        channel,
+        interactive,
+        true,
+        strict_warn_override,
+        ttl,
+    )
+}
+
+/// [`create_shell_execution_receipt`] for a decision whose analysis used
+/// `interactive_comments` (`AnalysisContext::interactive_comments`): the
+/// receipt records it, and consumption re-analyzes the command the same way
+/// ([`ShellReceiptContext::interactive_comments`]).
+pub fn create_shell_execution_receipt_with_comment_reading(
+    prepared: &PreparedExecution,
+    channel: ShellReceiptChannel,
+    interactive: bool,
+    interactive_comments: bool,
+    strict_warn_override: bool,
+    ttl: Duration,
+) -> Result<String, String> {
     #[cfg(not(unix))]
     {
-        let _ = (prepared, channel, interactive, strict_warn_override, ttl);
+        let _ = (
+            prepared,
+            channel,
+            interactive,
+            interactive_comments,
+            strict_warn_override,
+            ttl,
+        );
         return Err("strict shell execution receipts are unsupported on this platform".to_string());
     }
 
@@ -2925,6 +3384,7 @@ pub fn create_shell_execution_receipt(
                 None
             },
             interactive,
+            interactive_comments,
             strict_warn_override,
             created_unix_ms: now,
             expires_unix_ms,
@@ -2961,6 +3421,7 @@ pub fn shell_execution_receipt_context(
             shell: locked.receipt.shell,
             channel: locked.receipt.channel,
             interactive: locked.receipt.interactive,
+            interactive_comments: locked.receipt.interactive_comments,
             strict_warn_override: locked.receipt.strict_warn_override,
         }),
         ReceiptState::Prepared => Err("shell execution receipt is not armed".to_string()),
@@ -2971,6 +3432,9 @@ pub fn shell_execution_receipt_context(
             Err("shell execution receipt ended in a durable identity conflict".to_string())
         }
         ReceiptState::Discarded { .. } => Err("shell execution receipt was discarded".to_string()),
+        ReceiptState::Acknowledged { .. } => Err(
+            "shell execution receipt was acknowledged and cannot authorize execution".to_string(),
+        ),
     }
 }
 
@@ -3068,6 +3532,9 @@ pub fn arm_shell_execution_receipt(
             Err("shell receipt cannot be armed after consumption began".to_string())
         }
         ReceiptState::Discarded { .. } => Err("shell receipt was discarded".to_string()),
+        ReceiptState::Acknowledged { .. } => {
+            Err("shell receipt was acknowledged and cannot be armed".to_string())
+        }
     }
 }
 
@@ -3086,24 +3553,225 @@ pub fn discard_shell_execution_receipt(
             };
             locked.publish()
         }
-        ReceiptState::Discarded { .. } => Ok(()),
+        ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => Ok(()),
         ReceiptState::Consuming { .. } => {
             Err("shell receipt cannot be discarded after consumption began".to_string())
         }
-        ReceiptState::Committed { .. } => {
-            Err("shell receipt was already durably consumed".to_string())
-        }
+        ReceiptState::Committed { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Committed { .. },
+        } => Err("shell receipt was already durably consumed".to_string()),
         ReceiptState::Conflict { .. } => {
             Err("shell receipt ended in a durable identity conflict".to_string())
         }
     }
 }
 
+#[cfg(unix)]
+fn acknowledged_clean_retention_end(
+    previous: u64,
+    committed: u64,
+    acknowledged: u64,
+) -> Result<u64, String> {
+    if acknowledged < committed {
+        return Err("shell acknowledgement clock precedes its durable commit".to_string());
+    }
+    Ok(previous.min(acknowledged))
+}
+
+#[cfg(unix)]
+fn wait_for_acknowledged_retention_end(
+    retained_until: u64,
+    deadline: Instant,
+    mut clock: impl FnMut() -> Result<u64, String>,
+) -> Result<(), String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(
+                "shell acknowledgement retention boundary did not elapse before its deadline"
+                    .to_string(),
+            );
+        }
+        if clock()? > retained_until {
+            return Ok(());
+        }
+        // Existing pressure GC expires records strictly before `now`. Wait for
+        // real time to cross that boundary rather than subtracting a fictitious
+        // millisecond or changing unacknowledged records' expiry semantics.
+        std::thread::sleep(
+            Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+/// End retention only for the exact clean shell-boundary record whose terminal
+/// answer this caller acknowledges. Keep the observation until ordinary pressure
+/// cleanup; never upgrade evidence or shorten any security-history window.
+fn expire_acknowledged_clean_shell_transition(
+    receipt: &ShellReceipt,
+    outcome: &AcknowledgedReceiptOutcome,
+) -> Result<(), String> {
+    let AcknowledgedReceiptOutcome::Committed {
+        evidence_id,
+        generation,
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = (receipt, evidence_id, generation);
+        Err("strict shell-receipt retirement is unsupported on this platform".to_string())
+    }
+    #[cfg(unix)]
+    {
+        // Same receipt -> session order as consume/reconcile. Lock acquisition,
+        // durable mutation and any same-millisecond wait share one deadline.
+        let deadline = Instant::now()
+            .checked_add(RECEIPT_LOCK_TIMEOUT)
+            .ok_or_else(|| "shell receipt retirement deadline overflowed".to_string())?;
+        let state_path = crate::session_warnings::session_state_path(&receipt.session_id)
+            .ok_or_else(|| "shell receipt has an invalid session id".to_string())?;
+        let lock_path = crate::session_warnings::session_lock_path(&receipt.session_id)
+            .ok_or_else(|| "shell receipt has no stable session lock".to_string())?;
+        let parent = state_path
+            .parent()
+            .ok_or_else(|| "shell receipt session path has no parent".to_string())?;
+        ensure_secure_session_directory(parent)?;
+        let lock = ReceiptLock(
+            open_and_lock_secure(&lock_path, deadline).map_err(|error| error.to_string())?,
+        );
+        let lock_identity = secure_regular_identity(&lock, "shell receipt retirement lock")?;
+        let (mut file, mut ledger, active_slot, path, identity) =
+            open_or_initialize_strict_state(parent, &receipt.session_id, None, None)?;
+        validate_execution_ledger(&ledger, &receipt.session_id)?;
+        require_strict_anchor(&lock, &lock_path, &ledger)?;
+        let existing = ledger
+            .confirmed
+            .iter()
+            .chain(ledger.unresolved.iter())
+            .find(|record| record.execution_id == receipt.execution_id);
+        let Some(record) = existing else {
+            // An earlier explicit ACK may have ended retention, then lost its
+            // receipt publication/result before ordinary pressure GC reclaimed
+            // the clean observation. Its Committed receipt remains a known,
+            // non-replayable answer; absence never creates execution evidence.
+            return if ledger.generation > *generation {
+                Ok(())
+            } else {
+                Err("acknowledged shell execution lost its durable identity".to_string())
+            };
+        };
+        if record.evidence_grade != ExecutionEvidenceGrade::ShellBoundaryUnresolved
+            || record.evidence_history.len() != 1
+            || !record.warning_events.is_empty()
+            || !record.escalation_events.is_empty()
+            || !record.events.is_empty()
+        {
+            return Ok(());
+        }
+        if record.evidence_id != *evidence_id
+            || record.generation != *generation
+            || record.command_sha256 != receipt.command_sha256
+            || record.policy_basis_sha256 != receipt.policy_basis_sha256
+        {
+            return Err("acknowledged shell execution has different durable evidence".to_string());
+        }
+        let retained_until = acknowledged_clean_retention_end(
+            record.retention_until_unix_ms,
+            record.committed_unix_ms,
+            unix_time_ms()?,
+        )?;
+        if retained_until != record.retention_until_unix_ms {
+            let record = ledger
+                .unresolved
+                .iter_mut()
+                .find(|record| record.execution_id == receipt.execution_id)
+                .ok_or_else(|| {
+                    "clean shell execution is not in the unresolved ledger".to_string()
+                })?;
+            record.retention_until_unix_ms = retained_until;
+            advance_ledger(&mut ledger)?;
+            validate_execution_ledger(&ledger, &receipt.session_id)?;
+            if path_identity(&lock_path, "shell receipt retirement lock")? != lock_identity {
+                return Err("shell receipt retirement lock changed while held".to_string());
+            }
+            write_strict_state(
+                &lock,
+                &lock_path,
+                &mut file,
+                &path,
+                identity,
+                active_slot,
+                &ledger,
+                PublishFailureInjection::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        drop(file);
+        drop(lock); // No session lock is held during the bounded clock wait.
+        wait_for_acknowledged_retention_end(retained_until, deadline, unix_time_ms)
+    }
+}
+
+/// A caller may acknowledge only a terminal answer it has already observed.
+/// This is best-effort cleanup, never a prerequisite for executing a command.
+/// Keep unacknowledged outcomes recoverable after a lost consume/discard reply.
+/// Once acknowledged, the next normal GC pass may reclaim the record; a missing
+/// old token then fails closed rather than becoming a fresh authorization.
+pub fn acknowledge_shell_execution_receipt(
+    token: &str,
+    expected_channel: ShellReceiptChannel,
+) -> Result<(), String> {
+    let mut locked = lock_receipt(token)?;
+    ensure_receipt_context(&locked.receipt, token, expected_channel)?;
+    let outcome = match &locked.receipt.state {
+        ReceiptState::Committed {
+            observation,
+            evidence_id,
+            generation,
+            finished_unix_ms,
+        } => AcknowledgedReceiptOutcome::Committed {
+            observation: observation.clone(),
+            evidence_id: evidence_id.clone(),
+            generation: *generation,
+            finished_unix_ms: *finished_unix_ms,
+        },
+        ReceiptState::Discarded { finished_unix_ms } => AcknowledgedReceiptOutcome::Discarded {
+            finished_unix_ms: *finished_unix_ms,
+        },
+        ReceiptState::Acknowledged { .. } => return Ok(()),
+        ReceiptState::Prepared
+        | ReceiptState::Armed { .. }
+        | ReceiptState::Consuming { .. }
+        | ReceiptState::Conflict { .. } => {
+            return Err(
+                "shell receipt has no successful terminal outcome to acknowledge".to_string(),
+            )
+        }
+    };
+    // Durably end only clean observation retention before publishing an ACK
+    // eligible for receipt GC. A crash between these writes leaves Committed,
+    // which still answers reconciliation and refuses replay. Repeated ACK does
+    // not extend the shortened window or duplicate the ledger mutation.
+    expire_acknowledged_clean_shell_transition(&locked.receipt, &outcome)?;
+    locked.receipt.state = ReceiptState::Acknowledged { outcome };
+    locked.receipt.schema_version = ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION;
+    // publish refreshes both seals, including the immutable schema identity.
+    locked.publish()
+}
+
 /// Reconcile a prior consume attempt without authorizing or promoting any new
 /// execution. `true` means the exact immutable transition was already durable;
-/// `false` means no committed transition exists yet. This is deliberately
-/// separate from `consume`: a hook may clear old recovery state after a lost
-/// acknowledgement, but can never use reconciliation to authorize a replay.
+/// `false` means no committed transition was found. An explicitly reconciled
+/// Consuming receipt with no durable transition becomes Discarded: reconciliation
+/// abandons that attempt rather than reserving another authorization retry. This
+/// is deliberately separate from `consume`: a hook may clear old recovery state
+/// after a lost acknowledgement, but can never authorize a replay.
 pub fn reconcile_shell_execution_receipt(
     token: &str,
     expected_channel: ShellReceiptChannel,
@@ -3120,25 +3788,29 @@ pub fn reconcile_shell_execution_receipt(
         draft_identity_sha256,
         committed_policy_basis_sha256,
         committed_verdict_basis_sha256,
-        consuming_unix_ms,
     ) = match &locked.receipt.state {
-        ReceiptState::Committed { .. } => return Ok(true),
+        ReceiptState::Committed { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Committed { .. },
+        } => return Ok(true),
         ReceiptState::Conflict { .. } => {
             return Err(
                 "shell receipt ended in a durable identity conflict; refusing reconciliation"
                     .to_string(),
             )
         }
-        ReceiptState::Prepared | ReceiptState::Armed { .. } | ReceiptState::Discarded { .. } => {
-            return Ok(false);
-        }
+        ReceiptState::Prepared
+        | ReceiptState::Armed { .. }
+        | ReceiptState::Discarded { .. }
+        | ReceiptState::Acknowledged {
+            outcome: AcknowledgedReceiptOutcome::Discarded { .. },
+        } => return Ok(false),
         ReceiptState::Consuming {
             observation,
             evidence_id,
             draft_identity_sha256,
             committed_policy_basis_sha256,
             committed_verdict_basis_sha256,
-            consuming_unix_ms,
             ..
         } => (
             observation.clone(),
@@ -3146,7 +3818,6 @@ pub fn reconcile_shell_execution_receipt(
             draft_identity_sha256.clone(),
             committed_policy_basis_sha256.clone(),
             committed_verdict_basis_sha256.clone(),
-            *consuming_unix_ms,
         ),
     };
     match recover_shell_receipt_transition(
@@ -3170,14 +3841,16 @@ pub fn reconcile_shell_execution_receipt(
             Ok(true)
         }
         ShellReceiptRecovery::Missing => {
-            let retry_window_ms =
-                u64::try_from(CONSUMING_RETRY_WINDOW.as_millis()).unwrap_or(u64::MAX);
-            if unix_time_ms()? >= consuming_unix_ms.saturating_add(retry_window_ms) {
-                locked.receipt.state = ReceiptState::Discarded {
-                    finished_unix_ms: unix_time_ms()?,
-                };
-                locked.publish()?;
-            }
+            // Recovery checked the exact evidence under the strict ledger's
+            // stable lock. We still hold this receipt's lock, so no competing
+            // consumer can start or promote this receipt between that absence
+            // check and its terminal publication. Abandon it now; leaving an
+            // old pre-promotion failure Consuming would block every new line
+            // until the unrelated consume-retry window elapsed.
+            locked.receipt.state = ReceiptState::Discarded {
+                finished_unix_ms: unix_time_ms()?,
+            };
+            locked.publish()?;
             Ok(false)
         }
     }
@@ -3228,6 +3901,12 @@ pub fn consume_shell_execution_receipt(
         }
         ReceiptState::Discarded { .. } => {
             return Err("shell execution receipt was discarded".to_string())
+        }
+        ReceiptState::Acknowledged { .. } => {
+            return Err(
+                "shell execution receipt was acknowledged and cannot authorize execution"
+                    .to_string(),
+            )
         }
     };
 
@@ -3343,7 +4022,7 @@ pub fn consume_shell_execution_receipt(
         })?;
     validate_draft(&prepared.draft)?;
     let evidence_id = evidence_id(&locked.receipt);
-    locked.receipt.state = ReceiptState::Consuming {
+    let consuming = ReceiptState::Consuming {
         approval,
         warn_ack_proof_sha256: prepared
             .draft
@@ -3360,9 +4039,15 @@ pub fn consume_shell_execution_receipt(
             None => unix_time_ms()?,
         },
     };
-    locked.publish()?;
-
+    // Acquisition checks the prepared generation and policy under the stable
+    // ledger lock but never promotes this execution. A stale/contended first
+    // attempt must therefore remain Armed and immediately discardable. A prior
+    // Consuming attempt remains uncertain until exact recovery above succeeds.
     let gate = ExecutionGate::acquire(prepared.into_authorizable_draft()?, lock_timeout)?;
+    locked.receipt.state = consuming;
+    // Retain the gate across publication. Consuming must be durable BEFORE any
+    // ledger effect; if publication fails, dropping the gate cannot promote.
+    locked.publish()?;
     let outcome = match gate.promote_shell_unresolved(evidence_id.clone()) {
         Ok(outcome) => outcome,
         Err(error) if is_terminal_execution_replay_conflict(&error) => {
@@ -3464,6 +4149,43 @@ mod tests {
     fn isolated_state(test: impl FnOnce(&tempfile::TempDir, &str)) {
         isolated_state_with_guard(|temporary, session_id, _| {
             test(temporary, session_id);
+        });
+    }
+
+    #[test]
+    fn capability_validation_does_not_provision_missing_state() {
+        isolated_unregistered_state(|temporary, session| {
+            let root = crate::policy::state_dir().expect("isolated state path");
+            // Initial session selection may provision its fallback separately;
+            // already-bound capability validation must not recreate any of it.
+            if root.exists() {
+                fs::remove_dir_all(&root).unwrap();
+            }
+            assert!(!root.exists());
+            assert!(validate_shell_hook_instance_inner(
+                OTHER_HOOK_INSTANCE,
+                unsafe { libc::getppid() } as u32,
+                ShellHookFamily::Zsh,
+                session,
+                false,
+            )
+            .is_err());
+            assert!(!root.join("sessions").exists());
+            assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+            // The explicit registration route still provisions and validates.
+            let secret = register_shell_hook_instance(
+                unsafe { libc::getppid() } as u32,
+                ShellHookFamily::Zsh,
+                session,
+            )
+            .unwrap();
+            validate_shell_hook_instance(
+                &secret,
+                unsafe { libc::getppid() } as u32,
+                ShellHookFamily::Zsh,
+                session,
+            )
+            .unwrap();
         });
     }
 
@@ -3705,6 +4427,906 @@ mod tests {
         evidence_id
     }
 
+    fn commit_allow_receipt(token: &str, command: &str, session_id: &str) {
+        arm_allow(token);
+        assert!(matches!(
+            consume_shell_execution_receipt(
+                token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect("commit allow receipt"),
+            PromotionOutcome::Committed { .. }
+        ));
+    }
+
+    /// A check that read the command without comment recognition
+    /// (`--no-interactive-comments`) seals that reading into its receipt, so
+    /// consumption re-analyzes the same way. A receipt that kept the default
+    /// reading stores exactly the fields it stored before the reading existed.
+    #[test]
+    fn receipt_carries_the_comment_reading_to_consumption() {
+        isolated_state(|_, session| {
+            let command = "ls # list";
+            let prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            let token = create_shell_execution_receipt_with_comment_reading(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                false,
+                Duration::from_secs(60),
+            )
+            .expect("create shell execution receipt");
+            arm_allow(&token);
+            let context = shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh)
+                .expect("open receipt context");
+            assert!(!context.interactive_comments());
+            let stored = fs::read_to_string(receipt_path(&token)).expect("read receipt");
+            assert!(
+                stored.contains(r#""interactive_comments":false"#),
+                "{stored}"
+            );
+            // The reading is sealed: a receipt rewritten to the default
+            // reading no longer opens.
+            replace_receipt_bytes(
+                &token,
+                stored
+                    .replace(
+                        r#""interactive_comments":false"#,
+                        r#""interactive_comments":true"#,
+                    )
+                    .as_bytes(),
+            );
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+
+            let default_token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&default_token);
+            let context = shell_execution_receipt_context(&default_token, ShellReceiptChannel::Zsh)
+                .expect("open default receipt context");
+            assert!(context.interactive_comments());
+            let stored = fs::read_to_string(receipt_path(&default_token)).expect("read receipt");
+            assert!(!stored.contains("interactive_comments"), "{stored}");
+        });
+    }
+
+    #[test]
+    fn acknowledged_terminal_schema_preserves_outcome_but_never_authorizes_replay() {
+        isolated_state(|_, session| {
+            let command = "printf acknowledged";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            let original = lock_receipt(&token).unwrap().receipt;
+            assert_eq!(original.schema_version, RECEIPT_SCHEMA_VERSION);
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let acknowledged = lock_receipt(&token).unwrap().receipt;
+            assert_eq!(
+                acknowledged.schema_version,
+                ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION
+            );
+            assert_ne!(
+                acknowledged.immutable_seal_sha256,
+                original.immutable_seal_sha256
+            );
+            let ReceiptState::Committed {
+                observation,
+                evidence_id,
+                generation,
+                finished_unix_ms,
+            } = original.state
+            else {
+                panic!("not committed")
+            };
+            assert_eq!(
+                acknowledged.state,
+                ReceiptState::Acknowledged {
+                    outcome: AcknowledgedReceiptOutcome::Committed {
+                        observation,
+                        evidence_id,
+                        generation,
+                        finished_unix_ms
+                    },
+                }
+            );
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(
+                arm_shell_execution_receipt(&token, ShellReceiptChannel::Zsh, None, false).is_err()
+            );
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session),
+                Duration::from_secs(1)
+            )
+            .is_err());
+            assert_eq!(strict_generation(session), 2);
+            let _next = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            assert!(!receipt_path(&token).exists());
+            assert!(!receipt_lock_path(&token).exists());
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .is_err());
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+            assert_eq!(strict_generation(session), 2);
+        });
+    }
+
+    #[test]
+    fn acknowledgement_rejects_wrong_context_token_and_unresolved_states() {
+        isolated_state_with_guard(|_, session, environment| {
+            let command = "printf ack-scoped";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            arm_allow(&token);
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            let mut prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            force_consuming(&token, &mut prepared);
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            {
+                let mut locked = lock_receipt(&token).unwrap();
+                locked.receipt.state = ReceiptState::Conflict {
+                    observation: ShellReceiptChannel::Zsh.observation_tag().to_string(),
+                    evidence_id: evidence_id(&locked.receipt),
+                    generation: None,
+                    finished_unix_ms: unix_time_ms().unwrap(),
+                };
+                locked.publish().unwrap();
+            }
+            assert!(acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            let discarded = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            discard_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            let bytes = fs::read(receipt_path(&discarded)).unwrap();
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Fish).is_err()
+            );
+            assert!(
+                acknowledge_shell_execution_receipt(&"0".repeat(64), ShellReceiptChannel::Zsh)
+                    .is_err()
+            );
+            assert!(
+                acknowledge_shell_execution_receipt("invalid", ShellReceiptChannel::Zsh).is_err()
+            );
+            // The process resolver caches TIRITH_SESSION_ID. Bind an actual
+            // authenticated fixture to another session rather than pretending
+            // an environment mutation changes that already-resolved identity.
+            assert_ne!(session, "ack-other-session");
+            {
+                let mut wrong_session = lock_receipt(&discarded).unwrap();
+                wrong_session.receipt.session_id = "ack-other-session".into();
+                wrong_session.publish().unwrap();
+            }
+            let wrong_session_bytes = fs::read(receipt_path(&discarded)).unwrap();
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh)
+                    .unwrap_err()
+                    .contains("different shell session")
+            );
+            assert_eq!(
+                fs::read(receipt_path(&discarded)).unwrap(),
+                wrong_session_bytes
+            );
+            replace_receipt_bytes(&discarded, &bytes);
+            let instance = std::env::var("_TIRITH_RECEIPT_INSTANCE").unwrap();
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", OTHER_HOOK_INSTANCE);
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).is_err()
+            );
+            environment.set_env("_TIRITH_RECEIPT_INSTANCE", instance);
+            assert_eq!(fs::read(receipt_path(&discarded)).unwrap(), bytes);
+            {
+                let mut wrong_cwd = lock_receipt(&discarded).unwrap();
+                wrong_cwd.receipt.cwd_binding_sha256 = Some("0".repeat(64));
+                wrong_cwd.publish().unwrap();
+            }
+            assert!(
+                acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh)
+                    .unwrap_err()
+                    .contains("different working directory")
+            );
+            replace_receipt_bytes(&discarded, &bytes);
+            acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            assert!(!reconcile_shell_execution_receipt(
+                &discarded,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            discard_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&discarded, ShellReceiptChannel::Zsh).unwrap();
+        });
+    }
+
+    #[test]
+    fn acknowledged_schema_requires_terminal_shape_private_bindings_and_both_seals() {
+        isolated_state(|_, session| {
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                "printf ack-schema",
+                session,
+                false,
+            );
+            let original = lock_receipt(&token).unwrap().receipt;
+            let mut future_live = original.clone();
+            future_live.schema_version = ACKNOWLEDGED_RECEIPT_SCHEMA_VERSION;
+            refresh_receipt_seals(&mut future_live, &token).unwrap();
+            assert!(validate_receipt(&future_live, &token).is_err());
+            let mut unversioned_ack = original.clone();
+            unversioned_ack.state = ReceiptState::Acknowledged {
+                outcome: AcknowledgedReceiptOutcome::Discarded {
+                    finished_unix_ms: unix_time_ms().unwrap(),
+                },
+            };
+            refresh_receipt_seals(&mut unversioned_ack, &token).unwrap();
+            assert!(validate_receipt(&unversioned_ack, &token).is_err());
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let acknowledged = lock_receipt(&token).unwrap().receipt;
+            let mut missing_binding = acknowledged.clone();
+            missing_binding.cwd_binding_sha256 = None;
+            refresh_receipt_seals(&mut missing_binding, &token).unwrap();
+            assert!(validate_receipt(&missing_binding, &token).is_err());
+            let mut missing_command = acknowledged.clone();
+            missing_command.command_binding_sha256 = None;
+            refresh_receipt_seals(&mut missing_command, &token).unwrap();
+            assert!(validate_receipt(&missing_command, &token).is_err());
+            let mut schema_tamper = acknowledged.clone();
+            schema_tamper.schema_version = RECEIPT_SCHEMA_VERSION;
+            assert!(validate_receipt(&schema_tamper, &token).is_err());
+            let mut immutable_tamper = acknowledged.clone();
+            immutable_tamper.immutable_seal_sha256 = original.immutable_seal_sha256;
+            assert!(validate_receipt(&immutable_tamper, &token).is_err());
+            let mut state_tamper = acknowledged;
+            state_tamper.state = ReceiptState::Acknowledged {
+                outcome: AcknowledgedReceiptOutcome::Discarded {
+                    finished_unix_ms: 1,
+                },
+            };
+            assert!(validate_receipt(&state_tamper, &token).is_err());
+        });
+    }
+
+    fn mutate_test_receipt_ledger(session: &str, mutate: impl FnOnce(&mut ExecutionLedger)) {
+        let state = crate::session_warnings::session_state_path(session).unwrap();
+        let lock_path = crate::session_warnings::session_lock_path(session).unwrap();
+        let lock = ReceiptLock(
+            open_and_lock_secure(&lock_path, Instant::now() + Duration::from_secs(1)).unwrap(),
+        );
+        let (mut file, mut ledger, active_slot, path, identity) =
+            open_or_initialize_strict_state(state.parent().unwrap(), session, None, None).unwrap();
+        require_strict_anchor(&lock, &lock_path, &ledger).unwrap();
+        mutate(&mut ledger);
+        validate_execution_ledger(&ledger, session).unwrap();
+        write_strict_state(
+            &lock,
+            &lock_path,
+            &mut file,
+            &path,
+            identity,
+            active_slot,
+            &ledger,
+            PublishFailureInjection::default(),
+        )
+        .unwrap();
+    }
+
+    fn seed_test_receipt_ledger_pressure(session: &str) {
+        mutate_test_receipt_ledger(session, |ledger| {
+            let template = ledger.unresolved.front().unwrap().clone();
+            while ledger.unresolved.len() < MAX_UNRESOLVED_EXECUTIONS {
+                let mut record = template.clone();
+                let (generation, sequence) = advance_ledger(ledger).unwrap();
+                record.execution_id = format!("pressure-execution-{generation}");
+                record.evidence_id = format!("pressure-evidence-{generation}");
+                record.generation = generation;
+                record.ledger_sequence = sequence;
+                record.evidence_history = vec![EvidenceTransition {
+                    evidence_id: record.evidence_id.clone(),
+                    grade: record.evidence_grade,
+                    observed_unix_ms: record.committed_unix_ms,
+                    ledger_sequence: sequence,
+                    generation,
+                }];
+                ledger.unresolved.push_back(record);
+            }
+        });
+    }
+
+    fn test_receipt_ledger(session: &str) -> ExecutionLedger {
+        let state = crate::session_warnings::session_state_path(session).unwrap();
+        let (file, ledger, _, _, _) =
+            open_or_initialize_strict_state(state.parent().unwrap(), session, None, None).unwrap();
+        drop(file);
+        ledger
+    }
+
+    #[test]
+    fn acknowledged_clean_record_keeps_observation_until_pressure_but_ends_retention() {
+        isolated_state(|_, session| {
+            let command = "printf ack-recent-observation";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            let before = test_receipt_ledger(session);
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            let after = test_receipt_ledger(session);
+            assert_eq!(after.unresolved.len(), 1);
+            assert!(after.confirmed.is_empty());
+            assert_eq!(after.generation, before.generation + 1);
+            let original = &before.unresolved[0];
+            let actual = &after.unresolved[0];
+            assert!(actual.retention_until_unix_ms >= actual.committed_unix_ms);
+            assert!(actual.retention_until_unix_ms < unix_time_ms().unwrap());
+            assert!(actual.retention_until_unix_ms < original.retention_until_unix_ms);
+            let mut expected = original.clone();
+            expected.retention_until_unix_ms = actual.retention_until_unix_ms;
+            assert_eq!(
+                *actual, expected,
+                "only the clean retention deadline changes"
+            );
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(test_receipt_ledger(session), after);
+        });
+    }
+
+    #[test]
+    fn acknowledged_retention_uses_real_clock_boundary_without_extending_or_fabricating_time() {
+        assert_eq!(
+            acknowledged_clean_retention_end(200, 100, 120).unwrap(),
+            120
+        );
+        assert_eq!(
+            acknowledged_clean_retention_end(120, 100, 150).unwrap(),
+            120
+        );
+        assert!(acknowledged_clean_retention_end(200, 100, 99).is_err());
+        let mut times = [120, 121].into_iter();
+        wait_for_acknowledged_retention_end(120, Instant::now() + Duration::from_secs(1), || {
+            Ok(times.next().unwrap())
+        })
+        .unwrap();
+        assert!(wait_for_acknowledged_retention_end(
+            120,
+            Instant::now() + Duration::from_millis(3),
+            || Ok(120)
+        )
+        .is_err());
+        assert!(wait_for_acknowledged_retention_end(
+            120,
+            Instant::now() + Duration::from_millis(3),
+            || Ok(119)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn acknowledged_retirement_crash_before_receipt_publish_preserves_known_answer() {
+        isolated_state(|_, session| {
+            let command = "printf ack-retirement-crash";
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&token, command, session);
+            seed_test_receipt_ledger_pressure(session);
+            let pressure_generation = strict_generation(session);
+            let mut duplicate = prepare(&allow_verdict(), &Policy::default(), command, session);
+            let locked = lock_receipt(&token).unwrap();
+            duplicate
+                .draft
+                .replace_execution_id(locked.receipt.execution_id.clone())
+                .unwrap();
+            let ReceiptState::Committed {
+                observation,
+                evidence_id,
+                generation,
+                finished_unix_ms,
+            } = &locked.receipt.state
+            else {
+                panic!("not committed")
+            };
+            let outcome = AcknowledgedReceiptOutcome::Committed {
+                observation: observation.clone(),
+                evidence_id: evidence_id.clone(),
+                generation: *generation,
+                finished_unix_ms: *finished_unix_ms,
+            };
+            let bytes = fs::read(receipt_path(&token)).unwrap();
+            expire_acknowledged_clean_shell_transition(&locked.receipt, &outcome).unwrap();
+            drop(locked); // Simulate losing the process before receipt ACK publication.
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), bytes);
+            assert_eq!(strict_generation(session), pressure_generation + 1);
+            let ledger = test_receipt_ledger(session);
+            assert_eq!(ledger.unresolved.len(), MAX_UNRESOLVED_EXECUTIONS);
+            let observed = ledger
+                .unresolved
+                .iter()
+                .find(|record| record.execution_id == duplicate.draft.execution_id)
+                .unwrap();
+            assert!(observed.retention_until_unix_ms < unix_time_ms().unwrap());
+            assert!(
+                ExecutionGate::acquire(duplicate.draft, Duration::from_secs(1))
+                    .unwrap_err()
+                    .contains("stale")
+            );
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&allow_verdict(), &Policy::default(), command, session),
+                Duration::from_secs(1)
+            )
+            .is_err());
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(
+                strict_generation(session),
+                pressure_generation + 1,
+                "repeated cleanup does not fabricate another execution or mutation"
+            );
+            assert!(test_receipt_ledger(session).confirmed.is_empty());
+        });
+    }
+
+    #[test]
+    fn acknowledged_retirement_preserves_security_history_later_evidence_and_mismatches() {
+        for case in [
+            "warning",
+            "escalation",
+            "typed_event",
+            "later_transition",
+            "binding_mismatch",
+        ] {
+            isolated_state(|_, session| {
+                let command = "printf ack-retained-history";
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                commit_allow_receipt(&token, command, session);
+                seed_test_receipt_ledger_pressure(session);
+                mutate_test_receipt_ledger(session, |ledger| {
+                    let mut record = ledger.unresolved.pop_front().unwrap();
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    match case {
+                        "warning" => {
+                            record
+                                .warning_events
+                                .push(crate::session_warnings::WarningEvent {
+                                    timestamp,
+                                    rule_id: "non_ascii_hostname".into(),
+                                    severity: "medium".into(),
+                                    title: "retained warning".into(),
+                                    command_redacted: "printf fixture".into(),
+                                    domains: vec![],
+                                })
+                        }
+                        "escalation" => record.escalation_events.push(
+                            crate::session_warnings::EscalationEvent {
+                                timestamp,
+                                rule_id: "non_ascii_hostname".into(),
+                                domain: None,
+                            },
+                        ),
+                        "typed_event" => {
+                            record.events.push(crate::event_buffer::TypedEvent {
+                                event_id: "retained-event".into(),
+                                sequence: ledger.next_event_sequence,
+                                provenance: crate::event_buffer::EventProvenance::Unresolved,
+                                timestamp,
+                                kind: crate::event_buffer::EventKind::ProcessExec,
+                                rule_id: "retained-rule".into(),
+                                metadata: Default::default(),
+                            });
+                            ledger.next_event_sequence += 1;
+                        }
+                        "later_transition" => {
+                            let (generation, sequence) = advance_ledger(ledger).unwrap();
+                            record.evidence_id = "later-kernel-proof".into();
+                            record.evidence_grade = ExecutionEvidenceGrade::KernelExecStop;
+                            record.generation = generation;
+                            record.ledger_sequence = sequence;
+                            record.evidence_history.push(EvidenceTransition {
+                                evidence_id: record.evidence_id.clone(),
+                                grade: record.evidence_grade,
+                                observed_unix_ms: unix_time_ms().unwrap(),
+                                ledger_sequence: sequence,
+                                generation,
+                            });
+                        }
+                        "binding_mismatch" => record.command_sha256 = "0".repeat(64),
+                        _ => unreachable!(),
+                    }
+                    if record.evidence_grade.is_confirmed() {
+                        ledger.confirmed.push_back(record);
+                    } else {
+                        ledger.unresolved.push_front(record);
+                    }
+                });
+                let before = test_receipt_ledger(session);
+                let result = acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh);
+                if case == "binding_mismatch" {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(
+                    test_receipt_ledger(session),
+                    before,
+                    "{case} must not be retired or promoted"
+                );
+                assert!(reconcile_shell_execution_receipt(
+                    &token,
+                    ShellReceiptChannel::Zsh,
+                    Duration::from_secs(1)
+                )
+                .unwrap());
+                if case == "warning" {
+                    let next = create(
+                        &allow_verdict(),
+                        &Policy::default(),
+                        command,
+                        session,
+                        false,
+                    );
+                    arm_allow(&next);
+                    let error = consume_shell_execution_receipt(
+                        &next,
+                        ShellReceiptChannel::Zsh,
+                        command,
+                        prepare(&allow_verdict(), &Policy::default(), command, session),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("full of live security-bearing correlation evidence"));
+                    assert_eq!(
+                        test_receipt_ledger(session),
+                        before,
+                        "ACK cannot evict unrelated records to make room"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn acknowledged_all_allow_burst_exceeds_receipt_capacity_without_cap_growth() {
+        isolated_state(|_, session| {
+            let command = "printf allow-capacity";
+            for _ in 0..(MAX_RECEIPTS + 8) {
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                commit_allow_receipt(&token, command, session);
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            let commits = MAX_RECEIPTS + 8;
+            assert_eq!(
+                strict_generation(session),
+                2 * commits as u64,
+                "one commit and one explicit clean-ACK retention mutation per command"
+            );
+            let (file, ledger, _, _, _) = open_or_initialize_strict_state(
+                crate::session_warnings::session_state_path(session)
+                    .unwrap()
+                    .parent()
+                    .unwrap(),
+                session,
+                None,
+                None,
+            )
+            .unwrap();
+            drop(file);
+            assert!(ledger.confirmed.is_empty());
+            assert_eq!(ledger.unresolved.len(), commits % MAX_UNRESOLVED_EXECUTIONS);
+            assert!(ledger
+                .unresolved
+                .iter()
+                .all(|record| record.evidence_grade
+                    == ExecutionEvidenceGrade::ShellBoundaryUnresolved));
+            let count = fs::read_dir(receipt_directory().unwrap())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "json")
+                })
+                .count();
+            assert_eq!(
+                count, 1,
+                "acknowledged tombstones must not consume the live capacity"
+            );
+        });
+    }
+
+    #[test]
+    fn acknowledged_clean_history_cannot_strand_a_warning_at_capacity() {
+        isolated_state(|_, session| {
+            let policy = Policy::default();
+            let command = "printf acknowledged-clean-before-warning";
+            for _ in 0..(MAX_UNRESOLVED_EXECUTIONS - 1) {
+                let token = create(&allow_verdict(), &policy, command, session, false);
+                commit_allow_receipt(&token, command, session);
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            assert_eq!(
+                test_receipt_ledger(session).unresolved.len(),
+                MAX_UNRESOLVED_EXECUTIONS - 1
+            );
+            let warning_command = "printf acknowledged-warning";
+            let warning = warning_verdict(false, None);
+            let prepared = prepare(&warning, &policy, warning_command, session);
+            let warn_ack = prepared.requires_warn_ack();
+            let token = create_shell_execution_receipt(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            arm_shell_execution_receipt(&token, ShellReceiptChannel::Zsh, None, warn_ack).unwrap();
+            consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                warning_command,
+                prepare(&warning, &policy, warning_command, session),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let execution_id = lock_receipt(&token).unwrap().receipt.execution_id;
+            let full = test_receipt_ledger(session);
+            assert_eq!(full.unresolved.len(), MAX_UNRESOLVED_EXECUTIONS);
+            let retained_warning = full
+                .unresolved
+                .iter()
+                .find(|record| record.execution_id == execution_id)
+                .unwrap()
+                .clone();
+            assert!(!retained_warning.warning_events.is_empty());
+            acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            assert_eq!(
+                test_receipt_ledger(session),
+                full,
+                "ACK does not shorten security history"
+            );
+            let next = create(&allow_verdict(), &policy, command, session, false);
+            commit_allow_receipt(&next, command, session);
+            acknowledge_shell_execution_receipt(&next, ShellReceiptChannel::Zsh).unwrap();
+            let after = test_receipt_ledger(session);
+            assert_eq!(
+                after.unresolved.len(),
+                2,
+                "ordinary pressure GC reclaims only previously acknowledged clean records"
+            );
+            assert!(after.confirmed.is_empty());
+            assert_eq!(
+                after
+                    .unresolved
+                    .iter()
+                    .find(|record| record.execution_id == execution_id)
+                    .unwrap(),
+                &retained_warning
+            );
+        });
+    }
+
+    #[test]
+    fn acknowledged_mixed_burst_preserves_unacknowledged_lost_responses() {
+        isolated_state(|_, session| {
+            let command = "printf mixed-capacity";
+            let lost_commit = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            commit_allow_receipt(&lost_commit, command, session);
+            let lost_discard = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            discard_shell_execution_receipt(&lost_discard, ShellReceiptChannel::Zsh).unwrap();
+            let consuming = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&consuming);
+            let mut prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            force_consuming(&consuming, &mut prepared);
+            let untouched_prepared = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            let untouched_armed = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&untouched_armed);
+            let preserved = [
+                &lost_commit,
+                &lost_discard,
+                &consuming,
+                &untouched_prepared,
+                &untouched_armed,
+            ];
+            for token in preserved {
+                let mut locked = lock_receipt(token).unwrap();
+                locked.receipt.expires_unix_ms = locked.receipt.created_unix_ms
+                    + u64::try_from(MAX_RECEIPT_TTL.as_millis()).unwrap();
+                locked.publish().unwrap();
+            }
+            let before = preserved.map(|token| fs::read(receipt_path(token)).unwrap());
+            for index in 0..(MAX_RECEIPTS + 8) {
+                let token = create(
+                    &allow_verdict(),
+                    &Policy::default(),
+                    command,
+                    session,
+                    false,
+                );
+                if index % 2 == 0 {
+                    commit_allow_receipt(&token, command, session);
+                } else {
+                    discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+                }
+                acknowledge_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).unwrap();
+            }
+            for (token, bytes) in preserved.into_iter().zip(before) {
+                assert_eq!(fs::read(receipt_path(token)).unwrap(), bytes);
+            }
+            assert!(reconcile_shell_execution_receipt(
+                &lost_commit,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            assert!(!reconcile_shell_execution_receipt(
+                &lost_discard,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+            discard_shell_execution_receipt(&lost_discard, ShellReceiptChannel::Zsh).unwrap();
+            assert!(!reconcile_shell_execution_receipt(
+                &consuming,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1)
+            )
+            .unwrap());
+        });
+    }
+
+    #[test]
+    fn receipt_lock_owner_releases_before_duplicate_descriptor_closes() {
+        isolated_state(|_, session_id| {
+            let token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                "echo fixture",
+                session_id,
+                false,
+            );
+            let path = receipt_lock_path(&token);
+            let first = lock_receipt(&token).unwrap();
+            let retained = first._lock_file.try_clone().unwrap();
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(first);
+            let next = open_receipt_lock(&path, Duration::ZERO, false)
+                .expect("receipt lock release does not wait for duplicate descriptors");
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(retained);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(next);
+            assert!(lock_receipt(&token).is_ok());
+            assert!(
+                receipt_path(&token).is_file(),
+                "lock release preserves receipt history"
+            );
+        });
+    }
+
+    #[test]
+    fn receipt_registry_lock_owner_releases_before_duplicate_descriptor_closes() {
+        isolated_unregistered_state(|_, _| {
+            let directory = receipt_directory().unwrap();
+            let first = open_receipt_registry_lock(&directory).unwrap();
+            let retained = first.try_clone().unwrap();
+            let path = receipt_registry_lock_path(&directory);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(first);
+            let next = open_receipt_registry_lock(&directory)
+                .expect("registry lock release does not wait for duplicate descriptors");
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(retained);
+            assert!(open_receipt_lock(&path, Duration::ZERO, false).is_err());
+            drop(next);
+            assert!(open_receipt_registry_lock(&directory).is_ok());
+        });
+    }
+
     #[test]
     fn allow_receipt_consumes_once_and_durable_json_excludes_bearer_and_raw_command() {
         isolated_state(|_, session_id| {
@@ -3897,6 +5519,81 @@ mod tests {
             assert_ne!(retry, partially_delivered);
             validate_shell_hook_instance(&retry, shell_pid, ShellHookFamily::Zsh, session_id)
                 .expect("validate retry bearer");
+        });
+    }
+
+    #[test]
+    fn capability_anchor_lock_release_covers_error_and_retained_descriptor() {
+        isolated_unregistered_state(|_, _| {
+            let shell_pid = unsafe { libc::getppid() } as u32;
+            let shell_identity = shell_process_identity(shell_pid).unwrap();
+            let (_, path) = capability_paths(
+                unsafe { libc::geteuid() },
+                shell_pid,
+                &shell_identity.start_fingerprint,
+            )
+            .unwrap();
+            let prepared = prepared_capability_anchor(
+                unsafe { libc::geteuid() },
+                shell_pid,
+                &shell_identity.start_fingerprint,
+            )
+            .unwrap();
+            let mut retained = None;
+            let refused: Result<(), String> = (|| {
+                let first = create_capability_anchor(&path, &prepared)?;
+                retained = Some(first.try_clone().unwrap());
+                assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+                Err("refused validation after anchor acquisition".to_string())
+            })();
+            assert!(refused.is_err());
+            let next = open_capability_anchor_for(&path, Duration::ZERO)
+                .expect("failed validation releases before duplicate descriptors close");
+            let retained_next = next.try_clone().unwrap();
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            drop(retained);
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            drop(next);
+            let final_owner = open_capability_anchor_for(&path, Duration::ZERO)
+                .expect("opened anchor owner also releases before its duplicate closes");
+            drop(retained_next);
+            assert!(open_capability_anchor_for(&path, Duration::ZERO).is_err());
+            assert!(matches!(
+                read_capability_anchor(&final_owner).unwrap().state,
+                ShellHookCapabilityAnchorState::Prepared { .. }
+            ));
+            drop(final_owner);
+            assert!(path.is_file(), "lock release preserves the process anchor");
+        });
+    }
+
+    #[test]
+    fn capability_registry_lock_releases_before_duplicate_descriptor_closes() {
+        isolated_unregistered_state(|_, _| {
+            let directory = receipt_directory().unwrap();
+            let first = open_capability_registry_lock(&directory).unwrap();
+            let retained = first.try_clone().unwrap();
+            let competitor = File::open(&directory).unwrap();
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(first);
+            let next = open_capability_registry_lock(&directory)
+                .expect("capability registry owner releases before duplicate descriptors close");
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(retained);
+            assert_eq!(
+                competitor.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(next);
+            let final_owner = open_capability_registry_lock(&directory).unwrap();
+            drop(final_owner);
+            assert!(directory.is_dir());
         });
     }
 
@@ -4237,6 +5934,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for process-scoped capability tests"]
     fn protocol_v3_capability_process_helper() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         match std::env::var("TIRITH_CAPABILITY_PROCESS_HELPER").as_deref() {
             Ok("register") => {
                 let session_id = crate::session::resolve_session_id();
@@ -4274,6 +5972,191 @@ mod tests {
             }
             mode => panic!("unexpected subprocess-helper mode: {mode:?}"),
         }
+    }
+
+    #[test]
+    fn hook_freshness_reports_current_stale_and_unregistered_hooks() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        isolated_unregistered_state(|_, _| {
+            let freshness = hook_freshness(Some((shell_pid, HookRegistration::Capability)));
+            assert_eq!(freshness.this_shell, HookFreshnessState::Unregistered);
+            assert_eq!(
+                (freshness.other_live_current, freshness.other_live_stale),
+                (0, 0)
+            );
+            assert_eq!(hook_freshness(None).this_shell, HookFreshnessState::Unknown);
+        });
+        isolated_state(|temporary, _| {
+            // The hook registered by this executable is current.
+            assert_eq!(
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
+                HookFreshnessState::Current
+            );
+            // Seen from another shell, it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // After the binary is replaced (a different executable identity),
+            // the same record is a stale loaded hook, for this and other shells.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some((shell_pid, HookRegistration::Capability)), &upgraded)
+                    .this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+            // A record whose shell process has exited is never counted.
+            let (mut capability, _) = read_capability(&active_capability_path()).unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            capability.shell_pid = dead_pid;
+            let key = capability_key(
+                capability.effective_uid,
+                dead_pid,
+                &capability.shell_start_fingerprint,
+            );
+            let directory = active_capability_path().parent().unwrap().to_path_buf();
+            let dead_path = directory.join(format!(".hook-{key}.capability"));
+            fs::write(&dead_path, serde_json::to_vec(&capability).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+        });
+    }
+
+    fn hook_load_record_paths() -> Vec<PathBuf> {
+        let directory = existing_receipt_directory(unsafe { libc::geteuid() })
+            .expect("private receipt directory")
+            .expect("provisioned receipt directory");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(hook_presence_key)
+                    .is_some()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn hook_load_records_report_freshness_without_acting_as_capabilities() {
+        let shell_pid = unsafe { libc::getppid() } as u32;
+        let nushell = HookRegistration::Presence(HookPresenceFamily::Nushell);
+        let powershell = HookRegistration::Presence(HookPresenceFamily::PowerShell);
+        isolated_unregistered_state(|temporary, _| {
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load");
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // Loading the hook again in the same live shell replaces its record.
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell)
+                .expect("record the Nushell hook load again");
+            assert_eq!(hook_load_record_paths().len(), 1);
+            assert_eq!(
+                hook_freshness(Some((shell_pid, nushell))).this_shell,
+                HookFreshnessState::Current
+            );
+            // A load record never stands in for a protocol-v3 capability, and
+            // it names one shell family.
+            assert_eq!(
+                hook_freshness(Some((shell_pid, HookRegistration::Capability))).this_shell,
+                HookFreshnessState::Unregistered
+            );
+            assert_eq!(
+                hook_freshness(Some((shell_pid, powershell))).this_shell,
+                HookFreshnessState::Unknown
+            );
+            assert!(validate_shell_hook_instance_inner(
+                OTHER_HOOK_INSTANCE,
+                shell_pid,
+                ShellHookFamily::Zsh,
+                &crate::session::resolve_session_id(),
+                false,
+            )
+            .is_err());
+            // Seen from another shell it is one other live current terminal.
+            let other = hook_freshness(None);
+            assert_eq!((other.other_live_current, other.other_live_stale), (1, 0));
+            // A replaced executable makes the loaded hook stale.
+            let upgraded_path = temporary.path().join("tirith-upgraded");
+            fs::write(&upgraded_path, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&upgraded_path, fs::Permissions::from_mode(0o755)).unwrap();
+            let upgraded = executable_identity_at(&upgraded_path).unwrap();
+            assert_eq!(
+                hook_freshness_for(Some((shell_pid, nushell)), &upgraded).this_shell,
+                HookFreshnessState::Stale
+            );
+            let others = hook_freshness_for(None, &upgraded);
+            assert_eq!((others.other_live_current, others.other_live_stale), (0, 1));
+
+            // The record is private, is not a receipt (`*.json`) or capability
+            // name, and holds no secret.
+            let paths = hook_load_record_paths();
+            let record_path = &paths[0];
+            let name = record_path.file_name().unwrap().to_str().unwrap();
+            assert!(!name.ends_with(".json") && hook_capability_key(name).is_none());
+            assert_eq!(
+                fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
+            assert_eq!(record["family"], "nushell");
+            assert!(record.get("secret_sha256").is_none());
+            assert!(record.get("session_id").is_none());
+
+            // A record whose shell exited is never counted and is removed by
+            // the next registration; an exited shell cannot be registered.
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            record["shell_pid"] = serde_json::json!(dead_pid);
+            let key = presence_key(
+                unsafe { libc::geteuid() },
+                dead_pid,
+                record["shell_start_fingerprint"].as_str().unwrap(),
+            );
+            let directory = record_path.parent().unwrap();
+            let dead_path = hook_presence::presence_path(directory, &key);
+            fs::write(&dead_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::set_permissions(&dead_path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(hook_load_record_paths().len(), 2);
+            let counted = hook_freshness(None);
+            assert_eq!(
+                (counted.other_live_current, counted.other_live_stale),
+                (1, 0)
+            );
+            let error = register_hook_presence(dead_pid, HookPresenceFamily::PowerShell)
+                .expect_err("an exited shell cannot record a hook load");
+            assert!(error.contains("not a live process"), "{error}");
+            register_hook_presence(shell_pid, HookPresenceFamily::Nushell).unwrap();
+            assert_eq!(hook_load_record_paths(), vec![record_path.clone()]);
+        });
     }
 
     #[test]
@@ -5045,6 +6928,261 @@ mod tests {
     }
 
     #[test]
+    fn stale_pre_promotion_receipt_is_immediately_discardable_and_fresh_check_commits() {
+        isolated_state(|_, session_id| {
+            let command = "printf competing-shell-generation";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let winner = create(&verdict, &policy, command, session_id, false);
+            let loser = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&winner);
+            arm_allow(&loser);
+            let stale = prepare(&verdict, &policy, command, session_id);
+            let winner_prepared = prepare(&verdict, &policy, command, session_id);
+            consume_shell_execution_receipt(
+                &winner,
+                ShellReceiptChannel::Zsh,
+                command,
+                winner_prepared,
+                Duration::from_secs(1),
+            )
+            .expect("first contender commits");
+            let committed_generation = strict_generation(session_id);
+
+            let error = consume_shell_execution_receipt(
+                &loser,
+                ShellReceiptChannel::Zsh,
+                command,
+                stale,
+                Duration::from_secs(1),
+            )
+            .expect_err("the other contender's prepared generation is stale");
+            assert!(error.contains("execution decision is stale"), "{error}");
+            assert!(matches!(
+                lock_receipt(&loser)
+                    .expect("read losing receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Armed { .. }
+            ));
+            assert_eq!(strict_generation(session_id), committed_generation);
+            discard_shell_execution_receipt(&loser, ShellReceiptChannel::Zsh)
+                .expect("no ledger promotion started: discard without a retry delay");
+            assert!(consume_shell_execution_receipt(
+                &loser,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect_err("discarded token cannot be reused")
+            .contains("discarded"));
+
+            let retry = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&retry);
+            assert!(matches!(
+                consume_shell_execution_receipt(
+                    &retry,
+                    ShellReceiptChannel::Zsh,
+                    command,
+                    prepare(&verdict, &policy, command, session_id),
+                    Duration::from_secs(1),
+                )
+                .expect("an actual fresh check can commit immediately"),
+                PromotionOutcome::Committed { .. }
+            ));
+            assert_eq!(strict_generation(session_id), committed_generation + 1);
+        });
+    }
+
+    #[test]
+    fn first_consume_lock_timeout_does_not_mark_receipt_consuming() {
+        isolated_state(|_, session_id| {
+            let command = "printf contended-shell-lock";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let prepared = prepare(&verdict, &policy, command, session_id);
+            let path = crate::session_warnings::session_lock_path(session_id)
+                .expect("strict session lock path");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open strict session lock");
+            fs2::FileExt::lock_exclusive(&file).expect("hold competing owner");
+            let error = consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepared,
+                Duration::from_millis(20),
+            )
+            .expect_err("bounded lock acquisition refuses contention");
+            fs2::FileExt::unlock(&file).expect("release competing owner");
+            assert!(error.contains("timed out"), "{error}");
+            assert!(matches!(
+                lock_receipt(&token)
+                    .expect("read contended receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Armed { .. }
+            ));
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh)
+                .expect("discard a known pre-promotion failure immediately");
+            assert_eq!(strict_generation(session_id), 0);
+        });
+    }
+
+    #[test]
+    fn reconcile_abandons_missing_consuming_transition_without_waiting_for_retry_window() {
+        isolated_state(|_, session_id| {
+            let command = "printf abandoned-old-consuming-receipt";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            // This is also the state persisted by older clients before a
+            // stale-generation acquisition failed. An unrelated commit must
+            // not prevent safe non-authorizing abandonment of this attempt.
+            let other = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&other);
+            consume_shell_execution_receipt(
+                &other,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect("other shell advances the shared ledger");
+            let generation = strict_generation(session_id);
+            assert!(!reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .expect("exact transition is absent, not committed"));
+            assert!(matches!(
+                lock_receipt(&token)
+                    .expect("read abandoned receipt")
+                    .receipt
+                    .state,
+                ReceiptState::Discarded { .. }
+            ));
+            discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh)
+                .expect("the hook's reconcile-or-discard sequence clears recovery state");
+            assert!(consume_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                command,
+                prepare(&verdict, &policy, command, session_id),
+                Duration::from_secs(1),
+            )
+            .expect_err("abandonment can never authorize a retry")
+            .contains("discarded"));
+            assert_eq!(strict_generation(session_id), generation);
+        });
+    }
+
+    #[test]
+    fn reconcile_missing_transition_requires_ledger_lock_before_abandoning() {
+        isolated_state(|_, session_id| {
+            let command = "printf uncertain-locked-consuming-receipt";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            let original = fs::read(receipt_path(&token)).expect("original consuming bytes");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(crate::session_warnings::session_lock_path(session_id).unwrap())
+                .expect("open strict session lock");
+            fs2::FileExt::lock_exclusive(&file).expect("hold unknown ledger owner");
+            let error = reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_millis(20),
+            )
+            .expect_err("an unavailable ledger cannot prove absence");
+            fs2::FileExt::unlock(&file).expect("release unknown ledger owner");
+            assert!(error.contains("timed out"), "{error}");
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), original);
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+        });
+    }
+
+    #[test]
+    fn reconcile_missing_transition_requires_authenticated_channel_and_state() {
+        isolated_state(|_, session_id| {
+            let command = "printf authenticated-consuming-cleanup";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            let original = fs::read(receipt_path(&token)).expect("original sealed receipt");
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Fish,
+                Duration::from_secs(1),
+            )
+            .is_err());
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), original);
+            let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            value["state"]["evidence_id"] = serde_json::Value::String("changed-evidence".into());
+            let altered = serde_json::to_vec(&value).unwrap();
+            replace_receipt_bytes(&token, &altered);
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .is_err());
+            assert_eq!(fs::read(receipt_path(&token)).unwrap(), altered);
+            assert_eq!(strict_generation(session_id), 0);
+        });
+    }
+
+    #[test]
+    fn missing_consuming_transition_can_retry_before_explicit_abandonment() {
+        isolated_state(|_, session_id| {
+            let command = "printf retry-unacknowledged-pre-promotion";
+            let policy = Policy::default();
+            let verdict = allow_verdict();
+            let token = create(&verdict, &policy, command, session_id, false);
+            arm_allow(&token);
+            let mut prepared = prepare(&verdict, &policy, command, session_id);
+            force_consuming(&token, &mut prepared);
+            assert!(matches!(
+                consume_shell_execution_receipt(
+                    &token,
+                    ShellReceiptChannel::Zsh,
+                    command,
+                    prepare(&verdict, &policy, command, session_id),
+                    Duration::from_secs(1),
+                )
+                .expect("unacknowledged pre-promotion retry remains supported"),
+                PromotionOutcome::Committed { .. }
+            ));
+            assert!(reconcile_shell_execution_receipt(
+                &token,
+                ShellReceiptChannel::Zsh,
+                Duration::from_secs(1),
+            )
+            .expect("committed transition remains committed"));
+            assert!(discard_shell_execution_receipt(&token, ShellReceiptChannel::Zsh).is_err());
+            assert_eq!(strict_generation(session_id), 1);
+        });
+    }
+
+    #[test]
     fn consuming_crash_reconciles_durable_commit_without_authorizing_replay() {
         isolated_state(|_, session_id| {
             let command = "printf durable-consuming-crash";
@@ -5094,13 +7232,6 @@ mod tests {
             arm_allow(&token);
             let mut prepared = prepare(&verdict, &policy, command, session_id);
             force_consuming(&token, &mut prepared);
-
-            assert!(!reconcile_shell_execution_receipt(
-                &token,
-                ShellReceiptChannel::Zsh,
-                Duration::from_secs(1),
-            )
-            .expect("missing transition is recoverably absent"));
 
             let mut locked = lock_receipt(&token).expect("lock consuming receipt for aging");
             match &mut locked.receipt.state {

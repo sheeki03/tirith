@@ -54,7 +54,8 @@ pub struct ApprovalMetadata {
 }
 
 /// `Some(ApprovalMetadata)` if a verdict triggers any policy approval rule.
-/// Team-tier feature: callers should gate on tier before calling.
+/// This policy gate applies at every supported execution boundary. A caller
+/// without an interactive approval channel must refuse pending approval.
 pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMetadata> {
     if policy.approval_rules.is_empty() {
         return None;
@@ -636,6 +637,7 @@ mod tests {
 
     #[test]
     fn write_approval_file_cleans_up_stale_leaks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: leaked `tirith-approval-*.env` files older than the TTL
         // must be removed on the next write, but fresh files (a concurrent hook
         // may be reading them) and unrelated files must be left alone.

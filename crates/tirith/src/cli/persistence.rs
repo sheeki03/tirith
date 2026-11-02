@@ -341,6 +341,7 @@ mod tests {
 
     #[test]
     fn scan_json_body_emits_fingerprint_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let entries = vec![PersistenceEntry {
             key: "shell_rc:.zshrc".to_string(),
             kind: tirith_core::persistence::PersistenceKind::ShellRc,

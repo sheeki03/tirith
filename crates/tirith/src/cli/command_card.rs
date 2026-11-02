@@ -1061,6 +1061,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn denied_command_card_fetch_creates_no_cache_or_temp_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let cache = root.path().join("cards");
         let binding = tirith_core::runner::remote_command_card_cache_boundary_binding(
@@ -1186,6 +1187,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_card_atomic_through_symlink_updates_target_not_link() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();

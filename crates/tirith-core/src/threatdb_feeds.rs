@@ -99,6 +99,20 @@ impl FeedAccumulator {
         Ok(())
     }
 
+    /// URL feeds do not specify an executing client. Preserve the existing
+    /// generic projection and additionally retain curl's narrow DNS identity.
+    /// Do not invent an IP IOC: the writer keeps its existing literal-IP policy
+    /// for hostname records, while explicit IP feed fields still use add_ip.
+    fn add_url(&mut self, raw: &str, feed: &str, limits: FeedLimits) -> Result<(), String> {
+        if let Some(host) = extract_hostname_from_url(raw) {
+            self.add_hostname(host, feed, limits)?;
+        }
+        if let Some(host) = crate::parse::curl_empty_hex_dns_url_host(raw) {
+            self.add_hostname(host, feed, limits)?;
+        }
+        Ok(())
+    }
+
     fn add_ip(&mut self, ip: Ipv4Addr, feed: &str, limits: FeedLimits) -> Result<(), String> {
         if !self.ips.contains(&ip) && self.len() >= limits.entries {
             return Err(format!(
@@ -199,8 +213,8 @@ fn parse_urlhaus_csv_with_limits<R: Read>(
                 .iter()
                 .find(|value| value.starts_with("http://") || value.starts_with("https://"))
         });
-        if let Some(host) = raw.and_then(extract_hostname_from_url) {
-            entries.add_hostname(host, "URLhaus", limits)?;
+        if let Some(raw) = raw {
+            entries.add_url(raw, "URLhaus", limits)?;
         }
     }
     Ok(entries.finish())
@@ -250,9 +264,7 @@ fn parse_threatfox_csv_with_limits<R: Read>(
             .unwrap_or_default();
 
         if raw_ioc.starts_with("http://") || raw_ioc.starts_with("https://") {
-            if let Some(host) = extract_hostname_from_url(raw_ioc) {
-                entries.add_hostname(host, "ThreatFox", limits)?;
-            }
+            entries.add_url(raw_ioc, "ThreatFox", limits)?;
             continue;
         }
 
@@ -334,8 +346,8 @@ fn parse_phishtank_csv_with_limits<R: Read>(
     for (index, record) in csv.records().enumerate() {
         let record = record.map_err(|e| format!("PhishTank record error: {e}"))?;
         validate_record("PhishTank", index + 1, &record, limits)?;
-        if let Some(host) = record.get(url_idx).and_then(extract_hostname_from_url) {
-            entries.add_hostname(host, "PhishTank", limits)?;
+        if let Some(raw) = record.get(url_idx) {
+            entries.add_url(raw, "PhishTank", limits)?;
         }
     }
     Ok(entries.finish())
@@ -437,9 +449,7 @@ fn parse_digitalside_csv_with_limits<R: Read>(
 
         match ioc_type.as_str() {
             "url" => {
-                if let Some(host) = extract_hostname_from_url(value) {
-                    entries.add_hostname(host, "DigitalSide", limits)?;
-                }
+                entries.add_url(value, "DigitalSide", limits)?;
             }
             // A domain/hostname attribute is a bare host; the guard rejects a
             // stray URL sneaking into the field before it is stored.
@@ -1140,5 +1150,42 @@ mod tests {
         cursor.set_position(0);
         let error = parse_threatfox_zip(cursor).unwrap_err();
         assert!(error.contains("members"), "{error}");
+    }
+    #[test]
+    fn url_feeds_retain_curl_dns_identity_without_replacing_generic_projection() {
+        let raw = "http://0x7f.0x/path";
+        assert_eq!(extract_hostname_from_url(raw).as_deref(), Some("127.0.0.0"));
+        let entries = parse_urlhaus_csv(format!("url\n{raw}\n").as_bytes()).unwrap();
+        assert!(entries.hostnames.contains(&"0x7f.0x".to_string()));
+        assert!(entries.hostnames.contains(&"127.0.0.0".to_string()));
+        assert!(
+            entries.ips.is_empty(),
+            "a URL feed did not assert an IP IOC"
+        );
+        for entries in [
+            parse_threatfox_csv(format!("ioc,ioc_type\n{raw},url\n").as_bytes()).unwrap(),
+            parse_phishtank_csv(format!("url\n{raw}\n").as_bytes()).unwrap(),
+            parse_digitalside_csv(format!("type,value,to_ids\nurl,{raw},1\n").as_bytes()).unwrap(),
+        ] {
+            assert!(entries.hostnames.contains(&"0x7f.0x".to_string()));
+            assert!(entries.hostnames.contains(&"127.0.0.0".to_string()));
+            assert!(entries.ips.is_empty());
+        }
+        let mut accumulator = FeedAccumulator::default();
+        let limits = tiny_limits();
+        accumulator.add_url(raw, "test", limits).unwrap();
+        accumulator.add_url(raw, "test", limits).unwrap();
+        assert_eq!(
+            accumulator.len(),
+            2,
+            "projections deduplicate independently"
+        );
+        let mut accumulator = FeedAccumulator::default();
+        let mut limits = tiny_limits();
+        limits.entries = 1;
+        assert!(
+            accumulator.add_url(raw, "test", limits).is_err(),
+            "each additional identity consumes the existing indicator budget"
+        );
     }
 }

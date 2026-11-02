@@ -962,6 +962,7 @@ dangerous:
 
     #[test]
     fn dangerous_unknown_action_is_rejected_at_load() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A typo'd action must FAIL the manifest load (fail-strict), never
         // silently downgrade to a no-op.
         let err = CommandsManifest::from_yaml(
@@ -1054,6 +1055,7 @@ allowed:
 
     #[test]
     fn cached_load_hits_then_remits_on_mtime_change() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
 
         // P2: cached_load caches by (path, mtime) with a 5s TTL. Prove (a) a second
@@ -1177,6 +1179,7 @@ allowed:
     #[cfg(unix)]
     #[test]
     fn present_but_broken_manifest_is_not_silently_skipped() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::CString;
 
         // Control: no manifest + a `.git` boundary → discovery finds nothing.

@@ -1167,6 +1167,7 @@ mod tests {
 
     #[test]
     fn create_then_detect_roundtrips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
@@ -1190,6 +1191,7 @@ mod tests {
 
     #[test]
     fn create_normalizes_blank_callback_url_to_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R6 #8: a whitespace-only callback URL persists as `None`, so
         // the on-disk record can't claim a callback that runtime would no-op.
         // `create_at` is the single normalization point.
@@ -1223,6 +1225,7 @@ mod tests {
 
     #[test]
     fn create_rejects_unsafe_callback_before_persisting() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
@@ -1252,6 +1255,7 @@ mod tests {
     /// `append_entry` and `rewrite_store_lines`.
     #[test]
     fn mutators_persist_durably_to_disk() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
 
@@ -1285,6 +1289,7 @@ mod tests {
 
     #[test]
     fn unrelated_real_looking_key_does_not_fire() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         // Register one canary.
@@ -1299,6 +1304,7 @@ mod tests {
 
     #[test]
     fn detect_dedups_per_id() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let entry = create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1326,6 +1332,7 @@ mod tests {
 
     #[test]
     fn list_returns_all_entries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1335,6 +1342,7 @@ mod tests {
 
     #[test]
     fn prune_removes_only_the_target() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let a = create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1352,6 +1360,7 @@ mod tests {
 
     #[test]
     fn prune_unknown_id_is_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1360,6 +1369,7 @@ mod tests {
 
     #[test]
     fn rotate_changes_token_keeps_id_and_callback() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         let cb = Some("https://93.184.216.34/hit".to_string());
@@ -1379,6 +1389,7 @@ mod tests {
 
     #[test]
     fn rotate_unknown_id_is_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         create_at(&store, CanaryKind::AwsLike, None).unwrap();
@@ -1400,6 +1411,7 @@ mod tests {
 
     #[test]
     fn prune_preserves_unparseable_lines_on_rewrite() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R12 #F: prune's rewrite must not drop a line the reader
         // skips. Prune one of two canaries; the unknown line survives on disk.
         let dir = tempdir().unwrap();
@@ -1426,6 +1438,7 @@ mod tests {
 
     #[test]
     fn rotate_preserves_unparseable_lines_on_rewrite() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R12 #F: rotate's rewrite must not drop a skipped line.
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
@@ -1446,6 +1459,7 @@ mod tests {
 
     #[test]
     fn rotate_unknown_kind_fails_safe_without_corrupting() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R13 #A: a future-`kind` entry parses as a valid CanaryEntry
         // (not unparseable); rotating it must fail safe and leave the store
         // untouched, not mint a wrong-shaped token over the unknown kind.
@@ -1483,6 +1497,7 @@ mod tests {
 
     #[test]
     fn store_nonempty_reflects_create() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let store = store_in(dir.path());
         assert!(!store_nonempty_at(&store));
@@ -1492,6 +1507,7 @@ mod tests {
 
     #[test]
     fn sequential_locked_mutations_each_persist_and_release_lock() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F2 (Major): proves the lock is RELEASED between calls (a held lock
         // would deadlock the next acquire) and each mutation persists.
         let dir = tempdir().unwrap();
@@ -1518,6 +1534,7 @@ mod tests {
 
     #[test]
     fn acquire_proceeds_on_supported_lock_and_persists() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F1 (Major): the happy (supported-lock) path returns Ok and holds a real
         // lock across the write — not an unlocked best-effort handle.
         let dir = tempdir().unwrap();
@@ -1536,6 +1553,7 @@ mod tests {
 
     #[test]
     fn acquire_propagates_non_unsupported_io_errors() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F1 (Major): only `Unsupported` is best-effort; any other I/O failure
         // must propagate. Force it cross-platform by placing the store under a
         // regular file, so `create_dir_all(parent)` inside `acquire` fails.
@@ -1573,6 +1591,7 @@ mod tests {
 
     #[test]
     fn reader_io_error_line_does_not_truncate_later_entries() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F3 (Sev-5): a bad-UTF-8 line skips only THAT line; entries after it
         // still load. The old `map_while(Result::ok)` stopped at the first Err.
         let dir = tempdir().unwrap();
@@ -1617,6 +1636,7 @@ mod tests {
 
     #[test]
     fn fire_callback_without_url_is_noop() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A local-only canary (no callback URL) must not attempt any network.
         let hit = CanaryHit {
             id: "x".to_string(),
@@ -1629,6 +1649,7 @@ mod tests {
 
     #[test]
     fn callback_error_reason_never_contains_the_url_or_host() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CRITICAL (finding D): the audit reason must not embed the
         // operator-private URL/host. Provoke a real send error and assert the
         // classified reason is a coarse category only.

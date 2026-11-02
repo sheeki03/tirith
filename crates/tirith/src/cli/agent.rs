@@ -1361,6 +1361,7 @@ mod tests {
 
     #[test]
     fn sessions_handles_missing_log_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("does-not-exist.jsonl");
         // Missing log is NOT an error — exits 0 with zero groups.
@@ -1372,6 +1373,7 @@ mod tests {
 
     #[test]
     fn sessions_groups_by_origin_kind_and_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1419,6 +1421,7 @@ mod tests {
 
     #[test]
     fn sessions_filters_to_verdict_entries_only() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1485,6 +1488,7 @@ mod tests {
 
     #[test]
     fn sessions_json_format_outputs_structured_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Smoke the JSON branch via exit code (stdout capture is a subprocess
         // test the integration suite covers).
         let temp = tempdir().unwrap();
@@ -1509,6 +1513,7 @@ mod tests {
 
     #[test]
     fn explain_rejects_empty_query() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let code = explain("   ", Some(log.to_str().unwrap()), false);
@@ -1517,6 +1522,7 @@ mod tests {
 
     #[test]
     fn explain_matches_by_command_substring() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1544,6 +1550,7 @@ mod tests {
 
     #[test]
     fn explain_matches_by_session_id_exact() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         plant_audit_line(
@@ -1561,6 +1568,7 @@ mod tests {
 
     #[test]
     fn explain_matches_by_origin_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1579,6 +1587,7 @@ mod tests {
 
     #[test]
     fn explain_no_match_returns_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         plant_audit_line(
@@ -1596,6 +1605,7 @@ mod tests {
 
     #[test]
     fn explain_truncates_to_max_matches() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1616,6 +1626,7 @@ mod tests {
 
     #[test]
     fn explain_missing_log_returns_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let temp = tempdir().unwrap();
         let log = temp.path().join("nope.jsonl");
         let code = explain("anything", Some(log.to_str().unwrap()), false);
@@ -1685,6 +1696,7 @@ mod tests {
 
     #[test]
     fn format_session_group_debug_escapes_hostile_last_seen() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::collections::BTreeMap;
         let mut actions = BTreeMap::new();
         actions.insert("Allow".to_string(), 1);
@@ -1719,6 +1731,7 @@ mod tests {
 
     #[test]
     fn policy_init_writes_header_only_scaffold_when_no_log() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let nonexistent = repo.path().join("never").join("audit.jsonl");
         let code = policy_init_for_root(
@@ -1739,6 +1752,7 @@ mod tests {
 
     #[test]
     fn policy_init_lists_observed_origins() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let log = repo.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1782,6 +1796,7 @@ mod tests {
 
     #[test]
     fn policy_init_is_deterministic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let log = repo.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();
@@ -1829,6 +1844,7 @@ mod tests {
 
     #[test]
     fn policy_init_refuses_overwrite_without_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let log = repo.path().join("audit.jsonl");
         plant_audit_line(
@@ -1849,6 +1865,7 @@ mod tests {
 
     #[test]
     fn policy_init_overwrites_with_force() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let log = repo.path().join("audit.jsonl");
         plant_audit_line(
@@ -1880,6 +1897,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn policy_init_refuses_symlinked_tirith_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join(".tirith")).unwrap();
@@ -1899,6 +1917,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn policy_init_refuses_dangling_symlink_at_final_component() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");
@@ -1925,6 +1944,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn policy_init_force_does_not_follow_symlink_to_external_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");
@@ -1989,6 +2009,7 @@ mod tests {
 
     #[test]
     fn policy_init_json_format_outputs_structured_preview() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempdir().unwrap();
         let log = repo.path().join("audit.jsonl");
         let claude = AgentOrigin::agent("claude-code", None).unwrap();

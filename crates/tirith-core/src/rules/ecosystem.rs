@@ -291,6 +291,7 @@ mod tests {
 
     #[test]
     fn web3_rpc_finding_retains_only_typed_secret_free_endpoint_evidence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let address = format!("0x{}", "ab".repeat(20));
         let raw = format!(
             "https://user:pass@mainnet.infura.io/v3/providerToken123456789/{address}?api_key=hunter2#fragment"

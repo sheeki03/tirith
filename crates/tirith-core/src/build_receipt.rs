@@ -45,7 +45,7 @@
 //! # The tree digest
 //!
 //! [`scan_tree`] is the load-bearing primitive. It is modelled on the reviewed
-//! `artifact::resolver::attest_pip_trees` binding (domain-separated prefix,
+//! pip-tree attestation of the retired package resolver (domain-separated prefix,
 //! caps folded into the digest, sorted length-prefixed relative paths, mode,
 //! size, no-follow open, post-open re-stat, exact-length read plus a one-byte
 //! grow probe) but is cross-platform, built on retained directory capabilities,
@@ -1040,7 +1040,7 @@ fn hash_bound_file(
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
-    let mut handle = match root.open_descendant_file(&entry.relative, entry.size) {
+    let mut handle = match root.open_descendant_file_read_lease(&entry.relative, entry.size) {
         Ok(handle) => handle,
         Err(OpenRegularError::NotFound) => {
             return Err(TreeScanError::Changed(entry.relative.clone()))
@@ -1066,6 +1066,9 @@ fn hash_bound_file(
     if entry.identity != opened_identity {
         return Err(TreeScanError::Changed(entry.relative.clone()));
     }
+    // Windows holds a no-write sharing lease through the complete read. File
+    // times alone can miss a same-size rewrite; identity/generation checks
+    // remain necessary for changes between the inventory and this open.
     let opened_generation = file_generation(&handle)
         .map_err(|error| TreeScanError::Io(format!("{}: {error}", entry.relative)))?;
     if entry.generation != Some(opened_generation) || opened_generation.links != 1 {

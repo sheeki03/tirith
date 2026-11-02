@@ -90,14 +90,21 @@ pub fn scan(
     )
 }
 
+/// Explicit local-artifact interpretation; does not grant installation authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactEcosystem {
+    Python,
+    Npm,
+}
+
 /// Run `tirith package inspect` — the VERDICT-oriented artifact / installed
 /// inspector (B8b). Unlike `risk`/`explain` (advisory scorers that always exit 0),
 /// this exits scan-style: 0 clean, 1 a block-grade finding, 2 an advisory (warn)
 /// finding, 2 on a usage error.
 ///
 /// Modes (mutually exclusive at the CLI):
-/// * one or more `--artifact <file>` — inspect each wheel; with two or more, also
-///   correlate a cross-distribution loader/payload split across them (B8c);
+/// * one or more `--artifact <file>` — inspect local npm tarballs or wheels;
+///   multiple wheels also correlate a cross-distribution loader/payload split;
 /// * `--artifact-set <dir>` — inspect every `.whl` in a directory as a set;
 /// * `--installed <dir>` — inspect an installed environment (routes through the
 ///   `ecosystem scan --installed` engine, which already runs B5/B6/B7 and the
@@ -107,7 +114,12 @@ pub fn inspect(
     artifact_set: Option<&Path>,
     installed: Option<&Path>,
     json: bool,
+    ecosystem: Option<ArtifactEcosystem>,
 ) -> i32 {
+    if ecosystem.is_some() && (artifact_set.is_some() || installed.is_some()) {
+        eprintln!("tirith package inspect: --ecosystem requires explicit --artifact files.");
+        return 2;
+    }
     // Exactly one mode must be selected. clap marks `--artifact-set`/`--installed`
     // mutually exclusive; guard the combinations clap cannot express.
     let mode_count =
@@ -141,7 +153,75 @@ pub fn inspect(
         artifacts.to_vec()
     };
 
-    inspect_artifacts(&paths, json)
+    inspect_local_artifacts(
+        &paths,
+        if json {
+            super::npm_artifact::Format::Json
+        } else {
+            super::npm_artifact::Format::Human
+        },
+        ecosystem,
+    )
+}
+
+/// Shared local-artifact routing for `pkg inspect` and `package inspect`.
+/// Ecosystems cannot be mixed: npm evidence does not join the wheel authority.
+pub fn inspect_local_artifacts(
+    paths: &[PathBuf],
+    format: super::npm_artifact::Format,
+    ecosystem: Option<ArtifactEcosystem>,
+) -> i32 {
+    if ecosystem == Some(ArtifactEcosystem::Npm) {
+        return super::npm_artifact::inspect(paths, format);
+    }
+    let npm_count = paths
+        .iter()
+        .filter(|path| super::npm_artifact::is_unambiguous_npm_path(path))
+        .count();
+    if ecosystem.is_none() && npm_count > 0 {
+        if npm_count != paths.len() {
+            return local_usage_error("Select npm tarballs or Python wheels in one inspection, without mixing ecosystems.", format);
+        }
+        return super::npm_artifact::inspect(paths, format);
+    }
+    if format == super::npm_artifact::Format::Sarif {
+        return local_usage_error("Local wheel inspection supports human and JSON output; SARIF is available for npm tarballs.", format);
+    }
+    if paths.is_empty() {
+        return local_usage_error("Select at least one local artifact.", format);
+    }
+    inspect_artifacts(paths, format == super::npm_artifact::Format::Json)
+}
+
+pub fn diff_local_artifacts(
+    old: &Path,
+    new: &Path,
+    format: super::npm_artifact::Format,
+    ecosystem: Option<ArtifactEcosystem>,
+) -> i32 {
+    if ecosystem == Some(ArtifactEcosystem::Npm) {
+        return super::npm_artifact::diff(old, new, format);
+    }
+    if ecosystem == Some(ArtifactEcosystem::Python) {
+        return if format == super::npm_artifact::Format::Sarif {
+            local_usage_error(
+                "Local wheel comparison supports human and JSON output.",
+                format,
+            )
+        } else {
+            super::provenance::run_diff(old, new, format == super::npm_artifact::Format::Json)
+        };
+    }
+    match (super::npm_artifact::is_unambiguous_npm_path(old), super::npm_artifact::is_unambiguous_npm_path(new)) {
+        (true, true) => super::npm_artifact::diff(old, new, format),
+        (false, false) if format != super::npm_artifact::Format::Sarif => super::provenance::run_diff(old, new, format == super::npm_artifact::Format::Json),
+        (false, false) => local_usage_error("Local wheel comparison supports human and JSON output; SARIF is available for npm tarballs.", format),
+        _ => local_usage_error("A release comparison requires two npm tarballs or two Python wheels.", format),
+    }
+}
+
+fn local_usage_error(message: &str, format: super::npm_artifact::Format) -> i32 {
+    super::npm_artifact::usage_error(message, format)
 }
 
 /// Inspect an installed environment by routing through the `ecosystem scan
@@ -1285,6 +1365,7 @@ mod tests {
     /// `finalize_static_verdict` (not a manual re-check) and never double-emits.
     #[test]
     fn inspect_blocks_path_traversal_wheel_via_shared_chokepoint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::io::Write as _;
         use zip::write::SimpleFileOptions;
         use zip::ZipWriter;
@@ -1485,6 +1566,7 @@ mod tests {
 
     #[test]
     fn gather_content_signals_missing_explicit_path_is_not_inspected() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = gather_content_signals(
             Ecosystem::Npm,
             "whatever",
@@ -1495,6 +1577,7 @@ mod tests {
 
     #[test]
     fn gather_content_signals_inspects_explicit_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1519,6 +1602,7 @@ mod tests {
 
     #[test]
     fn installed_npm_lifecycle_body_drives_local_network_signal() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1562,6 +1646,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_known_popular_zero() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "react".to_string(),
@@ -1582,6 +1667,7 @@ mod tests {
 
     #[test]
     fn breakdown_human_renders_negative_clamp_factor() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let signals = PackageSignals {
             ecosystem: Ecosystem::Npm,
             name: "raect".to_string(),
@@ -1699,6 +1785,7 @@ mod tests {
 
     #[test]
     fn available_provenance_drives_api_factors_and_human_output() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         #[allow(deprecated)]
         let provenance = ApiProvenance {
             source: "pypi".to_string(),
@@ -1739,6 +1826,7 @@ mod tests {
 
     #[test]
     fn package_risk_human_output_sanitizes_every_untrusted_field() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use tirith_core::package_risk::{
             DepConfusionVerdict, OsvAdvisorySummary, RepoMismatchState, RepoMismatchVerdict,
         };

@@ -344,15 +344,15 @@ fn build_policy_summary(cwd: Option<&str>) -> PolicySummary {
         }
     }
 
-    // (2) File parsed (or absent): build the effective LOCAL policy as
-    // `analyze_inner` does (local discovery + read-only overlays) so counts
-    // match enforcement, but via `discover_local_only` so the dashboard never
-    // fetches a remote policy (CodeRabbit M13 PR #132 R9-2). Still applies
-    // incident-mode runtime overrides (a local concern).
-    let mut policy = crate::policy::Policy::discover_local_only(cwd);
-    policy.load_user_lists();
-    policy.load_org_lists(cwd);
-    policy.load_trust_entries(cwd);
+    // (2) File parsed (or absent): build the effective LOCAL policy with the
+    // same runtime overlays enforcement composes, so counts match enforcement,
+    // but via `discover_local_only` so the dashboard never fetches a remote
+    // policy (CodeRabbit M13 PR #132 R9-2). Still applies incident-mode runtime
+    // overrides (a local concern).
+    let policy = crate::policy_snapshot::compose_runtime_overlays(
+        crate::policy::Policy::discover_local_only(cwd),
+        cwd,
+    );
 
     policy_summary_from(&policy, policy.path.clone())
 }
@@ -1148,6 +1148,7 @@ mod tests {
 
     #[test]
     fn top_hosts_extracts_and_counts_from_redacted_previews() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Host extraction reuses the engine's URL extractor; counts aggregate
         // and sort descending.
         let rec = |cmd: &str| AuditRecord {
@@ -1509,6 +1510,7 @@ mod tests {
 
     #[test]
     fn build_audit_summary_reads_valid_log_through_capped_reader() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Happy path: a real in-window log still produces a populated summary
         // after the capped-read refactor. Two verdict records → 2 commands; a
         // blank + a malformed line exercise `parse_log`'s skipped_lines counting.
@@ -1572,6 +1574,7 @@ mod tests {
 
     #[test]
     fn build_audit_summary_non_regular_path_degrades_to_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 PR #132: a non-regular audit-log path (here a directory)
         // collapses to the same `None` degrade a missing log takes, never a panic.
         let dir = tempfile::tempdir().unwrap();
@@ -1587,6 +1590,7 @@ mod tests {
 
     #[test]
     fn build_audit_summary_oversized_log_degrades_to_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit M13 PR #132: an oversized log (> AUDIT_READ_CAP) is refused
         // before buffering, so the summary degrades to `None`. One byte over the
         // cap, with valid-ish bytes (rejection is on SIZE, not parse failure).
@@ -1609,6 +1613,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn build_audit_summary_fifo_log_does_not_hang() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::CString;
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("log.jsonl");

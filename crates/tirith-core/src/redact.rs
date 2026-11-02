@@ -3,10 +3,29 @@ use regex::Regex;
 
 /// Credential redaction entry. Public output never retains a secret-derived
 /// prefix; the label is fixed registry metadata.
+///
+/// The full regex is compiled on first use. Every redaction pass checks the
+/// entry's small Tier-1 fragment first, and ordinary text matches none of
+/// them, so compiling every full pattern up front cost about 30 ms in each
+/// `tirith check` process (the audit entry redacts the command) for nothing.
 struct CredRedactEntry {
     label: String,
-    regex: Regex,
+    source: String,
+    regex: once_cell::sync::OnceCell<Option<Regex>>,
     tier1: Regex,
+}
+
+impl CredRedactEntry {
+    /// Entries are admitted only when their pattern parses (see
+    /// `CREDENTIAL_REDACT_PATTERNS`), and a unit test compiles every shipped
+    /// pattern, so `None` (a pattern that parses but cannot be compiled) does
+    /// not occur for the built-in registry; it would only make the entry
+    /// match nothing, as a pattern that failed to compile did before.
+    fn regex(&self) -> Option<&Regex> {
+        self.regex
+            .get_or_init(|| Regex::new(&self.source).ok())
+            .as_ref()
+    }
 }
 
 /// Target audience for [`redact_for_audience`]. Controls WHAT is redacted on top
@@ -137,7 +156,6 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     #[derive(serde::Deserialize)]
     struct PkPat {
         id: String,
-        #[allow(dead_code)]
         regex: String,
         redact_regex: Option<String>,
         tier1_fragment: String,
@@ -146,13 +164,17 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
     let toml_str = include_str!("../assets/data/credential_patterns.toml");
     let cred_file: CredFile = toml::from_str(toml_str).expect("invalid credential_patterns.toml");
 
+    // Parsing is cheap; compiling is not. An entry whose pattern does not
+    // parse is skipped, as one that failed to compile always was.
+    let parses = |pattern: &str| regex_syntax::Parser::new().parse(pattern).is_ok();
     let mut entries = Vec::new();
     if let Some(patterns) = cred_file.pattern {
         for p in patterns {
-            if let Ok(re) = Regex::new(&p.regex) {
+            if parses(&p.regex) {
                 entries.push(CredRedactEntry {
                     label: p.id,
-                    regex: re,
+                    source: p.regex,
+                    regex: once_cell::sync::OnceCell::new(),
                     tier1: Regex::new(&p.tier1_fragment)
                         .expect("invalid credential Tier-1 fragment"),
                 });
@@ -163,11 +185,12 @@ static CREDENTIAL_REDACT_PATTERNS: Lazy<Vec<CredRedactEntry>> = Lazy::new(|| {
         for pk in pk_patterns {
             // `redact_regex` covers the full PEM block; fall back to the
             // header-only regex when omitted.
-            let redact_pattern = pk.redact_regex.as_deref().unwrap_or(&pk.regex);
-            if let Ok(re) = Regex::new(redact_pattern) {
+            let redact_pattern = pk.redact_regex.unwrap_or(pk.regex);
+            if parses(&redact_pattern) {
                 entries.push(CredRedactEntry {
                     label: pk.id,
-                    regex: re,
+                    source: redact_pattern,
+                    regex: once_cell::sync::OnceCell::new(),
                     tier1: Regex::new(&pk.tier1_fragment)
                         .expect("invalid private-key Tier-1 fragment"),
                 });
@@ -861,8 +884,11 @@ fn collect_base_redaction_spans(
         if !entry.tier1.is_match(input) {
             continue;
         }
+        let Some(regex) = entry.regex() else {
+            continue;
+        };
         let mut matches = 0usize;
-        for matched in entry.regex.find_iter(input) {
+        for matched in regex.find_iter(input) {
             push_redaction_span(
                 spans,
                 matched.start(),
@@ -1027,6 +1053,36 @@ pub(crate) fn privacy_project_durable_text(input: &str) -> String {
 /// free-text projection as durable identities.
 pub fn redact_blocked_output(input: &str) -> String {
     privacy_project_durable_text(input)
+}
+
+/// Exact fixed labels may survive repeated endpoint projection. This does not
+/// accept arbitrary marker text, suffixes, or labels from runtime configuration.
+pub(crate) fn is_fixed_redaction_marker(value: &str) -> bool {
+    if value == "[REDACTED]" {
+        return true;
+    }
+    let Some(label) = value
+        .strip_prefix("[REDACTED:")
+        .and_then(|v| v.strip_suffix(']'))
+    else {
+        return false;
+    };
+    matches!(
+        label,
+        "Bearer Token"
+            | "custom"
+            | "customer_id"
+            | "incomplete"
+            | "analysis_incomplete"
+            | "tirith_canary"
+            | "evm_private_key"
+            | "supported_secret"
+            | "path"
+            | "invalid_endpoint"
+    ) || BUILTIN_PATTERNS.iter().any(|(fixed, _)| *fixed == label)
+        || CREDENTIAL_REDACT_PATTERNS
+            .iter()
+            .any(|entry| entry.label == label)
 }
 
 /// Project a free-form key/value pair while retaining the key as context for
@@ -1860,8 +1916,25 @@ pub fn redact_verdict_with_compiled(
 ) {
     redact_findings_with_compiled(&mut verdict.findings, compiled);
     redact_optional_string(&mut verdict.policy_path_used, compiled);
-    redact_optional_string(&mut verdict.approval_fallback, compiled);
-    redact_optional_string(&mut verdict.approval_rule, compiled);
+    // These are string-backed protocol fields. Preserve only valid generated
+    // tokens; an arbitrary caller-supplied value still receives full DLP.
+    if !verdict
+        .approval_fallback
+        .as_deref()
+        .is_some_and(|value| matches!(value, "allow" | "warn" | "block"))
+    {
+        redact_optional_string(&mut verdict.approval_fallback, compiled);
+    }
+    if !verdict.approval_rule.as_deref().is_some_and(|value| {
+        serde_json::from_value::<crate::verdict::RuleId>(serde_json::Value::String(
+            value.to_string(),
+        ))
+        .ok()
+        .and_then(|rule| serde_json::to_value(rule).ok())
+            == Some(serde_json::Value::String(value.to_string()))
+    }) {
+        redact_optional_string(&mut verdict.approval_rule, compiled);
+    }
     redact_optional_string(&mut verdict.approval_description, compiled);
     redact_optional_string(&mut verdict.escalation_reason, compiled);
     redact_optional_string(&mut verdict.manifest_allowed_match, compiled);
@@ -1913,8 +1986,10 @@ pub fn redact_findings_with_compiled(
 }
 
 /// Recursively apply redact-sanitize-redact to every string value in a
-/// machine-readable projection while preserving keys, schema, booleans, and
-/// numeric decision metadata. Call this before any presentation bound.
+/// content value while preserving keys, booleans and numeric metadata. This is
+/// NOT suitable for entire machine responses: string enums, identifiers, MIME
+/// types and signed material are also strings. Classify those fields at the
+/// producing boundary (see `mcp::output_contract`) before presentation bounding.
 pub fn redact_json_strings(value: &mut serde_json::Value, compiled: &CompiledCustomPatterns) {
     match value {
         serde_json::Value::String(text) => {
@@ -2032,6 +2107,57 @@ fn powershell_env_assignment_value(chars: &[char], idx: usize) -> Option<(usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FPPERF-7: credential regexes compile on first use. The registry must
+    /// still hold exactly the entries an eager compile kept (every shipped
+    /// pattern compiles), and a lazily compiled entry must redact exactly as
+    /// the eager regex does.
+    #[test]
+    fn lazily_compiled_credential_patterns_match_the_eager_registry() {
+        #[derive(serde::Deserialize)]
+        struct File {
+            pattern: Vec<Pattern>,
+            private_key_pattern: Vec<PrivateKey>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pattern {
+            id: String,
+            regex: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PrivateKey {
+            id: String,
+            regex: String,
+            redact_regex: Option<String>,
+        }
+        let file: File = toml::from_str(include_str!("../assets/data/credential_patterns.toml"))
+            .expect("credential_patterns.toml");
+        let eager: Vec<(String, Regex)> = file
+            .pattern
+            .into_iter()
+            .map(|p| (p.id, p.regex))
+            .chain(
+                file.private_key_pattern
+                    .into_iter()
+                    .map(|pk| (pk.id, pk.redact_regex.unwrap_or(pk.regex))),
+            )
+            .map(|(id, source)| {
+                let regex = Regex::new(&source)
+                    .unwrap_or_else(|error| panic!("{id} must compile: {error}"));
+                (id, regex)
+            })
+            .collect();
+        assert_eq!(CREDENTIAL_REDACT_PATTERNS.len(), eager.len());
+        for (entry, (id, regex)) in CREDENTIAL_REDACT_PATTERNS.iter().zip(&eager) {
+            assert_eq!(&entry.label, id);
+            assert_eq!(entry.regex().map(Regex::as_str), Some(regex.as_str()));
+        }
+        // The redaction itself is unchanged for a credential the lazy path
+        // compiles on demand.
+        let input = format!("token ghp_{} end", "a".repeat(36));
+        let redacted = redact(&input);
+        assert!(!redacted.contains(&"a".repeat(36)), "{redacted}");
+    }
 
     #[test]
     fn durable_projection_covers_unlabelled_scalars_and_contextual_pairs() {
@@ -3431,6 +3557,7 @@ mod tests {
 
     #[test]
     fn customer_id_patterns_are_redacted_and_counted_under_one_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two patterns collapse to one `customer_id` label (count aggregates).
         let input = "customer CUST-12345 escalated; ref ACME-99887.";
         let patterns = vec![r"CUST-\d+".to_string(), r"ACME-\d+".to_string()];
@@ -3518,6 +3645,7 @@ mod tests {
 
     #[test]
     fn looks_secret_shaped_generic_opaque_token_gated_on_entropy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A long mixed-case/digit opaque token (entropy well above 4.0 bits/char)
         // matches the generic arm.
         let opaque = "aB3xK9mP2qR7tV1wY5zC4dF8gH6jL0nQ_sT-uW2xZ4bN8kM";

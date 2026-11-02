@@ -429,15 +429,8 @@ impl From<serde_json::Error> for CardError {
     }
 }
 
-/// Lowercase-hex encode a byte slice (no `hex` crate dependency in this crate).
-pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
+/// Lowercase-hex encode a byte slice.
+pub use crate::util::hex as hex_encode;
 
 /// Decode a lowercase/uppercase hex string into bytes. Returns `None` on any
 /// non-hex char or odd length.
@@ -477,11 +470,7 @@ pub fn key_id_for_secret_key(secret_key: &[u8; SECRET_KEY_LEN]) -> String {
 
 /// SHA-256 (hex) of an arbitrary byte slice — used to name cached card files
 /// and to compute a card's `script_sha256`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex_encode(&hasher.finalize())
-}
+pub use crate::util::sha256_hex;
 
 fn valid_command_shell(shell: &str) -> bool {
     matches!(shell, "posix" | "fish" | "powershell" | "cmd")
@@ -1554,6 +1543,7 @@ mod tests {
 
     #[test]
     fn verified_card_mismatched_command_is_mismatch_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let (secret, pubkey) = generate_keypair().unwrap();
         write_trusted_key(dir.path(), &pubkey);
@@ -1977,6 +1967,7 @@ mod tests {
 
     #[test]
     fn crlf_multiline_command_carried_card_verifies_without_normalization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: a CRLF-authored multi-line command via a CRLF-terminated
         // prelude must still VERIFY. The old `lines()` + `join("\n")` strip
         // normalized CRLF→LF and falsely Mismatched.

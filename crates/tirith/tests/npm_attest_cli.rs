@@ -1536,8 +1536,8 @@ fn pkg_install_npm_still_refuses() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("only `pip` is enforced"),
-        "npm installs stay unenforced: {stderr}"
+        stderr.contains("accept only `pip` requirements"),
+        "npm installs stay refused: {stderr}"
     );
 }
 

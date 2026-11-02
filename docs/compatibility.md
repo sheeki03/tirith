@@ -1,10 +1,11 @@
 # Compatibility and Stability
 
-This matrix describes Tirith 0.4.2. The
-[0.4.2 release notes](release-notes-0.4.2.md) cover what that patch release
-changes, and the [0.4.0 release notes](release-notes-0.4.0.md) summarize the
-0.4 line's published capabilities, compatibility boundaries, and remaining
-limitations.
+This matrix describes Tirith 0.5.0. The
+[0.5.0 release notes](release-notes-0.5.0.md) cover what that release changes
+and how to upgrade, and the [0.4.0 release notes](release-notes-0.4.0.md)
+summarize the platform boundaries and publication contract it builds on.
+[Everyday workflows](user-journeys.md) and [internals](internals.md) describe
+the profiles, rollouts, trust grants, dashboard and team policy added in 0.5.0.
 
 ## Stability Tiers
 
@@ -36,25 +37,29 @@ what an experimental command must satisfy to move to stable.
 | `fetch` | Experimental | Server-side cloaking detection (Unix only). |
 | `checkpoint` | Experimental | File checkpoint and rollback. |
 | `gateway` | Experimental | MCP gateway proxy for AI-agent security. Request analysis and output filtering are bounded and fail closed, but enforcement covers only calls actually routed through the gateway. |
-| `setup` | Experimental | Configure 19 named AI-agent hosts. A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. |
-| `policy` | Experimental | Policy `init` / `validate` / `test` / `tune`. |
-| `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`. Narrow scope and a 30-day TTL by default; scope visualization, per-entry `explain`, and a `diff` trail. |
+| `setup` | Experimental | Configure 19 named AI-agent hosts, plus `setup recommended` and `setup shell` (reviewed, undoable shell startup plans). A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. An upgrade does not rewrite installed agent adapters: `tirith doctor` marks outdated user-scope adapters and those of the project it runs in (from any directory inside it), and `tirith setup <host> --force` refreshes them. |
+| `policy` | Experimental | Policy `init` / `validate` / `effective` / `test` / `tune`, personal `profile` and `setting` changes saved as undoable `operation`s, `rollout` and `simulate`, and the optional `team` client. |
+| `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`, plus `expiry` / `revoke` / `migrate`. `add` needs `--rule` or `--all-rules` and writes scoped, expiring grants to `trust-grants.json`; scope visualization, per-entry `explain`, and a `diff` trail. |
+| `dashboard` | Experimental | Authenticated loopback dashboard (`open`, `serve`, `export`). Not required for protection. |
+| `review` | Experimental | Explicit, bounded, read-only review of a project's dependency, hook, AI-instruction and MCP files. |
 | `warnings` | Experimental | Show accumulated session warnings. |
 | `threat-db` | Experimental | Threat-DB `update` / `status` / `explain` / `sources` / `health` / `diff`. |
 | `package risk` / `package explain` / `package scan` | Experimental | Advisory package-name, local-content, installed-tree, and optional registry-provenance analysis. Does not enforce an install. |
 | `package inspect` | Experimental | Local-only verdict over wheel artifacts, artifact sets, or installed Python environments. No implicit download. |
-| `pkg approve` / `pkg install` | Experimental | Enforcing pip approval/install path on x86_64 Linux only. Unsupported systems refuse before pip starts; npm and Cargo are not enforcing backends. |
+| `pkg approve` | Experimental | Disabled with `pkg install`: after its native-authority check it refuses with `private_input_execution_unqualified` and records no approval. |
+| `pkg install` | Experimental | Disabled on every host: `private_input_execution_unqualified` refuses before resolver, quarantine, checkpoint, or package execution. Flags and elevation cannot enable it. Local inspection, `pkg verify-env`, ordinary command checks, and shell protection remain available. |
 | `pkg verify-env` | Experimental | Read-only RECORD verification of an installed Python environment. |
+| `pkg inspect` | Experimental | npm tarball inspection with exact hashes and bounded static evidence; nothing is extracted, installed or run. Inspection is not installation approval. |
 | `pkg graph` / `pkg diff` / `pkg attest` / `pkg receipt` | Experimental | Provenance, differential, attestation-binding, and receipt evidence. Graph and attestation are not auto-allow decisions. |
 | `mcp lock` / `mcp verify` / `mcp diff` | Experimental | Source-qualified MCP config and descriptor drift. `verify` is the gating command; `diff` is informational. |
 | `daemon` | Experimental | Background daemon (Unix only). |
-| `audit` | Experimental | Audit log export, stats, and compliance reports. |
+| `audit` | Experimental | Audit log export, stats, and compliance reports, plus `recent`, `feedback` (expectation labels, never trust) and reviewed segment retention (`rotate`, `export-segment`, `delete-segment`). |
 | `activate` | Experimental | License key activation. |
 | `license` | Experimental | License status and management. |
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
 | `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
 | `task check` | Preview | Diagnostic task-envelope assessment. Reports what an envelope would be allowed to do; executes, fetches, resolves, and writes nothing, and declares `enforceability: observe_only`. |
-| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. Enforceable on x86_64 Linux only; every other host refuses before anything is copied or spawned, with no degraded fallback. |
+| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. The candidate supports native x86_64 and AArch64 Linux with required Landlock and seccomp controls; unsupported hosts or missing controls refuse before project copy/spawn, with no degraded fallback. Final integrated release-artifact qualification remains separate. |
 | `browser audit` | Experimental | Read-only Chromium-family extension integrity audit. Chrome, Chromium, Brave, and Edge; Firefox and XPI are refused by name. |
 | `pkg attest-npm` | Experimental | Point-in-time npm signature and provenance receipt over an installed project. |
 | `attest` | Experimental | Point-in-time build and deployment receipts (`build`, `verify-build`, `deployment`, `verify-deployment`). |
@@ -129,10 +134,17 @@ Exit codes are stable:
 | 1    | Block (high/critical severity findings) |
 | 2    | Warn (medium/low severity findings) |
 | 3    | WarnAck — acknowledgement required (warn-ack hook protocol) |
+| 4    | Deferred block — a non-critical block held for review (opt-in: `--defer` or `TIRITH_DEFER=1`, without a TTY) |
 
 Exit code 3 is the warn-ack hook protocol path used by shell hooks under strict
 warn mode, not the normal direct-CLI contract. Non-hook callers should not
-normally see exit code 3.
+normally see exit code 3. Exit code 4 appears only when the caller opts in to
+deferral; a Critical finding still exits 1.
+
+A usage error also exits 2: since 0.5.0, an option `tirith check` does not
+know before the command (`tirith check --json --bogus -- cmd`) prints clap's
+error on stderr and nothing on stdout. A caller that reads JSON should treat
+exit 2 with empty stdout as an error, not a warning.
 
 ### Per-command exit codes are deliberately distinct
 
@@ -157,7 +169,7 @@ warning.
 
 ## JSON Output
 
-- `schema_version` is emitted in all JSON output (currently version 3)
+- Command-check JSON defaults to `schema_version: 3` with its existing fields. `tirith check --format json --json-schema 4` explicitly adds typed recovery advice; it keeps the same decision and exit code. Other commands retain their own documented schema versions.
 - Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version
@@ -192,7 +204,7 @@ it.
 
 | Document | Schema field | Notes |
 |---|---|---|
-| Command card | `schema_version` | Defaults to 1 and is SKIPPED when it equals 1, so a v1 card's signing bytes are byte-identical to what they were before schema 2 existed and every checked-in v1 signature still verifies. `web3` is likewise omitted when unset |
+| Command card | `schema_version` | New authoring uses schema 3 with a shell-bound command digest instead of raw command text. Legacy schema 1/2 verification and explicit signing migration retain their own contracts; a valid legacy signature does not satisfy exact Web3 authorization |
 | Browser extension baseline | `schema` plus an independent `format_version` | The hashing rules version is separate so a stale baseline reports one `schema_upgrade_required` entry rather than phantom drift on every extension |
 | npm provenance receipt | `schema` | |
 | Build receipt | `schema` | |

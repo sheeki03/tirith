@@ -472,6 +472,7 @@ mod tests {
 
     #[test]
     fn unsupported_ecosystem_returns_empty() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let advs = for_package(Ecosystem::Apt, "nginx", "1.0");
         assert!(advs.is_empty(), "apt is not a supported OSV ecosystem");
     }
@@ -539,6 +540,7 @@ mod tests {
 
     #[test]
     fn for_package_offline_failure_is_empty_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Graceful fallback path; no emptiness assertion (a cached CI row may
         // exist).
         let _ = for_package(

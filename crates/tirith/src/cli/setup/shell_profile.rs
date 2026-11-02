@@ -4,10 +4,8 @@
 //! nushell/PowerShell) so the hook installs idempotently and updates/removes
 //! without corrupting user content.
 
-use std::path::PathBuf;
-
-const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
-const END_MARKER: &str = "# END tirith-hook";
+pub(super) const BEGIN_MARKER: &str = "# BEGIN tirith-hook v1";
+pub(super) const END_MARKER: &str = "# END tirith-hook";
 const BEGIN_MARKER_STEM: &str = "# BEGIN tirith-hook v";
 
 /// Match only the managed marker grammar, while still recognizing a future
@@ -61,87 +59,22 @@ pub(crate) fn shell_quote(path: &str, shell: &str) -> String {
         return path.to_string();
     }
     match shell {
-        // PowerShell doubles a literal ' to escape; POSIX/fish break out of the quote.
-        "powershell" => format!("'{}'", path.replace('\'', "''")),
+        // PowerShell doubles a literal apostrophe. Fish also decodes escaped
+        // backslashes inside single quotes, so preserve those explicitly.
+        "powershell" | "pwsh" => format!("'{}'", path.replace('\'', "''")),
+        "fish" => format!("'{}'", path.replace('\\', "\\\\").replace('\'', "\\'")),
         _ => format!("'{}'", path.replace('\'', "'\\''")),
     }
 }
 
-/// Detect the user's default shell and return its profile file path.
-fn detect_shell_profile() -> Result<Option<(&'static str, PathBuf)>, String> {
-    let Some(home) = home::home_dir() else {
-        return Ok(None);
-    };
-    let shell = crate::cli::init::detect_shell();
-
-    Ok(profile_for_shell(shell, &home)?.map(|profile| (shell, profile)))
-}
-
-fn profile_for_shell(shell: &str, home: &std::path::Path) -> Result<Option<PathBuf>, String> {
-    let profile = match shell {
-        "zsh" => home.join(".zshrc"),
-        "bash" => {
-            // .bashrc preferred; fall back to .bash_profile, else create .bashrc.
-            let bashrc = home.join(".bashrc");
-            let bash_profile = home.join(".bash_profile");
-            if super::fs_helpers::read_to_string_scoped(&bashrc, home)?.is_some() {
-                bashrc
-            } else if super::fs_helpers::read_to_string_scoped(&bash_profile, home)?.is_some() {
-                bash_profile
-            } else {
-                bashrc
-            }
-        }
-        "fish" => home.join(".config").join("fish").join("config.fish"),
-        "nushell" => {
-            let config = home.join(".config").join("nushell").join("config.nu");
-            // Only offer if the user already has a nushell config directory.
-            if super::fs_helpers::read_to_string_scoped(&config, home)?.is_some()
-                || super::fs_helpers::parent_exists_scoped(&config, home)?
-            {
-                config
-            } else {
-                return Ok(None);
-            }
-        }
-        "powershell" => {
-            // On macOS/Linux, PowerShell profile lives under ~/.config/powershell/.
-            let profile = home
-                .join(".config")
-                .join("powershell")
-                .join("Microsoft.PowerShell_profile.ps1");
-            if super::fs_helpers::read_to_string_scoped(&profile, home)?.is_some()
-                || super::fs_helpers::parent_exists_scoped(&profile, home)?
-            {
-                profile
-            } else {
-                return Ok(None);
-            }
-        }
-        _ => return Ok(None),
-    };
-
-    Ok(Some(profile))
-}
-
-fn revalidate_profile_selection(
-    shell: &str,
-    home: &std::path::Path,
-    expected: &std::path::Path,
-) -> Result<(), String> {
-    let selected = profile_for_shell(shell, home)?;
-    if selected.as_deref() != Some(expected) {
-        return Err(format!(
-            "shell profile selection changed while setup was running; refusing to update {}",
-            expected.display()
-        ));
-    }
-    Ok(())
+/// Use the same target list for setup, inspection, update and removal.
+fn selected_targets() -> Result<crate::cli::shell_target::ShellTarget, String> {
+    crate::cli::shell_target::inspect_current()
 }
 
 /// Detect a manually-added `tirith init` (uncommented executable line). Skips
 /// comments/blanks to avoid false positives on `# TODO: tirith init`.
-fn has_executable_tirith_init(content: &str) -> bool {
+pub(super) fn has_executable_tirith_init(content: &str) -> bool {
     content.lines().any(|line| {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
@@ -162,213 +95,178 @@ fn has_executable_tirith_init(content: &str) -> bool {
     })
 }
 
-/// Validate that each BEGIN marker has a matching END marker. Err on unbalanced
-/// or nested markers so `remove_hook_blocks` never silently drops user content.
-fn validate_marker_pairing(content: &str) -> Result<(), String> {
-    let mut in_block = false;
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            if in_block {
-                return Err(
-                    "corrupted tirith-hook block — nested BEGIN markers, fix manually".to_string(),
-                );
+/// Why a managed marker sequence cannot be edited safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MarkerError {
+    NestedBegin,
+    EndWithoutBegin,
+    MissingEnd,
+}
+
+impl MarkerError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NestedBegin => "corrupted tirith-hook block — nested BEGIN markers, fix manually",
+            Self::EndWithoutBegin => {
+                "corrupted tirith-hook block — END marker without BEGIN, fix manually"
             }
-            in_block = true;
-        } else if line == END_MARKER {
-            if !in_block {
-                return Err(
-                    "corrupted tirith-hook block — END marker without BEGIN, fix manually"
-                        .to_string(),
-                );
-            }
-            in_block = false;
+            Self::MissingEnd => "corrupted tirith-hook block — missing END marker, fix manually",
         }
     }
-    if in_block {
-        return Err("corrupted tirith-hook block — missing END marker, fix manually".to_string());
+}
+
+/// A marker line is compared without its `\n` or `\r\n` terminator.
+fn marker_text(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+        None => line,
+    }
+}
+
+/// The one managed-block parser: byte ranges (BEGIN line through END line,
+/// inclusive of their terminators) of every block whose BEGIN line satisfies
+/// `is_begin`. Nested, unpaired or unterminated markers are refused, so no
+/// caller ever drops user content after a corrupt marker.
+pub(super) fn hook_blocks_matching(
+    text: &str,
+    is_begin: impl Fn(&str) -> bool,
+) -> Result<Vec<(usize, usize)>, MarkerError> {
+    let mut blocks = Vec::new();
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let marker = marker_text(line);
+        if is_begin(marker) {
+            if start.is_some() {
+                return Err(MarkerError::NestedBegin);
+            }
+            start = Some(offset);
+        } else if marker == END_MARKER {
+            let begin = start.take().ok_or(MarkerError::EndWithoutBegin)?;
+            blocks.push((begin, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    if start.is_some() {
+        return Err(MarkerError::MissingEnd);
+    }
+    Ok(blocks)
+}
+
+/// Managed blocks of any numeric marker version.
+pub(super) fn hook_blocks(text: &str) -> Result<Vec<(usize, usize)>, String> {
+    hook_blocks_matching(text, is_managed_begin_marker).map_err(|error| error.message().into())
+}
+
+/// `text` with the given block ranges removed; every other byte is kept.
+pub(super) fn without_blocks(text: &str, blocks: &[(usize, usize)]) -> String {
+    let mut output = String::new();
+    let mut offset = 0;
+    for &(start, end) in blocks {
+        output.push_str(&text[offset..start]);
+        offset = end;
+    }
+    output.push_str(&text[offset..]);
+    output
+}
+
+/// Extract the first managed block (BEGIN through END, inclusive) from content.
+#[cfg(test)]
+fn extract_managed_block(content: &str) -> Option<String> {
+    let blocks = hook_blocks(content).ok()?;
+    blocks
+        .first()
+        .map(|&(start, end)| content[start..end].to_owned())
+}
+
+/// Install through the same immutable, journaled plan used by local controls.
+pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
+    let target = selected_targets()?;
+    crate::cli::shell_target::require_personal_writer(&target)?;
+    if let Some(reason) = target.unsupported_reason {
+        return Err(reason);
+    }
+    let shell = super::shell_service::ShellKind::parse(&target.shell)?;
+    let prepared = super::shell_service::PreparedShell::capture_with_binary(
+        super::shell_service::ShellChange::Install { shell, force },
+        None,
+        Some(tirith_bin),
+    )?;
+    apply_prepared_shell(prepared, dry_run)?;
+    #[cfg(unix)]
+    if !dry_run && target.shell == "bash" {
+        let _ = crate::cli::bash_capability::run_and_cache();
     }
     Ok(())
 }
 
-/// Extract the full managed block (BEGIN through END, inclusive) from content.
-fn extract_managed_block(content: &str) -> Option<String> {
-    let mut in_block = false;
-    let mut block_lines = Vec::new();
-
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            in_block = true;
-            block_lines.push(line);
-            continue;
-        }
-        if in_block {
-            block_lines.push(line);
-            if line == END_MARKER {
-                break;
-            }
-        }
-    }
-
-    if block_lines.is_empty() {
-        None
-    } else {
-        let mut out = block_lines.join("\n");
-        out.push('\n');
-        Some(out)
-    }
-}
-
-/// Install the tirith shell hook (a managed block with the detected shell's init
-/// line) into the user's profile. Idempotent: skips a matching block unless
-/// `force`, reports drift when content differs.
-///
-/// For bash (non-dry-run) also runs the enter-mode delivery self-test (issue
-/// #111) and caches the verdict so the next shell picks enter-vs-preexec
-/// correctly. The probe is best-effort and never fails the setup.
-pub fn install_shell_hook(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
-    let result = install_shell_hook_inner(tirith_bin, force, dry_run);
-
-    // Refresh the bash enter-mode capability cache after a successful install,
-    // scoped to bash users without threading the shell name through the inner fn.
-    #[cfg(unix)]
-    if result.is_ok() && !dry_run {
-        if let Ok(Some(("bash", _))) = detect_shell_profile() {
-            let _ = crate::cli::bash_capability::run_and_cache();
-        }
-    }
-
-    result
-}
-
-fn install_shell_hook_inner(tirith_bin: &str, force: bool, dry_run: bool) -> Result<(), String> {
-    let home = home::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-    let (shell, profile_path) = detect_shell_profile()?.ok_or_else(|| {
-        "could not detect shell — add eval \"$(tirith init)\" to your shell profile manually"
-            .to_string()
-    })?;
-
-    let quoted_bin = shell_quote(tirith_bin, shell);
-    let hook_line = match shell {
-        "fish" => format!("{quoted_bin} init --shell fish | source"),
-        "nushell" => {
-            // Nushell cannot eval dynamically. Resolve the same hook asset that
-            // `tirith init --shell nushell` would print without spawning a
-            // second Tirith process with inherited environment or unbounded I/O.
-            resolve_nushell_hook_line()?
-        }
-        "powershell" => {
-            format!("Invoke-Expression (& {quoted_bin} init --shell powershell)")
-        }
-        _ => format!("eval \"$({quoted_bin} init)\""),
-    };
-
-    let managed_block = format!("{BEGIN_MARKER}\n{hook_line}\n{END_MARKER}\n");
-    let mut completed_verb = "updated";
-    let outcome = super::fs_helpers::transactional_update_checked(
-        &profile_path,
-        &home,
-        dry_run,
-        |snapshot| {
-            let existing = snapshot.text(&profile_path)?.unwrap_or_default();
-            let begin_count = existing
-                .lines()
-                .filter(|line| is_managed_begin_marker(line))
-                .count();
-
-            // A manually-added hook is an intentional opt-out from managed
-            // setup and must remain untouched.
-            if begin_count == 0 && has_executable_tirith_init(existing) {
-                eprintln!(
-                    "tirith: shell hook already in {} (manually added), skipping",
-                    profile_path.display()
-                );
-                return Ok(super::fs_helpers::FileUpdate::unchanged());
-            }
-            validate_marker_pairing(existing)?;
-
-            let mut content = match begin_count {
-                0 => {
-                    completed_verb = "added";
-                    if dry_run {
-                        eprintln!(
-                            "[dry-run] would append tirith shell hook to {}",
-                            profile_path.display()
-                        );
-                    }
-                    existing.to_string()
-                }
-                1 => {
-                    let matches = extract_managed_block(existing)
-                        .as_deref()
-                        .is_some_and(|block| block == managed_block);
-                    if matches && !force {
-                        eprintln!(
-                            "tirith: shell hook already in {}, up to date",
-                            profile_path.display()
-                        );
-                        return Ok(super::fs_helpers::FileUpdate::unchanged());
-                    }
-                    if !matches && !force {
-                        return Err(format!(
-                            "shell hook in {} has different content than expected — use --force to update",
-                            profile_path.display()
-                        ));
-                    }
-                    completed_verb = "replaced";
-                    if dry_run {
-                        eprintln!(
-                            "[dry-run] would replace tirith shell hook in {}",
-                            profile_path.display()
-                        );
-                    }
-                    remove_hook_blocks(existing)
-                }
-                _ if !force => {
-                    return Err(format!(
-                        "multiple tirith-hook blocks found in {} — use --force to deduplicate",
-                        profile_path.display()
-                    ));
-                }
-                _ => {
-                    completed_verb = "deduplicated";
-                    if dry_run {
-                        eprintln!(
-                            "[dry-run] would deduplicate tirith-hook blocks in {}",
-                            profile_path.display()
-                        );
-                    }
-                    remove_hook_blocks(existing)
-                }
-            };
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&managed_block);
-            Ok(super::fs_helpers::FileUpdate::write_text(content, 0o644))
-        },
-        || revalidate_profile_selection(shell, &home, &profile_path),
+/// Remove managed blocks from the shared target set, including shadowed Bash
+/// login files. Manual startup commands retain their exact bytes.
+pub(crate) fn remove_shell_hook(shell: &str, dry_run: bool) -> Result<(), String> {
+    let shell = super::shell_service::ShellKind::parse(shell)?;
+    let prepared = super::shell_service::PreparedShell::capture(
+        super::shell_service::ShellChange::Remove { shell },
+        None,
     )?;
-    if let Some(annotation) = outcome.completion_annotation() {
+    apply_prepared_shell(prepared, dry_run)
+}
+
+pub(super) fn apply_prepared_shell(
+    prepared: super::shell_service::PreparedShell,
+    dry_run: bool,
+) -> Result<(), String> {
+    use super::change_plan::{JobState, MutationService};
+    if dry_run {
+        let preview = prepared.projection();
+        if let Some(profiles) = preview["profiles"].as_array() {
+            for profile in profiles {
+                eprintln!(
+                    "[dry-run] {}: {}",
+                    profile["action"].as_str().unwrap_or("inspect"),
+                    profile["target"]
+                        .as_str()
+                        .unwrap_or("selected personal startup file")
+                );
+            }
+        }
+        return Ok(());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let redact = |error: String| {
+        tirith_core::redact::redact_sanitize_redact_with_compiled(&error, &prepared.compiled)
+    };
+    if prepared
+        .plan(&id)
+        .map_err(redact)?
+        .is_some_and(|status| status.no_op)
+    {
+        eprintln!("tirith: managed shell configuration is already current; manual startup entries were preserved");
+        return Ok(());
+    }
+    let outcome = MutationService::current()
+        .map_err(redact)?
+        .apply(&id, &prepared.snapshot)
+        .map_err(redact)?;
+    if outcome.state != JobState::Completed {
+        return Err(redact(format!(
+            "shell operation {id} stopped in {:?}: {}. Inspect with tirith policy operation {id}",
+            outcome.state,
+            outcome
+                .detail
+                .as_deref()
+                .unwrap_or("review the retained operation")
+        )));
+    }
+    eprintln!("tirith: shell configuration operation {id} completed; inspect or undo with tirith policy operation {id}");
+    if outcome.recovery {
         eprintln!(
-            "tirith: {completed_verb} shell hook in {}{annotation}",
-            profile_path.display(),
+            "tirith: platform recovery material was retained; inspect the operation before cleanup"
         );
     }
-
     Ok(())
 }
 
-fn resolve_nushell_hook_line() -> Result<String, String> {
-    let hook_dir = crate::cli::init::find_hook_dir().ok_or_else(|| {
-        "could not resolve nushell hook path — run `tirith init --shell nushell` and add the output to your config.nu manually"
-            .to_string()
-    })?;
-    nushell_hook_line_for_dir(&hook_dir)
-}
-
+#[cfg(test)]
 fn nushell_hook_line_for_dir(hook_dir: &std::path::Path) -> Result<String, String> {
     let hook_path = hook_dir.join("lib").join("nushell-hook.nu");
     let hook_path_text = super::run_impl::path_to_utf8(&hook_path, "Nushell hook")?;
@@ -379,42 +277,66 @@ fn nushell_hook_line_for_dir(hook_dir: &std::path::Path) -> Result<String, Strin
         ));
     }
     Ok(format!(
-        "source {}",
-        shell_quote(&hook_path_text, "nushell")
+        "{}\nsource {}\n{}",
+        crate::cli::init::integration_stamp("nushell", hook_dir),
+        shell_quote(&hook_path_text, "nushell"),
+        crate::cli::init::integration_handoff_cleanup("nushell"),
     ))
 }
 
-/// Remove all lines between BEGIN/END markers (inclusive). Caller MUST call
-/// `validate_marker_pairing` first — this does not re-validate, and unbalanced
-/// markers would drop trailing content.
+/// Remove every managed block (inclusive) from well-formed content.
+#[cfg(test)]
 fn remove_hook_blocks(content: &str) -> String {
-    let mut result = Vec::new();
-    let mut suppressing = false;
-
-    for line in content.lines() {
-        if is_managed_begin_marker(line) {
-            suppressing = true;
-            continue;
-        }
-        if line == END_MARKER {
-            suppressing = false;
-            continue;
-        }
-        if !suppressing {
-            result.push(line);
-        }
-    }
-
-    let mut out = result.join("\n");
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    without_blocks(content, &hook_blocks(content).unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_removal_preserves_manual_bytes_and_retires_shadowed_bash_blocks() {
+        crate::cli::test_harness::with_fake_env(false, |home, _| {
+            let manual = "# personal profile without final newline";
+            std::fs::write(home.join(".bashrc"), manual).unwrap();
+            std::fs::write(home.join(".bash_profile"), "# chosen login\n").unwrap();
+            let inactive = home.join(".bash_login");
+            std::fs::write(&inactive, "# before\n# BEGIN tirith-hook v1\neval \"$(tirith init)\"\n# END tirith-hook\n# after\n").unwrap();
+            remove_shell_hook("bash", false).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+                manual
+            );
+            assert_eq!(
+                std::fs::read_to_string(&inactive).unwrap(),
+                "# before\n# after\n"
+            );
+            remove_shell_hook("bash", false).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+                manual
+            );
+        });
+    }
+
+    #[test]
+    fn removal_preflights_corrupt_markers_before_mutating_any_profile() {
+        crate::cli::test_harness::with_fake_env(false, |home, _| {
+            let first = "# BEGIN tirith-hook v1\nhook\n# END tirith-hook\n";
+            std::fs::write(home.join(".bashrc"), first).unwrap();
+            std::fs::write(
+                home.join(".bash_profile"),
+                "# BEGIN tirith-hook v1\nmissing end\n",
+            )
+            .unwrap();
+            assert!(remove_shell_hook("bash", false).is_err());
+            assert_eq!(
+                std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+                first
+            );
+        });
+    }
 
     #[test]
     fn nushell_hook_line_uses_existing_hook_without_a_child_process() {
@@ -428,7 +350,12 @@ mod tests {
         let line = nushell_hook_line_for_dir(&hook_dir).unwrap();
         assert_eq!(
             line,
-            format!("source {}", shell_quote(hook.to_str().unwrap(), "nushell"))
+            format!(
+                "{}\nsource {}\n{}",
+                crate::cli::init::integration_stamp("nushell", &hook_dir),
+                shell_quote(hook.to_str().unwrap(), "nushell"),
+                crate::cli::init::integration_handoff_cleanup("nushell")
+            )
         );
     }
 
@@ -447,41 +374,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn profile_discovery_refuses_symlinked_intermediate_directory() {
-        let home = tempfile::tempdir().unwrap();
+    fn selected_external_config_still_refuses_symlinked_profile_parent() {
+        let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(outside.path().join("nushell")).unwrap();
-        std::fs::write(outside.path().join("nushell/config.nu"), "# outside").unwrap();
-        std::os::unix::fs::symlink(outside.path(), home.path().join(".config")).unwrap();
-
-        assert!(profile_for_shell("nushell", home.path()).is_err());
-    }
-
-    #[test]
-    fn bash_profile_discovery_preserves_existing_fallback() {
-        let home = tempfile::tempdir().unwrap();
-        let bash_profile = home.path().join(".bash_profile");
-        std::fs::write(&bash_profile, "# existing").unwrap();
-
-        assert_eq!(
-            profile_for_shell("bash", home.path()).unwrap(),
-            Some(bash_profile)
+        std::os::unix::fs::symlink(outside.path(), root.path().join("fish")).unwrap();
+        let result = super::super::fs_helpers::read_to_string_scoped(
+            &root.path().join("fish/config.fish"),
+            root.path(),
         );
-    }
-
-    #[test]
-    fn bash_profile_selection_revalidation_detects_new_higher_priority_file() {
-        let home = tempfile::tempdir().unwrap();
-        let bash_profile = home.path().join(".bash_profile");
-        std::fs::write(&bash_profile, "# existing").unwrap();
-        assert_eq!(
-            profile_for_shell("bash", home.path()).unwrap(),
-            Some(bash_profile.clone())
-        );
-
-        std::fs::write(home.path().join(".bashrc"), "# appeared concurrently").unwrap();
-        let error = revalidate_profile_selection("bash", home.path(), &bash_profile).unwrap_err();
-        assert!(error.contains("selection changed"));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -503,6 +404,14 @@ mod tests {
     #[test]
     fn quote_nushell_path_encodes_other_control_characters() {
         assert_eq!(shell_quote("a\u{001f}b", "nushell"), "\"a\\u{1f}b\"");
+    }
+
+    #[test]
+    fn quote_fish_preserves_backslashes_and_apostrophes() {
+        assert_eq!(
+            shell_quote("/tmp/a\\b'c\\", "fish"),
+            "'/tmp/a\\\\b\\'c\\\\'"
+        );
     }
 
     #[test]
@@ -592,12 +501,12 @@ mod tests {
     #[test]
     fn valid_single_block() {
         let content = "before\n# BEGIN tirith-hook v1\nhook\n# END tirith-hook\nafter\n";
-        assert!(validate_marker_pairing(content).is_ok());
+        assert!(hook_blocks(content).is_ok());
     }
 
     #[test]
     fn valid_no_blocks() {
-        assert!(validate_marker_pairing("just content\n").is_ok());
+        assert!(hook_blocks("just content\n").is_ok());
     }
 
     #[test]
@@ -619,7 +528,7 @@ mod tests {
     #[test]
     fn prefix_like_comments_are_not_extracted_or_removed() {
         let content = "# BEGIN tirith-hook v1 migration notes\nkeep this\n# END tirith-hook migration notes\n";
-        assert!(validate_marker_pairing(content).is_ok());
+        assert!(hook_blocks(content).is_ok());
         assert!(extract_managed_block(content).is_none());
         assert_eq!(remove_hook_blocks(content), content);
     }
@@ -627,21 +536,21 @@ mod tests {
     #[test]
     fn missing_end_marker() {
         let content = "# BEGIN tirith-hook v1\nhook\nno end\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("missing END"), "got: {err}");
     }
 
     #[test]
     fn orphan_end_marker() {
         let content = "stuff\n# END tirith-hook\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("END marker without BEGIN"), "got: {err}");
     }
 
     #[test]
     fn nested_begin_markers() {
         let content = "# BEGIN tirith-hook v1\n# BEGIN tirith-hook v1\n# END tirith-hook\n";
-        let err = validate_marker_pairing(content).unwrap_err();
+        let err = hook_blocks(content).unwrap_err();
         assert!(err.contains("nested BEGIN"), "got: {err}");
     }
 

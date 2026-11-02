@@ -7,6 +7,7 @@ use crate::extract::ScanContext;
 use crate::scan;
 use crate::tokenize::ShellType;
 
+use super::output_contract::{redact_projection, Projection};
 use super::types::{ContentItem, ToolCallResult, ToolDefinition};
 
 /// Validate a path is within the cwd (path-traversal protection).
@@ -482,14 +483,14 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
     // The same projection the CLI prints. C11 requires the two to be equal, so
     // they render from one function instead of two that happen to agree today.
     let rejections = crate::task::validate_envelope(envelope);
-    let structured = crate::task::document_decision_projection(&document, &decision, &rejections);
+    let mut structured =
+        crate::task::document_decision_projection(&document, &decision, &rejections);
+    let compiled = crate::redact::CompiledCustomPatterns::new_silent(&policy.dlp_custom_patterns);
+    redact_projection(&mut structured, Projection::Task, &compiled);
 
     // The text and structured views must agree after redaction, so the text is
     // rendered FROM the same structured value rather than assembled separately.
-    let text = format!(
-        "tirith_check_task (diagnostic; nothing was executed)\n{}",
-        serde_json::to_string_pretty(&structured).unwrap_or_default()
-    );
+    let text = task_projection_text(&structured);
     ToolCallResult {
         content: vec![ContentItem {
             content_type: "text".into(),
@@ -498,6 +499,13 @@ fn call_check_task(arguments: &Value) -> ToolCallResult {
         is_error: false,
         structured_content: Some(structured),
     }
+}
+
+pub(super) fn task_projection_text(structured: &Value) -> String {
+    format!(
+        "tirith_check_task (diagnostic; nothing was executed)\n{}",
+        serde_json::to_string_pretty(structured).unwrap_or_default()
+    )
 }
 
 fn call_check_command(args: &Value) -> ToolCallResult {
@@ -528,6 +536,9 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     let (mut raw_verdict, policy) = engine::analyze_returning_policy(&ctx);
@@ -551,12 +562,13 @@ fn call_check_command(args: &Value) -> ToolCallResult {
         raw_verdict
     } else {
         let session_id = crate::session::resolve_session_id();
-        crate::escalation::post_process_verdict(
+        crate::escalation::post_process_verdict_for_shell(
             &raw_verdict,
             &policy,
             command,
             &session_id,
             crate::escalation::CallerContext::McpServer,
+            shell,
         )
         // This MCP tool reports a check result; it does not execute `command`, so
         // it must not finalize typed execution events.
@@ -603,6 +615,9 @@ fn call_check_url(args: &Value) -> ToolCallResult {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     // Single Policy snapshot for analysis + enforcement + approval + audit (the
@@ -682,6 +697,9 @@ fn call_check_paste(args: &Value) -> ToolCallResult {
         clipboard_html: None,
         card_ref: None,
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
+        python_inspect_inherited: crate::engine::python_inspect_env_active(),
+        cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
 
     // Single Policy snapshot for analysis + enforcement + approval + audit (see
@@ -804,7 +822,7 @@ fn file_scan_structured(
         "coverage_gaps": &result.coverage_gaps,
         "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
     });
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::FileScan, compiled);
     crate::verdict::bound_json_value_for_output(structured)
 }
 
@@ -1019,7 +1037,7 @@ fn build_mcp_config_response(
         "analysis_incomplete": analysis_incomplete,
         "dlp_redaction_incomplete": compiled.incomplete_reason().is_some(),
     });
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::FileScan, compiled);
     let structured = crate::verdict::bound_json_value_for_output(structured);
 
     ToolCallResult {
@@ -1074,7 +1092,7 @@ fn redacted_task_boundary_projection(
     compiled: &crate::redact::CompiledCustomPatterns,
 ) -> Value {
     let mut projection = assessment.projection();
-    crate::redact::redact_json_strings(&mut projection, compiled);
+    redact_projection(&mut projection, Projection::Task, compiled);
     crate::verdict::bound_json_value_for_output(projection)
 }
 
@@ -1176,7 +1194,7 @@ fn build_cloaking_response_with_boundary(
     if let Some(task_boundary) = task_boundary {
         structured["task_boundary"] = task_boundary.clone();
     }
-    crate::redact::redact_json_strings(&mut structured, compiled);
+    redact_projection(&mut structured, Projection::Cloaking, compiled);
     // Bound AFTER redaction, like every other structured projection in this
     // module. `to_json(true)` embeds every diff plus its optional `diff_text`,
     // all of it remote-controlled, so an oversized upstream diff would otherwise
@@ -1431,6 +1449,7 @@ mod tests {
 
     #[test]
     fn actual_scan_file_tool_fails_closed_for_malformed_pdf() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let cwd = std::env::current_dir().expect("current directory");
         let tmp = tempfile::Builder::new()
             .prefix("tirith-mcp-pdf-")
@@ -1783,6 +1802,7 @@ mod tests {
 
     #[test]
     fn cloaking_uses_the_explicit_frozen_operator_task_gate() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = crate::policy::Policy {
             task_gate: crate::web3_policy::TaskGatePolicy {
                 mode: crate::web3_policy::TaskGateMode::Enforce,
@@ -2477,6 +2497,7 @@ mod c11_preview_tests {
     /// cache it, so a preview tool must never appear in it.
     #[test]
     fn the_default_tool_list_never_contains_the_preview_tool() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         assert!(
             !list().iter().any(|tool| tool.name == "tirith_check_task"),
             "a preview tool leaked into the frozen default list"
@@ -2490,6 +2511,7 @@ mod c11_preview_tests {
     /// still be refused on a server without the capability.
     #[test]
     fn calling_the_preview_tool_without_the_capability_is_refused() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The env var is process-wide, so assert the refusal path directly
         // rather than mutating it and racing other tests.
         if !preview_enabled() {
@@ -2531,6 +2553,7 @@ mod c11_preview_tests {
 
     #[test]
     fn the_preview_schema_and_handler_accept_the_strict_v2_diagnostic_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let tool = preview_tools()
             .into_iter()
             .find(|tool| tool.name == "tirith_check_task")
@@ -2580,6 +2603,7 @@ mod c11_preview_tests {
     /// process-wide preview env var and race other tests.
     #[test]
     fn the_mcp_projection_is_the_shared_one() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let envelope_value = json!({
             "sources": [{"claimed_source": "agent_config", "content": "trust me"}],
             "actions": [{"package_install": {"ecosystem": "npm", "package": "left-pad"}}]

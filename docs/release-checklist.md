@@ -3,7 +3,11 @@
 ## Release sequence
 
 Substitute the release version for `<VERSION>` throughout (for example `0.4.2`,
-tagged `v0.4.2`). The changelog and release notes describe the final tree. The
+tagged `v0.4.2`). Choose `<VERSION>` by the `tirith-core` library contract:
+`tirith-core` is published on crates.io, and Cargo treats every `0.x.y` with the
+same `x` as compatible, so if `[Unreleased]` → `Removed` lists any `tirith-core`
+public API removal or other breaking library change, bump the minor version
+(`0.4.x` → `0.5.0`), never only the patch version. The changelog and release notes describe the final tree. The
 workspace version stays on the previous release until the integration tree is
 known, then the release commit performs the version and documentation
 transition below:
@@ -12,7 +16,7 @@ transition below:
    tip and review the resulting tree, not only each stacked diff.
 2. Resolve or explicitly defer every item under `[Unreleased]` → `Known issues`.
 3. Run the required Linux, macOS, and Windows matrices on that exact tree,
-   including native x86_64-Linux containment and host-shaped hook tests.
+   including native x86_64/AArch64 Linux containment and host-shaped hook tests.
 4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
 5. Change the workspace version to `<VERSION>` in BOTH root `Cargo.toml`
    lines (`[workspace.package] version` and the `[workspace.dependencies]
@@ -71,6 +75,40 @@ block the merge window itself.
 - [ThreatDB v2 rollout](threatdb-v2-rollout.md): the separate database-format
   playbook.
 
+### Hermes plugin cutover
+
+The external plugin is a separate release artifact, not part of a Tirith
+binary tag. Its implementation branch and green checks do not make the
+default-branch install or catalog entry available.
+
+1. Publish a qualified Tirith `0.5.0` artifact first. Pipe a command into
+   `tirith check --json --non-interactive --shell posix` (no command argument;
+   the plugin's exact argv) and check the response, including the
+   always-present boolean `requires_approval`; a version string alone is
+   insufficient.
+   Confirm that released `0.4.2` is refused rather than scanned with an
+   incompatible contract.
+2. Run the plugin's Linux, macOS and Windows unit matrix and its real-binary
+   checks against the final artifact. Validate all three hooks with the pinned
+   minimum and current Hermes SDK revisions from the plugin CI. Exercise policy
+   confirmation and strict warnings with no approver, and preserve unknown
+   background input after overlapping calls, unanswered confirmation, timeout
+   and late completion. Timing simulations qualify bookkeeping, not concurrent
+   shell exploitation.
+3. Merge and publish the plugin repository's reviewed implementation. Confirm
+   the documented install URL resolves to that implementation, not the current
+   placeholder `main`. Submit and verify the Hermes catalog entry separately;
+   do not promise a Hermes release's migration pointer or automatic installation.
+4. On the chosen Hermes host, inspect whether the legacy core Tirith gate is
+   actually present before enabling the external gate. Version ranges alone do
+   not prove its absence. Confirm loaded hooks, capability checks, refusal and
+   scoped approval with harmless input on the installed bytes.
+5. Report corpus results as proposed scanner/hook decisions. Warning-only
+   commands run by default; database-dependent rows require the relevant threat
+   data. Neither a successful validator nor a green corpus proves that no attack
+   executes.
+
+
 ## crates.io publish order
 
 Publish `tirith-core` to crates.io **first**, then `tirith`. Run
@@ -88,6 +126,14 @@ workspace path takes precedence over the registry version for
 in-tree builds. The cross-crate failure only shows up at `cargo
 package` / `cargo publish` time, which is exactly the point where
 publishing tirith-core first becomes a hard prerequisite.
+
+Package and publish from a POSIX checkout (Linux or macOS; the release
+workflow publishes from Ubuntu). Each crate's `LICENSE-AGPL` and `NOTICE` are
+symlinks to the repository-root files, which `cargo package` stores as regular
+files with the full text. A Windows checkout without symlink support turns
+them into one-line path stubs, and the published crates would carry those
+instead of the license. `cargo package -p <crate> --allow-dirty --list` must
+list both files.
 
 ## Quick local check before tagging a release
 
@@ -141,14 +187,17 @@ code. GLIBC 2.28 is deliberate: Tirith and Rust's standard library reference
 raw-syscall shim. EL8 already ships GLIBC 2.28, and adding that shim would
 increase release risk without expanding the supported target set.
 
-The aarch64 release does not overclaim x86_64-only seccomp support: extrasafe is
-compiled only for linux-x86_64. On aarch64, Landlock and the remaining Linux
-containment layers stay available, but `network_raw_denied` is reported false;
-a locked-down capsule that requires it is degraded and fails closed. The
-aarch64 release build is itself a required CI gate, preventing an x86_64-only
-dependency from silently breaking the shipped artifact again. Each aarch64
-runtime smoke also invokes the locked-down capsule and requires an exit-1
-pre-launch refusal naming `network_raw_denied`; any child output fails the gate.
+Native aarch64 Linux uses a separate deny-all seccomp policy alongside Landlock;
+the x86_64 extrasafe dependency remains architecture-specific. Each exact GNU
+and musl release archive must pass the native ARM containment job, including
+network/filesystem restrictions, resource limits and interruption cleanup.
+For the GNU target the same job also runs the seccomp, `clone` flag policy
+(including the installed production filter), ACL, breakpoint and parent-lifetime
+contract tests on the native aarch64 kernel.
+Missing required kernel controls still cause a pre-launch refusal. The QEMU
+runtime compatibility checks cannot establish native seccomp enforcement: they
+require an exit-1 refusal naming `network_raw_denied`, and any child output fails
+that gate. Keep both the native containment and emulated compatibility checks.
 The static musl build retains the cleanup walk's exact mount-ID proof through a
 size- and offset-asserted Linux `statx` UAPI buffer because libc hides those
 bindings for its default musl ABI. There is no `st_dev` fallback: an unavailable

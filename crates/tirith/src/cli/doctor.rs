@@ -19,7 +19,7 @@ pub fn run(
     }
 
     if simulate_enter {
-        return run_simulate_enter();
+        return run_simulate_enter(json);
     }
 
     if fix {
@@ -121,10 +121,39 @@ fn run_fix(yes: bool) -> i32 {
     }
 
     {
-        let tools: Vec<_> = detect_ai_tools()
+        // A stale adapter (installed by an earlier release) is repaired like a
+        // broken one: setup refuses to overwrite it without force.
+        let (stale, elsewhere): (Vec<_>, Vec<_>) = gather_agent_adapters()
+            .into_iter()
+            .filter(|adapter| adapter.state == AdapterState::Stale)
+            .partition(|adapter| adapter.setup_dir.is_none());
+        // Setup writes these project adapters where it runs, so repairing one
+        // found in an ancestor from here would install a second adapter
+        // instead. Print the command that refreshes it in place.
+        for adapter in &elsewhere {
+            if let Some(remedy) = &adapter.remedy {
+                println!(
+                    "Fix: refresh the stale {} adapter at {}: run `{remedy}`",
+                    adapter.tool, adapter.path
+                );
+            }
+        }
+        let mut tools: Vec<_> = detect_ai_tools()
             .into_iter()
             .filter(|tool| tool.hook_state != HookInstallState::Effective)
+            .filter(|tool| !stale.iter().any(|adapter| adapter.tool == tool.name))
             .collect();
+        for adapter in &stale {
+            if !tools.iter().any(|tool| {
+                tool.name == adapter.tool && tool.configured_scope == Some(adapter.scope)
+            }) {
+                tools.push(DetectedTool {
+                    name: adapter.tool,
+                    configured_scope: Some(adapter.scope),
+                    hook_state: HookInstallState::Broken,
+                });
+            }
+        }
         if !tools.is_empty() {
             println!("Fix: Configure tirith for AI coding tools");
             for tool in &tools {
@@ -548,6 +577,463 @@ fn cline_hook_artifact(home: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Whether an installed agent hook adapter still matches the asset this binary
+/// embeds. Setup never rewrites an existing adapter without `--force`, so a
+/// binary upgrade leaves the previous release's adapter in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdapterState {
+    Current,
+    Stale,
+}
+
+/// One installed agent hook adapter and its currency against the embedded asset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AgentAdapterReport {
+    tool: &'static str,
+    scope: &'static str,
+    path: String,
+    state: AdapterState,
+    /// The command that refreshes a stale adapter; absent when current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remedy: Option<String>,
+    /// The directory `tirith setup` must run in to refresh this project
+    /// adapter, when it is not the current directory (the adapter was found
+    /// in an ancestor up to the repository root). `doctor --fix` leaves such
+    /// an adapter to the printed remedy rather than installing a new one here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup_dir: Option<String>,
+}
+
+/// The asset setup renders into an adapter, and the placeholders it substitutes.
+type AdapterTemplate = (&'static str, &'static [&'static str]);
+
+const VERBATIM: &[&str] = &[];
+const SHELL_HOOK_PLACEHOLDERS: &[&str] = &["__TIRITH_BIN__", "__TIRITH_PYTHON__"];
+const PI_GUARD_PLACEHOLDERS: &[&str] = &["\"__TIRITH_BIN__\"", "\"__TIRITH_INTEGRATION__\""];
+
+/// One adapter file setup may have written.
+struct AdapterCandidate {
+    tool: &'static str,
+    scope: &'static str,
+    path: PathBuf,
+    template: AdapterTemplate,
+    /// Where `tirith setup --scope project` must run to refresh the adapter,
+    /// when that is not the current directory.
+    setup_dir: Option<PathBuf>,
+}
+
+fn candidate(
+    tool: &'static str,
+    scope: &'static str,
+    path: PathBuf,
+    template: AdapterTemplate,
+) -> AdapterCandidate {
+    AdapterCandidate {
+        tool,
+        scope,
+        path,
+        template,
+        setup_dir: None,
+    }
+}
+
+/// The directory holding the project adapter at `relative` that applies to
+/// `cwd`: the nearest one from `cwd` up to the repository root (the `.git`
+/// boundary where policy discovery also stops), or `cwd` itself when none
+/// does. Setup writes these adapters in the directory it runs in, so doctor
+/// run from a subdirectory must still find the project's adapters.
+fn project_adapter_dir(cwd: &std::path::Path, relative: &str) -> PathBuf {
+    for dir in cwd.ancestors() {
+        if std::fs::symlink_metadata(dir.join(relative)).is_ok() {
+            return dir.to_path_buf();
+        }
+        if std::fs::metadata(dir.join(".git")).is_ok() {
+            break;
+        }
+    }
+    cwd.to_path_buf()
+}
+
+/// A project candidate found by walking up from `cwd`; `setup_dir` records an
+/// ancestor, since setup writes this host's project adapter where it runs.
+fn walked_project_candidate(
+    tool: &'static str,
+    cwd: &std::path::Path,
+    relative: &str,
+    template: AdapterTemplate,
+) -> AdapterCandidate {
+    let dir = project_adapter_dir(cwd, relative);
+    AdapterCandidate {
+        tool,
+        scope: "project",
+        path: dir.join(relative),
+        template,
+        setup_dir: (dir != cwd).then_some(dir),
+    }
+}
+
+/// Every adapter file setup writes for a host, in the same locations setup
+/// resolves, project scope first.
+fn agent_adapter_candidates(
+    home: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> Vec<AdapterCandidate> {
+    use crate::assets;
+    let check_py = (assets::TIRITH_CHECK_PY, VERBATIM);
+    let pi_guard = (assets::TIRITH_GUARD_TS, PI_GUARD_PLACEHOLDERS);
+    let mut candidates = Vec::new();
+    if let Some(cwd) = cwd {
+        // Kiro's own discovery (and setup's) already walks up to the nearest
+        // `.kiro/`, so its refresh command works from here.
+        let kiro_root =
+            tirith_core::policy::find_workspace_kiro_dir(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        candidates.extend([
+            walked_project_candidate(
+                "claude-code",
+                cwd,
+                ".claude/hooks/tirith-check.py",
+                check_py,
+            ),
+            walked_project_candidate(
+                "cursor",
+                cwd,
+                ".cursor/hooks/tirith-hook.sh",
+                (assets::CURSOR_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+            ),
+            walked_project_candidate(
+                "vscode",
+                cwd,
+                ".vscode/hooks/tirith-hook.sh",
+                (assets::VSCODE_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+            ),
+            walked_project_candidate(
+                "gemini-cli",
+                cwd,
+                ".gemini/hooks/tirith-security-guard-gemini.py",
+                (assets::GEMINI_HOOK_PY, VERBATIM),
+            ),
+            candidate(
+                "kiro",
+                "project",
+                kiro_root.join(".kiro/hooks/kiro-hook.py"),
+                (assets::KIRO_HOOK_PY, VERBATIM),
+            ),
+            walked_project_candidate(
+                "openclaw",
+                cwd,
+                ".openclaw/extensions/tirith-security/index.ts",
+                (assets::OPENCLAW_GUARD_TS, VERBATIM),
+            ),
+            walked_project_candidate("pi-cli", cwd, ".pi/extensions/tirith-guard.ts", pi_guard),
+        ]);
+        #[cfg(unix)]
+        {
+            let relative = ".openhands/hooks/tirith-check.py";
+            candidates.push(match std::env::var_os("OPENHANDS_WORK_DIR") {
+                // OpenHands reads exactly this directory, as setup writes it.
+                Some(value) if !value.is_empty() => candidate(
+                    "openhands",
+                    "project",
+                    PathBuf::from(value).join(relative),
+                    check_py,
+                ),
+                _ => walked_project_candidate("openhands", cwd, relative, check_py),
+            });
+        }
+    }
+    if let Some(root) = tirith_core::policy::find_repo_root(None) {
+        // Setup writes these at the repository root from any subdirectory.
+        candidates.push(candidate(
+            "copilot-cli",
+            "project",
+            root.join(".github/hooks/copilot-cli-hook.py"),
+            (assets::COPILOT_HOOK_PY, VERBATIM),
+        ));
+        #[cfg(unix)]
+        candidates.push(candidate(
+            "grok-build",
+            "project",
+            root.join(".grok/hooks/tirith-check.py"),
+            check_py,
+        ));
+    }
+    let gemini_home = std::env::var_os("GEMINI_CLI_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_path_buf());
+    let openclaw_user = crate::cli::setup::openclaw_state_dir_override(home)
+        .unwrap_or_else(|| home.join(".openclaw"));
+    candidates.extend([
+        candidate(
+            "claude-code",
+            "user",
+            home.join(".claude/hooks/tirith-check.py"),
+            check_py,
+        ),
+        candidate(
+            "cursor",
+            "user",
+            home.join(".cursor/hooks/tirith-hook.sh"),
+            (assets::CURSOR_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+        ),
+        candidate(
+            "windsurf",
+            "user",
+            home.join(".codeium/windsurf/hooks/tirith-hook.sh"),
+            (assets::WINDSURF_HOOK_SH, SHELL_HOOK_PLACEHOLDERS),
+        ),
+        candidate(
+            "gemini-cli",
+            "user",
+            gemini_home.join(".gemini/hooks/tirith-security-guard-gemini.py"),
+            (assets::GEMINI_HOOK_PY, VERBATIM),
+        ),
+        candidate(
+            "kiro",
+            "user",
+            home.join(".kiro/hooks/kiro-hook.py"),
+            (assets::KIRO_HOOK_PY, VERBATIM),
+        ),
+        candidate(
+            "openclaw",
+            "user",
+            openclaw_user.join("extensions/tirith-security/index.ts"),
+            (assets::OPENCLAW_GUARD_TS, VERBATIM),
+        ),
+        candidate(
+            "cline",
+            "user",
+            cline_hook_artifact(home).with_file_name("tirith-check.py"),
+            check_py,
+        ),
+    ]);
+    for (tool, path) in [
+        (
+            "pi-cli",
+            crate::cli::setup::pi_cli_user_guard_path(home).ok(),
+        ),
+        (
+            "prime-agent",
+            crate::cli::setup::prime_agent_user_guard_path(home).ok(),
+        ),
+        ("omp", crate::cli::setup::omp_user_guard_path(home).ok()),
+    ] {
+        if let Some(path) = path {
+            candidates.push(candidate(tool, "user", path, pi_guard));
+        }
+    }
+    #[cfg(unix)]
+    candidates.extend([
+        candidate(
+            "grok-build",
+            "user",
+            home.join(".grok/hooks/tirith-check.py"),
+            check_py,
+        ),
+        candidate(
+            "openhands",
+            "user",
+            home.join(".openhands/hooks/tirith-check.py"),
+            check_py,
+        ),
+    ]);
+    candidates
+}
+
+/// The Pi-family hosts that share one guard; its integration placeholder
+/// names one of them.
+const PI_FAMILY_INTEGRATIONS: &[&str] = &["pi-cli", "prime-agent", "omp"];
+
+/// Whether `installed` is exactly `template` with each placeholder replaced by
+/// one consistent value of the shape setup renders (see
+/// [`placeholder_value_is_valid`]); every other byte must match the embedded
+/// asset.
+#[cfg(test)]
+fn rendered_asset_matches(installed: &str, template: &str, placeholders: &[&str]) -> bool {
+    rendered_adapter_matches(None, installed, template, placeholders)
+}
+
+/// [`rendered_asset_matches`] for one host: a Pi-family guard must also name
+/// `tool` as its integration.
+fn rendered_adapter_matches(
+    tool: Option<&str>,
+    installed: &str,
+    template: &str,
+    placeholders: &[&str],
+) -> bool {
+    rendered_placeholder_values(installed, template, placeholders).is_some_and(|values| {
+        values.iter().zip(placeholders).all(|(value, placeholder)| {
+            value.is_none_or(|value| placeholder_value_is_valid(placeholder, value, tool))
+        })
+    })
+}
+
+/// The value each placeholder was rendered with, when `installed` is
+/// `template` with every placeholder replaced by one consistent single-line
+/// value; `None` when any other byte differs.
+fn rendered_placeholder_values<'a>(
+    installed: &'a str,
+    template: &str,
+    placeholders: &[&str],
+) -> Option<Vec<Option<&'a str>>> {
+    let mut literals = Vec::new();
+    let mut slots = Vec::new();
+    let mut rest = template;
+    loop {
+        let next = placeholders
+            .iter()
+            .enumerate()
+            .filter_map(|(index, placeholder)| rest.find(placeholder).map(|at| (at, index)))
+            .min();
+        let Some((at, index)) = next else {
+            literals.push(rest);
+            break;
+        };
+        literals.push(&rest[..at]);
+        slots.push(index);
+        rest = &rest[at + placeholders[index].len()..];
+    }
+    let mut remaining = installed.strip_prefix(literals[0])?;
+    let mut values: Vec<Option<&str>> = vec![None; placeholders.len()];
+    for (position, (slot, literal)) in slots.iter().zip(&literals[1..]).enumerate() {
+        let last = position + 1 == slots.len();
+        let value_end = if last {
+            remaining.strip_suffix(literal).map(str::len)
+        } else if literal.is_empty() {
+            None
+        } else {
+            remaining.find(literal)
+        }?;
+        let value = &remaining[..value_end];
+        if value.contains('\n') || values[*slot].is_some_and(|previous| previous != value) {
+            return None;
+        }
+        values[*slot] = Some(value);
+        remaining = &remaining[value_end + literal.len()..];
+    }
+    remaining.is_empty().then_some(values)
+}
+
+/// Whether a substituted placeholder value has the shape setup writes. Any
+/// single line used to be accepted, so a tampered line (a command appended
+/// after the interpreter path, say) was reported as a current adapter.
+fn placeholder_value_is_valid(placeholder: &str, value: &str, tool: Option<&str>) -> bool {
+    match placeholder {
+        // Substituted raw into `"${TIRITH_BIN:-...}"` and a comment: a bare
+        // `tirith` or an absolute path, with nothing the double-quoted
+        // expansion would interpret or end at. A backslash is literal there
+        // unless it precedes one of those characters, another backslash, or
+        // the closing `}` (a trailing `\` escapes it and the hook no longer
+        // parses), so a Windows path such as `C:\Program Files\...` stays
+        // valid.
+        "__TIRITH_BIN__" => {
+            (value == "tirith" || std::path::Path::new(value).is_absolute())
+                && !value
+                    .chars()
+                    .any(|c| matches!(c, '"' | '$' | '`' | '}' | '\r' | '\n'))
+                && !value.ends_with('\\')
+                && !value.contains("\\\\")
+        }
+        // `TIRITH_PYTHON=<shell_quote(absolute interpreter)>`.
+        "__TIRITH_PYTHON__" => decode_setup_shell_quoted(value)
+            .is_some_and(|python| std::path::Path::new(&python).is_absolute()),
+        // JSON string literals in the Pi-family guard.
+        "\"__TIRITH_BIN__\"" => canonical_json_string(value)
+            .is_some_and(|binary| std::path::Path::new(&binary).is_absolute()),
+        "\"__TIRITH_INTEGRATION__\"" => {
+            canonical_json_string(value).is_some_and(|integration| match tool {
+                Some(tool) => integration == tool,
+                None => PI_FAMILY_INTEGRATIONS.contains(&integration.as_str()),
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Decode a value setup quoted with `shell_quote(value, "bash")`, only when
+/// quoting the decoded text reproduces it exactly.
+fn decode_setup_shell_quoted(value: &str) -> Option<String> {
+    let decoded = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("'\\''", "'")
+    } else {
+        value.to_string()
+    };
+    (!decoded.contains(['\n', '\r']) && crate::cli::setup::shell_quote(&decoded, "bash") == value)
+        .then_some(decoded)
+}
+
+/// Decode a JSON string literal only in the exact form `serde_json` writes it.
+fn canonical_json_string(value: &str) -> Option<String> {
+    let decoded: String = serde_json::from_str(value).ok()?;
+    (serde_json::to_string(&decoded).ok()? == value).then_some(decoded)
+}
+
+fn adapter_remedy(tool: &str, scope: &str, setup_dir: Option<&std::path::Path>) -> String {
+    let setup = format!("tirith setup {tool} --scope {scope} --force");
+    match setup_dir.and_then(std::path::Path::to_str) {
+        Some(dir) => format!(
+            "cd {} && {setup}",
+            crate::cli::setup::shell_quote(dir, "bash")
+        ),
+        None => setup,
+    }
+}
+
+/// Report every installed agent hook adapter, current or stale. Paths shared by
+/// two scopes (a project rooted at HOME) are reported once, as user scope.
+fn gather_agent_adapters_with(
+    home: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+) -> Vec<AgentAdapterReport> {
+    let mut reports: Vec<AgentAdapterReport> = Vec::new();
+    for candidate in agent_adapter_candidates(home, cwd) {
+        let AdapterCandidate {
+            tool,
+            scope,
+            path,
+            template: (template, placeholders),
+            setup_dir,
+        } = candidate;
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        let current = read_hook_text(&path).is_some_and(|installed| {
+            rendered_adapter_matches(Some(tool), &installed, template, placeholders)
+        });
+        let path = path.display().to_string();
+        let state = if current {
+            AdapterState::Current
+        } else {
+            AdapterState::Stale
+        };
+        let report = AgentAdapterReport {
+            tool,
+            scope,
+            remedy: (state == AdapterState::Stale)
+                .then(|| adapter_remedy(tool, scope, setup_dir.as_deref())),
+            setup_dir: setup_dir.map(|dir| dir.display().to_string()),
+            path,
+            state,
+        };
+        match reports
+            .iter_mut()
+            .find(|existing| existing.tool == tool && existing.path == report.path)
+        {
+            Some(existing) => *existing = report,
+            None => reports.push(report),
+        }
+    }
+    reports
+}
+
+fn gather_agent_adapters() -> Vec<AgentAdapterReport> {
+    let Some(home) = home::home_dir() else {
+        return Vec::new();
+    };
+    let cwd = std::env::current_dir().ok();
+    gather_agent_adapters_with(&home, cwd.as_deref())
+}
+
 const MAX_DOCTOR_HOOK_BYTES: u64 = 1024 * 1024;
 
 /// Read a hook artifact without following its final path component and without
@@ -706,20 +1192,31 @@ fn posix_wrapper_execs_pinned_python(path: &std::path::Path, protocol: &str) -> 
     let protocol_reaches_exec = lines
         .windows(2)
         .any(|pair| pair[0] == protocol_assignment && pair[1].starts_with("exec "));
-    let pinned_exec = lines.iter().any(|line| {
-        let Some(command) = line.trim_start().strip_prefix("exec ") else {
-            return false;
-        };
-        command
+    let pinned_python = lines.iter().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("exec ")?
             .strip_suffix(&expected_adapter)
             .and_then(|python| python.strip_suffix(' '))
             .and_then(setup_shell_path)
-            .is_some()
     });
+    // The wrapper must be exactly what this release's setup writes for those
+    // pinned paths. An earlier wrapper lacks the missing-interpreter guard, so
+    // a moved interpreter would let the host run the tool unchecked.
+    let current_wrapper = match (&pinned_binary, &pinned_python) {
+        (Some(binary), Some(python)) => match (binary.to_str(), python.to_str()) {
+            (Some(binary), Some(python)) => {
+                crate::cli::setup::pre_tool_use_wrapper(protocol, binary, python, &adapter)
+                    .is_ok_and(|expected| expected == content)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
     executable
-        && pinned_exec
+        && pinned_python.is_some()
         && pinned_binary.is_some()
         && protocol_reaches_exec
+        && current_wrapper
         && !content.contains("__TIRITH_PYTHON__")
         && hook_adapter_is_current(&adapter)
 }
@@ -1067,6 +1564,12 @@ fn check_detection_gaps() -> Option<DetectionGapInfo> {
 
 #[derive(serde::Serialize)]
 struct DoctorInfo {
+    protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
+    audit_recording: super::audit_health::AuditHealth,
+    package_approval: super::package_approval_authority::PackageApprovalAvailability,
+    /// Whether this terminal's loaded hook was registered by this executable.
+    /// Loaded-hook evidence only, never blocking proof.
+    hook_freshness: super::hook_freshness::HookFreshnessReport,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1086,15 +1589,14 @@ struct DoctorInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_requested_require_enter: Option<String>,
     /// Effective bash mode exported by the hook (`TIRITH_BASH_EFFECTIVE_MODE`).
-    /// Absent means the hook was not sourced in this process.
+    /// Inherited diagnostic only; absence does not prove missing activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_mode: Option<String>,
     /// Effective protection exported by the hook (`TIRITH_BASH_EFFECTIVE_PROTECTION`).
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
-    /// Live protection status from `TIRITH_STATUS` (`blocks` / `warn-only` /
-    /// `degraded` / `off`); `degraded` = downgraded mid-session. Absent means no
-    /// hook was sourced in this process.
+    /// Raw reported `TIRITH_STATUS` (`blocks` / `warn-only` / `degraded` / `off`).
+    /// An inherited marker cannot verify blocking or current activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
     /// Cached bash enter-mode capability verdict from the last self-test
@@ -1123,6 +1625,9 @@ struct DoctorInfo {
     webhooks_available: bool,
     /// Other `tirith` binaries found on PATH that shadow or conflict with this one.
     shadow_binaries: Vec<String>,
+    /// Installed agent hook adapters and whether each matches this binary's
+    /// embedded asset; a stale adapter predates this release's checks.
+    agent_adapters: Vec<AgentAdapterReport>,
     /// Detection gap analysis from audit log data.
     #[serde(skip_serializing_if = "Option::is_none")]
     detection_gaps: Option<DetectionGapInfo>,
@@ -1171,7 +1676,7 @@ struct ThreatDbDoctorInfo {
 pub(crate) struct QuickDoctorInfo {
     /// Schema version for the polled shape; bumped only on a breaking change.
     pub(crate) schema_version: u32,
-    /// Live protection mode from `TIRITH_STATUS`, using the SAME vocabulary as
+    /// Legacy reported mode from inherited environment, using the SAME vocabulary as
     /// `tirith prompt-status`: `guarded` (blocking), `warn-only`, `degraded`,
     /// `off`; unknown values passed through verbatim.
     pub(crate) protection_mode: String,
@@ -1181,6 +1686,7 @@ pub(crate) struct QuickDoctorInfo {
     /// Whether the shell hook is configured in the detected shell's profile
     /// (mirrors the full report's `hook_configured`).
     pub(crate) hook_configured: bool,
+    pub(crate) protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
 }
 
 /// Gather ONLY the three cheap quick-status fields. The unit-testable seam:
@@ -1195,9 +1701,9 @@ pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
     // status` / `doctor --quick` is an EXTERNAL process, and `TIRITH_STATUS` is
     // deliberately NON-exported (prompt-only), so a protected shell never passes
     // it down — reading it alone makes a protected shell look "off". The bash hook
-    // re-exports `TIRITH_BASH_EFFECTIVE_PROTECTION` on every state change PRECISELY
-    // so an external check sees the truth; fall back to `TIRITH_STATUS` only for a
-    // user/shell that does export it.
+    // re-exports `TIRITH_BASH_EFFECTIVE_PROTECTION` on state changes. Both are
+    // inherited reports, not authenticated current-shell blocking evidence.
+    // Fall back to `TIRITH_STATUS` only for a user/shell that does export it.
     let live_protection = std::env::var("TIRITH_BASH_EFFECTIVE_PROTECTION")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1218,6 +1724,10 @@ pub(crate) fn gather_quick_info() -> QuickDoctorInfo {
 
     QuickDoctorInfo {
         schema_version: 1,
+        protection_evidence: crate::cli::protection_evidence::gather(
+            &protection_mode,
+            hook_configured,
+        ),
         protection_mode,
         policy_path_used,
         hook_configured,
@@ -1240,7 +1750,10 @@ fn run_quick(json: bool) -> i32 {
 
 /// Human-readable 2-3 line summary for `tirith doctor --quick`.
 pub(crate) fn print_quick_human(info: &QuickDoctorInfo) {
-    println!("  protection:   {}", info.protection_mode);
+    println!(
+        "  protection:   {} (reported; blocking unverified)",
+        info.protection_mode
+    );
     println!(
         "  hook:         {}",
         if info.hook_configured {
@@ -1293,7 +1806,7 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Live state exported by the hook; absence = bash hook not sourced here.
+    // Raw inherited reports; neither presence nor absence proves activation.
     let bash_effective_mode = std::env::var("TIRITH_BASH_EFFECTIVE_MODE")
         .ok()
         .filter(|s| !s.is_empty());
@@ -1301,8 +1814,8 @@ fn gather_info() -> DoctorInfo {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // `TIRITH_STATUS`: cross-shell live protection indicator from every hook.
-    // Absence = no hook ran here (typically a non-interactive subshell).
+    // TIRITH_STATUS is normally not exported. Preserve a supplied value as a
+    // diagnostic, without treating it as a current-shell observation.
     let tirith_status = std::env::var("TIRITH_STATUS")
         .ok()
         .filter(|s| !s.is_empty());
@@ -1363,7 +1876,19 @@ fn gather_info() -> DoctorInfo {
         }
     };
 
+    let reported_mode = crate::cli::prompt_status::protection_mode_from_status(
+        bash_effective_protection
+            .as_deref()
+            .or(tirith_status.as_deref()),
+    );
     DoctorInfo {
+        protection_evidence: crate::cli::protection_evidence::gather(
+            &reported_mode,
+            hook_configured,
+        ),
+        audit_recording: super::audit_health::read(),
+        package_approval: super::package_approval_authority::availability(),
+        hook_freshness: super::hook_freshness::gather(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         binary_path,
         detected_shell,
@@ -1391,6 +1916,7 @@ fn gather_info() -> DoctorInfo {
         cloaking_available: cfg!(unix),
         webhooks_available: cfg!(unix),
         shadow_binaries,
+        agent_adapters: gather_agent_adapters(),
         detection_gaps,
         threat_db,
         baseline,
@@ -1580,6 +2106,7 @@ struct PsCompatInfo {
 /// Machine-readable compatibility report for `tirith doctor --compat --format json`.
 #[derive(serde::Serialize)]
 struct CompatReport {
+    protection_evidence: crate::cli::protection_evidence::ProtectionEvidence,
     version: String,
     binary_path: String,
     detected_shell: String,
@@ -1587,13 +2114,13 @@ struct CompatReport {
     /// Requested bash mode (`TIRITH_BASH_MODE`); absent = default.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_requested_mode: Option<String>,
-    /// Effective bash mode exported by the hook; absent = hook not sourced here.
+    /// Reported effective bash mode; inherited values do not prove activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_mode: Option<String>,
     /// Effective protection exported by the hook.
     #[serde(skip_serializing_if = "Option::is_none")]
     bash_effective_protection: Option<String>,
-    /// Live cross-shell protection status exported as `TIRITH_STATUS`
+    /// Raw reported cross-shell protection status from `TIRITH_STATUS`
     /// (`blocks` / `warn-only` / `degraded` / `off`).
     #[serde(skip_serializing_if = "Option::is_none")]
     tirith_status: Option<String>,
@@ -1656,6 +2183,7 @@ fn gather_compat() -> CompatReport {
     let visual_audit = gather_visual_audit_compat();
 
     CompatReport {
+        protection_evidence: info.protection_evidence,
         version: info.version,
         binary_path: info.binary_path,
         detected_shell: info.detected_shell,
@@ -1883,7 +2411,7 @@ const BUNDLE_ENV_ALLOWLIST: &[&str] = &[
 /// Replace the literal home-directory path with `~` everywhere in `text` (the
 /// bundle's absolute paths would otherwise spell out the username). Applied as
 /// the last pass. Input unchanged when home can't be determined.
-fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
+pub(crate) fn redact_home_path(text: &str, home: Option<&std::path::Path>) -> String {
     let home = match home {
         Some(h) => h.to_string_lossy().into_owned(),
         None => return text.to_string(),
@@ -1982,7 +2510,7 @@ fn looks_like_secret(value: &str) -> bool {
 
 /// Assemble the full diagnostic bundle as a single redacted text blob. `home` is
 /// a parameter so tests can drive the home-path redaction deterministically.
-fn build_bundle_text(home: Option<&std::path::Path>) -> String {
+pub(crate) fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     let info = gather_info();
     let compat = gather_compat();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2000,7 +2528,7 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
          have been masked."
             .to_string(),
     );
-    line("Safe to attach to a bug report. Review it before sharing if unsure.".to_string());
+    line("Review this local diagnostic copy before sharing it.".to_string());
     line(String::new());
 
     line("== tirith ==".to_string());
@@ -2025,24 +2553,24 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
     line(format!("detected shell: {}", info.detected_shell));
     line(format!("interactive:    {}", info.interactive));
     line(format!(
-        "live status:    {} (TIRITH_STATUS)",
-        info.tirith_status.as_deref().unwrap_or("(hook not loaded)")
+        "reported status: {} (TIRITH_STATUS; blocking unverified)",
+        info.tirith_status.as_deref().unwrap_or("(not reported)")
     ));
     line(format!(
         "requested mode: {}",
         info.bash_requested_mode.as_deref().unwrap_or("(default)")
     ));
     line(format!(
-        "effective mode: {}",
+        "effective mode: {} (reported; activation unverified)",
         info.bash_effective_mode
             .as_deref()
-            .unwrap_or("(hook not loaded)")
+            .unwrap_or("(not reported)")
     ));
     line(format!(
-        "protection:     {}",
+        "protection:     {} (reported; blocking unverified)",
         info.bash_effective_protection
             .as_deref()
-            .unwrap_or("(hook not loaded)")
+            .unwrap_or("(not reported)")
     ));
     line(format!("bash safe mode: {}", info.bash_safe_mode));
     line(format!(
@@ -2164,6 +2692,7 @@ fn build_bundle_text(home: Option<&std::path::Path>) -> String {
 /// prefix is cosmetic. On Unix the handle is chmod'd `0600` BEFORE the write, so
 /// the bundle is never briefly world-readable. `keep()` persists at the random
 /// path (NOT `persist()` onto a guessable name).
+#[cfg(test)]
 fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathBuf> {
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-bundle-")
@@ -2187,57 +2716,45 @@ fn write_bundle_file(dir: &std::path::Path, text: &str) -> std::io::Result<PathB
 /// `tirith doctor --bundle`: write the redacted bundle to a file and print its
 /// path. With `--format json`, prints `{"bundle_path": "..."}`.
 fn run_bundle(json: bool) -> i32 {
-    let home = home::home_dir();
-    let text = build_bundle_text(home.as_deref());
-
-    // Write into the state dir; fall back to the system temp dir.
-    let dir = tirith_core::policy::state_dir().unwrap_or_else(std::env::temp_dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("tirith: could not create {}: {e}", dir.display());
-        return 1;
-    }
-
-    let path = match write_bundle_file(&dir, &text) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("tirith: could not write bundle into {}: {e}", dir.display());
-            return 1;
-        }
-    };
-
-    if json {
-        // The path can contain the home dir; redact it like the bundle body.
-        let shown = redact_home_path(&path.display().to_string(), home.as_deref());
-        match serde_json::to_string_pretty(&serde_json::json!({ "bundle_path": shown })) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("tirith: JSON serialization failed: {e}");
-                return 1;
-            }
-        }
-    } else {
-        println!("tirith: diagnostic bundle written to:");
-        println!("  {}", path.display());
-        println!();
-        println!("The bundle is redacted (secrets, tokens, and your home-directory path");
-        println!("are masked) and safe to attach to a bug report. Review it before");
-        println!("sharing if you want to be sure.");
-    }
-    0
+    super::support_bundle::run(false, Vec::new(), Vec::new(), json)
 }
 
-/// The `protection status:` line for `tirith doctor --compat`, from
-/// `TIRITH_STATUS`; `None` to omit. Surfaced for EVERY shell (the var is
-/// exported by every hook), not just bash — a previous bash-only gate dropped it
-/// for e.g. a degraded zsh session. `degraded` gets an explicit callout.
+/// Surface a reported marker for every shell without promoting inherited state.
 fn compat_protection_status_line(status: Option<&str>) -> Option<String> {
-    match status {
-        Some("degraded") => Some(
-            "  protection status:    DEGRADED (downgraded to warn-only this session)".to_string(),
-        ),
-        Some(status) => Some(format!("  protection status:    {status}")),
-        None => None,
-    }
+    status.map(|status| {
+        let label = if status == "degraded" {
+            "DEGRADED"
+        } else {
+            status
+        };
+        format!("  protection status:    {label} (reported by TIRITH_STATUS; blocking unverified)")
+    })
+}
+
+/// Full and compatibility reports use the same canonical evidence as quick
+/// status. Ordinary diagnostic capture never carries a live verification proof.
+fn format_protection_evidence(
+    evidence: &crate::cli::protection_evidence::ProtectionEvidence,
+) -> String {
+    use crate::cli::protection_evidence::ProtectionState;
+    let state = match evidence.state {
+        ProtectionState::Configured => "configured",
+        ProtectionState::ActivationRequired => "activation-required",
+        ProtectionState::ObservedBlocking => "observed-blocking",
+        ProtectionState::WarnOnly => "warn-only",
+        ProtectionState::Degraded => "degraded",
+        ProtectionState::Off => "off",
+        ProtectionState::Unknown => "unknown",
+    };
+    let blocking = if evidence.verified_blocking {
+        "blocking observed"
+    } else {
+        "blocking unverified"
+    };
+    format!(
+        "  protection evidence: {state} ({blocking}; source: {})",
+        evidence.source
+    )
 }
 
 /// Render the full `tirith doctor --compat` human report into a string.
@@ -2259,10 +2776,10 @@ fn format_compat_human(r: &CompatReport) -> String {
     line("");
 
     // Bash is the only shell with a requested-vs-effective split; others just
-    // report what the hook exported.
+    // report inherited hook markers.
     line("Shell hook mode");
-    // Cross-shell `TIRITH_STATUS` — emitted unconditionally (every hook exports
-    // it), NOT gated behind the bash-only branch below.
+    line(&format_protection_evidence(&r.protection_evidence));
+    // A supplied TIRITH_STATUS is not gated behind the bash-only branch.
     if let Some(status_line) = compat_protection_status_line(r.tirith_status.as_deref()) {
         line(&status_line);
     }
@@ -2277,11 +2794,15 @@ fn format_compat_human(r: &CompatReport) -> String {
             r.bash_effective_protection.as_deref(),
         ) {
             (Some(mode), Some(protection)) => {
-                line(&format!("  effective bash mode:  {mode}"));
-                line(&format!("  effective protection: {protection}"));
+                line(&format!(
+                    "  effective bash mode:  {mode} (reported; activation unverified)"
+                ));
+                line(&format!(
+                    "  effective protection: {protection} (reported; blocking unverified)"
+                ));
             }
             _ => {
-                line("  effective bash mode:  hook not loaded in this process");
+                line("  effective bash mode:  not reported to this process");
             }
         }
         match r.bash_enter_capability.as_deref() {
@@ -2458,42 +2979,32 @@ fn print_compat_human(r: &CompatReport) {
     print!("{}", format_compat_human(r));
 }
 
-/// Render the cross-shell `protection:` line from `TIRITH_STATUS`. A `degraded`
-/// status gets an explicit callout so a downgrade is never something to infer.
-fn print_protection_status(status: Option<&str>) {
-    match status {
-        Some("blocks") => {
-            println!("  protection:   blocks (a dangerous command is stopped before it runs)");
-        }
-        Some("warn-only") => {
-            println!("  protection:   warn-only (commands are checked but NOT blocked)");
-        }
-        Some("degraded") => {
-            println!("  protection:   DEGRADED — downgraded to warn-only this session");
-            println!();
-            println!("  WARNING: tirith protection was downgraded mid-session.");
-            println!("  Commands are still checked, but a dangerous one is NO LONGER blocked.");
-            println!("  Restart your shell to recover full protection. See the bash section");
-            println!("  below (and 'tirith doctor --bundle' for a full diagnostic report).");
-            println!();
-        }
-        Some("off") => {
-            println!("  protection:   off (the tirith hook installed nothing in this shell)");
-        }
-        Some(other) => {
-            // Forward-compatible: unrecognised value shown verbatim.
-            println!("  protection:   {other}");
-        }
-        None => {
-            // No hook ran (usually a non-interactive subshell); the bash block
-            // below prints the fuller "not loaded" diagnostic.
-        }
+/// A raw environment marker is useful diagnostic detail, never blocking proof.
+fn format_protection_status(status: Option<&str>) -> String {
+    let Some(status) = status else {
+        return String::new();
+    };
+    let label = if status == "degraded" {
+        "DEGRADED"
+    } else {
+        status
+    };
+    let mut out =
+        format!("  protection:   {label} (reported by TIRITH_STATUS; blocking unverified)\n");
+    if status == "degraded" {
+        out.push_str("  The inherited marker reports a downgrade to warn-only. Resolve any hook\n");
+        out.push_str("  warning, then restart your shell and verify blocking there.\n");
     }
+    out
 }
 
 fn print_human(info: &DoctorInfo) {
     println!("tirith {}", info.version);
+    println!("  audit recording: {}", info.audit_recording.summary());
     println!("  binary:       {}", info.binary_path);
+    println!("  pkg approval: {} (optional)", info.package_approval.state);
+    println!("    {}", info.package_approval.detail);
+    println!("    {}", info.package_approval.next_action);
     // Low-value advisory: the noisy shadow-binary warning is suppressed under
     // `--quiet` (the `--fix` guidance block remains a separate, always-shown path).
     if !info.shadow_binaries.is_empty() && !crate::cli::is_quiet() {
@@ -2561,8 +3072,14 @@ fn print_human(info: &DoctorInfo) {
         }
         println!();
     }
-    // Cross-shell live protection status from `TIRITH_STATUS`.
-    print_protection_status(info.tirith_status.as_deref());
+    println!("{}", format_protection_evidence(&info.protection_evidence));
+    for line in info.hook_freshness.human_lines() {
+        println!("  {line}");
+    }
+    print!(
+        "{}",
+        format_protection_status(info.tirith_status.as_deref())
+    );
     // Bash-only block: requested vs effective state. Also shown whenever any
     // bash env var is present (e.g. a zsh parent that spawns bash).
     let has_any_bash_env = info.bash_requested_mode.is_some()
@@ -2607,11 +3124,11 @@ fn print_human(info: &DoctorInfo) {
             info.bash_effective_protection.as_deref(),
         ) {
             (Some(mode), Some(protection)) => {
-                println!("  bash mode:            {mode}");
-                println!("  effective protection: {protection}");
+                println!("  bash mode:            {mode} (reported; activation unverified)");
+                println!("  effective protection: {protection} (reported; blocking unverified)");
             }
             _ => {
-                println!("  bash hook:            not loaded in this process");
+                println!("  bash hook:            state not reported to this process");
             }
         }
 
@@ -2682,7 +3199,7 @@ fn print_human(info: &DoctorInfo) {
             } else if live_enforcement_degraded {
                 println!("  to restore blocking:  TIRITH_BASH_PREEXEC_ENFORCE is set, but this");
                 println!(
-                    "                        shell is not blocking. Resolve any hook warning,"
+                    "                        hook reports reduced protection. Resolve its warning,"
                 );
                 println!("                        then start a new shell.");
             }
@@ -2750,6 +3267,25 @@ fn print_human(info: &DoctorInfo) {
             "not available (Unix-only)"
         }
     );
+
+    for (index, adapter) in info.agent_adapters.iter().enumerate() {
+        let label = if index == 0 { "agent hooks:" } else { "" };
+        match adapter.remedy.as_deref() {
+            None => println!(
+                "  {label:<13} {} ({}): current — {}",
+                adapter.tool, adapter.scope, adapter.path
+            ),
+            Some(remedy) => {
+                println!(
+                    "  {label:<13} {} ({}): STALE — {}",
+                    adapter.tool, adapter.scope, adapter.path
+                );
+                println!(
+                    "                installed adapter does not match this tirith release; run `{remedy}`"
+                );
+            }
+        }
+    }
 
     if let Some(ref tdb) = info.threat_db {
         if !tdb.installed {
@@ -2972,53 +3508,35 @@ fn unreadable_profile_msg(
 /// detector reuses the same check. `command_label` is the caller's log prefix
 /// (so the shared path doesn't surface a misleading "doctor:" elsewhere).
 pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<PathBuf>, bool) {
-    let home = match home::home_dir() {
-        Some(h) => h,
-        None => return (None, false),
+    let target = match crate::cli::shell_target::resolve_for_shell(shell) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("{command_label} shell target unavailable: {error}");
+            return (None, false);
+        }
     };
-
-    let profile_candidates: Vec<PathBuf> = match shell {
-        "zsh" => vec![
-            home.join(".zshrc"),
-            home.join(".zshenv"),
-            home.join(".zprofile"),
-        ],
-        "bash" => vec![
-            home.join(".bashrc"),
-            home.join(".bash_profile"),
-            home.join(".profile"),
-        ],
-        "fish" => {
-            let mut candidates = vec![home.join(".config/fish/config.fish")];
-            let conf_d = home.join(".config/fish/conf.d");
-            if let Ok(entries) = std::fs::read_dir(&conf_d) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("fish") {
-                        candidates.push(path);
-                    }
-                }
+    let mut profile_candidates: Vec<PathBuf> =
+        target.profiles.iter().map(|p| p.path.clone()).collect();
+    // These are valid manual startup routes, but their presence never proves
+    // that a particular current shell actually sourced them.
+    if shell == "zsh" {
+        if let Some(root) = target.profiles.first().and_then(|p| p.path.parent()) {
+            profile_candidates.extend([root.join(".zshenv"), root.join(".zprofile")]);
+        }
+    }
+    if shell == "fish" {
+        if let Some(root) = target.profiles.first().and_then(|p| p.path.parent()) {
+            if let Ok(entries) = std::fs::read_dir(root.join("conf.d")) {
+                let mut snippets: Vec<_> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("fish"))
+                    .collect();
+                snippets.sort();
+                profile_candidates.extend(snippets);
             }
-            candidates
         }
-        "powershell" | "pwsh" => {
-            let docs = home.join("Documents");
-            vec![
-                docs.join("PowerShell/Microsoft.PowerShell_profile.ps1"),
-                docs.join("WindowsPowerShell/Microsoft.PowerShell_profile.ps1"),
-                home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
-            ]
-        }
-        "nushell" | "nu" => {
-            let xdg = std::env::var("XDG_CONFIG_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
-            vec![xdg.join("nushell/config.nu")]
-        }
-        _ => return (None, false),
-    };
+    }
 
     // Scan ALL candidates — the first existing file may not be the configured one.
     let mut first_existing = None;
@@ -3053,9 +3571,51 @@ pub(crate) fn check_shell_profile(shell: &str, command_label: &str) -> (Option<P
 /// for the hook. Proves whether `bind -x` on Enter works HERE (issue #111)
 /// rather than guessing from the bash version.
 #[cfg(unix)]
-fn run_simulate_enter() -> i32 {
-    println!("tirith: running bash enter-mode delivery self-test...");
+fn run_simulate_enter(json: bool) -> i32 {
+    if !json {
+        println!("tirith: running bash enter-mode delivery self-test...");
+    }
     let outcome = crate::cli::bash_capability::run_and_cache();
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut evidence =
+        crate::cli::protection_evidence::ProtectionEvidence::configuration("unknown", false, true);
+    evidence.surface = "disposable-bash-enter-probe".into();
+    // This probe owns a disposable native shell, never the calling terminal.
+    // Its scope stays explicit even when its delivery self-test succeeds.
+    let passed = outcome.capability.enables_enter();
+    evidence.source = "disposable-native-shell-test".into();
+    evidence.observed_at = Some(observed_at);
+    evidence.expires_at = Some(observed_at.saturating_add(1));
+    evidence.fresh = passed;
+    evidence.verified_blocking = passed;
+    evidence.state = if passed {
+        crate::cli::protection_evidence::ProtectionState::ObservedBlocking
+    } else {
+        crate::cli::protection_evidence::ProtectionState::Unknown
+    };
+    evidence.invalidation_reason =
+        (!passed).then(|| "disposable shell did not complete its allow-and-block self-test".into());
+    if json {
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "shell": "bash",
+            "executable": outcome.bash_path,
+            "version": outcome.bash_version,
+            "protection_evidence": evidence,
+            "detail": outcome.reason,
+            "cache_path": outcome.cache_path,
+            "current_shell_verified": false,
+        });
+        return if write_json_stdout(&result, "tirith doctor: cannot write probe evidence") {
+            0
+        } else {
+            1
+        };
+    }
+    println!("  tested surface: disposable bash (current shell remains unverified)");
 
     if let Some(v) = &outcome.bash_version {
         println!("  bash version:   {v}");
@@ -3099,7 +3659,15 @@ fn run_simulate_enter() -> i32 {
 
 /// Non-Unix stub: enter mode / `bind -x` are Unix-only.
 #[cfg(not(unix))]
-fn run_simulate_enter() -> i32 {
+fn run_simulate_enter(json: bool) -> i32 {
+    if json {
+        let result = serde_json::json!({"schema_version": 1, "status": "unsupported", "surface": "disposable-bash-enter-probe", "current_shell_verified": false});
+        return if write_json_stdout(&result, "tirith doctor: cannot write probe evidence") {
+            0
+        } else {
+            1
+        };
+    }
     println!("tirith: --simulate-enter is only meaningful on Unix (bash enter mode)");
     0
 }
@@ -3213,11 +3781,27 @@ mod tests {
     fn write_effective_wrapper(path: &std::path::Path, protocol: &str) {
         let adapter = path.parent().unwrap().join("tirith-check.py");
         write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
+        write_executable(
+            path,
+            &crate::cli::setup::pre_tool_use_wrapper(
+                protocol,
+                "/opt/tirith/bin/tirith",
+                "/usr/bin/python3",
+                &adapter,
+            )
+            .unwrap(),
+        );
+    }
+
+    /// The wrapper an earlier release wrote: no missing-interpreter guard.
+    fn write_pre_guard_wrapper(path: &std::path::Path, protocol: &str) {
+        let adapter = path.parent().unwrap().join("tirith-check.py");
+        write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
         let adapter = crate::cli::setup::shell_quote(adapter.to_str().unwrap(), "bash");
         write_executable(
             path,
             &format!(
-                "#!/bin/sh\nTIRITH_BIN=/opt/tirith/bin/tirith \\\nTIRITH_HOOK_PROTOCOL={protocol} \\\nexec /usr/bin/python3 {adapter}\n"
+                "#!/bin/sh\n# Generated by `tirith setup`. Runs the shared pre-tool-use adapter with\n# this host's wire protocol. Do not edit; re-run setup to refresh it.\nTIRITH_BIN=/opt/tirith/bin/tirith \\\nTIRITH_HOOK_PROTOCOL={protocol} \\\nexec /usr/bin/python3 {adapter}\n"
             ),
         );
     }
@@ -3323,6 +3907,324 @@ mod tests {
         });
     }
 
+    fn render_shell_hook(template: &str, tirith: &str, python: &str) -> String {
+        template
+            .replace("__TIRITH_BIN__", tirith)
+            .replace("__TIRITH_PYTHON__", python)
+    }
+
+    #[test]
+    fn rendered_asset_matches_accepts_setup_substitutions_and_rejects_drift() {
+        for template in [
+            crate::assets::CURSOR_HOOK_SH,
+            crate::assets::VSCODE_HOOK_SH,
+            crate::assets::WINDSURF_HOOK_SH,
+        ] {
+            for (tirith, python) in [
+                ("/opt/tirith/bin/tirith", "/usr/bin/python3"),
+                ("tirith", "'/Users/a b/py thon/bin/python3'"),
+                (
+                    "/Users/o'brien/bin/tirith",
+                    "'/Users/o'\\''brien/bin/python3'",
+                ),
+            ] {
+                let rendered = render_shell_hook(template, tirith, python);
+                assert!(
+                    rendered_asset_matches(&rendered, template, SHELL_HOOK_PLACEHOLDERS),
+                    "{tirith} {python}"
+                );
+                assert!(!rendered_asset_matches(
+                    &format!("{rendered}\n"),
+                    template,
+                    SHELL_HOOK_PLACEHOLDERS
+                ));
+            }
+            // An earlier release's adapter: same placeholders, different logic.
+            let older = template.replacen("-I -S -c", "-c", 1);
+            assert_ne!(older, template);
+            let rendered = render_shell_hook(&older, "/opt/tirith/bin/tirith", "/usr/bin/python3");
+            assert!(!rendered_asset_matches(
+                &rendered,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // One placeholder rendered with two different values never matches.
+            let inconsistent = render_shell_hook(
+                &template.replacen("__TIRITH_BIN__", "/elsewhere/tirith", 1),
+                "/opt/tirith/bin/tirith",
+                "/usr/bin/python3",
+            );
+            assert!(!rendered_asset_matches(
+                &inconsistent,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // A substituted value is a single line.
+            let multiline =
+                render_shell_hook(template, "/opt/tirith\nrm -rf ~", "/usr/bin/python3");
+            assert!(!rendered_asset_matches(
+                &multiline,
+                template,
+                SHELL_HOOK_PLACEHOLDERS
+            ));
+            // A tampered placeholder line is not a setup value: setup writes a
+            // shell-quoted absolute interpreter and a bare or absolute Tirith
+            // path that the double-quoted expansion cannot interpret.
+            for (tirith, python) in [
+                (
+                    "/opt/tirith/bin/tirith",
+                    "/usr/bin/python3; echo '{\"permission\":\"allow\"}'; exit 0",
+                ),
+                ("/opt/tirith/bin/tirith", "python3"),
+                ("/opt/tirith/bin/tirith", "'/usr/bin/python3"),
+                ("/opt/tirith/bin/tirith", "/usr/bin/python3 #"),
+                ("/opt/tirith/bin/tirith", ""),
+                ("/opt/$(touch /tmp/x)/tirith", "/usr/bin/python3"),
+                ("/opt/tirith\"; exit 0; \"", "/usr/bin/python3"),
+                ("/opt/`id`/tirith", "/usr/bin/python3"),
+                ("/opt/ti}rith", "/usr/bin/python3"),
+                ("/opt/tirith\\", "/usr/bin/python3"),
+                ("/opt/ti\\\\rith", "/usr/bin/python3"),
+                ("relative/tirith", "/usr/bin/python3"),
+                ("", "/usr/bin/python3"),
+            ] {
+                let rendered = render_shell_hook(template, tirith, python);
+                assert!(
+                    !rendered_asset_matches(&rendered, template, SHELL_HOOK_PLACEHOLDERS),
+                    "tampered value accepted: {tirith:?} {python:?}"
+                );
+            }
+        }
+
+        let guard = crate::assets::TIRITH_GUARD_TS
+            .replace("\"__TIRITH_BIN__\"", "\"/opt/tirith/bin/tirith\"")
+            .replace("\"__TIRITH_INTEGRATION__\"", "\"omp\"");
+        assert!(rendered_asset_matches(
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        assert!(!rendered_asset_matches(
+            &rendered_guard("omp"),
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        // Guard values must be the canonical JSON string literals setup writes:
+        // an absolute Tirith path and the host's own integration name.
+        for (binary, integration) in [
+            (r#""/x"; globalThis.allow = true; "y""#, r#""omp""#),
+            (r#""\/opt\/tirith\/bin\/tirith""#, r#""omp""#),
+            (r#""tirith""#, r#""omp""#),
+            (r#"'/opt/tirith/bin/tirith'"#, r#""omp""#),
+            (r#""/opt/tirith/bin/tirith""#, r#""evil""#),
+            (r#""/opt/tirith/bin/tirith""#, r#""omp" || "x""#),
+        ] {
+            let tampered = crate::assets::TIRITH_GUARD_TS
+                .replace("\"__TIRITH_BIN__\"", binary)
+                .replace("\"__TIRITH_INTEGRATION__\"", integration);
+            assert!(
+                !rendered_asset_matches(
+                    &tampered,
+                    crate::assets::TIRITH_GUARD_TS,
+                    PI_GUARD_PLACEHOLDERS
+                ),
+                "tampered guard accepted: {binary} {integration}"
+            );
+        }
+        // A guard labelled for another Pi-family host is not this host's.
+        assert!(rendered_adapter_matches(
+            Some("omp"),
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+        assert!(!rendered_adapter_matches(
+            Some("pi-cli"),
+            &guard,
+            crate::assets::TIRITH_GUARD_TS,
+            PI_GUARD_PLACEHOLDERS
+        ));
+
+        for asset in [
+            crate::assets::TIRITH_CHECK_PY,
+            crate::assets::KIRO_HOOK_PY,
+            crate::assets::COPILOT_HOOK_PY,
+            crate::assets::GEMINI_HOOK_PY,
+            crate::assets::OPENCLAW_GUARD_TS,
+        ] {
+            assert!(rendered_asset_matches(asset, asset, VERBATIM));
+            assert!(!rendered_asset_matches(
+                &format!("{asset}# local edit\n"),
+                asset,
+                VERBATIM
+            ));
+            assert!(!rendered_asset_matches(&asset[1..], asset, VERBATIM));
+        }
+    }
+
+    #[test]
+    fn agent_adapters_report_current_and_stale_installs_with_a_force_remedy() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            let cursor = home.join(".cursor/hooks/tirith-hook.sh");
+            write_executable(
+                &cursor,
+                &render_shell_hook(
+                    crate::assets::CURSOR_HOOK_SH,
+                    "/opt/tirith/bin/tirith",
+                    "/usr/bin/python3",
+                ),
+            );
+            let claude = home.join(".claude/hooks/tirith-check.py");
+            write_executable(&claude, "#!/usr/bin/env python3\n# adapter from 0.4.x\n");
+            let gemini = cwd.join(".gemini/hooks/tirith-security-guard-gemini.py");
+            write_executable(&gemini, crate::assets::GEMINI_HOOK_PY);
+            let omp = crate::cli::setup::omp_user_guard_path(home).unwrap();
+            write_executable(&omp, &rendered_guard("omp"));
+
+            let reports = gather_agent_adapters_with(home, Some(cwd));
+            let find = |tool: &str| {
+                reports
+                    .iter()
+                    .find(|report| report.tool == tool)
+                    .unwrap_or_else(|| panic!("{tool} adapter not reported: {reports:?}"))
+            };
+            let cursor_report = find("cursor");
+            assert_eq!(cursor_report.scope, "user");
+            assert_eq!(cursor_report.state, AdapterState::Current);
+            assert_eq!(cursor_report.remedy, None);
+            assert_eq!(cursor_report.path, cursor.display().to_string());
+
+            let claude_report = find("claude-code");
+            assert_eq!(claude_report.scope, "user");
+            assert_eq!(claude_report.state, AdapterState::Stale);
+            assert_eq!(
+                claude_report.remedy.as_deref(),
+                Some("tirith setup claude-code --scope user --force")
+            );
+
+            let gemini_report = find("gemini-cli");
+            assert_eq!(gemini_report.scope, "project");
+            assert_eq!(gemini_report.state, AdapterState::Current);
+
+            assert_eq!(find("omp").state, AdapterState::Stale);
+            for absent in ["vscode", "windsurf", "kiro", "openclaw", "copilot-cli"] {
+                assert!(
+                    reports.iter().all(|report| report.tool != absent),
+                    "{absent}: {reports:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn agent_adapters_are_found_up_to_the_repository_root() {
+        with_fake_env(true, |home, cwd| {
+            let cwd = cwd.expect("cwd set");
+            // A repository whose root holds a stale project adapter, and a
+            // project adapter above that root that belongs to another tree.
+            let outer = cwd.join("outer");
+            let repo = outer.join("repo");
+            let subdir = repo.join("crates/inner");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(&subdir).unwrap();
+            write_executable(
+                &repo.join(".claude/hooks/tirith-check.py"),
+                "#!/usr/bin/env python3\n# adapter from an earlier release\n",
+            );
+            write_executable(
+                &repo.join(".gemini/hooks/tirith-security-guard-gemini.py"),
+                crate::assets::GEMINI_HOOK_PY,
+            );
+            write_executable(
+                &outer.join(".cursor/hooks/tirith-hook.sh"),
+                "#!/bin/sh\n# not this repository's adapter\n",
+            );
+
+            let reports = gather_agent_adapters_with(home, Some(&subdir));
+            let claude = reports
+                .iter()
+                .find(|report| report.tool == "claude-code")
+                .unwrap_or_else(|| panic!("repository adapter not found: {reports:?}"));
+            assert_eq!(claude.scope, "project");
+            assert_eq!(claude.state, AdapterState::Stale);
+            assert_eq!(
+                claude.path,
+                repo.join(".claude/hooks/tirith-check.py")
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(claude.setup_dir, Some(repo.display().to_string()));
+            // Setup writes this adapter where it runs, so the remedy runs there.
+            assert_eq!(
+                claude.remedy.as_deref(),
+                Some(
+                    format!(
+                        "cd {} && tirith setup claude-code --scope project --force",
+                        crate::cli::setup::shell_quote(repo.to_str().unwrap(), "bash")
+                    )
+                    .as_str()
+                )
+            );
+            let gemini = reports
+                .iter()
+                .find(|report| report.tool == "gemini-cli")
+                .unwrap();
+            assert_eq!(gemini.state, AdapterState::Current);
+            assert_eq!(gemini.remedy, None);
+            // Discovery stops at the `.git` boundary, as policy discovery does.
+            assert!(
+                reports.iter().all(|report| report.tool != "cursor"),
+                "{reports:?}"
+            );
+
+            // From the directory that holds the adapter, the remedy needs no cd.
+            let reports = gather_agent_adapters_with(home, Some(&repo));
+            let claude = reports
+                .iter()
+                .find(|report| report.tool == "claude-code")
+                .unwrap();
+            assert_eq!(claude.setup_dir, None);
+            assert_eq!(
+                claude.remedy.as_deref(),
+                Some("tirith setup claude-code --scope project --force")
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_without_the_missing_interpreter_guard_needs_repair() {
+        with_fake_env(true, |home, cwd| {
+            let wrapper = cline_hook_artifact(home);
+            write_pre_guard_wrapper(&wrapper, "cline");
+            let tools = detect_ai_tools_with(home, cwd);
+            let cline = tools.iter().find(|tool| tool.name == "cline").unwrap();
+            assert_eq!(cline.hook_state, HookInstallState::Broken);
+
+            write_effective_wrapper(&wrapper, "cline");
+            let tools = detect_ai_tools_with(home, cwd);
+            let cline = tools.iter().find(|tool| tool.name == "cline").unwrap();
+            assert_eq!(cline.hook_state, HookInstallState::Effective);
+        });
+    }
+
+    #[test]
+    fn agent_adapter_shared_by_both_scopes_is_reported_once_as_user() {
+        with_fake_env(false, |home, _| {
+            let adapter = home.join(".claude/hooks/tirith-check.py");
+            write_executable(&adapter, crate::assets::TIRITH_CHECK_PY);
+            let reports = gather_agent_adapters_with(home, Some(home));
+            let claude: Vec<_> = reports
+                .iter()
+                .filter(|report| report.tool == "claude-code")
+                .collect();
+            assert_eq!(claude.len(), 1, "{reports:?}");
+            assert_eq!(claude[0].scope, "user");
+            assert_eq!(claude[0].state, AdapterState::Current);
+        });
+    }
+
     #[test]
     fn complete_wrapper_chain_requires_the_adjacent_current_adapter() {
         with_fake_env(true, |home, cwd| {
@@ -3344,6 +4246,7 @@ mod tests {
 
     #[test]
     fn hook_reads_refuse_symlinks_fifos_and_oversized_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -3794,6 +4697,7 @@ mod tests {
 
     #[test]
     fn detect_shell_tool_conflicts_reports_only_profile_hits_when_offline_of_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A tool mentioned only in the profile (not on PATH) must still be
         // surfaced, with `in_profile` true and `on_path` reflecting reality.
         let tmp = tempfile::tempdir().unwrap();
@@ -3835,10 +4739,7 @@ mod tests {
     // --- protection-status rendering --------------------------------------
 
     #[test]
-    fn print_protection_status_does_not_panic_on_any_input() {
-        // Smoke: every variant (including an unknown value and None) renders
-        // without panicking. The content assertions live in the integration
-        // tests; this just guards the match arms.
+    fn full_doctor_human_markers_do_not_claim_verified_protection() {
         for s in [
             Some("blocks"),
             Some("warn-only"),
@@ -3847,7 +4748,19 @@ mod tests {
             Some("future-value"),
             None,
         ] {
-            print_protection_status(s);
+            let rendered = format_protection_status(s);
+            if let Some(marker) = s {
+                let label = if marker == "degraded" {
+                    "DEGRADED"
+                } else {
+                    marker
+                };
+                assert!(rendered.contains(label));
+                assert!(rendered.contains("reported by TIRITH_STATUS; blocking unverified"));
+                assert!(!rendered.contains("a dangerous command is stopped"));
+            } else {
+                assert!(rendered.is_empty());
+            }
         }
     }
 
@@ -3855,6 +4768,7 @@ mod tests {
 
     #[test]
     fn redact_home_path_masks_the_literal_home_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let home = std::path::Path::new("/Users/alice");
         let text = "hook dir: /Users/alice/.local/share/tirith/shell\npolicy: /Users/alice/.tirith/policy.yaml";
         let red = redact_home_path(text, Some(home));
@@ -4120,6 +5034,11 @@ mod tests {
     /// with every other field at a benign default. Used by the F3 tests.
     fn compat_report_for(detected_shell: &str, tirith_status: Option<&str>) -> CompatReport {
         CompatReport {
+            protection_evidence: crate::cli::protection_evidence::ProtectionEvidence::configuration(
+                &crate::cli::prompt_status::protection_mode_from_status(tirith_status),
+                false,
+                true,
+            ),
             version: "0.0.0-test".to_string(),
             binary_path: "/tmp/tirith".to_string(),
             detected_shell: detected_shell.to_string(),
@@ -4152,6 +5071,7 @@ mod tests {
     /// fish, and PowerShell hooks too, so the line must not be bash-gated.
     #[test]
     fn compat_human_surfaces_tirith_status_for_non_bash_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for shell in ["zsh", "fish", "powershell", "nushell"] {
             let report = compat_report_for(shell, Some("degraded"));
             let out = format_compat_human(&report);
@@ -4175,6 +5095,7 @@ mod tests {
     /// A plain (non-degraded) status is surfaced verbatim for a non-bash shell.
     #[test]
     fn compat_human_surfaces_plain_status_for_non_bash_shell() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = compat_report_for("zsh", Some("warn-only"));
         let out = format_compat_human(&report);
         assert!(
@@ -4187,6 +5108,7 @@ mod tests {
     /// `protection status:` line, and no panic / stray formatting.
     #[test]
     fn compat_human_omits_status_line_when_unset() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let report = compat_report_for("zsh", None);
         let out = format_compat_human(&report);
         assert!(
@@ -4206,13 +5128,71 @@ mod tests {
     fn compat_protection_status_line_is_shell_independent() {
         assert_eq!(
             compat_protection_status_line(Some("degraded")).as_deref(),
-            Some("  protection status:    DEGRADED (downgraded to warn-only this session)")
+            Some(
+                "  protection status:    DEGRADED (reported by TIRITH_STATUS; blocking unverified)"
+            )
         );
         assert_eq!(
             compat_protection_status_line(Some("blocks")).as_deref(),
-            Some("  protection status:    blocks")
+            Some("  protection status:    blocks (reported by TIRITH_STATUS; blocking unverified)")
         );
         assert_eq!(compat_protection_status_line(None), None);
+    }
+
+    #[test]
+    fn full_and_compat_doctor_do_not_promote_inherited_blocking() {
+        let mut environment = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        environment.set_env("TIRITH_VERIFIED_BLOCKING", "1");
+        environment.set_env("TIRITH_INTEGRATION_VERSION", "0.4.2");
+        environment.set_env("TIRITH_INTEGRATION_SHELL", "bash");
+        // Suppress optional host-tool detection; this is an inherited-marker
+        // regression, not a PowerShell or external capsule-helper qualification.
+        let empty_path = environment.roots().home.join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+        environment.set_env("PATH", empty_path.as_os_str());
+        for (reported, effective) in [("blocks", None), ("off", Some("blocks"))] {
+            environment.set_env("TIRITH_STATUS", reported);
+            if let Some(effective) = effective {
+                environment.set_env("TIRITH_BASH_EFFECTIVE_PROTECTION", effective);
+            } else {
+                environment.remove_env("TIRITH_BASH_EFFECTIVE_PROTECTION");
+            }
+            let full = gather_info();
+            let compat = gather_compat();
+            let quick = gather_quick_info();
+            for value in [
+                serde_json::to_value(&full).unwrap(),
+                serde_json::to_value(&compat).unwrap(),
+            ] {
+                assert_eq!(value["tirith_status"], reported);
+                if let Some(effective) = effective {
+                    assert_eq!(value["bash_effective_protection"], effective);
+                } else {
+                    assert!(value.get("bash_effective_protection").is_none());
+                }
+                let evidence = &value["protection_evidence"];
+                assert_eq!(evidence["verified_blocking"], false);
+                assert_eq!(evidence["fresh"], false);
+                assert_eq!(evidence["source"], "inherited-environment-unverified");
+                assert_ne!(evidence["state"], "observed-blocking");
+                assert!(evidence["observed_at"].is_null());
+                assert!(evidence["expires_at"].is_null());
+                assert!(evidence["invalidation_reason"].is_string());
+                assert_eq!(
+                    evidence,
+                    &serde_json::to_value(&quick.protection_evidence).unwrap()
+                );
+            }
+            let human = format_compat_human(&compat);
+            assert!(human.contains("blocking unverified"));
+            assert!(human.contains("reported by TIRITH_STATUS"));
+            assert!(!human.contains("observed-blocking"));
+            assert!(format_protection_evidence(&full.protection_evidence)
+                .contains("blocking unverified"));
+            let full_value = serde_json::to_value(&full).unwrap();
+            assert_eq!(full_value["hook_freshness"]["blocking_proof"], false);
+            assert!(full_value["hook_freshness"]["this_shell"].is_string());
+        }
     }
 
     #[test]
@@ -4291,6 +5271,7 @@ mod tests {
 
     #[test]
     fn compat_human_ps_psreadline_some_true_renders_yes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let out = format_compat_human(&compat_report_with_ps(Some(true)));
         assert!(
             out.contains("PSReadLine module: yes") || out.contains("PSReadLine module:     yes"),
@@ -4300,6 +5281,7 @@ mod tests {
 
     #[test]
     fn compat_human_ps_psreadline_some_false_renders_no_with_hint() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let out = format_compat_human(&compat_report_with_ps(Some(false)));
         assert!(
             out.contains("no (key binding will not work)"),
@@ -4509,9 +5491,13 @@ mod tests {
     /// (the extension contract must stay minimal/stable).
     #[test]
     fn quick_json_has_exactly_the_documented_fields() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let info = QuickDoctorInfo {
             schema_version: 1,
             protection_mode: "guarded".to_string(),
+            protection_evidence: crate::cli::protection_evidence::ProtectionEvidence::configuration(
+                "guarded", true, true,
+            ),
             policy_path_used: Some("/repo/.tirith/policy.yaml".to_string()),
             hook_configured: true,
         };
@@ -4524,6 +5510,7 @@ mod tests {
             [
                 "hook_configured",
                 "policy_path_used",
+                "protection_evidence",
                 "protection_mode",
                 "schema_version"
             ],
@@ -4677,6 +5664,7 @@ mod tests {
     /// create-new semantics through the contained writer.
     #[test]
     fn create_policy_contained_creates_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let path = repo.path().join(".tirith").join("policy.yaml");
         create_policy_contained(repo.path(), &path, "fail_mode: open\n").unwrap();
@@ -4687,6 +5675,7 @@ mod tests {
     /// "already exists" error is preserved.
     #[test]
     fn create_policy_contained_refuses_to_clobber_existing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path().join(".tirith");
         std::fs::create_dir_all(&dir).unwrap();
@@ -4703,6 +5692,7 @@ mod tests {
     /// file OUTSIDE the repo).
     #[test]
     fn create_policy_contained_refuses_symlinked_tirith_dir() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join(".tirith")).unwrap();
@@ -4720,6 +5710,7 @@ mod tests {
     /// contained writer refuses it.
     #[test]
     fn create_policy_contained_refuses_dangling_symlink_at_final_component() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("victim.yaml");

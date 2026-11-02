@@ -2,10 +2,46 @@
 //! flag conflicts are enforced, JSON envelopes are stable, and error messages
 //! include corrective suggestions.
 
+use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// One private HOME and XDG tree per test process, removed at exit, so these
+/// CLI runs never write the developer's audit log, state, or threat DB. The
+/// threat-DB update schedule is pushed into the future so a `check` here never
+/// leaves a detached download running.
+fn hermetic_root() -> &'static Path {
+    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("tirith-help-snapshots-")
+            .tempdir()
+            .expect("create hermetic root");
+        tirith_test_support::remove_at_exit(root.path());
+        for relative in ["config", "data", "state/tirith", "cache"] {
+            std::fs::create_dir_all(root.path().join(relative)).expect("create hermetic dir");
+        }
+        std::fs::write(
+            root.path().join("state/tirith/threatdb-next-check-at"),
+            "99999999999",
+        )
+        .expect("defer threat-DB update");
+        root
+    })
+    .path()
+}
 
 fn tirith() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tirith"))
+    let root = hermetic_root();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tirith"));
+    cmd.env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TIRITH_LOG", "0");
+    cmd
 }
 
 /// Verify a subcommand's --help contains an "Examples:" section with expected
@@ -444,11 +480,17 @@ fn help_check_shows_format_flag() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--format"));
     assert!(stdout.contains("human, json"));
-    // --json is an alias; only --format should be documented.
+    // Match the complete option token: the visible --json-schema selector is
+    // distinct from the hidden --json compatibility alias.
     assert!(
-        !stdout.contains("  --json"),
+        !stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("--json")),
         "--json should be hidden from help"
     );
+    assert!(stdout
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("--json-schema")));
 }
 
 #[test]
@@ -790,4 +832,105 @@ fn help_mcp_diff_documents_exit_codes() {
         stdout.contains("2  usage error"),
         "mcp diff --help must document exit 2 on usage error, got:\n{stdout}"
     );
+}
+
+#[test]
+fn package_install_help_states_the_disabled_execution_scope() {
+    for args in [vec!["pkg", "--help"], vec!["pkg", "install", "--help"]] {
+        let out = tirith().args(&args).output().expect("read package help");
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("disabled on every host"), "{args:?}: {text}");
+        assert!(text.contains("private_input_execution_unqualified"));
+        assert!(text
+            .contains("--yes, --allow-degraded, sudo, and administrator access do not enable it"));
+        assert!(text.contains("verify-env"));
+    }
+}
+
+#[test]
+fn package_approve_help_states_that_it_refuses_and_records_nothing() {
+    let out = tirith()
+        .args(["pkg", "approve", "--help"])
+        .output()
+        .expect("read package approve help");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("currently disabled on every host"), "{text}");
+    assert!(text.contains("native_authority"), "{text}");
+    assert!(
+        text.contains("private_input_execution_unqualified"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("approve its install plan"),
+        "help must not imply a working approval path: {text}"
+    );
+}
+
+fn normalized_help(args: &[&str]) -> String {
+    let out = tirith().args(args).output().expect("read help");
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Contained installation is disabled for every ecosystem, so `pkg install` and
+/// `pkg approve` help must not say pip installs are enforced, and the accepted
+/// `--target` flag must not be described as a required install directory.
+#[test]
+fn package_install_and_approve_help_do_not_claim_an_enforced_ecosystem() {
+    for command in ["install", "approve"] {
+        let text = normalized_help(&["pkg", command, "--help"]);
+        for stale in [
+            "only `pip` is enforced",
+            "the only enforced ecosystem",
+            "not enforced in this version",
+            "Required new dedicated install directory",
+        ] {
+            assert!(!text.contains(stale), "pkg {command}: {stale:?} in {text}");
+        }
+        assert!(
+            text.contains("disabled for every ecosystem"),
+            "pkg {command}: {text}"
+        );
+        assert!(
+            text.contains("Accepted for compatibility and ignored"),
+            "pkg {command} --target: {text}"
+        );
+    }
+}
+
+/// `trust gc` / `trust prune` help must describe what gc really collects
+/// (trust_lifecycle::prune_grants) and must not name a nonexistent module.
+#[test]
+fn trust_gc_and_prune_help_describe_the_actual_collection() {
+    for command in ["gc", "prune"] {
+        let text = normalized_help(&["trust", command, "--help"]);
+        for stale in ["cli::trust::gc", "currently the only collection mode"] {
+            assert!(
+                !text.contains(stale),
+                "trust {command}: {stale:?} in {text}"
+            );
+        }
+        for expected in [
+            "expired grants",
+            "revocations older than 30 days",
+            "above 768 KiB",
+            "has no effect",
+        ] {
+            assert!(
+                text.contains(expected),
+                "trust {command}: missing {expected:?} in {text}"
+            );
+        }
+    }
 }

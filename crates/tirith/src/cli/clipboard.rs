@@ -316,7 +316,8 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
     let unit_content = match render_service_unit() {
         Some(s) => s,
         None => {
-            // Windows: foreground only.
+            // Windows can use a foreground daemon. An absent platform backend
+            // cannot become available merely by running the daemon or using sudo.
             if json {
                 let env = GuardInstallEnvelope {
                     platform,
@@ -325,9 +326,14 @@ pub fn install_service(apply: bool, json: bool) -> i32 {
                     loaded: false,
                 };
                 write_json_or_complain(&env);
+            } else if cfg!(target_os = "android") {
+                eprintln!(
+                    "tirith clipboard guard install-service: {}",
+                    no_backend_message()
+                );
             } else {
                 eprintln!(
-                    "tirith clipboard guard install-service: service-mode clipboard guard is not supported on Windows.\n  Run `tirith clipboard daemon --foreground` in a long-running terminal instead.",
+                    "tirith clipboard guard install-service: service-mode clipboard guard is not supported on {platform}.\n  Run `tirith clipboard daemon --foreground` in a long-running terminal instead.",
                 );
             }
             return 1;
@@ -498,6 +504,10 @@ pub fn status(json: bool) -> i32 {
                 "tirith clipboard guard status: platform={platform}, unit={}, installed={installed}, loaded={loaded}",
                 p.display()
             ),
+            None if cfg!(target_os = "android") => eprintln!(
+                "tirith clipboard guard status: platform={platform}; {}",
+                no_backend_message()
+            ),
             None => eprintln!(
                 "tirith clipboard guard status: platform={platform} (service-mode not supported); use `tirith clipboard daemon --foreground`"
             ),
@@ -511,6 +521,12 @@ pub fn status(json: bool) -> i32 {
 /// window. Never returns (the service manager owns lifecycle; Ctrl-C ends `--foreground`).
 /// In JSON mode each event is one line of JSON for a log forwarder.
 pub fn daemon_foreground(json: bool) -> i32 {
+    // Android has no compiled backend to retry. Refuse before announcing a
+    // running guard or entering a loop that can never inspect the clipboard.
+    if cfg!(target_os = "android") {
+        emit_no_backend(json, "daemon");
+        return 1;
+    }
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -646,6 +662,12 @@ pub fn daemon_foreground(json: bool) -> i32 {
 /// print the source. No-op without the extension. Never returns (Ctrl-C ends); `--json`
 /// emits one line per attribution.
 pub fn watch(json: bool) -> i32 {
+    // Source attribution still needs the actual clipboard contents. An absent
+    // Android backend cannot produce an attributed observation.
+    if cfg!(target_os = "android") {
+        emit_no_backend(json, "watch");
+        return 1;
+    }
     use std::time::SystemTime;
 
     let Some(source_path) = tirith_core::clipboard::source_file_path() else {
@@ -845,6 +867,9 @@ fn analyze_as_paste_with_patterns(
         clipboard_html: None,
         card_ref: None,
         clipboard_source,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
     let (mut verdict, policy) = engine::analyze_returning_policy(&ctx);
     // Paranoia-filter against the exact policy snapshot used by analysis so the
@@ -901,25 +926,28 @@ fn read_file_capped(path: &Path) -> Result<String, i32> {
 /// Print the "no clipboard backend" envelope/notice. `verb` ("scan"/"copy") names the
 /// command in stderr mode.
 fn emit_no_backend(json: bool, verb: &str) {
+    let message = no_backend_message();
     if json {
         let env = ScanEnvelope {
             status: "no_backend",
             verdict: None,
-            error: Some("no clipboard backend available (headless display server?)"),
+            error: Some(message),
         };
         write_json_or_complain(&env);
     } else {
-        eprintln!(
-            "tirith clipboard {verb}: no clipboard backend available (headless display server?)"
-        );
+        eprintln!("tirith clipboard {verb}: {message}");
     }
 }
 
-/// SHA-256 hex via the shared core helper (Greptile R1 #6), so debounce key,
-/// paste-provenance rule, and `--with-source` all hash content the same way.
-fn sha256_hex(bytes: &[u8]) -> String {
-    tirith_core::clipboard::content_sha256_hex(bytes)
+fn no_backend_message() -> &'static str {
+    if cfg!(target_os = "android") {
+        "no clipboard backend available on Android/Termux; clipboard scanning and guarding are unavailable. Sudo does not enable this feature."
+    } else {
+        "no clipboard backend available (headless display server?)"
+    }
 }
+
+use tirith_core::util::sha256_hex;
 
 /// Serialize `value` as a single line of JSON to stdout, followed by `\n`.
 /// Used by the daemon's per-event emitter. Returns `Ok(())` on success.
@@ -960,7 +988,16 @@ fn service_platform() -> &'static str {
     {
         "windows-foreground-only"
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        "android-no-backend"
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android"
+    )))]
     {
         "unsupported"
     }
@@ -1179,6 +1216,17 @@ fn is_service_loaded() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_guard_and_watch_refuse_without_starting_polling() {
+        assert_eq!(super::daemon_foreground(true), 1);
+        assert_eq!(super::watch(true), 1);
+        assert_eq!(super::install_service(true, true), 1);
+        assert_eq!(super::service_platform(), "android-no-backend");
+        assert!(super::service_unit_path().is_none());
+        assert!(super::render_service_unit().is_none());
+    }
+
     use super::*;
     use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use tirith_core::verdict::Action;
@@ -1249,6 +1297,7 @@ mod tests {
 
     #[test]
     fn analyze_as_paste_flags_aws_key() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = analyze_as_paste(
             "export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
@@ -1265,6 +1314,7 @@ mod tests {
 
     #[test]
     fn analyze_as_paste_allows_plain_text() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let v = analyze_as_paste(
             "hello world\nthis is just a note\n",
             tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
@@ -1312,6 +1362,7 @@ mod tests {
 
     #[test]
     fn redact_override_refuses_non_secret_blocking_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let input = "curl https://example.com/install.sh | bash";
         let verdict = prepare_redacted_copy(input, ShareAudience::Generic, &[])
             .expect_err("credential redaction must not waive a pipe-to-shell verdict");
@@ -1320,6 +1371,7 @@ mod tests {
 
     #[test]
     fn redact_override_allows_content_after_secret_is_removed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = "AKIAIOSFODNN7EXAMPLE";
         let (redacted, summary) = prepare_redacted_copy(
             &format!("AWS_ACCESS_KEY_ID={key}"),
@@ -1439,6 +1491,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn render_service_unit_emits_nonempty_payload() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("supported platform should render unit");
         assert!(!s.is_empty());
     }
@@ -1447,6 +1500,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_includes_label() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("macos should render unit");
         assert!(s.contains("sh.tirith.clipboard"));
         assert!(s.contains("clipboard"));
@@ -1458,6 +1512,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_service_unit_targets_graphical_session() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("linux should render unit");
         assert!(s.contains("graphical-session.target"));
         assert!(s.contains("ExecStart="));
@@ -1469,6 +1524,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_service_unit_logs_to_user_library() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let s = render_service_unit().expect("macos should render unit");
         assert!(
             !s.contains("/tmp/tirith-clipboard"),
@@ -1485,6 +1541,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn install_service_idempotency_matches_content() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Mirror the `needs_write` predicate used by `install_service`.
         let unit_content = render_service_unit().expect("unit");
         let tmp = tempfile::NamedTempFile::new().unwrap();

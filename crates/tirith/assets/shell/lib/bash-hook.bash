@@ -38,16 +38,42 @@ if [[ "$_TIRITH_BOOTSTRAP_WAS_POSIX" == "0" ]]; then
 fi
 unset _TIRITH_BOOTSTRAP_WAS_POSIX _TIRITH_BOOTSTRAP_POSIXLY_SET _TIRITH_BOOTSTRAP_POSIXLY_VALUE
 
+# Keep owned initialization state private even when the caller uses `set -a`.
+# Trusted builtin lookup has already been established above. Explicit public
+# exports below still work; automatic exporting is restored on every ordinary
+# source return. Bash3.2 has no function-local option restoration primitive.
+builtin unset _TIRITH_INIT_ALLEXPORT
+_TIRITH_INIT_ALLEXPORT=0
+if [[ $- == *a* ]]; then
+  builtin set +a
+  _TIRITH_INIT_ALLEXPORT=1
+fi
+builtin export -n _TIRITH_INIT_ALLEXPORT
+_tirith_restore_init_allexport() {
+  local _tirith_init_rc=$?
+  if [[ "${_TIRITH_INIT_ALLEXPORT:-0}" == 1 ]]; then
+    builtin unset _TIRITH_INIT_ALLEXPORT
+    builtin set -a
+  else
+    builtin unset _TIRITH_INIT_ALLEXPORT
+  fi
+  return "$_tirith_init_rc"
+}
+
 # Guard against double-loading (session-local only).
 # If inherited from environment (exported by attacker/parent), ignore it.
 if [[ -n "$_TIRITH_BASH_LOADED" ]]; then
   if [[ "$(declare -p _TIRITH_BASH_LOADED 2>/dev/null)" =~ ^declare\ -[a-zA-Z]*x ]]; then
     unset _TIRITH_BASH_LOADED  # Inherited from env — ignore and load fresh
   else
+    _tirith_restore_init_allexport
     return  # Set in this session — genuine double-source guard
   fi
 fi
 _TIRITH_BASH_LOADED=1
+
+# A fresh load must not retain an inherited or failed integration label.
+unset TIRITH_INTEGRATION_VERSION TIRITH_INTEGRATION_SHELL
 
 # Clear attacker-controllable env vars before any hooks are installed.
 # A pre-set value would be eval'd on the first prompt.
@@ -86,12 +112,15 @@ do
 done
 unset _tirith_inherited_state
 
-# Session tracking: generate ID per shell session if not inherited
-if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
-  builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
-    "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
-  export TIRITH_SESSION_ID
-fi
+# Each freshly loaded shell owns its session. Inherited IDs from a parent
+# shell or terminal multiplexer must not join independent receipt ledgers.
+# The double-source guard above preserves this ID in the same live shell;
+# ordinary child commands still inherit it for that shell's correlation.
+# This shell-built value is the fallback; once the executable is pinned below,
+# `tirith __session-id` replaces its random part with an unpredictable one.
+builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
+  "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
+export TIRITH_SESSION_ID
 
 # Pin the executable before any repository command can mutate PATH. Resolve
 # the containing directory with shell builtins so this security initialization
@@ -125,7 +154,16 @@ unset _tirith_resolved_bin _tirith_bin_name _tirith_bin_dir
 if [[ $- == *i* && ( -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ) ]]; then
   printf '%s\n' "tirith: executable not found; bash hooks disabled" >&2
   TIRITH_STATUS=off
+  _tirith_restore_init_allexport
   return
+fi
+if [[ -n "$_TIRITH_BIN" && -x "$_TIRITH_BIN" ]]; then
+  _tirith_session_suffix="$(builtin command "$_TIRITH_BIN" __session-id 2>/dev/null)" \
+    || _tirith_session_suffix=""
+  if [[ ${#_tirith_session_suffix} -eq 36 && "$_tirith_session_suffix" != *[^0-9a-f-]* ]]; then
+    builtin printf -v TIRITH_SESSION_ID '%x-%s' "$$" "$_tirith_session_suffix"
+  fi
+  unset _tirith_session_suffix
 fi
 
 # Stock macOS Bash 3.2 runs an external command inside `$(...)` from a subshell.
@@ -241,6 +279,8 @@ _tirith_close_pending_fd() {
 # fail closed.
 _tirith_read_single_capture_line() {
   local file="$1" line="" count=0 terminated=0 read_rc=0 byte_count="" expected_bytes=0
+  builtin export -n line
+  builtin unset _TIRITH_CAPTURE_LINE
   _TIRITH_CAPTURE_LINE=""
   _tirith_capture_file_is_private "$file" || return 1
   while :; do
@@ -271,6 +311,7 @@ _tirith_read_single_capture_line() {
 # unsupported rc/stdout combination. A recoverable token is exposed for cleanup.
 _tirith_parse_v3_receipt_response() {
   local file="$1" check_rc="$2" line_ok=0
+  builtin unset _TIRITH_PARSED_RECEIPT
   _TIRITH_PARSED_RECEIPT=""
   _tirith_capture_file_is_private "$file" || return 2
   if _tirith_read_single_capture_line "$file"; then
@@ -308,6 +349,8 @@ _tirith_check_command_syntax() {
 }
 
 _TIRITH_RECEIPT_PROTOCOL=0
+# Discard inherited export attributes before creating the private shell capability.
+unset _TIRITH_RECEIPT_INSTANCE _TIRITH_CAPTURE_LINE
 _TIRITH_RECEIPT_INSTANCE=""
 _TIRITH_RECEIPT_SHELL_PID="$$"
 _TIRITH_RECEIPT_FAMILY="bash"
@@ -321,6 +364,10 @@ _tirith_receipt_parent_context_is_valid() {
      && "$$" == "$_TIRITH_RECEIPT_SHELL_PID" ]]
 }
 
+# Registration output is a private capability, including when the caller
+# sources this file with xtrace enabled. Restore only that caller option.
+_TIRITH_REGISTER_TRACE=0
+if [[ $- == *x* ]]; then builtin set +x; _TIRITH_REGISTER_TRACE=1; fi
 _tirith_receipt_capture_file=""
 _tirith_receipt_error_file=""
 _TIRITH_RECEIPT_REGISTER_ERROR=""
@@ -355,6 +402,12 @@ if [[ $- == *i* ]]; then
     && _tirith_remove_capture_file "$_tirith_receipt_error_file" >/dev/null 2>&1
 fi
 unset _tirith_receipt_capture_file _tirith_receipt_error_file _TIRITH_CAPTURE_LINE
+if [[ $_TIRITH_REGISTER_TRACE == 1 ]]; then
+  unset _TIRITH_REGISTER_TRACE
+  builtin set -x
+else
+  unset _TIRITH_REGISTER_TRACE
+fi
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -392,58 +445,84 @@ _tirith_escape_preview() {
   printf '%q' "$1"
 }
 
-_tirith_receipt_discard() {
-  local channel="$1" token="$2"
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0
+# Restore an entry status without touching any secret-bearing argument.
+_tirith_trace_preserve_status() { return "$1"; }
+
+# Every hook entry point that can handle a secret runs its body untraced:
+#   name() {
+#     local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+#     _tirith_untraced_begin
+#     _tirith_untraced_run name_untraced "$@"
+#   }
+# The two helpers read and set those caller locals (Bash scoping is dynamic).
+# _tirith_untraced_begin takes no arguments, so xtrace is already off before
+# any argument is expanded on a traced line. _tirith_untraced_run hands the
+# body the caller's entry status, then restores xtrace and allexport.
+_tirith_untraced_begin() {
+  if [[ $- == *x* ]]; then
+    builtin set +x
+    _tirith_trace_was_on=1
+  fi
+  if [[ $- == *a* ]]; then builtin set +a; _tirith_allexport_was_on=1; fi
+}
+
+_tirith_untraced_run() {
+  if _tirith_trace_preserve_status "$_tirith_entry_status"; then
+    "$@"
+  else
+    "$@"
+  fi
+  _tirith_result=$?
+  [[ $_tirith_allexport_was_on == 1 ]] && builtin set -a
+  [[ $_tirith_trace_was_on == 1 ]] && builtin set -x
+  return "$_tirith_result"
+}
+
+# One protocol-v3 receipt operation (consume, discard or reconcile):
+#   _tirith_receipt_call <action> <channel> <token> [<exact command>]
+# The token, and consume's exact command, travel on an exact stdin pipe and
+# never in argv or the environment. A successful operation also retires the
+# receipt inside the same Tirith call, so no separate acknowledgement runs.
+_tirith_receipt_call_untraced() {
+  local action="$1" channel="$2" token="$3" command_text="${4:-}"
+  builtin export -n token command_text
+  case "$action" in
+    discard) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 0 ;;
+    reconcile) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 1 ;;
+    consume) [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" && -n "$command_text" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
   _tirith_receipt_parent_context_is_valid || return 1
   local input_fd rc
-  _tirith_open_exact_input_pipe "$token" || return 1
+  if [[ "$action" == consume ]]; then
+    _tirith_open_exact_input_pipe "$token"$'\n'"$command_text" || return 1
+  else
+    _tirith_open_exact_input_pipe "$token" || return 1
+  fi
   input_fd="$_TIRITH_OPENED_FD"
   unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt discard \
-    --channel "$channel" <&"$input_fd" >/dev/null 2>&1
+  if [[ "$action" == consume ]]; then
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+      _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+      _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt consume \
+      --channel "$channel" <&"$input_fd" >/dev/null
+  else
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+      _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+      _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt "$action" \
+      --channel "$channel" <&"$input_fd" >/dev/null 2>&1
+  fi
   rc=$?
   _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
   return "$rc"
 }
 
-_tirith_receipt_consume() {
-  local channel="$1" token="$2" command_text="$3"
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" && -n "$command_text" ]] || return 1
-  _tirith_receipt_parent_context_is_valid || return 1
-  local input_fd rc
-  _tirith_open_exact_input_pipe "$token"$'\n'"$command_text" || return 1
-  input_fd="$_TIRITH_OPENED_FD"
-  unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt consume \
-    --channel "$channel" <&"$input_fd" >/dev/null
-  rc=$?
-  _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
-  return "$rc"
-}
-
-_tirith_receipt_reconcile() {
-  local channel="$1" token="$2"
-  [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 && -n "$token" ]] || return 1
-  _tirith_receipt_parent_context_is_valid || return 1
-  local input_fd rc
-  _tirith_open_exact_input_pipe "$token" || return 1
-  input_fd="$_TIRITH_OPENED_FD"
-  unset _TIRITH_OPENED_FD
-  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_BASH_INTERNAL=1 builtin command "$_TIRITH_BIN" __execution-receipt reconcile \
-    --channel "$channel" <&"$input_fd" >/dev/null 2>&1
-  rc=$?
-  _tirith_close_pending_fd "$input_fd" 2>/dev/null || rc=1
-  return "$rc"
+_tirith_receipt_call() {
+  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_receipt_call_untraced "$@"
 }
 
 
@@ -556,7 +635,7 @@ _tirith_persist_safe_mode() {
 # cache then fails. Enter-mode delivery itself is a bash-build property — it
 # does not change with the tirith version — so the cache is keyed on bash, not
 # on tirith. (`tirith_version` is still recorded in the file for diagnostics.)
-_TIRITH_ENTER_CAP_SCHEMA=2
+_TIRITH_ENTER_CAP_SCHEMA=3
 _TIRITH_ENTER_CAP_FILE="$_TIRITH_STATE_DIR/bash-enter-capability"
 
 # Read the enter-mode capability cache and decide whether enter mode is proven
@@ -705,12 +784,15 @@ _tirith_normalize_spacing() {
 # (history_line). Quotes and comments are data, never evidence that a command
 # name appeared in executable syntax. This deliberately rejects ambiguous
 # compound syntax instead of authenticating an alias expansion from a token in
-# a comment, string, heredoc body, or unused argument.
+# a comment, string, heredoc body, or unused argument. A word-start `#` starts
+# a comment only while `interactive_comments` is on: with it off, Bash runs the
+# text after it (`echo hi #; cmd` runs `echo hi '#'` and then `cmd`).
 _tirith_cmd_is_in_line() {
   local needle="$1" haystack="$2"
   [[ -z "$needle" || -z "$haystack" ]] && return 1
   local n_needle n_haystack n_segment segment="" quote="" escaped=0 at_word_start=1
-  local i char next previous
+  local i char next previous comments=1
+  builtin shopt -q interactive_comments || comments=0
   n_needle="$(_tirith_normalize_spacing "$needle")"
   [[ -n "$n_needle" ]] || return 1
   n_haystack="$(_tirith_normalize_spacing "$haystack")"
@@ -755,7 +837,7 @@ _tirith_cmd_is_in_line() {
       "\\") segment+="$char"; escaped=1; at_word_start=0; continue ;;
       "'"|'"') segment+="$char"; quote="$char"; at_word_start=0; continue ;;
       '#')
-        if [[ $at_word_start -eq 1 ]]; then
+        if [[ $at_word_start -eq 1 && $comments -eq 1 ]]; then
           char=$'\n'
         else
           segment+="$char"
@@ -867,6 +949,7 @@ _tirith_debug_trampoline() {
   # arbitrary shell code and change the live BASH_COMMAND value before Tirith
   # gets control back.
   local _user_bash_command="$BASH_COMMAND"
+  builtin export -n _user_bash_command
   local _user_line_id="${BASH_LINENO[0]:-0}"
   # Structural execution depth, not a function-name allowlist. At a top-level
   # DEBUG fire this trampoline is the sole FUNCNAME frame; extdebug-inherited
@@ -1290,25 +1373,59 @@ _tirith_session_lost_debug_trap() {
   return 0
 }
 
-_tirith_preexec_receipt_check() {
+# bash runs the text after a word-start `#` when `interactive_comments` is off
+# (`shopt -u interactive_comments`; it is on by default): `echo hi #; cmd`
+# prints `hi #` and runs `cmd`. Sets the caller's `comment_reading` to 0 then,
+# so Tirith reads the line the way this shell runs it, and to 1 otherwise. Read
+# at every check, because `shopt` can change the option mid-session. Callers
+# pass it to the binary as `_TIRITH_INTERACTIVE_COMMENTS`, never as a flag: a
+# pinned binary older than this hook ignores the variable and keeps its own
+# reading, while it would reject an unknown flag (`paste`) or take it for the
+# checked command (`check`).
+_tirith_comment_reading() {
+  comment_reading=1
+  builtin shopt -q interactive_comments || comment_reading=0
+  builtin export -n comment_reading
+}
+
+_tirith_preexec_receipt_check_untraced() {
   local scan_target="$1" warn_only="$2"
+  builtin export -n scan_target
   _tirith_receipt_parent_context_is_valid || return 1
   local -a render_args
+  local comment_reading
   render_args=()
   [[ "$warn_only" == "yes" ]] && render_args=(--warn-only)
+  _tirith_comment_reading
   local stdout_file rc
   stdout_file="$(_tirith_new_capture_file 2>/dev/null)" || return 1
   [[ -n "$stdout_file" ]] || return 1
+  if [[ "$scan_target" == "_tirith_verification_probe "* ]]; then
+    local _tirith_verification_capture
+    builtin export -n _tirith_verification_capture
+    _tirith_verification_capture="$(_tirith_verification_state)"
+  _TIRITH_VERIFICATION_CAPTURE=1 _TIRITH_HOOK=1 _TIRITH_BASH_INTERNAL=1 \
+    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+    builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
+    --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
+    >|"$stdout_file" <<<"$_tirith_verification_capture"
+  else
   _TIRITH_HOOK=1 _TIRITH_BASH_INTERNAL=1 \
     _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
     _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
     _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
     builtin command "$_TIRITH_BIN" check --approval-check --execution-receipt bash-preexec \
     --non-interactive --interactive --shell posix "${render_args[@]}" -- "$scan_target" \
     >|"$stdout_file"
+  fi
   rc=$?
 
   local parse_rc token
+  builtin export -n token
   _tirith_parse_v3_receipt_response "$stdout_file" "$rc"
   parse_rc=$?
   token="$_TIRITH_PARSED_RECEIPT"
@@ -1318,14 +1435,20 @@ _tirith_preexec_receipt_check() {
     0) ;;
     1) return 1 ;;
     *)
-      _tirith_receipt_discard bash-preexec "$token"
+      _tirith_receipt_call discard bash-preexec "$token"
       return 1
       ;;
   esac
-  if ! _tirith_receipt_consume bash-preexec "$token" "$scan_target"; then
-    _tirith_receipt_reconcile bash-preexec "$token" || return 1
+  if ! _tirith_receipt_call consume bash-preexec "$token" "$scan_target"; then
+    _tirith_receipt_call reconcile bash-preexec "$token" || return 1
   fi
   return 0
+}
+
+_tirith_preexec_receipt_check() {
+  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_preexec_receipt_check_untraced "$@"
 }
 
 
@@ -1359,6 +1482,7 @@ _tirith_preexec_block_current_line() {
 _tirith_preexec() {
   [[ "${_TIRITH_BASH_INTERNAL:-0}" == "1" ]] && return 0
   local bash_cmd="${3:-$BASH_COMMAND}"
+  builtin export -n bash_cmd
   local entry history_index="" history_line=""
   # Startup and bracketed prompt callbacks never inspect a typed history line.
   # Avoid two command-substitution forks on every automatic DEBUG fire. Keep
@@ -1370,6 +1494,7 @@ _tirith_preexec() {
       if entry="$(_tirith_read_history_entry)"; then
         history_index="${entry%%|*}"
         history_line="${entry#*|}"
+        builtin export -n entry history_line
       fi
       ;;
   esac
@@ -1528,6 +1653,7 @@ _tirith_preexec() {
     # allow verdict. A real re-submission gets a new history index (enforcement
     # already rejects ignoredups/ignoreboth), so it is checked afresh.
     local history_key="${history_index}|${history_line}"
+    builtin export -n history_key
     if [[ -n "${_TIRITH_PREEXEC_BLOCK_HISTORY_KEY:-}" ]]; then
       if [[ "$_TIRITH_PREEXEC_BLOCK_HISTORY_KEY" == "$history_key" ]]; then
         _tirith_last_key="$line_id"
@@ -1550,7 +1676,10 @@ _tirith_preexec() {
       _tirith_preexec_receipt_check "$history_line" no
       rc=$?
     else
-      _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix -- "$history_line"
+      local comment_reading
+      _tirith_comment_reading
+      _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --shell posix -- "$history_line"
       rc=$?
     fi
     _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
@@ -1566,6 +1695,7 @@ _tirith_preexec() {
         _tirith_last_key="$line_id"
         _tirith_last_rc=1
         _TIRITH_PREEXEC_BLOCK_HISTORY_KEY="$history_key"
+        builtin export -n _TIRITH_PREEXEC_BLOCK_HISTORY_KEY
         _tirith_preexec_block_current_line
         return $?
         ;;
@@ -1573,6 +1703,7 @@ _tirith_preexec() {
         _tirith_last_key="$line_id"
         _tirith_last_rc=1
         _TIRITH_PREEXEC_BLOCK_HISTORY_KEY="$history_key"
+        builtin export -n _TIRITH_PREEXEC_BLOCK_HISTORY_KEY
         _tirith_preexec_block_current_line \
           "tirith: preexec enforcement failed unexpectedly (exit $rc), blocking this command and disabling enforcement for this shell"
         return $?
@@ -1610,14 +1741,19 @@ _tirith_preexec() {
   # the scan target so identical commands on separate prompts each get a
   # fresh DETECTED banner — the prompt boundary advances line_id and
   # naturally invalidates the dedupe.
+  builtin export -n scan_target
   local dedupe_key="${line_id}|${scan_target}"
+  builtin export -n dedupe_key
   if [[ "${_tirith_last_cmd:-}" == "$dedupe_key" ]]; then
     _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
     return 0
   fi
   _tirith_last_cmd="$dedupe_key"
+  builtin export -n _tirith_last_cmd
 
   _TIRITH_BASH_INTERNAL=1
+  local comment_reading
+  _tirith_comment_reading
   if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 \
         && "${_TIRITH_PREEXEC_RECEIPTS_TRUSTED:-0}" == "1" ]]; then
     if _tirith_receipt_parent_context_is_valid; then
@@ -1628,7 +1764,8 @@ _tirith_preexec() {
         # in warn-only mode, which makes the scan the only thing this mode
         # offers. Run it plainly, and say once that execution evidence for this
         # shell is no longer strict.
-        _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
+        _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+          builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
         if [[ -z "${_TIRITH_RECEIPT_DEGRADE_WARNED:-}" ]]; then
           _TIRITH_RECEIPT_DEGRADE_WARNED=1
           _tirith_output "tirith: execution receipts unavailable; legacy checks remain active but session execution evidence is degraded"
@@ -1640,10 +1777,12 @@ _tirith_preexec() {
       # A functrace-inherited DEBUG trap may run in a Bash subshell where `$$`
       # still names the registered top-level shell. Do not make a false strict
       # receipt claim there; retain the mode's honest warn-only scan instead.
-      _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
+      _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
     fi
   else
-    _TIRITH_HOOK=1 builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
+    _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+      builtin command "$_TIRITH_BIN" check --shell posix --warn-only -- "$scan_target" || true
   fi
   _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
   _TIRITH_PREEXEC_ACTIVE_DECISION="allow"
@@ -1851,25 +1990,29 @@ _tirith_degrade_to_preexec() {
 }
 
 
-_tirith_prompt_hook() {
+_tirith_prompt_hook_untraced() {
   # Re-disarm the guarded accept-line every prompt. Arming leaves it bound to
   # accept-line until this runs, so disarming here closes the window in which
   # an injected accept sequence could accept a line the checker never approved.
   if declare -F _tirith_enter_disarm_accept >/dev/null 2>&1; then
     if ! _tirith_enter_disarm_accept; then
       local failed_pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
+      builtin export -n failed_pending_receipt
       unset _TIRITH_PENDING_EVAL
       unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
       if [[ -n "$failed_pending_receipt" ]]; then
-        _tirith_receipt_discard bash-enter "$failed_pending_receipt" || true
+        _tirith_receipt_call discard bash-enter "$failed_pending_receipt" || true
       fi
       _tirith_degrade_to_preexec "could not disarm guarded accept-line" || true
       return
     fi
   fi
   local pending_eval="${_TIRITH_PENDING_EVAL:-}"
+  builtin export -n pending_eval
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
+  builtin export -n pending_receipt
   local pending_command="${_TIRITH_PENDING_COMMAND:-}"
+  builtin export -n pending_command
   unset _TIRITH_PENDING_EVAL
   unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
 
@@ -1878,12 +2021,12 @@ _tirith_prompt_hook() {
           || -z "$pending_eval" \
           || -z "$pending_command" \
           || "$pending_eval" != "$pending_command" ]]; then
-      _tirith_receipt_discard bash-enter "$pending_receipt" || true
+      _tirith_receipt_call discard bash-enter "$pending_receipt" || true
       _tirith_degrade_to_preexec "deferred command state did not match its receipt"
       return 1
     fi
-    if ! _tirith_receipt_consume bash-enter "$pending_receipt" "$pending_command"; then
-      if ! _tirith_receipt_reconcile bash-enter "$pending_receipt"; then
+    if ! _tirith_receipt_call consume bash-enter "$pending_receipt" "$pending_command"; then
+      if ! _tirith_receipt_call reconcile bash-enter "$pending_receipt"; then
         _tirith_degrade_to_preexec "execution receipt could not be committed before delivery"
         return 1
       fi
@@ -1895,8 +2038,22 @@ _tirith_prompt_hook() {
   fi
 
   if [[ -n "$pending_eval" ]]; then
+    # This is user command execution, outside the private receipt operation.
+    # Restore its original ALLEXPORT before evaluation, and do not overwrite
+    # an intentional `set +a`/`set -a` performed by the delivered command.
+    pending_receipt=""
+    if [[ "${_tirith_allexport_was_on:-0}" == 1 ]]; then
+      _tirith_allexport_was_on=0
+      builtin set -a
+    fi
     builtin eval -- "$pending_eval"
   fi
+}
+
+_tirith_prompt_hook() {
+  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_prompt_hook_untraced "$@"
 }
 
 _tirith_is_prompt_hook_attached() {
@@ -2200,7 +2357,7 @@ _tirith_queue_enter_delivery() {
   # command can still be put visibly into Readline for a safe retry.
   if ! _tirith_enter_arm_accept; then
     unset _TIRITH_PENDING_EVAL _TIRITH_PENDING_COMMAND _TIRITH_PENDING_RECEIPT
-    _tirith_receipt_discard bash-enter "$receipt_token" || true
+    _tirith_receipt_call discard bash-enter "$receipt_token" || true
     READLINE_LINE="$cmd"
     READLINE_POINT=${#cmd}
     _tirith_degrade_to_preexec "could not arm guarded accept-line" || true
@@ -2255,7 +2412,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
   if ! _tirith_ensure_prompt_hook; then
     _tirith_degrade_to_preexec "PROMPT_COMMAND is readonly or unattachable"
   else
-    _tirith_enter() {
+    _tirith_enter_untraced() {
       # Save terminal state — bind -x can corrupt echo in some PTY environments (gcloud ssh, etc.)
       local _saved_stty
       if [[ -n "$_TIRITH_STTY_BIN" ]]; then
@@ -2275,7 +2432,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -n "${_TIRITH_PENDING_EVAL:-}" \
             || -n "${_TIRITH_PENDING_COMMAND:-}" \
             || -n "${_TIRITH_PENDING_RECEIPT:-}" ]]; then
-        _tirith_receipt_discard bash-enter "${_TIRITH_PENDING_RECEIPT:-}"
+        _tirith_receipt_call discard bash-enter "${_TIRITH_PENDING_RECEIPT:-}"
         unset _TIRITH_PENDING_EVAL
         unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
         _tirith_degrade_to_preexec "previous command not delivered (check shell history)"
@@ -2314,27 +2471,46 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
       if [[ -z "$errfile" || -z "$stdout_file" ]]; then
         [[ -n "$errfile" ]] && _tirith_remove_capture_file "$errfile" >/dev/null 2>&1
         [[ -n "$stdout_file" ]] && _tirith_remove_capture_file "$stdout_file" >/dev/null 2>&1
+        _tirith_output "tirith: recovery: open a separate terminal with bash --noprofile --norc, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
         _tirith_degrade_to_preexec "could not create private receipt capture files"
         return
       fi
       local approval_path="" warn_ack_path="" receipt_token=""
+      builtin export -n receipt_token
       local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
       _TIRITH_BASH_INTERNAL=1
       local -a receipt_args
+      local comment_reading
       receipt_args=()
       [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]] && receipt_args=(--execution-receipt bash-enter)
+      _tirith_comment_reading
+      if [[ "$READLINE_LINE" == "_tirith_verification_probe "* ]]; then
+        local _tirith_verification_capture
+        builtin export -n _tirith_verification_capture
+        _tirith_verification_capture="$(_tirith_verification_state)"
+      _TIRITH_VERIFICATION_CAPTURE=1 _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
+        "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile" <<<"$_tirith_verification_capture"
+      else
       _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
         _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
         _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
         builtin command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
         "${receipt_args[@]}" -- "$READLINE_LINE" >|"$stdout_file" 2>|"$errfile"
+      fi
       rc=$?
       _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
       local output
+      builtin export -n output
       output=$(<"$errfile")
       _tirith_remove_capture_file "$errfile" >/dev/null 2>&1
 
       local receipt_lines=0 path_lines=0 malformed_stdout=0 line
+      builtin export -n line
       if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
         local protocol_parse_rc
         _tirith_parse_v3_receipt_response "$stdout_file" "$rc"
@@ -2368,7 +2544,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
             _tirith_output ""
             _tirith_output "command> $escaped_line"
             [[ -n "$output" ]] && _tirith_output "$output"
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             _tirith_degrade_to_preexec "invalid protocol-v3 execution-receipt response (exit $rc)"
             return
             ;;
@@ -2426,7 +2602,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           [[ -n "$output" ]] && _tirith_output "$output"
           [[ -n "$approval_path" ]] && _tirith_remove_capture_file "$approval_path" >/dev/null 2>&1
           [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-          _tirith_receipt_discard bash-enter "$receipt_token"
+          _tirith_receipt_call discard bash-enter "$receipt_token"
           _tirith_degrade_to_preexec "tirith returned unexpected exit code $rc"
           return  # READLINE_LINE preserved for re-execution via preexec
         fi
@@ -2463,7 +2639,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
                 *)
                   _tirith_output "tirith: approval not granted — fallback: block"
                   [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-                  _tirith_receipt_discard bash-enter "$receipt_token"
+                  _tirith_receipt_call discard bash-enter "$receipt_token"
                   READLINE_LINE=""
                   READLINE_POINT=0
                   return
@@ -2473,14 +2649,14 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
           elif [[ $rc -eq 1 ]]; then
             # Approval not required but command was blocked: honor block
             [[ -n "$warn_ack_path" ]] && _tirith_remove_capture_file "$warn_ack_path" >/dev/null 2>&1
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             READLINE_LINE=""
             READLINE_POINT=0
             return
           fi
         elif [[ $rc -eq 1 ]]; then
           # No approval file: honor block
-          _tirith_receipt_discard bash-enter "$receipt_token"
+          _tirith_receipt_call discard bash-enter "$receipt_token"
           READLINE_LINE=""
           READLINE_POINT=0
           return
@@ -2489,7 +2665,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         # Warn-ack workflow (exit code 3): strict_warn requires explicit acknowledgement
         if [[ $rc -eq 3 && -n "$warn_ack_path" ]]; then
           if ! _tirith_parse_warn_ack "$warn_ack_path"; then
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             _tirith_output "tirith: warning acknowledgement metadata is invalid; command blocked"
             READLINE_LINE=""
             READLINE_POINT=0
@@ -2501,7 +2677,7 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
             warn_acknowledged="yes"
           else
             _tirith_output "tirith: warnings not acknowledged — command blocked"
-            _tirith_receipt_discard bash-enter "$receipt_token"
+            _tirith_receipt_call discard bash-enter "$receipt_token"
             READLINE_LINE=""
             READLINE_POINT=0
             return
@@ -2525,6 +2701,12 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
 
       _tirith_queue_enter_delivery "$cmd" "$receipt_token"
       return $?
+    }
+
+    _tirith_enter() {
+      local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+      _tirith_untraced_begin
+      _tirith_untraced_run _tirith_enter_untraced "$@"
     }
 
     # Bracketed paste interception
@@ -2554,11 +2736,15 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
         local tmpfile
         tmpfile="$(_tirith_new_capture_file 2>/dev/null)" || {
           _tirith_output "tirith: paste check failed (could not create private output capture)"
+          _tirith_output "tirith: recovery: open a separate terminal with bash --noprofile --norc, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
           return
         }
         local _tirith_prev_internal="${_TIRITH_BASH_INTERNAL:-0}"
         _TIRITH_BASH_INTERNAL=1
-        printf '%s' "$pasted" | builtin command "$_TIRITH_BIN" paste --shell posix --interactive >|"$tmpfile" 2>&1
+        local comment_reading
+        _tirith_comment_reading
+        printf '%s' "$pasted" | _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+          builtin command "$_TIRITH_BIN" paste --shell posix --interactive >|"$tmpfile" 2>&1
         local rc=$?
         _TIRITH_BASH_INTERNAL="$_tirith_prev_internal"
         local output=$(<"$tmpfile")
@@ -2653,20 +2839,27 @@ if [[ "$_TIRITH_BASH_MODE" == "enter" ]] && [[ $- == *i* ]]; then
 fi
 
 # Exit summary: show session warnings on shell exit
-_tirith_exit_summary() {
+_tirith_exit_summary_untraced() {
   _tirith_discard_pending_debug_trap_capture
   if _tirith_capture_file_is_private "${_TIRITH_DEBUG_OWNERSHIP_FILE:-}"; then
     _tirith_remove_capture_file "$_TIRITH_DEBUG_OWNERSHIP_FILE" >/dev/null 2>&1 || true
   fi
   _TIRITH_DEBUG_OWNERSHIP_FILE=""
   local pending_receipt="${_TIRITH_PENDING_RECEIPT:-}"
+  builtin export -n pending_receipt
   unset _TIRITH_PENDING_EVAL
   unset _TIRITH_PENDING_RECEIPT _TIRITH_PENDING_COMMAND
-  [[ -n "$pending_receipt" ]] && _tirith_receipt_discard bash-enter "$pending_receipt"
+  [[ -n "$pending_receipt" ]] && _tirith_receipt_call discard bash-enter "$pending_receipt"
   [[ -n "${TIRITH_SESSION_ID:-}" ]] || return
   local _sd="${XDG_STATE_HOME:-$HOME/.local/state}/tirith"
   [[ -f "$_sd/sessions/$TIRITH_SESSION_ID.json" ]] || return
   builtin command "$_TIRITH_BIN" warnings --summary
+}
+
+_tirith_exit_summary() {
+  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_exit_summary_untraced "$@"
 }
 
 _tirith_exit_trampoline() {
@@ -2692,6 +2885,76 @@ unset _tirith_prev_exit_spec _TIRITH_EXTRACTED_TRAP
 # shell can accept another user command. Enter mode leaves DEBUG untouched;
 # its runtime fallback installs the same prompt bootstrap on demand.
 
+# A bounded in-memory fingerprint is sampled only for explicit diagnostic
+# probes. Include this helper and the sampler themselves so redefinition is
+# detected, alongside native interception/binding state. Never emit capabilities.
+_tirith_verification_state() {
+  local _tirith_function_name
+  builtin printf 'tirith-loaded-shell-v1\n'
+  for _tirith_function_name in $(builtin compgen -A function _tirith_); do
+    builtin declare -f "$_tirith_function_name"
+  done
+  builtin declare -p PROMPT_COMMAND 2>/dev/null || builtin printf 'PROMPT_COMMAND absent\n'
+  builtin trap -p DEBUG
+  # Prompt-level capture observes the real caller trap even on Bash versions
+  # where function/subshell queries hide a non-inherited DEBUG handler.
+  builtin printf 'debug-ready=%s installed=%s ownership=%s captured=%s\n' \
+    "${_TIRITH_DEBUG_TRAP_CAPTURE_READY:-0}" "${_TIRITH_DEBUG_TRAP_INSTALLED:-0}" \
+    "${_TIRITH_DEBUG_TRAP_OWNERSHIP_OK:-0}" "${_TIRITH_CAPTURED_DEBUG_TRAP_SPEC:-}"
+  builtin shopt -p extdebug 2>/dev/null
+  [[ -o functrace ]] && builtin printf 'functrace=on\n' || builtin printf 'functrace=off\n'
+  builtin bind -m emacs-standard -s 2>/dev/null
+  builtin bind -m emacs-standard -X 2>/dev/null
+  builtin bind -m vi-insertion -s 2>/dev/null
+  builtin bind -m vi-insertion -X 2>/dev/null
+  builtin bind -m vi-command -s 2>/dev/null
+  builtin bind -m vi-command -X 2>/dev/null
+  builtin printf 'mode=%s protection=%s protocol=%s enforce=%s bypass=%s\n' \
+    "${_TIRITH_BASH_MODE:-unknown}" "${TIRITH_BASH_EFFECTIVE_PROTECTION:-unknown}" \
+    "${_TIRITH_RECEIPT_PROTOCOL:-0}" "${_TIRITH_PREEXEC_ENFORCE:-0}" "${TIRITH:-1}"
+}
+
+_tirith_verification_probe_untraced() {
+  local _TIRITH_BASH_INTERNAL=1
+  local _tirith_action _tirith_id _tirith_channel _tirith_state
+  builtin export -n _tirith_state
+  if [[ "$#" -eq 1 && "$1" == start ]]; then
+    _tirith_action=start
+    _tirith_id=""
+  elif [[ "$#" -eq 2 && "$2" =~ ^(allowed|blocked|status)$ ]]; then
+    _tirith_id="$1"
+    _tirith_action="$2"
+  else
+    builtin printf '%s\n' 'tirith: use _tirith_verification_probe start, then its exact challenge commands' >&2
+    return 2
+  fi
+  if [[ "${_TIRITH_RECEIPT_PROTOCOL:-0}" != 3 ]]; then
+    builtin printf '%s\n' 'tirith: authenticated shell verification requires the current protocol-v3 hook' >&2
+    return 1
+  fi
+  _tirith_channel=bash-preexec
+  [[ "${_TIRITH_BASH_MODE:-}" == enter ]] && _tirith_channel=bash-enter
+  _tirith_state="$(_tirith_verification_state)" || return 1
+  local -a _tirith_id_args=()
+  [[ -n "$_tirith_id" ]] && _tirith_id_args=(--id "$_tirith_id")
+  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    builtin command "$_TIRITH_BIN" __shell-verification "$_tirith_action" \
+    --channel "$_tirith_channel" "${_tirith_id_args[@]}" <<<"$_tirith_state"
+}
+
+_tirith_verification_probe() {
+  local _tirith_entry_status=$? _tirith_trace_was_on=0 _tirith_allexport_was_on=0 _tirith_result
+  _tirith_untraced_begin
+  _tirith_untraced_run _tirith_verification_probe_untraced "$@"
+}
+
+# Report loaded code only after this fresh initialization reaches installation.
+if [[ $- == *i* ]]; then
+  export TIRITH_INTEGRATION_VERSION="${_TIRITH_INIT_VERSION:-unknown}" TIRITH_INTEGRATION_SHELL=bash
+fi
+
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded
 # hook copy; `tirith output wrap on` writes an active copy of the function
@@ -2709,6 +2972,7 @@ unset _tirith_prev_exit_spec _TIRITH_EXTRACTED_TRAP
 #   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
 # }
 # alias tirith-out='tirith-output-guard-wrap'
+_tirith_restore_init_allexport
 else
   # A readonly or otherwise hostile POSIXLY_CORRECT can deny the only
   # grammar-level path to trusted builtin lookup. Skip the entire hook body and

@@ -472,6 +472,7 @@ mod tests {
 
     #[test]
     fn provenance_of_missing_file_is_neutral() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("does-not-exist");
         let prov = provenance_of(&p);
@@ -483,6 +484,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recently_modified_binary_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("payload");
         mkexec(&p, 0o755);
@@ -502,6 +504,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn world_writable_binary_fires_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("loose");
         mkexec(&p, 0o757); // world-writable + world-exec
@@ -514,6 +517,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_world_writable_recent_binary_does_not_fire_world_writable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("ok");
         mkexec(&p, 0o755);
@@ -550,6 +554,7 @@ mod tests {
 
     #[test]
     fn match_package_owner_recognizes_nix_store() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let owner = match_package_owner(Path::new("/nix/store/abc-foo/bin/foo"));
         // Canonicalize falls back to the literal path, so the prefix match holds
         // even when /nix/store is absent.
@@ -559,6 +564,7 @@ mod tests {
 
     #[test]
     fn match_package_owner_none_for_random_path() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let owner = match_package_owner(Path::new("/some/random/place/bin/foo"));
         assert!(owner.is_none());
     }

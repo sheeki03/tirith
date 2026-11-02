@@ -184,6 +184,16 @@ pub enum RuleId {
     ThreatCisaKev,
     ThreatSuspiciousPackage,
     ThreatSafeBrowsing,
+    /// A runtime package lookup (OSV.dev, deps.dev) for a package the command
+    /// installs could not be completed: skipped by offline mode with no cached
+    /// answer, out of time, or the registry/API was unreachable or answered
+    /// badly. Incomplete verification of one package, not evidence that it is
+    /// malicious, so it is Medium (a warning, never a block by default) and has
+    /// its own id: `analysis_incomplete` stays the High "this command's
+    /// structure could not be analyzed" finding, and a policy can treat the two
+    /// differently (the strict profile blocks both). Emitted by
+    /// `threatdb_api` after the engine, so it has no PATTERN_TABLE entry.
+    PackageLookupIncomplete,
 
     // Package reputation rules (M6 ch6) — emitted by package_risk /
     // install_txn / ecosystem_scan from the registry-API path. Tier-1 attaches
@@ -875,19 +885,19 @@ pub enum RuleId {
     /// path-traversal wheel). Triggered by artifact inspection, not a PATTERN_TABLE string,
     /// so it lives in `EXTERNALLY_TRIGGERED_RULES` with no fixture. High severity.
     WheelStructurallyRejected,
-    /// D3: the bytes the package firewall is about to inspect/install do NOT hash
-    /// to the digest the resolver pinned and the quarantine recorded (MITRE T1565
-    /// data manipulation). The firewall operates only on content-addressed
-    /// quarantine blobs and RE-HASHES each one immediately before evaluation
-    /// (cross-cutting invariant 4, the TOCTOU re-bind); if the on-disk blob is
-    /// absent, unreadable, or hashes to anything other than the approved digest,
-    /// the approved bytes are gone and installing would run unapproved content, so
-    /// this fires and the enforcing surface fails closed. DISTINCT from
+    /// D3: fired when the bytes the removed pip package firewall was about to
+    /// inspect/install did NOT hash to the digest the resolver pinned and the
+    /// quarantine recorded (MITRE T1565 data manipulation). That firewall
+    /// operated only on content-addressed quarantine blobs and RE-HASHED each one
+    /// immediately before evaluation (cross-cutting invariant 4, the TOCTOU
+    /// re-bind); if the on-disk blob was absent, unreadable, or hashed to anything
+    /// other than the approved digest, this fired and the install failed closed. DISTINCT from
     /// [`Self::ArtifactKnownMalicious`], which is a POSITIVE threat-DB match on a
     /// known-malicious hash: this is an integrity failure (the bytes are not the
-    /// approved bytes), not a reputation hit. Produced by
-    /// `crate::artifact::firewall`, not from a command/paste fixture, so it has no
-    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`. Critical
+    /// approved bytes), not a reputation hit. It was produced only by the removed
+    /// pip package firewall, never from a command/paste fixture, so it has no
+    /// PATTERN_TABLE entry and lives in `EXTERNALLY_TRIGGERED_RULES`; the id stays
+    /// so policies and audit readers that name it keep parsing. Critical
     /// severity (whence the action is Block).
     ArtifactDownloadIntegrityMismatch,
     /// F2: a local release differential between two versions of the SAME
@@ -1176,7 +1186,7 @@ pub(crate) enum OutputDataOperation {
     Stealth,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Evidence {
     Url {
@@ -1902,8 +1912,40 @@ pub(crate) fn internal_web3_evidence(evidence: &Evidence) -> Option<InternalWeb3
     }
 }
 
+/// Re-point the extraction index of an internal Web3 evidence record (see
+/// [`internal_web3_evidence`]) at `map(index)`, or at no URL when `map` has
+/// none. Other evidence is left alone. Used when the findings of one
+/// analysis join another analysis's extracted-URL list.
+pub(crate) fn remap_web3_extraction_index(
+    evidence: &mut Evidence,
+    map: impl Fn(usize) -> Option<usize>,
+) {
+    let Some(
+        InternalWeb3Evidence::Endpoint {
+            extraction_index: Some(index),
+        }
+        | InternalWeb3Evidence::Address {
+            extraction_index: Some(index),
+        },
+    ) = internal_web3_evidence(evidence)
+    else {
+        return;
+    };
+    let Evidence::Text { detail } = evidence else {
+        return;
+    };
+    let Some(token_start) = detail.find(";index=").map(|at| at + ";index=".len()) else {
+        return;
+    };
+    let token_end = detail[token_start..]
+        .find(';')
+        .map_or(detail.len(), |offset| token_start + offset);
+    let token = map(index).map_or_else(|| "none".to_string(), |index| index.to_string());
+    detail.replace_range(token_start..token_end, &token);
+}
+
 /// A suspicious character with its position and details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SuspiciousChar {
     /// Byte offset in the string
     pub offset: usize,
@@ -2248,7 +2290,10 @@ pub fn retained_finding_indices_for_output(findings: &[Finding]) -> Vec<usize> {
                 0 => finding.severity == Severity::Critical,
                 _ => {
                     finding.severity == Severity::High
-                        || finding.rule_id == RuleId::AnalysisIncomplete
+                        || matches!(
+                            finding.rule_id,
+                            RuleId::AnalysisIncomplete | RuleId::PackageLookupIncomplete
+                        )
                 }
             };
             if matches_priority && !selected[index] {
@@ -2296,6 +2341,11 @@ pub fn bound_json_value_for_output(value: serde_json::Value) -> serde_json::Valu
     if let Some(object) = value.as_object() {
         for key in [
             "action",
+            "requires_approval",
+            "approval_timeout_secs",
+            "approval_fallback",
+            "approval_rule",
+            "approval_description",
             "status",
             "kind",
             "event",
@@ -3089,6 +3139,34 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web3_extraction_indexes_remap_and_other_evidence_is_untouched() {
+        let mut address = web3_address_evidence(Some(3));
+        remap_web3_extraction_index(&mut address, |index| (index == 3).then_some(12));
+        assert_eq!(
+            internal_web3_evidence(&address),
+            Some(InternalWeb3Evidence::Address {
+                extraction_index: Some(12)
+            })
+        );
+        remap_web3_extraction_index(&mut address, |_| None);
+        assert_eq!(
+            internal_web3_evidence(&address),
+            Some(InternalWeb3Evidence::Address {
+                extraction_index: None
+            })
+        );
+        let mut url = Evidence::Url {
+            raw: "https://example.com/;index=3".to_string(),
+        };
+        remap_web3_extraction_index(&mut url, |_| Some(9));
+        assert!(
+            url == Evidence::Url {
+                raw: "https://example.com/;index=3".to_string(),
+            }
+        );
+    }
 
     fn assert_secret_free_projection(label: &str, projection: &str, secret: &str) {
         assert!(!projection.contains(secret), "{label}: {projection}");

@@ -1,8 +1,27 @@
 # Uninstall
 
+Removing files in your home directory needs no administrator privileges.
+System packages, a root-owned approval helper, and its system keyring require
+administrator privileges. The examples use `sudo` for those operations;
+omit it when already in a root session. You do not need to install `sudo`
+to remove Tirith. See [installation privileges](install-privileges.md) for
+the requirements of each distribution channel.
+
 ## Remove shell hook
 
-Remove the `tirith init` hook line from your shell config:
+Before deleting the binary, review and remove Tirith-owned startup blocks:
+
+```sh
+tirith setup shell --shell zsh --remove --dry-run
+tirith setup shell --shell zsh --remove
+```
+
+Select the shell you configured (`bash`, `zsh`, `fish`, `nushell`, `powershell`
+or `pwsh`). The shared resolver accounts for custom shell roots. Managed removal
+preserves manually added lines and unrelated settings; remove your own
+`tirith init` line separately. The paths below are common defaults, not a list
+that overrides `ZDOTDIR`, XDG paths or the actual PowerShell profile:
+
 
 | Shell | Config file |
 |-------|-------------|
@@ -10,6 +29,10 @@ Remove the `tirith init` hook line from your shell config:
 | bash | `~/.bashrc` |
 | fish | `~/.config/fish/config.fish` |
 | PowerShell | `$PROFILE` |
+| Nushell | `$nu.config-path` |
+
+Open a fresh terminal after removal so the old loaded hook is no longer active.
+Stop any Tirith service you started before deleting its executable or state.
 
 ## Remove AI-agent integrations
 
@@ -75,6 +98,12 @@ sudo dnf remove tirith
 ### Shell script install
 ```sh
 rm ~/.local/bin/tirith
+```
+
+If you enabled the optional package-approval helper, remove it from an
+administrator session after all installations using it have been removed:
+
+```sh
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous
 sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.absent
@@ -116,27 +145,46 @@ sudo rm -f /usr/local/libexec/tirith-package-approval-authority.tirith-previous.
 
 ## Remove data
 
-tirith stores data in XDG-compliant directories:
+Uninstalling the binary does not delete policy, exceptions, history, private
+operation journals, support bundles or retained recovery files. Review and
+export anything you need before deletion; deleting recovery state removes its
+status/retry/undo information. Close services and remove integrations first.
+
+Linux and macOS use XDG locations. With no overrides, the directories are:
 
 ```sh
-# Remove config (policy, allowlist, blocklist)
-rm -rf ~/.config/tirith
+rm -rf ~/.config/tirith       # policy, exceptions and user settings
+rm -rf ~/.local/share/tirith  # audit log, receipts and materialized hooks
+rm -rf ~/.local/state/tirith  # operation/recovery state and support bundles
+rm -rf ~/.cache/tirith        # cached remote policy
+```
 
-# Remove data (audit log, receipts, materialized hooks, last_trigger)
-rm -rf ~/.local/share/tirith
+If `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` or `XDG_CACHE_HOME` is set, review the
+corresponding `tirith` subdirectory there instead. The current macOS CLI does
+not use `~/Library/Application Support/tirith` or `~/Library/Preferences/tirith`
+as these default stores. A separately configured audit log, downloaded bundle,
+export or binary rollback sidecar also remains at its chosen location; inspect
+those paths rather than deleting a shared parent directory.
 
-# Optional: remove native package-approval keys after all Tirith installs are gone
+On Windows, config and data use the Tirith directory under `%APPDATA%`. State
+uses `%USERPROFILE%\.local\state\tirith`, or the `tirith` subdirectory under
+`XDG_STATE_HOME` when configured. The remote-policy cache uses
+`%USERPROFILE%\.cache\tirith`, or the `tirith` subdirectory under
+`XDG_CACHE_HOME` when configured. `%LOCALAPPDATA%\tirith` can also contain the
+user installation; remove it only after reviewing the installation and paths.
+
+```powershell
+Remove-Item -Recurse "$env:APPDATA\tirith"
+Remove-Item -Recurse "$env:USERPROFILE\.local\state\tirith"
+Remove-Item -Recurse "$env:USERPROFILE\.cache\tirith"
+```
+
+Only after all installations using the shared native package-approval authority
+are gone, remove its system keyring from an administrator session:
+
+```sh
 sudo rm -rf /etc/tirith/package-approval
 ```
 
-On macOS:
-```sh
-rm -rf ~/Library/Application\ Support/tirith
-rm -rf ~/Library/Preferences/tirith
-```
-
-On Windows:
-```powershell
-Remove-Item -Recurse "$env:LOCALAPPDATA\tirith"
-Remove-Item -Recurse "$env:APPDATA\tirith"
-```
+Administrator privileges are only needed for protected system paths. Removing
+user-owned data does not require sudo.

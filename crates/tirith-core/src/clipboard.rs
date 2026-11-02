@@ -25,6 +25,58 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Android/Bionic shim for the `arboard` clipboard crate, which ships
+/// X11/Wayland/Windows/macOS backends only and has no Android implementation
+/// (see the `cfg(not(target_os = "android"))` gate in Cargo.toml). It presents
+/// exactly the surface `clipboard.rs` uses so the rest of this module compiles
+/// unchanged. Tirith has no Android clipboard backend, even when an optional
+/// display server is present. Every operation reports "no backend" through the
+/// existing degradation path, never fabricated clipboard content.
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+mod android_clipboard {
+    /// Mirrors `arboard::Clipboard` (the subsets this module calls).
+    pub struct Clipboard;
+
+    /// Mirrors `arboard::Error` for the variants/uses in this module.
+    pub enum Error {
+        ContentNotAvailable,
+        Other(String),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Error::ContentNotAvailable => write!(f, "content not available"),
+                Error::Other(s) => write!(f, "{s}"),
+            }
+        }
+    }
+
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            // Wording matches the keywords `classify_arboard_error` maps to
+            // `NoBackend` ("no display server"), so callers degrade identically.
+            Err(Error::Other(
+                "no display server backend compiled for Android clipboard access".into(),
+            ))
+        }
+
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            Err(Error::ContentNotAvailable)
+        }
+
+        pub fn set_text(&mut self, _s: String) -> Result<(), Error> {
+            Err(Error::Other("no clipboard backend on Android".into()))
+        }
+    }
+}
+
+/// On Android, resolve every `arboard::…` path in this module to the shim above;
+/// on all other targets this alias is compiled out and the real crate is used.
+#[cfg(target_os = "android")]
+use android_clipboard as arboard;
+
 /// Read cap for the companion `clipboard_source.json`; larger → unreadable
 /// (`None`) rather than buffered. Mirrors the incident-flag / command-card caps.
 /// Public so `tirith browser host` rejects a record whose serialized form would
@@ -124,23 +176,14 @@ pub fn source_file_nonempty() -> bool {
 /// Lowercase-hex SHA-256 of `bytes` — the single source of truth for the
 /// clipboard-content hash (Greptile R1 #6) so the record, the rule, and the CLI
 /// displays can never drift apart.
-pub fn content_sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
-}
+pub use crate::util::sha256_hex as content_sha256_hex;
 
 /// Failure modes for clipboard access. `NoBackend` is the soft-fail path —
 /// callers degrade (empty envelope, exit 0 in JSON mode), never panic.
 #[derive(Debug, Error)]
 pub enum ClipboardError {
-    /// No clipboard backend (Linux without X/Wayland, non-interactive Windows
-    /// session). Caller degrades gracefully.
+    /// No clipboard backend (Android, Linux without X/Wayland, non-interactive
+    /// Windows session). Caller degrades gracefully.
     #[error("no clipboard backend available (headless display server?)")]
     NoBackend,
 
@@ -208,6 +251,19 @@ mod tests {
         assert!(msg.contains("no clipboard backend"));
     }
 
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_clipboard_never_reports_empty_or_copied_content() {
+        assert!(matches!(
+            read_clipboard_text(),
+            Err(ClipboardError::NoBackend)
+        ));
+        assert!(matches!(
+            write_clipboard_text("test"),
+            Err(ClipboardError::NoBackend)
+        ));
+    }
+
     /// `Other` carries the upstream message through unchanged.
     #[test]
     fn other_passes_through_upstream_message() {
@@ -221,6 +277,7 @@ mod tests {
 
     #[test]
     fn source_record_roundtrips_from_disk() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         std::fs::write(
@@ -237,6 +294,7 @@ mod tests {
 
     #[test]
     fn source_record_optional_fields_default() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `#[serde(default)]` fields let a minimal/older record still parse.
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
@@ -252,6 +310,7 @@ mod tests {
 
     #[test]
     fn source_record_absent_is_none_not_panic() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         // File never created — fail-safe to None.
@@ -261,6 +320,7 @@ mod tests {
 
     #[test]
     fn source_record_malformed_is_none() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         std::fs::write(&path, b"this is not json").unwrap();
@@ -272,6 +332,7 @@ mod tests {
 
     #[test]
     fn source_file_nonempty_reflects_write() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("clipboard_source.json");
         assert!(!source_file_nonempty_at(&path));
@@ -281,6 +342,7 @@ mod tests {
 
     #[test]
     fn source_file_nonempty_rejects_a_directory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // CodeRabbit R7: a directory at the path (non-zero len() on some
         // filesystems) must NOT count as a non-empty record — the reader only
         // accepts a regular file, so the fast-path probe must too.

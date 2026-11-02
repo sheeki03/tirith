@@ -12,15 +12,27 @@ if [[ -n "$_TIRITH_ZSH_LOADED" ]]; then
     return  # Set in this session — genuine double-source guard
   fi
 fi
+# A source-level always scope restores the caller option on early return and
+# interrupt as well as success. Explicit public exports remain intentional.
+builtin unset _TIRITH_INIT_ALLEXPORT
+_TIRITH_INIT_ALLEXPORT="${options[allexport]}"
+{
+builtin unsetopt allexport
+builtin typeset +x _TIRITH_INIT_ALLEXPORT
 _TIRITH_ZSH_LOADED=1
 
-# Session tracking: generate ID per shell session if not inherited
-if [[ -z "${TIRITH_SESSION_ID:-}" ]]; then
-  builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
-    "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
-  export TIRITH_SESSION_ID
-fi
+# A fresh load must not retain an inherited or failed integration label.
+unset TIRITH_INTEGRATION_VERSION TIRITH_INTEGRATION_SHELL
 
+# Each freshly loaded shell owns its session. Inherited IDs from a parent
+# shell or terminal multiplexer must not join independent receipt ledgers.
+# The double-source guard above preserves this ID in the same live shell;
+# ordinary child commands still inherit it for that shell's correlation.
+# This shell-built value is the fallback; once the executable is pinned below,
+# `tirith __session-id` replaces its random part with an unpredictable one.
+builtin printf -v TIRITH_SESSION_ID '%x-%x-%x-%x' \
+  "$$" "${SECONDS:-0}" "${RANDOM:-0}" "${RANDOM:-0}"
+export TIRITH_SESSION_ID
 # Pin the executable before any repository command can mutate PATH. All hook
 # callbacks use this absolute path for the lifetime of the shell session.
 if [[ "$#" -eq 2 && "$1" == "--tirith-executable" ]]; then
@@ -39,6 +51,12 @@ if [[ -z "$_TIRITH_BIN" || ! -x "$_TIRITH_BIN" ]]; then
   TIRITH_STATUS=off
   return
 fi
+_tirith_session_suffix="$(command "$_TIRITH_BIN" __session-id 2>/dev/null)" \
+  || _tirith_session_suffix=""
+if [[ ${#_tirith_session_suffix} -eq 36 && "$_tirith_session_suffix" != *[^0-9a-f-]* ]]; then
+  builtin printf -v TIRITH_SESSION_ID '%x-%s' "$$" "$_tirith_session_suffix"
+fi
+unset _tirith_session_suffix
 
 # Protocol-v3 callbacks run after arbitrary commands may have changed PATH.
 # Prefer system helpers, then search the source-time PATH for non-FHS systems
@@ -68,10 +86,9 @@ _TIRITH_MKTEMP_BIN="$(_tirith_resolve_helper mktemp /usr/bin/mktemp /bin/mktemp)
 _TIRITH_RM_BIN="$(_tirith_resolve_helper rm /bin/rm /usr/bin/rm)" || _TIRITH_RM_BIN=""
 _TIRITH_WC_BIN="$(_tirith_resolve_helper wc /usr/bin/wc /bin/wc)" || _TIRITH_WC_BIN=""
 _TIRITH_ENV_BIN="$(_tirith_resolve_helper env /usr/bin/env /bin/env)" || _TIRITH_ENV_BIN=""
-_TIRITH_SH_BIN="$(_tirith_resolve_helper sh /bin/sh /usr/bin/sh)" || _TIRITH_SH_BIN=""
 _TIRITH_V3_HELPERS_READY=1
 for _tirith_helper in "$_TIRITH_MKTEMP_BIN" "$_TIRITH_RM_BIN" "$_TIRITH_WC_BIN" \
-  "$_TIRITH_ENV_BIN" "$_TIRITH_SH_BIN"; do
+  "$_TIRITH_ENV_BIN"; do
   [[ "$_tirith_helper" == /* && -f "$_tirith_helper" && -x "$_tirith_helper" ]] \
     || _TIRITH_V3_HELPERS_READY=0
 done
@@ -94,22 +111,25 @@ fi
 # degraded status instead of misparsing the hidden flag. Registration itself
 # happens further down, after the capture-file helpers are defined.
 _TIRITH_RECEIPT_PROTOCOL=0
+# Discard inherited export attributes before creating the private shell capability.
+unset _TIRITH_RECEIPT_INSTANCE
 _TIRITH_RECEIPT_INSTANCE=""
 _TIRITH_RECEIPT_REGISTER_ERROR=""
 _TIRITH_RECEIPT_SHELL_PID="$$"
 _TIRITH_RECEIPT_FAMILY="zsh"
 
-# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
-# We exec a hidden tirith subcommand that reads ITS OWN inherited environment
-# and writes ONLY variable names + an 8-char value-hash prefix (never raw
-# values, never a recoverable hash) to <state-dir>/env_snapshot.json. The child
-# inherits this shell's exported env, so no value ever crosses an argv boundary
-# or a temp file. Interactive-only and backgrounded (&) so it never blocks the
-# prompt. The hook is sourced once per session (guarded above), so this runs
-# once per shell start.
-if [[ -o interactive ]]; then
+# The shell-start environment baseline records variable names only. This is a
+# best-effort background write; a snapshot is never protection evidence.
+_tirith_env_snapshot_once() {
+  builtin setopt localoptions noxtrace noallexport
+  [[ "${_TIRITH_ENV_SNAPSHOT_PENDING:-0}" == 1 ]] || return 0
+  _TIRITH_ENV_SNAPSHOT_PENDING=0
   command "$_TIRITH_BIN" env snapshot >/dev/null 2>&1 &!
-fi
+  return 0
+}
+unset _TIRITH_ENV_SNAPSHOT_PENDING
+builtin typeset -gi _TIRITH_ENV_SNAPSHOT_PENDING=0
+[[ -o interactive ]] && _TIRITH_ENV_SNAPSHOT_PENDING=1
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream
@@ -134,57 +154,49 @@ _tirith_output() {
 }
 
 _tirith_escape_preview() {
-  printf '%q' -- "$1"
+  # zsh's printf takes no `--` after the format: it would print it as data.
+  builtin printf '%q' "$1"
 }
 
-_tirith_receipt_reconcile_at() {
-  local token="$1" original_cwd="$2"
+# One protocol-v3 receipt operation (consume, discard or reconcile):
+#   _tirith_receipt_call <action> <token> <original-cwd> [<exact command>]
+# The token, and consume's exact command, travel on stdin and never in argv or
+# the environment. `--cwd` makes Tirith enter the receipt's working directory
+# itself, so it stays this shell's direct child without an `sh -c cd` hop, and
+# a successful operation also retires the receipt inside the same call.
+_tirith_receipt_call() {
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x action="$1" token="$2" original_cwd="$3" expected="$4"
   [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
     || return 1
-  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt reconcile --channel zsh' \
-    >/dev/null 2>&1
-}
-
-_tirith_receipt_consume_at() {
-  local token="$1" expected="$2" original_cwd="$3"
-  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
-    || return 1
-  builtin printf '%s\n%s' "$token" "$expected" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt consume --channel zsh' \
-    >/dev/null
-}
-
-_tirith_receipt_discard_at() {
-  local token="$1" original_cwd="$2"
-  [[ $_TIRITH_V3_HELPERS_READY -eq 1 && -n "$token" && -n "$original_cwd" ]] \
-    || return 1
-  builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
-    _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
-    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
-    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
-    _TIRITH_RECEIPT_CWD="$original_cwd" \
-    _TIRITH_BIN="$_TIRITH_BIN" \
-    "$_TIRITH_SH_BIN" -c 'cd "$_TIRITH_RECEIPT_CWD" 2>/dev/null || exit 1; exec "$_TIRITH_BIN" __execution-receipt discard --channel zsh' \
-    >/dev/null 2>&1
+  case "$action" in
+    consume)
+      builtin printf '%s\n%s' "$token" "$expected" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        "$_TIRITH_BIN" __execution-receipt consume --cwd "$original_cwd" --channel zsh \
+        >/dev/null
+      ;;
+    discard|reconcile)
+      builtin printf '%s' "$token" | command "$_TIRITH_ENV_BIN" \
+        _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+        _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+        _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+        "$_TIRITH_BIN" __execution-receipt "$action" --cwd "$original_cwd" --channel zsh \
+        >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 _tirith_unresolved_receipt_cleanup() {
-  local token="${_TIRITH_UNRESOLVED_RECEIPT:-}"
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x token="${_TIRITH_UNRESOLVED_RECEIPT:-}"
   local original_cwd="${_TIRITH_UNRESOLVED_RECEIPT_CWD:-}"
   [[ -n "$token" ]] || return 0
-  if _tirith_receipt_reconcile_at "$token" "$original_cwd" \
-     || _tirith_receipt_discard_at "$token" "$original_cwd"; then
+  if _tirith_receipt_call reconcile "$token" "$original_cwd" \
+     || _tirith_receipt_call discard "$token" "$original_cwd"; then
     unset _TIRITH_UNRESOLVED_RECEIPT _TIRITH_UNRESOLVED_RECEIPT_CWD
     return 0
   fi
@@ -192,13 +204,14 @@ _tirith_unresolved_receipt_cleanup() {
 }
 
 _tirith_receipt_discard_or_retain() {
-  local token="$1" original_cwd="$2"
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x token="$1" original_cwd="$2"
   [[ -n "$token" && -n "$original_cwd" ]] || return 1
-  if _tirith_receipt_discard_at "$token" "$original_cwd"; then
+  if _tirith_receipt_call discard "$token" "$original_cwd"; then
     return 0
   fi
   if [[ -z "${_TIRITH_UNRESOLVED_RECEIPT:-}" ]]; then
-    _TIRITH_UNRESOLVED_RECEIPT="$token"
+    builtin typeset -g +x _TIRITH_UNRESOLVED_RECEIPT="$token"
     _TIRITH_UNRESOLVED_RECEIPT_CWD="$original_cwd"
   fi
   return 1
@@ -237,9 +250,14 @@ _tirith_v3_cleanup_registration_files() {
 # registration is rejected. Capture stdout/stderr through temp files from a
 # plain foreground command instead, and keep the failure reason for the
 # status warning below instead of discarding it.
+# The probe passes `--require-cwd` because _tirith_receipt_call always sends
+# `--cwd`: a pinned binary older than these hooks rejects the flag, so the hook
+# stays in the legacy flow rather than failing every receipt operation.
+_TIRITH_REGISTER_TRACE=0
+if [[ -o xtrace ]]; then builtin unsetopt xtrace; _TIRITH_REGISTER_TRACE=1; fi
 if [[ -o interactive ]] \
    && [[ $_TIRITH_V3_HELPERS_READY -eq 1 ]] \
-   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
+   && [[ "$(command "$_TIRITH_BIN" __execution-receipt capability --require-cwd 2>/dev/null)" == "TIRITH_EXECUTION_RECEIPT_PROTOCOL=3" ]]; then
   _tirith_register_out="$(_tirith_v3_new_capture_file)" || _tirith_register_out=""
   _tirith_register_err="$(_tirith_v3_new_capture_file)" || _tirith_register_err=""
   if [[ -n "$_tirith_register_out" && -n "$_tirith_register_err" ]]; then
@@ -268,6 +286,13 @@ if [[ -o interactive ]] \
   unset _tirith_register_out _tirith_register_err
 fi
 
+
+if [[ $_TIRITH_REGISTER_TRACE == 1 ]]; then
+  unset _TIRITH_REGISTER_TRACE
+  builtin setopt xtrace
+else
+  unset _TIRITH_REGISTER_TRACE
+fi
 
 _tirith_parse_approval() {
   local file="$1"
@@ -330,14 +355,30 @@ _tirith_parse_warn_ack() {
   return 0
 }
 
+# zsh runs the text after a word-start `#` unless `interactivecomments` is set,
+# and it is unset by default: `echo hi #; cmd` prints `hi #` and runs `cmd`.
+# Sets the caller's `comment_reading` to 0 then, so Tirith reads the line the
+# way this shell runs it, and to 1 otherwise. Read at every check, because
+# `setopt` can change the option mid-session. Callers pass it to the binary as
+# `_TIRITH_INTERACTIVE_COMMENTS`, never as a flag: a pinned binary older than
+# this hook ignores the variable and keeps its own reading, while it would
+# reject an unknown flag (`paste`) or take it for the checked command (`check`).
+_tirith_comment_reading() {
+  comment_reading=1
+  [[ -o interactivecomments ]] || comment_reading=0
+}
+
 # Save original accept-line widget if it exists
 if (( $+widgets[accept-line] )); then
   zle -A accept-line _tirith_original_accept_line
 fi
 
 _tirith_accept_line() {
+  builtin setopt localoptions noxtrace noallexport
   setopt localoptions clobber   # mktemp + redirect needs clobber
-  local buf="$BUFFER"
+  local -h +x buf="$BUFFER"
+  local -h +x comment_reading
+  _tirith_comment_reading
 
   # Never create or deliver a second receipt while recovery of an older one is
   # unresolved. Reconciliation/discard runs in the original working directory.
@@ -368,27 +409,38 @@ _tirith_accept_line() {
   # Protocol v3 returns only an already-armed receipt token on stdout. The
   # protocol-off path below retains the legacy approval temp-file workflow.
   local errfile=""
-  local approval_path="" warn_ack_path="" receipt_token=""
-  local check_stdout="" rc=1 output=""
+  local -h +x approval_path="" warn_ack_path="" receipt_token=""
+  local -h +x check_stdout="" rc=1 output=""
   if [[ $_TIRITH_RECEIPT_PROTOCOL -eq 3 ]]; then
     local outfile="" receipt_cwd="$PWD"
     if ! errfile="$(_tirith_v3_new_capture_file)" \
        || ! outfile="$(_tirith_v3_new_capture_file)"; then
       [[ -n "$errfile" ]] && _tirith_v3_remove_capture_files "$errfile" >/dev/null 2>&1
-      _tirith_output "tirith: secure execution-receipt capture unavailable; command blocked"
+      _tirith_output "tirith: secure execution-receipt capture unavailable; command blocked. tirith: recovery: open a separate terminal with zsh -f, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
       BUFFER=""
       zle send-break
       return
     fi
+    if [[ "$buf" == "_tirith_verification_probe "* ]]; then
+      local -h +x verification_capture="$(_tirith_verification_state)"
+    _TIRITH_VERIFICATION_CAPTURE=1 _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+      _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+      _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+      command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
+      --execution-receipt zsh -- "$buf" >"$outfile" 2>"$errfile" <<<"$verification_capture"
+    else
     _TIRITH_HOOK=1 _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
       _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
       _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+      _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
       command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
       --execution-receipt zsh -- "$buf" >"$outfile" 2>"$errfile"
+    fi
     rc=$?
     output=$(<"$errfile")
 
-    local receipt_prefix="TIRITH_EXECUTION_RECEIPT=" receipt_line="" candidate_token=""
+    local -h +x receipt_prefix="TIRITH_EXECUTION_RECEIPT=" receipt_line="" candidate_token=""
     local stdout_bytes stdout_lines expected_bytes first_line_status=1 frame_valid=0
     stdout_bytes=$(LC_ALL=C command "$_TIRITH_WC_BIN" -c <"$outfile" 2>/dev/null)
     stdout_bytes="${stdout_bytes//[[:space:]]/}"
@@ -426,8 +478,8 @@ _tirith_accept_line() {
         zle redisplay
         return
       fi
-      if ! _tirith_receipt_consume_at "$receipt_token" "$buf" "$receipt_cwd"; then
-        if _tirith_receipt_reconcile_at "$receipt_token" "$receipt_cwd"; then
+      if ! _tirith_receipt_call consume "$receipt_token" "$receipt_cwd" "$buf"; then
+        if _tirith_receipt_call reconcile "$receipt_token" "$receipt_cwd"; then
           _tirith_output "tirith: receipt recovery completed but cannot authorize replay; command not executed — press Enter for a fresh check"
         else
           _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
@@ -437,7 +489,7 @@ _tirith_accept_line() {
         return
       fi
       if [[ $rc -eq 2 ]]; then
-        local v3_escaped_buf=$(_tirith_escape_preview "$buf")
+        local -h +x v3_escaped_buf=$(_tirith_escape_preview "$buf")
         _tirith_output ""
         _tirith_output "command> $v3_escaped_buf"
         [[ -n "$output" ]] && _tirith_output "$output"
@@ -456,7 +508,7 @@ _tirith_accept_line() {
 
     if [[ $rc -eq 1 && "$stdout_bytes" == "0" ]]; then
       _tirith_v3_remove_capture_files "$outfile" "$errfile" >/dev/null 2>&1
-      local v3_blocked_buf=$(_tirith_escape_preview "$buf")
+      local -h +x v3_blocked_buf=$(_tirith_escape_preview "$buf")
       _tirith_output ""
       _tirith_output "command> $v3_blocked_buf"
       [[ -n "$output" ]] && _tirith_output "$output"
@@ -470,7 +522,7 @@ _tirith_accept_line() {
     [[ -n "$receipt_token" ]] \
       && _tirith_receipt_discard_or_retain "$receipt_token" "$receipt_cwd" >/dev/null 2>&1
     _tirith_v3_remove_capture_files "$outfile" "$errfile" >/dev/null 2>&1
-    local v3_malformed_buf=$(_tirith_escape_preview "$buf")
+    local -h +x v3_malformed_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
     _tirith_output "command> $v3_malformed_buf"
     [[ -n "$output" ]] && _tirith_output "$output"
@@ -483,13 +535,14 @@ _tirith_accept_line() {
   # Legacy protocol-off behavior: stdout is the approval metadata path(s), and
   # the shell retains ownership of the historical prompt/fallback workflow.
   if ! errfile="$(_tirith_v3_new_capture_file)"; then
-    _tirith_output "tirith: secure preflight capture unavailable; command blocked"
+    _tirith_output "tirith: secure preflight capture unavailable; command blocked. tirith: recovery: open a separate terminal with zsh -f, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
     BUFFER=""
     zle send-break
     return
   fi
-  check_stdout=$(_TIRITH_HOOK=1 command "$_TIRITH_BIN" check \
-    --approval-check --non-interactive --interactive --shell posix -- "$buf" 2>"$errfile")
+  check_stdout=$(_TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+    command "$_TIRITH_BIN" check --approval-check --non-interactive --interactive --shell posix \
+    -- "$buf" 2>"$errfile")
   rc=$?
   output=$(<"$errfile")
   _tirith_v3_remove_capture_files "$errfile" >/dev/null 2>&1
@@ -504,12 +557,12 @@ _tirith_accept_line() {
   if [[ $rc -eq 0 ]]; then
     :  # Allow: no output
   elif [[ $rc -eq 2 || $rc -eq 3 ]]; then
-    local escaped_buf=$(_tirith_escape_preview "$buf")
+    local -h +x escaped_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
     _tirith_output "command> $escaped_buf"
     [[ -n "$output" ]] && _tirith_output "$output"
   elif [[ $rc -eq 1 ]]; then
-    local escaped_buf=$(_tirith_escape_preview "$buf")
+    local -h +x escaped_buf=$(_tirith_escape_preview "$buf")
     _tirith_output ""
     _tirith_output "command> $escaped_buf"
     [[ -n "$output" ]] && _tirith_output "$output"
@@ -600,28 +653,32 @@ if (( $+widgets[bracketed-paste] )); then
 fi
 
 _tirith_bracketed_paste() {
+  builtin setopt localoptions noxtrace noallexport
   setopt localoptions clobber   # mktemp + redirect needs clobber
   # Read the pasted content into CUTBUFFER via the original widget
-  local old_buffer="$BUFFER"
+  local -h +x old_buffer="$BUFFER"
   local old_cursor="$CURSOR"
   zle _tirith_original_bracketed_paste 2>/dev/null || zle .bracketed-paste
 
   # The new content is what was added to BUFFER
-  local new_buffer="$BUFFER"
-  local pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
+  local -h +x new_buffer="$BUFFER"
+  local -h +x pasted="${new_buffer:$old_cursor:$((${#new_buffer} - ${#old_buffer}))}"
 
   if [[ -n "$pasted" ]]; then
     # Pipe pasted content to tirith paste, use temp file to prevent tty leakage
-    local tmpfile="" output="" rc=1
+    local -h +x tmpfile="" output="" rc=1
     if ! tmpfile="$(_tirith_v3_new_capture_file)"; then
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
-      _tirith_output "tirith: secure paste capture unavailable; paste blocked for safety"
+      _tirith_output "tirith: secure paste capture unavailable; paste blocked for safety. tirith: recovery: open a separate terminal with zsh -f, inspect tirith doctor --quick, pinned helpers and writable TMPDIR, then restart and verify. Pre-binary hook failures cannot be repaired with TIRITH=0."
       zle send-break
       return
     fi
+    local -h +x comment_reading
+    _tirith_comment_reading
     builtin printf '%s' "$pasted" \
-      | _TIRITH_HOOK=1 command "$_TIRITH_BIN" paste --shell posix --interactive >"$tmpfile" 2>&1
+      | _TIRITH_HOOK=1 _TIRITH_INTERACTIVE_COMMENTS="$comment_reading" \
+        command "$_TIRITH_BIN" paste --shell posix --interactive >"$tmpfile" 2>&1
     rc=$?
     output=$(<"$tmpfile")
     if ! _tirith_v3_remove_capture_files "$tmpfile" >/dev/null 2>&1; then
@@ -641,7 +698,7 @@ _tirith_bracketed_paste() {
       # Block or unexpected: revert paste
       BUFFER="$old_buffer"
       CURSOR=$old_cursor
-      local escaped_paste=$(_tirith_escape_preview "$pasted")
+      local -h +x escaped_paste=$(_tirith_escape_preview "$pasted")
       _tirith_output ""
       _tirith_output "paste> $escaped_paste"
       [[ -n "$output" ]] && _tirith_output "$output"
@@ -699,6 +756,55 @@ if [[ -o interactive ]]; then
   fi
 fi
 
+# Sample loaded definitions and native bindings in memory for explicit probes.
+# Include the sampler/helper bodies so redefinition invalidates the challenge.
+_tirith_verification_state() {
+  local name
+  builtin print -r -- tirith-loaded-shell-v1
+  for name in ${(ok)functions}; do
+    [[ "$name" == _tirith_* ]] && builtin functions "$name"
+  done
+  builtin typeset -p precmd_functions preexec_functions zshexit_functions 2>/dev/null
+  builtin zle -l -L accept-line bracketed-paste 2>/dev/null
+  builtin bindkey -M emacs '^M'
+  builtin bindkey -M viins '^M'
+  builtin bindkey -M vicmd '^M'
+  builtin print -r -- "protocol=${_TIRITH_RECEIPT_PROTOCOL:-0} protection=${TIRITH_STATUS:-unknown} bypass=${TIRITH:-1}"
+}
+
+_tirith_verification_probe() {
+  builtin setopt localoptions noxtrace noallexport
+  local -h +x action id="" state
+  if [[ "$#" -eq 1 && "$1" == start ]]; then
+    action=start
+  elif [[ "$#" -eq 2 && ( "$2" == allowed || "$2" == blocked || "$2" == status ) ]]; then
+    id="$1"
+    action="$2"
+  else
+    builtin print -ru2 -- 'tirith: use _tirith_verification_probe start, then its exact challenge commands'
+    return 2
+  fi
+  if [[ "${_TIRITH_RECEIPT_PROTOCOL:-0}" != 3 ]]; then
+    builtin print -ru2 -- 'tirith: authenticated shell verification requires the current protocol-v3 hook'
+    return 1
+  fi
+  state="$(_tirith_verification_state)" || return 1
+  local -a id_args=()
+  [[ -n "$id" ]] && id_args=(--id "$id")
+  _TIRITH_RECEIPT_INSTANCE="$_TIRITH_RECEIPT_INSTANCE" \
+    _TIRITH_RECEIPT_SHELL_PID="$_TIRITH_RECEIPT_SHELL_PID" \
+    _TIRITH_RECEIPT_FAMILY="$_TIRITH_RECEIPT_FAMILY" \
+    command "$_TIRITH_BIN" __shell-verification "$action" --channel zsh "${id_args[@]}" <<<"$state"
+}
+
+# Record the shell-start environment baseline once per interactive shell.
+_tirith_env_snapshot_once
+
+# Report loaded code only after this fresh initialization reaches installation.
+if [[ -o interactive ]]; then
+  export TIRITH_INTEGRATION_VERSION="${_TIRITH_INIT_VERSION:-unknown}" TIRITH_INTEGRATION_SHELL=zsh
+fi
+
 # ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
 # Opt-in output-direction wrapper. Commented out by default in this embedded
 # hook copy; `tirith output wrap on` writes an active copy of the function
@@ -716,3 +822,13 @@ fi
 #   "$@" 2>&1 | command tirith view --max-bytes 16777216 -
 # }
 # alias tirith-out='tirith-output-guard-wrap'
+
+} always {
+  if [[ "${_TIRITH_INIT_ALLEXPORT:-off}" == on ]]; then
+    builtin unset _TIRITH_INIT_ALLEXPORT
+    builtin setopt allexport
+  else
+    builtin unset _TIRITH_INIT_ALLEXPORT
+    builtin unsetopt allexport
+  fi
+}

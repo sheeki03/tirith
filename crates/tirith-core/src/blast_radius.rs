@@ -148,42 +148,74 @@ pub fn env_snapshot() -> HashMap<String, String> {
 
 const MAX_NESTED_COMMAND_DEPTH: usize = 8;
 
+/// `(segment, shell, best_effort)`. A segment of a best-effort body (a fish
+/// wrapper child, see [`crate::extract::ExecutableBody::best_effort`]) may add
+/// findings, never an analysis gap.
+type ExecutableSegment = (tokenize::Segment, ShellType, bool);
+
+/// Why the nested-command walk could not see every executable segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestedCoverageGap {
+    /// A body nests deeper than [`MAX_NESTED_COMMAND_DEPTH`].
+    Depth,
+    /// A bounded scan, input, candidate or retained-body budget ran out.
+    Budget,
+    /// A nested shell body could not be resolved: a dynamic, grouped or
+    /// unsupported construct.
+    Unresolved,
+}
+
 fn collect_executable_segments(
     input: &str,
     shell: ShellType,
     depth: usize,
-    out: &mut Vec<(tokenize::Segment, ShellType)>,
-) -> bool {
+    best_effort: bool,
+    out: &mut Vec<ExecutableSegment>,
+) -> Option<NestedCoverageGap> {
     let execution_view = crate::extract::shell_execution_view(input, shell);
     out.extend(
         tokenize::tokenize(execution_view.as_ref(), shell)
             .into_iter()
-            .map(|segment| (segment, shell)),
+            .map(|segment| (segment, shell, best_effort)),
     );
     let nested_scan = crate::extract::executable_substitution_scan(input, shell);
-    let mut incomplete = nested_scan.gap.is_some();
+    let mut gap = nested_scan.gap.filter(|_| !best_effort).map(|gap| {
+        if gap == crate::extract::ShellExecutionGap::WorkBudgetExceeded {
+            NestedCoverageGap::Budget
+        } else {
+            NestedCoverageGap::Unresolved
+        }
+    });
     let nested = nested_scan.bodies;
     if nested.is_empty() {
-        return incomplete;
+        return gap;
     }
     if depth >= MAX_NESTED_COMMAND_DEPTH {
-        return true;
+        return (!best_effort && nested.iter().any(|body| !body.best_effort))
+            .then_some(NestedCoverageGap::Depth);
     }
     for body in nested {
         // Do not use `Iterator::any`: traversing every sibling is required to
         // collect all executable segments even after an earlier depth gap.
-        incomplete |= collect_executable_segments(&body.input, body.shell, depth + 1, out);
+        let child = collect_executable_segments(
+            &body.input,
+            body.shell,
+            depth + 1,
+            best_effort || body.best_effort,
+            out,
+        );
+        gap = gap.or(child);
     }
-    incomplete
+    gap
 }
 
 fn executable_segments(
     input: &str,
     shell: ShellType,
-) -> (Vec<(tokenize::Segment, ShellType)>, bool) {
+) -> (Vec<ExecutableSegment>, Option<NestedCoverageGap>) {
     let mut segments = Vec::new();
-    let incomplete = collect_executable_segments(input, shell, 0, &mut segments);
-    (segments, incomplete)
+    let gap = collect_executable_segments(input, shell, 0, false, &mut segments);
+    (segments, gap)
 }
 
 /// Cheap, filesystem-free blast-radius check for the hot path. Fires the
@@ -197,23 +229,52 @@ pub fn cheap_check(
     env_map: &HashMap<String, String>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let (segments, nested_incomplete) = executable_segments(input, shell);
+    let (segments, nested_gap) = executable_segments(input, shell);
 
-    if nested_incomplete {
+    if let Some(gap) = nested_gap {
+        // Name the boundary that was actually hit: a body Tirith could not
+        // resolve is not a budget or depth limit.
+        let (description, matched) = match gap {
+            NestedCoverageGap::Depth => (
+                "A nested shell body is deeper than Tirith's bounded nested-shell depth, so a \
+                 destructive command inside it cannot be ruled out.",
+                "nested body beyond the depth limit",
+            ),
+            NestedCoverageGap::Budget => (
+                "Tirith reached its bounded nested-shell analysis budget (input, \
+                 lexical-candidate or retained-body limit), so a destructive command in the \
+                 unexamined part cannot be ruled out.",
+                "nested body suffix omitted by bounded analysis",
+            ),
+            NestedCoverageGap::Unresolved => (
+                "The command runs a nested shell body Tirith could not resolve (a dynamic, \
+                 grouped or unsupported shell construct), so a destructive command inside it \
+                 cannot be ruled out.",
+                "unresolved nested shell body",
+            ),
+        };
         findings.push(finding(
             RuleId::AnalysisIncomplete,
             Severity::High,
             "nested command analysis was incomplete",
-            "A destructive command may be hidden beyond Tirith's bounded nested-shell depth, \
-             lexical-candidate, input, or retained-body budget.",
+            description,
             Evidence::CommandPattern {
                 pattern: "nested shell execution coverage gap".to_string(),
-                matched: "nested body suffix omitted by bounded analysis".to_string(),
+                matched: matched.to_string(),
             },
         ));
     }
 
-    for (seg, segment_shell) in &segments {
+    // Findings of a best-effort segment from this index on keep only those
+    // that prove a risk (see `ExecutableSegment`).
+    let mut best_effort_start: Option<usize> = None;
+    for (seg, segment_shell, best_effort) in &segments {
+        if let Some(start) = best_effort_start.take() {
+            retain_proven_from(&mut findings, start);
+        }
+        if *best_effort {
+            best_effort_start = Some(findings.len());
+        }
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
@@ -395,8 +456,21 @@ pub fn cheap_check(
             }
         }
     }
+    if let Some(start) = best_effort_start {
+        retain_proven_from(&mut findings, start);
+    }
 
     dedup_findings(findings)
+}
+
+/// Drop the analysis-gap findings at `start..`, keeping the proven ones.
+fn retain_proven_from(findings: &mut Vec<Finding>, start: usize) {
+    let mut index = 0usize;
+    findings.retain(|finding| {
+        let keep = index < start || !crate::extract::is_incompleteness_finding(finding);
+        index += 1;
+        keep
+    });
 }
 
 /// Full filesystem simulation for `tirith preview`: walks cwd-relative targets
@@ -429,17 +503,18 @@ fn simulate_with_work_limit(
         ..BlastReport::default()
     };
     let mut budget = WorkBudget::new(work_limit);
-    let (segments, nested_incomplete) = executable_segments(input, shell);
-    if nested_incomplete {
+    let (segments, nested_gap) = executable_segments(input, shell);
+    if nested_gap.is_some() {
         report.walk_errors += 1;
         report.walk_truncated = true;
         report.classification_incomplete = true;
     }
 
-    for (seg, segment_shell) in &segments {
+    for (seg, segment_shell, best_effort) in &segments {
         let parsed = match parse_fs_op(seg, *segment_shell) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
+            Err(_) if *best_effort => continue,
             Err(crate::rules::command::EffectiveCommandError::WorkBudgetExceeded) => {
                 report.walk_errors += 1;
                 report.walk_truncated = true;
@@ -758,10 +833,14 @@ fn parse_rsync(args: &[String]) -> Option<ParsedFsOp> {
         return None;
     }
 
-    let operands: Vec<String> = stripped
+    // Redirections are the shell's, not rsync operands: in
+    // `rsync --delete src/ dst/ >log` the destination is `dst/`.
+    let argv = crate::escalation::args_without_redirections(args);
+    let operands: Vec<String> = argv
         .iter()
+        .map(|a| strip_outer_quotes(a))
         .filter(|a| !a.starts_with('-'))
-        .map(|a| (*a).to_string())
+        .map(str::to_string)
         .collect();
     // Destination = last operand; the side `--delete` prunes.
     let targets = operands.last().cloned().into_iter().collect();
@@ -1548,6 +1627,28 @@ mod tests {
     }
 
     #[test]
+    fn nested_coverage_gap_wording_names_the_boundary_that_was_hit() {
+        let description = |input: &str| {
+            cheap_check(input, ShellType::Posix, &empty_env())
+                .into_iter()
+                .find(|finding| finding.title == "nested command analysis was incomplete")
+                .map(|finding| finding.description)
+        };
+        // An unresolvable construct is not a budget or depth limit.
+        let unresolved = description("$CMD --version").expect("dynamic command name gap");
+        assert!(unresolved.contains("could not resolve"), "{unresolved}");
+        assert!(!unresolved.contains("budget"), "{unresolved}");
+        // Complete literal bodies report no gap at all.
+        for input in [
+            "{ echo a; echo b; } > out.txt",
+            "cat <<< \"hello\"",
+            "echo a | xargs -I{} echo {}",
+        ] {
+            assert_eq!(description(input), None, "{input}");
+        }
+    }
+
+    #[test]
     fn dedup_preserves_distinct_incomplete_boundaries() {
         let first = finding(
             RuleId::AnalysisIncomplete,
@@ -1584,6 +1685,7 @@ mod tests {
 
     #[test]
     fn work_budget_caps_directory_only_trees_and_keeps_dir_counts_honest() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let tree = root.path().join("tree");
         fs::create_dir_all(tree.join("a")).unwrap();
@@ -1609,6 +1711,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn work_budget_caps_symlink_only_trees_and_exact_budget_is_complete() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let tree = root.path().join("tree");
         fs::create_dir_all(&tree).unwrap();
@@ -1632,6 +1735,7 @@ mod tests {
 
     #[test]
     fn nonmatching_glob_candidates_consume_the_global_work_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("a.txt"), b"x").unwrap();
         fs::write(root.path().join("b.txt"), b"x").unwrap();
@@ -1697,6 +1801,7 @@ mod tests {
 
     #[test]
     fn matching_glob_growth_and_followup_walk_share_one_budget() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("a.log"), b"x").unwrap();
         fs::write(root.path().join("b.log"), b"x").unwrap();
@@ -1714,6 +1819,7 @@ mod tests {
 
     #[test]
     fn glob_errors_are_not_flattened_and_consume_budget_before_later_targets() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("later.txt"), b"x").unwrap();
 
@@ -1894,6 +2000,7 @@ mod tests {
 
     #[test]
     fn preview_classifies_relative_targets_against_its_supplied_cwd() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Exercise only lexical classification: do not invoke `simulate` and do
         // not read or walk the synthetic system paths.
         assert!(is_system_path_for_preview(".", Path::new("/etc"), None));
@@ -2089,7 +2196,9 @@ mod tests {
 
     #[test]
     fn cheap_check_retains_executable_scan_budget_exhaustion() {
-        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(254));
+        // `echo` and the `$(` opener are the last two lexical candidates.
+        let fill = crate::extract::MAX_EXECUTABLE_SCAN_CANDIDATES - 2;
+        let exact = format!("{}echo $(rm -rf /)", "true;".repeat(fill));
         let exact_findings = cheap_check(&exact, ShellType::Posix, &empty_env());
         assert!(
             exact_findings
@@ -2104,7 +2213,7 @@ mod tests {
             "the exact-cap control must remain complete: {exact_findings:?}"
         );
 
-        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(255));
+        let plus_one = format!("{}echo $(rm -rf /)", "true;".repeat(fill + 1));
         let findings = cheap_check(&plus_one, ShellType::Posix, &empty_env());
         assert!(
             findings.iter().any(|finding| {
@@ -2148,6 +2257,7 @@ mod tests {
 
     #[test]
     fn simulate_counts_files_in_temp_tree() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dist");
         fs::create_dir_all(&target).unwrap();
@@ -2175,6 +2285,7 @@ mod tests {
 
     #[test]
     fn simulate_counts_symlinks_without_following() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("d");
         fs::create_dir_all(&target).unwrap();
@@ -2201,6 +2312,7 @@ mod tests {
 
     #[test]
     fn simulate_detects_outside_repo() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let outside = dir.path().join("outside");
@@ -2228,6 +2340,7 @@ mod tests {
 
     #[test]
     fn simulate_large_file_count_info() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("many");
         fs::create_dir_all(&target).unwrap();
@@ -2248,6 +2361,7 @@ mod tests {
 
     #[test]
     fn budget_cutoff_before_a_later_target_fails_closed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The first target exhausts the work budget, so the second target — which
         // escapes the repository — is never classified. The report must say so
         // rather than presenting "outside repo: no" as a complete answer.
@@ -2282,6 +2396,7 @@ mod tests {
 
     #[test]
     fn simulate_truncates_past_depth_cap() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // pr-test-analyzer #2: a tree deeper than MAX_WALK_DEPTH must set
         // walk_truncated (depth-cap DoS guard).
         let dir = tempfile::tempdir().unwrap();
@@ -2308,6 +2423,7 @@ mod tests {
 
     #[test]
     fn simulate_glob_expansion_counted() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.log"), b"x").unwrap();
         fs::write(dir.path().join("b.log"), b"x").unwrap();
@@ -2325,6 +2441,7 @@ mod tests {
 
     #[test]
     fn simulate_supports_bracket_and_wildcard_directory_components() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("service-a/logs");
         fs::create_dir_all(&logs).unwrap();
@@ -2346,6 +2463,7 @@ mod tests {
 
     #[test]
     fn glob_intermediate_component_ignores_ordinary_files() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("plain.txt"), b"not a directory").unwrap();
         fs::create_dir_all(dir.path().join("service-a")).unwrap();
@@ -2365,6 +2483,7 @@ mod tests {
 
     #[test]
     fn simulate_empty_var_glob_is_system_and_outside() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let report = simulate(
             "rm -rf \"$EMPTY/\"",
@@ -2383,6 +2502,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn simulate_flags_unreadable_subdir_as_walk_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F3: a read_dir permission error on a subtree must increment walk_errors.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

@@ -375,6 +375,7 @@ mod tests {
 
     #[test]
     fn update_policy_key_creates_file() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         update_policy_key(&path, "context_guard_enabled", "true").unwrap();
@@ -384,6 +385,7 @@ mod tests {
 
     #[test]
     fn inject_requires_an_exact_independent_lifecycle_entry() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for (label, command, preserved_key, preserved_value) in [
             (
                 "decoy substring",

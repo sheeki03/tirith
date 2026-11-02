@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,6 +13,7 @@ jobs:
   benchmark:
     name: Performance
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,7 +37,7 @@ jobs:
         # the downstream result step is gated on this step's success.
         run: |
           set -o pipefail
-          cargo bench --bench perf -- --output-format bencher | tee bench-output.txt
+          cargo bench --locked --bench perf -- --output-format bencher | tee bench-output.txt
 
       # C19: the ABSOLUTE gate. The relative alert below reports but does not
       # fail, so on its own it can only answer "slower than last week" and never
@@ -46,11 +48,48 @@ jobs:
       - name: Enforce absolute benchmark budgets
         run: ./scripts/check-bench-budgets.sh bench-output.txt
 
+      # Allocation regression gate. The ceilings are plain committed numbers,
+      # about 25% above counts measured on aarch64 (macOS and Linux, rustc
+      # 1.98); they have not yet been confirmed on ubuntu-latest x86_64. No
+      # hashes or runner pins are checked, but a new toolchain or std can move
+      # allocation counts, so re-measure and raise a ceiling deliberately when
+      # that happens or when growth is intended. Derivation:
+      # crates/tirith-core/benches/resource_ceilings.json.
+      - name: Enforce allocation ceilings
+        run: >-
+          cargo bench --locked -p tirith-core --bench resource_counts --
+          --output "$GITHUB_WORKSPACE/resource-allocations.json"
+          --ceilings "$GITHUB_WORKSPACE/crates/tirith-core/benches/resource_ceilings.json"
+
+      # Informational only: which source, toolchain and runner produced the
+      # numbers above. Nothing compares or pins these values.
+      - name: Record measurement provenance
+        if: always()
+        run: |
+          {
+            echo "source_revision: $GITHUB_SHA"
+            echo "run: $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+            echo "runner: ${ImageOS:-unknown} ${ImageVersion:-unknown} $(uname -srm)"
+            rustc -Vv
+            cargo -V
+          } > resource-provenance.txt
+
+      - name: Upload allocation report and provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: resource-allocations-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            resource-allocations.json
+            resource-provenance.txt
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Upload trusted-main benchmark input
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: benchmark-output
+          name: benchmark-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: bench-output.txt
           if-no-files-found: error
 
@@ -69,7 +108,7 @@ jobs:
       - name: Download benchmark output
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: benchmark-output
+          name: benchmark-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-output
 
       - name: Store benchmark result

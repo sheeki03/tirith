@@ -2308,6 +2308,7 @@ jobs:
 
     #[test]
     fn poisoned_pair_execute_sink_is_one_high_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
         ));
@@ -2335,6 +2336,7 @@ jobs:
 
     #[test]
     fn downloaded_report_with_no_dangerous_sink_is_not_a_finding() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: cat dist/coverage.json\n      - run: ls -la dist\n"
         ));
@@ -2348,6 +2350,7 @@ jobs:
 
     #[test]
     fn unresolved_named_producer_without_direct_upload_blocks_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let local_action = r#"
 name: CI
 on:
@@ -2382,6 +2385,7 @@ jobs:
 
     #[test]
     fn resolved_named_producer_without_an_upload_does_not_block_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let producer = r#"
 name: CI
 on:
@@ -2402,6 +2406,7 @@ jobs:
 
     #[test]
     fn unresolved_producer_that_is_not_fork_reachable_does_not_block_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let producer = r#"
 name: CI
 on:
@@ -2426,6 +2431,7 @@ jobs:
 
     #[test]
     fn artifact_name_mismatch_proves_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/download-artifact@v4\n",
             "        with:\n",
@@ -2441,6 +2447,7 @@ jobs:
 
     #[test]
     fn dynamic_producer_artifact_name_is_partial_not_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let producer = PRODUCER.replace("name: build", "name: build-${{ matrix.os }}");
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
@@ -2455,6 +2462,7 @@ jobs:
 
     #[test]
     fn download_artifact_v3_cannot_fetch_across_runs() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/download-artifact@v3\n",
             "        with:\n",
@@ -2469,6 +2477,7 @@ jobs:
 
     #[test]
     fn fixed_run_id_is_not_bound_to_the_triggering_run() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/download-artifact@v4\n",
             "        with:\n",
@@ -2483,6 +2492,7 @@ jobs:
 
     #[test]
     fn another_repository_is_unresolved_not_proven() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/download-artifact@v4\n",
             "        with:\n",
@@ -2499,6 +2509,7 @@ jobs:
 
     #[test]
     fn trusted_digest_comparison_suppresses_but_self_supplied_does_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let trusted = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: sha256sum -c checksums.txt\n      - run: bash ./dist/install.sh\n"
         ));
@@ -2519,6 +2530,7 @@ jobs:
 
     #[test]
     fn comment_claiming_verification_suppresses_nothing() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: |\n          # verified upstream, checksum ok\n          bash ./dist/install.sh\n"
         ));
@@ -2527,6 +2539,7 @@ jobs:
 
     #[test]
     fn attestation_verification_suppresses() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: gh attestation verify dist/app --repo owner/name\n      - run: bash ./dist/install.sh\n"
         ));
@@ -2535,6 +2548,7 @@ jobs:
 
     #[test]
     fn every_sink_kind_fires_and_inert_commands_do_not() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let sinks = [
             "      - run: bash ./dist/install.sh\n",
             "      - run: . ./dist/env.sh\n",
@@ -2566,6 +2580,7 @@ jobs:
 
     #[test]
     fn interpreter_module_and_env_assignment_shapes_are_not_sinks() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Each of these follows a download into the WORKSPACE ROOT, where every
         // relative operand is nominally "inside" the artifact, so only the
         // operand's shape keeps them from reading as artifact execution.
@@ -2604,6 +2619,7 @@ jobs:
 
     #[test]
     fn sink_before_download_is_not_a_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "      - run: bash ./dist/install.sh\n{CROSS_RUN_DOWNLOAD}"
         ));
@@ -2612,6 +2628,7 @@ jobs:
 
     #[test]
     fn sink_outside_the_download_directory_is_not_a_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./scripts/install.sh\n"
         ));
@@ -2620,6 +2637,7 @@ jobs:
 
     #[test]
     fn trusted_push_only_producer_never_participates() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let producer = PRODUCER.replace("on:\n  pull_request:", "on:\n  push:");
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
@@ -2631,6 +2649,7 @@ jobs:
 
     #[test]
     fn consumer_bound_to_a_different_producer_name_is_not_a_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
         ))
@@ -2640,6 +2659,7 @@ jobs:
 
     #[test]
     fn wildcard_producer_list_is_partial_not_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
         ))
@@ -2651,6 +2671,7 @@ jobs:
 
     #[test]
     fn dawidd6_bound_download_is_a_recognised_consumer_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: dawidd6/action-download-artifact@v6\n",
             "        with:\n",
@@ -2664,6 +2685,7 @@ jobs:
 
     #[test]
     fn dawidd6_workflow_branch_form_is_unresolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: dawidd6/action-download-artifact@v6\n",
             "        with:\n",
@@ -2679,6 +2701,7 @@ jobs:
 
     #[test]
     fn github_script_listing_the_triggering_run_is_a_recognised_consumer_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/github-script@v7\n",
             "        with:\n",
@@ -2697,6 +2720,7 @@ jobs:
 
     #[test]
     fn gh_run_download_in_a_run_step_is_a_recognised_consumer_shape() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - run: gh run download ${{ github.event.workflow_run.id }} --name build --dir dist\n",
             "      - run: bash ./dist/install.sh\n",
@@ -2706,6 +2730,7 @@ jobs:
 
     #[test]
     fn reusable_workflow_consumer_is_unresolved_never_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = "name: Deploy\non:\n  workflow_run:\n    workflows: [CI]\njobs:\n  ship:\n    uses: ./.github/workflows/deploy-impl.yml\n";
         let result = analyze(PRODUCER, yaml);
         assert!(result.findings.is_empty());
@@ -2714,6 +2739,7 @@ jobs:
 
     #[test]
     fn local_composite_action_step_is_unresolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - uses: ./.github/actions/ship\n"
         ));
@@ -2724,6 +2750,7 @@ jobs:
 
     #[test]
     fn matrix_consumer_job_is_unresolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = format!(
             "name: Deploy\non:\n  workflow_run:\n    workflows: [CI]\njobs:\n  ship:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [linux, mac]\n    steps:\n{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
         );
@@ -2750,6 +2777,7 @@ jobs:
 
     #[test]
     fn yaml_aliases_expand_once_and_still_prove_the_chain() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = concat!(
             "name: Deploy\n",
             "on:\n  workflow_run:\n    workflows: [CI]\n",
@@ -2887,6 +2915,7 @@ jobs:
 
     #[test]
     fn unresolvable_step_shell_blocks_the_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = format!(
             "name: Deploy\non:\n  workflow_run:\n    workflows: [CI]\njobs:\n  ship:\n    runs-on: ${{{{ env.RUNNER }}}}\n    steps:\n{CROSS_RUN_DOWNLOAD}      - run: bash ./dist/install.sh\n"
         );
@@ -2897,6 +2926,7 @@ jobs:
 
     #[test]
     fn download_with_no_name_lands_each_artifact_in_its_own_subdirectory() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `actions/download-artifact` with no `name:` takes every artifact of the
         // run and unpacks EACH into `<path>/<artifact-name>/`, so `build` lands
         // at `dist/build`, not at `dist`.
@@ -2938,6 +2968,7 @@ jobs:
 
     #[test]
     fn pattern_download_is_unresolved() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(concat!(
             "      - uses: actions/download-artifact@v4\n",
             "        with:\n",
@@ -2953,6 +2984,7 @@ jobs:
 
     #[test]
     fn sha_pinned_download_action_is_still_recognised() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pin = "a".repeat(40);
         let yaml = consumer(&format!(
             "      - uses: actions/download-artifact@{pin}\n        with:\n          name: build\n          path: dist\n          run-id: ${{{{ github.event.workflow_run.id }}}}\n      - run: bash ./dist/install.sh\n"
@@ -2962,6 +2994,7 @@ jobs:
 
     #[test]
     fn publish_action_step_is_a_sink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let yaml = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - uses: pypa/gh-action-pypi-publish@release/v1\n"
         ));
@@ -2974,6 +3007,7 @@ jobs:
 
     #[test]
     fn nameless_download_does_not_taint_the_trusted_checkout() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // GitHub's own fork-safe reporter pattern: download every artifact of the
         // triggering run into the workspace, then run a script from the trusted
         // default-branch checkout. Each artifact lands in `./<name>/`, so the
@@ -3005,6 +3039,7 @@ jobs:
 
     #[test]
     fn gh_run_download_without_a_name_isolates_each_artifact() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let flat = consumer(concat!(
             "      - run: gh run download ${{ github.event.workflow_run.id }} --dir out\n",
             "      - run: bash ./out/install.sh\n",
@@ -3022,6 +3057,7 @@ jobs:
 
     #[test]
     fn a_github_env_assignment_is_a_sink_only_for_a_loader_variable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Recording where the artifact was put is bookkeeping; no later step
         // resolves anything from `report_dir`.
         for inert in [
@@ -3057,6 +3093,7 @@ jobs:
 
     #[test]
     fn an_unevaluated_if_condition_is_partial_not_high() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // (a) The producer only uploads on `push`, so a fork's pull request never
         // creates the artifact this consumer would download.
         let guarded_producer = PRODUCER.replace(
@@ -3095,6 +3132,7 @@ jobs:
 
     #[test]
     fn a_digest_check_the_analyzer_cannot_place_suppresses_nothing_silently() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // The checksum file is named through a variable, so whether the artifact
         // wrote it is unknown. Reading that as a passing check is how an attacker
         // hides the whole chain.
@@ -3126,6 +3164,7 @@ jobs:
 
     #[test]
     fn a_command_that_could_move_the_artifact_blocks_the_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for relocation in [
             "      - run: tar -xzf dist/app.tar.gz -C .\n      - run: bash ./install.sh\n",
             "      - run: cp dist/install.sh ./setup.sh\n      - run: ./setup.sh\n",
@@ -3149,6 +3188,7 @@ jobs:
 
     #[test]
     fn find_execution_mutation_and_unknown_actions_block_the_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for command in [
             "find dist -type f -exec {} +",
             "find dist -type f -execdir sh {} +",
@@ -3178,6 +3218,7 @@ jobs:
 
     #[test]
     fn proven_read_only_find_remains_downgradable() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         for command in [
             "find dist -type f -print",
             "find -L dist -maxdepth 2 -name '*.json' -printf '%p\\n'",
@@ -3202,6 +3243,7 @@ jobs:
 
     #[test]
     fn an_unmodelled_fetch_of_the_triggering_run_blocks_the_downgrade() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // `gh api .../artifacts` + `curl` of an `archive_download_url` is a real
         // published download mechanism this pass does not model.
         let rest = consumer(concat!(
@@ -3227,6 +3269,7 @@ jobs:
 
     #[test]
     fn a_docker_build_and_push_of_the_workspace_is_a_sink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let pushed = consumer(&format!(
             "{CROSS_RUN_DOWNLOAD}      - uses: docker/build-push-action@v6\n        with:\n          context: .\n          push: true\n"
         ));
@@ -3235,6 +3278,7 @@ jobs:
 
     #[test]
     fn an_artifact_re_upload_hop_is_partial_not_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // A `workflow_run` relay downloads the fork's artifact and republishes it
         // under a new name, which the next consumer then executes.
         let relay = "name: Relay\non:\n  workflow_run:\n    workflows: [CI]\njobs:\n  relay:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/download-artifact@v4\n        with:\n          name: build\n          path: dist\n          run-id: ${{ github.event.workflow_run.id }}\n      - uses: actions/upload-artifact@v4\n        with:\n          name: relayed\n          path: dist\n";

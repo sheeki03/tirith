@@ -283,6 +283,7 @@ mod tests {
 
     #[test]
     fn update_baseline_flag_appends_and_replaces() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
         std::fs::write(&path, "paranoia: 2\nfail_mode: open\n").unwrap();
@@ -307,6 +308,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_baseline_flag_refuses_symlinked_policy() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let external = outside.path().join("bashrc-like");

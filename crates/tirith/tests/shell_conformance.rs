@@ -74,6 +74,44 @@ const VERDICT_IDLE: Duration = Duration::from_secs(60);
 /// reset against.
 const MARKER_MAX: Duration = Duration::from_secs(90);
 
+/// `status` of every shell execution receipt left in the isolated store.
+/// Hooks no longer send a separate `acknowledge` call: a successful consume
+/// retires its receipt in the same Tirith process, so no receipt may be left
+/// in the `committed` state once its command has run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn receipt_statuses(env: &IsolatedEnv) -> Vec<String> {
+    let directory = env.state_home.join("tirith/sessions/execution-receipts");
+    let mut statuses = Vec::new();
+    for entry in std::fs::read_dir(directory).expect("receipt directory") {
+        let path = entry.expect("receipt directory entry").path();
+        if path.extension().and_then(|part| part.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read receipt");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt JSON");
+        statuses.push(
+            value["state"]["status"]
+                .as_str()
+                .expect("receipt state status")
+                .to_owned(),
+        );
+    }
+    statuses
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_consumed_receipts_are_retired(env: &IsolatedEnv, shell: &str) {
+    let statuses = receipt_statuses(env);
+    assert!(
+        statuses.iter().any(|status| status == "acknowledged"),
+        "{shell}: the executed line's receipt must be retired by consume itself: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "committed"),
+        "{shell}: no consumed receipt may be left unretired: {statuses:?}"
+    );
+}
+
 /// Return `(confirmed, unresolved)` from the newest valid fixed-slot ledger.
 /// This independently verifies that a PTY command crossed the durable receipt
 /// boundary instead of merely exercising the hook's legacy fallback.
@@ -356,6 +394,7 @@ fn bash_preexec_warned_command_executes_once() {
 fn bash_preexec_enforce_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
     let marker = env.workdir.join("preexec_blocked.txt");
+    let allowed = env.workdir.join("preexec_allowed.txt");
     let bash = match modern_bash() {
         Some(b) => b,
         None => {
@@ -376,12 +415,31 @@ fn bash_preexec_enforce_blocked_command_does_not_execute() {
     sess.wait_idle(QUIET, SETTLE_MAX);
     sess.clear_buffer();
 
+    sess.send_line(&format!("printf 'ALLOWED\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "ALLOWED", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "ALLOWED"),
+        1,
+        "allowed control must execute exactly once"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
     // A blocked pipe-to-shell whose `&&`-guarded marker write must never happen.
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | bash && touch '{}'",
+        "printf 'true' | bash && touch '{}'",
         marker.display()
     ));
-    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "AFTER"),
+        1,
+        "shell must remain usable after blocking"
+    );
     sess.close();
 
     assert!(
@@ -743,6 +801,9 @@ fn bash_enter_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "bash");
     sess.close();
 
     assert_eq!(
@@ -1245,6 +1306,9 @@ fn fish_allowed_command_executes_exactly_once() {
     // No terminal output from `printf >> marker`; poll the marker file.
     sess.send_line(&format!("printf 'RAN\\n' >> '{}'", marker.display()));
     let body = wait_for_marker(&marker, "RAN", MARKER_MAX);
+    // Read the receipt store before close(): `exit` arms its own receipt,
+    // and that locked operation may already clean up the retired one.
+    assert_consumed_receipts_are_retired(&env, "fish");
     sess.close();
 
     assert_eq!(
@@ -1252,6 +1316,67 @@ fn fish_allowed_command_executes_exactly_once() {
         1,
         "fish: allowed command must execute exactly once, marker held: {body:?}"
     );
+}
+
+#[test]
+fn fish_multiline_commands_and_loops_execute_once() {
+    let mut env = IsolatedEnv::new();
+    let lines = env.workdir.join("fish_multiline.txt");
+    let loop_marker = env.workdir.join("fish_loop.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let commands = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'SECOND\\n' >> '{}'",
+        lines.display(),
+        lines.display()
+    );
+    session.send_raw(format!("\x1b[200~{commands}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&lines, "SECOND", MARKER_MAX);
+    assert_eq!(body, "FIRST\nSECOND\n");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+
+    let loop_command = format!(
+        "for item in one two\nprintf '%s\\n' $item >> '{}'\nend",
+        loop_marker.display()
+    );
+    session.send_raw(format!("\x1b[200~{loop_command}\x1b[201~\r").as_bytes());
+    let body = wait_for_marker(&loop_marker, "two", MARKER_MAX);
+    assert_eq!(body, "one\ntwo\n");
+    assert_consumed_receipts_are_retired(&env, "fish multiline");
+    session.close();
+}
+
+#[test]
+fn fish_multiline_block_checks_entire_buffer_before_execution() {
+    let mut env = IsolatedEnv::new();
+    let first = env.workdir.join("fish_multiline_first.txt");
+    let blocked = env.workdir.join("fish_multiline_blocked.txt");
+    let control = env.workdir.join("fish_multiline_control.txt");
+    let Some(mut session) = fish_session(&mut env) else {
+        eprintln!("skipping: fish not installed");
+        return;
+    };
+    let command = format!(
+        "printf 'FIRST\\n' >> '{}'\nprintf 'true' | bash; and touch '{}'",
+        first.display(),
+        blocked.display()
+    );
+    session.send_raw(format!("\x1b[200~{command}\x1b[201~\r").as_bytes());
+    session.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    session.send_line(&format!("printf 'AFTER\\n' >> '{}'", control.display()));
+    assert_eq!(wait_for_marker(&control, "AFTER", MARKER_MAX), "AFTER\n");
+    session.close();
+    assert!(
+        !first.exists(),
+        "no prefix of a blocked multiline buffer may run"
+    );
+    assert!(!blocked.exists(), "blocked second line must not run");
 }
 
 /// Issue #188: Fish completion must remain an editor-only action. Completing an
@@ -1313,14 +1438,21 @@ fn fish_allowed_command_output_visible() {
         }
     };
 
-    sess.send_line("echo fish_nonce_3471");
-    let out = sess.expect("fish_nonce_3471");
+    // The complete sentinel is absent from the typed command, so editor echo
+    // and autosuggestion redraws cannot satisfy the output assertion.
+    let command = "builtin printf '\\n%s%s\\n' 'fish_nonce_' '3471'";
+    let sentinel = "fish_nonce_3471";
+    assert!(!command.contains(sentinel));
+    sess.clear_buffer();
+    sess.send_line(command);
+    sess.expect(&format!("\r\n{sentinel}\r\n"));
     sess.close();
+    let out = sess.output();
 
-    let n = count_occurrences(&out, "fish_nonce_3471");
-    assert!(
-        (1..=3).contains(&n),
-        "fish: command output must be visible (echo + autosuggest + output), saw {n}"
+    assert_eq!(
+        count_occurrences(out, &format!("\r\n{sentinel}\r\n")),
+        1,
+        "fish: expected one standalone execution-output sentinel, got {out:?}"
     );
 }
 
@@ -1329,6 +1461,7 @@ fn fish_allowed_command_output_visible() {
 fn fish_blocked_command_does_not_execute() {
     let mut env = IsolatedEnv::new();
     let marker = env.workdir.join("fish_blocked.txt");
+    let allowed = env.workdir.join("fish_allowed_control.txt");
     let mut sess = match fish_session(&mut env) {
         Some(s) => s,
         None => {
@@ -1337,23 +1470,42 @@ fn fish_blocked_command_does_not_execute() {
         }
     };
 
+    sess.send_line(&format!("printf 'ALLOWED\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "ALLOWED", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "ALLOWED"),
+        1,
+        "allowed control must execute exactly once"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+
     // Blocked pipe-to-shell; the `; and touch` (fish syntax) runs only if the
     // pipe ran. tirith must block first.
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | bash; and touch '{}'",
+        "printf 'true' | bash; and touch '{}'",
         marker.display()
     ));
     // `expect_any` polls for the block verdict/hint (the "hook finished" signal,
     // since the hook's `tirith check` subprocess emits nothing until it returns
     // — `wait_idle` would return mid-subprocess, the no-output race).
     let out = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
+    );
+    sess.send_line(&format!("printf 'AFTER\\n' >> '{}'", allowed.display()));
+    let body = wait_for_marker(&allowed, "AFTER", MARKER_MAX);
+    assert_eq!(
+        count_occurrences(&body, "AFTER"),
+        1,
+        "shell must remain usable after blocking"
     );
     sess.close();
 
     assert!(
-        out.contains("BLOCKED") || out.contains("getvet.sh") || out.contains("tirith run"),
+        out.contains("BLOCKED")
+            || out.contains("tirith check --suggest")
+            || out.contains("tirith run"),
         "fish: a blocked command must surface a tirith verdict, got:\n{out}"
     );
     // The verdict surfaced only after `tirith check` returned, so the hook has
@@ -1715,17 +1867,20 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         1,
         "zsh warned command must execute exactly once"
     );
+    assert_consumed_receipts_are_retired(&env, "zsh");
 
     sess.send_line(&format!(
-        "curl https://example.com/install.sh | sh; touch '{}'",
+        "printf 'true' | sh; touch '{}'",
         blocked.display()
     ));
     let output = sess.expect_any(
-        &["BLOCKED", "getvet.sh", "tirith run"],
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
         Duration::from_secs(15),
     );
     assert!(
-        output.contains("BLOCKED") || output.contains("getvet.sh") || output.contains("tirith run"),
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
         "zsh blocked command must surface a Tirith verdict, got:\n{output}"
     );
     assert!(!blocked.exists(), "zsh blocked command must not execute");
@@ -1739,6 +1894,61 @@ fn zsh_protocol_v3_delivery_and_ledger_conformance() {
         unresolved,
         baseline_unresolved + 2,
         "only the allowed and warned zsh lines may enter shell-boundary history"
+    );
+    sess.close();
+}
+
+/// zsh runs the text after a word-start `#` unless `interactivecomments` is
+/// set, and `zsh -f -i` leaves it unset (zsh's default). The hook reports the
+/// option at every check, so a pipe to `sh` hidden behind `#` is blocked and
+/// nothing on the line runs; after `setopt interactivecomments` in the same
+/// session the `#` starts a comment again and only the text before it runs.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn zsh_hook_reads_hash_text_by_the_live_interactivecomments_option() {
+    let mut env = IsolatedEnv::new();
+    let hidden = env.workdir.join("zsh_hash_hidden.txt");
+    let visible = env.workdir.join("zsh_hash_visible.txt");
+    let mut sess = match zsh_session(&mut env) {
+        Some(session) => session,
+        None => {
+            eprintln!("skipping: zsh not installed");
+            return;
+        }
+    };
+
+    sess.send_line(&format!(
+        "print -r -- hi #; printf 'true' | sh; touch '{}'",
+        hidden.display()
+    ));
+    let output = sess.expect_any(
+        &["BLOCKED", "tirith check --suggest", "tirith run"],
+        VERDICT_IDLE,
+    );
+    assert!(
+        output.contains("BLOCKED")
+            || output.contains("tirith check --suggest")
+            || output.contains("tirith run"),
+        "the text after `#` must be checked while interactivecomments is unset, got:\n{output}"
+    );
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!hidden.exists(), "a blocked line must not run");
+    sess.clear_buffer();
+
+    sess.send_line("setopt interactivecomments");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    sess.clear_buffer();
+    sess.send_line(&format!(
+        "print -r -- RAN >> '{}' #; printf 'true' | sh; touch '{}'",
+        visible.display(),
+        hidden.display()
+    ));
+    let body = wait_for_marker(&visible, "RAN", MARKER_MAX);
+    assert_eq!(count_occurrences(&body, "RAN"), 1, "{body:?}");
+    sess.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !hidden.exists(),
+        "with interactivecomments set the text after `#` is a comment and must not run"
     );
     sess.close();
 }
@@ -1788,4 +1998,201 @@ fn harness_reports_bash_availability_consistently() {
             );
         }
     }
+}
+
+// Caller-shell verification tests drive the exact three commands through the
+// real native editor/DEBUG interception. A disposable child's success only
+// describes that child's process, hook and current configuration.
+fn verification_challenge(session: &mut PtySession) -> String {
+    session.clear_buffer();
+    session.send_line("_tirith_verification_probe start");
+    let output = session.expect("Evidence expires after five minutes.");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    let id = output
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("_tirith_verification_probe ")?;
+            let (id, kind) = rest.split_once(' ')?;
+            (kind == "allowed" && uuid::Uuid::parse_str(id).is_ok()).then(|| id.to_owned())
+        })
+        .expect("start must issue the exact inert commands");
+    session.clear_buffer();
+    id
+}
+
+fn verification_allowed(session: &mut PtySession, id: &str) {
+    session.send_line(&format!("_tirith_verification_probe {id} allowed"));
+    let output = session.expect("\"verified_blocking\": false");
+    assert!(output.contains("\"status\": \"pending\""));
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+}
+
+fn verification_complete(session: &mut PtySession, id: &str) {
+    verification_allowed(session, id);
+    session.send_line(&format!("_tirith_verification_probe {id} blocked"));
+    session.expect("diagnostic command blocked");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !output.contains("\"observation\""),
+        "blocked body executed: {output}"
+    );
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("\"status_exit_code\": 0");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    let start = output
+        .find('{')
+        .expect("helper must emit its JSON envelope");
+    let value: serde_json::Value = serde_json::Deserializer::from_str(&output[start..])
+        .into_iter()
+        .next()
+        .expect("helper JSON exists")
+        .expect("helper JSON is valid");
+    assert_eq!(value["observation"]["status"], "observed_blocking");
+    assert_eq!(value["observation"]["scope"], "current_shell_only");
+    assert_eq!(value["observation"]["source"], "authenticated_caller_shell");
+    assert_eq!(value["protection"]["verified_blocking"], true);
+    assert_eq!(value["status"]["protection_evidence"], value["protection"]);
+    assert_eq!(value["status"]["protected"], true);
+    assert_eq!(
+        value["status"]["requirement"]["verified_blocking_required"],
+        true
+    );
+    assert_eq!(value["status"]["requirement"]["satisfied"], true);
+    assert_eq!(value["status_exit_code"], 0);
+    session.clear_buffer();
+
+    // An ordinary child must not inherit the helper's proof or read a saved
+    // success into canonical status, even in the same still-protected PTY.
+    session.send_line("tirith status --json --require-verified-blocking");
+    session.expect("\"verified_blocking\": false");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    let start = output.find('{').expect("status must emit JSON");
+    let value: serde_json::Value = serde_json::Deserializer::from_str(&output[start..])
+        .into_iter()
+        .next()
+        .expect("status JSON exists")
+        .expect("status JSON is valid");
+    assert_eq!(value["protected"], false);
+    assert_eq!(value["requirement"]["satisfied"], false);
+    session.clear_buffer();
+}
+
+#[test]
+fn bash_caller_shell_verification_observes_actual_blocking() {
+    let mut env = IsolatedEnv::new();
+    env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
+    let Some(mut session) = bash_preexec_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // A changed startup input invalidates an earlier successful observation.
+    std::fs::write(env.home.join(".bashrc"), "# changed after verification\n").unwrap();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("shell verification check failed");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[test]
+fn fish_caller_shell_verification_observes_actual_blocking() {
+    let mut env = IsolatedEnv::new();
+    std::fs::create_dir_all(env.config_home.join("fish/conf.d")).unwrap();
+    let Some(mut session) = fish_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_caller_shell_verification_observes_actual_blocking_and_helper_drift() {
+    let mut env = IsolatedEnv::new();
+    let Some(mut session) = zsh_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // Ordinary analysis correctly refuses this dynamic function assignment.
+    // Deliberately turn interception off inside this disposable fixture, prove
+    // the redefinition executed, then restore protection before testing drift.
+    session.send_line("zle -A .accept-line accept-line");
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    let changed = env.workdir.join("helper-definition-changed");
+    session.send_line(&format!(
+        "functions[_tirith_verification_probe]=\"${{functions[_tirith_verification_probe]}}; :\" && builtin print -r -- changed > '{}'",
+        changed.display()
+    ));
+    assert_eq!(
+        wait_for_marker(&changed, "changed", MARKER_MAX),
+        "changed\n"
+    );
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line("zle -N accept-line _tirith_accept_line");
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("shell verification check failed");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn zsh_caller_shell_verification_rejects_disabled_interception() {
+    let mut env = IsolatedEnv::new();
+    let Some(mut session) = zsh_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_allowed(&mut session, &id);
+    session.send_line("zle -A .accept-line accept-line");
+    session.expect("TIRITH_PTY> ");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} blocked"));
+    session.expect("\"verified_blocking\": false");
+    session.wait_idle(QUIET, SETTLE_MAX);
+    session.clear_buffer();
+    session.send_line(&format!("_tirith_verification_probe {id} status"));
+    session.expect("\"verified_blocking\": false");
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(!output.contains("\"verified_blocking\": true"));
+}
+
+#[test]
+fn bash_caller_shell_verification_rejects_debug_trap_removal() {
+    let mut env = IsolatedEnv::new();
+    env.set("TIRITH_BASH_PREEXEC_ENFORCE", "1");
+    let Some(mut session) = bash_preexec_session(&mut env) else {
+        return;
+    };
+    let id = verification_challenge(&mut session);
+    verification_complete(&mut session, &id);
+    // Deliberately remove the native interception inside one accepted command,
+    // before another prompt can update the captured ownership facts.
+    session.send_line(&format!(
+        "trap - DEBUG; _tirith_verification_probe {id} status"
+    ));
+    let outcome = session.expect_any(
+        &["\"verified_blocking\": false", "shell verification"],
+        VERDICT_IDLE,
+    );
+    assert!(
+        outcome.contains("\"verified_blocking\": false") || outcome.contains("shell verification"),
+        "removed DEBUG trap produced no refusal: {outcome}"
+    );
+    let output = session.wait_idle(QUIET, SETTLE_MAX);
+    assert!(
+        !output.contains("\"verified_blocking\": true"),
+        "removed DEBUG trap retained verification: {output}"
+    );
 }

@@ -10,7 +10,6 @@ License:        AGPL-3.0-only
 URL:            https://github.com/sheeki03/tirith
 
 Requires:       ca-certificates
-Requires:       sudo
 
 %description
 Terminal security tool that intercepts commands and pasted text, detects
@@ -58,6 +57,9 @@ echo "  bash (~/.bashrc):                       eval \"\$(tirith init)\""
 echo "  fish (~/.config/fish/config.fish):      tirith init | source"
 echo ""
 echo "Then restart your terminal. Verify: tirith doctor"
+echo "Package approval is disabled in this release: 'tirith pkg approve' issues no approvals and never elevates."
+echo "The installed approval helper and sudo do not enable it; ordinary checks and shell protection remain available."
+echo "Package execution remains disabled pending native qualification."
 echo ""
 
 %changelog

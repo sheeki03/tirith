@@ -830,6 +830,7 @@ mod tests {
 
     #[test]
     fn ownership_index_adds_duplicate_owner_edges() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Two distributions both claim the same installed path: the cross-distribution
         // duplicate the ownership index detects becomes DuplicateOwner edges.
         let di = |name: &str| DistributionIdentity {
@@ -860,6 +861,7 @@ mod tests {
 
     #[test]
     fn ownership_via_index_distribution_ownership_round_trips() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Reuse the real B5 builder so the graph composes from the same primitive the
         // post-install path uses, not a test-only shortcut.
         let tmp = std::env::temp_dir().join(format!("prov-graph-{}", std::process::id()));

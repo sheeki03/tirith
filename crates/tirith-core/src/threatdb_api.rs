@@ -175,6 +175,7 @@ trait PackageThreatBackend {
 
 struct LivePackageThreatBackend {
     network: RuntimeThreatNetwork,
+    cache: CacheReadContext,
 }
 
 impl PackageThreatBackend for LivePackageThreatBackend {
@@ -184,7 +185,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         name: &str,
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        resolve_default_version(ecosystem, name, deadline, self.network)
+        resolve_default_version(ecosystem, name, deadline, self.network, &self.cache)
     }
 
     fn query_osv(
@@ -194,7 +195,14 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: &str,
         deadline: Instant,
     ) -> LookupOutcome<Vec<OsvVuln>> {
-        query_osv(ecosystem, name, version, deadline, self.network)
+        query_osv(
+            ecosystem,
+            name,
+            version,
+            deadline,
+            self.network,
+            &self.cache,
+        )
     }
 
     fn find_kev_alias(
@@ -202,7 +210,7 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         advisories: &[OsvVuln],
         deadline: Instant,
     ) -> LookupOutcome<Option<String>> {
-        find_kev_alias(advisories, deadline, self.network)
+        find_kev_alias(advisories, deadline, self.network, &self.cache)
     }
 
     fn collect_package_metadata(
@@ -212,7 +220,14 @@ impl PackageThreatBackend for LivePackageThreatBackend {
         version: Option<&str>,
         deadline: Instant,
     ) -> MetadataLookup {
-        collect_package_metadata(ecosystem, name, version, deadline, self.network)
+        collect_package_metadata(
+            ecosystem,
+            name,
+            version,
+            deadline,
+            self.network,
+            &self.cache,
+        )
     }
 }
 
@@ -253,7 +268,7 @@ fn package_incomplete_finding(
         return None;
     }
     Some(Finding {
-        rule_id: RuleId::AnalysisIncomplete,
+        rule_id: RuleId::PackageLookupIncomplete,
         severity: Severity::Medium,
         title: "Package threat intelligence could not be completed".to_string(),
         description: format!(
@@ -469,21 +484,106 @@ pub fn enrich_command_with_network(
     mode: RuntimeThreatMode,
     network: RuntimeThreatNetwork,
 ) -> Vec<Finding> {
+    enrich_command_readings_with_network(input, None, shell, config, mode, network)
+}
+
+/// [`enrich_command_with_network`] over every reading the engine analyzed:
+/// the command as typed and, when the analysis also read it the way an
+/// interactive shell without comment recognition runs it, that reading
+/// ([`crate::engine::interactive_comments_reading`]). The packages and URLs
+/// of both are looked up together, each once, so `echo hi #; npm install
+/// <pkg>` looks up the package that shell installs. The typed reading is
+/// always enriched; the other only adds to it.
+pub fn enrich_command_readings_with_network(
+    input: &str,
+    interactive_comments_reading: Option<&str>,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+) -> Vec<Finding> {
+    enrich_command_with_cache(
+        &readings(input, interactive_comments_reading),
+        shell,
+        config,
+        mode,
+        network,
+        CacheReadContext::new(unix_now(), mode.timeout()),
+    )
+}
+
+/// The input as typed, then the interactive-comments reading when there is
+/// one.
+fn readings<'a>(input: &'a str, interactive_comments_reading: Option<&'a str>) -> Vec<&'a str> {
+    std::iter::once(input)
+        .chain(interactive_comments_reading)
+        .collect()
+}
+
+/// One explicit read phase, with no network, cache publication or eviction.
+/// Complete refers to configured enrichment, not arbitrary command safety.
+pub(crate) fn capture_cached_enrichment(
+    input: &str,
+    interactive_comments_reading: Option<&str>,
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    captured_at: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Finding>, bool) {
+    let findings = enrich_command_with_cache(
+        &readings(input, interactive_comments_reading),
+        shell,
+        config,
+        RuntimeThreatMode::Inline,
+        RuntimeThreatNetwork::CacheOnly,
+        CacheReadContext::new(
+            captured_at.timestamp().max(0) as u64,
+            Duration::from_millis(500),
+        ),
+    );
+    let complete = !findings.iter().any(|finding| {
+        matches!(
+            finding.rule_id,
+            RuleId::AnalysisIncomplete | RuleId::PackageLookupIncomplete
+        )
+    });
+    (findings, complete)
+}
+
+fn enrich_command_with_cache(
+    inputs: &[&str],
+    shell: ShellType,
+    config: &ThreatIntelConfig,
+    mode: RuntimeThreatMode,
+    network: RuntimeThreatNetwork,
+    cache: CacheReadContext,
+) -> Vec<Finding> {
     if !config.osv_enabled && !config.deps_dev_enabled && config.google_safe_browsing_key.is_none()
     {
         return Vec::new();
     }
 
-    let segments = crate::tokenize::tokenize(input, shell);
-    // `extract_packages_detail_for_shell`, not the bare variant: the detail form
-    // exists precisely so a consumer whose output is a security decision can see
-    // that the package list was cut. Discarding it made a runtime verdict read
-    // as a complete assessment of a command it had only partly looked at.
-    let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
-    let extraction_truncated = extracted.truncated;
-    let packages = extracted.packages;
-    let urls = extract::extract_urls(input, shell);
-    let backend = LivePackageThreatBackend { network };
+    let mut extraction_truncated = false;
+    let mut packages = Vec::new();
+    let mut urls = Vec::new();
+    for input in inputs {
+        // Issue #264: `N=npm; "$N" install pkg` is enriched exactly like the
+        // literal `npm install pkg` it is proven to run.
+        let literal_view = crate::extract::posix_variable_command_literal_view(input, shell);
+        let input = literal_view.as_deref().unwrap_or(input);
+        let segments = crate::tokenize::tokenize(input, shell);
+        // `extract_packages_detail_for_shell`, not the bare variant: the detail
+        // form exists precisely so a consumer whose output is a security
+        // decision can see that the package list was cut. Discarding it made a
+        // runtime verdict read as a complete assessment of a command it had
+        // only partly looked at.
+        let extracted = threatintel::extract_packages_detail_for_shell(&segments, shell);
+        extraction_truncated |= extracted.truncated;
+        // Repeats across readings are looked up once (`deduplicate_packages`,
+        // and the URL candidate set below).
+        packages.extend(extracted.packages);
+        urls.extend(extract::extract_urls(input, shell));
+    }
+    let backend = LivePackageThreatBackend { network, cache };
     let (mut findings, package_budget_truncated) =
         enrich_packages_with_backend(packages, config, mode.timeout(), &backend);
     let mut seen = HashSet::new();
@@ -533,7 +633,9 @@ pub fn enrich_command_with_network(
                 }
             }
             for batch in candidates.chunks(GSB_BATCH_SIZE) {
-                for (url, match_type) in query_safe_browsing_batch(batch, api_key, deadline) {
+                for (url, match_type) in
+                    query_safe_browsing_batch(batch, api_key, deadline, &backend.cache)
+                {
                     let key = format!("safe-browsing:{url}");
                     if seen.insert(key) {
                         findings.push(Finding {
@@ -581,6 +683,133 @@ pub fn enrich_command_with_network(
     findings
 }
 
+// A capture owns the complete cache-read budget. Repeated references to a
+// package or KEV catalog reuse the first observed bytes, including misses.
+// No mutable global cache or thread-local input can change a frozen preview.
+struct CacheReadContext {
+    now: u64,
+    deadline: Instant,
+    state: std::cell::RefCell<CacheReadState>,
+}
+
+#[derive(Default)]
+struct CacheReadState {
+    bytes: u64,
+    entries: std::collections::BTreeMap<PathBuf, Option<std::rc::Rc<CachedValue>>>,
+}
+
+struct CachedValue {
+    fetched_at: u64,
+    value: serde_json::Value,
+}
+
+const MAX_CAPTURE_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CAPTURE_CACHE_FILES: usize = 128;
+const MAX_CACHE_JSON_NODES: usize = 65_536;
+
+impl CacheReadContext {
+    fn new(now: u64, timeout: Duration) -> Self {
+        Self {
+            now,
+            deadline: Instant::now() + timeout,
+            state: Default::default(),
+        }
+    }
+
+    fn load<T: DeserializeOwned>(&self, kind: &str, key: &str, ttl_secs: u64) -> Option<T> {
+        if Instant::now() >= self.deadline {
+            return None;
+        }
+        let path = cache_path(kind, key)?;
+        let cached = {
+            let mut state = self.state.borrow_mut();
+            if let Some(prior) = state.entries.get(&path) {
+                prior.clone()
+            } else {
+                if state.entries.len() >= MAX_CAPTURE_CACHE_FILES {
+                    return None;
+                }
+                let remaining = MAX_CAPTURE_CACHE_BYTES.saturating_sub(state.bytes);
+                let cap = remaining.min(MAX_RESPONSE_BYTES);
+                let observed = self
+                    .read(&path, cap, &mut state.bytes)
+                    .map(std::rc::Rc::new);
+                state.entries.insert(path, observed.clone());
+                observed
+            }
+        }?;
+        // Future clocks are unknown, never fresh forever via saturating_sub.
+        if cached.fetched_at > self.now
+            || self.now - cached.fetched_at > ttl_secs
+            || Instant::now() >= self.deadline
+        {
+            return None;
+        }
+        serde_json::from_value(cached.value.clone()).ok()
+    }
+
+    fn read(&self, path: &std::path::Path, cap: u64, bytes_read: &mut u64) -> Option<CachedValue> {
+        use crate::util::dirfd::{file_generation, DirCapability};
+        use std::io::Read as _;
+        if cap == 0 {
+            return None;
+        }
+        let parent = DirCapability::open_root(path.parent()?).ok()?;
+        let parent_identity = parent.identity().ok()?;
+        let name = path.file_name()?.to_str()?;
+        let mut file = parent.open_child_file(name, cap).ok()?;
+        let generation = file_generation(&file).ok()?;
+        let mut bytes = Vec::new();
+        let result = (&mut file)
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut bytes);
+        *bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+        if result.is_err()
+            || bytes.len() as u64 > cap
+            || file_generation(&file).ok()? != generation
+            || file_generation(&parent.open_child_file(name, cap).ok()?).ok()? != generation
+            || DirCapability::open_root(path.parent()?)
+                .ok()?
+                .identity()
+                .ok()?
+                != parent_identity
+            || Instant::now() >= self.deadline
+        {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let value = crate::mcp_lock::parse_json_no_duplicates(text).ok()?;
+        let mut pending = vec![&value];
+        let mut nodes = 0;
+        while let Some(value) = pending.pop() {
+            nodes += 1;
+            if nodes > MAX_CACHE_JSON_NODES {
+                return None;
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    if values.len() > MAX_DECODED_ITEMS {
+                        return None;
+                    }
+                    pending.extend(values.iter());
+                }
+                serde_json::Value::Object(values) => {
+                    if values.len() > MAX_DECODED_ITEMS {
+                        return None;
+                    }
+                    pending.extend(values.values());
+                }
+                _ => (),
+            }
+        }
+        let envelope: CacheEnvelope<serde_json::Value> = serde_json::from_value(value).ok()?;
+        Some(CachedValue {
+            fetched_at: envelope.fetched_at,
+            value: envelope.value,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope<T> {
     fetched_at: u64,
@@ -598,14 +827,9 @@ fn cache_path(kind: &str, key: &str) -> Option<PathBuf> {
     )
 }
 
+#[cfg(test)]
 fn load_cache<T: DeserializeOwned>(kind: &str, key: &str, ttl_secs: u64) -> Option<T> {
-    let path = cache_path(kind, key)?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let envelope: CacheEnvelope<T> = serde_json::from_str(&content).ok()?;
-    if unix_now().saturating_sub(envelope.fetched_at) > ttl_secs {
-        return None;
-    }
-    Some(envelope.value)
+    CacheReadContext::new(unix_now(), Duration::from_secs(5)).load(kind, key, ttl_secs)
 }
 
 fn store_cache<T: Serialize>(kind: &str, key: &str, value: &T) {
@@ -744,6 +968,7 @@ fn query_osv(
     version: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Vec<OsvVuln>> {
     let Some(label) = ecosystem_label(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -752,7 +977,7 @@ fn query_osv(
         return LookupOutcome::Unsupported;
     };
     let cache_key = format!("{label}:{name}:{version}");
-    if let Some(response) = load_cache::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
+    if let Some(response) = cache.load::<OsvQueryResponse>("osv", &cache_key, CACHE_TTL_SECS) {
         return LookupOutcome::Complete(response.vulns);
     }
     if !network.allows_network() {
@@ -798,6 +1023,36 @@ fn query_osv(
 struct DepsPackageResponse {
     #[serde(default)]
     versions: Vec<DepsPackageVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_published_at_secs: Option<i64>,
+}
+
+impl DepsPackageResponse {
+    fn bound_versions(&mut self) {
+        self.default_version = None;
+        self.first_published_at_secs = None;
+        if self.versions.len() > MAX_DECODED_ITEMS {
+            // Retain semantic metadata, not an arbitrary replacement record.
+            // Moving a late default avoids copying; the original prefix stays
+            // readable by older cache readers without losing its oldest entry.
+            self.first_published_at_secs = self
+                .versions
+                .iter()
+                .filter_map(|version| version.published_at.as_deref())
+                .filter_map(parse_rfc3339_secs)
+                .min();
+            if let Some(index) = self.versions.iter().position(|version| version.is_default) {
+                if index >= MAX_DECODED_ITEMS {
+                    self.default_version = Some(std::mem::take(
+                        &mut self.versions[index].version_key.version,
+                    ));
+                }
+            }
+            self.versions.truncate(MAX_DECODED_ITEMS);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -820,6 +1075,7 @@ fn deps_package(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<DepsPackageResponse> {
     let Some(system) = deps_system_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -827,7 +1083,7 @@ fn deps_package(
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{system}:{encoded}");
     if let Some(response) =
-        load_cache::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
+        cache.load::<DepsPackageResponse>("deps-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
     }
@@ -857,7 +1113,7 @@ fn deps_package(
             Ok(response) => response,
             Err(error) => return LookupOutcome::Incomplete(error),
         };
-    response.versions.truncate(MAX_DECODED_ITEMS);
+    response.bound_versions();
     store_cache("deps-package", &cache_key, &response);
     LookupOutcome::Complete(response)
 }
@@ -867,14 +1123,16 @@ fn resolve_default_version(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Option<String>> {
-    match deps_package(ecosystem, name, deadline, network) {
+    match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(package) => LookupOutcome::Complete(
             package
                 .versions
                 .into_iter()
                 .find(|version| version.is_default)
-                .map(|version| version.version_key.version),
+                .map(|version| version.version_key.version)
+                .or(package.default_version),
         ),
         LookupOutcome::Unsupported => LookupOutcome::Unsupported,
         LookupOutcome::Incomplete(error) => LookupOutcome::Incomplete(error),
@@ -897,6 +1155,7 @@ fn ecosystems_package(
     name: &str,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<EcosystemsPackageResponse> {
     let Some(registry) = ecosystems_registry_name(ecosystem) else {
         return LookupOutcome::Unsupported;
@@ -904,7 +1163,7 @@ fn ecosystems_package(
     let encoded = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
     let cache_key = format!("{registry}:{encoded}");
     if let Some(response) =
-        load_cache::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
+        cache.load::<EcosystemsPackageResponse>("ecosystems-package", &cache_key, CACHE_TTL_SECS)
     {
         return LookupOutcome::Complete(response);
     }
@@ -958,18 +1217,23 @@ fn collect_package_metadata(
     _version: Option<&str>,
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> MetadataLookup {
     let mut incomplete = Vec::new();
-    let first_release_days = match deps_package(ecosystem, name, deadline, network) {
+    let first_release_days = match deps_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(response) => response
-            .versions
-            .iter()
-            .filter_map(|version| version.published_at.as_deref())
-            .filter_map(parse_rfc3339_secs)
-            .min()
+            .first_published_at_secs
+            .or_else(|| {
+                response
+                    .versions
+                    .iter()
+                    .filter_map(|version| version.published_at.as_deref())
+                    .filter_map(parse_rfc3339_secs)
+                    .min()
+            })
             .map(|first_seen| {
-                let now = unix_now() as i64;
-                ((now - first_seen).max(0)) / 86_400
+                let now = cache.now as i64;
+                now.saturating_sub(first_seen).max(0) / 86_400
             }),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -978,7 +1242,7 @@ fn collect_package_metadata(
         }
     };
 
-    let maintainers = match ecosystems_package(ecosystem, name, deadline, network) {
+    let maintainers = match ecosystems_package(ecosystem, name, deadline, network, cache) {
         LookupOutcome::Complete(package) => Some(package.maintainers.len()),
         LookupOutcome::Unsupported => None,
         LookupOutcome::Incomplete(error) => {
@@ -1008,8 +1272,12 @@ struct KevVulnerability {
     cve_id: String,
 }
 
-fn kev_aliases(deadline: Instant, network: RuntimeThreatNetwork) -> LookupOutcome<HashSet<String>> {
-    if let Some(cached) = load_cache::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
+fn kev_aliases(
+    deadline: Instant,
+    network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
+) -> LookupOutcome<HashSet<String>> {
+    if let Some(cached) = cache.load::<Vec<String>>("kev", "active", KEV_CACHE_TTL_SECS) {
         return LookupOutcome::Complete(cached.into_iter().collect());
     }
     if !network.allows_network() {
@@ -1045,11 +1313,12 @@ fn find_kev_alias(
     advisories: &[OsvVuln],
     deadline: Instant,
     network: RuntimeThreatNetwork,
+    cache: &CacheReadContext,
 ) -> LookupOutcome<Option<String>> {
     if advisories.is_empty() {
         return LookupOutcome::Complete(None);
     }
-    match kev_aliases(deadline, network) {
+    match kev_aliases(deadline, network, cache) {
         LookupOutcome::Complete(kev) => LookupOutcome::Complete(
             advisories
                 .iter()
@@ -1090,12 +1359,13 @@ fn query_safe_browsing_batch(
     urls: &[String],
     api_key: &str,
     deadline: Instant,
+    cache: &CacheReadContext,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     for url in urls {
         if let Some(response) =
-            load_cache::<SafeBrowsingResponse>("safe-browsing", url, CACHE_TTL_SECS)
+            cache.load::<SafeBrowsingResponse>("safe-browsing", url, CACHE_TTL_SECS)
         {
             if let Some(m) = response.matches.first() {
                 out.push((url.clone(), m.threat_type.clone()));
@@ -1374,6 +1644,28 @@ fn safe_browsing_candidate_url(
         UrlLike::Standard { parsed, .. } if matches!(parsed.scheme(), "http" | "https") => {
             parsed.as_str()
         }
+        UrlLike::Unparsed {
+            raw_host: Some(host),
+            ..
+        } if matches!(parsed.scheme(), Some("http" | "https")) => {
+            let metadata = url::Url::parse(raw).ok()?;
+            if let Some(domain) = crate::parse::curl_empty_hex_dns_url_host(raw) {
+                if domain != *host {
+                    return None;
+                }
+                // Re-parsing the host would silently change the subject to
+                // an IP. DNS-classify the retained client authority, then
+                // build the scrubbed origin directly without its secrets.
+                return privacy_scrub_authority(
+                    metadata.scheme(),
+                    url::Host::Domain(domain.as_str()),
+                    metadata.port(),
+                    resolver,
+                    dns_budget,
+                );
+            }
+            raw
+        }
         UrlLike::Unparsed { .. } if raw.starts_with("http://") || raw.starts_with("https://") => {
             raw
         }
@@ -1397,18 +1689,32 @@ fn privacy_scrub_url(
     resolver: Option<&dyn crate::network::DnsResolver>,
     dns_budget: &mut crate::network::DnsRequestBudget,
 ) -> Option<String> {
-    let mut parsed = url::Url::parse(raw).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let parsed = url::Url::parse(raw).ok()?;
+    privacy_scrub_authority(
+        parsed.scheme(),
+        parsed.host()?,
+        parsed.port(),
+        resolver,
+        dns_budget,
+    )
+}
+
+/// Host kind has already been selected by the originating parser. Never
+/// reinterpret a retained client DNS name as a WHATWG numeric address here.
+fn privacy_scrub_authority(
+    scheme: &str,
+    host: url::Host<&str>,
+    port: Option<u16>,
+    resolver: Option<&dyn crate::network::DnsResolver>,
+    dns_budget: &mut crate::network::DnsRequestBudget,
+) -> Option<String> {
+    if !matches!(scheme, "http" | "https") {
         return None;
     }
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    // Local-only classification (no DNS — we never connect to the candidate,
-    // we only transmit its scrubbed string): reject non-public IP literals and
-    // intranet-style hostnames so internal URLs never leave the machine.
-    match parsed.host()? {
+    // Classify literals locally and DNS names through the bounded resolver.
+    // Never connect to the candidate; only its scrubbed origin can leave the
+    // machine after every observed address has passed the public-address check.
+    match host {
         url::Host::Ipv4(v4) => {
             if !crate::url_validate::is_public_addr(&std::net::SocketAddr::new(
                 std::net::IpAddr::V4(v4),
@@ -1448,8 +1754,8 @@ fn privacy_scrub_url(
     }
     // Keep only the origin. Secrets embedded in path segments are as sensitive
     // as query tokens, and Safe Browsing does not justify disclosing them.
-    parsed.set_path("/");
-    Some(parsed.into())
+    let port = port.map(|port| format!(":{port}")).unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}/"))
 }
 
 fn ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
@@ -1541,6 +1847,440 @@ mod tests {
     use std::net::IpAddr;
     use std::sync::Mutex;
     use url::Url;
+
+    fn write_cache_fixture(kind: &str, key: &str, value: &str) -> PathBuf {
+        let path = cache_path(kind, key).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, value).unwrap();
+        path
+    }
+
+    #[test]
+    fn bounded_package_cache_preserves_default_version_resolution() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        for (name, defaults, expected) in [
+            ("late-default", vec![MAX_DECODED_ITEMS + 16], Some("1.64.0")),
+            (
+                "boundary-default",
+                vec![MAX_DECODED_ITEMS - 1],
+                Some("1.64.0"),
+            ),
+            (
+                "first-default",
+                vec![0, MAX_DECODED_ITEMS + 16],
+                Some("1.64.0"),
+            ),
+            ("no-default", vec![], None),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: if defaults.contains(&index) {
+                                "1.64.0".into()
+                            } else {
+                                format!("0.{index}.0")
+                            },
+                        },
+                        published_at: None,
+                        is_default: defaults.contains(&index),
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            // Preserve the first default's meaning even if malformed upstream
+            // metadata designates a different later version as default too.
+            if name == "first-default" {
+                response.versions[MAX_DECODED_ITEMS + 16]
+                    .version_key
+                    .version = "2.0.0".into();
+            }
+            response.bound_versions();
+            store_cache(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &response,
+            );
+            let cache = CacheReadContext::new(unix_now(), Duration::from_secs(5));
+            let result = resolve_default_version(
+                Ecosystem::Npm,
+                name,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            match result {
+                LookupOutcome::Complete(version) => {
+                    assert_eq!(version.as_deref(), expected, "{name}");
+                }
+                other => panic!("bounded cache must remain usable for {name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_package_cache_preserves_package_age_with_a_late_default() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let now = parse_rfc3339_secs("2026-01-15T00:00:00Z").unwrap() as u64;
+        for (name, oldest_index) in [
+            ("oldest-boundary", MAX_DECODED_ITEMS - 1),
+            ("oldest-beyond-prefix", MAX_DECODED_ITEMS + 8),
+        ] {
+            let mut response = DepsPackageResponse {
+                versions: (0..MAX_DECODED_ITEMS + 17)
+                    .map(|index| DepsPackageVersion {
+                        version_key: DepsVersionKey {
+                            version: format!("1.{index}.0"),
+                        },
+                        published_at: Some(if index == oldest_index {
+                            "2000-01-01T00:00:00Z".into()
+                        } else {
+                            "2026-01-01T00:00:00Z".into()
+                        }),
+                        is_default: index == MAX_DECODED_ITEMS + 16,
+                    })
+                    .collect(),
+                default_version: None,
+                first_published_at_secs: None,
+            };
+            response.bound_versions();
+            write_cache_fixture(
+                "deps-package",
+                &format!("npm:{}", utf8_percent_encode(name, NON_ALPHANUMERIC)),
+                &serde_json::json!({"fetched_at": now, "value": response}).to_string(),
+            );
+            let cache = CacheReadContext::new(now, Duration::from_secs(5));
+            let metadata = collect_package_metadata(
+                Ecosystem::Npm,
+                name,
+                None,
+                Instant::now() + Duration::from_secs(5),
+                RuntimeThreatNetwork::CacheOnly,
+                &cache,
+            );
+            let signal = metadata.signal.expect("cached package age");
+            assert_eq!(
+                signal.first_release_days,
+                Some((now as i64 - parse_rfc3339_secs("2000-01-01T00:00:00Z").unwrap()) / 86_400),
+                "{name}",
+            );
+            assert!(
+                !signal.is_suspicious(),
+                "established package cannot become new: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_cache_capture_reuses_first_hit_and_miss_without_writes() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let path = write_cache_fixture(
+            "fixture",
+            "known",
+            r#"{"fetched_at":100,"value":["first"]}"#,
+        );
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert_eq!(
+            cache.load::<Vec<String>>("fixture", "known", 60).unwrap(),
+            ["first"]
+        );
+        let bytes = cache.state.borrow().bytes;
+        std::fs::write(&path, r#"{"fetched_at":100,"value":["changed"]}"#).unwrap();
+        assert_eq!(
+            cache.load::<Vec<String>>("fixture", "known", 60).unwrap(),
+            ["first"]
+        );
+        assert_eq!(cache.state.borrow().bytes, bytes);
+        assert!(cache
+            .load::<Vec<String>>("fixture", "missing", 60)
+            .is_none());
+        write_cache_fixture("fixture", "missing", r#"{"fetched_at":100,"value":[]}"#);
+        assert!(cache
+            .load::<Vec<String>>("fixture", "missing", 60)
+            .is_none());
+        assert_eq!(
+            CacheReadContext::new(100, Duration::from_secs(5))
+                .load::<Vec<String>>("fixture", "known", 60)
+                .unwrap(),
+            ["changed"]
+        );
+    }
+
+    #[test]
+    fn bounded_cache_rejects_future_expired_duplicate_and_excessive_values() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        for (key, text) in [
+            ("future", r#"{"fetched_at":101,"value":[]}"#.to_string()),
+            ("expired", r#"{"fetched_at":1,"value":[]}"#.to_string()),
+            (
+                "duplicate",
+                r#"{"fetched_at":100,"fetched_at":100,"value":[]}"#.to_string(),
+            ),
+            (
+                "collection",
+                serde_json::json!({"fetched_at":100,"value":vec!["x";MAX_DECODED_ITEMS+1]})
+                    .to_string(),
+            ),
+        ] {
+            write_cache_fixture("fixture", key, &text);
+            assert!(
+                CacheReadContext::new(100, Duration::from_secs(5))
+                    .load::<Vec<String>>("fixture", key, 60)
+                    .is_none(),
+                "{key}"
+            );
+        }
+        let large = write_cache_fixture("fixture", "large", "");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(large)
+            .unwrap()
+            .set_len(MAX_RESPONSE_BYTES + 1)
+            .unwrap();
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert!(cache.load::<Vec<String>>("fixture", "large", 60).is_none());
+        assert_eq!(
+            cache.state.borrow().bytes,
+            0,
+            "oversize refused before read"
+        );
+
+        write_cache_fixture("fixture", "small", r#"{"fetched_at":100,"value":[]}"#);
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        cache.state.borrow_mut().bytes = MAX_CAPTURE_CACHE_BYTES - 1;
+        assert!(cache.load::<Vec<String>>("fixture", "small", 60).is_none());
+        let cache = CacheReadContext::new(100, Duration::ZERO);
+        assert!(cache.load::<Vec<String>>("fixture", "small", 60).is_none());
+        assert!(cache.state.borrow().entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_cache_refuses_symlink_fifo_and_replaced_directory() {
+        use std::os::unix::fs::symlink;
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let source = write_cache_fixture("fixture", "source", r#"{"fetched_at":100,"value":[]}"#);
+        let linked = cache_path("fixture", "link").unwrap();
+        symlink(&source, &linked).unwrap();
+        let fifo = cache_path("fixture", "fifo").unwrap();
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let cache = CacheReadContext::new(100, Duration::from_secs(5));
+        assert!(cache.load::<Vec<String>>("fixture", "link", 60).is_none());
+        assert!(cache.load::<Vec<String>>("fixture", "fifo", 60).is_none());
+        let directory = source.parent().unwrap();
+        let moved = directory.with_extension("moved");
+        std::fs::rename(directory, &moved).unwrap();
+        symlink(&moved, directory).unwrap();
+        assert!(cache.load::<Vec<String>>("fixture", "source", 60).is_none());
+    }
+
+    #[test]
+    fn disabled_cached_enrichment_has_no_gap_and_creates_no_cache_directory() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let config = ThreatIntelConfig {
+            osv_enabled: false,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        };
+        let directory = policy::state_dir().unwrap().join("threatdb-api-cache");
+        assert!(!directory.exists());
+        let (findings, complete) = capture_cached_enrichment(
+            "pip install missing-package==1.0.0",
+            None,
+            ShellType::Posix,
+            &config,
+            chrono::Utc::now(),
+        );
+        assert!(findings.is_empty() && complete);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn frozen_cached_threat_uses_candidate_policy_and_never_rereads_changed_cache() {
+        let guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let name = "tirith-frozen-cache-regression";
+        // The existing PEP440 contract canonicalizes ==1.0.0 to exact version
+        // "1" before choosing a registry/cache identity.
+        let key = format!("pypi:{name}:1");
+        store_cache(
+            "osv",
+            &key,
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-FROZEN-FIXTURE".into(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+        store_cache("kev", "active", &Vec::<String>::new());
+        let policy = crate::policy::Policy {
+            threat_intel: ThreatIntelConfig {
+                osv_enabled: true,
+                deps_dev_enabled: false,
+                google_safe_browsing_key: None,
+                ..ThreatIntelConfig::default()
+            },
+            ..crate::policy::Policy::default()
+        };
+        let context = crate::engine::AnalysisContext {
+            input: format!("pip install {name}==1.0.0"),
+            shell: ShellType::Posix,
+            scan_context: crate::extract::ScanContext::Exec,
+            raw_bytes: None,
+            interactive: true,
+            cwd: Some(guard.roots().cwd.display().to_string()),
+            file_path: None,
+            repo_root: None,
+            is_config_override: false,
+            clipboard_html: None,
+            card_ref: None,
+            clipboard_source: crate::clipboard::ClipboardSourceState::AbsentOrInvalid,
+            python_inspect_inherited: false,
+            cdpath_inherited: false,
+            interactive_comments: true,
+        };
+        let frozen = crate::evaluation::FrozenEvaluation::capture_with_policy(
+            context,
+            &policy,
+            crate::escalation::CallerContext::Cli,
+            None,
+            crate::evaluation::SessionEvidence::Captured(Box::new(
+                crate::session_warnings::SessionWarnings::new("frozen-cache"),
+            )),
+        );
+        let before = frozen.evaluate_current();
+        assert!(
+            !before
+                .explanation
+                .gaps
+                .contains(&crate::evaluation::EvidenceGap::RuntimeThreatEnrichmentNotCaptured),
+            "{:?}",
+            before.verdict.findings
+        );
+        assert!(before
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable));
+        std::fs::remove_dir_all(policy::state_dir().unwrap().join("threatdb-api-cache")).unwrap();
+        let repeated = frozen.evaluate_current();
+        assert_eq!(
+            serde_json::to_value(&before.verdict).unwrap(),
+            serde_json::to_value(&repeated.verdict).unwrap()
+        );
+        assert!(!policy::state_dir()
+            .unwrap()
+            .join("threatdb-api-cache")
+            .exists());
+        let mut candidate = policy;
+        candidate.paranoia = 4;
+        candidate
+            .severity_overrides
+            .insert(RuleId::ThreatOsvVulnerable.to_string(), Severity::Info);
+        let changed = frozen.evaluate(&candidate);
+        assert!(changed
+            .verdict
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable
+                && finding.severity == Severity::Info));
+        assert!(!changed
+            .explanation
+            .gaps
+            .contains(&crate::evaluation::EvidenceGap::DetectorPolicyChanged));
+    }
+
+    /// `echo hi #; pip install <pkg>` in an interactive shell without comment
+    /// recognition installs the package, so enrichment of that reading looks
+    /// it up; the typed reading alone holds only a comment. Both runtime
+    /// paths read it: inline enrichment and a frozen capture.
+    #[test]
+    fn enrichment_also_reads_the_interactive_comments_reading() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().unwrap();
+        let name = "tirith-hidden-behind-hash";
+        store_cache(
+            "osv",
+            &format!("pypi:{name}:1"),
+            &OsvQueryResponse {
+                vulns: vec![OsvVuln {
+                    id: "OSV-HIDDEN-FIXTURE".into(),
+                    aliases: Vec::new(),
+                    summary: None,
+                    references: Vec::new(),
+                }],
+            },
+        );
+        store_cache("kev", "active", &Vec::<String>::new());
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            google_safe_browsing_key: None,
+            ..ThreatIntelConfig::default()
+        };
+        let typed = format!("echo hi #; pip install {name}==1.0.0");
+        let reading = |interactive_comments| {
+            crate::engine::interactive_comments_reading(
+                &typed,
+                ShellType::Posix,
+                crate::extract::ScanContext::Exec,
+                true,
+                interactive_comments,
+            )
+        };
+        assert_eq!(
+            reading(true),
+            None,
+            "comments recognised: no second reading"
+        );
+        let reading = reading(false).expect("the reading without comments");
+        let osv = |findings: &[Finding]| {
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+        };
+        let enrich = |reading: Option<&str>| {
+            enrich_command_readings_with_network(
+                &typed,
+                reading,
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        assert!(!osv(&enrich(None)));
+        let both = enrich(Some(&reading));
+        assert!(osv(&both), "{both:?}");
+        let plain = format!("pip install {name}==1.0.0");
+        assert_eq!(
+            enrich_command_readings_with_network(
+                &plain,
+                Some(&plain),
+                ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+            .iter()
+            .filter(|finding| finding.rule_id == RuleId::ThreatOsvVulnerable)
+            .count(),
+            1,
+            "a package both readings hold is looked up once"
+        );
+        let (captured, _) = capture_cached_enrichment(
+            &typed,
+            Some(&reading),
+            ShellType::Posix,
+            &config,
+            chrono::Utc::now(),
+        );
+        assert!(osv(&captured), "{captured:?}");
+    }
 
     #[derive(Default)]
     struct FakeDns {
@@ -1934,6 +2674,7 @@ mod tests {
 
     #[test]
     fn enrich_command_returns_empty_when_all_apis_disabled() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let config = ThreatIntelConfig {
             osv_enabled: false,
             deps_dev_enabled: false,
@@ -2020,7 +2761,7 @@ mod tests {
                 "later package was starved for {command}: {findings:?}"
             );
             assert!(findings.iter().any(|finding| {
-                finding.rule_id == RuleId::AnalysisIncomplete
+                finding.rule_id == RuleId::PackageLookupIncomplete
                     && finding.description.contains("slow-pkg")
                     && finding
                         .description
@@ -2039,7 +2780,7 @@ mod tests {
             &failed,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding.description.contains("OSV lookup transport failed")
                 && finding.description.contains("not evidence")
         }));
@@ -2058,7 +2799,7 @@ mod tests {
             &unsatisfied,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("registry default does not satisfy constraint")
@@ -2081,7 +2822,7 @@ mod tests {
             &backend,
         );
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("default-version resolution deadline exhausted")
@@ -2114,6 +2855,7 @@ mod tests {
             "1.0.0",
             deadline,
             RuntimeThreatNetwork::CacheOnly,
+            &CacheReadContext::new(unix_now(), Duration::from_secs(5)),
         );
         assert!(matches!(cached, LookupOutcome::Complete(vulns) if vulns.len() == 1));
 
@@ -2123,6 +2865,7 @@ mod tests {
             "9.9.9",
             deadline,
             RuntimeThreatNetwork::CacheOnly,
+            &CacheReadContext::new(unix_now(), Duration::from_secs(5)),
         );
         assert!(
             matches!(missing, LookupOutcome::Incomplete(LookupFailure::Offline)),
@@ -2148,7 +2891,7 @@ mod tests {
         );
 
         assert!(findings.iter().any(|finding| {
-            finding.rule_id == RuleId::AnalysisIncomplete
+            finding.rule_id == RuleId::PackageLookupIncomplete
                 && finding
                     .description
                     .contains("OSV lookup was skipped by offline mode")
@@ -2159,6 +2902,109 @@ mod tests {
                     .description
                     .contains("offline mode forbids DNS and HTTP")
         }));
+    }
+
+    /// A package lookup that could not be completed (here: offline with no
+    /// cached answer) is its own Medium rule, a warning rather than a block,
+    /// and never the High `analysis_incomplete` that unanalyzable command
+    /// structure produces. It still marks the enrichment as incomplete.
+    #[test]
+    fn package_lookup_gaps_have_their_own_rule_id_and_stay_medium() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: true,
+            ..ThreatIntelConfig::default()
+        };
+        for input in [
+            "pip install tirith-offline-command-fixture",
+            "npm install tirith-offline-npm-fixture@9.9.9",
+        ] {
+            let findings = enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            );
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == RuleId::PackageLookupIncomplete
+                        && finding.severity == Severity::Medium
+                }),
+                "{input}: {findings:?}"
+            );
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule_id != RuleId::AnalysisIncomplete),
+                "{input}: {findings:?}"
+            );
+            assert_eq!(
+                crate::verdict::action_from_findings(&findings),
+                crate::verdict::Action::Warn,
+                "{input}"
+            );
+            let (_, complete) = capture_cached_enrichment(
+                input,
+                None,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                chrono::Utc::now(),
+            );
+            assert!(!complete, "{input}");
+        }
+    }
+
+    /// Issue #264: a package manager named through a proven literal variable is
+    /// enriched exactly like the literal command, so indirection cannot skip
+    /// runtime package intelligence.
+    #[test]
+    fn variable_named_package_manager_is_enriched_like_the_literal() {
+        let _guard = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        let config = ThreatIntelConfig {
+            osv_enabled: true,
+            deps_dev_enabled: false,
+            ..ThreatIntelConfig::default()
+        };
+        let enrich = |input: &str| {
+            enrich_command_with_network(
+                input,
+                crate::tokenize::ShellType::Posix,
+                &config,
+                RuntimeThreatMode::Inline,
+                RuntimeThreatNetwork::CacheOnly,
+            )
+        };
+        for (literal, indirect) in [
+            (
+                "P=pip; pip install tirith-offline-command-fixture==9.9.9",
+                r#"P=pip; "$P" install tirith-offline-command-fixture==9.9.9"#,
+            ),
+            (
+                "N=npm; npm install tirith-offline-npm-fixture@9.9.9",
+                r#"N=npm; "${N}" install tirith-offline-npm-fixture@9.9.9"#,
+            ),
+        ] {
+            let literal_findings = enrich(literal);
+            assert!(
+                literal_findings
+                    .iter()
+                    .any(|finding| finding.rule_id == RuleId::PackageLookupIncomplete),
+                "{literal}: {literal_findings:?}"
+            );
+            let describe = |findings: &[Finding]| {
+                findings
+                    .iter()
+                    .map(|finding| (finding.rule_id, finding.description.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                describe(&enrich(indirect)),
+                describe(&literal_findings),
+                "{indirect}"
+            );
+        }
     }
 
     /// Runtime enrichment has three independent caps and every one of them used
@@ -2210,6 +3056,66 @@ mod tests {
             all.description.contains("incompletely analyzed"),
             "the verdict wording must say it is not clean: {}",
             all.description
+        );
+    }
+    #[test]
+    fn curl_empty_hex_safe_browsing_preserves_dns_and_scrubs_origin() {
+        let raw = "HTTP://trusted.example:password@0x7f.%30x:8080/private?secret=yes#token";
+        let parsed = crate::extract::parse_curl_destination(raw);
+        let resolver = FakeDns::public_for(&["0x7f.0x"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, Some(&resolver), &mut dns_budget()),
+            Some("http://0x7f.0x:8080/".to_string())
+        );
+        assert_eq!(*resolver.calls.lock().unwrap(), vec!["0x7f.0x"]);
+        let private = FakeDns::public_for(&[])
+            .with_answer("0x7f.0x", Some(vec!["127.0.0.1".parse().unwrap()]));
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, Some(&private), &mut dns_budget()),
+            None
+        );
+        assert_eq!(*private.calls.lock().unwrap(), vec!["0x7f.0x"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&parsed, raw, None, &mut dns_budget()),
+            None
+        );
+    }
+    #[test]
+    fn curl_dns_origin_requires_consistent_authority_and_all_public_answers() {
+        let raw = "http://0x7f.0x:8080/private?token=secret";
+        let parsed = crate::extract::parse_curl_destination(raw);
+        for answers in [
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                "93.184.216.34".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            ]),
+        ] {
+            let resolver = FakeDns::public_for(&[]).with_answer("0x7f.0x", answers);
+            assert_eq!(
+                safe_browsing_candidate_url(&parsed, raw, Some(&resolver), &mut dns_budget()),
+                None
+            );
+        }
+        let contradictory = UrlLike::Unparsed {
+            raw: raw.to_string(),
+            raw_host: Some("example.com".to_string()),
+            raw_path: None,
+        };
+        let resolver = FakeDns::public_for(&["0x7f.0x", "example.com"]);
+        assert_eq!(
+            safe_browsing_candidate_url(&contradictory, raw, Some(&resolver), &mut dns_budget()),
+            None
+        );
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            privacy_scrub_url(
+                "https://user:secret@[2606:4700:4700::1111]:8080/path?token=secret",
+                None,
+                &mut dns_budget()
+            ),
+            Some("https://[2606:4700:4700::1111]:8080/".to_string())
         );
     }
 }

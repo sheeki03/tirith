@@ -184,7 +184,11 @@ fn redacted_task_boundary_projection(
     compiled: &tirith_core::redact::CompiledCustomPatterns,
 ) -> serde_json::Value {
     let mut projection = assessment.projection();
-    tirith_core::redact::redact_json_strings(&mut projection, compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut projection,
+        tirith_core::output_contract::Projection::Task,
+        compiled,
+    );
     tirith_core::verdict::bound_json_value_for_output(projection)
 }
 
@@ -370,6 +374,7 @@ mod tests {
 
     #[test]
     fn enforcing_operator_policy_refuses_before_fetch() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let policy = tirith_core::policy::Policy {
             task_gate: tirith_core::web3_policy::TaskGatePolicy {
                 mode: tirith_core::web3_policy::TaskGateMode::Enforce,

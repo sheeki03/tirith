@@ -20,32 +20,35 @@ If hooks are not found:
 
 ## Filing a bug report: `tirith doctor --bundle`
 
-To attach a complete, **redacted** diagnostic to a bug report, run:
+Preview local diagnostics before saving or sharing them:
 
+```sh
+tirith doctor --bundle --bundle-preview --json
 ```
-tirith doctor --bundle
+
+Select an incident from `tirith audit recent --json` or a saved setup/lifecycle
+operation when it is relevant. Use the actual event or operation UUID:
+
+```sh
+tirith doctor --bundle --bundle-preview --bundle-incident EVENT_UUID --bundle-operation OPERATION_UUID --json
 ```
 
-It writes a single text file (path printed on completion, under
-`~/.local/state/tirith/`) containing the doctor info, tirith and hook
-versions, shell / mode / effective protection, hook-chain state, policy
-discovery, threat-DB status, and a curated slice of the environment. The
-aliases `tirith doctor --redacted-report` and `tirith doctor --shell-trace`
-produce the same file.
+Selections are explicit, with at most ten incidents and operations combined.
+Incident lookup searches a bounded recent page, not the entire history. Missing,
+ambiguous and withheld entries are reported; the bundle does not verify audit
+integrity or prove that an operation executed.
 
-The bundle is **redacted by design**:
+Omit `--bundle-preview` to save the same selection with fresh redaction. The
+candidate writes a private JSON file under Tirith's state directory, normally
+`~/.local/state/tirith/support/` (or `$XDG_STATE_HOME/tirith/support/`).
+`--json` reports `bundle_path` and `shared: false`; no upload occurs. The aliases
+`--redacted-report` and `--shell-trace` select the same bundle mode.
 
-- Only a curated allowlist of tirith-relevant environment variables is
-  included — unrelated cloud credentials and API keys are never even
-  candidates.
-- Any value that still looks like a token or secret is masked as
-  `<redacted>`.
-- The literal home-directory path is replaced with `~`, so absolute paths in
-  the report do not reveal your username.
-
-It is safe to attach to a public issue. Review it first if you want to be
-sure. Add `--format json` to get `{"bundle_path": "..."}` instead of the
-human summary.
+The report includes bounded doctor diagnostics, a curated environment allowlist
+and only the records selected above. Mandatory and configured secret redaction
+run again at export, and the home path is shortened. Review the saved file before
+attaching it to a public issue: redaction cannot establish that every remaining
+project name, command detail or operational fact is suitable for publication.
 
 ## Protection downgraded (`degraded` status)
 
@@ -70,17 +73,31 @@ non-exported `TIRITH_STATUS` shell variable for exactly that — see
 for bash, zsh, fish, PowerShell, and Starship. tirith adds no per-prompt
 output of its own; wiring `TIRITH_STATUS` into a prompt is opt-in.
 
-To recover full protection after a degrade, restart your shell (and see
-"Persistent safe mode" below if it keeps happening).
+To recover full protection after a degrade, open a new terminal or start a
+child shell (not `exec "$SHELL"`, see below), and see "Persistent safe mode"
+below if it keeps happening.
 
 ## Execution receipts unavailable or degraded
 
 Strict protocol-v3 receipts are available only to interactive bash, zsh, and
 fish hooks. Each live shell process registers once, and the capability is bound
 to that process and start identity, shell family, session ID, effective user,
-and the pinned Tirith executable identity. Nested shells register independently
-even when they inherit the same session ID. Do not export or manually set any
-`_TIRITH_RECEIPT_*` variable.
+and the pinned Tirith executable identity. Each fresh Bash, Zsh, Fish, or
+PowerShell hook load assigns a new `TIRITH_SESSION_ID`, replacing an inherited
+value. This keeps multiplexer panes and nested shells from sharing one shell's
+receipt ledger or warning history. Re-sourcing an already loaded hook keeps its
+ID; ordinary commands launched from that shell still inherit it. Explicit
+`TIRITH_SESSION_ID` values remain supported for CLI and agent callers that do
+not load a shell hook. Do not export or manually set any `_TIRITH_RECEIPT_*`
+variable.
+
+If a competing decision advances the ledger before a command is committed,
+that command is refused and its unused receipt can be discarded immediately.
+Press Enter again for a fresh check. Older unresolved receipts are reconciled
+against their exact durable transition: a committed one stays consumed; a
+proven missing one is discarded without the old 30-second delay. Unreadable,
+unauthenticated, or conflicting state still refuses; do not clear private
+receipt variables to bypass it.
 
 If the hook reports that receipts are unavailable, and a line is printed
 directly under the legacy-mode or degraded-evidence warning, read that line
@@ -101,7 +118,7 @@ compound command executed.
 
 **Who this affects.** zsh and fish. Bash is not affected: on the same failure it
 calls `_tirith_degrade_to_preexec` and keeps working in warn-only mode
-(`shell/lib/bash-hook.bash:2277-2281`). PowerShell has no strict receipt channel
+(`_tirith_enter` in `crates/tirith/assets/shell/lib/bash-hook.bash`). PowerShell has no strict receipt channel
 and is not affected either.
 
 **Symptom.** Every command you press Enter on is refused with
@@ -130,11 +147,11 @@ runs the tirith binary, and fails closed when that fails. A full or read-only
 `TMPDIR` makes `mktemp` fail, so the block happens without the binary ever being
 consulted.
 
-- zsh: `shell/lib/zsh-hook.zsh:314` and `:354` for the accept-line widget,
-  `:578` and `:595` for the bracketed-paste widget.
-- fish: `_tirith_v3_new_capture_file` (`shell/lib/fish-hook.fish:198-212`)
-  returns 1, and both the protocol-v3 and legacy branches then block
-  (`:434` and `:457`); the paste widget does the same at `:356`. Unlike bash,
+- zsh: `_tirith_accept_line` (the accept-line widget) and `_tirith_bracketed_paste`
+  (the bracketed-paste widget) in `crates/tirith/assets/shell/lib/zsh-hook.zsh`.
+- fish: `_tirith_v3_new_capture_file` (in `crates/tirith/assets/shell/lib/fish-hook.fish`)
+  returns 1, and both the protocol-v3 and preflight branches of
+  `_tirith_check_command` then block; the paste widget does the same. Unlike bash,
   fish has no degrade path.
 
 Failing closed is right for an ANALYSIS failure. It is the wrong answer for an
@@ -177,12 +194,14 @@ brew info tirith
 hash -r
 ```
 
-Then refresh materialized hooks and restart shell:
+Then refresh materialized hooks and open a new terminal:
 
 ```bash
 rm -rf ~/.local/share/tirith/shell
-exec zsh   # or exec bash / restart terminal
 ```
+
+Do not use `exec zsh` or `exec bash` for this: the replaced shell keeps the
+old shell's receipt registration and runs in legacy mode (#281).
 
 ## Wrong `tirith` binary on PATH
 
@@ -398,6 +417,35 @@ tirith's Tier 1 fast path (no URLs detected) targets <2ms. If you notice latency
 1. Run `tirith check --format json -- "your command"` and check `timings_ms`
 2. If Tier 1 is slow, check for extremely long command strings
 3. Policy file loading (Tier 2) adds ~1ms. Use `tirith doctor` to see policy paths
+
+## Long scripts and analysis limits
+
+tirith analyzes a checked command completely up to fixed limits: 1 MiB of shell
+text, 16384 shell words, 4096 commands, 96 KiB or 4096 words per simple
+command, and 256 nested bodies (substitutions, groups, wrapper, function and
+shell-fed heredoc bodies) totalling 256 KiB per level. An agent's batch script
+of a few hundred to a few thousand lines and a heredoc file write of several
+thousand lines fit. Past a limit, the unexamined part is blocked as
+`analysis_incomplete` ("Command exceeds Tirith's analysis size limits" or
+"Command analysis exceeded its work budget") instead of being treated as clean,
+so a destructive command cannot hide after it. Split such a script into several
+checked commands.
+
+## Numeric curl destinations and ports
+
+`curl HOST PORT` supplies two URL operands. For example, curl interprets the
+second operand in `curl -sv 203.0.113.10 8080` as the numeric IPv4 host
+`0.0.31.144`. A destination port belongs in the URL:
+`curl -sv http://203.0.113.10:8080/`.
+
+Curl also accepts decimal, hexadecimal, octal and shortened dotted IPv4 hosts.
+Tirith preserves those destinations in analysis and shows both the original host
+and its canonical address when they differ. Values consumed by options such as
+`--local-port 8080` or `--output 8080` are not additional destinations. Netcat's
+separate `HOST PORT` grammar is different.
+
+See curl's [URL operand rules](https://curl.se/docs/manpage.html#URL) and
+[numeric address syntax](https://curl.se/docs/url-syntax.html#numerical-ipv4-addresses).
 
 ## False positives
 

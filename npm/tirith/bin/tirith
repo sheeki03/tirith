@@ -23,6 +23,49 @@ if (!pkg) {
   process.exit(1);
 }
 
+// The published Linux npm packages contain GNU executables. A Linux kernel
+// alone does not prove the glibc runtime they require (for example on Alpine).
+if (process.platform === "linux") {
+  let glibc;
+  let runtimeReportAvailable = false;
+  try {
+    const reporting = process.report;
+    if (typeof reporting.excludeNetwork !== "boolean") {
+      throw new Error("network-free runtime reporting is unavailable");
+    }
+    const previousExcludeNetwork = reporting.excludeNetwork;
+    try {
+      reporting.excludeNetwork = true;
+      if (reporting.excludeNetwork !== true) {
+        throw new Error("network-free runtime reporting is unavailable");
+      }
+      const report = reporting.getReport();
+      if (!report || !report.header || typeof report.header !== "object") {
+        throw new Error("runtime report is malformed");
+      }
+      glibc = report.header.glibcVersionRuntime;
+      runtimeReportAvailable = true;
+    } finally {
+      reporting.excludeNetwork = previousExcludeNetwork;
+    }
+  } catch {
+    // Older Node or unavailable runtime facts remain unknown, not GNU.
+    glibc = undefined;
+    runtimeReportAvailable = false;
+  }
+  if (typeof glibc !== "string" || !/^\d+\.\d+(?:\.\d+)?$/.test(glibc)) {
+    const reason = runtimeReportAvailable
+      ? "The runtime report does not identify glibc (for example on musl/Alpine). "
+      : "Node could not provide a network-free runtime report. Use Node 20.13+ (20.x) or 22+ with reporting enabled to identify this libc. ";
+    console.error(
+      "The published Linux npm packages require glibc. " + reason +
+        "Use a compatible release or package channel, or build from source with cargo install tirith. " +
+        "A user installation does not require administrator privileges."
+    );
+    process.exit(1);
+  }
+}
+
 let binPath;
 try {
   const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));

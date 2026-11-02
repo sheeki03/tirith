@@ -1,14 +1,23 @@
+pub mod health;
+pub mod retention;
+mod verify;
+#[cfg(windows)]
+mod windows;
+use verify::verify_open_audit_log;
+
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(any(not(windows), test))]
+use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use base64::Engine as _;
+#[cfg(test)]
 use fs2::FileExt;
 use serde::{Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::verdict::Verdict;
 
@@ -22,7 +31,6 @@ const MAX_AUDIT_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_AUDIT_LOG_LINES: usize = 1_000_000;
 const MAX_AUDIT_PROBLEMS: usize = 256;
 const MAX_AUDIT_PROBLEM_BYTES: usize = 4 * 1024;
-const MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES: usize = 1024 * 1024;
 
 fn audit_diagnostics_enabled() -> bool {
     matches!(
@@ -306,8 +314,8 @@ impl AuditEntry {
 
     /// Projection used only by the private append path before chain-owned
     /// `prev_hash`/`sig` values are injected. No caller-owned string is exempted:
-    /// exact artifact digests are injected later through the private typed
-    /// [`TrustedArtifactReceiptDetail`] capability.
+    /// exact receipt digests are injected later through the private typed
+    /// [`TrustedCapsuleReceiptDetail`] capability.
     fn chain_source_privacy_projection(&self) -> Self {
         let mut projected = self.privacy_projection();
         // Chain fields are owned exclusively by `append_to_audit_log`; never
@@ -376,13 +384,13 @@ enum AuditWrite {
 }
 
 /// A digest whose provenance was checked against a saved, content-addressed
-/// [`crate::receipt::ArtifactScanReceipt`]. The bytes are private and there is no
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]. The bytes are private and there is no
 /// public syntax-only constructor, so a lowercase 64-hex caller string cannot
 /// acquire durable-log trust merely by looking like SHA-256.
 #[derive(Clone)]
-struct TrustedArtifactDigest([u8; 32]);
+struct TrustedReceiptDigest([u8; 32]);
 
-impl TrustedArtifactDigest {
+impl TrustedReceiptDigest {
     fn from_verified_hex(value: &str) -> Option<Self> {
         if !is_lowercase_sha256(value) {
             return None;
@@ -405,22 +413,10 @@ impl TrustedArtifactDigest {
     }
 }
 
-/// Private append capability for the only free-form audit detail whose exact
-/// digest bytes must survive privacy projection. Construction independently
-/// reloads the just-saved receipt and recomputes its content address; raw string
-/// shape alone is never sufficient.
-struct TrustedArtifactReceiptDetail {
-    receipt_id: TrustedArtifactDigest,
-    content_sha256: TrustedArtifactDigest,
-}
-
 /// Read a just-saved receipt back under the same private-file contract its
 /// writer promised, so a digest capability is only ever minted from bytes that
-/// are still owner-only, regular, unlinked, and bounded.
-///
-/// Shared by the install-receipt and capsule-run-receipt anchors because both
-/// persist through [`crate::util::write_file_atomic_0600`]; `kind` only shapes
-/// the diagnostic wording, never the checks.
+/// are still owner-only, regular, unlinked, and bounded. `kind` only shapes the
+/// diagnostic wording, never the checks.
 fn read_owner_only_receipt_bytes(
     path: &std::path::Path,
     cap: usize,
@@ -457,82 +453,38 @@ fn read_owner_only_receipt_bytes(
     Ok(bytes)
 }
 
-impl TrustedArtifactReceiptDetail {
-    fn from_recorded_receipt(receipt_id: &str, content_sha256: &str) -> Result<Self, String> {
-        if !is_lowercase_sha256(receipt_id) {
-            return Err("artifact receipt id is not a canonical sha256 digest".to_string());
-        }
-        let path = crate::policy::data_dir()
-            .ok_or_else(|| "artifact receipt digest has no trusted saved receipt".to_string())?
-            .join("receipts")
-            .join(format!("{receipt_id}.json"));
-        let bytes =
-            read_owner_only_receipt_bytes(&path, MAX_TRUSTED_ARTIFACT_RECEIPT_BYTES, "artifact")?;
-        let receipt: crate::receipt::ArtifactScanReceipt = serde_json::from_slice(&bytes)
-            .map_err(|_| "saved artifact receipt is invalid".to_string())?;
-        let computed = receipt.compute_content_hash();
-        if receipt.receipt_id != receipt_id
-            || !receipt.content_hash_matches()
-            || computed != content_sha256
-        {
-            return Err(
-                "artifact receipt digest does not match the saved canonical receipt".to_string(),
-            );
-        }
-        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
-            .ok_or_else(|| "artifact receipt id is not a canonical sha256 digest".to_string())?;
-        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
-            .ok_or_else(|| "artifact receipt hash is not a canonical sha256 digest".to_string())?;
-        Ok(Self {
-            receipt_id,
-            content_sha256,
-        })
-    }
-
-    fn render(&self) -> String {
-        format!(
-            "{} sha256:{}",
-            self.receipt_id.to_hex(),
-            self.content_sha256.to_hex()
-        )
-    }
-}
-
 /// The private receipt-detail capabilities the chain writer accepts, each bound
 /// to the ONE `entry_type` it may appear on. Binding the entry type to the
-/// capability (rather than checking one hard-coded string) is what keeps a
-/// capsule digest from being written onto an install-receipt line, or the
-/// reverse, when a third receipt kind is added later.
+/// capability (rather than checking one hard-coded string) is what keeps one
+/// receipt kind's digest from being written onto another kind's line when a
+/// second receipt kind is added. (The package-install `artifact_receipt`
+/// writer was removed with the package firewall; existing lines still verify
+/// as ordinary chain entries.)
 enum TrustedReceiptDetail<'a> {
-    Artifact(&'a TrustedArtifactReceiptDetail),
     CapsuleRun(&'a TrustedCapsuleReceiptDetail),
 }
 
 impl TrustedReceiptDetail<'_> {
     fn entry_type(&self) -> &'static str {
         match self {
-            Self::Artifact(_) => "artifact_receipt",
             Self::CapsuleRun(_) => "capsule_run_receipt",
         }
     }
 
     fn render(&self) -> String {
         match self {
-            Self::Artifact(detail) => detail.render(),
             Self::CapsuleRun(detail) => detail.render(),
         }
     }
 }
 
-/// The same private append capability for a C14 capsule-run receipt.
-///
-/// A sibling rather than a widening of [`TrustedArtifactReceiptDetail`]: the two
-/// receipts have different schemas and live in different directories, so one
-/// constructor that deserialized "whichever parses" would let an install receipt
-/// be anchored as a capsule run or the reverse.
+/// Private append capability for the only free-form audit detail whose exact
+/// digest bytes must survive privacy projection: a C14 capsule-run receipt.
+/// Construction independently reloads the just-saved receipt and recomputes its
+/// content address; raw string shape alone is never sufficient.
 struct TrustedCapsuleReceiptDetail {
-    receipt_id: TrustedArtifactDigest,
-    content_sha256: TrustedArtifactDigest,
+    receipt_id: TrustedReceiptDigest,
+    content_sha256: TrustedReceiptDigest,
 }
 
 impl TrustedCapsuleReceiptDetail {
@@ -559,9 +511,9 @@ impl TrustedCapsuleReceiptDetail {
                 "capsule receipt digest does not match the saved canonical receipt".to_string(),
             );
         }
-        let receipt_id = TrustedArtifactDigest::from_verified_hex(receipt_id)
+        let receipt_id = TrustedReceiptDigest::from_verified_hex(receipt_id)
             .ok_or_else(|| "capsule receipt id is not a canonical sha256 digest".to_string())?;
-        let content_sha256 = TrustedArtifactDigest::from_verified_hex(content_sha256)
+        let content_sha256 = TrustedReceiptDigest::from_verified_hex(content_sha256)
             .ok_or_else(|| "capsule receipt hash is not a canonical sha256 digest".to_string())?;
         Ok(Self {
             receipt_id,
@@ -588,13 +540,26 @@ fn append_to_audit_log(entry: &AuditEntry, log_path: Option<PathBuf>) -> AuditWr
 fn append_to_audit_log_inner(
     entry: &AuditEntry,
     log_path: Option<PathBuf>,
-    trusted_artifact_detail: Option<TrustedReceiptDetail<'_>>,
+    trusted_receipt_detail: Option<TrustedReceiptDetail<'_>>,
 ) -> AuditWrite {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") {
+    let path = log_path.or_else(default_log_path);
+    let result = append_to_audit_log_unobserved(entry, path.clone(), trusted_receipt_detail);
+    if let (AuditWrite::Failed(_), Some(path)) = (&result, path.as_ref()) {
+        health::record_append_failure(path);
+    }
+    result
+}
+
+fn append_to_audit_log_unobserved(
+    entry: &AuditEntry,
+    log_path: Option<PathBuf>,
+    trusted_receipt_detail: Option<TrustedReceiptDetail<'_>>,
+) -> AuditWrite {
+    if !logging_enabled() {
         return AuditWrite::Skipped;
     }
 
-    let Some(path) = log_path.or_else(default_log_path) else {
+    let Some(path) = log_path else {
         return AuditWrite::Skipped;
     };
 
@@ -623,16 +588,21 @@ fn append_to_audit_log_inner(
         }
     }
 
-    let mut open_opts = OpenOptions::new();
-    // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
-    // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
-    open_opts.create(true).append(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        open_opts.mode(0o600);
-        open_opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = open_opts.open(&path);
+    #[cfg(windows)]
+    let file = windows::open_log(&path);
+    #[cfg(not(windows))]
+    let file = {
+        let mut open_opts = OpenOptions::new();
+        // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE. Opening with
+        // FILE_APPEND_DATA alone fails with ERROR_ACCESS_DENIED (os error 5).
+        open_opts.create(true).append(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            open_opts.mode(0o600);
+            open_opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        open_opts.open(&path)
+    };
 
     let mut file = match file {
         Ok(f) => f,
@@ -650,7 +620,7 @@ fn append_to_audit_log_inner(
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 
-    if let Err(e) = file.lock_exclusive() {
+    if let Err(e) = health::lock_append_for(&file, health::APPEND_LOCK_TIMEOUT) {
         let reason = format!("cannot lock {}: {e}", path.display());
         audit_diagnostic(format!("tirith: audit: {reason}"));
         return AuditWrite::Failed(reason);
@@ -786,9 +756,9 @@ fn append_to_audit_log_inner(
     // public rendering path, but the mutable entry used for chaining and
     // signing is itself made privacy-safe before any hash is derived.
     let mut entry = entry.chain_source_privacy_projection();
-    if let Some(detail) = trusted_artifact_detail {
+    if let Some(detail) = trusted_receipt_detail {
         if entry.entry_type != detail.entry_type() {
-            let reason = "trusted artifact detail used for a non-receipt audit entry".to_string();
+            let reason = "trusted receipt detail used for a non-receipt audit entry".to_string();
             audit_diagnostic(format!("tirith: audit: {reason}"));
             let _ = fs2::FileExt::unlock(&file);
             return AuditWrite::Failed(reason);
@@ -1016,11 +986,7 @@ fn canon_write(v: &serde_json::Value, out: &mut String) {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
+use crate::util::sha256_hex;
 
 /// Hash of one audit line: parse JSON, drop `sig`, canonicalize, sha256-hex.
 /// `None` if the line is not valid JSON (a legacy/corrupt line yields no hash
@@ -1281,7 +1247,8 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
     // NOT followed or clobbered: O_EXCL fails if the path already exists, and
     // O_NOFOLLOW fails if the final component is a symlink. On an O_EXCL
     // collision (a name already squatted), randomize the suffix and retry a few
-    // times before giving up. On non-unix we fall back to plain create+truncate.
+    // times before giving up. Windows uses protected private CREATE_NEW files
+    // with the same bounded collision handling.
     let (tmp, mut f) = open_head_tmp(&hp)?;
 
     // Write + fsync the temp file so its bytes are durable before the rename.
@@ -1310,7 +1277,7 @@ fn write_head(log_path: &std::path::Path, receipt: &HeadReceipt) -> std::io::Res
 /// retries with a randomized suffix so a squatted temp name cannot wedge the
 /// writer permanently.
 fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         // First the stable `<head>.tmp` name (the common, uncontended case), then
         // randomized fallbacks if that exact path is squatted.
@@ -1329,10 +1296,16 @@ fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
                 tmp_os.push(format!(".tmp.{}.{}.{}", std::process::id(), nonce, attempt));
             }
             let tmp = PathBuf::from(tmp_os);
-            let mut opts = OpenOptions::new();
-            opts.write(true).create_new(true).mode(0o600);
-            opts.custom_flags(libc::O_NOFOLLOW);
-            match opts.open(&tmp) {
+            #[cfg(unix)]
+            let opened = {
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true).mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+                opts.open(&tmp)
+            };
+            #[cfg(windows)]
+            let opened = windows::create_head(&tmp);
+            match opened {
                 Ok(f) => return Ok((tmp, f)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -1343,7 +1316,7 @@ fn open_head_tmp(hp: &std::path::Path) -> std::io::Result<(PathBuf, fs::File)> {
             "head temp path is squatted; refusing to write head receipt",
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let mut tmp_os = hp.as_os_str().to_owned();
         tmp_os.push(".tmp");
@@ -1471,29 +1444,20 @@ fn sign_canonical(canonical: &[u8]) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
 }
 
-/// Whether ed25519 audit signing is available right now: a `config_dir()`
-/// signing key exists AND passes the same ownership/permission gate the chain
-/// signer uses. The D6 receipt path consults this to decide whether its
-/// hash-chain anchor is cryptographically SIGNED ("mandatory for `pkg install`")
-/// or only chained ("tamper-evident"). It performs no I/O beyond stat+read of the
-/// key, exactly like a single [`sign_canonical`] attempt would.
-pub fn audit_signing_available() -> bool {
-    audit_signing_secret().is_some()
-}
-
 /// Canonical JSON of `value` for content-hashing/signing: object keys sorted
 /// recursively, compact, no insignificant whitespace, so re-serializing the same
-/// logical value reproduces identical bytes. Exposed for the D6
-/// [`crate::receipt::ArtifactScanReceipt`] so its content hash and the chain
-/// anchor share ONE canonicalizer with the audit chain (a divergent second
-/// canonicalizer would let a receipt hash drift from what the chain recorded).
+/// logical value reproduces identical bytes. Exposed so receipt content hashes
+/// (for example [`crate::receipt::ArtifactScanReceipt`] and
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]) and the chain anchor share ONE
+/// canonicalizer with the audit chain (a divergent second canonicalizer would let
+/// a receipt hash drift from what the chain recorded).
 pub fn canonical_json_for_hash(value: &serde_json::Value) -> String {
     canonical_json_string(value)
 }
 
 /// Sign `canonical` bytes with the ed25519 audit key, returning the base64
-/// signature, or `None` when no usable signing key is configured. Exposed so the
-/// D6 receipt's OPTIONAL detached signature is produced by the same key + routine
+/// signature, or `None` when no usable signing key is configured. Exposed so a
+/// receipt's OPTIONAL detached signature is produced by the same key + routine
 /// as the audit chain, never a second key path.
 pub fn sign_canonical_bytes(canonical: &[u8]) -> Option<String> {
     sign_canonical(canonical)
@@ -1718,406 +1682,8 @@ pub fn verify_audit_log(
             return report;
         }
     };
-    let verify_key = audit_verify_key();
-
-    // Stream the log instead of slurping it into a String + Vec<&str> + Vec<String>
-    // of per-line hashes: a large log.jsonl would otherwise burn memory proportional
-    // to the file size (and worse, to the 64-hex hash strings). Verification only
-    // needs ROLLING state: the previous line's hash (for the chain link), the line
-    // BEFORE it (for the head one-behind crash-window check), the running counts,
-    // and whether any line is signed. So we keep just `prev_hash` / `prev_prev_hash`
-    // and scalar counters here, not the whole file.
-    use std::io::Read as _;
-    // `Take` limits actual reads to one byte past the accepted ceiling, while
-    // `remaining_log_bytes` prevents even that sentinel byte entering a line.
-    // This stays bounded if a writer that ignores the advisory lock grows the
-    // inode after the metadata check above.
-    let limited_log = (&log_file).take(MAX_AUDIT_LOG_BYTES + 1);
-    let mut reader = std::io::BufReader::new(limited_log);
-    let mut remaining_log_bytes = MAX_AUDIT_LOG_BYTES;
-    let mut chaining_started = false;
-    // Rolling tail hashes: `prev_hash` is line (i-1)'s hash, `prev_prev_hash` is
-    // line (i-2)'s. These replace the old `hashes[i-1]` / `hashes[n-1]` / `hashes[n-2]`
-    // indexing. `last_hash`/`second_last_hash` snapshot the final tail for the head
-    // and `--expected-head` checks after the loop.
-    let mut prev_hash = String::new();
-    let mut prev_prev_hash = String::new();
-    // "Signatures required" must NOT rest solely on the mutable `<log>.head` sidecar:
-    // an attacker could strip every `sig` AND rewrite the receipt to `signing_enabled:
-    // false`. So anchor the signal in the (hash-chained) log data too: if ANY retained
-    // line still carries a `sig`, signing was enabled and every entry is expected to be
-    // signed. Signing configuration is also a local monotonic-mode anchor: if the
-    // key/public-key path remains, removing the only line signature and `.head`
-    // cannot make verification silently reinterpret the log as unsigned.
-    // Because a signed log signs from its genesis (signing cannot be enabled mid-stream
-    // over a non-empty log), the realistic case flips on line 0. The ONLY way a signed
-    // line appears after unsigned ones is a tampered log whose earlier `sig`s were
-    // stripped. Track only a count/range for leading unsigned entries; retaining
-    // every line number made this otherwise-streaming verifier linear-space.
-    let mut signing_expected =
-        head.as_ref().map(|h| h.signing_enabled).unwrap_or(false) || audit_signing_configured();
-    let mut early_unsigned_count = 0usize;
-    let mut early_unsigned_first = 0usize;
-    let mut early_unsigned_last = 0usize;
-    let mut i = 0usize;
-    let mut physical_lines = 0usize;
-
-    loop {
-        let line = match read_bounded_audit_line(
-            &mut reader,
-            MAX_AUDIT_LINE_BYTES,
-            &mut remaining_log_bytes,
-        ) {
-            Ok(BoundedAuditLine::Eof) => break,
-            Ok(BoundedAuditLine::Line(line)) => {
-                if physical_lines >= MAX_AUDIT_LOG_LINES {
-                    let _ = fs2::FileExt::unlock(&log_file);
-                    report.total_lines = i;
-                    report.signing_expected = signing_expected;
-                    fail_audit_problem(
-                        &mut report,
-                        format!(
-                            "audit log exceeds the {} physical-line verification limit",
-                            MAX_AUDIT_LOG_LINES
-                        ),
-                    );
-                    return report;
-                }
-                physical_lines += 1;
-                line
-            }
-            Ok(BoundedAuditLine::TooLong) => {
-                if physical_lines >= MAX_AUDIT_LOG_LINES {
-                    let _ = fs2::FileExt::unlock(&log_file);
-                    report.total_lines = i;
-                    report.signing_expected = signing_expected;
-                    fail_audit_problem(
-                        &mut report,
-                        format!(
-                            "audit log exceeds the {} physical-line verification limit",
-                            MAX_AUDIT_LOG_LINES
-                        ),
-                    );
-                    return report;
-                }
-                physical_lines += 1;
-                fail_audit_problem(
-                    &mut report,
-                    format!(
-                        "line {}: exceeds the {} byte limit",
-                        i + 1,
-                        MAX_AUDIT_LINE_BYTES
-                    ),
-                );
-                prev_prev_hash = std::mem::take(&mut prev_hash);
-                i += 1;
-                continue;
-            }
-            Ok(BoundedAuditLine::TotalLimit) => {
-                let _ = fs2::FileExt::unlock(&log_file);
-                report.total_lines = i;
-                report.signing_expected = signing_expected;
-                fail_audit_problem(
-                    &mut report,
-                    format!(
-                        "audit log exceeds the {} byte verification limit during read",
-                        MAX_AUDIT_LOG_BYTES
-                    ),
-                );
-                return report;
-            }
-            Err(error) => {
-                let _ = fs2::FileExt::unlock(&log_file);
-                report.total_lines = i;
-                report.signing_expected = signing_expected;
-                fail_audit_problem(
-                    &mut report,
-                    format!("cannot read {}: {error}", log_path.display()),
-                );
-                return report;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let trimmed = line.trim();
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                fail_audit_problem(&mut report, format!("line {}: invalid JSON: {e}", i + 1));
-                // An invalid line still occupies a chain slot, so its hash is the
-                // empty string (as the old `hashes.push(String::new())` recorded),
-                // breaking any chain link that points at it.
-                prev_prev_hash = std::mem::take(&mut prev_hash);
-                i += 1;
-                continue;
-            }
-        };
-        let prev = val.get("prev_hash").and_then(|v| v.as_str());
-        let this_hash = line_hash(trimmed).unwrap_or_default();
-
-        // The signature handling below runs for EVERY entry independent of whether
-        // it carries `prev_hash` (is chained), so the genesis/first signed entry
-        // (which has no `prev_hash`) is authenticated, counted, and downgrade-
-        // checked just like a chained line.
-        if let Some(prev) = prev {
-            if !chaining_started && i > 0 && report.legacy_prefix > 0 && prev_hash == prev {
-                // The immediately preceding unchained line is this chain's
-                // genesis (its root), not a legacy entry, so it does not count
-                // toward the legacy prefix.
-                report.legacy_prefix -= 1;
-            }
-            chaining_started = true;
-            report.chained_lines += 1;
-            if i == 0 {
-                fail_audit_problem(&mut report, "line 1: prev_hash present but no prior entry");
-            } else if prev_hash != prev {
-                fail_audit_problem(
-                    &mut report,
-                    format!("line {}: chain break (prev_hash mismatch)", i + 1),
-                );
-            }
-        } else if !chaining_started {
-            report.legacy_prefix += 1;
-        } else {
-            fail_audit_problem(
-                &mut report,
-                format!("line {}: missing prev_hash after the chain started", i + 1),
-            );
-        }
-
-        // Signature handling, run for EVERY entry independent of `prev_hash`. The
-        // genesis entry (no `prev_hash`) and every chained entry are each counted
-        // in `signed_lines` and ed25519-verified when a public key is configured.
-        // Verifying only inside the chained branch (the prior bug) left the first
-        // signed entry unauthenticated and undercounted.
-        let sig_present = val.get("sig").and_then(|v| v.as_str());
-        if sig_present.is_some() {
-            // A `sig` field is present (counted exactly as the old `is_some()` did,
-            // including an empty `sig: ""`, which is counted but is NOT a real
-            // signature). Only a NON-EMPTY sig anchors `signing_expected` (matching
-            // the old `any_line_signed` pre-scan, which required `!s.is_empty()`).
-            report.signed_lines += 1;
-            if sig_present.map(|s| !s.is_empty()).unwrap_or(false) && !signing_expected {
-                // First REAL signed line: signing IS expected. Aggregate earlier
-                // unsigned entries as one bounded diagnostic; a signed line after
-                // them means their `sig`s were stripped (e.g. a stripped genesis).
-                signing_expected = true;
-                if early_unsigned_count == 1 {
-                    fail_audit_problem(
-                        &mut report,
-                        format!(
-                            "line {early_unsigned_first}: missing signature on a signed log \
-                             (possible signature downgrade)"
-                        ),
-                    );
-                } else if early_unsigned_count > 1 {
-                    fail_audit_problem(
-                        &mut report,
-                        format!(
-                            "lines {early_unsigned_first}-{early_unsigned_last}: \
-                             {early_unsigned_count} missing signatures on a signed log \
-                             (possible signature downgrade)"
-                        ),
-                    );
-                }
-            }
-        } else if signing_expected {
-            // No `sig` field, but this log is signed (per the head receipt OR an
-            // already-observed `sig`). Because `sig` is excluded from the chain hash,
-            // stripping it leaves the chain intact and is otherwise invisible, so flag
-            // it as a signature downgrade. This runs for EVERY entry, NOT just chained
-            // ones: a signed log signs from its genesis, so stripping `sig` from the
-            // FIRST (genesis/root) entry is just as much a downgrade as from a later
-            // line.
-            fail_audit_problem(
-                &mut report,
-                format!(
-                    "line {}: missing signature on a signed log (possible signature downgrade)",
-                    i + 1
-                ),
-            );
-        } else {
-            // No `sig` field while signing is NOT YET known to be expected (head says
-            // unsigned and no real signed line seen yet). Buffer its number: if a
-            // signed line appears later it is retroactively flagged above; otherwise
-            // the log is genuinely unsigned and the counters are discarded.
-            if early_unsigned_count == 0 {
-                early_unsigned_first = i + 1;
-            }
-            early_unsigned_last = i + 1;
-            early_unsigned_count = early_unsigned_count.saturating_add(1);
-        }
-        if let (Some(sig_b64), Some(vk)) = (sig_present, verify_key.as_ref()) {
-            let mut unsigned = val.clone();
-            if let Some(o) = unsigned.as_object_mut() {
-                o.remove("sig");
-            }
-            let canon = canonical_json_string(&unsigned);
-            let verified = base64::engine::general_purpose::STANDARD
-                .decode(sig_b64)
-                .ok()
-                .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
-                .map(|sig| {
-                    use ed25519_dalek::Verifier;
-                    vk.verify(canon.as_bytes(), &sig).is_ok()
-                })
-                .unwrap_or(false);
-            if !verified {
-                fail_audit_problem(
-                    &mut report,
-                    format!("line {}: signature verification failed", i + 1),
-                );
-            }
-        }
-        // Advance the rolling tail: line i becomes the new "previous", and the old
-        // "previous" becomes "previous-previous" (kept for the head one-behind check).
-        prev_prev_hash = std::mem::replace(&mut prev_hash, this_hash);
-        i += 1;
-    }
-
+    let report = verify_open_audit_log(&log_file, head, expected_head);
     let _ = fs2::FileExt::unlock(&log_file);
-
-    // Finalize the streamed state into the shape the post-loop checks expect.
-    report.total_lines = i;
-    report.signing_expected = signing_expected;
-    // The final tail hashes (replacing the old `hashes[n-1]` / `hashes[n-2]`). After
-    // the loop, `prev_hash` is the LAST line's hash and `prev_prev_hash` the one
-    // before it; for n < 2 the unused one stays empty, matching the old `n > 1` guards.
-    let last_hash = prev_hash;
-    let second_last_hash = prev_prev_hash;
-    let n = i;
-
-    // Fail CLOSED when a signed log cannot actually be authenticated. If
-    // signatures are expected (head receipt OR an observed `sig`) but no public
-    // key (`audit-signing.pub`) is configured, the signatures present in the log
-    // were never verified above, so we cannot vouch for the log. Reporting `ok`
-    // here would let a signed log "pass" purely because the verifier lacks the
-    // key — a fail-open hole. Require the key to be present to call it verified.
-    if report.signing_expected && verify_key.is_none() {
-        fail_audit_problem(
-            &mut report,
-            "log is signed but no verifying key (audit-signing.pub) is available; \
-             cannot authenticate signatures"
-                .to_string(),
-        );
-    }
-
-    // F5: verify the HEAD RECEIPT's own signature when the log is signed. The chain
-    // hash excludes `sig`, so an attacker could strip every line's `sig` AND set
-    // the receipt's `signing_enabled=false` to masquerade the log as unsigned.
-    // Anchoring `signing_expected` in the chained data (any_line_signed) already
-    // means stripping must ALSO rewrite the receipt; signing the receipt closes the
-    // loop: without the private key the attacker cannot re-sign a tampered receipt,
-    // so any head edit (including flipping `signing_enabled`) invalidates this
-    // signature. Continued key-path presence independently requires signed mode,
-    // covering a stripped single-entry genesis plus deleted receipt.
-    if report.signing_expected {
-        if let (Some(h), Some(vk)) = (head.as_ref(), verify_key.as_ref()) {
-            let head_sig_ok = match (h.sig.as_deref(), head_canonical_unsigned(h)) {
-                (Some(sig_b64), Some(canon)) => base64::engine::general_purpose::STANDARD
-                    .decode(sig_b64)
-                    .ok()
-                    .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
-                    .map(|sig| {
-                        use ed25519_dalek::Verifier;
-                        vk.verify(canon.as_bytes(), &sig).is_ok()
-                    })
-                    .unwrap_or(false),
-                _ => false,
-            };
-            if !head_sig_ok {
-                fail_audit_problem(
-                    &mut report,
-                    "head signature invalid (possible signing-state downgrade)",
-                );
-            }
-        }
-    }
-
-    match head {
-        Some(head) => {
-            // The head `count` is the TOTAL number of log lines the receipt covers
-            // (set as `prev_count + 1` in `write_head`, where `prev_count` starts
-            // from `count_lines` over the whole file including any legacy-unchained
-            // prefix). So a clean tail must match BOTH the tail hash AND the line
-            // count: a stale/rewritten receipt that reuses an old hash but reports
-            // the wrong count is otherwise accepted, hiding a rollback/replace.
-            // `last_hash` is the streamed equivalent of the old `hashes[n - 1]`.
-            if n > 0 && head.head_hash == last_hash {
-                if head.count == n as u64 {
-                    report.head_status = format!("head receipt OK (count {})", head.count);
-                } else {
-                    report.head_status = format!(
-                        "head receipt count mismatch: expected {n}, got {}",
-                        head.count
-                    );
-                    let problem = report.head_status.clone();
-                    fail_audit_problem(&mut report, problem);
-                }
-            } else if n > 1 && head.head_hash == second_last_hash {
-                // The documented crash window: the last line synced but the receipt
-                // still points one entry back, so its count must be exactly n - 1.
-                if head.count == (n - 1) as u64 {
-                    report.head_status =
-                        "head receipt is one entry behind (crash window); acceptable".to_string();
-                } else {
-                    report.head_status = format!(
-                        "head receipt count mismatch: expected {}, got {}",
-                        n - 1,
-                        head.count
-                    );
-                    let problem = report.head_status.clone();
-                    fail_audit_problem(&mut report, problem);
-                }
-            } else {
-                report.head_status =
-                    "head receipt does not match log tail (possible truncation)".to_string();
-                let problem = report.head_status.clone();
-                fail_audit_problem(&mut report, problem);
-            }
-        }
-        None => {
-            // A missing `.head` sidecar must fail closed when there is a truncation
-            // anchor to defeat: an attacker who deletes the sidecar of an existing
-            // chained log would otherwise pass verification, defeating truncation
-            // detection (the chain alone proves internal consistency but not that
-            // the tail is intact). The operator can still verify by supplying
-            // `--expected-head` (an explicit out-of-band anchor, validated just
-            // below); when present it is the trusted tail, so we stay tolerant here
-            // and let that check decide. A purely legacy/unchained log (no chained
-            // entries) has no truncation anchor by design and remains tolerant.
-            //
-            // C3: a SIGNED log whose ONLY retained entry is the genesis line has
-            // `signing_expected = true` but `chained_lines = 0` (the genesis has no
-            // `prev_hash`). Deleting its `.head` must ALSO fail closed: the receipt
-            // is what binds `signing_enabled`, so dropping it makes a
-            // truncation-to-empty of a signed log unverifiable. Gate on `signing
-            // expected OR chained` so the signed single-entry case is covered too.
-            if (report.chained_lines > 0 || report.signing_expected) && expected_head.is_none() {
-                report.head_status =
-                    "no head receipt for a signed/chained log (missing sidecar; truncation cannot \
-                     be ruled out; pass --expected-head to verify out-of-band)"
-                        .to_string();
-                let problem = report.head_status.clone();
-                fail_audit_problem(&mut report, problem);
-            } else {
-                report.head_status = "no head receipt (truncation cannot be detected)".to_string();
-            }
-        }
-    }
-
-    if let Some(exp) = expected_head {
-        // `last_hash` is the streamed tail hash (old `hashes[n - 1]`).
-        if n == 0 || last_hash != exp {
-            fail_audit_problem(
-                &mut report,
-                "expected-head does not match the computed tail hash",
-            );
-        }
-    }
-
     report
 }
 
@@ -2454,15 +2020,14 @@ pub fn log_trust_change(
     }
 }
 
-/// The outcome of anchoring a D6 [`crate::receipt::ArtifactScanReceipt`] in the
-/// audit hash-chain.
+/// The outcome of anchoring a receipt (a C14
+/// [`crate::capsule_receipt::CapsuleRunReceipt`]) in the audit hash-chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptAnchor {
     /// The receipt's content hash was appended to the chain. `signed` is true when
-    /// the entry carries an ed25519 signature (the chain is signed): a SIGNED
-    /// anchor is "mandatory for `pkg install`"; an unsigned one is only
-    /// "tamper-evident" (hash-chained). The chain `prev_hash` link makes either
-    /// detectable on edit.
+    /// the entry carries an ed25519 signature (the chain is signed); an unsigned
+    /// one is only "tamper-evident" (hash-chained). The chain `prev_hash` link
+    /// makes either detectable on edit.
     Recorded { signed: bool },
     /// The anchor was intentionally not written (`TIRITH_LOG=0` or no log path).
     /// NOT an error, but it means there is no chain record of this receipt.
@@ -2472,105 +2037,10 @@ pub enum ReceiptAnchor {
     Failed(String),
 }
 
-/// Anchor a D6 [`crate::receipt::ArtifactScanReceipt`] in the audit hash-chain.
-///
-/// This records ONE `entry_type = "artifact_receipt"` line whose content binds the
-/// receipt's `receipt_id` and `content_sha256` (plus the install verdict's action
-/// and rule ids) into the tamper-evident chain via [`append_to_audit_log`], so the
-/// receipt inherits the same `prev_hash` chaining, optional ed25519 signature, and
-/// head-receipt truncation anchor as every verdict line. The receipt FILE is the
-/// authoritative artifact; this chain line is the anchor that makes a later edit or
-/// deletion of the receipt detectable.
-///
-/// No secrets are recorded here: only a digest pair independently proven against
-/// the saved content-addressed receipt, the verdict action, and the verdict rule
-/// ids (the [`crate::receipt`] builder already redacted everything the receipt
-/// itself carries). `detail` carries a compact `"<id> sha256:<hash>"` so a human
-/// reading the raw log can tie the line back to the saved receipt.
-///
-/// Returns a [`ReceiptAnchor`] telling the caller whether the line was written and,
-/// if so, whether it was ed25519-SIGNED: the signal a `pkg install` surface uses
-/// to enforce that a signed anchor is mandatory (vs. the default "tamper-evident"
-/// wording when signing is not configured).
-#[must_use = "the caller must know whether the receipt was anchored (and signed) in the chain"]
-pub(crate) fn log_artifact_scan_receipt(
-    receipt_id: &str,
-    content_sha256: &str,
-    verdict_action: &str,
-    verdict_rule_ids: &[String],
-) -> ReceiptAnchor {
-    // Preserve the ordinary logging-off/no-destination behavior without trying
-    // to establish a trust capability that will never reach a durable sink.
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
-        return ReceiptAnchor::Skipped;
-    }
-    let trusted_detail =
-        match TrustedArtifactReceiptDetail::from_recorded_receipt(receipt_id, content_sha256) {
-            Ok(detail) => detail,
-            Err(reason) => return ReceiptAnchor::Failed(reason),
-        };
-    let entry = AuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        session_id: privacy_project_audit_text(&crate::session::resolve_session_id()),
-        // The verdict the receipt records its install gated on. Drives nothing for a
-        // non-verdict entry; it is here so the chain line is self-describing.
-        action: privacy_project_audit_text(verdict_action),
-        rule_ids: verdict_rule_ids
-            .iter()
-            .map(|rule_id| privacy_project_audit_text(rule_id))
-            .collect(),
-        command_redacted: String::new(),
-        bypass_requested: false,
-        bypass_honored: false,
-        interactive: false,
-        policy_path: None,
-        event_id: None,
-        tier_reached: 3,
-        entry_type: "artifact_receipt".to_string(),
-        event: None,
-        integration: None,
-        hook_type: None,
-        // Injected only after the ordinary privacy projection, through the
-        // private `trusted_detail` capability below.
-        detail: None,
-        elapsed_ms: None,
-        raw_action: None,
-        raw_rule_ids: None,
-        trust_pattern: None,
-        trust_rule_id: None,
-        trust_action: None,
-        trust_ttl_expires: None,
-        trust_scope: None,
-        // An install receipt is an operator/tool action, not an agent-attributed
-        // command, so no synthetic origin.
-        agent_origin: None,
-        manifest_allowed_match: None,
-        prev_hash: None,
-        sig: None,
-    };
-
-    match append_to_audit_log_inner(
-        &entry,
-        None,
-        Some(TrustedReceiptDetail::Artifact(&trusted_detail)),
-    ) {
-        // The serialized line carries `sig` iff the chain signed it; detect that
-        // without re-parsing by checking for the field. (A signed log always
-        // produces a non-empty `"sig":"..."`.)
-        AuditWrite::Written(line) => ReceiptAnchor::Recorded {
-            signed: line_is_signed(&line),
-        },
-        AuditWrite::Skipped => ReceiptAnchor::Skipped,
-        AuditWrite::Failed(reason) => ReceiptAnchor::Failed(reason),
-    }
-}
-
 /// Anchor a C14 [`crate::capsule_receipt::CapsuleRunReceipt`] in the audit hash
 /// chain.
 ///
-/// A sibling of [`log_artifact_scan_receipt`], deliberately not a widening of
-/// it: an install receipt attests a verdict over artifacts and carries rule ids,
-/// while a capsule run attests a containment outcome and carries none. This
+/// A capsule run attests a containment outcome and carries no rule ids. This
 /// records ONE `entry_type = "capsule_run_receipt"` line binding the receipt's
 /// content address, so a later edit or deletion of the saved receipt is
 /// detectable against the (optionally ed25519-signed) chain.
@@ -2584,7 +2054,7 @@ pub(crate) fn log_capsule_run_receipt(
     content_sha256: &str,
     status: &str,
 ) -> ReceiptAnchor {
-    if std::env::var("TIRITH_LOG").ok().as_deref() == Some("0") || default_log_path().is_none() {
+    if !logging_enabled() || default_log_path().is_none() {
         return ReceiptAnchor::Skipped;
     }
     let trusted_detail =
@@ -2639,7 +2109,7 @@ pub(crate) fn log_capsule_run_receipt(
 }
 
 /// Whether a serialized audit line carries a non-empty ed25519 `sig`. Used by
-/// [`log_artifact_scan_receipt`] to report whether the receipt's chain anchor was
+/// [`log_capsule_run_receipt`] to report whether the receipt's chain anchor was
 /// signed without re-deriving the key state.
 fn line_is_signed(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line.trim())
@@ -2654,6 +2124,11 @@ fn default_log_path() -> Option<PathBuf> {
 
 /// Public accessor for the audit log path (so out-of-crate readers need not
 /// hard-code `data_dir()/log.jsonl`).
+/// Whether audit logging is on (`TIRITH_LOG=0` turns it off).
+pub fn logging_enabled() -> bool {
+    std::env::var("TIRITH_LOG").ok().as_deref() != Some("0")
+}
+
 pub fn audit_log_path() -> Option<PathBuf> {
     default_log_path()
 }
@@ -2717,29 +2192,12 @@ mod tests {
         }
     }
 
-    fn write_sample_artifact_receipt() -> String {
-        let receipt = crate::receipt::ArtifactScanReceipt::new(
-            "0.3.3".to_string(),
-            "a".repeat(64),
-            7,
-            "uv pip install example".to_string(),
-            "uv 0.4.0".to_string(),
-            "pip 24.0".to_string(),
-            crate::receipt::CapsuleReceipt {
-                backend_id: "test".to_string(),
-                coverage: crate::capsule::CapsuleCoverage::NONE,
-            },
-            vec!["b".repeat(64)],
-            None,
-            crate::receipt::VerdictSummary {
-                action: "Block".to_string(),
-                rule_ids: vec!["ArtifactKnownMalicious".to_string()],
-                finding_count: 1,
-            },
-        );
-        let directory = crate::policy::data_dir()
-            .expect("isolated data directory")
-            .join("receipts");
+    // Only the Unix-only signed-anchor test needs a saved receipt.
+    #[cfg(unix)]
+    fn write_sample_capsule_receipt() -> String {
+        let receipt = crate::capsule_receipt::sample_contained_receipt();
+        let directory =
+            crate::capsule_receipt::capsule_receipts_dir().expect("isolated data directory");
         std::fs::create_dir_all(&directory).unwrap();
         crate::util::write_file_atomic_0600(
             &directory.join(format!("{}.json", receipt.receipt_id)),
@@ -2951,12 +2409,7 @@ mod tests {
         log_trust_change(&pattern, Some(&rule_id), &action, Some(&ttl), &scope)
             .expect("append trust audit entry");
         assert!(matches!(
-            log_artifact_scan_receipt(
-                &bare_scalar,
-                &bare_scalar,
-                &action,
-                std::slice::from_ref(&rule_id)
-            ),
+            log_capsule_run_receipt(&bare_scalar, &bare_scalar, &action),
             ReceiptAnchor::Failed(_)
         ));
 
@@ -2968,8 +2421,8 @@ mod tests {
         assert!(!persisted.contains(&canary), "{persisted}");
         assert!(persisted.contains("REDACTED"), "{persisted}");
         assert!(
-            !persisted.contains("\"entry_type\":\"artifact_receipt\""),
-            "untrusted digest input must not produce an artifact anchor: {persisted}"
+            !persisted.contains("\"entry_type\":\"capsule_run_receipt\""),
+            "untrusted digest input must not produce a receipt anchor: {persisted}"
         );
         for (index, line) in persisted.lines().enumerate().skip(1) {
             let value: serde_json::Value = serde_json::from_str(line).expect("chained audit line");
@@ -3033,6 +2486,45 @@ mod tests {
         );
 
         global_state.remove_env("TIRITH_LOG");
+    }
+
+    #[test]
+    fn contended_append_reports_failure_without_changing_verdict_or_allowing_required_audit() {
+        let _environment = GlobalStateGuard::new().expect("isolated audit environment");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("held.jsonl");
+        #[cfg(windows)]
+        let held = windows::open_log(&log).unwrap();
+        #[cfg(not(windows))]
+        let held = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&log)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let verdict = Verdict::allow_fast(1, crate::verdict::Timings::default());
+        let start = std::time::Instant::now();
+        assert!(log_verdict(&verdict, "inert", Some(log.clone()), None, &[]).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(verdict.action, crate::verdict::Action::Allow);
+        assert!(health::latest_process_failure(&log).is_some());
+        assert!(log_verdict_with_raw_required(
+            &verdict,
+            "inert",
+            Some(log.clone()),
+            None,
+            &[],
+            None,
+            None
+        )
+        .is_err());
+        assert_eq!(held.metadata().unwrap().len(), 0);
+        fs2::FileExt::unlock(&held).unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), Vec::<u8>::new());
+        log_verdict(&verdict, "inert", Some(log.clone()), None, &[]).unwrap();
+        // A later success does not erase the observation of a lost record.
+        assert!(health::latest_process_failure(&log).is_some());
     }
 
     #[test]
@@ -4163,7 +3655,10 @@ mod tests {
     fn audit_chain_concurrent_appends_stay_consistent() {
         // The exclusive fs2 lock must serialize concurrent in-process writers so
         // no interleave breaks a prev_hash. Spawn several threads each appending
-        // a few entries to ONE log, then verify the chain and line count.
+        // a few entries to ONE log, then compare the exact acknowledged records
+        // with disk. A bounded lock wait can explicitly refuse under contention;
+        // it must never report success for a missing record or partially append
+        // a refused record. The held-lock regression pins the deadline itself.
         let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         global_state.set_env("TIRITH_LOG", "1");
         let dir = tempfile::tempdir().unwrap();
@@ -4171,22 +3666,68 @@ mod tests {
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 4;
-        std::thread::scope(|scope| {
+        let outcomes = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
             for t in 0..THREADS {
                 let log = log.clone();
-                scope.spawn(move || {
-                    for i in 0..PER_THREAD {
-                        let _ = append_to_audit_log(
-                            &chain_test_entry(&format!("t{t}-{i}")),
-                            Some(log.clone()),
-                        );
-                    }
-                });
+                workers.push(scope.spawn(move || {
+                    (0..PER_THREAD)
+                        .map(|i| {
+                            append_to_audit_log(
+                                &chain_test_entry(&format!("t{t}-{i}")),
+                                Some(log.clone()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }));
             }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
         });
-
-        let total = std::fs::read_to_string(&log).unwrap().lines().count();
-        assert_eq!(total, THREADS * PER_THREAD, "every append must land");
+        assert_eq!(outcomes.len(), THREADS * PER_THREAD);
+        let mut acknowledged = std::collections::BTreeSet::new();
+        let mut refused = 0;
+        for outcome in outcomes {
+            match outcome {
+                AuditWrite::Written(line) => assert!(acknowledged.insert(line)),
+                AuditWrite::Failed(reason) => {
+                    assert!(
+                        reason.starts_with("cannot lock ")
+                            && reason.ends_with("audit append lock deadline reached"),
+                        "unexpected append failure: {reason}"
+                    );
+                    refused += 1;
+                }
+                AuditWrite::Skipped => panic!("configured append was silently skipped"),
+            }
+        }
+        assert!(
+            !acknowledged.is_empty(),
+            "at least one concurrent writer must progress"
+        );
+        assert_eq!(acknowledged.len() + refused, THREADS * PER_THREAD);
+        let persisted = std::fs::read_to_string(&log).unwrap();
+        let total = persisted.lines().count();
+        assert_eq!(
+            total,
+            acknowledged.len(),
+            "every acknowledged append must land exactly once"
+        );
+        assert_eq!(
+            persisted
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>(),
+            acknowledged
+        );
+        if refused > 0 {
+            assert!(
+                health::latest_process_failure(&log).is_some(),
+                "a refused append must leave a failure observation"
+            );
+        }
         let report = verify_audit_log(&log, None);
         assert!(
             report.ok,
@@ -4194,7 +3735,7 @@ mod tests {
             report.problems
         );
         // Genesis line is unchained; every subsequent line is chained.
-        assert_eq!(report.chained_lines, THREADS * PER_THREAD - 1);
+        assert_eq!(report.chained_lines, total - 1);
     }
 
     #[cfg(unix)]
@@ -4869,15 +4410,15 @@ mod tests {
         global_state.remove_env("XDG_CONFIG_HOME");
     }
 
-    /// The D6 chain anchor: when audit signing is configured, the
-    /// `artifact_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
-    /// reports `signed: true` (the "mandatory for `pkg install`" signal); the chain
-    /// then verifies with the matching public key.
+    /// The receipt chain anchor: when audit signing is configured, the
+    /// `capsule_run_receipt` line is ed25519-SIGNED and `ReceiptAnchor::Recorded`
+    /// reports `signed: true`; the chain then verifies with the matching public
+    /// key.
     #[test]
     // Unix-only: signing the anchor requires writing the audit log (taking the fs2
     // lock), which is unavailable on a Windows append handle.
     #[cfg(unix)]
-    fn artifact_receipt_anchor_is_signed_when_signing_enabled() {
+    fn receipt_anchor_is_signed_when_signing_enabled() {
         let mut global_state = GlobalStateGuard::new().expect("isolate process-global test state");
         let dir = tempfile::tempdir().unwrap();
         // Isolate BOTH the data dir (so the anchor lands in our temp log) and the
@@ -4898,19 +4439,14 @@ mod tests {
         std::fs::write(cfg.join("audit-signing.pub"), vk.to_bytes()).unwrap();
 
         assert!(
-            audit_signing_available(),
+            audit_signing_secret().is_some(),
             "the planted key must make signing available"
         );
 
         // The exact digest capability comes from a saved canonical receipt, not
         // from accepting an arbitrary lowercase-hex string by shape.
-        let receipt_hash = write_sample_artifact_receipt();
-        let anchor = log_artifact_scan_receipt(
-            &receipt_hash,
-            &receipt_hash,
-            "Block",
-            &["ArtifactKnownMalicious".to_string()],
-        );
+        let receipt_hash = write_sample_capsule_receipt();
+        let anchor = log_capsule_run_receipt(&receipt_hash, &receipt_hash, "contained");
         assert_eq!(
             anchor,
             ReceiptAnchor::Recorded { signed: true },
@@ -4919,7 +4455,7 @@ mod tests {
 
         let log_path = audit_log_path().expect("log path");
         let body = std::fs::read_to_string(&log_path).unwrap();
-        assert!(body.contains("\"entry_type\":\"artifact_receipt\""));
+        assert!(body.contains("\"entry_type\":\"capsule_run_receipt\""));
         assert!(
             body.contains(&format!("{receipt_hash} sha256:{receipt_hash}")),
             "typed receipt hashes must survive the free-form privacy projection"

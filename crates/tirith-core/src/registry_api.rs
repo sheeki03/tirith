@@ -1857,6 +1857,7 @@ mod tests {
 
     #[test]
     fn gather_unavailable_on_network_error() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = FakeClient {
             result: Err(FetchError::Network("connection refused".to_string())),
         };
@@ -1872,6 +1873,7 @@ mod tests {
 
     #[test]
     fn gather_unavailable_on_not_found_sets_existence_not_found() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let client = FakeClient {
             result: Err(FetchError::NotFound),
         };
@@ -1919,6 +1921,7 @@ mod tests {
 
     #[test]
     fn exact_lookup_never_reuses_different_latest_version() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut metadata = meta_clean();
         metadata.latest_version = Some("2.0.0".to_string());
         let client = FakeClient {
@@ -2141,6 +2144,7 @@ mod tests {
 
     #[test]
     fn unsupported_ecosystem_degrades_gracefully() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Go has no registry API — a graceful Unavailable.
         let err = FetchError::UnsupportedEcosystem(Ecosystem::Go);
         assert!(err.reason().contains("go"));
@@ -2489,6 +2493,7 @@ mod tests {
 
     #[test]
     fn fetch_rejects_traversal_name_without_a_request() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // F2 end-to-end: a traversal name short-circuits to `InvalidName` before
         // any URL is built, so this test issues no request.
         let client = HttpRegistryClient::without_cache();

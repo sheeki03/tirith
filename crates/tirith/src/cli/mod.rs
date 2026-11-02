@@ -1,5 +1,18 @@
 use std::io::Write;
 
+pub(crate) mod audit_health;
+pub mod audit_retention;
+pub mod feedback;
+pub mod project_review;
+pub mod recommended_setup;
+pub mod shell_verification;
+pub mod support_bundle;
+pub(crate) mod team_connection;
+pub(crate) mod team_enrollment;
+pub(crate) mod team_rollout;
+mod team_shared;
+pub mod tuning;
+
 /// Output format for commands that support human and JSON output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum HumanJsonFormat {
@@ -45,6 +58,18 @@ impl HumanJsonSarifFormat {
     }
 }
 
+/// Whether the interactive shell that runs a `check`ed or `paste`d command
+/// treats a word-start `#` as a comment: `false` with
+/// `--no-interactive-comments`, or when `_TIRITH_INTERACTIVE_COMMENTS` is `0`.
+/// The bash and zsh hooks report the shell's option through that variable
+/// rather than the flag, so a pinned binary older than the hooks ignores it
+/// and keeps its own reading, where an unknown flag would be a usage error
+/// (paste) or, before `--`, the start of the checked command itself (check).
+pub(crate) fn interactive_comments_reading(no_interactive_comments_flag: bool) -> bool {
+    !no_interactive_comments_flag
+        && std::env::var_os("_TIRITH_INTERACTIVE_COMMENTS").is_none_or(|value| value != "0")
+}
+
 /// `true` when `TIRITH_OFFLINE` is set truthy (`1`/`true`/`yes`/`on`,
 /// case-insensitive, trimmed). The env-var half of the CLI-wide offline switch
 /// that every networked command routes through, so it behaves identically.
@@ -58,6 +83,30 @@ pub(crate) fn offline_env_active() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Bound diagnostics shown in a JSON response: at most `cap` messages, each
+/// passed through `project` (for example DLP redaction) and withheld when it
+/// exceeds 1 KiB. Returns the shown messages and how many were omitted.
+pub(crate) fn bounded_diagnostics(
+    messages: Vec<String>,
+    cap: usize,
+    project: impl Fn(&str) -> String,
+) -> (Vec<String>, usize) {
+    let omitted = messages.len().saturating_sub(cap);
+    let shown = messages
+        .iter()
+        .take(cap)
+        .map(|message| {
+            let shown = project(message);
+            if shown.len() > 1024 {
+                "[withheld: diagnostic exceeds output limit]".to_string()
+            } else {
+                shown
+            }
+        })
+        .collect();
+    (shown, omitted)
 }
 
 /// Write `value` as pretty JSON + trailing newline to stdout through one locked
@@ -366,6 +415,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn write_file_atomic_dangling_symlink_falls_back() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -429,6 +479,7 @@ mod write_json_tests {
 
     #[test]
     fn contained_atomic_write_stays_beneath_root() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -466,6 +517,7 @@ mod write_json_tests {
 
     #[test]
     fn config_write_without_a_v2_provider_fails_closed_when_provenance_is_required() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -496,6 +548,7 @@ mod write_json_tests {
 
     #[test]
     fn config_write_operation_mismatch_never_enters_replay_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let root = tempfile::tempdir().unwrap();
@@ -567,6 +620,7 @@ mod write_json_tests {
 
     #[test]
     fn every_config_projection_mutation_fails_before_replay_consumption() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct Mutation {
@@ -798,6 +852,7 @@ mod write_json_tests {
 
     #[test]
     fn context_label_writer_is_byte_identical_on_real_writer_denial() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -819,6 +874,7 @@ mod write_json_tests {
 
     #[test]
     fn retained_publisher_does_not_run_after_policy_change_deny() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let mut policy = inert();
         policy.task_gate.mode = tirith_core::web3_policy::TaskGateMode::Enforce;
         policy
@@ -851,6 +907,7 @@ mod write_json_tests {
 
     #[test]
     fn denied_parent_creating_write_leaves_namespace_absent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         let path = config.join("policy.yaml");
@@ -880,6 +937,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn cli_rejects_distinct_non_utf8_config_destinations() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -908,6 +966,7 @@ mod write_json_tests {
 
     #[test]
     fn contained_atomic_write_preserves_no_clobber_semantics() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".tirith");
         std::fs::create_dir(&config).unwrap();
@@ -954,6 +1013,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn contained_atomic_write_rejects_final_symlink() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -976,6 +1036,7 @@ mod write_json_tests {
     #[cfg(unix)]
     #[test]
     fn contained_atomic_write_rejects_symlinked_parent() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -1619,11 +1680,11 @@ pub mod browser_audit;
 pub mod browser_host;
 pub mod canary;
 /// Consumer-facing capsule launch surface (Stack E, unit E5): the single seam
-/// `runner.rs`, `temp_run.rs`, the package-firewall install, and the gateway
-/// upstream spawn route through. Selects the host backend (Landlock/seccomp,
-/// Seatbelt, AppContainer, or NoOp), probes deliverable coverage, fails closed for
-/// enforcing surfaces under degraded coverage, and offers both a run-to-completion
-/// and a piped-stdio launch on top of one fail-closed gate.
+/// `runner.rs`, `temp_run.rs` and the gateway upstream spawn route through.
+/// Selects the host backend (Landlock/seccomp, Seatbelt, AppContainer, or NoOp),
+/// probes deliverable coverage, fails closed for enforcing surfaces under
+/// degraded coverage, and offers both a run-to-completion and a piped-stdio
+/// launch on top of one fail-closed gate.
 pub mod capsule;
 pub mod capsule_child;
 pub mod capsule_proxy;
@@ -1648,6 +1709,7 @@ pub mod command_card;
 pub mod commands;
 pub mod completions;
 pub mod context;
+pub(crate) mod control;
 pub mod daemon;
 pub mod dashboard;
 pub mod devcontainer;
@@ -1659,7 +1721,9 @@ pub mod exec;
 pub mod explain;
 pub mod fix;
 pub mod gateway;
+pub mod history;
 pub mod hook_event;
+pub(crate) mod hook_freshness;
 pub mod hooks;
 pub mod hygiene;
 pub mod iac;
@@ -1673,6 +1737,7 @@ pub mod last_trigger;
 pub mod license_cmd;
 pub mod logs;
 pub mod lsp;
+pub(crate) mod managed_policy;
 pub mod manpage;
 pub mod mcp;
 pub mod mcp_server;
@@ -1684,6 +1749,7 @@ pub mod mcp_server;
 /// a clean receipt means npm's signature check passed, never that the package
 /// code is benign. The spawn / rendering half of
 /// [`tirith_core::provenance::npm`].
+pub mod npm_artifact;
 pub mod npm_integrity;
 pub mod onboard;
 pub mod output_guard;
@@ -1695,18 +1761,17 @@ pub mod path;
 pub mod pending;
 pub mod persistence;
 /// The package-firewall CLI surface (PR D7): `tirith pkg install | verify-env |
-/// approve | receipt`. Drives the D1-D6 resolve -> firewall -> re-bind -> contained
-/// install -> receipt pipeline, binding an operator approval to an
-/// `InstallPlanDigest`. Distinct from `tirith install` (analysis-only).
+/// approve | receipt | trust-tool`. Contained package execution is disabled, so
+/// `install` and `approve` refuse with a named reason; the verification and
+/// receipt commands keep working, and `trust-tool` records a pin that nothing in
+/// this release reads. Distinct from `tirith install` (analysis-only).
 pub mod pkg;
-/// Contained install-from-digest for the package firewall (PR D4, CLI half): write
-/// the re-bound plan's `approved.txt`, build the pinned `python -m pip install`
-/// argv, and run it through the fail-closed capsule launcher (never the uncontained
-/// `ProcessInstallRunner`).
-pub mod pkg_install;
 pub mod policy;
 pub mod preview;
+pub mod profile;
+pub(crate) mod profile_service;
 pub mod prompt_status;
+pub mod protection_evidence;
 pub mod provenance;
 /// `tirith pkg attest` (PR F3, the `sigstore-attestations` spike): fetch a wheel's
 /// PyPI publish provenance from the Integrity API, bind the attestation's subject
@@ -1716,12 +1781,15 @@ pub mod provenance;
 /// network / `sigstore-*` half the plan keeps out of `tirith-core`.
 pub mod pypi_integrity;
 pub mod receipt;
+mod receipt_display;
+pub mod rollout;
 pub mod rule;
 pub mod scan;
 pub mod score;
 pub mod secret;
 pub mod selfupdate;
 pub mod share;
+pub mod shell_target;
 pub mod ssh;
 pub mod status;
 pub mod sudo;
@@ -1731,6 +1799,7 @@ pub(crate) mod task_receipt_keys;
 pub mod temp_run;
 pub mod threatdb_cmd;
 pub mod trust;
+pub mod trust_lifecycle;
 pub mod view;
 pub mod visual_audit;
 pub mod warnings;

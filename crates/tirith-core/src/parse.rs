@@ -24,7 +24,9 @@ pub enum UrlLike {
         tag: Option<String>,
         digest: Option<String>,
     },
-    /// URL that failed standard parsing but has extractable components.
+    /// URL with extractable components whose client authority cannot be held
+    /// faithfully by `url::Url`, or whose standard parsing failed. Validated
+    /// scheme/port/userinfo remain available without rewriting its host.
     Unparsed {
         raw: String,
         raw_host: Option<String>,
@@ -73,7 +75,9 @@ impl UrlLike {
             UrlLike::Standard { raw_host, .. } => Some(raw_host.as_str()),
             UrlLike::Scp { host, .. } => Some(host.as_str()),
             UrlLike::DockerRef { registry, .. } => registry.as_deref().or(Some("docker.io")),
-            UrlLike::Unparsed { raw_host, .. } => raw_host.as_deref(),
+            UrlLike::Unparsed { raw, raw_host, .. } => validated_raw_authority(raw)
+                .map(|authority| authority.host)
+                .or(raw_host.as_deref()),
             UrlLike::SchemelessHostPath { host, .. } => Some(host.as_str()),
         }
     }
@@ -122,6 +126,22 @@ impl UrlLike {
     pub fn scheme(&self) -> Option<&str> {
         match self {
             UrlLike::Standard { parsed, .. } => Some(parsed.scheme()),
+            UrlLike::Unparsed { raw, .. } => {
+                let authority = validated_raw_authority(raw)?;
+                // Recognized client schemes are case-insensitive. Borrow static canonical
+                // spellings without changing the public accessor's return type.
+                for scheme in [
+                    "http", "https", "ftp", "ftps", "scp", "sftp", "ssh", "ws", "wss", "file",
+                    "socks4", "socks4a", "socks5", "socks5h", "gopher", "gophers", "dict", "imap",
+                    "imaps", "ldap", "ldaps", "mqtt", "pop3", "pop3s", "rtsp", "smb", "smbs",
+                    "smtp", "smtps", "telnet", "tftp",
+                ] {
+                    if authority.scheme.eq_ignore_ascii_case(scheme) {
+                        return Some(scheme);
+                    }
+                }
+                Some(authority.scheme)
+            }
             _ => None,
         }
     }
@@ -141,6 +161,9 @@ impl UrlLike {
     pub fn port(&self) -> Option<u16> {
         match self {
             UrlLike::Standard { parsed, .. } => parsed.port(),
+            UrlLike::Unparsed { raw, .. } => {
+                validated_raw_authority(raw).and_then(|value| value.port)
+            }
             _ => None,
         }
     }
@@ -157,9 +180,152 @@ impl UrlLike {
                 }
             }
             UrlLike::Scp { user, .. } => user.as_deref(),
+            UrlLike::Unparsed { raw, .. } => {
+                validated_raw_authority(raw).and_then(|value| value.user)
+            }
             _ => None,
         }
     }
+}
+
+/// Validated borrowed metadata for a component-bearing URL. The temporary
+/// standards parse proves complete URL syntax, never the client host identity.
+/// Ordinary parse failures keep their prior None accessors; this adds metadata
+/// only where a valid URL has been deliberately retained outside Standard.
+struct RawAuthority<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    user: Option<&'a str>,
+    port: Option<u16>,
+}
+
+fn validated_raw_authority(raw: &str) -> Option<RawAuthority<'_>> {
+    let scheme_end = leading_scheme_separator(raw)?;
+    let parsed = Url::parse(raw).ok()?;
+    parsed.host_str()?;
+    let after_scheme = &raw[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // A backslash can be a WHATWG authority separator, but is never an
+    // authority delimiter in this client view. Do not invent userinfo from it.
+    if authority.contains('\\') {
+        return None;
+    }
+    let user = authority.rsplit_once('@').and_then(|(userinfo, _)| {
+        let name = userinfo.split(':').next()?;
+        (!name.is_empty()).then_some(name)
+    });
+    Some(RawAuthority {
+        scheme: &raw[..scheme_end],
+        // A validated URL may spell an empty port (`host:`). The generic
+        // raw-host helper intentionally remains unchanged for old callers.
+        host: extract_host_from_hostport(
+            split_userinfo(authority)
+                .strip_suffix(':')
+                .unwrap_or(split_userinfo(authority)),
+        ),
+        user,
+        port: parsed.port(),
+    })
+}
+
+/// curl 8.7.1's IPv4 parser requires digits after a hexadecimal prefix. A
+/// numeric-looking authority containing an empty `0x` component remains a DNS
+/// name, unlike WHATWG's IPv4 parser. Restrict this exception to exactly that
+/// family; ordinary integer/octal/hex IPv4 and generic URL parsing stay intact.
+/// Decode host escapes once, as curl does after numeric recognition fails.
+pub(crate) fn curl_empty_hex_dns_host(raw_host: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(raw_host.len());
+    let mut bytes = raw_host.bytes();
+    while let Some(byte) = bytes.next() {
+        let value = if byte == b'%' {
+            let high = (bytes.next()? as char).to_digit(16)?;
+            let low = (bytes.next()? as char).to_digit(16)?;
+            (high * 16 + low) as u8
+        } else {
+            byte
+        };
+        if !(value.is_ascii_hexdigit() || matches!(value, b'x' | b'X' | b'.')) {
+            return None;
+        }
+        decoded.push((value as char).to_ascii_lowercase());
+    }
+    if !decoded.split('.').any(|part| part == "0x")
+        || !matches!(url::Host::parse(&decoded), Ok(url::Host::Ipv4(_)))
+    {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// The second reading of a curl empty-hex DNS name. curl 8.7.1 resolves the
+/// spelling as a DNS name, but builds that hand it to a libc resolver read it
+/// with `inet_aton`, which (like WHATWG) accepts an empty `0x` component as 0.
+/// Policy evaluates both readings: deny if either matches, allow only if both do.
+pub(crate) fn curl_empty_hex_numeric_reading(raw_host: &str) -> Option<std::net::Ipv4Addr> {
+    let decoded = curl_empty_hex_dns_host(raw_host)?;
+    match url::Host::parse(&decoded) {
+        Ok(url::Host::Ipv4(address)) => Some(address),
+        _ => None,
+    }
+}
+
+/// Apply the client exception only to a completely validated authority. This
+/// also separates an accepted empty port without loosening hostname feed or
+/// network-list validation, which use the bare-host helper above.
+pub(crate) fn curl_empty_hex_dns_url_host(raw: &str) -> Option<String> {
+    let normalized = normalize_curl_url(raw)?;
+    curl_empty_hex_dns_host(validated_raw_authority(normalized.as_ref())?.host)
+}
+
+/// The leading scheme and slash count in a curl URL operand, without allocation.
+pub(crate) fn curl_scheme_separator(raw: &str) -> Option<(usize, usize)> {
+    let colon = raw.find(':')?;
+    let scheme = &raw[..colon];
+    let mut characters = scheme.chars();
+    if !characters.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        || !characters.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let rest = &raw[colon + 1..];
+    let slashes = rest.bytes().take_while(|byte| *byte == b'/').count();
+    if !(1..=3).contains(&slashes) {
+        return None;
+    }
+    Some((colon, slashes))
+}
+
+/// Normalize only a curl URL operand's scheme separator. Network URLs accept
+/// one through three slashes; file URLs keep their local-path semantics.
+/// Generic URL and SCP parsing deliberately do not use this client view.
+pub(crate) fn normalize_curl_url(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let (colon, slashes) = curl_scheme_separator(raw)?;
+    let scheme = &raw[..colon];
+    let rest = &raw[colon + 1..];
+    if scheme.eq_ignore_ascii_case("file") {
+        return (slashes >= 2).then_some(std::borrow::Cow::Borrowed(raw));
+    }
+    let network_scheme = [
+        "http", "https", "ftp", "ftps", "scp", "sftp", "ssh", "ws", "wss", "socks4", "socks4a",
+        "socks5", "socks5h", "gopher", "gophers", "dict", "imap", "imaps", "ldap", "ldaps", "mqtt",
+        "pop3", "pop3s", "rtsp", "smb", "smbs", "smtp", "smtps", "telnet", "tftp",
+    ]
+    .iter()
+    .any(|candidate| scheme.eq_ignore_ascii_case(candidate));
+    if slashes == 2 {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+    if !network_scheme || rest.get(slashes..)?.starts_with(['?', '#']) {
+        return None;
+    }
+    let mut normalized = String::with_capacity(raw.len() + 2 - slashes);
+    normalized.push_str(&raw[..colon + 1]);
+    normalized.push_str("//");
+    normalized.push_str(&rest[slashes..]);
+    Some(std::borrow::Cow::Owned(normalized))
 }
 
 /// Extract the raw host from a URL string BEFORE IDNA normalization (handles
@@ -205,23 +371,12 @@ fn leading_scheme_separator(raw: &str) -> Option<usize> {
 /// Split userinfo from authority on the LAST unencoded `@` (so `user%40name@host`
 /// resolves to `host` — `%40` is userinfo, not a separator).
 fn split_userinfo(authority: &str) -> &str {
-    let bytes = authority.as_bytes();
-    let mut last_at = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            i += 3;
-            continue;
-        }
-        if bytes[i] == b'@' {
-            last_at = Some(i);
-        }
-        i += 1;
-    }
-    match last_at {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    }
+    // Percent-encoded @ is spelled %40 and contains no literal separator.
+    // Even malformed escapes must not hide a following literal @, which the
+    // URL parser still treats as the userinfo boundary.
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 /// Extract host from a host:port string, handling IPv6 brackets.
@@ -411,6 +566,24 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_host_malformed_percent_cannot_hide_userinfo_separator() {
+        for userinfo in [
+            "user:q7z9canary%",
+            "user:q7z9canary%x",
+            "user:q7z9canary%%",
+            "user%40name:q7z9canary",
+        ] {
+            for host in ["0x08080808", "8.8.8.8", "[2001:db8::1]"] {
+                let raw = format!("https://{userinfo}@{host}:8080/path");
+                assert_eq!(extract_raw_host(&raw).as_deref(), Some(host), "{raw}");
+                let parsed = parse_url(&raw);
+                assert!(matches!(&parsed, UrlLike::Standard { .. }), "{parsed:?}");
+                assert_eq!(parsed.raw_host(), Some(host), "{raw}");
+            }
+        }
+    }
+
+    #[test]
     fn test_raw_host_encoded_colon() {
         let raw = "http://exam%3Aple.com/path";
         let host = extract_raw_host(raw);
@@ -594,5 +767,37 @@ mod tests {
     fn test_unparsed_fallback() {
         let u = parse_url("not://[invalid");
         assert!(matches!(u, UrlLike::Unparsed { .. }));
+    }
+    #[test]
+    fn curl_empty_hex_dns_exception_does_not_reclassify_other_numeric_forms() {
+        for (raw, expected) in [
+            ("0x7f.0x", "0x7f.0x"),
+            ("0X7F.0X", "0x7f.0x"),
+            ("127.0x", "127.0x"),
+            ("0x.1", "0x.1"),
+            ("0x", "0x"),
+            ("0x7f.%30x", "0x7f.0x"),
+            ("%30x7f.0x", "0x7f.0x"),
+            ("0x7f.0x.", "0x7f.0x."),
+        ] {
+            assert_eq!(
+                curl_empty_hex_dns_host(raw).as_deref(),
+                Some(expected),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "0x7f.0x1",
+            "127.0.0.1",
+            "2130706433",
+            "0x7f.%30x1",
+            "0x7f.%2530x",
+            "0x7f.0x.invalid",
+            "0x7f.0x:",
+            "4294967296.0x",
+            "0x7f.%zz",
+        ] {
+            assert_eq!(curl_empty_hex_dns_host(raw), None, "{raw}");
+        }
     }
 }

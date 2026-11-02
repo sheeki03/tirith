@@ -347,14 +347,7 @@ pub fn value_hash8(value: &str) -> String {
     hex.chars().take(VALUE_HASH_PREFIX_LEN).collect()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
+use crate::util::hex as hex_encode;
 
 /// How a sensitive variable differs between the shell-start snapshot and the
 /// current environment.
@@ -1611,6 +1604,7 @@ mod tests {
 
     #[test]
     fn secret_bearing_environment_names_are_dropped_or_projected_at_every_boundary() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let canary = format!("ghp_canary_{}", "A".repeat(30));
         let snapshot = EnvSnapshot::from_env_pairs(
             [(canary.as_str(), "set"), ("AWS_SECRET_ACCESS_KEY", "set")],
@@ -1671,6 +1665,7 @@ mod tests {
 
     #[test]
     fn unknown_and_removed_policy_names_remain_presence_only_on_persistence() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env_snapshot.json");
         let canary = value_hash8("removed-policy-secret");
@@ -1791,6 +1786,7 @@ mod tests {
 
     #[test]
     fn future_snapshot_schema_is_rejected_without_rewriting_any_byte() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env_snapshot.json");
         let future = r#"{
@@ -1857,6 +1853,7 @@ mod tests {
 
     #[test]
     fn persisted_presence_baseline_reports_comparison_unavailable_after_restart() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env_snapshot.json");
         let secret = "wallet-secret-never-durable";
@@ -1936,6 +1933,7 @@ mod tests {
 
     #[test]
     fn effective_sensitive_vars_merges_and_dedups() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let extra = vec![s("MY_CUSTOM_TOKEN"), s("GITHUB_TOKEN"), s("  ")];
         let eff = effective_sensitive_vars(&extra);
         // Built-ins present.
@@ -1954,6 +1952,7 @@ mod tests {
 
     #[test]
     fn explain_finds_export_and_masks_value() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::write(
@@ -1979,6 +1978,7 @@ mod tests {
 
     #[test]
     fn explain_handles_fish_and_powershell_and_plain_assignment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::create_dir_all(home.join(".config/fish")).unwrap();
@@ -2010,6 +2010,7 @@ mod tests {
 
     #[test]
     fn explain_unknown_var_reports_no_sources() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let ex = explain_var_in("NOPE_NOT_SET", Some(dir.path()));
         assert!(ex.sources.is_empty());
@@ -2226,6 +2227,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_in_rc_fires_with_masked_value() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::write(
@@ -2280,6 +2282,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_scan_drops_secret_bearing_names_before_finding_construction() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let canary = format!("ghp_canary_{}", "A".repeat(30));
         std::fs::write(
@@ -2299,6 +2302,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_finding_projects_secret_bearing_rc_path_components() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let canary = format!("ghp_canary_{}", "B".repeat(30));
         let home = dir.path().join(format!("profile-{canary}"));
@@ -2320,6 +2324,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_scan_ignores_non_sensitive_and_missing_home() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".bashrc"), "export EDITOR=vim\n").unwrap();
         let sensitive = effective_sensitive_vars(&[]);
@@ -2330,6 +2335,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_honors_policy_extension() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".profile"), "export MY_CORP_KEY=zzz\n").unwrap();
         // Without the extension, MY_CORP_KEY is not sensitive → no finding.
@@ -2345,6 +2351,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_scan_uses_prefix_kinds_and_ignores_public_rpc() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".zshrc"),
@@ -2362,6 +2369,7 @@ mod tests {
 
     #[test]
     fn persisted_secret_scan_uses_canonical_alias_spellings_and_fish_form() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".zshrc"),

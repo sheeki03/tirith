@@ -11,6 +11,7 @@ pub fn run(
     json: bool,
     non_interactive: bool,
     interactive_flag: bool,
+    interactive_comments: bool,
     html_path: Option<&str>,
     with_source: bool,
 ) -> i32 {
@@ -126,6 +127,9 @@ pub fn run(
         clipboard_html,
         card_ref: None,
         clipboard_source: clipboard_source_state,
+        python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
+        cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments,
     };
 
     // PR #121 item 18: one policy snapshot for analysis + enforcement + audit, to
@@ -325,7 +329,11 @@ fn write_paste_json(
         obj.insert("clipboard_source".to_string(), source);
     }
     let compiled = tirith_core::redact::CompiledCustomPatterns::new_silent(custom_patterns);
-    tirith_core::redact::redact_json_strings(&mut value, &compiled);
+    tirith_core::output_contract::redact_projection(
+        &mut value,
+        tirith_core::output_contract::Projection::Verdict,
+        &compiled,
+    );
     let value = tirith_core::verdict::bound_json_value_for_output(value);
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, &value)?;

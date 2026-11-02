@@ -657,6 +657,7 @@ mod tests {
     /// shape is clean: no anomaly, an Allow verdict.
     #[test]
     fn identical_pure_release_is_clean() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -690,6 +691,7 @@ mod tests {
     /// finding warns (Medium -> Warn) under the default policy.
     #[test]
     fn pure_to_native_flags_and_warns() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -743,6 +745,7 @@ mod tests {
     /// pure-to-native (the baseline was not pure).
     #[test]
     fn native_to_more_native_does_not_flag_pure_to_native() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -780,6 +783,7 @@ mod tests {
     /// A release that adds a `.pth` startup hook flags `StartupHookAdded`.
     #[test]
     fn no_hook_to_pth_flags_startup_hook_added() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -828,6 +832,7 @@ mod tests {
     /// near-empty baseline flags `JavaScriptVolumeJump`; a small JS file does not.
     #[test]
     fn javascript_volume_jump_threshold() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -876,6 +881,7 @@ mod tests {
     /// runtime-download" delta) flags `NewExecutionCapability` naming the signal.
     #[test]
     fn new_network_signal_flags_new_execution_capability() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel("demo", "1.0", vec![], vec![]);
         let new = wheel(
             "demo",
@@ -903,6 +909,7 @@ mod tests {
     /// does not flag a new execution capability.
     #[test]
     fn new_coverage_marker_does_not_flag_capability() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel("demo", "1.0", vec![], vec![]);
         let new = wheel(
             "demo",
@@ -917,6 +924,7 @@ mod tests {
 
     #[test]
     fn incomplete_release_side_cannot_finalize_allow() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel("demo", "1.0", vec![], vec![]);
         let mut new = wheel("demo", "1.1", vec![], vec![]);
         new.coverage = crate::artifact::InspectionCoverage {
@@ -957,6 +965,7 @@ mod tests {
     /// the same name (differing only by PEP 503 separators/case) does not.
     #[test]
     fn identity_change_uses_pep503_normalization() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let a = wheel("Flask", "1.0", vec![], vec![]);
         let b = wheel("requests", "1.0", vec![], vec![]);
         assert!(diff_inspections(&a, &b)
@@ -982,6 +991,7 @@ mod tests {
     /// anomaly even when paired with a named wheel: there is no name to compare.
     #[test]
     fn generic_archive_has_no_identity_anomaly() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let named = wheel("demo", "1.0", vec![], vec![]);
         let mut generic =
             ArtifactInspection::new(InspectionSubject::GenericArchive(GenericArchiveIdentity {
@@ -998,6 +1008,7 @@ mod tests {
     /// produces ONE finding listing all of them, and the diff order is stable.
     #[test]
     fn multiple_anomalies_one_finding_stable_order() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel(
             "demo",
             "1.0",
@@ -1052,6 +1063,7 @@ mod tests {
     /// JSON surface the CLI renders).
     #[test]
     fn release_diff_serializes() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel("demo", "1.0", vec![], vec![]);
         let new = wheel(
             "demo",
@@ -1081,6 +1093,7 @@ mod tests {
     /// warn into a Block, exercising the `finalize_static_verdict` override seam.
     #[test]
     fn policy_action_override_upgrades_to_block() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let old = wheel("demo", "1.0", vec![], vec![]);
         let new = wheel(
             "demo",
@@ -1211,6 +1224,7 @@ mod tests {
     /// must no longer inherit the heuristic anomaly's Warn-only outcome.
     #[test]
     fn diff_artifact_files_blocks_unparseable_pure_to_native_end_to_end() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         // OLD: pure Python (one .py member).
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
@@ -1249,6 +1263,7 @@ mod tests {
     /// path (no false positive on an honest point release).
     #[test]
     fn diff_artifact_files_clean_on_honest_release() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 2\n")]);
@@ -1262,6 +1277,7 @@ mod tests {
 
     #[test]
     fn diff_artifact_files_blocks_entry_capped_new_release_end_to_end() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let new = write_entry_capped_demo_wheel(dir.path(), "1.1");
@@ -1285,6 +1301,7 @@ mod tests {
 
     #[test]
     fn diff_artifact_files_refuses_structurally_rejected_new_release() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(dir.path(), "1.0", &[("demo/__init__.py", b"x = 1\n")]);
         let new = write_demo_wheel(
@@ -1302,6 +1319,7 @@ mod tests {
 
     #[test]
     fn diff_artifact_files_refuses_structurally_rejected_old_baseline() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let old = write_demo_wheel(
             dir.path(),
@@ -1320,6 +1338,7 @@ mod tests {
     /// A missing OLD artifact is a `ReleaseDiffError::Old`, not a panic.
     #[test]
     fn diff_artifact_files_missing_old_errors() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let dir = tempfile::tempdir().unwrap();
         let new = write_demo_wheel(dir.path(), "1.1", &[("demo/__init__.py", b"x = 1\n")]);
         let missing = dir.path().join("does-not-exist.whl");

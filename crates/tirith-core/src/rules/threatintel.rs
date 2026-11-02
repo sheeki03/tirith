@@ -107,8 +107,38 @@ pub fn extract_packages_detail_for_shell(
     let mut truncated = false;
 
     for seg in segments {
+        // Remove only operators belonging to the original outer shell. This
+        // must precede wrapper resolution: `env -S` produces literal argv,
+        // where a `>` argument remains data and cannot consume the next package.
+        let outer = if matches!(shell, ShellType::Posix | ShellType::Fish)
+            && seg
+                .args
+                .iter()
+                .any(|arg| crate::escalation::shell_redirection_token(arg).is_some())
+            && segment_has_original_shell_arguments(seg, shell)
+        {
+            let mut filtered = seg.clone();
+            let mut skip_target = false;
+            filtered.args.retain(|arg| {
+                if skip_target {
+                    skip_target = false;
+                    return false;
+                }
+                if let Some(separate) = crate::escalation::shell_redirection_token(arg) {
+                    skip_target = separate;
+                    return false;
+                }
+                true
+            });
+            Some(filtered)
+        } else {
+            None
+        };
         let (resolved_command, resolved_args) =
-            match crate::extract::resolve_wrapped_command_for_shell(seg, shell) {
+            match crate::extract::resolve_wrapped_command_for_shell(
+                outer.as_ref().unwrap_or(seg),
+                shell,
+            ) {
                 Some(resolved) => resolved,
                 None => continue,
             };
@@ -160,25 +190,46 @@ pub fn extract_packages_detail_for_shell(
     }
 }
 
+/// Synthetic/resolved segments can carry literal argv that resembles shell
+/// syntax. Only the original single-command lexical view grants permission to
+/// remove redirection words. Failure keeps all argv available for inspection.
+fn segment_has_original_shell_arguments(segment: &Segment, shell: ShellType) -> bool {
+    let parsed = crate::tokenize::tokenize(&segment.raw, shell);
+    matches!(parsed.as_slice(), [original]
+        if original.command == segment.command && original.args == segment.args)
+}
+
 const MAX_EXECUTABLE_PACKAGE_DEPTH: usize = 8;
+
+/// `(segment, shell, best_effort)`: a segment of a best-effort body (a fish
+/// wrapper child, see `crate::extract::ExecutableBody::best_effort`) adds its
+/// packages but never an analysis gap.
+type PackageSegment = (Segment, ShellType, bool);
 
 fn collect_executable_segments(
     input: &str,
     shell: ShellType,
     depth: usize,
-    segments: &mut Vec<(Segment, ShellType)>,
+    best_effort: bool,
+    segments: &mut Vec<PackageSegment>,
 ) {
     let execution_view = crate::extract::shell_execution_view(input, shell);
     segments.extend(
         crate::tokenize::tokenize(execution_view.as_ref(), shell)
             .into_iter()
-            .map(|segment| (segment, shell)),
+            .map(|segment| (segment, shell, best_effort)),
     );
     if depth >= MAX_EXECUTABLE_PACKAGE_DEPTH {
         return;
     }
     for body in crate::extract::executable_substitution_scan(input, shell).bodies {
-        collect_executable_segments(&body.input, body.shell, depth + 1, segments);
+        collect_executable_segments(
+            &body.input,
+            body.shell,
+            depth + 1,
+            best_effort || body.best_effort,
+            segments,
+        );
     }
 }
 
@@ -186,9 +237,9 @@ fn collect_executable_segments(
 /// preserving each child wrapper's effective shell.
 pub(crate) fn extract_packages_from_input(input: &str, shell: ShellType) -> Vec<PackageRef> {
     let mut segments = Vec::new();
-    collect_executable_segments(input, shell, 0, &mut segments);
+    collect_executable_segments(input, shell, 0, false, &mut segments);
     let mut packages = Vec::new();
-    for (segment, segment_shell) in segments {
+    for (segment, segment_shell, _) in segments {
         packages.extend(extract_packages_for_shell(&[segment], segment_shell));
     }
     packages
@@ -258,6 +309,8 @@ const PIP_ARG_FLAGS: &[&str] = &[
     "--cert",
     "--client-cert",
     "--cache-dir",
+    "--report",
+    "--log",
 ];
 
 fn extract_pip_packages(args: &[String], packages: &mut Vec<PackageRef>) {
@@ -854,13 +907,13 @@ pub fn check(
     let mut findings = Vec::new();
 
     let mut executable_segments = Vec::new();
-    collect_executable_segments(input, shell, 0, &mut executable_segments);
+    collect_executable_segments(input, shell, 0, false, &mut executable_segments);
     let mut packages = Vec::new();
     let mut truncated = false;
-    for (segment, segment_shell) in &executable_segments {
+    for (segment, segment_shell, best_effort) in &executable_segments {
         let extracted =
             extract_packages_detail_for_shell(std::slice::from_ref(segment), *segment_shell);
-        truncated |= extracted.truncated;
+        truncated |= extracted.truncated && !best_effort;
         packages.extend(extracted.packages);
     }
     // A partial package list must not read as a complete assessment. Emitted
@@ -1053,8 +1106,13 @@ pub fn check(
                 }
             }
 
-            // URL host may itself be an IP literal.
-            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            // URL host may itself be an IP literal, or a curl empty-hex DNS
+            // name that a libc resolver reads as one.
+            if let Some(ip) = host
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .or_else(|| crate::parse::curl_empty_hex_numeric_reading(host))
+            {
                 if checked_ips.insert(ip) {
                     if let Some(m) = db.check_ip(ip) {
                         let (rule_id, severity, threat_type) = ip_rule_for_source(m.source);
@@ -1085,7 +1143,7 @@ pub fn check(
     }
 
     // IP literals in command tokens (ssh/scp/nc and friends).
-    for (seg, segment_shell) in &executable_segments {
+    for (seg, segment_shell, _) in &executable_segments {
         for arg in &seg.args {
             if let Some(ip) = extract_ipv4_from_token_for_shell(arg, *segment_shell) {
                 if checked_ips.insert(ip) {
@@ -1138,6 +1196,100 @@ mod tests {
     }
 
     #[test]
+    fn issue_270_redirections_do_not_become_npm_packages() {
+        for input in [
+            "npm install express 2>/dev/null",
+            "npm install 2>/dev/null express",
+            "npm install express 2> /dev/null",
+            "npm install express >/dev/null 2>&1",
+            "env npm install express 2>/dev/null",
+            "sudo npm install express 2>/dev/null",
+        ] {
+            let packages = tokenize_and_extract(input);
+            let names: Vec<_> = packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect();
+            assert_eq!(names, ["express"], "{input}");
+        }
+        for input in [
+            "git add . 2>/dev/null",
+            "npm install 2>/dev/null",
+            "npm view express version 2>/dev/null",
+        ] {
+            assert!(tokenize_and_extract(input).is_empty(), "{input}");
+        }
+    }
+
+    #[test]
+    fn issue_264_package_redirections_are_not_registry_operands() {
+        for input in [
+            "pip install pytest 2>&1 | tail -10",
+            "pip install 2> /tmp/errors pytest",
+            "pip install pytest > /tmp/output 2>&1",
+            "pip install --index-url 2>&1 https://pypi.org/simple pytest",
+            "pip install pytest {log}>/tmp/output",
+            "npm install left-pad 2>&1 | tail -10",
+            "cargo install ripgrep 2> /tmp/errors",
+            "gem install rake 1>&2",
+        ] {
+            let packages = tokenize_and_extract(input);
+            assert_eq!(packages.len(), 1, "{input}: {packages:?}");
+            assert!(matches!(
+                packages[0].name.as_str(),
+                "pytest" | "left-pad" | "ripgrep" | "rake"
+            ));
+        }
+        for input in ["pip install pytest '2>&1'", "pip install pytest 2\\>\\&1"] {
+            assert!(
+                tokenize_and_extract(input).len() > 1,
+                "quoted/escaped argv was dropped: {input}"
+            );
+        }
+        for input in [
+            "env -S 'pip install --report > malicious-package'",
+            "env -S 'pip install --log > malicious-package'",
+            "sudo env -S 'pip install --report > malicious-package' 2>&1",
+            "env -S 'pip install --report > malicious-package' 2> /tmp/errors",
+        ] {
+            let packages = tokenize_and_extract(input);
+            assert_eq!(packages.len(), 1, "{input}: {packages:?}");
+            assert_eq!(
+                packages[0].name, "malicious-package",
+                "literal argv was reinterpreted: {input}"
+            );
+        }
+        for raw in [
+            "",
+            "__tirith_env_split_literal_v1__ 'pip' 'install' '--report' '>' 'malicious-package'",
+        ] {
+            let literal = Segment {
+                raw: raw.to_owned(),
+                command: Some("pip".to_owned()),
+                args: ["install", "--report", ">", "malicious-package"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                preceding_separator: None,
+                byte_range: 0..0,
+            };
+            let packages = extract_packages_for_shell(&[literal], ShellType::Posix);
+            assert!(
+                packages
+                    .iter()
+                    .any(|package| package.name == "malicious-package"),
+                "literal/synthetic argv lost its package: {raw}: {packages:?}"
+            );
+        }
+        let packages = extract_packages_from_input(
+            "pip install pytest 2>$(npm install left-pad)",
+            ShellType::Posix,
+        );
+        assert!(packages.iter().any(|package| package.name == "pytest"));
+        assert!(packages.iter().any(|package| package.name == "left-pad"));
+    }
+
+    #[test]
     fn pip_install_single() {
         let pkgs = tokenize_and_extract("pip install requests");
         assert_eq!(pkgs.len(), 1);
@@ -1178,17 +1330,29 @@ mod tests {
 
     #[test]
     fn pip_install_version_range_is_constraint() {
+        for command in [
+            "pip install 'requests>=2.0'",
+            "pip install \"requests>=2.0\"",
+            "pip install requests\\>=2.0",
+        ] {
+            let pkgs = tokenize_and_extract(command);
+            assert_eq!(pkgs.len(), 1, "{command}");
+            assert_eq!(pkgs[0].name, "requests");
+            // A range is now preserved as a parsed Constraint (no longer dropped).
+            match &pkgs[0].version {
+                VersionIntent::Constraint { raw, parsed } => {
+                    assert_eq!(raw, ">=2.0");
+                    assert!(parsed.is_some());
+                }
+                other => panic!("expected Constraint for {command}, got {other:?}"),
+            }
+        }
+        // Unquoted, `>=2.0` redirects stdout to a file named `=2.0`: pip
+        // installs `requests` with no version pinned.
         let pkgs = tokenize_and_extract("pip install requests>=2.0");
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "requests");
-        // A range is now preserved as a parsed Constraint (no longer dropped).
-        match &pkgs[0].version {
-            VersionIntent::Constraint { raw, parsed } => {
-                assert_eq!(raw, ">=2.0");
-                assert!(parsed.is_some());
-            }
-            other => panic!("expected Constraint, got {other:?}"),
-        }
+        assert!(matches!(pkgs[0].version, VersionIntent::Unspecified));
     }
 
     #[test]
@@ -1426,8 +1590,31 @@ mod tests {
         }
     }
 
+    /// Bug 5: the numeric reading of a curl empty-hex host is looked up as an IP.
+    #[test]
+    fn curl_empty_hex_host_numeric_reading_is_checked_against_ip_indicators() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 87);
+        writer.add_ip(
+            std::net::Ipv4Addr::new(10, 0, 0, 5),
+            ThreatSource::FeodoTracker,
+        );
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        let input = "curl http://0xa.0x.0x.0x5/payload";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        let findings = check(input, ShellType::Posix, &extracted, Some(&db));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == RuleId::ThreatMaliciousIp),
+            "{findings:?}"
+        );
+    }
+
     #[test]
     fn npm_alias_command_cannot_bypass_target_threat_record() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 90);
         writer.add_package(
@@ -1471,6 +1658,7 @@ mod tests {
     /// a complete one.
     #[test]
     fn padding_a_command_line_cannot_hide_a_package_from_assessment() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 91);
         writer.add_package(
@@ -1527,6 +1715,7 @@ mod tests {
     /// the tree already knows are installs.
     #[test]
     fn prefix_word_and_alias_installs_reach_the_threat_db() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 92);
         writer.add_package(
@@ -1592,6 +1781,7 @@ mod tests {
 
     #[test]
     fn exact_malicious_url_fires_even_when_host_absent_from_feed() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // Regression: pr173-0020 — the v2 malicious-URL index must be queried
         // in production, not just at compile-time validation. An exact URL hit
         // whose host is NOT in the hostname feed must still fire High.
@@ -1633,6 +1823,7 @@ mod tests {
 
     #[test]
     fn exact_malicious_url_dedupes_against_hostname_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         // pr173-0020 — when BOTH the exact URL and its hostname are listed,
         // the exact-URL finding subsumes the hostname finding (one finding).
         let key = SigningKey::generate(&mut OsRng);
@@ -1659,6 +1850,7 @@ mod tests {
 
     #[test]
     fn malicious_package_in_nested_executable_body_reaches_threat_intel() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 96);
         writer.add_package(
@@ -1700,6 +1892,7 @@ mod tests {
 
     #[test]
     fn npm_bare_protocol_spec_cannot_bypass_target_threat_record() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let parsed = tokenize_and_extract("npm install npm:lodash@4.17.21");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "lodash");
@@ -2219,12 +2412,14 @@ mod tests {
 
     #[test]
     fn check_returns_empty_without_db() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let findings = check("pip install malicious-pkg", ShellType::Posix, &[], None);
         assert!(findings.is_empty(), "check() must be fail-open without DB");
     }
 
     #[test]
     fn command_to_threatdb_uses_registry_package_and_version_identity() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 88);
         for (eco, name, version) in [
@@ -2262,6 +2457,7 @@ mod tests {
 
     #[test]
     fn overlapping_claims_enforce_strongest_evidence_in_both_formats_and_orders() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::from_bytes(&[23u8; 32]);
         for format in [ThreatDbFormat::V1, ThreatDbFormat::V2] {
             for all_versions_first in [false, true] {
@@ -2370,6 +2566,7 @@ mod tests {
 
     #[test]
     fn digit_leading_resolver_selectors_emit_unresolved_warning() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 89);
         for (eco, name) in [
@@ -2419,6 +2616,7 @@ mod tests {
 
     #[test]
     fn trailing_dot_hostname_alias_remains_a_high_threat_match() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let key = SigningKey::generate(&mut OsRng);
         let mut writer = ThreatDbWriter::new(1_700_000_000, 97);
         writer.add_hostname("malicious.example", ThreatSource::Urlhaus);
@@ -2490,5 +2688,31 @@ mod tests {
         let (ip_rule, ip_sev, _) = ip_rule_for_source(threatdb::ThreatSource::DigitalSide);
         assert_eq!(ip_rule, RuleId::ThreatMaliciousIp);
         assert_eq!(ip_sev, Severity::High);
+    }
+    #[test]
+    fn curl_empty_hex_dns_indicator_survives_ingestion_and_lookup() {
+        let _shared_state = tirith_test_support::SharedStateGuard::acquire();
+        let key = SigningKey::generate(&mut OsRng);
+        let mut writer = ThreatDbWriter::new(1_700_000_000, 97);
+        writer.add_hostname("0x7f.0x", ThreatSource::Urlhaus);
+        let db = ThreatDb::from_bytes(writer.build(&key).expect("build"), 0).expect("load");
+        assert!(db.check_hostname("0x7f.0x").is_some());
+        assert!(db.check_hostname("127.0.0.0").is_none());
+        let input = "curl http://0x7f.0x/path";
+        let extracted = crate::extract::extract_urls(input, ShellType::Posix);
+        assert!(check(input, ShellType::Posix, &extracted, Some(&db))
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ThreatMaliciousUrl));
+        let backing = crate::engine::build_dsl_backing(
+            input,
+            ShellType::Posix,
+            crate::extract::ScanContext::Exec,
+            &extracted,
+            Some(&db),
+        );
+        assert_eq!(
+            backing.as_eval_context(None, None).urls[0].reputation,
+            crate::custom_rule_dsl::Reputation::Malicious
+        );
     }
 }

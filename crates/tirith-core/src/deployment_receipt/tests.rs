@@ -565,6 +565,7 @@ fn observations_come_from_the_response_that_served_the_bytes_and_no_other() {
 
 #[test]
 fn a_loopback_base_url_is_refused_before_any_request() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let files = vec![tree_file("app.js", b"built")];
     let error = fetch_routes(
         "https://127.0.0.1/",
@@ -578,6 +579,7 @@ fn a_loopback_base_url_is_refused_before_any_request() {
 
 #[test]
 fn a_credential_bearing_base_url_is_refused() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let files = vec![tree_file("app.js", b"built")];
     let error = fetch_routes(
         "https://user:secret@app.example/",
@@ -725,6 +727,7 @@ fn a_route_resolving_off_the_origin_reaches_no_network() {
 
 #[test]
 fn the_default_route_map_goes_through_the_same_gate_as_an_explicit_one() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // A directory named `\c2.example` holding a file `p?id=1` is a legal tree on
     // Linux and macOS, and the tree scanner applies no character validation, so
     // an honest `attest build` over a hostile dependency produces this manifest.
@@ -763,6 +766,7 @@ fn the_default_route_map_goes_through_the_same_gate_as_an_explicit_one() {
 
 #[test]
 fn the_default_route_map_is_capped_like_an_explicit_one() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // `default_route_map` emits one route per manifest entry with no cap of its
     // own, so the cap has to come from the gate. Only a hand-edited build
     // receipt can carry a manifest this long, which is why `BuildReceipt`
@@ -1047,6 +1051,7 @@ fn a_receipt_that_drops_its_caveats_is_refused() {
 
 #[test]
 fn an_unverifiable_build_receipt_produces_a_mismatch_with_no_fetch() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let mut build = build_with(vec![tree_file("app.js", b"js")], AttestStatus::Partial);
     // Tamper: the content address no longer covers the document.
     build.subject.argv_digest = "f".repeat(64);
@@ -1077,6 +1082,7 @@ fn an_unverifiable_build_receipt_produces_a_mismatch_with_no_fetch() {
 
 #[test]
 fn a_refused_base_url_records_every_route_as_a_mismatch() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let build = build_with(vec![tree_file("app.js", b"js")], AttestStatus::Partial);
     let receipt = deployment_receipt(
         &build,
@@ -1141,6 +1147,7 @@ fn verify_deployment_reports_the_built_files_that_were_never_fetched() {
 
 #[test]
 fn a_truncated_build_manifest_is_never_reported_as_whole_site_coverage() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // The build produced 4097 files and the manifest stops at the cap. Reading
     // the manifest length as the total makes routes_requested == the total and
     // the uncovered arithmetic structurally zero, so every file past the cap
@@ -1187,6 +1194,7 @@ fn a_truncated_build_manifest_is_never_reported_as_whole_site_coverage() {
 
 #[test]
 fn partial_coverage_is_partial_in_the_document_and_in_the_verifier_alike() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     // One route mapped against a hundred built files. The permissive halves were
     // the durable status field and the exit code, so both are pinned here.
     let files: Vec<TreeFile> = (0..100)
@@ -1279,6 +1287,7 @@ fn verify_deployment_refuses_a_receipt_whose_signature_does_not_verify() {
 
 #[test]
 fn a_build_receipt_whose_signature_is_rejected_is_never_fetched_against() {
+    let _shared_state = tirith_test_support::SharedStateGuard::acquire();
     let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let anchor = SignatureAnchor {
         verifying_key: Some(key.verifying_key().to_bytes()),

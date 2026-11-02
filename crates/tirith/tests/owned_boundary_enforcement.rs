@@ -44,6 +44,11 @@ impl Workspace {
             fs::write(tirith_dir.join("policy.yaml"), policy).expect("write policy");
         }
         fs::create_dir_all(dir.path().join("home")).expect("create home");
+        // Online runs must not leave a detached threat-DB download that
+        // outlives this temporary directory.
+        let state = dir.path().join("home/state/tirith");
+        fs::create_dir_all(&state).expect("create state");
+        fs::write(state.join("threatdb-next-check-at"), "99999999999").expect("defer update");
         Self { dir }
     }
 
@@ -319,15 +324,15 @@ fn windows_refuses_the_unavailable_remote_script_surfaces() {
 // tirith pkg approve: deny before resolver network
 // ---------------------------------------------------------------------------
 
-/// `prepare_plan` starts with `ResolverTools::discover`, so any message about a
-/// resolver tool proves the boundary was crossed: PATH lookup happened, and the
-/// quarantine transaction and network resolve are the next statements.
+/// Any message about a resolver tool would prove resolver discovery (PATH
+/// lookup, then quarantine and network resolve) ran. `pkg approve` must refuse
+/// before all of it.
 fn reached_prepare_plan(stderr: &str) -> bool {
     stderr.contains("resolver tool") || stderr.contains("resolve failed") || stderr.contains("uv")
 }
 
 #[test]
-fn pkg_approve_without_the_gate_reaches_plan_preparation() {
+fn pkg_approve_without_the_gate_checks_native_prerequisites_before_preparation() {
     let workspace = Workspace::new(None);
     let target = workspace.dir.path().join("approved-target");
     let target = target.to_string_lossy();
@@ -346,10 +351,19 @@ fn pkg_approve_without_the_gate_reaches_plan_preparation() {
         );
         return;
     }
+    if stderr.contains("Native package-approval issuance is off:") {
+        assert!(!reached_prepare_plan(&stderr));
+        assert!(collect_paths(&workspace.home().join("data")).is_empty());
+        return;
+    }
+    // With the native authority available, approve refuses with the disabled
+    // execution backend's named reason instead of preparing a plan.
     assert!(
-        reached_prepare_plan(&stderr),
-        "the control must reach prepare_plan: {stderr}"
+        stderr.contains("private_input_execution_unqualified:"),
+        "approve must refuse after the native-authority check: {stderr}"
     );
+    assert!(!reached_prepare_plan(&stderr));
+    assert!(collect_paths(&workspace.home().join("data")).is_empty());
 }
 
 #[test]
@@ -375,7 +389,8 @@ fn pkg_approve_denies_before_any_resolver_or_quarantine_work() {
         return;
     }
     assert!(
-        stderr.contains("refused before any network or install step"),
+        stderr.contains("Native package-approval issuance is off:")
+            || stderr.contains("private_input_execution_unqualified:"),
         "stderr: {stderr}"
     );
     assert!(
@@ -416,10 +431,13 @@ fn pkg_approve_json_reports_the_refusal_as_structured_output() {
     assert_eq!(json["command"], "approve");
     assert_eq!(
         json["error_phase"],
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "task_gate"
-        } else {
+        if json["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("blocked_native:"))
+        {
             "native_authority"
+        } else {
+            "refused_before_exec"
         }
     );
     assert_eq!(json["target_executed"], false);
@@ -901,9 +919,9 @@ fn observe_mode_does_not_become_enforcement_through_warn_action() {
 /// decision must never reach it, or a decision that tightened the capsule would
 /// be satisfied by no capsule at all.
 ///
-/// The invariant is structural today: `pkg install` launches through
-/// `run_to_completion_bound_inputs`, whose API has no degraded mode at all, and
-/// `tirith run` passes `FailClosed`. This scan pins that by refusing any NEW
+/// The invariant is structural today: `pkg install` refuses before any launch
+/// (contained package execution is disabled), and `tirith run` passes
+/// `FailClosed`. This scan pins that by refusing any NEW
 /// file from naming `AllowDegraded`, so wiring a future enforcing surface to it
 /// fails here instead of silently running attacker code uncontained.
 #[test]
@@ -914,9 +932,6 @@ fn only_the_declared_best_effort_surfaces_name_the_degraded_policy() {
         "temp_run.rs",
         // Defines the policy and its guard.
         "capsule.rs",
-        // Maps the historical `--allow-degraded` flag; the value is discarded
-        // before the launch, which always fails closed.
-        "pkg.rs",
     ];
     let mut offenders = Vec::new();
     for path in collect_paths(&source_root) {
