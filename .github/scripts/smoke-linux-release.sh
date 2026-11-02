@@ -50,6 +50,23 @@ grep -q '^tirith ' <<<"$version_output" || {
   exit 1
 }
 
+if [[ "$(uname -m)" == x86_64 && ! -e /usr/bin/sudo ]]; then
+  set +e
+  status_output=$("${runtime_env[@]}" "$tirith_bin" status --json 2>&1)
+  approve_output=$("${runtime_env[@]}" "$tirith_bin" pkg approve pip examplepkg==1.0.0 \
+    --target "$state_root/approval-target" --format json 2>&1)
+  approve_rc=$?
+  set -e
+  grep -q '"package_approval"' <<<"$status_output"
+  grep -q '"trusted_sudo_present": false' <<<"$status_output"
+  grep -q '"ordinary_protection_requires_sudo": false' <<<"$status_output"
+  [[ "$approve_rc" -eq 1 ]]
+  grep -q '"error_phase": "native_authority"' <<<"$approve_output"
+  grep -q 'Native package-approval issuance is off:' <<<"$approve_output"
+  [[ ! -e "$state_root/approval-target" ]]
+  [[ ! -d "$state_root/data/tirith/quarantine" ]]
+fi
+
 set +e
 safe_output=$("${runtime_env[@]}" "$tirith_bin" check --non-interactive --shell posix -- "printf release-smoke" 2>&1)
 safe_rc=$?
