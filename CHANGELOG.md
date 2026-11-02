@@ -173,7 +173,7 @@ This release removes `tirith-core` library API (see Removed), so it is `0.5.0`, 
 
 ### Maintenance
 
-- `cargo deny` and `cargo audit` ignore RUSTSEC-2024-0449 (the unmaintained `unsafe-libyaml`, used only through the deprecated `serde_yaml` 0.9; no vulnerability is reported) until `serde_yaml` is replaced. They also ignore RUSTSEC-2026-0367, -0368 and -0369 (`zip` 2.4.2 extraction keeping SUID/SGID bits and following symlinks): Tirith never calls `zip`'s `extract` functions, reading archive members into memory and rejecting symlink members, and the fixed `zip` 9 needs Rust 1.88, above the 1.83 MSRV.
+- `cargo deny` and `cargo audit` ignore RUSTSEC-2024-0449 (the unmaintained `unsafe-libyaml`, used only through the deprecated `serde_yaml` 0.9; no vulnerability is reported) until `serde_yaml` is replaced. They also ignore RUSTSEC-2026-0367, -0368, -0369 and -0429 (`zip` 2.4.2 extraction's permission/symlink handling and unbounded symlink-target allocation): Tirith never calls `zip`'s `extract` functions, reading archive members into memory and rejecting symlink members with a bounded evidence read, and the fixed `zip` 9 needs Rust 1.88, above the 1.83 MSRV.
 - Test runs keep shells, hooks and the CLI out of the developer's home directory (bash history, audit log, hook state, threat-DB update checks), and the dashboard writer-failure, native-shell and browser-fixture tests no longer flake under load or with a home-like `TMPDIR`.
 
 ## [0.4.2] - 2026-09-11

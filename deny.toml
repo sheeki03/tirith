@@ -36,8 +36,9 @@ ignore = [
     "RUSTSEC-2024-0449",
     # zip 2.4.2: ZipArchive::extract and ZipStreamReader::extract keep SUID/SGID
     # bits (0367), create symlinks whose targets leave the destination (0368)
-    # and apply permissions through symlinks (0369). The fixed line is
-    # zip >=9.0.0, which requires Rust 1.88, above tirith's MSRV 1.83. Tirith
+    # and apply permissions through symlinks (0369). ZipArchive::extract also
+    # allocates a symlink target from its untrusted declared size (0429).
+    # The fixed line is zip >=9.0.0 (Rust 1.88, above tirith's MSRV 1.83). Tirith
     # never calls either extract function: it reads wheel and artifact members
     # into memory by index, rejects symlink members, and writes no member to
     # disk; ZipWriter only builds archives in memory (tests and lab artifacts).
@@ -46,6 +47,7 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 ]
 
 [licenses]
