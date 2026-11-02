@@ -266,9 +266,10 @@ contains, and attests.
   presence of a config file.
 - **Host-hook failure behavior:** Grok Build, Cline, and OpenHands allow the
   tool when their hook process crashes or times out. Tirith's adapter denies on
-  its own errors by default, but it cannot make a host honor a process that did
-  not return. Re-run setup if a pinned interpreter moves and test the real host
-  after every upgrade.
+  its own errors by default, and the generated hooks deny when their pinned
+  Python interpreter has moved (unless `TIRITH_FAIL_OPEN=1`), but Tirith cannot
+  make a host honor a process that did not return. Re-run setup if a pinned
+  interpreter moves and test the real host after every upgrade.
 - **Prime Agent IPython is source-level extraction:** the guard covers shell
   escapes/magics and common `os`, `subprocess`, and `pty.spawn` forms, but it is
   not a Python runtime sandbox. A wrapper defined in an earlier cell,
@@ -868,9 +869,9 @@ See `mcp/clients/` for the host-specific guides that are available.
 **GitHub Action** with SARIF upload to GitHub Security tab:
 
 ```yaml
-- uses: sheeki03/tirith@v0.4.2
+- uses: sheeki03/tirith@v0.5.0
   with:
-    version: 0.4.2
+    version: 0.5.0
     fail_on: high
     sarif: true
 ```
@@ -1302,7 +1303,7 @@ Disable: `export TIRITH_LOG=0`
 - [Cookbook](docs/cookbook.md), policy examples for common setups
 - [Troubleshooting](docs/troubleshooting.md), shell quirks, latency, false positives
 - [Compatibility](docs/compatibility.md), stable vs experimental surface
-- [0.4.2 release notes](docs/release-notes-0.4.2.md), what the current patch release changes, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the 0.4 line's highlights, limitations, and publication contract
+- [0.5.0 release notes](docs/release-notes-0.5.0.md), what the current release changes and how to upgrade, and the [0.4.0 release notes](docs/release-notes-0.4.0.md) for the platform boundaries and publication contract it builds on
 - [Release checklist](docs/release-checklist.md), protected publication sequence and registry verification
 - [Security policy](SECURITY.md), vulnerability reporting
 - [Uninstall](docs/uninstall.md), clean removal per shell and package manager

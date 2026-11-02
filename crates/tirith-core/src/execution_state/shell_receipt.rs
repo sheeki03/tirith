@@ -130,6 +130,7 @@ pub struct ShellReceiptContext {
     shell: ShellType,
     channel: ShellReceiptChannel,
     interactive: bool,
+    interactive_comments: bool,
     strict_warn_override: bool,
 }
 
@@ -148,6 +149,13 @@ impl ShellReceiptContext {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// Whether the check that issued the receipt read the command with
+    /// comment recognition (`AnalysisContext::interactive_comments`).
+    /// Consumption re-analyzes with the same reading.
+    pub fn interactive_comments(&self) -> bool {
+        self.interactive_comments
     }
 
     pub fn strict_warn_override(&self) -> bool {
@@ -282,10 +290,28 @@ struct ShellReceipt {
     requires_warn_ack: bool,
     approval_fallback: Option<String>,
     interactive: bool,
+    /// `false` when the issuing check read the command for a shell that
+    /// does not treat a word-start `#` as a comment
+    /// (`--no-interactive-comments`); consumption re-analyzes it the same
+    /// way. Omitted while `true`, so a receipt it does not apply to (and one
+    /// written before it existed) keeps its exact stored form and seal.
+    #[serde(
+        default = "receipt_interactive_comments_default",
+        skip_serializing_if = "receipt_interactive_comments_is_default"
+    )]
+    interactive_comments: bool,
     strict_warn_override: bool,
     created_unix_ms: u64,
     expires_unix_ms: u64,
     state: ReceiptState,
+}
+
+fn receipt_interactive_comments_default() -> bool {
+    true
+}
+
+fn receipt_interactive_comments_is_default(interactive_comments: &bool) -> bool {
+    *interactive_comments
 }
 
 #[cfg(unix)]
@@ -497,6 +523,12 @@ fn immutable_receipt_identity(receipt: &ShellReceipt) -> serde_json::Value {
     let identity_object = identity
         .as_object_mut()
         .expect("static receipt identity is an object");
+    if !receipt.interactive_comments {
+        identity_object.insert(
+            "interactive_comments".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
     if let Some(digest) = &receipt.cwd_sha256 {
         identity_object.insert(
             "cwd_sha256".to_string(),
@@ -3229,9 +3261,38 @@ pub fn create_shell_execution_receipt(
     strict_warn_override: bool,
     ttl: Duration,
 ) -> Result<String, String> {
+    create_shell_execution_receipt_with_comment_reading(
+        prepared,
+        channel,
+        interactive,
+        true,
+        strict_warn_override,
+        ttl,
+    )
+}
+
+/// [`create_shell_execution_receipt`] for a decision whose analysis used
+/// `interactive_comments` (`AnalysisContext::interactive_comments`): the
+/// receipt records it, and consumption re-analyzes the command the same way
+/// ([`ShellReceiptContext::interactive_comments`]).
+pub fn create_shell_execution_receipt_with_comment_reading(
+    prepared: &PreparedExecution,
+    channel: ShellReceiptChannel,
+    interactive: bool,
+    interactive_comments: bool,
+    strict_warn_override: bool,
+    ttl: Duration,
+) -> Result<String, String> {
     #[cfg(not(unix))]
     {
-        let _ = (prepared, channel, interactive, strict_warn_override, ttl);
+        let _ = (
+            prepared,
+            channel,
+            interactive,
+            interactive_comments,
+            strict_warn_override,
+            ttl,
+        );
         return Err("strict shell execution receipts are unsupported on this platform".to_string());
     }
 
@@ -3323,6 +3384,7 @@ pub fn create_shell_execution_receipt(
                 None
             },
             interactive,
+            interactive_comments,
             strict_warn_override,
             created_unix_ms: now,
             expires_unix_ms,
@@ -3359,6 +3421,7 @@ pub fn shell_execution_receipt_context(
             shell: locked.receipt.shell,
             channel: locked.receipt.channel,
             interactive: locked.receipt.interactive,
+            interactive_comments: locked.receipt.interactive_comments,
             strict_warn_override: locked.receipt.strict_warn_override,
         }),
         ReceiptState::Prepared => Err("shell execution receipt is not armed".to_string()),
@@ -4377,6 +4440,62 @@ mod tests {
             .expect("commit allow receipt"),
             PromotionOutcome::Committed { .. }
         ));
+    }
+
+    /// A check that read the command without comment recognition
+    /// (`--no-interactive-comments`) seals that reading into its receipt, so
+    /// consumption re-analyzes the same way. A receipt that kept the default
+    /// reading stores exactly the fields it stored before the reading existed.
+    #[test]
+    fn receipt_carries_the_comment_reading_to_consumption() {
+        isolated_state(|_, session| {
+            let command = "ls # list";
+            let prepared = prepare(&allow_verdict(), &Policy::default(), command, session);
+            let token = create_shell_execution_receipt_with_comment_reading(
+                &prepared,
+                ShellReceiptChannel::Zsh,
+                true,
+                false,
+                false,
+                Duration::from_secs(60),
+            )
+            .expect("create shell execution receipt");
+            arm_allow(&token);
+            let context = shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh)
+                .expect("open receipt context");
+            assert!(!context.interactive_comments());
+            let stored = fs::read_to_string(receipt_path(&token)).expect("read receipt");
+            assert!(
+                stored.contains(r#""interactive_comments":false"#),
+                "{stored}"
+            );
+            // The reading is sealed: a receipt rewritten to the default
+            // reading no longer opens.
+            replace_receipt_bytes(
+                &token,
+                stored
+                    .replace(
+                        r#""interactive_comments":false"#,
+                        r#""interactive_comments":true"#,
+                    )
+                    .as_bytes(),
+            );
+            assert!(shell_execution_receipt_context(&token, ShellReceiptChannel::Zsh).is_err());
+
+            let default_token = create(
+                &allow_verdict(),
+                &Policy::default(),
+                command,
+                session,
+                false,
+            );
+            arm_allow(&default_token);
+            let context = shell_execution_receipt_context(&default_token, ShellReceiptChannel::Zsh)
+                .expect("open default receipt context");
+            assert!(context.interactive_comments());
+            let stored = fs::read_to_string(receipt_path(&default_token)).expect("read receipt");
+            assert!(!stored.contains("interactive_comments"), "{stored}");
+        });
     }
 
     #[test]

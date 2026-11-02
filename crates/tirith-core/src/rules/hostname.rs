@@ -1,7 +1,7 @@
 use crate::homoglyph;
 use crate::parse::UrlLike;
 use crate::policy::Policy;
-use crate::util::levenshtein;
+use crate::util::within_one_edit;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run all hostname rules against a parsed URL.
@@ -360,7 +360,7 @@ fn check_confusable_domain(
         // For short domains (< 8 chars), skip levenshtein entirely since
         // single-edit matches are too noisy.
         let len_diff = (host_lower.len() as isize - known_lower.len() as isize).unsigned_abs();
-        if known_lower.len() >= 8 && len_diff <= 3 && levenshtein(&host_lower, &known_lower) <= 1 {
+        if known_lower.len() >= 8 && len_diff <= 3 && within_one_edit(&host_lower, &known_lower) {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableDomain,
                 severity: Severity::Medium,

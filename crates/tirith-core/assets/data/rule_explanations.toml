@@ -844,8 +844,8 @@ severity_rationale = "Medium — Docker images from unknown registries may conta
 description = "A Docker or Podman command pulls an image from a registry not in the trusted set: docker.io, ghcr.io, gcr.io, quay.io, registry.k8s.io, mcr.microsoft.com, public.ecr.aws."
 examples_bad = ["docker pull evil-registry.example.com/image"]
 examples_good = ["docker pull ghcr.io/owner/image:latest"]
-false_positive_guidance = "Private registries and self-hosted registries will trigger this. Add trusted registries to your policy."
-remediation = "Use images from trusted registries. If using a private registry, add it to your policy allowlist."
+false_positive_guidance = "Private registries and self-hosted registries will trigger this. Trust the registry host itself, not one image: `tirith trust add <registry-host> --broad --rule docker_untrusted_registry`."
+remediation = "Use images from trusted registries. To trust a private registry, run `tirith trust add <registry-host> --broad --rule docker_untrusted_registry`, or list the registry host in the allowlist of your user or organization policy. A repository's committed policy cannot allowlist it, and a `<registry-host>/*` pattern is refused."
 mitre_id = "T1195.002"
 
 [[rule]]

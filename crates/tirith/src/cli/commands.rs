@@ -1019,10 +1019,11 @@ pub fn check(command_parts: &[String], shell: &str, json: bool) -> i32 {
     // Reuse the exact `tirith check` path — no divergent second code path.
     super::check::run(
         &cmd, shell_type, json, /* legacy JSON schema */ 3, /* non_interactive */ false,
-        /* interactive_flag */ false, /* approval_check */ false,
-        /* execution_receipt */ None, /* strict_warn */ false, /* no_daemon */ true,
-        /* warn_only */ false, /* defer */ false, /* offline */ false,
-        /* suggest_safe_command */ false, /* card */ None,
+        /* interactive_flag */ false, /* interactive_comments */ true,
+        /* approval_check */ false, /* execution_receipt */ None,
+        /* strict_warn */ false, /* no_daemon */ true, /* warn_only */ false,
+        /* defer */ false, /* offline */ false, /* suggest_safe_command */ false,
+        /* card */ None,
     )
 }
 
@@ -1061,6 +1062,7 @@ fn analyze_command(
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: tirith_core::engine::python_inspect_env_active(),
         cdpath_inherited: tirith_core::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
     engine::analyze_returning_policy(&ctx)
 }

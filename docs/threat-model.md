@@ -19,8 +19,8 @@
 | Vector | Detection | Rules |
 |--------|-----------|-------|
 | Homoglyph/punycode domains | IDN analysis, confusable table | `confusable_domain`, `punycode_domain`, `mixed_script_in_label` |
-| curl\|bash / wget\|sh | Command shape analysis | `curl_pipe_shell`, `wget_pipe_shell`, `pipe_to_interpreter` |
-| ANSI escape injection in paste | Byte scanning | `ansi_escapes`, `control_chars` |
+| curl\|bash / wget\|sh, a download piped into `source` / `.` or `busybox sh` | Command shape analysis | `curl_pipe_shell`, `wget_pipe_shell`, `pipe_to_interpreter` |
+| ANSI escape injection in a paste or a checked command (CRLF line endings exempt) | Byte scanning | `ansi_escapes`, `control_chars` |
 | Bidi/zero-width Unicode tricks | Byte scanning | `bidi_controls`, `zero_width_chars` |
 | Hidden newlines in paste | Content analysis | `hidden_multiline` |
 | URL shortener obfuscation | Domain matching | `shortened_url` |

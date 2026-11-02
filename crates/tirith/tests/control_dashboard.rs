@@ -734,27 +734,44 @@ fn real_service_reports_writer_failure_even_when_no_history_record_was_saved() {
     state.set_env("TIRITH_LOG", "1");
     let log = tirith_core::audit::audit_log_path().unwrap();
     std::fs::create_dir_all(&log).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
-    state.apply_to_command(&mut command);
-    let checked = command
-        .current_dir(&state.roots().cwd)
-        .args([
-            "check",
-            "--json",
-            "--shell",
-            "posix",
-            "--no-daemon",
-            "--",
-            "echo inert",
-        ])
-        .output()
-        .unwrap();
+    // The writer saves its private notice best-effort, waiting 25 ms for a lock
+    // on the filesystem-root inode that concurrent setup tests also take. Under
+    // that contention a single run may legitimately record nothing, so observe
+    // further real writer failures until one notice lands.
+    let notice = tirith_core::policy::state_dir()
+        .unwrap()
+        .join("audit-append-failure-v1.json");
+    for _ in 0..50 {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tirith"));
+        state.apply_to_command(&mut command);
+        let checked = command
+            .current_dir(&state.roots().cwd)
+            .args([
+                "check",
+                "--json",
+                "--shell",
+                "posix",
+                "--no-daemon",
+                "--",
+                "echo inert",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        assert!(String::from_utf8_lossy(&checked.stderr).contains("audit append failed"));
+        if notice.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(
-        checked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&checked.stderr)
+        notice.exists(),
+        "no writer failure notice was saved in 50 attempts"
     );
-    assert!(String::from_utf8_lossy(&checked.stderr).contains("audit append failed"));
     let (server, _) = service(&state);
     for (method, path, body) in [
         ("GET", "/api/state", None),

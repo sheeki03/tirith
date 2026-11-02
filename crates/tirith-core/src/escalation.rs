@@ -19,11 +19,19 @@ use crate::verdict::{Action, Evidence, Finding, RuleId, Severity, Verdict};
 /// applied per-rule severity overrides. Every late producer must use this seam
 /// so those findings cannot bypass policy or diverge between daemon and inline
 /// execution.
+///
+/// An honored bypass is an Allow that skipped analysis, so late findings are
+/// discarded rather than merged: they would re-raise the action of a command
+/// the policy let the user run unchecked, which then prompts or blocks on the
+/// receipt path (#284).
 pub fn merge_late_findings(
     verdict: &mut Verdict,
     mut findings: Vec<Finding>,
     policy: &crate::policy::Policy,
 ) {
+    if verdict.bypass_honored {
+        return;
+    }
     for finding in &mut findings {
         if let Some(override_severity) = policy.severity_override(&finding.rule_id) {
             finding.severity = override_severity;
@@ -1532,6 +1540,28 @@ pub(crate) fn args_without_redirections(args: &[String]) -> Vec<String> {
 /// word. Returns the argv prefix plus whether the operator consumes the next
 /// shell word. Process substitutions stay part of the word.
 pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    redirection_suffix(word, false)
+}
+
+/// [`shell_redirection_suffix`] for fish words: a single-quoted string accepts
+/// `\'` and `\\`, backticks are ordinary bytes, `(` opens a command
+/// substitution with or without `$`, and fish has no process substitution, so
+/// `>(cmd)` redirects to the file the substitution names.
+pub(crate) fn fish_redirection_suffix(word: &str) -> Option<(&str, bool)> {
+    redirection_suffix(word, true)
+}
+
+/// [`shell_redirection_token`] for fish, where `>(cmd)` is a redirection to the
+/// file the command substitution names.
+pub(crate) fn fish_redirection_token(word: &str) -> Option<bool> {
+    let rest = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if rest.starts_with(">(") || rest.starts_with("<(") {
+        return Some(false);
+    }
+    shell_redirection_token(word)
+}
+
+fn redirection_suffix(word: &str, fish: bool) -> Option<(&str, bool)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -1552,7 +1582,9 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
         }
         match quote {
             Quote::Single => {
-                if ch == '\'' {
+                if fish && ch == '\\' {
+                    escaped = true;
+                } else if ch == '\'' {
                     quote = Quote::None;
                 }
                 continue;
@@ -1586,7 +1618,7 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
                     quote = Quote::Double;
                     continue;
                 }
-                '`' => {
+                '`' if !fish => {
                     quote = Quote::Backtick;
                     continue;
                 }
@@ -1615,7 +1647,14 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
         // Operators inside command/process substitutions belong to that
         // nested command, not the outer delete command. Consume the opening
         // parenthesis here so it is counted exactly once.
-        if matches!(ch, '$' | '<' | '>') && chars.peek().is_some_and(|(_, next)| *next == '(') {
+        if fish && ch == '(' {
+            substitution_depth = 1;
+            continue;
+        }
+        if matches!(ch, '$' | '<' | '>')
+            && !(fish && ch != '$')
+            && chars.peek().is_some_and(|(_, next)| *next == '(')
+        {
             let _ = chars.next();
             substitution_depth = 1;
             continue;
@@ -1623,7 +1662,7 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
 
         // A `>` or `<` inside `${parameter expansion}` is word content (for
         // example `${x:-a>b}`), not an outer redirection operator.
-        if ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
+        if !fish && ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '{') {
             let _ = chars.next();
             parameter_depth = 1;
             continue;
@@ -1639,7 +1678,12 @@ pub(crate) fn shell_redirection_suffix(word: &str) -> Option<(&str, bool)> {
             return None;
         }
         let candidate = &word[candidate_index..];
-        if let Some(target_is_separate) = shell_redirection_token(candidate) {
+        let token = if fish {
+            fish_redirection_token(candidate)
+        } else {
+            shell_redirection_token(candidate)
+        };
+        if let Some(target_is_separate) = token {
             return Some((&word[..candidate_index], target_is_separate));
         }
     }
@@ -2590,6 +2634,30 @@ mod tests {
 
         assert_eq!(verdict.findings[0].severity, Severity::Critical);
         assert_eq!(verdict.action, Action::Block);
+    }
+
+    #[test]
+    fn late_findings_do_not_reopen_an_honored_bypass() {
+        // #284: runtime lookups merged into an honored TIRITH=0 bypass raised
+        // it to Warn, so strict_warn prompted for a command the user had
+        // already been allowed to run unchecked.
+        let mut verdict = Verdict::allow_fast(2, Timings::default());
+        verdict.bypass_requested = true;
+        verdict.bypass_available = true;
+        verdict.bypass_honored = true;
+
+        merge_late_findings(
+            &mut verdict,
+            vec![make_finding(
+                RuleId::PackageLookupIncomplete,
+                Severity::Medium,
+            )],
+            &crate::policy::Policy::default(),
+        );
+
+        assert_eq!(verdict.action, Action::Allow);
+        assert!(verdict.findings.is_empty());
+        assert!(verdict.bypass_honored);
     }
 
     #[test]

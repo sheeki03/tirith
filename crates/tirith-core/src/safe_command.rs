@@ -82,6 +82,7 @@ fn default_exec_context(cmd: &str, shell: ShellType) -> AnalysisContext {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     }
 }
 
@@ -209,8 +210,9 @@ fn analyze_cli_inline_candidate_with_network(
     network: crate::threatdb_api::RuntimeThreatNetwork,
 ) -> Verdict {
     let mut raw = engine::analyze_with_policy_without_bypass(ctx, policy);
-    let runtime_findings = crate::threatdb_api::enrich_command_with_network(
+    let runtime_findings = crate::threatdb_api::enrich_command_readings_with_network(
         &ctx.input,
+        ctx.interactive_comments_reading().as_deref(),
         ctx.shell,
         &policy.threat_intel,
         crate::threatdb_api::RuntimeThreatMode::Inline,
@@ -441,6 +443,7 @@ fn context_with_input(ctx: &AnalysisContext, input: String) -> AnalysisContext {
         clipboard_source: ctx.clipboard_source.clone(),
         python_inspect_inherited: ctx.python_inspect_inherited,
         cdpath_inherited: ctx.cdpath_inherited,
+        interactive_comments: true,
     }
 }
 

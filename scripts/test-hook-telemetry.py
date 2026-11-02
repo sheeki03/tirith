@@ -249,7 +249,7 @@ function execFileSync(binary,args,options) {
   if (args[0] === "check") {
     if (options.timeout < 9850) throw Object.assign(new Error("check timed out"), {killed:true, code:"ETIMEDOUT"});
     state.now += 9850;
-    return "";
+    return JSON.stringify({requires_approval:false, findings:[]});
   }
   if (state.stubborn) {
     state.now += 250;

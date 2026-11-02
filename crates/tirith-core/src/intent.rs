@@ -387,6 +387,7 @@ pub fn command_signals(command: &str, shell: ShellType) -> Vec<CommandSignal> {
         clipboard_source: crate::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: crate::engine::python_inspect_env_active(),
         cdpath_inherited: crate::engine::cdpath_env_active(),
+        interactive_comments: true,
     };
     let verdict = engine::analyze(&ctx);
 

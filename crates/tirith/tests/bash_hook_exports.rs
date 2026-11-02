@@ -27,6 +27,27 @@ fn enter_mode_supported() -> bool {
     pty_support::modern_bash().is_some()
 }
 
+/// A private HOME and XDG data/config/cache roots below `root` for a test
+/// shell running the real binary, so its history, the audit log, and a
+/// detached threat-DB download never reach the developer's real home. The
+/// update schedule (under the caller's `XDG_STATE_HOME`, which is `root`) is
+/// pushed far into the future so no detached download outlives the test.
+fn isolated_home(root: &std::path::Path) -> std::path::PathBuf {
+    let home = root.join("home");
+    for dir in [
+        home.clone(),
+        root.join("config"),
+        root.join("data"),
+        root.join("cache"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let state = root.join("tirith");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("threatdb-next-check-at"), "99999999999").unwrap();
+    home
+}
+
 fn hook_path() -> String {
     format!(
         "{}/assets/shell/lib/bash-hook.bash",
@@ -134,7 +155,11 @@ fn source_hook_and_dump_exports(capability: Option<&str>, extra_env: &[(&str, &s
     let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path());
     for (k, v) in &env_vars {
@@ -259,7 +284,11 @@ fn hook_does_not_export_in_noninteractive_shell() {
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -386,7 +415,11 @@ fn status_is_not_exported_to_child_processes() {
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -464,7 +497,11 @@ printf 'LINE=[%s]\nPOINT=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -519,7 +556,11 @@ printf 'DEGRADED=[%s]\nLINE=[%s]\nPOINT=[%s]\n' \
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -575,7 +616,11 @@ printf 'EVAL_RAN=[%s]\nEVAL=[%s]\nCOMMAND=[%s]\nRECEIPT=[%s]\nDISCARDED=[%s]\nDE
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -623,7 +668,11 @@ fi
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -655,7 +704,11 @@ fn doctor_stdout(env: &[(&str, &str)]) -> String {
     let out = Command::new(bash_under_test())
         .args(["--norc", "--noprofile", "-c", &bash_script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("XDG_STATE_HOME", tmpdir.path())
         .output()
@@ -790,7 +843,11 @@ fn source_hook_run_and_dump(extra_env: &[(&str, &str)], body: &str) -> String {
     let mut cmd = Command::new(bash_under_test());
     cmd.args(["--norc", "--noprofile", "-i", "-c", &script])
         .env_clear()
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", isolated_home(tmpdir.path()))
+        .env("HISTFILE", "")
+        .env("XDG_CONFIG_HOME", tmpdir.path().join("config"))
+        .env("XDG_DATA_HOME", tmpdir.path().join("data"))
+        .env("XDG_CACHE_HOME", tmpdir.path().join("cache"))
         .env("PATH", path_with_tirith_under_test())
         .env("XDG_STATE_HOME", tmpdir.path());
     for (k, v) in &env_vars {

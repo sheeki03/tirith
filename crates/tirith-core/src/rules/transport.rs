@@ -19,7 +19,18 @@ pub(crate) fn check_with_raw_url(
     check_plain_http_to_sink(url, in_sink_context, &mut findings);
     check_shortened_url(url, &mut findings);
 
-    if matches!(url, UrlLike::SchemelessHostPath { .. }) && in_sink_context {
+    // A schemeless loopback operand (`curl localhost:3000`) reaches this
+    // machine whichever scheme the client picks, so the scheme ambiguity this
+    // rule reports cannot be exploited from the network (the same reasoning as
+    // the loopback exemption of `check_plain_http_to_sink`).
+    // The operand as typed must spell the loopback authority literally: a
+    // numeric shorthand such as curl's empty-hex `0x7f.0x` is a DNS name to
+    // curl even though a URL parser normalizes it to 127.0.0.0.
+    let schemeless_loopback = raw_url
+        .or(url.raw_host())
+        .is_some_and(crate::rules::shared::literal_loopback_destination);
+    if matches!(url, UrlLike::SchemelessHostPath { .. }) && in_sink_context && !schemeless_loopback
+    {
         findings.push(Finding {
             rule_id: RuleId::SchemelessToSink,
             severity: Severity::Medium,
@@ -135,6 +146,25 @@ fn strip_quotes_simple(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Lower an [`RuleId::InsecureTlsFlags`] finding for a request that provably
+/// stays on this machine (every destination a literal loopback authority,
+/// nothing that can reroute it; decided by the command rules). Without a
+/// network path there is no attacker in the middle, so the flag is reported at
+/// Low severity (a warning at the paranoia levels that show Low findings)
+/// instead of blocking.
+pub(crate) fn downgrade_insecure_tls_for_loopback(finding: &mut Finding) {
+    if finding.rule_id != RuleId::InsecureTlsFlags {
+        return;
+    }
+    finding.severity = Severity::Low;
+    finding.title = "Insecure TLS flag on a loopback request".to_string();
+    finding.description = format!(
+        "{} The request only reaches this machine (a loopback address with no proxy or \
+         address override), so no network attacker can intercept it.",
+        finding.description
+    );
 }
 
 /// Check command arguments for insecure TLS flags according to the resolved

@@ -477,3 +477,39 @@ fn expanded_option_values_are_read_as_curl_reads_them() {
     let input = "curl --url 'https://{{HOST}}/health'";
     assert!(command_rules(input).contains(&RuleId::AnalysisIncomplete));
 }
+
+#[test]
+fn scheme_slash_variants_expand_only_the_curl_authority() {
+    for slashes in ["/", "//", "///"] {
+        let input = format!("curl 'http:{slashes}169.254.169.[254-254]/latest/meta-data/'");
+        assert!(
+            command_rules(&input).contains(&RuleId::MetadataEndpoint),
+            "{input}"
+        );
+        let urls = extract::extract_urls(&input, ShellType::Posix);
+        assert!(
+            urls.iter()
+                .any(|url| url.parsed.host() == Some("169.254.169.254")),
+            "{input}: {urls:?}"
+        );
+        assert!(
+            denied(&input, &["169.254.0.0/16"], &[]).contains(&RuleId::CommandNetworkDeny),
+            "{input}"
+        );
+        let disabled = format!("curl -g 'http:{slashes}169.254.169.[254-254]/latest/meta-data/'");
+        assert!(
+            !command_rules(&disabled).contains(&RuleId::MetadataEndpoint),
+            "{disabled}"
+        );
+        assert!(
+            denied(&disabled, &["169.254.0.0/16"], &[]).is_empty(),
+            "{disabled}"
+        );
+        let path = format!("curl 'https:{slashes}example.com/path/{{169.254.169.254,other}}'");
+        assert!(
+            !command_rules(&path).contains(&RuleId::MetadataEndpoint),
+            "{path}"
+        );
+        assert!(denied(&path, &["169.254.0.0/16"], &[]).is_empty(), "{path}");
+    }
+}

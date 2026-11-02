@@ -65,6 +65,7 @@ fn analyze_exec(input: &str, cwd: &str) -> tirith_core::verdict::Verdict {
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     engine::analyze(&ctx)
 }
@@ -665,6 +666,7 @@ fn scan_config_file(repo: &TempDir, file_path: &str) -> tirith_core::verdict::Ve
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::Unread,
         python_inspect_inherited: false,
         cdpath_inherited: false,
+        interactive_comments: true,
     };
     engine::analyze(&ctx)
 }

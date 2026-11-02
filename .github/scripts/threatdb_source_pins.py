@@ -12,6 +12,7 @@ from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 import socket
@@ -37,10 +38,40 @@ HEX_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 COMMITS_PER_PAGE = 100
 MAX_COMMIT_PAGES = 10
+# GitHub answers 422 when it cannot build a comparison in time ("Sorry, this
+# diff is taking too long to generate"). Every other permanent status from the
+# compare endpoint stays fatal.
+COMPARISON_UNAVAILABLE_STATUSES = frozenset({422})
 
 
 class PinError(RuntimeError):
     """A fail-closed pin manifest or discovery error."""
+
+
+class GitHubStatusError(PinError):
+    """GitHub answered with a permanent, non-retryable HTTP status."""
+
+    def __init__(self, status: int, endpoint: str) -> None:
+        super().__init__(f"GitHub API permanent HTTP {status} for {endpoint}")
+        self.status = status
+
+
+class ComparisonUnavailable(GitHubStatusError):
+    """GitHub answered but cannot compare a pin with its candidate.
+
+    This says nothing about either commit: the timestamp lag still holds, only
+    the commit count and changed-file evidence are missing.
+    """
+
+    def __init__(self, status: int, endpoint: str) -> None:
+        super().__init__(status, endpoint)
+        self.reason = f"github_http_{status}"
+
+
+def comparison_status_error(status: int, endpoint: str) -> PinError:
+    if status in COMPARISON_UNAVAILABLE_STATUSES:
+        return ComparisonUnavailable(status, endpoint)
+    return GitHubStatusError(status, endpoint)
 
 
 class JsonClient(Protocol):
@@ -190,7 +221,7 @@ class GitHubClient:
                     except (ValueError, TypeError):
                         retryable = False
                 if not retryable:
-                    raise PinError(f"GitHub API permanent HTTP {error.code} for {endpoint}") from error
+                    raise GitHubStatusError(error.code, endpoint) from error
             except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
                 reason = getattr(error, "reason", error)
                 retryable = isinstance(reason, (TimeoutError, ConnectionError)) or (
@@ -211,7 +242,11 @@ class GitHubClient:
         )
 
     def compare(self, repository: str, base: str, head: str) -> Any:
-        return self._get(f"/repos/{repository}/compare/{base}...{head}")
+        endpoint = f"/repos/{repository}/compare/{base}...{head}"
+        try:
+            return self._get(endpoint)
+        except GitHubStatusError as error:
+            raise comparison_status_error(error.status, endpoint) from error
 
 
 def retry_delay(retry_after: str | None, attempt: int, remaining: float) -> float | None:
@@ -233,21 +268,27 @@ def retry_delay(retry_after: str | None, attempt: int, remaining: float) -> floa
     return delay if 0 <= delay < remaining else None
 
 
+def source_observation(item: dict[str, Any]) -> dict[str, Any]:
+    observation = {
+        "pinned_commit": item["old_commit"],
+        "candidate_commit": item["candidate"]["commit"],
+        "candidate_timestamp": item["candidate"]["commit_timestamp"],
+        "ahead_by": item.get("comparison", {}).get("ahead_by", 0),
+        "max_lag_hours": item["max_lag_hours"],
+        "review_required": item["changed"],
+    }
+    if "comparison_unavailable" in item:
+        # The commit count is unknown; the candidate timestamp still gives the lag.
+        observation["ahead_by"] = None
+        observation["comparison_unavailable"] = item["comparison_unavailable"]
+    return observation
+
+
 def observation_document(selected_at: str, changes: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "checked_at": selected_at,
-        "sources": {
-            item["source"]: {
-                "pinned_commit": item["old_commit"],
-                "candidate_commit": item["candidate"]["commit"],
-                "candidate_timestamp": item["candidate"]["commit_timestamp"],
-                "ahead_by": item.get("comparison", {}).get("ahead_by", 0),
-                "max_lag_hours": item["max_lag_hours"],
-                "review_required": item["changed"],
-            }
-            for item in changes
-        },
+        "sources": {item["source"]: source_observation(item) for item in changes},
     }
 
 
@@ -279,9 +320,15 @@ class FixtureClient:
     def compare(self, repository: str, base: str, head: str) -> Any:
         key = f"{repository}:{base}...{head}"
         try:
-            return self.document["comparisons"][key]
+            comparison = self.document["comparisons"][key]
         except (KeyError, TypeError) as error:
             raise PinError(f"API fixture has no comparison for {key}") from error
+        # {"http_status": N} replays a permanent GitHub answer for this compare.
+        if isinstance(comparison, dict) and "http_status" in comparison:
+            raise comparison_status_error(
+                comparison["http_status"], f"/repos/{repository}/compare/{base}...{head}"
+            )
+        return comparison
 
 
 def normalized_commit(entry: Any, repository: str) -> dict[str, str]:
@@ -395,24 +442,46 @@ def update_pins(
             "old_commit": source["commit"],
             "old_commit_timestamp": source["commit_timestamp"],
             "policy": source["candidate_policy"],
+            "proposed": False,
             "repository": source["repository"],
             "source": source_name,
             "stale": lag_hours > source["max_lag_hours"],
         }
         if item["changed"]:
-            comparison = client.compare(
-                source["repository"], source["commit"], candidate["commit"]
-            )
-            item["comparison"] = summarize_comparison(
-                source["repository"],
-                source["commit"],
-                candidate["commit"],
-                comparison,
-            )
-            source["commit"] = candidate["commit"]
-            source["commit_timestamp"] = candidate["commit_timestamp"]
-            source["selected_at"] = selected_at
-            changed = True
+            try:
+                comparison = client.compare(
+                    source["repository"], source["commit"], candidate["commit"]
+                )
+            except ComparisonUnavailable as error:
+                # Nothing then shows the candidate is strictly ahead of the pin,
+                # so this source is observed by timestamp but never adopted.
+                item["comparison_unavailable"] = error.reason
+                warning = (
+                    f"{source_name}: {error}; "
+                    "lag comes from commit timestamps, and the pin stays at "
+                    f"{source['commit'][:12]} instead of adopting "
+                    f"{candidate['commit'][:12]}"
+                )
+                print(f"threatdb_source_pins.py: warning: {warning}", file=sys.stderr)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # An annotation keeps a pin that needs a manual update
+                    # visible on the run page, not only in the step log.
+                    print(
+                        "::warning title=ThreatDB source pin not updated::"
+                        + annotation_text(warning)
+                    )
+            else:
+                item["comparison"] = summarize_comparison(
+                    source["repository"],
+                    source["commit"],
+                    candidate["commit"],
+                    comparison,
+                )
+                item["proposed"] = True
+                source["commit"] = candidate["commit"]
+                source["commit_timestamp"] = candidate["commit_timestamp"]
+                source["selected_at"] = selected_at
+                changed = True
         elif candidate["commit_timestamp"] != source["commit_timestamp"]:
             raise PinError(
                 f"{source_name} pinned commit timestamp disagrees with GitHub"
@@ -420,6 +489,10 @@ def update_pins(
         changes.append(item)
     validate_manifest(manifest)
     return changed, changes
+
+
+def annotation_text(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def markdown_code(value: str) -> str:
@@ -437,9 +510,12 @@ def render_report(selected_at: str, changes: list[dict[str, Any]]) -> str:
         "|---|---:|---|---|---:|---|",
     ]
     for item in changes:
-        state = (
-            "stale" if item["stale"] else ("update" if item["changed"] else "current")
-        )
+        if "comparison_unavailable" in item:
+            state = "skipped (stale)" if item["stale"] else "skipped"
+        elif item["stale"]:
+            state = "stale"
+        else:
+            state = "update" if item["proposed"] else "current"
         candidate = item["candidate"]
         lines.append(
             "| {source} | {state} | `{old}` | `{new}` | {lag:.1f}h / {limit}h | `{policy}` |".format(
@@ -474,6 +550,12 @@ def render_report(selected_at: str, changes: list[dict[str, Any]]) -> str:
                     f"- changed path prefixes: `{json.dumps(comparison['path_prefixes'], sort_keys=True)}`",
                     f"- GitHub file list truncated: `{str(comparison['files_truncated']).lower()}`",
                 ]
+            )
+        elif "comparison_unavailable" in item:
+            lines.append(
+                f"- not proposed: GitHub could not compare it with pin "
+                f"`{item['old_commit'][:12]}` (`{item['comparison_unavailable']}`); "
+                "the pin stays until a reviewer updates it by hand"
             )
         else:
             lines.append("- no change")
@@ -521,8 +603,11 @@ def command_update(arguments: argparse.Namespace) -> int:
     atomic_write(arguments.report, report)
     result = {
         "changed": changed,
-        "changed_sources": [item["source"] for item in changes if item["changed"]],
+        "changed_sources": [item["source"] for item in changes if item["proposed"]],
         "selected_at": selected_at,
+        "skipped_sources": [
+            item["source"] for item in changes if "comparison_unavailable" in item
+        ],
         "stale_sources": [item["source"] for item in changes if item["stale"]],
         "upstream_observations": observation_document(selected_at, changes),
     }

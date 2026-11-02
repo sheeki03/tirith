@@ -209,7 +209,16 @@ fn run_group(prefixes: &[&str], count: usize) {
         assert_contract(case, &value);
         if let Some(expected_keys) = &case.top_level_keys {
             let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-            assert_eq!(&keys, expected_keys, "{} public fields changed", case.case);
+            // Keep the recorded 0.4.2 bytes unchanged. The 0.5.0 check contract
+            // intentionally adds this authority field; all legacy keys,
+            // decisions, exits and persisted input bytes must still match.
+            let mut expected_keys = expected_keys.clone();
+            if args.first().is_some_and(|arg| arg == "check") {
+                assert_eq!(value["requires_approval"].as_bool(), Some(false));
+                expected_keys.push("requires_approval".into());
+                expected_keys.sort_unstable();
+            }
+            assert_eq!(keys, expected_keys, "{} public fields changed", case.case);
         }
         let baseline: Vec<_> = capture
             .cases

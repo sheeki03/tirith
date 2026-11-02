@@ -37,7 +37,10 @@ existing entries.
 
 ## Manual Setup
 
-If you prefer to configure manually, or need to customize the hook:
+Do not hand-write the hook script. The adapter must enforce the approval and
+acknowledgement rules in [How it works](#how-it-works); a simplified script
+that only branches on the exit code lets through commands that policy says a
+human must approve first.
 
 1. Install `tirith` and ensure it is on PATH:
 
@@ -45,139 +48,22 @@ If you prefer to configure manually, or need to customize the hook:
    tirith --version
    ```
 
-2. Create the PreToolUse hook script at `.claude/hooks/tirith-check.py` in
-   your project (or globally at `~/.claude/hooks/tirith-check.py`):
+2. Generate the hook script with setup. It writes `.claude/hooks/tirith-check.py`
+   in your project (or `~/.claude/hooks/tirith-check.py` with `--scope user`);
+   `--dry-run` shows every file and settings change without writing:
 
-   ```python
-   #!/usr/bin/env python3
-   """Claude Code PreToolUse hook — runs tirith check on Bash tool calls."""
-
-   import json, os, shutil, subprocess, sys
-
-   def get(data, *keys):
-       for k in keys:
-           if k in data:
-               return data[k]
-       return None
-
-   def deny(reason):
-       print(json.dumps({
-           "hookSpecificOutput": {
-               "hookEventName": "PreToolUse",
-               "permissionDecision": "deny",
-               "permissionDecisionReason": reason,
-           }
-       }))
-       sys.exit(0)
-
-   def fail_action():
-       """Return deny (default, fail-closed) or allow (fail-open via env)."""
-       return "allow" if os.environ.get("TIRITH_FAIL_OPEN") == "1" else "deny"
-
-   def fail_closed(reason):
-       """Deny or allow based on TIRITH_FAIL_OPEN, for error/missing-binary paths."""
-       action = fail_action()
-       if action == "deny":
-           deny(reason)
-       else:
-           sys.exit(0)
-
-   def main():
-       try:
-           raw = sys.stdin.read()
-           if not raw.strip():
-               fail_closed("tirith: empty hook input — blocked for safety")
-           data = json.loads(raw)
-       except (json.JSONDecodeError, OSError):
-           fail_closed("tirith: failed to parse hook input — blocked for safety")
-           return
-
-       if not isinstance(data, dict):
-           fail_closed("tirith: invalid hook input — blocked for safety")
-           return
-
-       event = get(data, "hook_event_name", "hookEventName")
-       tool = get(data, "tool_name", "toolName")
-       tool_input = get(data, "tool_input", "toolInput") or {}
-
-       if event != "PreToolUse" or tool != "Bash":
-           sys.exit(0)
-       if not isinstance(tool_input, dict):
-           fail_closed("tirith: invalid tool_input — blocked for safety")
-           return
-
-       command = tool_input.get("command")
-       if not isinstance(command, str) or not command.strip():
-           fail_closed("tirith: missing command — blocked for safety")
-           return
-
-       tirith_bin = os.environ.get("TIRITH_BIN") or shutil.which("tirith") or "tirith"
-
-       try:
-           result = subprocess.run(
-               [tirith_bin, "check", "--json", "--non-interactive",
-                "--shell", "posix", "--", command],
-               capture_output=True, text=True, timeout=10,
-           )
-       except FileNotFoundError:
-           fail_closed("tirith: binary not found — blocked for safety")
-           return
-       except subprocess.TimeoutExpired:
-           fail_closed("tirith: check timed out — blocked for safety")
-           return
-       except OSError as e:
-           fail_closed(f"tirith: OS error — {e}")
-           return
-
-       if result.returncode == 0:
-           sys.exit(0)
-
-       if result.returncode not in (1, 2):
-           fail_closed(f"tirith: unexpected exit code {result.returncode} — blocked for safety")
-           return
-       if not result.stdout.strip():
-           fail_closed("tirith: check failed with no output — blocked for safety")
-           return
-
-       if result.returncode == 2:
-           warn_action = os.environ.get("TIRITH_HOOK_WARN_ACTION", "deny").lower()
-           if warn_action == "allow":
-               sys.exit(0)
-
-       reason = "Tirith security check failed"
-       if result.stdout.strip():
-           try:
-               verdict = json.loads(result.stdout)
-               findings = verdict.get("findings", [])
-               if findings:
-                   parts = []
-                   for f in findings:
-                       title = f.get("title", f.get("rule_id", "unknown"))
-                       severity = f.get("severity", "")
-                       parts.append(f"[{severity}] {title}" if severity else title)
-                   reason = "Tirith: " + "; ".join(parts)
-           except json.JSONDecodeError:
-               reason = result.stdout.strip()[:500]
-
-       deny(reason)
-
-   if __name__ == "__main__":
-       try:
-           main()
-       except Exception:
-           if os.environ.get("TIRITH_FAIL_OPEN") == "1":
-               sys.exit(0)
-           print(json.dumps({
-               "hookSpecificOutput": {
-                   "hookEventName": "PreToolUse",
-                   "permissionDecision": "deny",
-                   "permissionDecisionReason": "tirith: unexpected hook error — blocked for safety",
-               }
-           }))
-           sys.exit(0)
+   ```bash
+   tirith setup claude-code --dry-run
+   tirith setup claude-code
    ```
 
-3. Register the hook in `.claude/settings.json` (merge with existing):
+   The generated file is Tirith's embedded adapter
+   (`crates/tirith/assets/hooks/tirith-check.py` in the source tree). If you
+   must customize it, start from a copy of that file and keep its decision
+   logic intact rather than writing a new hook.
+
+3. Setup registers the hook in `.claude/settings.json`. If you register it
+   yourself instead, point it at the generated script (merge with existing):
 
    ```json
    {
@@ -188,7 +74,7 @@ If you prefer to configure manually, or need to customize the hook:
            "hooks": [
              {
                "type": "command",
-               "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\""
+               "command": "'/absolute/path/to/python3' \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\" || exit 2"
              }
            ]
          }
@@ -197,10 +83,15 @@ If you prefer to configure manually, or need to customize the hook:
    }
    ```
 
+   Use an absolute interpreter path: Claude Code does not resolve `python3`
+   from the agent's runtime PATH. Keep the trailing `|| exit 2`: Claude Code
+   treats any other non-zero hook exit as non-blocking, so without it a hook
+   that cannot start would let the command run.
+
    If you have multiple tirith versions installed, pin the binary path:
 
    ```json
-   "command": "TIRITH_BIN=\"${HOME}/.cargo/bin/tirith\" python3 \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\""
+   "command": "TIRITH_BIN=\"${HOME}/.cargo/bin/tirith\" '/absolute/path/to/python3' \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/tirith-check.py\" || exit 2"
    ```
 
 4. Restart Claude Code (hooks load at session startup).
@@ -243,21 +134,62 @@ Expected: runs normally with no interference.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
-| `TIRITH_HOOK_WARN_ACTION` | `deny` | `deny` blocks warnings, `allow` passes them |
+| `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes a warning on with no permission decision (you see it as a `systemMessage`, the model in `additionalContext`, and Claude Code's own permission rules decide), `ask` asks you to confirm, `deny` blocks it; any other value blocks |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## How it works
 
 The hook intercepts the Claude Code `PreToolUse` event for `Bash` tool calls.
-It extracts the command string, passes it to `tirith check --json`, and:
+It extracts the command string, passes it to `tirith check --json`, and
+answers on stdout (exit 0):
 
-- Exit 0 from tirith → allow (clean)
-- Exit 1 → deny (block finding)
-- Exit 2 → warn (denied by default, configurable via `TIRITH_HOOK_WARN_ACTION`)
-- Any other exit / timeout / missing binary → **deny** (fail-closed)
+- Exit 0 from tirith: no output, so Claude Code's normal permission flow
+  applies, unless the JSON has `requires_approval: true`, then deny.
+- Exit 1: deny (block finding). `TIRITH_FAIL_OPEN` does not apply.
+- Exit 2: warn. A warning is never an approval. By default
+  (`TIRITH_HOOK_WARN_ACTION=allow`) the hook answers without a
+  `permissionDecision`, so Claude Code applies your own permission rules (your
+  allow, ask and deny rules and its default prompt) exactly as for a clean
+  command. The warning (severity, title, rule id and a short fix) reaches you
+  as a `systemMessage` and the model as `additionalContext`.
+  `TIRITH_HOOK_WARN_ACTION=ask` answers `permissionDecision: "ask"`, with the
+  warning as the prompt's reason; `deny` blocks; any other value blocks and
+  names the valid values (`allow`, `ask`, `deny`). Earlier releases answered a
+  warning with `permissionDecision: "allow"`, which Claude Code documents as
+  skipping its permission prompt.
+- `requires_approval: true` on exit 0 or 2 (a policy `approval_rules` match,
+  or `strict_warn`): always deny, regardless of `TIRITH_HOOK_WARN_ACTION` and
+  `TIRITH_FAIL_OPEN`. The hook has no channel to collect approval or
+  acknowledgement; retry the command from a Tirith-protected interactive shell.
+- Exit 3 (mandatory warning acknowledgement): always deny.
+- Exit 4 (deferred block from `TIRITH_DEFER=1` / `tirith check --defer`,
+  recorded for `tirith pending`): always deny, regardless of
+  `TIRITH_FAIL_OPEN`.
+- Missing or invalid JSON, or a non-boolean `requires_approval`, on exit 0 or
+  2: checker error — deny unless `TIRITH_FAIL_OPEN=1`. Exit 2 with
+  `TIRITH_HOOK_WARN_ACTION` set to anything but `allow` stays denied.
+- Any other exit / timeout / missing binary: **deny** (fail-closed).
 
 The hook is **fail-closed by default**: if tirith is missing, times out, or errors,
-commands are blocked. Set `TIRITH_FAIL_OPEN=1` to switch to fail-open behavior.
+commands are blocked. Set `TIRITH_FAIL_OPEN=1` to switch to fail-open behavior
+for those checker errors only; it never overrides a block, a deferred block,
+or a required approval or acknowledgement.
+
+A `TIRITH=0` bypass that user or org policy honors
+(`allow_bypass_env_noninteractive: true`, since the hook runs
+non-interactively) exits 0 with `"action": "allow"`, `"bypass_honored": true`
+and `"requires_approval": false`, so the hook allows it. Because the hook runs
+on the agent's behalf, that grant extends to the agent itself: it can prefix
+`TIRITH=0` to any command and skip every check, including blocks,
+`approval_rules` and `strict_warn`. Enable `allow_bypass_env_noninteractive`
+only for trusted automation.
+
+## Upgrading
+
+After upgrading the tirith binary, re-run `tirith setup claude-code --force`
+with the same `--scope` you used originally, so the installed hook picks up
+the new checks. `tirith doctor` flags an installed hook that differs from the
+current embedded adapter.
 
 ## Notes
 
