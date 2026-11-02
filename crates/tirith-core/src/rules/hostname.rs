@@ -6,6 +6,16 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Run all hostname rules against a parsed URL.
 pub fn check(url: &UrlLike, policy: &Policy) -> Vec<Finding> {
+    check_with_raw_url(url, policy, None)
+}
+
+/// Preserve the extracted operand when schemeless parsing has normalized its
+/// host. Keep the public UrlLike representation and rule entry point unchanged.
+pub(crate) fn check_with_raw_url(
+    url: &UrlLike,
+    policy: &Policy,
+    raw_url: Option<&str>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     if let Some(raw_host) = url.raw_host() {
@@ -18,7 +28,7 @@ pub fn check(url: &UrlLike, policy: &Policy) -> Vec<Finding> {
 
     if let Some(host) = url.host() {
         check_punycode_domain(host, &mut findings);
-        check_raw_ip(host, &mut findings);
+        check_raw_ip(url, raw_url, &mut findings);
         check_lookalike_tld(host, &mut findings);
     }
 
@@ -173,47 +183,63 @@ fn check_userinfo_trick(url: &UrlLike, findings: &mut Vec<Finding>) {
     }
 }
 
-fn check_raw_ip(host: &str, findings: &mut Vec<Finding>) {
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+fn check_raw_ip(url: &UrlLike, raw_url: Option<&str>, findings: &mut Vec<Finding>) {
+    let Some(host) = url.host() else {
+        return;
+    };
+    let (title, address_kind) = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         // Loopback (127.x) is benign local development — skip.
         if ip.octets()[0] == 127 {
             return;
         }
-        findings.push(Finding {
-            rule_id: RuleId::RawIpUrl,
-            severity: Severity::Medium,
-            title: "URL uses raw IP address".to_string(),
-            description: format!("URL points to IP address {host} instead of a domain name"),
-            evidence: vec![Evidence::Url {
-                raw: host.to_string(),
-            }],
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
-        });
-        return;
-    }
-    let stripped = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() {
+        ("URL uses raw IP address", "IP address")
+    } else {
+        let stripped = host.trim_start_matches('[').trim_end_matches(']');
+        let Ok(ip) = stripped.parse::<std::net::Ipv6Addr>() else {
+            return;
+        };
         // IPv6 loopback (::1) or IPv4-mapped loopback (::ffff:127.x) is benign — skip.
         if ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.octets()[0] == 127) {
             return;
         }
-        findings.push(Finding {
-            rule_id: RuleId::RawIpUrl,
-            severity: Severity::Medium,
-            title: "URL uses raw IPv6 address".to_string(),
-            description: format!("URL points to IPv6 address {host} instead of a domain name"),
-            evidence: vec![Evidence::Url {
-                raw: host.to_string(),
-            }],
-            human_view: None,
-            agent_view: None,
-            mitre_id: None,
-            custom_rule_id: None,
-        });
-    }
+        ("URL uses raw IPv6 address", "IPv6 address")
+    };
+
+    // Standard URLs retain their original host. Schemeless URLs retain it only
+    // in ExtractedUrl.raw; use the same temporary scheme as the extractor to
+    // separate userinfo/port/path without displaying credentials as host text.
+    let schemeless_raw_host = if matches!(url, UrlLike::SchemelessHostPath { .. }) {
+        raw_url.and_then(|raw| {
+            let authority = raw.strip_prefix("//").unwrap_or(raw);
+            crate::parse::extract_raw_host(&format!("http://{authority}"))
+        })
+    } else {
+        None
+    };
+    let raw_host = schemeless_raw_host
+        .as_deref()
+        .or_else(|| url.raw_host())
+        .unwrap_or(host);
+    let description = if raw_host == host {
+        format!("URL points to {address_kind} {host} instead of a domain name")
+    } else {
+        format!(
+            "URL host '{raw_host}' is interpreted as {address_kind} {host} instead of a domain name"
+        )
+    };
+    findings.push(Finding {
+        rule_id: RuleId::RawIpUrl,
+        severity: Severity::Medium,
+        title: title.to_string(),
+        description,
+        evidence: vec![Evidence::Url {
+            raw: raw_host.to_string(),
+        }],
+        human_view: None,
+        agent_view: None,
+        mitre_id: None,
+        custom_rule_id: None,
+    });
 }
 
 fn check_non_standard_port(host: &str, port: u16, findings: &mut Vec<Finding>) {
