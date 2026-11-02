@@ -8,6 +8,8 @@ on:
       - ".github/workflows/release.yml"
       - ".github/scripts/smoke-linux-release.sh"
       - ".github/scripts/verify-glibc-compat.sh"
+      - ".github/scripts/release-compatibility.py"
+      - ".github/scripts/test-release-compatibility.py"
       - "Cargo.lock"
       - "Cargo.toml"
       - "Dockerfile"
@@ -86,6 +88,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The tag-only release job builds release-compatibility.json with this
+      # image's default python3, so the generator's self-test runs here (not in
+      # ci.yml) to prove it works there before a tag.
+      - name: Validate signed release compatibility payload generation
+        run: python3 .github/scripts/test-release-compatibility.py
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.97.0"

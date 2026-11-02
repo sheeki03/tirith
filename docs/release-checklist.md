@@ -81,10 +81,13 @@ The external plugin is a separate release artifact, not part of a Tirith
 binary tag. Its implementation branch and green checks do not make the
 default-branch install or catalog entry available.
 
-1. Publish a qualified Tirith `0.5.0` artifact first. Check the actual
-   `check --stdin --format json` response, including the always-present boolean
-   `requires_approval`; a version string alone is insufficient. Confirm that
-   released `0.4.2` is refused rather than scanned with an incompatible contract.
+1. Publish a qualified Tirith `0.5.0` artifact first. Pipe a command into
+   `tirith check --json --non-interactive --shell posix` (no command argument;
+   the plugin's exact argv) and check the response, including the
+   always-present boolean `requires_approval`; a version string alone is
+   insufficient.
+   Confirm that released `0.4.2` is refused rather than scanned with an
+   incompatible contract.
 2. Run the plugin's Linux, macOS and Windows unit matrix and its real-binary
    checks against the final artifact. Validate all three hooks with the pinned
    minimum and current Hermes SDK revisions from the plugin CI. Exercise policy
@@ -123,6 +126,14 @@ workspace path takes precedence over the registry version for
 in-tree builds. The cross-crate failure only shows up at `cargo
 package` / `cargo publish` time, which is exactly the point where
 publishing tirith-core first becomes a hard prerequisite.
+
+Package and publish from a POSIX checkout (Linux or macOS; the release
+workflow publishes from Ubuntu). Each crate's `LICENSE-AGPL` and `NOTICE` are
+symlinks to the repository-root files, which `cargo package` stores as regular
+files with the full text. A Windows checkout without symlink support turns
+them into one-line path stubs, and the published crates would carry those
+instead of the license. `cargo package -p <crate> --allow-dirty --list` must
+list both files.
 
 ## Quick local check before tagging a release
 

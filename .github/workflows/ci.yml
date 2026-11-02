@@ -42,8 +42,6 @@ jobs:
           python3 .github/scripts/test-threatdb-operations.py
       - name: Validate fail-closed ThreatDB fetch orchestration
         run: bash .github/scripts/test-fetch-threatdb-sources.sh
-      - name: Validate signed release compatibility payload generation
-        run: python3 .github/scripts/test-release-compatibility.py
       - name: Validate workflow hygiene
         run: python3 .github/scripts/test-workflow-hygiene.py
       - name: Validate documentation links
