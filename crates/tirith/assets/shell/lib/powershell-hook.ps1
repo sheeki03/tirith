@@ -4,21 +4,19 @@
 
 # Guard against double-loading (session-local only).
 # If inherited from environment (exported by attacker/parent), ignore it.
+if ([Environment]::GetEnvironmentVariable('_TIRITH_PS_LOADED')) {
+    [Environment]::SetEnvironmentVariable('_TIRITH_PS_LOADED', $null)
+    $global:_TIRITH_PS_LOADED = $false
+}
 if ($global:_TIRITH_PS_LOADED) {
-    if ([Environment]::GetEnvironmentVariable('_TIRITH_PS_LOADED')) {
-        [Environment]::SetEnvironmentVariable('_TIRITH_PS_LOADED', $null)
-        $global:_TIRITH_PS_LOADED = $false
-        # Fall through to load fresh
-    } else {
-        return  # Set in this session - genuine double-source guard
-    }
+    return  # Set in this session - genuine double-source guard
 }
 $global:_TIRITH_PS_LOADED = $true
 
-# Session tracking: generate ID per session if not inherited
-if (-not $env:TIRITH_SESSION_ID) {
-    $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-}
+# Give each freshly loaded shell its own correlation session, even when its
+# parent exported an ID. The double-source guard above preserves this value in
+# the same live shell. PowerShell has no strict receipt channel.
+$env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
 # M8 ch2 — surface "this shell is on the remote side of an SSH session" to
 # `tirith prompt-status` (planned for M8 ch6) and any other downstream

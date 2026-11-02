@@ -16,6 +16,7 @@
 // inevitably has items a given file does not touch.
 #![allow(dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -156,6 +157,10 @@ pub struct IsolatedEnv {
     /// A scratch directory the test may use as the shell's cwd.
     pub workdir: PathBuf,
     env: HashMap<String, String>,
+    // PID identifies which fixture capability supplies the observed session.
+    // It is never used to signal a process.
+    shell_pid: Cell<Option<u32>>,
+    loaded_session_id: RefCell<Option<String>>,
 }
 
 impl IsolatedEnv {
@@ -184,9 +189,9 @@ impl IsolatedEnv {
             config_home.display().to_string(),
         );
         env.insert("TERM".to_string(), "xterm-256color".to_string());
-        // Unique session id per IsolatedEnv so per-session state never collides
-        // between concurrent tests (`process::id()` is shared across a run, so
-        // pair it with a per-call counter).
+        // An inherited correlation ID deliberately exercises fresh-hook
+        // isolation. Receipt assertions use the ID actually registered by the
+        // spawned shell, never this parent value.
         use std::sync::atomic::{AtomicU64, Ordering};
         static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
         env.insert(
@@ -208,6 +213,8 @@ impl IsolatedEnv {
             config_home,
             workdir,
             env,
+            shell_pid: Cell::new(None),
+            loaded_session_id: RefCell::new(None),
         }
     }
 
@@ -223,11 +230,57 @@ impl IsolatedEnv {
         self
     }
 
-    /// Stable session identity injected into the shell under test.
-    pub fn session_id(&self) -> &str {
-        self.env
-            .get("TIRITH_SESSION_ID")
-            .expect("pty harness: session id must be present")
+    /// Observe the session that this actual spawned shell registered. This is
+    /// test metadata, not a capability or an execution-proof shortcut: the
+    /// conformance assertions still independently inspect the durable ledger.
+    pub fn session_id(&self) -> String {
+        if let Some(id) = self.loaded_session_id.borrow().as_ref() {
+            return id.clone();
+        }
+        let pid = self
+            .shell_pid
+            .get()
+            .expect("pty harness: spawned shell PID");
+        let directory = self.state_home.join("tirith/sessions/execution-receipts");
+        let mut matching = Vec::new();
+        for entry in std::fs::read_dir(directory).expect("registered shell capability directory") {
+            let path = entry.expect("capability directory entry").path();
+            if path.extension().and_then(|part| part.to_str()) != Some("capability") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path).expect("capability metadata");
+            assert!(metadata.is_file() && metadata.len() <= 16 * 1024);
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .expect("read fixture capability")
+                .take(16 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 16 * 1024);
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("fixture capability must be valid JSON");
+            if value["shell_pid"].as_u64() == Some(u64::from(pid)) {
+                let id = value["session_id"].as_str().expect("registered session ID");
+                assert!(!id.is_empty() && id.len() <= 128);
+                assert!(id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+                matching.push(id.to_owned());
+            }
+        }
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one capability for the spawned shell"
+        );
+        let id = matching.pop().unwrap();
+        assert_ne!(
+            Some(&id),
+            self.env.get("TIRITH_SESSION_ID"),
+            "a fresh hook must not reuse the injected parent session ID"
+        );
+        *self.loaded_session_id.borrow_mut() = Some(id.clone());
+        id
     }
 
     /// Fixed-slot execution ledger created by protocol-v3 receipt consumption.
@@ -396,6 +449,8 @@ impl PtySession {
             .slave
             .spawn_command(cmd)
             .expect("pty harness: spawn shell");
+        env.shell_pid.set(child.process_id());
+        *env.loaded_session_id.borrow_mut() = None;
         // Drop the slave once the child holds it, or the master never sees EOF.
         drop(pair.slave);
 
