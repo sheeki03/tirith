@@ -102,7 +102,7 @@ covers the everyday subset; this is the complete reference.
 | Command | What it does |
 |---------|-------------|
 | `tirith pkg approve <backend> <spec>` | Resolve and inspect a requirement set and approve its install plan, printing the plan digest the approval binds to. Does not install |
-| `tirith pkg install <backend> <spec>` | Resolve, inspect, and install only the verified hash-pinned bytes inside the containment capsule, with a tamper-evident receipt. Enforcing execution is x86_64 Linux-only; every other platform fails closed before pip starts |
+| `tirith pkg install <backend> <spec>` | Currently disabled on every host pending private-input qualification. Refuses with `private_input_execution_unqualified` before resolver, quarantine, checkpoint, or package execution; flags and elevation do not enable it |
 | `tirith pkg verify-env` | Verify an already-installed environment's RECORD integrity without installing anything |
 | `tirith pkg trust-tool` | Enroll a fully static native Linux `uv` executable by canonical path and SHA-256 |
 | `tirith pkg graph` | Compose a provenance graph (ownership / execution / payload) over a wheel set or an installed environment. Read model only |

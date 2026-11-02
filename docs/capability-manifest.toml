@@ -620,14 +620,14 @@ coverage = "Clipboard with secret-shape gating and browser source attribution; i
 policy_complete = true
 
 # ---------------------------------------------------------------------------
-# Package firewall (Python; install enforcement is x86_64 Linux-only)
+# Package firewall (Python; contained install execution is disabled)
 # ---------------------------------------------------------------------------
 
 [[command]]
 name = "pkg install"
 group = "Package firewall"
-inspected = "full"
-coverage = "Resolves with hashes, quarantines the exact wheel bytes, and inspects them. Enforcing Python installation is x86_64 Linux-only and uses only the verified bytes inside a containment capsule with a tamper-evident receipt; every other platform or architecture fails closed before pip starts."
+inspected = "none"
+coverage = "Contained package execution is disabled on every host pending qualification of immutable named inputs for the complete target lifetime. Refuses before resolver execution, network access, quarantine writes, checkpoint creation, or package launch. Flags and elevation do not enable the backend; package inspect and pkg verify-env remain available."
 policy_complete = true
 
 [[command]]

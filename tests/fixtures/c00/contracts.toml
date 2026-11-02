@@ -28,6 +28,17 @@ projection_bytes_sha256 = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1
 security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f1d60731b46fb"
 
 [capability_manifest]
+# Private-input execution qualification compatibility note: `pkg install` now
+# refuses before resolver, quarantine, checkpoint, or package execution on every
+# host. Its inspection level changes from full to none, and its coverage states
+# the disabled execution scope. This is an explicit defensive capability
+# restriction pending qualification of immutable named inputs for the complete
+# target lifetime; generic capsule coverage is insufficient to establish it.
+# All 88 commands, their order and groups, manifest_version 1, and every
+# policy_complete value are unchanged. Only pkg install's inspected and coverage
+# fields differ; every other parsed command field is unchanged. The public
+# refusal retains exit 1 and the existing JSON fields, with refused_before_exec
+# naming the earlier failure phase. Flags and elevation cannot bypass it.
 # Release-documentation truthfulness note: the existing `mcp-server` coverage
 # now distinguishes the six cross-platform tools from the additional
 # `tirith_fetch_cloaking` tool available on Unix. No command, group, inspection
@@ -99,7 +110,7 @@ security_projection_hash = "3c6db0581ec9a6beab368502810e8faa273916e55f19a20eb21f
 # tirith does not download, inspect, or bind the tarball bytes npm installs. No
 # command was added, removed, renamed, or regrouped, and no `inspected` or
 # `policy_complete` value changed; that was a documentation-truth edit only.
-sha256 = "03270b4ec0ce3d38ad081d810a1bedca5b2904f32da05dc3cef9ee1ee8a0929f"
+sha256 = "c6bf1e24d5f455d2de0f1965b875bcff467f19f0d92cb27334fe0fcef10b5a58"
 
 [mcp]
 default_tools = [

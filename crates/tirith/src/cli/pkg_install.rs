@@ -1,5 +1,8 @@
 //! Contained install-from-digest for the package firewall (PR D4, CLI half).
 //!
+//! Execution is currently disabled before install preparation by the shared
+//! private-input qualification guard. The implementation below remains gated.
+//!
 //! `tirith-core`'s [`tirith_core::artifact::install`] does the pure planning: it
 //! re-binds the approval against the live threat DB (re-hashing every quarantine
 //! blob), and produces a [`tirith_core::artifact::install::DigestInstallPlan`]
@@ -36,10 +39,9 @@
 //! enforcing install through the uncontained runner.
 //!
 //! [`run_contained_install`] is the production side-effect seam called by
-//! `tirith pkg install` on x86_64 Linux. Unsupported platforms and architectures
-//! refuse before package execution. Platform-gated recovery helpers remain compiled
-//! only on their owning targets; the module-level dead-code allowance covers those
-//! narrow compatibility seams without weakening the launch path.
+//! `tirith pkg install`. Its qualification guard currently refuses every host
+//! before install preparation or package execution. The retained implementation
+//! is not an enabled capability.
 #![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -1514,6 +1516,15 @@ pub fn run_contained_install(
     suppress_child_output: bool,
     task_denied_effects: &std::collections::BTreeSet<tirith_core::effects::CommandEffectKind>,
 ) -> Result<AuthorizedContainedInstallOutcome, ContainedInstallError> {
+    // Refuse an already-authorized internal call before approved.txt publication
+    // or executor preparation.
+    capsule::require_private_input_execution_qualification().map_err(|error| {
+        let refused = error.into_capsule_refusal(&plan.spec);
+        ContainedInstallError::CapsuleRefused {
+            backend_id: refused.backend_id,
+            reason: refused.reason,
+        }
+    })?;
     let AuthorizedInstallLaunch {
         target_install_path,
         target_handle,

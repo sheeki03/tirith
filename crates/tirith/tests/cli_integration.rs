@@ -22002,10 +22002,10 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
                 stderr.contains("package approvals are redeemable only on x86_64 Linux"),
                 "pkg approve must report its native capability boundary: {stderr}"
             );
-        } else if action == "install" && !cfg!(target_os = "linux") {
+        } else if action == "install" {
             assert!(
-                stderr.contains("enforcing package target binding is supported only on Linux"),
-                "pkg install must report its target capability boundary: {stderr}"
+                stderr.contains("private_input_execution_unqualified:"),
+                "pkg install must refuse before resolver discovery: {stderr}"
             );
         } else {
             assert!(
@@ -22021,20 +22021,14 @@ fn pkg_approve_and_install_reject_same_uid_path_resolver_before_execution() {
     );
 }
 
-/// `tirith pkg install pip <req>` on a host whose resolver toolchain is ABSENT must
-/// fail closed: a non-zero exit and a refusal message, never a clean success or a
-/// silent uncontained install. This is the real enforcing-surface negative path —
-/// the resolver-discovery gate refuses before any download/spawn. (The deeper
-/// `InterpreterNotFound` leg, reached only AFTER a successful resolve, is unit-
-/// tested in `cli/pkg_install.rs::install_fails_closed_when_capsule_is_degraded`;
-/// it cannot be driven end to end here without a real `uv`.)
+/// An absent resolver cannot change the package backend's qualification refusal.
+/// This reaches the real public command without any tool or network dependency.
 #[test]
 fn pkg_install_pip_fails_closed_when_toolchain_absent() {
     let home = tempfile::tempdir().expect("tempdir");
     let target = home.path().join("env");
     let out = tirith()
-        // No resolver tools on PATH -> discover() returns ToolNotFound, the install
-        // refuses. PATH is the only thing steering tool discovery here.
+        // The qualification refusal must precede even resolver discovery.
         .env("PATH", empty_path_dir(home.path()))
         // Isolate the data dir on every OS so no approval/receipt state leaks in.
         .env("XDG_DATA_HOME", home.path())
@@ -22058,18 +22052,11 @@ fn pkg_install_pip_fails_closed_when_toolchain_absent() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if cfg!(target_os = "linux") {
-        assert!(
-            stderr.contains("tirith pkg install:") && stderr.contains("resolve failed"),
-            "the refusal must name the failed resolve, not silently proceed: {stderr}"
-        );
-    } else {
-        assert!(
-            stderr.contains("target_binding")
-                && stderr.contains("enforcing package target binding is supported only on Linux"),
-            "the refusal must name the unavailable native target binding: {stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("tirith pkg install:")
+            && stderr.contains("private_input_execution_unqualified:"),
+        "the refusal must name the unqualified private-input backend: {stderr}"
+    );
     // The enforcing surface must NOT have installed into the target environment.
     assert!(
         !target.exists()
@@ -22151,20 +22138,136 @@ fn pkg_install_pip_json_still_fails_closed_when_toolchain_absent() {
         )
     });
     assert_eq!(json["success"], false);
-    assert_eq!(
-        json["error_phase"],
-        if cfg!(target_os = "linux") {
-            "plan_preparation"
-        } else {
-            "target_binding"
-        }
-    );
+    assert_eq!(json["error_phase"], "refused_before_exec");
+    assert!(json["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("private_input_execution_unqualified:"));
     assert_eq!(json["target_executed"], false);
     assert_eq!(json["target_published"], false);
     assert!(
         !target.exists(),
         "an early structured refusal must not create the dedicated target"
     );
+}
+
+/// Existing confirmation/degradation flags cannot qualify a disabled execution
+/// backend. Refusal must precede target binding and all package state creation.
+#[test]
+fn pkg_install_private_input_qualification_refuses_before_package_side_effects() {
+    for flags in [
+        Vec::<&str>::new(),
+        vec!["--yes"],
+        vec!["--allow-degraded"],
+        vec!["--yes", "--allow-degraded"],
+    ] {
+        for json in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let data = fixture.path().join("data-must-not-exist");
+            let config = fixture.path().join("config-must-not-exist");
+            let target = fixture.path().join("missing-parent").join("target");
+            let mut command = tirith();
+            command
+                .current_dir(fixture.path())
+                .env("HOME", fixture.path())
+                .env("USERPROFILE", fixture.path())
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", &data)
+                .env(
+                    "XDG_STATE_HOME",
+                    fixture.path().join("state-must-not-exist"),
+                )
+                .env(
+                    "XDG_CACHE_HOME",
+                    fixture.path().join("cache-must-not-exist"),
+                )
+                .env(
+                    "XDG_RUNTIME_DIR",
+                    fixture.path().join("runtime-must-not-exist"),
+                )
+                .env("APPDATA", &data)
+                .env(
+                    "LOCALAPPDATA",
+                    fixture.path().join("local-data-must-not-exist"),
+                )
+                .env("TIRITH_LOG", "0")
+                .args(["pkg", "install", "pip", "examplepkg==1.0.0", "--target"])
+                .arg(&target)
+                .args(&flags);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().expect("run public package refusal");
+            assert_eq!(output.status.code(), Some(1), "flags={flags:?}");
+            let reason = if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .expect("one complete JSON refusal document");
+                assert_eq!(value["success"], false);
+                assert_eq!(value["error_phase"], "refused_before_exec");
+                assert_eq!(value["target_executed"], false);
+                assert_eq!(value["target_published"], false);
+                value["reason"].as_str().unwrap().to_owned()
+            } else {
+                assert!(output.stdout.is_empty());
+                String::from_utf8(output.stderr).expect("static refusal is UTF-8")
+            };
+            assert!(reason.contains("private_input_execution_unqualified:"));
+            assert!(reason.contains("Sudo or administrator access does not qualify"));
+            assert!(!data.exists(), "refusal must not create package state");
+            assert!(!config.exists(), "refusal must not create configuration");
+            assert!(!target.parent().unwrap().exists());
+            assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
+        }
+    }
+}
+
+/// A complete private-input argv and valid spec must hit qualification before
+/// platform setup or descriptor validation. The target is a harmless shell that
+/// would create a marker if reached; no package or namespace attack is attempted.
+#[cfg(unix)]
+#[test]
+fn hidden_capsule_private_inputs_refuse_before_target_execution() {
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("target-executed");
+    let spec = tirith_core::capsule::CapsuleSpec::locked_down();
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    let output = tirith()
+        .current_dir(fixture.path())
+        .args(["__capsule-child", &spec_json])
+        .args([
+            "--staging-root",
+            "/must-not-open-stage",
+            "--staging-fd",
+            "57",
+            "--input-fd",
+            "58",
+            "--input-name",
+            "approved.txt",
+            "--target-dir-fd",
+            "59",
+            "--target-dir-root",
+            "/must-not-open-target",
+            "--target-dir-visible-root",
+            "/must-not-open-pending-target",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"printf launched > "$1""#,
+            "private-input-refusal-test",
+        ])
+        .arg(&marker)
+        .output()
+        .expect("run hidden private-input refusal");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("private_input_execution_unqualified:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("invalid capsule spec"));
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists(), "refused target must never execute");
+    assert!(fs::read_dir(fixture.path()).unwrap().next().is_none());
 }
 
 /// `tirith pkg install` only enforces `pip` in v1; a non-pip ecosystem must be a

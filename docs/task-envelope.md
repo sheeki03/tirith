@@ -245,8 +245,16 @@ envelope (`capsule_preset_run`, `remote_script_run`, `gateway_forward`,
 `package_manager_network`, and `package_manager_execution`) and is a no-op at
 the four that submit package or config-write envelopes (`package_approval`,
 `package_resolve`, `package_install_preparation`, `config_write`).
-`tirith pkg approve`, `pkg install`, and tirith-owned config writes keep working
-unchanged.
+These assessment results do not qualify the package execution backend.
+`tirith pkg install` currently refuses on every host with
+`private_input_execution_unqualified`, before resolver, quarantine, checkpoint,
+or package execution. The refusal applies regardless of `task_gate.mode`,
+`action_incomplete_analysis`, existing approvals, confirmation flags, or elevation.
+
+`tirith pkg approve` and tirith-owned config writes retain their existing
+native authority and policy requirements. Local `tirith package inspect`,
+`pkg verify-env`, ordinary `tirith check`, and shell protection remain available
+under their existing policies.
 
 `warn` remains the conservative default, and
 `effects_denied_for_untrusted_sources` is the blunter control. But `block` is a

@@ -791,3 +791,18 @@ fn help_mcp_diff_documents_exit_codes() {
         "mcp diff --help must document exit 2 on usage error, got:\n{stdout}"
     );
 }
+
+#[test]
+fn package_install_help_states_the_disabled_execution_scope() {
+    for args in [vec!["pkg", "--help"], vec!["pkg", "install", "--help"]] {
+        let out = tirith().args(&args).output().expect("read package help");
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("disabled on every host"), "{args:?}: {text}");
+        assert!(text.contains("private_input_execution_unqualified"));
+        assert!(text
+            .contains("--yes, --allow-degraded, sudo, and administrator access do not enable it"));
+        assert!(text.contains("verify-env"));
+    }
+}
