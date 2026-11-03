@@ -168,22 +168,31 @@ class OperationsTests(unittest.TestCase):
         self.documents[path] = VERIFY.canonical(value)
         self.assertIn("signature", self.no_validation_retry())
 
-    def test_verified_propagation_lag_has_bounded_retries_and_can_recover(self):
+    def test_verified_lag_outlasts_raw_discovery_cache(self):
         path = VERIFY.PRIMARY + "threatdb-manifest.json"
         current = self.documents[path]
         self.replace_signed("threatdb-manifest.json", lambda value: value.update(version=6))
-        sleeps = []
+        elapsed = 0
         def advance(delay):
-            sleeps.append(delay)
-            self.documents[path] = current
-        report = VERIFY.verify_with_propagation_retry(7, True, self.key, lambda url, limit: self.documents[url], advance)
+            nonlocal elapsed
+            elapsed += delay
+            if elapsed >= 300:
+                self.documents[path] = current
+        report = VERIFY.verify_with_propagation_retry(7, False, self.key, lambda url, limit: self.documents[url], advance)
         self.assertEqual(report["status"], "verified")
-        self.assertEqual(sleeps, [10])
+        self.assertEqual(report["sequence"], 7)
+        self.assertEqual({item["surface"] for item in report["checked"]}, {"primary", "fallback"})
+
+    def test_persistent_verified_lag_still_times_out(self):
         self.replace_signed("threatdb-manifest.json", lambda value: value.update(version=6))
-        sleeps.clear()
+        elapsed = 0
+        def advance(delay):
+            nonlocal elapsed
+            elapsed += delay
+            self.assertLessEqual(elapsed, 600, "publication backoff must remain bounded")
         with self.assertRaises(VERIFY.PublicationLag):
-            VERIFY.verify_with_propagation_retry(7, True, self.key, lambda url, limit: self.documents[url], sleeps.append)
-        self.assertEqual(sleeps, [10, 20])
+            VERIFY.verify_with_propagation_retry(7, True, self.key, lambda url, limit: self.documents[url], advance)
+        self.assertGreaterEqual(elapsed, 300, "cover the raw-file cache lifetime before timing out")
 
     def test_same_sequence_equivocation_and_mixed_run_assets_are_refused(self):
         original = copy.deepcopy(self.documents)

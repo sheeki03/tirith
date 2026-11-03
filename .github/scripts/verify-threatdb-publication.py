@@ -218,13 +218,16 @@ def verify_publication(sequence, v2_enabled, key, download=fetch):
 
 
 def verify_with_propagation_retry(sequence, v2_enabled, key, download=fetch, sleep=time.sleep):
-    for attempt in range(3):
+    # Raw GitHub discovery responses advertise a five-minute cache lifetime.
+    # Allow that cache to expire, but only for authenticated older pointers.
+    retry_delays = (10, 20, 30, 60, 120, 120)
+    for attempt in range(len(retry_delays) + 1):
         try:
             return verify_publication(sequence, v2_enabled, key, download)
         except PublicationLag:
-            if attempt == 2:
+            if attempt == len(retry_delays):
                 raise
-            sleep(10 * (attempt + 1))
+            sleep(retry_delays[attempt])
 
 
 def main(argv=None):
