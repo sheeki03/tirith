@@ -11,19 +11,19 @@
     },
     "ecosystems_typosquatting_dataset": {
       "candidate_policy": "default_branch_head",
-      "commit": "fd0bde98d200efe5c282a07edc4c68fba13252c6",
-      "commit_timestamp": "2025-12-17T11:33:09Z",
+      "commit": "ccda8797fd8bdf980a320a7fc2ae06eb1664a845",
+      "commit_timestamp": "2026-10-30T16:23:34Z",
       "max_lag_hours": 720,
       "repository": "ecosyste-ms/typosquatting-dataset",
-      "selected_at": "2026-08-31T19:22:30Z"
+      "selected_at": "2026-11-07T02:38:23Z"
     },
     "ossf_malicious_packages": {
       "candidate_policy": "latest_assign_ids",
-      "commit": "fed4af1871531557d07163a06e148ddf3b643140",
-      "commit_timestamp": "2026-09-11T08:26:52Z",
+      "commit": "e39cb5053ace9f276ccacd176f12cd7e3d1330e3",
+      "commit_timestamp": "2026-11-06T23:20:37Z",
       "max_lag_hours": 48,
       "repository": "ossf/malicious-packages",
-      "selected_at": "2026-09-11T11:43:22Z"
+      "selected_at": "2026-11-07T02:38:23Z"
     }
   }
 }
