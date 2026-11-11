@@ -1,8 +1,10 @@
 //! `tirith prompt-status` — M8 ch6. A fast one-line status emitter for shell
 //! prompts: protection posture plus cloud/k8s contexts and sudo/SSH state.
 //!
-//! Output shapes: short (`[tirith:guarded][aws:prod][kube:payments-prod]`),
-//! long (`tirith: guarded; aws: prod; …`), and a stable `--json` envelope.
+//! Output shapes: short (`[tirith:blocking-unverified][aws:prod][kube:payments-prod]`),
+//! long (`tirith: blocking-unverified; aws: prod; …`), and a stable `--json`
+//! envelope. The text forms print `blocking-unverified` for the `guarded` mode
+//! and `unknown` for `off`; the JSON keeps the mode value.
 //!
 //! Two caches keep it prompt-fast: the 5s process-global cache in
 //! [`tirith_core::context_detect`] and a 30s per-user on-disk cache at

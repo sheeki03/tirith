@@ -1054,8 +1054,8 @@ Examples:
     /// cache is well under 5 ms but the process spawn dominates.
     #[command(after_help = "\
 Output forms:
-  tirith prompt-status --short                # [tirith:guarded][aws:prod][kube:payments-prod]
-  tirith prompt-status                         # tirith: guarded; aws: prod; kube: payments-prod
+  tirith prompt-status --short                # [tirith:blocking-unverified][aws:prod][kube:payments-prod]
+  tirith prompt-status                         # tirith: blocking-unverified; aws: prod; kube: payments-prod
   tirith prompt-status --json                  # JSON envelope (stable schema_version=1)
 
 Examples:
@@ -1565,7 +1565,7 @@ Examples:
   tirith trust list --format json --expired
   tirith trust explain example.com
   tirith trust diff
-  tirith trust gc --expired
+  tirith trust gc
   tirith trust remove example.com")]
     Trust {
         #[command(subcommand)]
@@ -3539,8 +3539,9 @@ WHAT THE PRESET DOES:
     and 16 MiB combined output, tightened further by any task_gate policy
 
 RECEIPT:
-  Every invocation writes one signed, content-addressed receipt, including a
-  refusal. It records the argv DIGEST (never the argv), the project input and
+  Every invocation writes one content-addressed receipt, including a refusal.
+  It is ed25519-signed when this installation has an audit signing key and
+  unsigned otherwise. It records the argv DIGEST (never the argv), the project input and
   output tree digests, the backend, requested versus achieved coverage, the
   effective limits, the child's exit status SEPARATELY from Tirith's decision,
   the termination reason, a bounded file diff, whether a copy was materialized
@@ -7311,8 +7312,8 @@ What it collects:
   records are kept. In the legacy trust.json stores: expired entries only.
 
 Examples:
-  tirith trust gc --expired
-  tirith trust gc --expired --scope user")]
+  tirith trust gc
+  tirith trust gc --scope user")]
     Gc {
         /// Accepted for compatibility; has no effect (gc always collects what
         /// "What it collects" lists)

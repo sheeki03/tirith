@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - ThreatDB publication verification allows six minutes of bounded backoff for authenticated older discovery pointers, covering GitHub's five-minute raw-file cache lifetime. Invalid signatures, malformed documents and inconsistent pointers still fail without propagation retries.
+- Offline mode (`--offline`, `TIRITH_OFFLINE=1`) makes no audit upload and posts no webhook. The audit entry is still written and stays in the upload queue, and a later online run sends it. 0.5.0 made both requests in offline mode.
+- GNU `parallel` is analyzed as the command runner it is. `curl … | parallel` runs the downloaded lines as commands and is `curl_pipe_shell`; `cat jobs.txt | parallel` is `pipe_to_interpreter`. The command template, which parallel hands to a shell, is analyzed as shell source, with `:::` items substituted into it (`parallel 'curl … | sh' ::: 1`, `parallel rm -rf ::: ~`). 0.5.0 allowed all of these. An option the grammar does not know, a template word that is not a literal, an item that lands in a command name or in code, and `--pipe` into an interpreter block as incomplete analysis. A local commands file (`parallel -a jobs.txt`) is treated like `sh jobs.txt`.
+- A sensitive file whose lines become the arguments of an upload client blocks as incomplete analysis: `xargs -a .env curl URL -d`, `parallel -a .env curl URL -d`, `parallel curl URL -d :::: .env` and `cat .env | parallel curl URL -d`. 0.5.0 allowed the `parallel` forms, and allowed `xargs -a` unless the path began with `~`.
+- CLI help: the `tirith trust gc` examples no longer show `--expired`, which has no effect; the `capsule run` receipt is described as signed only when an audit signing key exists; `prompt-status` shows the text it prints (`blocking-unverified`).
 
 ### Security
 

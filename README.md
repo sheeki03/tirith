@@ -1072,7 +1072,8 @@ That is the daily-driver set. tirith groups its commands into 8 categories: scan
   `TIRITH_API_KEY` are set, each audit log entry is also spooled and uploaded
   to that server. `--offline` / `TIRITH_OFFLINE=1` disables
   every `check` enrichment and refresh request in both daemon and inline modes.
-  It does not stop a configured audit upload or webhook.
+  In offline mode a configured audit upload is queued instead of sent, and no
+  webhook is posted (0.5.0 still sent both).
 - **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
   fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
   SSRF guard re-checks DNS at connect time and on every redirect hop. To reach a
@@ -1192,7 +1193,7 @@ tirith trust list                 # scope class per entry; '!' marks broad ones
 tirith trust explain example.com  # what it covers, when it expires, why added
 tirith trust revoke GRANT_ID      # revoke one grant; reports broader ones that remain
 tirith trust diff                 # what changed in the trust set
-tirith trust gc --expired         # drop expired grants and old revocations
+tirith trust gc                   # drop expired grants and old revocations
 ```
 
 Each entry's **scope** is classified as `exact`, `substring`, `domain`,
