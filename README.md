@@ -89,17 +89,19 @@ tirith: BLOCKED
 
 The command never executes.
 
-**Pipe-to-shell with clean URL, warned, not blocked:**
+**Plain HTTP request to a LAN address, warned, not blocked:**
 
 ```
-$ curl -fsSL https://get.docker.com | sh
+$ curl http://192.168.1.20:8080/health
 
 tirith: WARNING
-  [MEDIUM] pipe_to_interpreter, Download piped to interpreter
-    Consider downloading first and reviewing.
+  [MEDIUM] raw_ip_url, URL uses raw IP address
+  [MEDIUM] plain_http_to_sink, Plain HTTP URL in execution context
+  [MEDIUM] private_network_access, Private network access: 192.168.1.20
 ```
 
-Warning prints to stderr. Command still runs.
+Warning prints to stderr. Command still runs. A download piped to a shell
+(`curl ... | sh`) is not a warning: it blocks as `curl_pipe_shell`.
 
 **Base64 decode-execute chain, blocked:**
 
@@ -152,7 +154,7 @@ Nothing. Zero output. You forget tirith is running.
 
 ## What it catches
 
-**244 detection rules across 35 categories.**
+**245 detection rules across 35 categories.**
 
 | Category | What it stops |
 |----------|--------------|
@@ -247,10 +249,12 @@ contains, and attests.
   created. A full/read-only `TMPDIR` can therefore refuse every command, and
   `TIRITH=0` cannot recover because the binary is never reached. Follow the
   recovery steps in [troubleshooting](docs/troubleshooting.md).
-- **Platform-limited features:** daemon mode, `tirith run`, and `tirith fetch`
-  are Unix surfaces. `tirith run --no-exec` remains an inspection workflow
-  there, but live remote-script execution is Linux-only and refuses before
-  download on every other host. `tirith setup` is cross-platform, while each
+- **Platform-limited features:** daemon mode, `tirith run`, `tirith fetch`, and
+  `tirith gateway run` are Unix surfaces. `tirith run --no-exec` remains an
+  inspection workflow there, but live remote-script execution is Linux-only and
+  refuses before download on every other host. On Windows, `tirith gateway run`
+  refuses before reading its run config or starting the upstream server;
+  `tirith gateway validate-config` stays available. `tirith setup` is cross-platform, while each
   host integration has its own platform contract (for example Cline has POSIX
   and Windows wrappers; OpenHands' blocking hook is Unix-only).
 - **Package-name extraction scope:** covers language ecosystems (pip,
@@ -266,10 +270,13 @@ contains, and attests.
   presence of a config file.
 - **Host-hook failure behavior:** Grok Build, Cline, and OpenHands allow the
   tool when their hook process crashes or times out. Tirith's adapter denies on
-  its own errors by default, and the generated hooks deny when their pinned
-  Python interpreter has moved (unless `TIRITH_FAIL_OPEN=1`), but Tirith cannot
-  make a host honor a process that did not return. Re-run setup if a pinned
-  interpreter moves and test the real host after every upgrade.
+  its own errors by default, and on Linux and macOS the generated hooks deny
+  when their pinned Python interpreter has moved (unless `TIRITH_FAIL_OPEN=1`),
+  but Tirith cannot make a host honor a process that did not return. On
+  Windows, the Gemini CLI and Kiro hook commands run the pinned Python directly,
+  so a moved or removed interpreter makes them fail open until `tirith setup` is
+  run again. Re-run setup if a pinned interpreter moves and test the real host
+  after every upgrade.
 - **Prime Agent IPython is source-level extraction:** the guard covers shell
   escapes/magics and common `os`, `subprocess`, and `pty.spawn` forms, but it is
   not a Python runtime sandbox. A wrapper defined in an earlier cell,
@@ -467,7 +474,10 @@ the shell accepts it. This does not cover a non-interactive shell, a direct
 `exec`, or an agent process that never loaded the hook:
 
 - **Blocks dangerous commands**: homograph URLs, pipe-to-shell, insecure downloads
-- **Blocks malicious paste**: ANSI injection, bidi attacks, hidden multiline in pasted content
+- **Blocks malicious paste**: ANSI injection, bidi attacks, hidden multiline in pasted content.
+  In fish this covers pastes made through `fish_clipboard_paste` (Ctrl+V and Ctrl+Y bindings);
+  a terminal-initiated bracketed paste is not scanned at paste time, see
+  [troubleshooting](docs/troubleshooting.md#fish-clipboard-paste-scope)
 - **Agent-independent interactive gate**: no agent-specific integration is
   needed when that agent actually uses the protected interactive shell
 - **Zero agent modification**: the agent doesn't know tirith exists until a command is blocked
@@ -663,7 +673,8 @@ sudo cannot supply the missing Android clipboard or containment backends.
 Windows supports detection, scanning, webhooks, policy management, audit
 uploads, and `tirith setup`. The PowerShell hook provides PSReadLine preflight
 interception, but it does not claim a strict post-accept execution receipt.
-Live remote-script execution and daemon mode remain unavailable on Windows.
+Live remote-script execution, daemon mode, and `tirith gateway run` remain
+unavailable on Windows.
 
 **Scoop:**
 
@@ -733,7 +744,7 @@ tirith init --shell fish | source   # in ~/.config/fish/config.fish
 |-------|-----------|-----------|
 | zsh | accept-line + paste widgets | 5.8+ |
 | bash | enter-key macro or preexec (two modes) | 3.2 compatibility path; 5.0+ for the fully tested modern path |
-| fish | Enter-key + paste handlers | 3.5+ |
+| fish | Enter-key + `fish_clipboard_paste` handlers | 3.5+ |
 | PowerShell | PSReadLine handler | 7.0+ |
 
 Bash uses enter mode when a capability self-test has proven it works for your bash, and preexec otherwise. Since 0.4.1 that self-test passes on stock GNU bash, so enter mode is the ordinary outcome once `tirith setup` or `tirith doctor` has run it; the shell hook reads the cached verdict at startup. See [troubleshooting](docs/troubleshooting.md#bash-enter-mode-vs-preexec-mode) for details on the modes, the self-test, and SSH fallback behavior.
@@ -812,6 +823,8 @@ tirith version --provenance # version, build info, install method, verification
 - **Package-manager installs** (Homebrew, cargo, npm, Scoop, AUR, apt/dnf) are never self-modified. tirith prints the exact command to run instead, e.g. `brew upgrade tirith`. Updating through the package manager keeps its database consistent.
 - **Self-replaceable installs** (the `install.sh` tarball, a standalone binary, or a securely owned Tirith release cached under a Hermes root (`HERMES_HOME`, or `~/.hermes` when that variable is unset; Unix only)) are updated in place: tirith downloads the latest release, verifies it, then atomically swaps the binary, keeping the previous one as a `tirith.tirith-previous` sidecar. The cosign signature is verified by **default**: if it cannot be verified (cosign missing, or the release published no signature) the update aborts. Pass `--allow-unsigned` to fall back to checksum-only verification; a checksum mismatch always aborts regardless. `tirith update --rollback` reverts to the previous binary; `--dry-run` shows what would happen without changing anything. Updates remain explicit: Tirith never checks for or installs a new binary in the background.
 
+**After an upgrade, refresh agent integrations.** Installed agent adapters are files that `tirith setup` wrote, and upgrading the binary does not rewrite them. Run `tirith doctor`: it marks outdated adapters STALE and prints the refresh command. Then run `tirith setup <host> --scope <scope> --force` for each one (from inside the project for a project-scope setup) and restart the host. Adapters installed by 0.4.x do not enforce the 0.5.0 approval requirement until they are refreshed; see the [0.5.0 release notes](docs/release-notes-0.5.0.md).
+
 > [!NOTE]
 > The install scripts (`scripts/install.sh` and the Windows `install.ps1`) also verify the release's cosign signature by **default** and abort if [`cosign`](https://github.com/sigstore/cosign) is missing or the signature cannot be verified. Install `cosign` first, or set `TIRITH_ALLOW_UNSIGNED=1` to install with checksum-only verification (not recommended). A checksum or signature mismatch always aborts regardless of this opt-out.
 
@@ -859,6 +872,8 @@ An MCP-only row exposes Tirith's tools but does not force the host to call them.
 A hook row is automatic only after the host has loaded the generated artifact
 and still honors its refusal contract. Run `tirith doctor`, restart the host,
 and perform the host-shaped allow/block check after setup and every upgrade.
+After an upgrade, first re-run `tirith setup <host> --scope <scope> --force` for
+every adapter that `tirith doctor` marks STALE.
 Full config paths, precedence rules, fail-open behavior, and verification steps
 are in the
 [agent integration and trust matrix](mcp/clients/mcp-only-agents.md).
@@ -1009,7 +1024,7 @@ The everyday commands:
 | `tirith pkg install` | Currently disabled on every host: refuses with `private_input_execution_unqualified` before resolver or package execution |
 | `tirith pkg verify-env` | Verify an existing Python environment without installing packages |
 | `tirith mcp {lock,verify}` | Pin and gate a repo's MCP servers |
-| `tirith gateway run` | Proxy an upstream MCP server and enforce configured request/output boundaries |
+| `tirith gateway run` | Proxy an upstream MCP server and enforce configured request/output boundaries (Unix) |
 | `tirith daemon start` | Background daemon for faster checks (Unix) |
 
 Explicit, opt-in surfaces. None of these run implicitly, and none has a daemon or a background monitor:
@@ -1044,15 +1059,20 @@ That is the daily-driver set. tirith groups its commands into 8 categories: scan
 - **No telemetry**: no analytics, no crash reporting, no phone-home behavior.
 - **No long-lived background processes by default**: tirith is invoked
   per-command and exits immediately. The threat-DB refresh above is a
-  short-lived detached update, not a resident process. Optional `tirith daemon
-  start` is the only resident process, and it is opt-in.
+  short-lived detached update, not a resident process. Processes that stay
+  running are opt-in and start only when you ask for them, such as `tirith
+  daemon start` and the clipboard guard service that `tirith clipboard guard
+  install-service --apply` installs as a launchd or systemd user unit.
 - **Network only on documented surfaces**:
-  `run`, `fetch`, and `audit report --upload` reach the network only on explicit
+  `run` and `fetch` reach the network only on explicit
   invocation; `check` uses the configured runtime threat sources and the
   threat-DB refresh follows the schedule above. Daemon mode adds network-aware
   URL resolution, and optional webhook / policy-server integrations can make
-  outbound requests when configured. `--offline` / `TIRITH_OFFLINE=1` disables
-  every `check` hot-path network producer in both daemon and inline modes.
+  outbound requests when configured: when both `TIRITH_SERVER_URL` and
+  `TIRITH_API_KEY` are set, each audit log entry is also spooled and uploaded
+  to that server. `--offline` / `TIRITH_OFFLINE=1` disables
+  every `check` enrichment and refresh request in both daemon and inline modes.
+  It does not stop a configured audit upload or webhook.
 - **Egress guard on fetches.** `tirith run`, `fetch --save`, and `command-card
   fetch` refuse private, loopback, and cloud-metadata hosts by default, and an
   SSRF guard re-checks DNS at connect time and on every redirect hop. To reach a
@@ -1179,8 +1199,9 @@ Each entry's **scope** is classified as `exact`, `substring`, `domain`,
 `wildcard`, or `bare-TLD`. Every non-exact scope (`substring` / `domain` /
 `wildcard` / `bare-TLD`) requires `--broad`, so a sweeping allow is always a
 deliberate choice. Exact URLs use normalized URL equality (including scheme,
-host, effective port, path, query, and fragment), never substring matching. All
-subcommands support `--format json`. New entries are stable, expiring grants in
+host, effective port, path, query, and fragment), never substring matching. Every
+subcommand except `remove`, `last` and `from-last-trigger` supports
+`--format json`. New entries are stable, expiring grants in
 `trust-grants.json`; `trust.json` entries written by older versions keep
 working unchanged (an entry with no TTL is treated as permanent) until you run
 `tirith trust migrate --scope user`. See [trust grants](docs/trust-grants.md).
@@ -1255,11 +1276,13 @@ Repo-scoped `.tirith/policy.yaml` files can only tighten, never weaken: a repo p
 With `strict_warn: true` (or `--strict-warn` on the CLI), medium-risk findings prompt for explicit acknowledgement in interactive terminals instead of silently warning:
 
 ```
-$ curl -sSL https://get.docker.com | sh
+$ curl http://192.168.1.20:8080/health
 
 tirith: WARNING
-  [MEDIUM] pipe_to_interpreter, Download piped to interpreter
-tirith: proceed with 1 warning(s)? [y/N]
+  [MEDIUM] raw_ip_url, URL uses raw IP address
+  [MEDIUM] plain_http_to_sink, Plain HTTP URL in execution context
+  [MEDIUM] private_network_access, Private network access: 192.168.1.20
+tirith: proceed with 3 warning(s)? [y/N]
 ```
 
 Shell hooks use exit code 3 for the warn-ack protocol. Old hooks that don't know about exit code 3 fall through to fail-open behavior.
@@ -1275,7 +1298,7 @@ For the rare case you know exactly what you're doing:
 TIRITH=0 curl -L https://something.xyz | bash
 ```
 
-This is a standard shell per-command prefix; the variable exists only for that single command and does not persist in your session. Organizations can disable it entirely with `allow_bypass_env: false` in policy.
+This is a standard shell per-command prefix; the variable exists only for that single command and does not persist in your session. By default the bypass is honored only in interactive use: for a non-interactive caller such as a script or an AI agent, `TIRITH=0` is ignored and the command is checked as usual unless policy sets `allow_bypass_env_noninteractive: true`. Organizations can disable it entirely with `allow_bypass_env: false` in policy.
 
 > [!CAUTION]
 > `TIRITH=0` is per-command. Do not export it in shell profiles, dotfiles, or CI config; a permanent bypass defeats the entire protection model. If you find yourself reaching for it often, add the trusted source to `allowlist` in your policy file instead.
@@ -1285,10 +1308,11 @@ This is a standard shell per-command prefix; the variable exists only for that s
 ## Data handling
 
 Local JSONL audit log at `~/.local/share/tirith/log.jsonl`:
-- Timestamp, session ID, action, rule IDs, redacted command preview
+- Timestamp, session ID, action, rule IDs, policy path, caller origin, and a secret-redacted command preview: the whole command when it is 80 bytes or shorter, otherwise its first 80 bytes
 - Raw detection data (`raw_action`, `raw_rule_ids`) preserved alongside enforced action for coverage auditing
 - Session warning state at `~/.local/state/tirith/sessions/`
-- **No** full commands, environment variables, or file contents
+- **No** environment variables or file contents
+- When both `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are set, each audit entry is also spooled and uploaded to that policy server
 
 Disable: `export TIRITH_LOG=0`
 
@@ -1339,7 +1363,7 @@ Feature guides:
 
 ## License
 
-**Core security coverage ships in the open-source tree.** All 244 detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
+**Core security coverage ships in the open-source tree.** All 245 detection rules and the MCP server are available from source. The repository still contains legacy licensing and policy-server code paths, so avoid assuming that every runtime path is already tier-free.
 
 tirith is dual-licensed:
 

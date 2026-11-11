@@ -52,10 +52,24 @@ guarantee that runtime enrichment makes no network request. Offline mode is
 enforced in both the direct and daemon-backed check paths; an unavailable local
 answer is reported as incomplete rather than silently going online.
 
+A `check` also starts a detached, rate-limited refresh of the signed threat
+database when one is due (every 24 hours by default) and, on a device enrolled
+in a team policy, a refresh of that policy cache. Neither delays the command.
+Set `threat_intel.auto_update_hours: 0` to turn the database refresh off;
+offline mode skips both.
+
 - `paste` makes no network calls.
 - Tirith sends no telemetry, analytics, or crash reports.
-- Analysis results are written to a local JSONL audit log only.
-- Full command text is redacted in logs (first 80 chars, truncated).
+- By default, analysis results are written to a local JSONL audit log and go
+  nowhere else. Two operator-configured settings send them off the machine:
+  when both `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are set, each audit entry
+  is also queued and uploaded to that server, and a policy `webhooks` entry
+  posts a notification for findings at or above its severity. Offline mode
+  does not stop either one.
+- The log does not keep full command text. It stores a secret-redacted
+  preview: the whole command when that is 80 bytes or shorter, otherwise its
+  first 80 bytes. An upload carries the same preview. A webhook carries a
+  redacted preview of up to 200 characters.
 
 The audit log lives at `$XDG_DATA_HOME/tirith/log.jsonl` (normally
 `~/.local/share/tirith/log.jsonl`, or the platform equivalent). Disable it with
@@ -63,7 +77,7 @@ The audit log lives at `$XDG_DATA_HOME/tirith/log.jsonl` (normally
 
 There is no unrelated phone-home behavior.
 
-## Reproducible builds
+## Release verification
 
 Release artifacts are built via GitHub Actions with:
 - [Sigstore cosign](https://github.com/sigstore/cosign) signatures using GitHub OIDC

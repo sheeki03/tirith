@@ -401,7 +401,7 @@ This avoids enter-mode readline interception in environments where PTY handling 
 
 ## PowerShell: PSReadLine conflicts
 
-If using PSReadLine, ensure the tirith hook loads after PSReadLine initialization. The hook overrides `PSConsoleHostReadLine` to intercept pastes.
+If using PSReadLine, ensure the tirith hook loads after PSReadLine initialization. The hook registers PSReadLine key handlers (`Set-PSReadLineKeyHandler`) for Enter, to check the command, and for Ctrl+V, to check pasted content.
 This is preflight interception only. Tirith does not claim a strict PowerShell
 execution receipt because mutable PSReadLine history is not accepted as proof
 that the command executed.
@@ -465,14 +465,14 @@ Use `tirith doctor` to see which policy files are active.
 
 ## Warp terminal: silent blocking
 
-Warp terminal handles `/dev/tty` output differently than traditional terminals. tirith auto-detects Warp and uses stderr instead, but if block/warn messages aren't showing:
+Warp terminal handles `/dev/tty` output differently than traditional terminals. The bash, zsh and fish hooks write block/warn messages to stderr by default, with no Warp-specific detection. They write to `/dev/tty` only when `TIRITH_OUTPUT=tty` is set, so if block/warn messages aren't showing, make sure that override is not in effect:
 
 ```bash
 # Add to your ~/.zshrc or ~/.bashrc
-export TIRITH_OUTPUT=stderr
+unset TIRITH_OUTPUT
 ```
 
-This forces tirith to output to stderr instead of `/dev/tty`, which Warp displays correctly.
+`tty` is the only value the hooks recognize; any other value, or none, keeps the stderr default, which Warp displays correctly.
 
 ## Codex: MCP protected, but direct shell commands still run
 

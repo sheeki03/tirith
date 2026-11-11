@@ -43,7 +43,9 @@ their own explicit command.
 - **Open the dashboard:** run `tirith dashboard`. See [dashboard](dashboard.md).
 - **Join a team policy:** see [team policy](team-policy.md).
 - **Upgrade:** `tirith update --dry-run` previews the update (network access);
-  `tirith update` starts the confirmed workflow. See [Upgrade](#upgrade).
+  `tirith update` starts the confirmed workflow. Afterwards refresh installed
+  agent adapters with `tirith setup <host> --scope <scope> --force`. See
+  [Upgrade](#upgrade).
 - **Support and retention:** `tirith doctor --bundle` saves a reviewed support
   bundle privately and uploads nothing. `tirith audit rotate` saves a retention
   plan; `tirith audit rotate --operation-id OPERATION_ID --apply` applies it.
@@ -185,7 +187,21 @@ Use the owning package manager's update command for package-managed
 installations. A self-replaceable personal installation can use `tirith update`;
 a saved rollback uses `tirith update --rollback`. Review the candidate identity
 and compatibility first. After replacement, open a new terminal (status then
-reports the loaded hook as `current` again) and reload agent integrations.
+reports the loaded hook as `current` again).
+
+Then refresh agent integrations. Installed adapters are files that
+`tirith setup` wrote, and upgrading the binary does not rewrite them:
+
+```sh
+tirith doctor                                 # marks outdated adapters STALE
+tirith setup <host> --scope <scope> --force   # each STALE one
+```
+
+Run both from your home directory for user-scope adapters, and again from
+inside each project where you ran project-scope setup. Restart each agent host
+afterwards. Adapters installed by 0.4.x do not enforce the 0.5.0 approval
+requirement until refreshed; see the
+[0.5.0 release notes](release-notes-0.5.0.md).
 
 The dashboard's Settings page shows the exact upgrade and rollback command for
 your installation channel to copy into a terminal. Its "Refresh threat DB now"
