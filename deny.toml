@@ -48,6 +48,48 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # hickory-proto 0.24.4, three panics in the zone-file (record text) parser:
+    # a malformed SVCB/HTTPS `alpn` value (0487), a lone quote as a parameter
+    # value (0489) and a token of 4096 or more characters (0490). Records
+    # decoded from the DNS wire format do not take that path. Tirith uses
+    # hickory only through `TokioAsyncResolver::tokio_from_system_conf()` in
+    # network/dns.rs: it sends queries and decodes wire responses, and never
+    # parses a zone file or record text. The fix is 0.26.2, the same API and
+    # MSRV break as the 0119 entry above. Remove these ignores (and the
+    # .cargo/audit.toml twin) when the resolver can move to >=0.26.2.
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
+    # hickory-proto 0.24.4 reserves vectors sized by the record counts in a
+    # DNS message header before reading any record, about 18 MB for a packet
+    # that claims 65,535 records. THIS ONE IS REACHABLE: Tirith decodes
+    # responses to its own lookups, so a resolver that is malicious, or an
+    # on-path attacker who spoofs a response, can trigger it. The effect is a
+    # transient allocation that is freed when decoding fails. It is not memory
+    # corruption, and lookups are bounded per check by `DnsRequestBudget` and
+    # the resolver timeout, so the cost is memory pressure for the length of a
+    # lookup. Accepted until the resolver can move to >=0.26.2 (API and MSRV
+    # break, as above); that upgrade is the real fix.
+    "RUSTSEC-2026-0491",
+    # libsqlite3-sys 0.30.1 bundles a SQLite that can return uninitialized
+    # page-cache memory when it opens a database together with a crafted
+    # `-wal` file of a different page size (CVE-2026-119375). Only a process
+    # that opens database files a less trusted party could have written is
+    # exposed. The tirith CLI does not link SQLite. The two optional servers do
+    # (tools/policy-server, tools/license-server, through rusqlite 0.32), and
+    # each opens only its own database, at a path the server operator
+    # configures. The fix is libsqlite3-sys >=0.39 with rusqlite 0.41, which
+    # need Rust 1.88 and 1.89; the MSRV job tests the whole workspace on 1.83.
+    # Remove this ignore (and the .cargo/audit.toml twin) once MSRV allows
+    # rusqlite >=0.41.
+    "RUSTSEC-2026-0459",
+    # pin-utils 0.1.0 is unmaintained (an informational advisory; no
+    # vulnerability is reported, and the advisory lists no fixed release). It
+    # comes in only through futures-util and hyper, under reqwest, axum,
+    # tower-lsp and hickory. Nothing in this workspace depends on it directly.
+    # Remove this ignore (and the .cargo/audit.toml twin) when those crates
+    # stop depending on it.
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
