@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - RustSec advisories published after 0.5.0 are triaged in `deny.toml` and `.cargo/audit.toml`: `hickory-proto` (RUSTSEC-2026-0487, -0489, -0490, -0491), `libsqlite3-sys` (RUSTSEC-2026-0459) and `pin-utils` (RUSTSEC-2026-0441). None has a fixed release that builds on Rust 1.83. One is reachable: a malicious resolver, or a spoofed response to one of Tirith's own DNS lookups, can make the decoder reserve about 18 MB for the length of that lookup (RUSTSEC-2026-0491). The others are in code paths Tirith does not use, or in the optional servers' own database files.
 
+### Maintenance
+
+- Release builds for macOS run on the `macos-15` runner image. GitHub no longer provides `macos-14`, so the release workflow could not build macOS artifacts after the 0.5.0 tag.
+
 ### Docs
 
 - The threat model covers 0.5: coding agents, MCP servers and clients, hostile repositories, Tirith's own update channels and local services are named as actors and trust boundaries. It no longer calls the `web3_guard` fields inert, and it states that containment is delivered on Linux only in this release.
