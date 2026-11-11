@@ -51,18 +51,18 @@ and stderr caps, and its stderr is redacted before it reaches the receipt.
 | State | Meaning |
 |---|---|
 | `provenance-verified` | npm verified a publish attestation. When a lockfile SRI was available, the attestation's in-toto subject digest bound to it |
-| `signature-only` | npm named neither an invalid nor a missing signature for it, so its registry signature verified and it publishes no attestation. Derived by subtraction, and the receipt says so |
+| `signature-only` | a legacy state, kept so older receipts still parse. No current run produces it: npm's JSON has no positive per-package signature bucket, and a package npm did not name is `not-audited` |
 | `missing` | the registry provides signing keys but published no signature for this package |
 | `invalid` | a signature, an attestation, or the attested subject digest FAILED. The security-relevant negative state |
 | `not-audited` | installed and eligible, but no audit result covers it |
 | `unsupported-source` | the dependency is not from a registry (git, file, link, workspace), so npm's signature audit does not apply. Kept explicit rather than dropped, because a silently omitted dependency reads as coverage that was never attempted |
 
-`signature-only` is derived by subtraction because npm's
-`--include-attestations` JSON enumerates only the invalid, the missing, and the
-ATTESTED packages. Subtraction needs a premise about what npm audited, and npm's
-JSON carries no counters, so the premise is re-established from the lockfile and
-the install tree. Anything that cannot be established becomes `not-audited`
-instead.
+`signature-only` is not derived by subtraction. npm's `--include-attestations`
+JSON enumerates only the invalid, the missing, and the ATTESTED packages, and it
+carries no counters. Absence from all three buckets is therefore never read as a
+verified signature, even for an installed package from the public registry: that
+package is `not-audited`. The receipt's `signature_only_derived_by_subtraction`
+coverage field is a legacy field and is always `false`.
 
 ## The one binding tirith performs itself
 
@@ -82,7 +82,7 @@ reports and the receipt says so.
 
 | Outcome | Exit | Meaning |
 |---|---|---|
-| `clean` | 0 | every eligible package is signature-covered, and provenance-verified too when `--require-provenance` is set |
+| `clean` | 0 | every eligible package is `provenance-verified`. A registry dependency that npm names in no bucket is `not-audited`, which makes the run `partial`, so a project with any unattested dependency is not `clean`. `--require-provenance` is recorded in the receipt and additionally rejects `signature-only`, which no current run produces |
 | `mismatch` | 1 | at least one `invalid`. A failed signature, attestation, or subject binding dominates everything |
 | `partial` | 3 | the receipt exists but the coverage is incomplete. Never a claim that the incomplete part was fine |
 
@@ -96,20 +96,31 @@ The common causes, each of which runs no audit command at all rather than
 guessing:
 
 - **an unsupported npm version**, outside the contract table;
-- **a project `.npmrc` that reconfigures the audit.** If the project's own
-  `.npmrc` sets `registry`, `ca`, `cafile`, `strict-ssl`, `_keys`, `omit`,
-  `userconfig`, or `globalconfig`, the run returns partial. The audit child runs
-  in the project directory, where npm reads the project's `.npmrc` above the
-  user and global config, so honoring it would let the audited project configure
-  its own audit;
+- **a project `.npmrc` with any setting in it.** If the project's own `.npmrc`
+  holds any assignment at all, whatever the key, the run returns partial and
+  names the first key. Only comments and blank lines pass. It is not a list of
+  dangerous keys, because npm can add audit-affecting keys over time. The audit
+  child runs in the project directory, where npm reads the project's `.npmrc`
+  above the user and global config, so honoring it would let the audited project
+  configure its own audit;
 - **Windows**, where npm is a batch launcher (`npm.cmd`) that the
   trusted-executable validator refuses;
 - **offline mode**, which resolves and spawns nothing;
 - **a missing `node_modules` or `package-lock.json`**;
-- **a non-public registry.** npm ships the Sigstore TUF root that pins
-  `registry.npmjs.org`, and that is the only host whose signing-key availability
-  tirith can assert without asking the host itself. A private registry is
-  therefore partial rather than clean.
+- **an invalid registry mode.** Setting `TIRITH_NPM_REGISTRY`,
+  `TIRITH_NPM_AUTH_SOURCE`, `TIRITH_NPM_CA_FILE`, or `TIRITH_NPM_PROXY` without
+  `TIRITH_NPM_AUDIT_MODE=trusted-private`, or selecting that mode without its
+  required inputs, is refused rather than falling back to the public registry.
+
+**A non-public registry** is a separate case, and here the audit command does
+run. The default (public) mode pins `https://registry.npmjs.org/` with isolated,
+empty user and global npm config, so a dependency the lockfile resolves from
+another host is never reported as covered and the run cannot be clean. A private
+registry is audited only in the explicit trusted-private mode:
+`TIRITH_NPM_AUDIT_MODE=trusted-private`, an HTTPS `TIRITH_NPM_REGISTRY` origin,
+and an absolute, owner-only credential file in `TIRITH_NPM_AUTH_SOURCE`, with
+optional `TIRITH_NPM_CA_FILE` and `TIRITH_NPM_PROXY`. The receipt records which
+mode ran and the registry origin, never the credential.
 
 Other partial reasons cover the honest failure modes of the run itself: a
 timeout, an output-cap breach, non-strict JSON, a duplicate JSON key, trailing
@@ -123,7 +134,9 @@ written atomically at mode `0600` when `--out` is given. It carries the schema,
 receipt type, content address, timestamp, tirith version, engine build, policy
 projection hash, status, subject, evidence, coverage, and the caveats. It shares
 its envelope shape with the capsule, browser-baseline, build, and deployment
-receipts, and like them it is **not anchored in the audit hash chain**.
+receipts. Like the browser-baseline, build, and deployment receipts it is **not
+anchored in the audit hash chain**. Only the capsule run receipt is eligible for
+anchoring, and only when an audit chain is configured.
 
 ## See also
 

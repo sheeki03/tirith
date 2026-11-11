@@ -5,8 +5,9 @@ bounty, a "can you reproduce this", a take-home exercise. This is the workflow
 tirith supports for that, and, just as importantly, the workflow's real limits.
 
 The short version: **`tirith capsule run --preset untrusted-project` is the only
-control here that can stop anything, and the 0.5.0 candidate supports native
-x86_64 and AArch64 Linux.** Everything else on this page is inspection and evidence.
+control here that can stop anything, and in 0.5.0 it is enforceable only on
+native x86_64 and AArch64 Linux.** Everything else on this page is inspection and
+evidence.
 
 ## Before you clone
 
@@ -22,12 +23,14 @@ single-file `tirith check` does not.
 
 ```bash
 tirith ecosystem scan /path/to/project
-tirith hooks scan /path/to/project
+cd /path/to/project && tirith hooks scan
 ```
 
 `ecosystem scan` scores every declared dependency, `hooks scan` inventories git,
 husky, lefthook, and pre-commit hooks, which is where a repository most cheaply
-arranges to run code the moment you touch it.
+arranges to run code the moment you touch it. `hooks scan` takes no path
+argument: it inventories the repository that contains the current directory, and
+it reads hook bodies as text without running them.
 
 ## Running it: the capsule preset
 
@@ -58,11 +61,13 @@ caps at 100,000 files, 200,000 entries of every kind, 256 levels of nesting, and
 
 ### It refuses on the wrong host, before copying anything
 
-The candidate preset is enforceable on native x86_64 and AArch64 Linux with
-usable Landlock and seccomp, not merely on a matching CPU. Both Linux backends
-provide raw-network denial; macOS cannot enforce a per-process memory or
-process-count ceiling, and the parent-owned wall-clock/combined-output supervisor
-is Linux-only. Final released artifacts still require native qualification.
+The preset is enforceable on native x86_64 and AArch64 Linux with usable
+Landlock and seccomp, not merely on a matching CPU. Both Linux backends provide
+raw-network denial; macOS cannot enforce a per-process memory or process-count
+ceiling, and the parent-owned wall-clock/combined-output supervisor is
+Linux-only. The release workflow runs the preset from the exact AArch64 GNU and
+musl release archives on a native ARM runner, and the release job depends on
+that run (`native-arm-runtime` in `.github/workflows/release.yml`).
 
 On any other host the command refuses before anything is copied or spawned,
 names the exact control it could not deliver, and writes a refusal receipt. On a
@@ -101,7 +106,8 @@ audit chain` or, with no key and no chain (for example under the documented
 `TIRITH_LOG=0`), `receipt is unsigned (no audit signing key configured) and NOT
 anchored in the audit chain`. A skipped anchor is deliberately not a failure and
 does NOT change the exit code
-(`crates/tirith/src/cli/capsule_run.rs:913-925`), so read the printed line
+(`exit_code_with_receipt` in `crates/tirith/src/cli/capsule_run.rs`), so read
+the printed line
 rather than the exit status before handing a receipt to someone else as
 tamper-evident evidence. It records the argv DIGEST
 (never the argv), the project input and output tree digests, the backend,
@@ -129,8 +135,13 @@ per-backend coverage ledger.
 ```bash
 tirith browser audit --baseline ~/ext-baseline.json
 tirith persistence diff
-tirith checkpoint diff
+tirith checkpoint diff <id>
 ```
+
+`persistence diff` and `checkpoint diff` compare against a baseline taken before
+the run, with `tirith persistence scan` and `tirith checkpoint create <paths>`.
+`checkpoint diff` needs that checkpoint's id, which `tirith checkpoint list`
+shows.
 
 If you keep a browser extension baseline, comparing after the fact is how a
 silently updated wallet extension becomes visible. That is

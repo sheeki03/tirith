@@ -95,9 +95,12 @@ are not affected. See `tirith dashboard --help`.
   `action_incomplete_analysis: block` it is always refused). Only one refresh
   runs at a time.
 - Read-only views (state, integrations, activity, history, freshness,
-  operation status and the job list) never contact a policy server. The
-  effective-policy view and applying or undoing a change resolve the full
-  policy, which can. With a legacy remote policy server configured, the
+  operation status and the job list) never contact a policy server
+  themselves. Starting the service resolves the full policy once in the
+  background, which can contact a configured remote policy server, and the
+  first read waits up to 16 seconds for that result. The effective-policy
+  view and applying or undoing a change also resolve the full policy, which
+  can. With a legacy remote policy server configured, the
   exceptions list and explain also resolve the full policy when a local policy
   input has changed since the cached snapshot or no full resolution has
   finished yet, so they can contact it too.

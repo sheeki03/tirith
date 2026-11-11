@@ -28,8 +28,10 @@ Different package names are labelled as such.
 
 ## Choose the ecosystem
 
-`.tgz` files are read as npm. A `.tar.gz` file is read as a Python source
-distribution unless you select npm explicitly:
+`.tgz` files are read as npm. A `.tar.gz` file is routed to the Python reader
+unless you select npm explicitly. That reader handles wheels only: `pkg inspect`
+records a `.tar.gz` as an unsupported artifact without analyzing its contents,
+so an npm tarball with that name gets no npm analysis unless you pass the flag:
 
 ```sh
 tirith pkg inspect package.tar.gz --ecosystem npm --json

@@ -79,5 +79,12 @@ before a callback is sent. On
 detection (and only on detection) tirith sends one best-effort POST of
 `{kind, detected_at, context}` — **never the token value** — to that URL. There
 is no tirith-operated endpoint. A callback failure is logged to the audit log
-and never blocks the verdict. This is the single exception to tirith's
-no-network rule, and it is gated entirely behind your explicit `--callback-url`.
+and never blocks the verdict. The callback is gated entirely behind your
+explicit `--callback-url`.
+
+The callback is not tirith's only network use. By default `tirith check`
+refreshes the signed threat database in the background about every 24 hours
+(`threat_intel.auto_update_hours`), and package-install checks query OSV.dev and
+deps.dev (`threat_intel.osv_enabled` and `threat_intel.deps_dev_enabled`, both
+on). See [Data handling](../SECURITY.md#data-handling) and
+[ThreatDB freshness](threatdb-freshness.md).

@@ -23,10 +23,11 @@ malformed or hostile workflow yields no findings rather than a panic.
 
 **Consequence an operator must know:** the post-pass runs only for a directory
 scan, and "directory scan" is not the CLI alone. It lives inside `scan::scan`
-(`scan.rs:254`, invoking it at `:436`), so it runs for `tirith scan`
-(`crates/tirith/src/cli/scan.rs:248`), the `tirith_scan_directory` MCP tool
-(`crates/tirith-core/src/mcp/tools.rs:742`), and both MCP scan resources
-(`crates/tirith-core/src/mcp/resources.rs:153` and `:244`). An agent gating on
+(`scan.rs:276`, invoking `run_workflow_artifact_post_pass` at `:462`), so it runs
+for `tirith scan` (`crates/tirith/src/cli/scan.rs:248`), the
+`tirith_scan_directory` MCP tool (`call_scan_directory`,
+`crates/tirith-core/src/mcp/tools.rs:862`), and both MCP scan resources
+(`crates/tirith-core/src/mcp/resources.rs:154` and `:254`). An agent gating on
 `tirith_scan_directory` gets the chain findings and the downgraded severity just
 as the CLI does.
 
@@ -84,9 +85,9 @@ parse, so a bounded scan degrades to "not proven either way" rather than to
 its mere presence removes the right to say no chain exists.
 
 The lowering happens only in the post-pass, never in `rules::cifile`, because
-the four surfaces listed above cannot run the post-pass and must keep the
-original severity. A downgrade there would have weakened `tirith check`, the MCP
-scan tool, and the LSP.
+the three per-file surfaces listed above cannot run the post-pass and must keep
+the original severity. A downgrade there would have weakened `tirith check`, the
+`tirith_scan_file` MCP tool, and the LSP.
 
 ## Bounds
 
