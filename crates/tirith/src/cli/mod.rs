@@ -74,15 +74,7 @@ pub(crate) fn interactive_comments_reading(no_interactive_comments_flag: bool) -
 /// case-insensitive, trimmed). The env-var half of the CLI-wide offline switch
 /// that every networked command routes through, so it behaves identically.
 pub(crate) fn offline_env_active() -> bool {
-    std::env::var("TIRITH_OFFLINE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    tirith_core::network::offline_env_active()
 }
 
 /// Bound diagnostics shown in a JSON response: at most `cap` messages, each

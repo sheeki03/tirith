@@ -106,6 +106,7 @@ pub fn scan(
     // Offline-safe (degrades any failure to `ApiSignals::Unavailable`) and
     // memoized inside `ecosystem_scan::scan`, so a package is fetched at most once.
     let use_online = online && !offline && !super::offline_env_active();
+    tirith_core::audit_upload::set_offline(offline);
     let http_client = HttpRegistryClient::new();
     // Fold `gather_api_signals`'s existence result into provenance (as `tirith
     // install` does) so the `PackageNotFoundInRegistry` gate can read it.

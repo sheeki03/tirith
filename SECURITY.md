@@ -64,8 +64,10 @@ offline mode skips both.
   nowhere else. Two operator-configured settings send them off the machine:
   when both `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are set, each audit entry
   is also queued and uploaded to that server, and a policy `webhooks` entry
-  posts a notification for findings at or above its severity. Offline mode
-  does not stop either one.
+  posts a notification for findings at or above its severity. In offline
+  mode neither request is made: the audit entry stays queued and a later
+  online run uploads it, and no webhook is posted for that check. (0.5.0
+  made both requests in offline mode as well.)
 - The log does not keep full command text. It stores a secret-redacted
   preview: the whole command when that is 80 bytes or shorter, otherwise its
   first 80 bytes. An upload carries the same preview. A webhook carries a

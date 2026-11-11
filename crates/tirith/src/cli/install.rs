@@ -2464,6 +2464,7 @@ fn run_package_manager(
     // Resolve the effective online mode before preparing any network
     // authorization. Offline analysis has no registry transition to authorize.
     let use_online = online && !offline && !super::offline_env_active();
+    tirith_core::audit_upload::set_offline(offline);
     let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let policy = Policy::discover(cwd.as_deref());
     tirith_core::policy::freeze_captured_policy_dlp_patterns(&policy.dlp_custom_patterns);
