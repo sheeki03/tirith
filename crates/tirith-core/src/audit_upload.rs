@@ -8,6 +8,28 @@ const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 /// retention value.
 const ABSOLUTE_MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Set by a command that was invoked with `--offline`. `TIRITH_OFFLINE` needs
+/// no caller: [`upload_suppressed`] reads it directly.
+static OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the invoking command is offline.
+///
+/// Offline is a network boundary, not a logging one. While it holds, an event
+/// is still appended to the durable spool and trimmed to retention, and the
+/// next online invocation uploads it. Only the upload is skipped.
+///
+/// Call this from a one-shot command, never from a long-lived service that
+/// answers for other callers: the setting is process-wide.
+pub fn set_offline(offline: bool) {
+    OFFLINE.store(offline, std::sync::atomic::Ordering::Release);
+}
+
+/// `true` when no upload may start: the command said `--offline`, or
+/// `TIRITH_OFFLINE` is set.
+fn upload_suppressed() -> bool {
+    OFFLINE.load(std::sync::atomic::Ordering::Acquire) || crate::network::offline_env_active()
+}
+
 /// Dedicated cross-process lock guarding every spool read/append/rewrite
 /// (repo-0250): without it, two drainers snapshot-then-rewrite from stale
 /// state and can delete or duplicate each other's events.
@@ -376,6 +398,13 @@ pub fn spool_and_upload(
     // grow the queue past the configured bounds.
     trim_spool_to_retention(max_ev, max_b);
 
+    // Offline: the event is queued and stays queued. Checked after the append
+    // and the trim so an offline run neither loses the event nor lets the
+    // queue outgrow its bounds.
+    if upload_suppressed() {
+        return;
+    }
+
     if DRAIN_ACTIVE
         .compare_exchange(
             false,
@@ -448,6 +477,56 @@ mod tests {
     fn test_spool_path_uses_xdg_state() {
         let _shared_state = tirith_test_support::SharedStateGuard::acquire();
         let _path = spool_path();
+    }
+
+    /// Queue one event the way a verdict append does and report what happened:
+    /// the spool contents, and whether a drain worker was claimed.
+    fn queue_one_event() -> (String, bool) {
+        spool_and_upload(
+            "{\"n\":1}",
+            "https://collector.invalid",
+            "test-key",
+            None,
+            None,
+        );
+        let queued = fs::read_to_string(spool_path()).unwrap_or_default();
+        let draining = DRAIN_ACTIVE.load(std::sync::atomic::Ordering::Acquire);
+        (queued, draining)
+    }
+
+    #[test]
+    fn offline_flag_queues_the_event_and_starts_no_upload() {
+        let _global = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        set_offline(true);
+        let suppressed = upload_suppressed();
+        let (queued, draining) = queue_one_event();
+        set_offline(false);
+
+        assert!(suppressed);
+        assert!(
+            queued.contains("{\"n\":1}"),
+            "event must stay queued: {queued:?}"
+        );
+        assert!(!draining, "an offline run must not claim a drain worker");
+        assert!(
+            !upload_suppressed(),
+            "the flag must not outlive the command"
+        );
+    }
+
+    #[test]
+    fn offline_env_queues_the_event_and_starts_no_upload() {
+        let mut global = tirith_test_support::GlobalStateGuard::new().expect("isolated state");
+        global.set_env("TIRITH_OFFLINE", "1");
+        let suppressed = upload_suppressed();
+        let (queued, draining) = queue_one_event();
+
+        assert!(suppressed);
+        assert!(
+            queued.contains("{\"n\":1}"),
+            "event must stay queued: {queued:?}"
+        );
+        assert!(!draining, "an offline run must not claim a drain worker");
     }
 
     #[test]

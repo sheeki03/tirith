@@ -165,6 +165,9 @@ pub fn run(
 ) -> i32 {
     let _policy_diagnostic_capture = tirith_core::policy::PolicyDiagnosticCapture::start();
     let offline = offline || crate::cli::offline_env_active();
+    // `--offline` covers the audit upload too: the entry is queued and a later
+    // online run uploads it.
+    tirith_core::audit_upload::set_offline(offline);
     let shell_name = match shell_type {
         ShellType::Posix => "posix",
         ShellType::Fish => "fish",
@@ -671,7 +674,7 @@ pub fn run(
         last_trigger::write_last_trigger(&effective, cmd, &policy.dlp_custom_patterns);
     }
 
-    if !policy.webhooks.is_empty() {
+    if should_dispatch_webhooks(offline, &policy.webhooks) {
         tirith_core::webhook::dispatch(
             &effective,
             cmd,
@@ -2803,6 +2806,31 @@ fn parse_action(s: &str) -> Option<Action> {
         "WarnAck" => Some(Action::WarnAck),
         "Block" => Some(Action::Block),
         _ => None,
+    }
+}
+
+/// A webhook is an outbound request, so an offline check sends none. The audit
+/// entry for the verdict is still written, and queued for upload when one is
+/// configured.
+fn should_dispatch_webhooks(
+    offline: bool,
+    webhooks: &[tirith_core::policy::WebhookConfig],
+) -> bool {
+    !offline && !webhooks.is_empty()
+}
+
+#[cfg(test)]
+mod webhook_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn offline_check_sends_no_webhook() {
+        let webhooks: Vec<tirith_core::policy::WebhookConfig> =
+            serde_yaml::from_str("- url: https://collector.invalid/hook\n")
+                .expect("webhook config");
+        assert!(should_dispatch_webhooks(false, &webhooks));
+        assert!(!should_dispatch_webhooks(true, &webhooks));
+        assert!(!should_dispatch_webhooks(false, &[]));
     }
 }
 

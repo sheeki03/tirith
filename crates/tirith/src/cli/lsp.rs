@@ -13,7 +13,9 @@
 //! ([`Evidence::ByteSequence`]/[`Evidence::HomoglyphAnalysis`]) gets a precise
 //! [`Range`] (byte→UTF-16 per the LSP spec), else whole-document.
 //!
-//! No off-buffer analysis: never reads the file from disk, never the network.
+//! No off-buffer analysis: the document is never read from disk. Analysis
+//! itself is not network-free: policy discovery can contact a configured
+//! remote policy server, and a canary registered with a callback URL fires it.
 //! Sync kind is FULL (each change carries the whole text — no server-side
 //! cache). AI-config DRIFT rules need a snapshot diff and cannot fire on a
 //! single buffer. See `docs/lsp-profiles.md`.

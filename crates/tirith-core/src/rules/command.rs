@@ -3004,10 +3004,61 @@ fn resolve_interpreter_name_depth_tracking(
             "command" | "exec" | "nohup" | "stdbuf" => {
                 return resolve_wrapper_args_depth(&seg.args, &cmd_base, shell, budget, exhausted);
             }
+            // GNU parallel with no command template runs each line of its
+            // standard input as a command line, so a pipe into it is a pipe
+            // into an interpreter.
+            "parallel"
+                if matches!(shell, ShellType::Posix | ShellType::Fish)
+                    && parallel_runs_stdin_as_commands(&seg.args, shell) =>
+            {
+                return Some(cmd_base);
+            }
             _ => {}
         }
     }
     None
+}
+
+/// Whether any command in `source` (shell source text) runs an interpreter,
+/// directly or behind an execution wrapper.
+pub(crate) fn source_runs_interpreter(source: &str, shell: ShellType) -> bool {
+    tokenize::tokenize(source, shell)
+        .iter()
+        .any(|segment| resolve_interpreter_name(segment, shell).is_some())
+}
+
+/// Whether this GNU parallel invocation takes its COMMANDS from standard
+/// input: it has no command template, no `:::` / `::::` input source and no
+/// arg-file. An option this grammar does not know answers `false`; the
+/// executable-body scanner reports that case as unresolved.
+fn parallel_runs_stdin_as_commands(args: &[String], shell: ShellType) -> bool {
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = normalize_shell_token(&args[index], shell);
+        if matches!(token.as_str(), ":::" | ":::+" | "::::" | "::::+") {
+            return false;
+        }
+        if token == "--" {
+            return index + 1 >= args.len();
+        }
+        let long_name = token
+            .split_once('=')
+            .map_or(token.as_str(), |(name, _)| name);
+        let short_arg_file = token.starts_with('-')
+            && !token.starts_with("--")
+            && token[1..]
+                .chars()
+                .find(|flag| !PARALLEL_BOOLEAN_SHORT_OPTIONS.contains(flag))
+                == Some('a');
+        if matches!(long_name, "--arg-file" | "--argfile") || short_arg_file {
+            return false;
+        }
+        match parallel_option_advance(args, index, shell) {
+            Ok(Some(advance)) => index += advance,
+            Ok(None) | Err(()) => return false,
+        }
+    }
+    true
 }
 
 /// Resolve the effective INTERPRETER from an `env` split-string payload (the
@@ -9533,10 +9584,19 @@ fn promoted_read_flow(
             }
         }
         "find" => find_promoted_read_flow(args, shell),
-        "parallel" => merge_flow_proof(
-            parallel_arg_file_promotion(args, shell, None).output,
-            parallel_promoted_read_flow(args, shell),
-        ),
+        "parallel" => {
+            let promoted = merge_flow_proof(
+                parallel_arg_file_promotion(args, shell, None).output,
+                parallel_promoted_read_flow(args, shell),
+            );
+            // Items read from a pipe become the template's operands, as with
+            // `xargs <reader>`: which file is then read is not modelled.
+            if promoted == FlowProof::Clean && pipe_connected && pipe_sensitive_path_list {
+                FlowProof::Incomplete
+            } else {
+                promoted
+            }
+        }
         _ => FlowProof::Clean,
     }
 }
@@ -9665,6 +9725,11 @@ fn arg_file_operand_flow(
 struct ArgFilePromotion {
     present: bool,
     output: FlowProof,
+    /// The lines of a sensitive arg-file become arguments of a command that
+    /// can carry them to another host (`xargs -a .env curl URL -d`). That is a
+    /// fact about the utility's ARGV, which `output` does not describe: the
+    /// sink is the utility itself, so nothing downstream ever sees the bytes.
+    argument_sink: bool,
 }
 
 impl ArgFilePromotion {
@@ -9672,6 +9737,7 @@ impl ArgFilePromotion {
         Self {
             present: false,
             output: FlowProof::Clean,
+            argument_sink: false,
         }
     }
 
@@ -9679,7 +9745,57 @@ impl ArgFilePromotion {
         Self {
             present: true,
             output,
+            argument_sink: false,
         }
+    }
+
+    fn with_argument_sink(mut self, argument_sink: bool) -> Self {
+        self.argument_sink = argument_sink;
+        self
+    }
+}
+
+/// Commands whose arguments can leave the machine. The same set the dataflow
+/// loop treats as argument sinks for a sensitive command substitution.
+fn is_remote_argument_sink(command: &str) -> bool {
+    matches!(
+        command,
+        "curl"
+            | "wget"
+            | "http"
+            | "https"
+            | "xh"
+            | "scp"
+            | "rsync"
+            | "rclone"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "socat"
+            | "dig"
+            | "nslookup"
+    )
+}
+
+/// Whether `utility`, run by `xargs` or `parallel` with arguments read from an
+/// input whose flow is `input`, can send those arguments to another host.
+///
+/// A utility that cannot be resolved is not proven to stay local, so it counts
+/// when the input is relevant. A clean input never counts.
+fn promoted_arguments_reach_remote_sink(
+    input: FlowProof,
+    utility: Option<&[String]>,
+    shell: ShellType,
+) -> bool {
+    if input == FlowProof::Clean {
+        return false;
+    }
+    let Some(utility) = utility.filter(|utility| !utility.is_empty()) else {
+        return false;
+    };
+    match promoted_utility_base(utility, shell) {
+        Ok(command) => is_remote_argument_sink(&command),
+        Err(()) => true,
     }
 }
 
@@ -9869,12 +9985,9 @@ fn xargs_arg_file_promotion(
     }
 
     if present {
-        ArgFilePromotion::present(promoted_arg_file_output(
-            input,
-            args.get(index..).filter(|body| !body.is_empty()),
-            shell,
-            staged,
-        ))
+        let utility = args.get(index..).filter(|body| !body.is_empty());
+        ArgFilePromotion::present(promoted_arg_file_output(input, utility, shell, staged))
+            .with_argument_sink(promoted_arguments_reach_remote_sink(input, utility, shell))
     } else {
         ArgFilePromotion::absent()
     }
@@ -9894,8 +10007,13 @@ fn parallel_arg_file_promotion(
     let template_end = separator.unwrap_or(args.len());
     let mut input = FlowProof::Clean;
     let mut present = false;
-    let fallback =
-        explicit_arg_file_candidate(args, template_end, shell, &['0', 'k', 'm', 'v'], staged);
+    let fallback = explicit_arg_file_candidate(
+        args,
+        template_end,
+        shell,
+        PARALLEL_BOOLEAN_SHORT_OPTIONS,
+        staged,
+    );
     let mut index = 0usize;
     let mut options = true;
     while index < template_end {
@@ -9930,11 +10048,11 @@ fn parallel_arg_file_promotion(
             let flags = &token[1..];
             let mut value_option = None;
             for (offset, option) in flags.char_indices() {
-                if matches!(option, 'a' | 'j' | 'P' | 'S' | 'L' | 'N' | 'n' | 's') {
+                if PARALLEL_VALUE_SHORT_OPTIONS.contains(&option) {
                     value_option = Some((option, offset + option.len_utf8()));
                     break;
                 }
-                if !matches!(option, '0' | 'k' | 'm' | 'v') {
+                if !PARALLEL_BOOLEAN_SHORT_OPTIONS.contains(&option) {
                     break;
                 }
             }
@@ -9971,13 +10089,21 @@ fn parallel_arg_file_promotion(
         break;
     }
 
-    if !present {
-        return ArgFilePromotion::absent();
-    }
-    match args
+    let utility = args
         .get(index..template_end)
-        .filter(|body| !body.is_empty())
-    {
+        .filter(|body| !body.is_empty());
+    // `:::: FILE` is the other way a file's lines become the template's
+    // arguments. It needs no `-a`, so it is checked whether or not one was
+    // present.
+    let file_sources = separator.map_or(FlowProof::Clean, |separator| {
+        parallel_file_source_flow(args, separator, shell, staged)
+    });
+    let argument_sink =
+        promoted_arguments_reach_remote_sink(merge_flow_proof(input, file_sources), utility, shell);
+    if !present {
+        return ArgFilePromotion::absent().with_argument_sink(argument_sink);
+    }
+    match utility {
         Some(utility) => ArgFilePromotion::present(promoted_arg_file_output(
             input,
             Some(utility),
@@ -9986,6 +10112,31 @@ fn parallel_arg_file_promotion(
         )),
         None => ArgFilePromotion::present(incomplete_if_relevant(input)),
     }
+    .with_argument_sink(argument_sink)
+}
+
+/// Flow of the files named after `::::` / `::::+`. Their lines become the
+/// template's arguments at run time. Operands after `:::` are the arguments
+/// themselves, already visible to the template, and are not counted here.
+fn parallel_file_source_flow(
+    args: &[String],
+    separator: usize,
+    shell: ShellType,
+    staged: Option<&StagedDataflow>,
+) -> FlowProof {
+    let mut flow = FlowProof::Clean;
+    let mut from_file = false;
+    for raw in &args[separator..] {
+        match normalize_shell_token(raw, shell).as_str() {
+            ":::" | ":::+" => from_file = false,
+            "::::" | "::::+" => from_file = true,
+            _ if from_file => {
+                flow = merge_flow_proof(flow, arg_file_operand_flow(raw, shell, staged));
+            }
+            _ => {}
+        }
+    }
+    flow
 }
 
 fn promoted_operand_flow(raw: &str, shell: ShellType) -> FlowProof {
@@ -10273,12 +10424,18 @@ const PARALLEL_VALUE_LONG_OPTIONS: &[&str] = &[
     "--delay",
     "--delimiter",
     "--extensionreplace",
+    "--halt",
+    "--halt-on-error",
     "--header",
     "--joblog",
     "--jobs",
     "--load",
+    "--max-args",
+    "--max-chars",
     "--max-line-length-allowed",
+    "--max-lines",
     "--max-procs",
+    "--max-replace-args",
     "--memfree",
     "--nice",
     "--recend",
@@ -10296,7 +10453,9 @@ const PARALLEL_VALUE_LONG_OPTIONS: &[&str] = &[
     "--sshloginfile",
     "--tagstring",
     "--timeout",
+    "--tmpdir",
     "--transferfile",
+    "--trim",
     "--workdir",
     "--wd",
 ];
@@ -10320,14 +10479,29 @@ const PARALLEL_BOOLEAN_LONG_OPTIONS: &[&str] = &[
     "--pipepart",
     "--plus",
     "--progress",
+    "--quote",
     "--resume",
     "--retry-failed",
     "--round-robin",
+    "--shuf",
     "--tag",
     "--ungroup",
     "--verbose",
     "--will-cite",
+    "--xargs",
 ];
+
+/// GNU parallel short options that take no value. Shared with the
+/// executable-body scanner, which must agree on where an arg-file option sits
+/// in a cluster.
+pub(crate) const PARALLEL_BOOLEAN_SHORT_OPTIONS: &[char] =
+    &['0', 'k', 'm', 'q', 'r', 't', 'u', 'v', 'X'];
+
+/// GNU parallel short options whose value is the rest of the word or the next
+/// word. `-I` (a different replacement string) is deliberately absent: the
+/// template model below only knows the default strings.
+const PARALLEL_VALUE_SHORT_OPTIONS: &[char] =
+    &['a', 'C', 'd', 'E', 'j', 'L', 'N', 'n', 'P', 'S', 's'];
 
 fn parallel_short_option_advance(token: &str, has_next: bool) -> Result<usize, ()> {
     let flags = token
@@ -10335,7 +10509,7 @@ fn parallel_short_option_advance(token: &str, has_next: bool) -> Result<usize, (
         .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
         .ok_or(())?;
     for (offset, option) in flags.char_indices() {
-        if matches!(option, 'a' | 'j' | 'P' | 'S' | 'L' | 'N' | 'n' | 's') {
+        if PARALLEL_VALUE_SHORT_OPTIONS.contains(&option) {
             return if offset + option.len_utf8() < flags.len() {
                 Ok(1)
             } else if has_next {
@@ -10344,14 +10518,18 @@ fn parallel_short_option_advance(token: &str, has_next: bool) -> Result<usize, (
                 Err(())
             };
         }
-        if !matches!(option, '0' | 'k' | 'm' | 'v') {
+        if !PARALLEL_BOOLEAN_SHORT_OPTIONS.contains(&option) {
             return Err(());
         }
     }
     Ok(1)
 }
 
-fn parallel_option_advance(
+/// How many words the GNU parallel option at `index` occupies: `Ok(None)` when
+/// the word is not an option (the command template starts there), `Err` when
+/// it is an option this grammar does not know. Shared with the executable-body
+/// scanner so both read the same option prefix.
+pub(crate) fn parallel_option_advance(
     args: &[String],
     index: usize,
     shell: ShellType,
@@ -15220,10 +15398,16 @@ fn check_data_exfiltration_depth(
         let arg_file_output_override = match cmd_base.as_str() {
             "xargs" => {
                 let promotion = xargs_arg_file_promotion(&effective.args, shell, Some(staged));
+                if promotion.argument_sink {
+                    findings.push(unresolved_sensitive_upload_finding());
+                }
                 promotion.present.then_some(promotion.output)
             }
             "parallel" => {
                 let promotion = parallel_arg_file_promotion(&effective.args, shell, Some(staged));
+                if promotion.argument_sink {
+                    findings.push(unresolved_sensitive_upload_finding());
+                }
                 if promotion.present {
                     Some(merge_flow_proof(
                         promotion.output,
