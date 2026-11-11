@@ -95,13 +95,14 @@ Example:
 `protection_mode` uses the same vocabulary as `tirith prompt-status` (see
 `docs/prompt-integration.md`), derived from the hook's effective-protection
 signal — `TIRITH_BASH_EFFECTIVE_PROTECTION` first, falling back to
-`TIRITH_STATUS`. Both carry the same value set:
+`TIRITH_STATUS`. `TIRITH_STATUS` carries the values below; the bash variable
+carries only `blocks`, `warn-only` or `off`:
 
 | hook signal value   | `protection_mode` | meaning                                            |
 | ------------------- | ----------------- | -------------------------------------------------- |
 | `blocks`            | `guarded`         | Marker reports blocking; current-shell blocking remains unverified. |
 | `warn-only`         | `warn-only`       | Marker reports checking without blocking. |
-| `degraded`          | `degraded`        | Marker reports a downgrade to warn-only. |
+| `degraded`          | `degraded`        | Marker reports reduced protection: a downgrade to warn-only, a bash preexec hook that could not be installed, or zsh/fish legacy checks without execution receipts (see `docs/prompt-status.md`). |
 | `off`, empty, unset | `off`             | No live mode visible to this external process / protection off.|
 | (any other value)   | (verbatim)        | Forwarded unchanged for forward compatibility.     |
 

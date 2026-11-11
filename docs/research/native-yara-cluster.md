@@ -1,5 +1,12 @@
 # Spike 5c: native YARA, signature-base, TLSH, and capa cluster
 
+> **Historical record.** This is the decision record of a research spike on
+> branch `security/spikes` (commit bb95bd40, facts checked 2026-07-16). It
+> predates 0.5.0 and is not maintained. File and line citations, and statements
+> about what is in the tree, pending, or added in "this PR", describe that
+> moment. For the current state read the [threat model](../threat-model.md) and
+> [enforcement coverage](../enforcement-coverage.md).
+
 Status: research spike, go/no-go decision record. No `native-yara` feature, no
 `yara-x` dependency, no scanner is added in this PR. The closure checks below were
 run against throwaway crates in scratch space, never committed.

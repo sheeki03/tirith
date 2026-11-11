@@ -124,7 +124,7 @@ table is the actual implementation, not a wish list.
 | Signal | Set by | Trust class | Variant produced |
 |---|---|---|---|
 | `TIRITH_INTEGRATION` env var | The hook the upstream agent installed (e.g. `claude-code`, `cursor`, `vscode`) | Caller (operator-trust) | `Agent { tool, version? }` |
-| `TIRITH_INTEGRATION_VERSION` env var | Companion to `TIRITH_INTEGRATION` — optional, not yet emitted by any hook | Caller | populates the `version` slot on `Agent` |
+| `TIRITH_INTEGRATION_VERSION` env var | Companion to `TIRITH_INTEGRATION`, optional. No agent adapter sets it. The 0.5.0 shell hooks (bash, zsh, fish, PowerShell, nushell) export it with the loaded shell hook's version, so an agent adapter started from a hooked terminal inherits that value | Caller | populates the `version` slot on `Agent`; when inherited, the slot holds the shell hook's version, not the agent's |
 | MCP `initialize.clientInfo` | The MCP client connecting to `tirith mcp-server` | Caller (caller-claimed) | `Mcp { client_name, client_version? }` |
 | Gateway path (built-in) | The fact that `tirith gateway` is the process running | Built-in (tirith chose this code path) | `Gateway` |
 | CI provider env (`GITHUB_ACTIONS`, `BUILDKITE`, `CIRCLECI`, …) | The CI runner | Caller (env is operator-trust) | `Ci { provider }` |
@@ -506,10 +506,14 @@ per-site pins.
 
 When the env-bypass policy (`allow_bypass_env` /
 `allow_bypass_env_noninteractive`) honors a `TIRITH=0` invocation, the
-bypass branch in `cli/check.rs`, `cli/gateway.rs`, and
+bypass branch in `cli/check.rs` and
 `mcp/tools.rs::call_check_command` audits the raw verdict and skips
 `post_process_verdict` — which means `apply_agent_rules` does not run,
-and `agent_rules.deny` does not enforce. The bypass is consistent with
+and `agent_rules.deny` does not enforce. The gateway has no such branch in
+0.5.0: it analyzes guarded calls with
+`engine::analyze_without_bypass_returning_policy` and never honors `TIRITH=0`
+(pinned by `gateway_analysis_context_is_noninteractive_and_cannot_honor_bypass`
+in `cli/gateway.rs`). The bypass is consistent with
 how `TIRITH=0` overrides every other detection, but operators writing
 `agent_rules.deny` may reasonably expect `deny` to be more authoritative
 than the user's interactive bypass. Surfaced as PR #120 wave-end review
@@ -520,8 +524,8 @@ Pinned by the regression test
 `agent_rules_deny_skipped_under_tirith_bypass_today` in
 `crates/tirith/tests/cli_integration.rs`. Revisit in M5 after operator
 feedback — flipping the contract means running `apply_agent_rules` even
-on the bypass branch at all three sites (`cli/check.rs`,
-`cli/gateway.rs`, `mcp/tools.rs::call_check_command`) and updating the
+on the bypass branch at both sites (`cli/check.rs`,
+`mcp/tools.rs::call_check_command`) and updating the
 existing bypass-contract pin
 `bypass_path_records_single_audit_entry_with_agent_origin`.
 

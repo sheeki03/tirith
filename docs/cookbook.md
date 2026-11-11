@@ -53,7 +53,7 @@ organization, or incident restrictions. Re-check the command after changing poli
 ## 1. Strict Organization (Fail Closed, No Bypass)
 
 ```yaml
-# .tirith/policy.yaml (repo root)
+# $TIRITH_POLICY_ROOT/.tirith/policy.yaml (org policy), or ~/.config/tirith/policy.yaml
 fail_mode: closed
 allow_bypass_env: false
 severity_overrides:
@@ -61,7 +61,7 @@ severity_overrides:
   plain_http_to_sink: CRITICAL
 ```
 
-All findings block execution. No bypass mechanism. Shortened URLs and plain HTTP are escalated.
+A command Tirith cannot evaluate is blocked instead of allowed. No bypass mechanism. Shortened URLs and plain HTTP are escalated, so they block; other findings keep their default action. A repository's own `.tirith/policy.yaml` can set `fail_mode: closed` and `allow_bypass_env: false`, but its `severity_overrides` are ignored.
 
 ## 2. Personal Developer (Defaults + Allowlist)
 
@@ -84,7 +84,7 @@ Default severity mappings. Allowlisted URLs skip analysis.
 
 ```bash
 # In CI pipeline
-tirith check --non-interactive --format json -- curl https://example.com/setup.sh | bash
+tirith check --non-interactive --format json -- 'curl https://example.com/setup.sh | bash'
 EXIT=$?
 if [ $EXIT -eq 1 ]; then
   echo "BLOCKED by tirith" >&2
@@ -97,13 +97,13 @@ Non-interactive mode never prompts. JSON output for machine parsing.
 ## 4. Docker-Focused (Escalate Docker Rules)
 
 ```yaml
-# .tirith/policy.yaml
+# ~/.config/tirith/policy.yaml (severity_overrides in a repository's .tirith/policy.yaml are ignored)
 severity_overrides:
   docker_untrusted_registry: CRITICAL
-  docker_tag_latest: HIGH
+  dockerfile_unpinned_image: HIGH
 ```
 
-All Docker-related findings are escalated. Other rules use default severity.
+These two Docker findings are escalated from their default Medium. Other rules use default severity.
 
 ## 5. Learning Mode (All Low Severity)
 
@@ -119,7 +119,7 @@ severity_overrides:
   confusable_domain: LOW
 ```
 
-Everything becomes a LOW-severity warning. Nothing blocks. Useful for onboarding.
+The listed rules drop to LOW and no longer block. A LOW finding is hidden at the default `paranoia` and shown as a warning at `paranoia: 3` or higher. Rules that are not listed keep their default severity and can still block. Useful for onboarding.
 
 ## 6. cargo-vet (Rust Supply-Chain Audit)
 
@@ -128,17 +128,19 @@ hasn't configured [cargo-vet](https://mozilla.github.io/cargo-vet/). The
 `vet_not_configured` rule fires at LOW severity by default. To escalate:
 
 ```yaml
-# .tirith/policy.yaml
+# ~/.config/tirith/policy.yaml
 severity_overrides:
   vet_not_configured: HIGH
 ```
 
-To suppress it (e.g. for non-Rust repos):
+To suppress it (e.g. for non-Rust repos), lower its severity instead. The
+allowlist matches URLs, not rule IDs, so it cannot suppress this rule, and a
+repository's `.tirith/allowlist` is ignored:
 
-```
-# ~/.config/tirith/allowlist
-# or .tirith/allowlist
-vet_not_configured
+```yaml
+# ~/.config/tirith/policy.yaml
+severity_overrides:
+  vet_not_configured: INFO
 ```
 
 ## 7. vet (getvet.sh) — Safe Pipe-to-Shell
@@ -295,7 +297,7 @@ tirith trust add get.docker.com --broad --rule curl_pipe_shell
 tirith trust list                 # see every entry, its scope, and its TTL
 tirith trust explain get.docker.com
 tirith trust diff                 # what changed since last time
-tirith trust gc --expired         # remove entries whose TTL has passed
+tirith trust gc                   # remove entries whose TTL has passed
 ```
 
 Use `--permanent` if an entry genuinely should never expire, and `--reason`

@@ -4,8 +4,11 @@
 
 If you discover a security vulnerability in tirith, please report it responsibly:
 
-1. **GitHub Security Advisory** (preferred): Use the [Security tab](../../security/advisories/new) to create a private advisory
-2. **Email**: Send details to the maintainers listed in the repository
+1. **GitHub Security Advisory** (preferred): Use the [Security tab](https://github.com/sheeki03/tirith/security/advisories/new) to create a private advisory
+2. **Email**: security@tirith.sh
+
+The repository-level [security policy](../SECURITY.md) is the authoritative
+copy. It also covers data handling and release verification.
 
 Please include:
 - Description of the vulnerability

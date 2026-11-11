@@ -35,7 +35,7 @@ a standalone CLI for scanning, scoring, auditing, and AI agent security.
 eval "$(tirith init --shell zsh)"              # zsh
 eval "$(tirith init --shell bash)"             # bash
 tirith init --shell fish | source              # fish
-tirith init --shell nushell | source           # nushell
+tirith init --shell nushell                    # nushell: add the printed lines to config.nu (warn-only, cannot block)
 
 # Check a command before running it
 tirith check -- 'curl https://example.com/install.sh | bash'
@@ -63,7 +63,7 @@ tirith uses a three-tier analysis pipeline:
 | **path** | Non-ASCII paths, homoglyph filenames, double-encoding attacks |
 | **credential** | Exposed tokens, API keys in command arguments |
 
-Additional categories (codefile, configfile, environment, rendered, threatintel,
+Additional categories (code, config, environment, rendered, threatintel,
 custom) are also available.
 
 List all rules: `tirith explain --list`
@@ -118,13 +118,14 @@ tirith fetch https://example.com/install.sh
 tirith fetch --format json https://example.com/install.sh
 ```
 
-### Download and execute safely (Unix)
+### Download and execute safely (inspection on Unix; live execution on Linux)
 
 Download a script, analyze it, and optionally execute with SHA-256
-verification and receipt logging:
+verification and receipt logging. Live execution is Linux-only; every other
+host refuses it before download, so use `--no-exec` there:
 
 ```bash
-tirith run https://get.example-tool.sh
+tirith run https://get.example-tool.sh                  # live execution: Linux only
 tirith run --no-exec https://example.com/install.sh     # analyze only
 tirith run --sha256 abc123... https://example.com/install.sh
 ```
@@ -243,7 +244,7 @@ Manage the threat intelligence database for enhanced detection:
 
 ```bash
 tirith threat-db update          # download/update threat DB
-tirith threat-db update --force  # force re-download
+tirith threat-db update --force  # re-download even if up to date; bypasses rollback protection
 tirith threat-db status          # show DB age and entry counts
 ```
 
@@ -274,7 +275,7 @@ are evidence surfaces, not enforcing package-firewall backends.
 ```bash
 tirith task check --file task-envelope.json       # diagnostic; executes nothing
 tirith capsule run --preset untrusted-project \
-  --project ./untrusted -- /bin/sh -c 'make test' # x86_64 Linux only
+  --project ./untrusted -- /bin/sh -c 'make test' # x86_64 or AArch64 Linux only
 tirith browser audit --browser chrome
 tirith pkg attest-npm --project .
 tirith attest build --help
@@ -282,7 +283,7 @@ tirith attest deployment --help
 ```
 
 These commands have command-specific evidence exit codes; do not assume the
-`tirith check` 0/1/2/3 ladder. See `docs/compatibility.md`.
+`tirith check` 0/1/2/3/4 ladder. See `docs/compatibility.md`.
 
 ### Policy management
 
@@ -332,8 +333,15 @@ and `attest` define command-specific codes in `docs/compatibility.md`.
 |------|--------|---------|
 | 0 | Allow | Safe — no findings or all findings are informational |
 | 1 | Block | Dangerous — execution prevented |
-| 2 | Warn | Suspicious — execution allowed, user notified |
-| 3 | WarnAck | Warn with strict acknowledgement required |
+| 2 | Warn | Suspicious: user notified; execution allowed only when `requires_approval` is false |
+| 3 | WarnAck | Warn with strict acknowledgement required; do not run without the user's acknowledgement |
+| 4 | Deferred block | Blocked pending review; only with `--defer` (or `TIRITH_DEFER=1`) in a no-TTY context |
+
+`tirith check --format json` always carries a boolean `requires_approval`. When
+it is true (an approval rule matched, or a warning needs acknowledgement), the
+command must not run until the user approves it, whatever the exit code. A
+missing or non-boolean value is not permission. An unknown option before `--`
+is a usage error: it also exits 2 and prints nothing on stdout.
 
 ### Output streams per command
 
@@ -393,7 +401,7 @@ Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 |---------|---------|
 | `check` | Analyze a command before execution |
 | `paste` | Check pasted content for threats |
-| `run` | Safely download and execute a script (Unix) |
+| `run` | Inspect a remote script (Unix); live execution is Linux-only |
 | `score` | Risk-score a URL |
 | `diff` | Compare a URL against known-good patterns |
 | `scan` | Scan files for hidden content and config poisoning |
@@ -417,7 +425,7 @@ Run manually: `tirith mcp-server` (JSON-RPC over stdio)
 | `mcp` | Lock, verify, diff, and explain repository MCP configuration |
 | `mcp-server` | Run as MCP server (JSON-RPC over stdio) |
 | `task` | Diagnostic untrusted-task assessment (preview) |
-| `capsule` | Fail-closed untrusted-project containment on supported x86_64 Linux |
+| `capsule` | Fail-closed untrusted-project containment on supported x86_64 and AArch64 Linux |
 | `browser` | Native-messaging setup and Chromium-family extension audit |
 | `attest` | Point-in-time build and deployment receipts |
 | `daemon` | Background daemon for faster checks |

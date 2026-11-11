@@ -1,9 +1,10 @@
 # Runtime containment capsule
 
 The capsule is tirith's OS containment layer. It runs a tirith-launched
-child process (a downloaded script, a previewed command, an upstream MCP server,
-or a package install) inside a real OS sandbox, and it is honest about exactly
-what it managed to enforce on the current host.
+child process (a downloaded script, a previewed command, or an upstream MCP
+server) inside a real OS sandbox, and it is honest about exactly what it managed
+to enforce on the current host. In this release that sandbox is delivered on
+Linux only; see the per-platform note under the table below.
 
 This is the one narrow exception to tirith's "no runtime sandboxing" non-goal
 (see `docs/threat-model.md`). It is per-invocation and applies only to processes
@@ -14,9 +15,9 @@ tirith itself launches, never to arbitrary shell commands.
 | Surface | Flag | Network | Fail mode |
 | --- | --- | --- | --- |
 | `tirith run` (live execution is Linux-only; `--no-exec` is inspection-only on Unix) | default for every live run (`--capsule` remains accepted) | deny-all | fail closed |
-| `tirith temp-run` | `--capsule` | deny-all | best-effort (runs uncontained if no backend, and says so) |
-| `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed |
-| `tirith pkg install` (execution currently disabled on every host) | always | deny-all | refuses before resolver, quarantine, checkpoint, or package execution |
+| `tirith temp-run` | `--capsule` | deny-all | best-effort: contained on Linux; runs uncontained on macOS and Windows, and says so |
+| `tirith gateway run` | `--capsule` (or the `secure` gateway profile) | deny-all | fail closed: contained on Linux; refuses on macOS and Windows |
+| `tirith pkg install` (execution currently disabled on every host) | none (no flag enables it) | none (nothing is launched) | refuses before resolver, quarantine, checkpoint, or package execution |
 | `tirith capsule run` (native x86_64 and AArch64 Linux with usable Landlock and seccomp) | `--preset untrusted-project` | deny-all (no domain allow-listing is offered) | fail closed; hosts missing required controls refuse before anything is copied or spawned |
 
 "Fail closed" means: if this host's backend cannot enforce the containment the
@@ -24,6 +25,26 @@ surface requires, the command refuses to run rather than running the child
 uncontained. The `temp-run` surface is the only best-effort one, because it is
 explicitly a filesystem-impact preview rather than a security boundary; with
 `--capsule` it hardens the run where it can and reports honestly when it cannot.
+
+Per platform, this is what happens today. `temp-run --capsule` and the contained
+gateway both request the locked-down specification, which carries all six
+resource ceilings. A backend that cannot deliver every requested control reports
+degraded coverage, and neither non-Linux backend can: macOS has no enforceable
+memory, process-count, combined-output, or wall-clock ceiling, and Windows has no
+open-files or combined-output ceiling.
+
+- **Linux** enforces. The parent supervisor owns combined output and wall clock,
+  so the specification is fully delivered where Landlock and seccomp are usable.
+  A Linux host without them is degraded like the platforms below.
+- **macOS** (`seatbelt`): `temp-run --capsule` always runs the command
+  uncontained and prints a `DEGRADED` line (`"capsule_contained": false` in
+  JSON). `gateway run --capsule` and the `secure` gateway profile always refuse
+  to launch the upstream, naming `resource_limits` as a missing control.
+- **Windows** (`appcontainer`): `temp-run --capsule` always runs uncontained and
+  says so, for the same reason. The gateway always refuses, because no contained
+  launch with piped stdio exists there.
+
+So no shipped surface contains anything on macOS or Windows in this release.
 
 `tirith pkg install pip` currently refuses with `private_input_execution_unqualified`
 on every host. The private named-input backend cannot guarantee unchanged package
@@ -36,9 +57,12 @@ removed, so no code path can start a package with private named inputs.
 
 This restriction applies to contained package execution. `tirith package inspect`
 and `tirith pkg verify-env` remain available; the latter verifies an existing
-environment without launching pip. `tirith pkg approve` checks its native
-approval authority and then refuses with the same reason; it records no
-approval, because nothing could redeem one. Ordinary capsules and command
+environment without launching pip. `tirith pkg approve` first checks its native
+approval authority, whose prerequisites exist only on x86_64 Linux. A host
+without them refuses at that check (phase `native_authority`) with that check's
+own reason. Where the authority is available, approve validates its arguments
+and then refuses with the same reason as `pkg install`. In every case it records
+no approval, because nothing could redeem one. Ordinary capsules and command
 protection retain their existing platform and coverage requirements.
 
 ### The untrusted-project preset
@@ -84,8 +108,10 @@ every host while implying a capability the product does not have. Dependencies
 must be vendored or installed by a separate trusted transaction; this preset
 performs no network dependency installation.
 
-Every invocation writes one signed, content-addressed receipt, including a
-refusal. It records the argv DIGEST (never the argv), the project input and
+Every invocation writes one content-addressed receipt, including a refusal. The
+receipt is ed25519-signed when this installation has an audit signing key and
+unsigned otherwise, and the run prints which. It records the argv DIGEST (never
+the argv), the project input and
 output tree digests, the backend, requested versus achieved coverage, the
 effective limits, the child's exit status separately from Tirith's own decision,
 the termination reason, a bounded file diff, whether an ephemeral copy of the
@@ -151,9 +177,14 @@ adopting the profile.
 | Platform | Backend | Mechanism |
 | --- | --- | --- |
 | Linux | `landlock-seccomp` | Landlock filesystem confinement + a seccomp policy that grants no socket-creation syscalls, applied in a single-threaded re-exec launcher before `execve` |
-| macOS | `seatbelt` | a `sandbox-exec` SBPL profile (`deny default` + an allow-list, `deny network*` except the loopback broker), plus an environment scrub and resource limits applied by the launcher |
+| macOS | `seatbelt` | a `sandbox-exec` SBPL profile (`deny default` + an allow-list, `deny network*` except the loopback broker), plus an environment scrub and CPU and open-files limits applied by the launcher |
 | Windows | `appcontainer` | an AppContainer profile + package SID, ACL grants on the allowed roots, a suspended `CreateProcessW` inside the container with no inherited handles, and a kill-on-close Job Object with resource caps |
 | any other | `noop` | contains nothing and never claims any coverage; enforcing surfaces always fail closed |
+
+The `seatbelt` and `appcontainer` rows describe mechanisms that are implemented,
+but neither backend can deliver every resource ceiling of the locked-down
+specification, so no shipped surface runs a child under them in this release.
+See [Where it applies](#where-it-applies).
 
 ## The honesty contract
 
@@ -188,8 +219,8 @@ every resolved IP validated (private / loopback / cloud-metadata rejected), a
 pinned destination IP with no re-resolution, a pinned TLS SNI, and caps on
 connections / bytes / handshake / idle. No current backend wires a verified
 raw-socket block to the broker yet, so `domain_proxy_enforced` is false
-everywhere today and any allow-listed-egress spec fails closed. Installs need no
-network at all, so they use `deny-all` and are unaffected.
+everywhere today and any allow-listed-egress spec fails closed. Every shipped
+surface uses `deny-all` and is unaffected.
 
 ## Environment scrubbing
 
@@ -208,11 +239,19 @@ the benign config it needs.
 
 ## Checking coverage on your host
 
-`tirith doctor` reports the capsule backend selected for your platform and the
-per-capability coverage it can enforce, including whether deny-all containment is
-enforceable (so enforcing surfaces would work rather than fail closed) and
-whether domain egress is enforceable. It also lists any optional external
-containment helpers found on `$PATH`.
+`tirith doctor` reports the capsule backend selected for your platform, whether
+that backend alone can fully enforce the locked-down deny-all specification, and
+whether domain egress is enforceable. `tirith doctor --format json` also carries
+the per-capability flags. It also lists any optional external containment helpers
+found on `$PATH`.
+
+Read the deny-all line with care. No backend enforces the combined-output
+ceiling by itself, so doctor currently reports deny-all containment as not fully
+enforceable on every host, with the text "enforcing surfaces fail closed". On
+macOS and Windows that matches what the surfaces do. On Linux it does not
+predict them: `tirith run`, `tirith capsule run`, and the contained gateway hand
+combined output and wall clock to the parent supervisor and do run contained
+where Landlock and seccomp are usable.
 
 ## Optional external helpers
 

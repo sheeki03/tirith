@@ -86,9 +86,11 @@ keeps your later edits.
 
 ## Limits
 
-- Profiles change rule actions and severities only. They do not change named
-  `scan.profiles`, which integrations are set up, or how output looks. The
-  legacy `paranoia` field is held at 1 by all three profiles.
+- Profiles set only the fields behind the table above: rule severities and
+  actions, `fail_mode`, `allow_bypass_env`, `allow_bypass_env_noninteractive`,
+  `strict_warn` and, for Strict, `scan.require_complete`. They do not change
+  named `scan.profiles`, which integrations are set up, or how output looks.
+  The legacy `paranoia` field is held at 1 by all three profiles.
 - Every profile keeps unrelated detection, repository tightening, organization
   and remote policy restrictions, and incident restrictions. A finding that is
   already blocked stays blocked and cannot become approvable.

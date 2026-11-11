@@ -39,7 +39,7 @@ tirith trust expiry GRANT_ID --ttl 1h
 tirith trust revoke GRANT_ID
 tirith trust remove PATTERN --rule RULE
 tirith trust diff                  # what changed in the trust set since the last diff
-tirith trust gc --expired          # prune expired grants and old revocations
+tirith trust gc                    # prune expired grants and old revocations (--expired is accepted and changes nothing)
 ```
 
 - `revoke` keeps a revoked record and reports broader grants that still apply.

@@ -17,7 +17,10 @@ transition below:
 2. Resolve or explicitly defer every item under `[Unreleased]` → `Known issues`.
 3. Run the required Linux, macOS, and Windows matrices on that exact tree,
    including native x86_64/AArch64 Linux containment and host-shaped hook tests.
-4. Complete the Web3/task and ThreatDB v2 rollout playbooks below.
+4. Work through the Web3/task and ThreatDB v2 rollout playbooks below. The
+   ThreatDB v2 playbook is staged across releases: its Phase 4 cutover is a
+   separate decision gated by `ENABLE_THREATDB_V2`, not a release requirement
+   (0.5.0 shipped with v2 publication disabled).
 5. Change the workspace version to `<VERSION>` in BOTH root `Cargo.toml`
    lines (`[workspace.package] version` and the `[workspace.dependencies]
    tirith-core` version), regenerate `Cargo.lock` AND `fuzz/Cargo.lock` (a

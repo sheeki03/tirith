@@ -270,9 +270,10 @@ separate, and narrower:
 
 - an interactive shell hook in a blocking mode refuses to run the line;
 - the MCP gateway refuses to forward the call;
-- a tirith-owned transition (`pkg approve`, `pkg install`, `install`, `run`,
-  `install url`, a tirith config write, the capsule preset) refuses before its
-  own irreversible step.
+- a tirith-owned transition (`install`, `run`, `install url`, a tirith config
+  write, the capsule preset) refuses before its own irreversible step.
+  `pkg install` and `pkg approve` are not in this list: in 0.5.0 they refuse
+  on every host whatever the findings are.
 
 A non-interactive shell, a direct `exec`, a program linking `tirith-core` as a
 library, and an agent that never loaded the hook are not covered. `TIRITH=0`

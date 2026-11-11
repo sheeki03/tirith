@@ -91,9 +91,11 @@ every change in detail.
   command in an interactive shell.
 - **Known verdicts are never fail-open.** Adapters deny a block (even when its
   output is lost), a required acknowledgement (exit 3) and a deferred block
-  (exit 4), also with `TIRITH_FAIL_OPEN=1`, which now covers only checker
-  errors. A warning that `TIRITH_HOOK_WARN_ACTION` gates (`ask`, `deny` or an
-  unrecognized value) stays denied when its output is damaged. The Cursor,
+  (exit 4), also with `TIRITH_FAIL_OPEN=1`, which now covers only the cases
+  where no verdict exists: a checker error, or hook input the adapter cannot
+  parse or that carries no command. A warning that `TIRITH_HOOK_WARN_ACTION`
+  gates (`ask`, `deny` or an unrecognized value) stays denied when its output
+  is damaged. The Cursor,
   VS Code and Windsurf adapters no longer import Python modules from the
   project directory.
 - **A warning is shown, not approved.** Claude Code and VS Code receive the
@@ -103,7 +105,8 @@ every change in detail.
   VS Code, Copilot CLI, Cursor) and denies with guidance elsewhere.
 - **Malformed or oversized hook traffic is denied.** The VS Code, Cursor,
   Windsurf and OpenClaw adapters deny a shell call whose command is missing or
-  not a string; before, they skipped the check or checked the wrong text. The
+  not a string (unless `TIRITH_FAIL_OPEN=1` is set); before, they skipped the
+  check or checked the wrong text. The
   Pi, Prime Agent, OMP and OpenClaw guards read checker responses up to 16 MiB
   and deny anything larger, even with `TIRITH_FAIL_OPEN=1`. On Linux and
   macOS, an adapter whose pinned Python has moved or been removed denies

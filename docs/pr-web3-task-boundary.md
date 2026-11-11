@@ -1,5 +1,13 @@
 # PR: add a Web3 and provenance-aware execution boundary
 
+> **Historical record.** This is the description of the
+> `codex/web3-task-boundary` pull request. It predates 0.5.0 and is not
+> maintained. Statements about what is unreachable, deferred, pending, or done
+> by "this branch" or "this PR" describe that moment, and some no longer hold.
+> For the current state read [enforcement coverage](enforcement-coverage.md),
+> the [Web3 command guard](security/web3-command-guard.md), and the
+> [threat model](threat-model.md).
+
 Branch `codex/web3-task-boundary`. This file is the PR description; copy it into
 the pull request body when the PR is opened.
 

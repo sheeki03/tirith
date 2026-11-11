@@ -28,6 +28,10 @@ client (Phase 3) must precede publishing any v2 data (Phase 4), so that by the
 time v2 exists on the feed, the clients that select it can already read it, and
 the clients that cannot still have v1.
 
+Tirith 0.5.0 is in Phase 3. Clients since 0.4.0 carry the v1+v2 reader, the
+feed serves v1 only, and v2 publication is not enabled. One visible effect is
+that [source ages](threatdb-freshness.md) stay unavailable until Phase 4.
+
 ## Safety properties
 
 These are implemented in DB-B and are what make the staged rollout safe:
@@ -68,7 +72,8 @@ exists before flipping the publish gate.
 
 ## Phase 4 publish and rollback
 
-When the gate is met, DB-D adds the v2 publish step to the release workflow: the
+The v2 publish steps already exist in `.github/workflows/threatdb.yml` and are
+skipped while the gate is off. When the gate is on, the
 compiler builds both immutable assets, signs the generation index over their
 canonical metadata, and stages the index as the final local commit point. The
 workflow uploads the v2 asset first and overwrites `threatdb-index-v2.json` only

@@ -1,15 +1,21 @@
 # LSP analysis profiles (M14)
 
 `tirith lsp` runs a **Language Server** over stdin/stdout so an editor extension
-can surface tirith diagnostics inline as you edit. The server reads only the
-editor's in-memory document text — it never re-reads the file from disk and
-never reaches the network.
+can surface tirith diagnostics inline as you edit. The server analyzes only the
+editor's in-memory document text and never re-reads the document from disk. It
+does read your tirith policy from disk (the Log file profile reads it offline,
+for custom injection seeds only). Two opt-in settings let it contact the
+network: a configured remote policy server, which policy resolution for the
+other three profiles can fetch from, and a canary created with
+`--callback-url`, whose callback is sent when a buffer contains that token.
 
 When a document is opened or changed, the server:
 
 1. Derives the file path from the document URI and routes it to an **analysis
    profile** by file type (`profile_for_path`). An unrecognised file type gets
    **zero diagnostics** (the server clears any it had previously published).
+   A buffer over 10 MiB is not analyzed, whatever its file type; see
+   [Limitations](#limitations-v1).
 2. Runs the engine over the buffer once per **scan context** the profile names
    (`contexts_for`), **unions** the findings, and applies the profile's
    **retain** allow-set (`retains`) — keeping only the diagnostics that make
@@ -21,9 +27,11 @@ When a document is opened or changed, the server:
 3. Maps each retained finding to one LSP diagnostic (severity, message, the
    rule-id as `code`, source `tirith`, and a range — see below).
 
-`tirith lsp` adds **no new detection rules**. Every diagnostic it emits comes
+`tirith lsp` adds **no new detection rules**. Every finding it reports comes
 from a rule that already ships and is reachable today via the named context (or,
-for the Log file profile, via the `analyze_output` output firewall).
+for the Log file profile, via the `analyze_output` output firewall). The only
+other diagnostics are the "NOT scanned" notices under
+[Limitations](#limitations-v1), which carry no rule `code`.
 
 ## Profiles
 
@@ -136,6 +144,7 @@ Severities map as: Critical / High → `Error`, Medium → `Warning`, Low →
 | **AI-config drift is out of scope**  | The drift rules `ai_config_hidden_instruction_added` / `ai_config_tool_use_escalation` compare a file against a last-known-safe **snapshot** (`tirith ai diff`). They cannot fire on a single in-editor buffer with no snapshot to diff against, so the LSP never produces them (they remain in the AI-config retain set only so a future snapshot-aware client keeps them if present). |
 | **Whole-document ranges**            | As above — findings without byte-offset evidence are reported against the whole document rather than a precise span.                                                                                    |
 | **No quick-fixes / code actions**    | v1 publishes diagnostics only. It does not offer code actions, hovers, or completions.                                                                                                                  |
+| **10 MiB analysis cap**              | A buffer over 10 MiB (the file scanner's `MAX_FILE_SIZE`) is not scanned. The server publishes one Information-level "NOT scanned" notice at the first character instead of an empty result, so the file does not look clean. An internal analysis error publishes the same kind of notice at Warning level. |
 
 > **Note:** Log-file diagnostics are **no longer** a v1 limitation. A `.log`
 > buffer is captured command output, so the server now analyzes it through the

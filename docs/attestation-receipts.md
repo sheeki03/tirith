@@ -124,13 +124,16 @@ subcommand's help says so.
 | Trust | Effect on status |
 |---|---|
 | `verified` | `clean` |
-| `unsigned` | `clean` (the installation had no audit key when the receipt was made) |
+| `unsigned` | `clean` (the receipt carries no signature, and the installation checking it has no audit key configured) |
 | `uncheckable` | `partial` (a signature is present but this installation has no key to check it) |
 | `rejected` | `mismatch` |
 
 A STRIPPED signature is `rejected`, not `unsigned`, because stripping is
 otherwise the cheapest forgery available: `signature_present` is inside the
 content address on purpose, so removing the signature changes the receipt id.
+An installation that has an audit key also treats every unsigned receipt as
+stripped, so a receipt made on a machine with no key is `rejected` when it is
+checked on a machine that signs.
 
 ## Not anchored in the audit chain
 

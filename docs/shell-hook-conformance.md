@@ -69,6 +69,16 @@ that every component of a compound line executed. PowerShell deliberately has
 PSReadLine preflight interception without strict receipts because mutable
 history is not accepted as execution proof.
 
+When zsh or fish cannot negotiate protocol v3 (an older pinned binary, missing
+helper executables, or a rejected registration), the hook says so at load,
+sets `TIRITH_STATUS` to `degraded`, and runs its legacy check flow. Legacy
+checks still stop a blocked command, but the hook, not Tirith, runs the
+approval and acknowledgement prompts. A checker exit code other than 0 to 3
+is reported as `unexpected exit code ... running unprotected`, and the command
+runs. The PowerShell Enter handler does the same on an unexpected exit code.
+Under protocol v3 a malformed response blocks the command instead, and bash
+enter mode degrades to preexec.
+
 Invariant (f) is the safety floor. A hook is allowed to *fail* — terminals are
 varied and hostile environments exist — but it is never allowed to fail
 *silently*. If blocking protection is lost, the user has to be told so they can
@@ -213,7 +223,11 @@ enter-vs-preexec by a version gate. The gate is **capability-based**:
   there. The bash hook itself reads the cache file at startup (a single
   small-file read, which *is* init-safe): it selects enter mode only when the
   cache proves enter delivery works for the running bash, and otherwise falls
-  back to the safe default, preexec.
+  back to the safe default, preexec. Two conditions select preexec before the
+  cache is consulted: a persisted safe-mode flag from an earlier enter-mode
+  failure, and an SSH session (`SSH_CONNECTION`, `SSH_TTY` or `SSH_CLIENT`
+  set). An explicit `TIRITH_BASH_MODE` overrides all of these. Preexec is
+  warn-only unless `TIRITH_BASH_PREEXEC_ENFORCE=1` is set.
 
 The harness starts every test from an empty capability cache, so the
 capability-correct behaviour there is the fallback to preexec. Its bare PTY is

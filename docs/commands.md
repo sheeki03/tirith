@@ -42,7 +42,7 @@ project review, interruptions, upgrade and removal.
 | `tirith status` | "Am I protected?": protection mode, hook health, whether this terminal's loaded hook is current, active policy, threat-DB freshness; exits non-zero when protection is provably reduced (`--json`) |
 | `tirith doctor` | Diagnose install / hooks / policy. `--fix` auto-fixes, `--compat` is a static shell/terminal report, `--quick` is a pollable snapshot, and `--verify-shell` gives the actual caller-shell challenge. Use `--bundle --bundle-preview` to review selected diagnostics before private export (`--bundle-incident`, `--bundle-operation`) |
 | `tirith prompt-status` | One-line protection and active-context indicator for your prompt (`--short`, `--json`; 30s cache) |
-| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review, copyable upgrade commands and a guarded ThreatDB refresh (`--no-browser --json` for headless access; each printed URL signs in once and expires after 2 minutes); `export` retains the static report route |
+| `tirith dashboard` | Open authenticated loopback controls for personal setup, protection, exceptions, history, project review, copyable upgrade commands and a guarded ThreatDB refresh (`--no-browser --json` for headless access; each printed URL signs in once and expires after 2 minutes); `export` retains the static report route, and `serve` serves that report on a loopback-only HTTP server with an ephemeral token |
 | `tirith warnings` | Session warnings (`--summary` for shell exit hooks, `--clear`, `--format json`) |
 | `tirith receipt {last,list,verify}` | Track and verify scripts run through `tirith run` |
 | `tirith logs {scan,summarize,redact}` | Review agent / CLI logs for injection seeds, secrets, and escape bytes (`summarize --safe-for-agent`) |
@@ -54,7 +54,7 @@ project review, interruptions, upgrade and removal.
 |---------|-------------|
 | `tirith init` | Print the shell hook for your profile (`--prompt-status` adds the prompt snippet) |
 | `tirith onboard` | Guided first-run wizard: detect the environment and recommend the personal Balanced profile, or a legacy template with `--team` / `--ai-agent-heavy` (`--apply`) |
-| `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--dry-run`, `--update-configs`) |
+| `tirith setup <tool>` | One-command setup for 19 named hosts: claude-code, cline, codex, copilot-cli, continue, cursor, fx, gemini-cli, grok-build, kiro, omp, openclaw, opencode, openhands, pi-cli, prime-agent, roo-code, vscode, and windsurf (`--scope`, `--with-mcp`, `--install-zshenv`, `--dry-run`, `--update-configs`, `--force`). Upgrading Tirith does not rewrite installed adapters: `tirith doctor` marks outdated ones STALE, and `tirith setup <host> --scope <scope> --force` refreshes each one |
 | `tirith setup recommended` | Apply one personal shell/profile plan (`--scope user --shell bash --profile balanced`); `--agent claude-code` also configures the Claude Code Bash hook in the same undoable plan (macOS and Linux); `--dry-run` writes nothing and `--plan-only` saves a review for later apply |
 | `tirith setup shell` | Set up, repair (`--force`) or remove owned startup blocks (`--remove`) for an explicit `--shell`; activation and verified blocking are separate |
 | `tirith install <backend> <args>` | Recorded, risk-analyzed install across npm / pip / cargo / apt / brew / dnf / yum / pacman / scoop / docker / go / url (`--online`, `--no-exec`, `--yes`, `--sha256`) |
@@ -62,7 +62,7 @@ project review, interruptions, upgrade and removal.
 | `tirith browser {host,install-extension}` | Install the Chrome native-messaging host that records clipboard provenance |
 | `tirith browser audit` | Read-only integrity audit of installed Chromium-family extensions: tree digests, permissions, execution surfaces, install class, provenance, and drift against a baseline receipt (`--browser`, `--profile`, `--baseline`, `--write-baseline`) |
 | `tirith devcontainer {guard,inject}` / `codespaces {setup,inject}` | Guard container operations and inject tirith into `devcontainer.json` |
-| `tirith activate <key>` / `tirith license` | Activate a commercial license key, or show and manage license status |
+| `tirith activate <key>` / `tirith license` | Activate a commercial license key, or show and manage license status (`license deactivate`, `license refresh`) |
 
 ## Policy, trust & rule authoring
 
@@ -70,7 +70,7 @@ project review, interruptions, upgrade and removal.
 |---------|-------------|
 | `tirith policy {init,validate,test,tune,effective}` | Scaffold (`--template`), validate, dry-run, suggest from audit, and inspect policy. `effective` defaults to a local-only diagnostic; `effective --runtime` uses the enforcement resolver, including configured remote policy and separate overlays ([coverage](internals.md#effective-policy-snapshot)) |
 | `tirith policy {profile,setting,operation,simulate}` | Preview/apply typed personal changes, inspect/retry/cancel/undo saved operations, and compare effective decisions for a captured command without executing it |
-| `tirith trust {add,expiry,revoke,migrate,list,explain,diff,remove,gc,last,from-last-trigger,audit}` | Manage [trust grants](trust-grants.md) (narrow scope, 30-day TTL by default; `add` needs `--rule` or explicit `--all-rules`; `--scope project` binds one checkout); `migrate --scope user` moves legacy entries; `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
+| `tirith trust {add,expiry,revoke,migrate,list,explain,diff,remove,gc,prune,last,from-last-trigger,audit}` | Manage [trust grants](trust-grants.md) (narrow scope, 30-day TTL by default; `add` needs `--rule` or explicit `--all-rules`; `--scope project` binds one checkout); `migrate --scope user` moves legacy entries; `prune` is an alias for `gc`; `from-last-trigger` suggests targeted trust; only explicit `--apply` writes it, and other restrictions remain |
 | `tirith policy rollout {prepare,show,activate,undo}` | Measure a profile against representative commands, then activate or undo it as one reviewed operation ([rollouts](policy-rollouts.md)) |
 | `tirith policy team {connect,disconnect,status,enrollment,rollout}` | Optional self-hosted [team policy](team-policy.md): connection, explicit enrollment with background refresh and an offline grace period, reviewed publication, rollback and fleet reports |
 | `tirith rule {test,validate,explain}` | Author and test custom detection rules (regex or the `when:` semantic DSL) |
@@ -80,13 +80,13 @@ project review, interruptions, upgrade and removal.
 
 | Command | What it does |
 |---------|-------------|
-| `tirith daemon {start,stop}` | Background daemon for faster checks and network enrichment (`start --detach`, Unix) |
+| `tirith daemon {start,stop,status}` | Background daemon for faster checks and network enrichment (`start --detach`, Unix); `status` reports whether it is running and measures latency |
 | `tirith hooks {scan,guard,explain}` | Inventory and classify git / husky / lefthook / pre-commit hooks |
 | `tirith exec {check,provenance,guard}` | Report a binary's package owner, signature, permissions, and whether it shadows a system command |
-| `tirith env {guard,diff,explain}` | Monitor sensitive env-var lifecycle (values are never stored) |
+| `tirith env {guard,diff,explain,graph}` | Monitor sensitive env-var lifecycle (values are never stored); `graph --installed <env>` shows the same read-only provenance graph as `pkg graph --installed` |
 | `tirith path {audit,watch,which}` | Flag PATH-hijack risk (repo-local, `/tmp`, or writable-before-system directories) |
 | `tirith sudo {guard,session,require-reason}` | Sudo-escalation gates with a reasoned session window |
-| `tirith ssh {guard,label}` | Label SSH hosts; destructive commands on a labeled-prod host escalate |
+| `tirith ssh {guard,label,bootstrap}` | Label SSH hosts; destructive commands on a labeled-prod host escalate. `bootstrap` is a deferred stub: it deploys nothing and exits 2 |
 | `tirith context {status,guard,label}` | Label and guard active cloud / k8s contexts (prod-destructive escalation) |
 | `tirith persistence {scan,diff,watch}` | Inventory and diff persistence footholds (rc files, authorized_keys, crontab, LaunchAgents) |
 | `tirith hygiene {scan,fix}` | Scan `~/.ssh`, `~/.aws`, `~/.kube`, `.npmrc`, and more for loose permissions or plaintext tokens (`fix` is chmod-only) |
@@ -128,7 +128,7 @@ project review, interruptions, upgrade and removal.
 |---------|-------------|
 | `tirith mcp-server` | Run tirith as an MCP server (six cross-platform tools, plus `tirith_fetch_cloaking` on Unix) over JSON-RPC stdio; tool/resource output is sanitized by default (`--unsafe-unsanitized-tool-output` restores legacy pass-through) |
 | `tirith mcp {lock,verify,diff,explain,permissions,policy}` | Inventory and gate a repo's MCP servers into `.tirith/mcp.lock`, with per-server tool and per-capability views |
-| `tirith gateway run` | MCP gateway proxy that intercepts AI-agent shell tool calls (`--filter-output`) |
+| `tirith gateway run` | MCP gateway proxy that intercepts AI-agent shell tool calls (`--filter-output`; Unix, refuses on Windows) |
 | `tirith agent {sessions,explain,current,allow,block,policy}` | Caller-origin (human / agent / MCP / CI / IDE) governance; an `agent_rules.deny` match forces a block |
 | `tirith ai {scan,diff,quarantine,explain-config,snapshot}` | AI-config workflow: scan, snapshot, detect drift or poisoning, and quarantine a suspect file |
 | `tirith lsp` | Language server that surfaces tirith diagnostics inline in your editor |
@@ -142,4 +142,4 @@ project review, interruptions, upgrade and removal.
 | `tirith checkpoint {create,list,restore,diff,purge,watch}` | Snapshot files before risky operations in the private per-user state directory; `restore` sha256-verifies each blob and reports per-file outcomes. Releases before 0.4.0 may have left data under `/tmp/tirith/checkpoints`; inspect and remove that legacy directory manually. |
 | `tirith pending {list,resolve,export}` | Pending-decision registry for deferred blocks, suppressed-finding rollups, and restore prompts |
 | `tirith share --target <a>` / `tirith redact --audience <a>` | Audience-aware redaction before sharing (github-issue, slack, llm, public-paste) |
-| `tirith clipboard {copy,scan,guard,watch}` | Clipboard with secret-shape gating and browser source attribution |
+| `tirith clipboard {copy,scan,guard,watch}` | Clipboard with secret-shape gating and browser source attribution. `guard {install-service,uninstall-service,status}` manages an opt-in background service (launchd or systemd user unit; not supported on Windows) that runs the clipboard polling daemon; `install-service` only prints the unit unless `--apply` is given |

@@ -16,15 +16,21 @@ earlier integrations as well as the hosts added for 0.4.0. An MCP-only row is
 not an automatic command gate. A hook/plugin row is automatic only after the
 host has loaded the artifact and honors its documented refusal contract.
 
-Three of these hosts fail **open** on their own side: Grok Build, Cline, and
-OpenHands all let the tool run when a hook errors or times out. Tirith's adapter
+Several of these hosts fail **open** on their own side. Grok Build, Cline, and
+OpenHands all let the tool run when a hook errors or times out. Claude Code,
+Gemini CLI, Kiro and Copilot CLI also run the tool when a hook command cannot
+start or exits with a code the host does not treat as a block. Tirith's adapter
 is fail-closed (it denies on its own errors unless `TIRITH_FAIL_OPEN=1`), but it
 cannot compensate for a host that ignores a crashed hook. The Cline and
-OpenHands wrappers, and the Gemini CLI, Kiro and Copilot CLI hook commands,
-check that the pinned Python interpreter still exists and answer with the
-host's deny when it does not (unless `TIRITH_FAIL_OPEN=1`), so a moved
-interpreter does not silently switch the guard off. Prime Agent and OMP
-block when a handler throws, so a guard crash fails closed there.
+OpenHands wrappers, and on Linux and macOS the Gemini CLI, Kiro and Copilot
+CLI hook commands, check that the pinned Python interpreter still exists and
+answer with the host's deny when it does not (unless `TIRITH_FAIL_OPEN=1`), so
+a moved interpreter does not silently switch the guard off. On Linux and macOS
+the Claude Code hook command ends in `|| exit 2` for the same reason. On
+Windows the Claude Code, Gemini CLI, Kiro and Copilot CLI commands run the
+pinned interpreter directly, so a moved or removed interpreter makes them fail
+open until `tirith setup` is run again. Prime Agent and OMP block when a
+handler throws, so a guard crash fails closed there.
 
 Every setup command stores the validated absolute path of the running `tirith`
 binary. Existing unrelated configuration is preserved, writes are contained
@@ -63,8 +69,14 @@ applies the same rules; only the host's deny shape differs (a JSON decision, a
 - Any other exit code, timeout, or missing binary: deny unless
   `TIRITH_FAIL_OPEN=1`.
 
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
-deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists. That is checker
+errors and, in the Python and shell adapters (Claude Code, Grok Build, Cline,
+OpenHands, Copilot CLI, Gemini CLI, Kiro, Cursor, VS Code, Windsurf) and the
+OpenClaw plugin, hook input that cannot be parsed or carries no command
+string. The Pi-family guard sends a call it cannot read to
+`TIRITH_HOOK_UNRESOLVED_ACTION` instead (see below). `TIRITH_FAIL_OPEN=1` never
+overrides a block, a deferred block, or a required approval or
+acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 hooks run non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
@@ -117,9 +129,10 @@ forms receive the same HOME expansion as the host before contained writes.
 
 OpenCode setup targets the current stable `opencode` schema. It does not write
 the separate beta `opencode2` configuration shape. OMP and Pi CLI are also
-different integrations: OMP receives MCP tools, while existing
-[`tirith setup pi-cli`](pi-cli.md) installs Pi's real blocking `tool_call`
-extension.
+different integrations: `tirith setup omp` registers the MCP tools and installs
+the shared blocking `tool_call` guard in OMP's hook directory, while
+[`tirith setup pi-cli`](pi-cli.md) installs that guard as a Pi extension and
+registers no MCP server.
 
 OMP setup follows `OMP_PROFILE`, then legacy `PI_PROFILE`; an explicitly empty
 `OMP_PROFILE` selects the default profile. Named profiles ignore

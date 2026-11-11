@@ -10,7 +10,11 @@ output-direction analyzer before they reach the calling agent:
   is the secure default; `--unsafe-unsanitized-tool-output` is an explicit
   legacy compatibility escape hatch.
 
-Gateway filtering remains an explicit flag outside the secure profile. The
+Gateway filtering remains an explicit flag outside the secure profile
+(`gateway_profile: secure`). The gateway also turns it on for
+`--approve-descriptors` and when an approved descriptor baseline exists for
+the upstream. The gateway entries that `tirith setup` registers do not pass
+`--filter-output`. The
 local MCP server filters by default because its calling agent is a privileged
 consumer and repository-derived resource text is untrusted output.
 
@@ -33,7 +37,7 @@ transforms based on the verdict's `Action`:
   "content": [
     {
       "type": "text",
-      "text": "[tirith: tool output blocked — see audit log entry <event_id> for details]"
+      "text": "[tirith: tool output blocked - see audit log entry <event_id> for details]"
     }
   ],
   "isError": true
@@ -81,9 +85,11 @@ The prepended notice has the shape:
 ```json
 {
   "type": "text",
-  "text": "[tirith: WARNING — N findings; see audit log entry <event_id>]"
+  "text": "[tirith: WARNING: N findings; see audit log entry <event_id>]"
 }
 ```
+
+With one finding the text reads `1 finding`.
 
 ## Fail-mode
 
@@ -93,15 +99,23 @@ a detected injection or a malformed guarded tool result into an allow. Which
 findings block is a severity question, not a fail-mode one — Critical and High
 findings block and have their content replaced, Medium and Low findings warn
 and keep sanitized content, per the two sections above.
+The one opt-in exception is `mcp_redact_injection: true` in user or org policy;
+a repository policy cannot enable it. It downgrades a Block to a redacted Warn
+when every blocking finding is a prompt-injection seed rule, the result has no
+string in `structuredContent`, and a rescan after blanking the matched seed
+spans is clean. The seed spans are blanked and the rest is forwarded. Any
+other blocking finding keeps the whole-message Block.
 `tirith mcp-server` engages the filter for tool and resource-read output by
 default. Only the explicitly named `--unsafe-unsanitized-tool-output`
 compatibility flag disables that local-server boundary.
 
 ## Listing and resource-response inspection
 
-The gateway also inspects the untrusted results of `tools/list`,
+When the output filter is enabled (see the top of this page), the gateway also
+inspects the untrusted results of `tools/list`,
 `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`,
-and `prompts/get`. Every string leaf and object key reaches the same output
+and `prompts/get`. Without it these results are forwarded uninspected. Every
+string leaf and object key reaches the same output
 analyzer. Resource links, descriptors, content URIs, URI templates, and URLs in
 extension metadata additionally cross the outbound destination policy.
 
@@ -164,8 +178,21 @@ The filter inherits the M7 ch1 output ruleset:
 - `output_title_manipulation` — Info (Allow — audited only)
 - `output_clear_screen` — Info (Allow — audited only)
 
-Plain SGR colour passes (legitimate agents use it). Only the dangerous subset
-above triggers.
+The same pass also runs these rules:
+
+- `ignore_previous_instructions`, `prompt_injection_in_output` and
+  `prompt_injection_obfuscated`: High (Block). Policy `injection_seeds_custom`
+  adds seeds.
+- `output_data_exfiltration`: High (Block)
+- `credential_in_text`: High (Block)
+- `canary_token_touched`: High (Block), when canary tokens are registered
+- `output_analysis_overflow`: High (Block)
+- `output_truncated_escape_sequence`: High (Block) for an OSC 52 payload,
+  otherwise Medium (Warn)
+- `analysis_incomplete`: High (Block) when an analysis budget is exceeded
+
+Plain SGR colour passes (legitimate agents use it). Among escape sequences,
+only the dangerous subset above triggers.
 
 ## Audit format
 

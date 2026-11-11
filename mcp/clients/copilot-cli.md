@@ -19,7 +19,10 @@ deny decision if a finding fires.
   when the check JSON has `requires_approval: true` (always deny)
 - Warning with `TIRITH_HOOK_WARN_ACTION=ask`: stdout JSON
   `{"permissionDecision":"ask","permissionDecisionReason":"..."}`
-- Pinned Python interpreter missing: deny JSON unless `TIRITH_FAIL_OPEN=1`
+- Pinned Python interpreter missing: deny JSON unless `TIRITH_FAIL_OPEN=1`.
+  On Windows the generated command runs the pinned interpreter directly,
+  without this check, so a moved or removed interpreter is not answered with
+  a deny there.
 
 ## IMPORTANT: launch from repo root
 
@@ -71,13 +74,19 @@ If you prefer to configure manually:
        "preToolUse": [
          {
            "type": "command",
-           "bash": "python3 .github/hooks/copilot-cli-hook.py",
+           "bash": "/absolute/path/to/python3 .github/hooks/copilot-cli-hook.py",
            "timeoutSec": 30
          }
        ]
      }
    }
    ```
+
+   Use an absolute interpreter path: Copilot does not resolve `python3` from
+   its runtime PATH. On Linux and macOS the command that
+   `tirith setup copilot-cli` writes also tests that the interpreter exists
+   and answers with a deny when it does not. This minimal form does not, so
+   prefer the generated config.
 
 ## Verification
 
@@ -102,7 +111,7 @@ Expected: runs normally with no interference.
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings with no decision (silent exit 0), `ask` asks you to confirm, `deny` blocks them; any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when the hook input is empty, unparseable, or a `bash` call carries no command string |
 
 ## Decision logic
 
@@ -131,8 +140,10 @@ passes it to `tirith check --json`, and:
 - Any other exit / timeout / missing binary: **deny** (fail-closed by
   default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block,
-a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists: checker errors,
+hook input that is empty or cannot be parsed, and a `bash` call whose
+`toolArgs` is malformed or carries no command string. It never overrides a
+block, a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
 bypass that user or org policy honors (`allow_bypass_env_noninteractive: true`,
 since the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
@@ -157,5 +168,6 @@ installed hook that differs from the current embedded adapter.
 - Automated setup validates Python once and records its absolute path while
   keeping the hook script repo-relative. Re-run setup if that interpreter
   moves; Copilot does not resolve `python3` from its runtime PATH.
-- Telemetry events are logged via `tirith hook-event` (fire-and-forget,
-  non-blocking).
+- Telemetry events are logged via `tirith hook-event`. The hook waits at most
+  0.25 seconds for that child, then stops it. Telemetry never changes the
+  decision.

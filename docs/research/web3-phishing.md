@@ -1,5 +1,14 @@
 # Spike 5b: web3 phishing feed
 
+> **Historical record.** This is the decision record of a research spike on
+> branch `security/spikes` (commit bb95bd40, facts checked 2026-07-16). It
+> predates 0.5.0 and is not maintained. File and line citations, the "current
+> baseline", and statements about what is in the tree, pending, or added in
+> "this PR" describe that moment. For the current state read the
+> [Web3 command guard](../security/web3-command-guard.md), the
+> [threat model](../threat-model.md), and
+> [enforcement coverage](../enforcement-coverage.md).
+
 Status: research spike, go/no-go decision record. This is a source-class and
 schema sketch plus a legal review. There is no code change, no wired enum
 variant, and no shipped feed in this PR.

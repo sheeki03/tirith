@@ -27,4 +27,27 @@
 # Fix is zip >=9.0.0 (Rust 1.88 > MSRV 1.83). Tirith never calls ZipArchive or
 # ZipStreamReader extract(): members are read into memory, symlink members are
 # rejected, nothing is written to disk. Keep in sync with deny.toml.
-ignore = ["RUSTSEC-2026-0009", "RUSTSEC-2026-0187", "RUSTSEC-2026-0119", "RUSTSEC-2024-0449", "RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369", "RUSTSEC-2026-0429"]
+#
+# RUSTSEC-2026-0487 / -0489 / -0490: hickory-proto 0.24.4 panics in the
+# zone-file (record text) parser. Tirith only sends queries and decodes wire
+# responses through the system resolver; it never parses zone files or record
+# text. Fix is 0.26.2 (API break vs our 0.24 pin / MSRV 1.83). Keep in sync
+# with deny.toml.
+#
+# RUSTSEC-2026-0491: hickory-proto 0.24.4 reserves about 18 MB from the record
+# counts in a DNS message header before reading any record. REACHABLE through a
+# malicious resolver or a spoofed response to one of Tirith's own lookups. The
+# allocation is transient and bounded per check by DnsRequestBudget and the
+# resolver timeout; it is not memory corruption. Accepted until the resolver
+# can move to >=0.26.2. Keep in sync with deny.toml.
+#
+# RUSTSEC-2026-0459: libsqlite3-sys 0.30.1 bundles a SQLite affected by
+# CVE-2026-119375 (crafted `-wal` file). Only tools/policy-server and
+# tools/license-server link it, and each opens only its own database, at a
+# path the server operator configures. Fix needs rusqlite 0.41 (Rust 1.89 > MSRV
+# 1.83). Keep in sync with deny.toml.
+#
+# RUSTSEC-2026-0441: pin-utils is unmaintained (informational, no known
+# vulnerability, no fixed release), pulled in only through futures-util and
+# hyper. Keep in sync with deny.toml.
+ignore = ["RUSTSEC-2026-0009", "RUSTSEC-2026-0187", "RUSTSEC-2026-0119", "RUSTSEC-2024-0449", "RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369", "RUSTSEC-2026-0429", "RUSTSEC-2026-0487", "RUSTSEC-2026-0489", "RUSTSEC-2026-0490", "RUSTSEC-2026-0491", "RUSTSEC-2026-0459", "RUSTSEC-2026-0441"]

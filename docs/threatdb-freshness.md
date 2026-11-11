@@ -4,6 +4,14 @@ The threat database is a signed file that Tirith downloads and verifies. Its
 freshness report tells you how old the database and its source data really
 are, without contacting the network.
 
+In 0.5.0 the source ages are not available yet. The feed publishes the signed
+source-integrity sidecar only when the v2 threat feed is enabled (see the
+[v2 rollout](threatdb-v2-rollout.md)), and it is not enabled in 0.5.0. Until
+then `freshness.source_evidence` is `unavailable`, `freshness.sources` is
+empty, and `tirith threat-db update` prints a "source evidence HTTP 404"
+notice. `publication_age_seconds` is still reported, and the signed database
+still updates and protects normally.
+
 ## Check freshness
 
 ```sh
@@ -60,8 +68,11 @@ the budget.
   recent rebuild. A future timestamp gives an unknown age and
   `clock_skew: true`, never a zero age. Missing evidence stays unknown.
 - A database published without a signed source-integrity sidecar cannot report
-  authenticated source ages. Run `tirith threat-db update` to retry fetching
-  the evidence for the installed generation.
+  authenticated source ages. Every database is published that way until the v2
+  threat feed is enabled, so in 0.5.0 `tirith threat-db update` cannot fetch
+  the evidence and prints the "source evidence HTTP 404" notice instead. Once
+  the sidecar is published, the same command fetches it for the installed
+  generation.
 - A source-evidence outage never replaces or invalidates a verified database;
   freshness is then reported unavailable.
 - TLS or connection-identity failures, permanent HTTP statuses, invalid

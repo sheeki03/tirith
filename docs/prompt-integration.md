@@ -1,8 +1,10 @@
 # Wiring `tirith prompt-status` into your shell prompt
 
 `tirith prompt-status` is a fast status emitter designed to be called from
-your shell prompt on every redraw. It shows the operator's current
-protection posture (`guarded` / `warn-only` / `degraded` / `off`) plus
+your shell prompt on every redraw. It shows the protection posture the
+shell hook reports (`blocking-unverified` / `warn-only` / `degraded` /
+`unknown` in the text forms, `guarded` / `warn-only` / `degraded` / `off`
+in JSON) plus
 the currently-active kubernetes / AWS / SSH / sudo context — at a glance.
 
 This doc is the manual-install reference. `tirith init --shell <name>
@@ -24,14 +26,21 @@ non-exported shell variable that the **shell hook itself** sets — see
 
 ```sh
 $ tirith prompt-status --short
-[tirith:guarded][aws:prod][kube:payments-prod]
+[tirith:blocking-unverified][aws:prod][kube:payments-prod]
 
 $ tirith prompt-status
-tirith: guarded; aws: prod; kube: payments-prod; sudo: session active
+tirith: blocking-unverified; aws: prod; kube: payments-prod; sudo: session active
 
 $ tirith prompt-status --json
-{"schema_version":1,"protection_mode":"guarded","contexts":{"aws":"prod","kube":"payments-prod"},"ssh_remote":false,"sudo_active":true}
+{"schema_version":1,"protection_mode":"guarded","protection_evidence":{...},"contexts":{"aws":"prod","kube":"payments-prod"},"ssh_remote":false,"sudo_active":true}
 ```
+
+The text forms print `blocking-unverified` where the hook reports `blocks`:
+a prompt call only receives the forwarded status and has not observed this
+shell block anything. They print `unknown` when no status is visible. The
+JSON `protection_mode` keeps `guarded` and `off` for those two cases.
+`protection_evidence` is the same object `tirith doctor --quick` emits (see
+`docs/doctor-modes.md`); its `verified_blocking` is always `false` here.
 
 The JSON envelope is the stable interface — `schema_version` is pinned
 at `1` and additive fields are allowed without bumping it; structural
@@ -39,7 +48,7 @@ changes will bump the version. An in-shell wrapper that already forwards
 `TIRITH_STATUS` (the snippets below) can parse the JSON form for its own
 formatting. Note that a fully **external** renderer that shells out as a
 separate process (Starship) cannot see the non-exported `TIRITH_STATUS` and
-would read `off` regardless of output format — see the
+would read `off` (`unknown` in the text forms) regardless of output format — see the
 [Starship](#starship) section for the export-based approach it needs.
 
 ## Auto-install (recommended)
@@ -74,7 +83,7 @@ to prompt-render time.
 
 **Forward `TIRITH_STATUS`.** The shell hooks expose the live status as a
 deliberately NON-exported variable, so a bare `tirith prompt-status` child
-process cannot see it (it would always show `off`). The
+process cannot see it (it would always show `unknown`). The
 `TIRITH_STATUS="${TIRITH_STATUS:-}"` prefix passes it into the child for that one
 call without exporting it session-wide. The `${VAR:-}` form (rather than bare
 `$VAR`) keeps the prompt safe under `set -u` / `setopt NO_UNSET` when the hook
@@ -131,7 +140,7 @@ The nushell hook **deliberately exposes no `TIRITH_STATUS` variable**: every
 nushell `$env` entry is exported (inherited by child processes), and nushell
 has no non-exported session variable a prompt closure could read, so there is
 no safe way to surface a live status. A `tirith prompt-status` call in a
-nushell prompt would therefore always print `off`. nushell protection is
+nushell prompt would therefore always print `unknown`. nushell protection is
 warn-only regardless — see the nushell note in `docs/prompt-status.md`. If you
 just want a plain prompt, render `$env.PWD` directly without a tirith segment:
 
@@ -145,7 +154,7 @@ $env.PROMPT_COMMAND = {|| $"($env.PWD)> "}
 Starship is an **external** renderer: it shells out to a separate child
 process each prompt, which cannot read the hook's non-exported
 `TIRITH_STATUS`. So a Starship `custom` module that runs `tirith
-prompt-status` would always show `off`. To surface the status in Starship you
+prompt-status` would always show `unknown`. To surface the status in Starship you
 must opt back into **exporting** the variable yourself (accepting that child
 processes then inherit it) and read it directly — `export TIRITH_STATUS` after
 the hook is sourced, then `command = "echo $TIRITH_STATUS"`. The full Starship

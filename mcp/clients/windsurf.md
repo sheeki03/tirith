@@ -12,8 +12,15 @@ Windsurf can execute commands through:
 1. Integrated terminal (user commands, Cascade-run shell)
 2. MCP `tools/call` (tool execution via MCP servers)
 
-The `pre_run_command` hook covers path 1. The MCP gateway covers path 2.
-Configure both for full automatic protection.
+The `pre_run_command` hook covers path 1. The MCP gateway covers path 2 only
+for calls that are routed through it. The gateway entry that
+`tirith setup windsurf` registers wraps Tirith's own MCP server
+(`tirith mcp-server`). Other MCP servers in your Windsurf configuration are
+not routed through it. To cover one, register that server behind its own
+`tirith gateway run --upstream-bin <server>` entry. The registered entry does
+not pass `--filter-output`, so upstream responses are filtered only when you
+add that flag or set the `secure` gateway profile (`gateway_profile: secure`).
+`tirith gateway run` is Unix-only and refuses to start on Windows.
 
 ## Quick Setup (Recommended)
 
@@ -49,13 +56,18 @@ If you prefer to configure manually:
      "hooks": {
        "pre_run_command": [
          {
-           "command": "/path/to/tirith-hook.sh",
+           "command": "/absolute/path/to/.codeium/windsurf/hooks/tirith-hook.sh",
            "show_output": true
          }
        ]
      }
    }
    ```
+
+   Let `tirith setup windsurf` generate `tirith-hook.sh`. The embedded script
+   has `__TIRITH_BIN__` and `__TIRITH_PYTHON__` placeholders that setup
+   replaces with the tirith path and the pinned Python interpreter, so a raw
+   copy of the asset does not work.
 
 3. Add a non-interactive zsh guard to `~/.zshenv` (agent shell path):
 
@@ -76,12 +88,15 @@ If you prefer to configure manually:
            "gateway", "run",
            "--upstream-bin", "tirith",
            "--upstream-arg", "mcp-server",
-           "--config", "~/.config/tirith/gateway.yaml"
+           "--config", "/absolute/path/to/.config/tirith/gateway.yaml"
          ]
        }
      }
    }
    ```
+
+   Use an absolute path for `--config`. The gateway reads the path as given
+   and does not expand `~`.
 
    First, copy the config template:
 
@@ -106,7 +121,7 @@ Expected: blocked by Tirith (exit code 2, reason on stderr).
 |----------|---------|--------|
 | `TIRITH_BIN` | path pinned by setup | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings on stderr, exit 0), `deny` blocks them; `ask` is denied with guidance because Windsurf has no confirmation prompt for this integration; any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when the hook input cannot be parsed or carries no command string |
 
 ## Hook decision logic
 
@@ -138,8 +153,10 @@ the reason on stderr.
   (fail-closed by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
 Every deny is hook exit 2 with the reason on stderr.
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
-deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists: checker errors,
+and hook input that is empty, cannot be parsed, or carries no command string.
+It never overrides a block, a deferred block, or a required approval or
+acknowledgement. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows

@@ -11,7 +11,15 @@ MCP gateway protection only covers path 2. To get automatic protection in one
 setup, configure both:
 
 - Non-interactive zsh guard (covers native shell execution)
-- MCP gateway (covers MCP tool calls)
+- MCP gateway (covers MCP tool calls that are routed through it)
+
+The gateway entry that `tirith setup codex` registers wraps Tirith's own MCP
+server (`tirith mcp-server`). Other MCP servers registered with Codex are not
+routed through it. To cover one, register that server behind its own
+`tirith gateway run --upstream-bin <server>` entry. The registered entry does
+not pass `--filter-output`, so upstream responses are filtered only when you
+add that flag or set the `secure` gateway profile (`gateway_profile: secure`).
+`tirith gateway run` is Unix-only and refuses to start on Windows.
 
 ## Quick Setup (Recommended)
 
