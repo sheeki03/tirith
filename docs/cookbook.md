@@ -297,7 +297,7 @@ tirith trust add get.docker.com --broad --rule curl_pipe_shell
 tirith trust list                 # see every entry, its scope, and its TTL
 tirith trust explain get.docker.com
 tirith trust diff                 # what changed since last time
-tirith trust gc --expired         # remove entries whose TTL has passed
+tirith trust gc                   # remove entries whose TTL has passed
 ```
 
 Use `--permanent` if an entry genuinely should never expire, and `--reason`

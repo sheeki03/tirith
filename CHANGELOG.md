@@ -11,10 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ThreatDB publication verification allows six minutes of bounded backoff for authenticated older discovery pointers, covering GitHub's five-minute raw-file cache lifetime. Invalid signatures, malformed documents and inconsistent pointers still fail without propagation retries.
 
+### Security
+
+- RustSec advisories published after 0.5.0 are triaged in `deny.toml` and `.cargo/audit.toml`: `hickory-proto` (RUSTSEC-2026-0487, -0489, -0490, -0491), `libsqlite3-sys` (RUSTSEC-2026-0459) and `pin-utils` (RUSTSEC-2026-0441). None has a fixed release that builds on Rust 1.83. One is reachable: a malicious resolver, or a spoofed response to one of Tirith's own DNS lookups, can make the decoder reserve about 18 MB for the length of that lookup (RUSTSEC-2026-0491). The others are in code paths Tirith does not use, or in the optional servers' own database files.
+
 ### Docs
 
 - The threat model covers 0.5: coding agents, MCP servers and clients, hostile repositories, Tirith's own update channels and local services are named as actors and trust boundaries. It no longer calls the `web3_guard` fields inert, and it states that containment is delivered on Linux only in this release.
-- `README.md` and `SECURITY.md`: the warn-level example is a real one (`curl ... | sh` blocks as `curl_pipe_shell`); audit entries are also uploaded when both `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are set; offline mode does not stop a configured audit upload or webhook; the log keeps a secret-redacted command preview of at most 80 bytes; the rule count is 245.
+- `README.md` and `SECURITY.md`: the warn-level example is a real one (`curl ... | sh` blocks as `curl_pipe_shell`); audit entries are also uploaded when both `TIRITH_SERVER_URL` and `TIRITH_API_KEY` are set; the log keeps a secret-redacted command preview of at most 80 bytes; the rule count is 245.
 - The agent client guides state what `TIRITH_FAIL_OPEN=1` covers (checker errors, and hook input that cannot be parsed or carries no command), what the gateway entry registered by `tirith setup` covers, and the Windows pinned-interpreter exception. The 0.5.0 release notes say the same.
 - Corrected statements in the capsule, npm provenance, task envelope, output filter, prompt status, profiles, dashboard, ThreatDB freshness, LSP and cookbook guides, and refreshed the source line references in the enforcement coverage ledger.
 - Pull-request and research records under `docs/` carry a historical banner, and the remediation ledger READMEs state that their statuses were not reconciled with 0.5.0.
