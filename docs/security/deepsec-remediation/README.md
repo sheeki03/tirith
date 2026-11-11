@@ -7,6 +7,13 @@ document does not claim any finding is DeepSec-verified or closed. The R3-INT
 convergence gate (full revalidation bound to a convergence SHA) remains open by
 design.
 
+Status at v0.5.0: the R1, R2 and R3 implementation stacks described below were
+merged before the v0.5.0 tag and are part of that release. This document and
+its ledgers were not updated afterwards. Wording such as "this PR" and
+"implementation branches", and every per-root status, describes the program as
+it was planned. No root is recorded here as verified or closed, and the
+revalidation named above has still not been run.
+
 This program turns the adjudicated DeepSec inventory at
 `e1ec47ef9f43e32872a550522067a680ff659e6e` into reviewable, dependency-aware
 remediation stacks. The plan PR itself is stacked directly on PR #174

@@ -2,6 +2,14 @@
 
 `source-index.json` is the immutable 135-row source ledger. `findings.json` is the canonical remediation-root ledger. `main.md` is a generated human view and must never be edited by hand.
 
+## Status at v0.5.0
+
+The ledger has not been reconciled with the 0.5.0 release. Every root is still recorded as `confirmed_open`, with the single `imported` event of 2026-08-17, because no lifecycle evidence has been attached since the import and no closure bundle (`docs/security/closure-evidence.json`) has been committed. A lifecycle value in `findings.json` or `main.md` therefore says that closure evidence is missing. It does not say that the finding is present in a release.
+
+For example, TIRITH-SEC-0001 (MCP clients bypassing enforcement with `TIRITH=0`) is fixed in 0.5.0: gateway analysis is non-interactive and never honors the bypass, and the regression test `gateway_analysis_context_is_noninteractive_and_cannot_honor_bypass` covers it. Its row changes only when that evidence is recorded through the process below. The other roots have not been checked against 0.5.0 one by one.
+
+The reports under `sources/` are immutable inputs, pinned by digest. They describe the commits they audited (`d7ce6b36` and `e9cf7c60`, both from August 2026 and both before 0.5.0), and their file links are paths on the reviewer's own checkout. They are not a description of any release.
+
 ## Source accounting
 
 | Source | Rows | Deterministic extraction |

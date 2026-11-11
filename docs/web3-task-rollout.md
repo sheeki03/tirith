@@ -1,5 +1,12 @@
 # Rollout and rollback: the Web3 and untrusted-task boundary
 
+> **Historical record.** This runbook was written for the release that first
+> shipped these features (0.4.0) and predates 0.5.0. Statements here about what
+> is pending, "before merge", unreachable, or not yet wired describe that
+> moment. It is kept as the staging and rollback reference. For what each
+> capability does today, read [enforcement coverage](enforcement-coverage.md)
+> and the [Web3 command guard](security/web3-command-guard.md).
+
 This is the operator runbook for the release that adds the Web3 command guard,
 the untrusted-task boundary, and the explicit audit and receipt commands. It
 names who does what, what each stage must prove before the next one starts, and
@@ -210,9 +217,10 @@ Do not promote until all of these hold:
 - every enforcing backend reports its required controls achieved;
 - the operator has actually configured trusted networks, signers, and RPC
   matchers wherever production enforcement is wanted. An enforcing gate over an
-  empty policy is not a security posture. Command-card keys are deliberately NOT
-  on this list: no surface checks a Web3 card, so configuring
-  `command_card_key_ids` adds nothing to a promotion decision.
+  empty policy is not a security posture. Command-card keys belong on this list
+  only if you set `require_command_card`: the engine then accepts a signed Web3
+  card only from a key listed in `command_card_key_ids`, and an operation whose
+  card cannot be approved blocks (see Stage 3, step 5).
 
 ## Stage 3: owned-boundary enforcement (operator)
 

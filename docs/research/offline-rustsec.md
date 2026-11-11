@@ -1,5 +1,12 @@
 # Spike 5a: offline RustSec advisory audit
 
+> **Historical record.** This is the decision record of a research spike on
+> branch `security/spikes` (commit bb95bd40, facts checked 2026-07-16). It
+> predates 0.5.0 and is not maintained. File and line citations, and statements
+> about tirith's "current" behaviour or what ships, describe that moment. For
+> the current state read the [threat model](../threat-model.md) and
+> [enforcement coverage](../enforcement-coverage.md).
+
 Status: research spike, go/no-go decision record. No shipped feature, no new
 runtime dependency. The reproducible probe used to produce the corpus numbers
 below lives in `tools/rustsec-probe/` (a standalone crate, detached from the
