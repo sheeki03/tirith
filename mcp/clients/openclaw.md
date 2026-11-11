@@ -76,7 +76,7 @@ operations.
 | `TIRITH_SHELL` | inferred for `exec` when unambiguous | Trusted `exec`-shell assertion: `posix`, `fish`, `powershell`, or `cmd` |
 | `TIRITH_BASH_SHELL` | required for `bash` | Trusted legacy Bash-tool shell assertion; same values as `TIRITH_SHELL` |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (returns `undefined`, findings on stderr), `deny` blocks them; `ask` is denied with guidance (the plugin does not use OpenClaw's `requireApproval`); any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when an `exec` or `bash` call carries no command string |
 
 ## Decision logic
 
@@ -148,8 +148,10 @@ After resolving the exact tokenizer:
 - ENOENT (binary not found) / timeout / unexpected exit: **deny** (fail-closed
   by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
-deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists: checker errors,
+and an `exec` or `bash` call whose `command` is missing, empty, or not a
+string. It never overrides a block, a deferred block, a required approval or
+acknowledgement, or a shell-resolution failure. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the plugin runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the plugin allows
@@ -182,8 +184,8 @@ current embedded adapter.
 - The plugin uses `execFileSync` with a 10-second timeout.
 - Timeout detection checks `err.killed`, `err.signal === "SIGTERM"`, and
   `err.code === "ETIMEDOUT"`.
-- Hook telemetry events are logged via `tirith hook-event` (fire-and-forget
-  via `execFile`).
+- Hook telemetry events are logged via `tirith hook-event`, run with
+  `execFileSync` and a 250 ms timeout. Telemetry never changes the decision.
 - No `python3` dependency -- the plugin is pure TypeScript.
 - The plugin registers as `id: "tirith-security"`, `name: "tirith Security Scanner"`.
 - The pure shell resolver is exercised on Linux, macOS, and Windows CI. Keep the

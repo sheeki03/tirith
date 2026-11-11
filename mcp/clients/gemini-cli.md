@@ -17,7 +17,9 @@ intercepts `run_shell_command` tool calls, passes the command to
 - Warn-allow: findings printed to stderr, silent exit 0, except when the
   check JSON has `requires_approval: true` (always deny)
 - Pinned Python interpreter missing: stderr reason, exit 2 (blocks), unless
-  `TIRITH_FAIL_OPEN=1`
+  `TIRITH_FAIL_OPEN=1`. On Windows the generated command runs the pinned
+  interpreter directly, without this check, so a moved or removed interpreter
+  makes the hook fail open there until `tirith setup gemini-cli` is run again.
 
 ## Quick Setup (Recommended)
 
@@ -76,7 +78,7 @@ Expected: runs normally with no interference.
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (findings printed to stderr, exit 0), `deny` blocks them; `ask` is denied with guidance because Gemini CLI has no confirmation prompt for this integration; any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when the hook input is empty, unparseable, or a `run_shell_command` call carries no command string |
 
 ## Decision logic
 
@@ -108,8 +110,11 @@ and:
 - Any other exit / timeout / missing binary: **deny** (fail-closed by default).
   Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
-`TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block,
-a deferred block, or a required approval or acknowledgement. A `TIRITH=0`
+`TIRITH_FAIL_OPEN=1` covers the cases where no verdict exists: checker errors,
+hook input that is empty or cannot be parsed, and a `run_shell_command` call
+whose `tool_input` is malformed or carries no command string. It never
+overrides a block, a deferred block, or a required approval or
+acknowledgement. A `TIRITH=0`
 bypass that user or org policy honors (`allow_bypass_env_noninteractive: true`,
 since the hook runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the hook allows
@@ -129,8 +134,9 @@ current embedded adapter.
 
 - The hook supports dual-case field names (`hook_event_name` / `hookEventName`,
   `tool_name` / `toolName`, `tool_input` / `toolInput`).
-- Hook telemetry events are logged via `tirith hook-event` (fire-and-forget,
-  non-blocking).
+- Hook telemetry events are logged via `tirith hook-event`. The hook waits at
+  most 0.25 seconds for that child, then stops it. Telemetry never changes the
+  decision.
 - Automated setup validates Python once and records its absolute path in the
   hook command. Re-run setup if that interpreter moves; the agent does not
   resolve `python3` from its runtime PATH.

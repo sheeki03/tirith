@@ -36,7 +36,7 @@ what an experimental command must satisfy to move to stable.
 | `run` | Experimental | Remote-script inspection on Unix; live execution is Linux-only, sealed-descriptor-bound, and refused before download elsewhere. |
 | `fetch` | Experimental | Server-side cloaking detection (Unix only). |
 | `checkpoint` | Experimental | File checkpoint and rollback. |
-| `gateway` | Experimental | MCP gateway proxy for AI-agent security. Request analysis and output filtering are bounded and fail closed, but enforcement covers only calls actually routed through the gateway. |
+| `gateway` | Experimental | MCP gateway proxy for AI-agent security. Request analysis and output filtering are bounded and fail closed, but enforcement covers only calls actually routed through the gateway. Output filtering runs only with `--filter-output` or the `secure` gateway profile. `gateway run` is Unix-only and refuses to start on Windows; `gateway validate-config` works on every platform. |
 | `setup` | Experimental | Configure 19 named AI-agent hosts, plus `setup recommended` and `setup shell` (reviewed, undoable shell startup plans). A written artifact is not proof the host loaded it; run the per-host verification matrix after setup and upgrades. An upgrade does not rewrite installed agent adapters: `tirith doctor` marks outdated user-scope adapters and those of the project it runs in (from any directory inside it), and `tirith setup <host> --force` refreshes them. |
 | `policy` | Experimental | Policy `init` / `validate` / `effective` / `test` / `tune`, personal `profile` and `setting` changes saved as undoable `operation`s, `rollout` and `simulate`, and the optional `team` client. |
 | `trust` | Experimental | Manage trusted patterns: `add` / `list` / `explain` / `diff` / `remove` / `gc`, plus `expiry` / `revoke` / `migrate`. `add` needs `--rule` or `--all-rules` and writes scoped, expiring grants to `trust-grants.json`; scope visualization, per-entry `explain`, and a `diff` trail. |
@@ -59,7 +59,7 @@ what an experimental command must satisfy to move to stable.
 | `mcp-server` | Experimental | MCP server mode (JSON-RPC over stdio). |
 | `lab` | Experimental | Adversarial training corpus runner. Offline. `--filter` narrows by tag; `--score` adds a 0-100 risk score per scenario. |
 | `task check` | Preview | Diagnostic task-envelope assessment. Reports what an envelope would be allowed to do; executes, fetches, resolves, and writes nothing, and declares `enforceability: observe_only`. |
-| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. The candidate supports native x86_64 and AArch64 Linux with required Landlock and seccomp controls; unsupported hosts or missing controls refuse before project copy/spawn, with no degraded fallback. Final integrated release-artifact qualification remains separate. |
+| `capsule run` | Experimental | Fail-closed contained run of an untrusted project. 0.5.0 supports native x86_64 and AArch64 Linux with required Landlock and seccomp controls; unsupported hosts or missing controls refuse before project copy/spawn, with no degraded fallback. Final integrated release-artifact qualification remains separate. |
 | `browser audit` | Experimental | Read-only Chromium-family extension integrity audit. Chrome, Chromium, Brave, and Edge; Firefox and XPI are refused by name. |
 | `pkg attest-npm` | Experimental | Point-in-time npm signature and provenance receipt over an installed project. |
 | `attest` | Experimental | Point-in-time build and deployment receipts (`build`, `verify-build`, `deployment`, `verify-deployment`). |
@@ -141,6 +141,14 @@ warn mode, not the normal direct-CLI contract. Non-hook callers should not
 normally see exit code 3. Exit code 4 appears only when the caller opts in to
 deferral; a Critical finding still exits 1.
 
+An exit code alone is not execution permission. Since 0.5.0, `tirith check`
+JSON (schema 3 and 4) always carries a boolean `requires_approval`. It is
+`true` for an active approval-rule gate, `WarnAck`, or a required
+strict-warning acknowledgement, and it can accompany exit 0 or exit 2. A
+caller that executes commands must deny on `requires_approval: true` instead
+of branching on the exit code alone. The shipped agent adapters do so, and
+they treat a missing or non-boolean value as a checker error.
+
 A usage error also exits 2: since 0.5.0, an option `tirith check` does not
 know before the command (`tirith check --json --bogus -- cmd`) prints clap's
 error on stderr and nothing on stdout. A caller that reads JSON should treat
@@ -171,6 +179,7 @@ warning.
 
 - Command-check JSON defaults to `schema_version: 3` with its existing fields. `tirith check --format json --json-schema 4` explicitly adds typed recovery advice; it keeps the same decision and exit code. Other commands retain their own documented schema versions.
 - Version 3 changes: added `Info` severity level (maps to `Allow` action), added `httpie_pipe_shell` and `xh_pipe_shell` rule IDs
+- Since 0.5.0 both versions always carry a boolean `requires_approval` (see "Exit Codes"). An honored `TIRITH=0` bypass prints the normal verdict with `action: "allow"`, `bypass_honored: true` and `requires_approval: false`
 - JSON fields are additive only: new fields may appear in any release
 - Existing fields will not be removed or change type within a major version
 - The `findings` array structure is stable

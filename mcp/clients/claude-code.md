@@ -86,7 +86,9 @@ human must approve first.
    Use an absolute interpreter path: Claude Code does not resolve `python3`
    from the agent's runtime PATH. Keep the trailing `|| exit 2`: Claude Code
    treats any other non-zero hook exit as non-blocking, so without it a hook
-   that cannot start would let the command run.
+   that cannot start would let the command run. On Windows, setup writes the
+   command without this suffix, so a hook that cannot start there does not
+   block.
 
    If you have multiple tirith versions installed, pin the binary path:
 
@@ -135,7 +137,7 @@ Expected: runs normally with no interference.
 |----------|---------|--------|
 | `TIRITH_BIN` | `tirith` (from PATH) | Override tirith binary path |
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes a warning on with no permission decision (you see it as a `systemMessage`, the model in `additionalContext`, and Claude Code's own permission rules decide), `ask` asks you to confirm, `deny` blocks it; any other value blocks |
-| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
+| `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors, or when the hook input is empty, larger than 2 MiB, unparseable, or carries no command string |
 
 ## How it works
 
@@ -171,9 +173,11 @@ answers on stdout (exit 0):
 - Any other exit / timeout / missing binary: **deny** (fail-closed).
 
 The hook is **fail-closed by default**: if tirith is missing, times out, or errors,
-commands are blocked. Set `TIRITH_FAIL_OPEN=1` to switch to fail-open behavior
-for those checker errors only; it never overrides a block, a deferred block,
-or a required approval or acknowledgement.
+commands are blocked. So is hook input that is empty, larger than 2 MiB,
+unparseable, or without a command string. Set `TIRITH_FAIL_OPEN=1` to switch
+to fail-open behavior for those cases, where no verdict exists. It never
+overrides a block, a deferred block, or a required approval or
+acknowledgement.
 
 A `TIRITH=0` bypass that user or org policy honors
 (`allow_bypass_env_noninteractive: true`, since the hook runs

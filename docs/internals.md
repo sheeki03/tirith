@@ -895,8 +895,11 @@ an observable active mode is shown as configured, never as freshly verified
 protection. An absent environment variable alone does not prove that activation
 is missing.
 
-`tirith doctor --simulate-enter --format json` emits the measured Bash executable,
-version, and an actual disposable-shell allow/block observation. That observation
+`tirith doctor --simulate-enter` prints the measured Bash executable, version,
+and the result of an actual disposable-shell allow/block self-test. In 0.5.0
+the CLI rejects `--format json` and `--json` together with `--simulate-enter`,
+so the JSON form of that observation is not reachable from the command line.
+That observation
 belongs only to `disposable-bash-enter-probe`; it never certifies the calling shell,
 a nested shell, another host, or the whole machine. Observations are rejected on
 surface/identity mismatch, expiry, clock rollback, incomplete/failed probes, or a

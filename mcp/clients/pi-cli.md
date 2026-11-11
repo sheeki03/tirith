@@ -3,9 +3,13 @@
 ## How it works
 
 Pi CLI supports TypeScript extensions that can intercept tool calls. Tirith
-registers a `tool_call` handler (`tirith-guard.ts`) that intercepts `bash` tool
-calls, runs `tirith check --json` synchronously, and returns either `undefined`
-(allow) or `{block: true, reason: string}` (deny).
+registers a `tool_call` handler (`tirith-guard.ts`) that intercepts shell tool
+calls (`bash`, `shell`, `run_terminal_command`, `terminal`), runs
+`tirith check --json` synchronously, and returns either `undefined` (allow) or
+`{block: true, reason: string}` (deny). The same guard file serves Prime Agent
+and OMP, so it also checks notebook tools (`ipython`, `python`, `jupyter`) and
+OMP's `eval`, `hub` and `debug` tools when a host exposes them; see
+[mcp-only-agents.md](mcp-only-agents.md#the-pi-family-guard).
 
 **Hook file:** `tirith-guard.ts`
 
@@ -54,9 +58,14 @@ locally controlled user profile instead of the project tree.
    tirith --version
    ```
 
-2. Copy `tirith-guard.ts` to your Pi CLI extensions directory.
+2. Generate `tirith-guard.ts` with `tirith setup pi-cli` (add `--dry-run` to
+   preview) instead of copying the asset. The embedded file has
+   `"__TIRITH_BIN__"` and `"__TIRITH_INTEGRATION__"` placeholders that setup
+   replaces with the absolute tirith path and the host label, so a raw copy
+   cannot find tirith and, by default, blocks every guarded call.
 
-3. Register the extension with Pi CLI so it loads on startup.
+3. Setup writes the file to `.pi/extensions/` (project) or
+   `~/.pi/agent/extensions/` (user). Confirm that Pi CLI loads it on startup.
 
 ## Verification
 
@@ -76,13 +85,14 @@ stdin. Verification requires running Pi CLI with the extension installed.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `TIRITH_HOOK_WARN_ACTION` | `allow` | `allow` passes warnings (returns `undefined`, findings on stderr), `deny` blocks them; `ask` is denied with guidance because the Pi-family host has no confirmation prompt for this integration; any other value blocks |
+| `TIRITH_HOOK_UNRESOLVED_ACTION` | `deny` | What to do with an execution call the guard cannot read: a command that is missing, empty, not a string or larger than 1 MiB, a notebook command built at runtime, or an OMP `eval`, `hub` or `debug` call whose real command is not in the event. `deny` blocks it. `warn` lets it run with a stderr warning and still checks the parts it can read; it applies only while `TIRITH_HOOK_WARN_ACTION` is `allow`. Any other value is treated as `deny` |
 | `TIRITH_FAIL_OPEN` | unset | Set to `1` to allow commands when tirith is missing or errors |
 
 ## Decision logic
 
-The extension intercepts `tool_call` events for `bash` tool calls. It extracts
-`event.input.command`, passes it to `tirith check --json` via `execFileSync`,
-and:
+The extension intercepts `tool_call` events for the shell tools listed above.
+It extracts `event.input.command`, passes it on stdin to `tirith check --json`
+via `execFileSync`, and:
 
 - Exit 0 from tirith: allow (returns `undefined`), unless the JSON has
   `requires_approval: true`, then deny.
@@ -109,7 +119,9 @@ and:
   by default). Set `TIRITH_FAIL_OPEN=1` for fail-open.
 
 `TIRITH_FAIL_OPEN=1` covers checker errors only; it never overrides a block, a
-deferred block, or a required approval or acknowledgement. A `TIRITH=0` bypass
+deferred block, or a required approval or acknowledgement. It also does not
+allow a call the guard cannot read, which `TIRITH_HOOK_UNRESOLVED_ACTION`
+governs, or a checker response larger than 16 MiB. A `TIRITH=0` bypass
 that user or org policy honors (`allow_bypass_env_noninteractive: true`, since
 the extension runs non-interactively) exits 0 with `"action": "allow"`,
 `"bypass_honored": true` and `"requires_approval": false`, so the extension
@@ -128,8 +140,8 @@ current embedded adapter.
 ## Notes
 
 - The extension uses `execFileSync` with a 10-second timeout.
-- Hook telemetry events are logged via `tirith hook-event` (fire-and-forget
-  via `execFile`).
+- Hook telemetry events are logged via `tirith hook-event`, run with
+  `execFileSync` and a 250 ms timeout. Telemetry never changes the decision.
 - No `python3` dependency -- the extension is pure TypeScript.
 - `tests/ipython-vector-extraction.mjs` runs in CI against the exact shipped
   bytes of this extension: the cell extractor, and the `tool_call` handler

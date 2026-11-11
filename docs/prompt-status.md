@@ -24,19 +24,22 @@ changes.
 
 | Value | Meaning |
 |-------|---------|
-| `blocks` | A dangerous command is stopped before it runs (bash enter mode, bash preexec with enforcement, zsh, fish, PowerShell). |
+| `blocks` | A dangerous command is stopped before it runs (bash enter mode, bash preexec with enforcement, zsh and fish with execution receipts, PowerShell). |
 | `warn-only` | Commands are checked and you are warned, but a dangerous one is **not** blocked (bash preexec without enforcement). |
-| `degraded` | Protection was **downgraded mid-session** from a stronger level — for example bash enter mode fell back to preexec warn-only. Worth noticing: you are less protected than when the shell started. |
-| `off` | The hook installed nothing in this shell (for example PowerShell without PSReadLine). |
+| `degraded` | Protection is **weaker than the hook was set up to give**. Mid-session: a stronger level was lost, for example bash enter mode fell back to preexec warn-only, bash lost its `DEBUG` trap, or the PowerShell checker could not run. At load: zsh or fish could not negotiate execution receipts and run their legacy checks (commands are still checked and blocked); requested bash preexec enforcement could not engage; or the bash preexec hook could not be installed (`extdebug` already enabled, or the `DEBUG` trap or `PROMPT_COMMAND` could not be preserved), in which case nothing is intercepted. Worth noticing in every case. |
+| `off` | The hook installed nothing in this shell (for example PowerShell without PSReadLine, or the tirith executable was not found). Bash preexec mode also reports `off` between sourcing the hook and the first prompt, before its `DEBUG` trap is in place. |
 
-The variable is **never set** in a non-interactive shell — the hook is a
-complete no-op there — and, because it is not exported, it is also never
-inherited by a non-interactive child of an interactive shell. Either way a
-script never sees a misleading status.
+In a non-interactive shell the hook installs no interception and never
+reports `blocks`, `warn-only` or `degraded`. The variable is left unset there,
+or set to `off`: PowerShell always initializes it to `off`, and zsh and bash
+set `off` when the hook cannot start. Because it is not exported, it is also
+never inherited by a non-interactive child of an interactive shell. Either way
+a script never sees a misleading status.
 
 `degraded` is deliberately distinct from `warn-only`: a shell that simply
 *starts* in warn-only is `warn-only`, while a shell that *loses* a stronger
-guarantee at runtime is `degraded`.
+guarantee at runtime, or cannot reach the level it was set up for at load, is
+`degraded`.
 
 > **nushell** does not set `TIRITH_STATUS`. Nushell has no session variable
 > that is both readable by a prompt closure and not inherited by child
