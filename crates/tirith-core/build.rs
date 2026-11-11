@@ -347,6 +347,11 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         id: "pipe_to_interpreter",
         tier1_exec_fragments: &[
             r"(?i)\|[&\s]*(?:\S*(?:sudo|env|command|exec|nohup)\S*\s+|/\S*/?)*(?:\S+\s+)*\S*(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|ash|mksh|python[23]?|pypy|node|deno|bun|perl|ruby|php|lua|tclsh|elixir|rscript|pwsh|iex|invoke-expression|cmd)",
+            // GNU parallel runs its command template through a shell, and with
+            // no template it runs its input lines as commands. Admit the bare
+            // token so `rules::command` and the executable-body scanner see
+            // every parallel invocation, not only one that also has a URL.
+            r"\bparallel\b",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Pipe output to an interpreter (| bash, | sudo bash, | iex, etc.)",

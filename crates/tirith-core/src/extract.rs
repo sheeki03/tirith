@@ -10067,6 +10067,309 @@ fn scan_xargs_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubst
     push_control_prefix_body(utility, shell, scan);
 }
 
+/// Replacement strings GNU parallel substitutes with an input item. Positional
+/// forms (`{1}`, `{2.}`) are found by [`parallel_positional_replacements`].
+const PARALLEL_REPLACEMENTS: &[&str] = &["{}", "{.}", "{/}", "{//}", "{/.}", "{#}", "{%}"];
+
+/// Most `:::` items expanded into their own command line. Past this, or with
+/// more than one input source, the template alone is analyzed.
+const MAX_PARALLEL_EXPANDED_ITEMS: usize = 16;
+
+fn is_parallel_source_separator(token: &str) -> bool {
+    matches!(token, ":::" | ":::+" | "::::" | "::::+")
+}
+
+/// Positional replacement strings (`{1}`, `{-1}`, `{2.}`, `{3/}`, `{1//}`,
+/// `{2/.}`) present in a template word. Other braces (`awk '{print $1}'`) are
+/// ordinary text.
+fn parallel_positional_replacements(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let mut found = Vec::new();
+    let mut start = 0usize;
+    while let Some(open) = word[start..].find('{').map(|at| at + start) {
+        let mut end = open + 1;
+        if bytes.get(end) == Some(&b'-') {
+            end += 1;
+        }
+        let digits = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end > digits {
+            for suffix in ["/.", "//", "/", ".", ""] {
+                if word[end..].starts_with(suffix) && bytes.get(end + suffix.len()) == Some(&b'}') {
+                    found.push(word[open..=end + suffix.len()].to_string());
+                    break;
+                }
+            }
+        }
+        start = open + 1;
+    }
+    found
+}
+
+/// Whether a word naming a parallel input file is produced by a substitution
+/// (`<(curl …)`, `$(mktemp)`), so the file is not one that exists before the
+/// command runs.
+fn parallel_input_is_computed(raw: &str, shell: ShellType) -> bool {
+    raw.contains("$(")
+        || raw.contains('`')
+        || raw.contains("<(")
+        || raw.contains(">(")
+        || (shell == ShellType::Fish && raw.contains('('))
+}
+
+/// [`static_wrapper_word`] for a template word, with parallel's replacement
+/// strings kept as they are. `{}` and `{.}` are not shell literals on their
+/// own, and here they are placeholders, not brace expressions.
+fn parallel_static_word(raw: &str, shell: ShellType) -> Option<String> {
+    if raw.contains(['\u{1}', '\u{2}']) {
+        return static_wrapper_word(raw, shell);
+    }
+    // An unquoted `~` or `~/path` is expanded to the home directory by the
+    // calling shell. What parallel's shell then sees is a path, not code.
+    if let Some(rest) = raw.strip_prefix('~') {
+        if rest.is_empty() {
+            return Some("~".to_string());
+        }
+        if rest.starts_with('/') {
+            return parallel_static_word(rest, shell).map(|word| format!("~{word}"));
+        }
+    }
+    let mut tokens: Vec<String> = PARALLEL_REPLACEMENTS
+        .iter()
+        .filter(|replacement| raw.contains(**replacement))
+        .map(|replacement| (*replacement).to_string())
+        .collect();
+    tokens.extend(parallel_positional_replacements(raw));
+    // Longest first, so `{/.}` is masked before `{/}` could split it.
+    tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
+    tokens.dedup();
+    let mut masked = raw.to_string();
+    for (slot, token) in tokens.iter().enumerate() {
+        masked = masked.replace(token.as_str(), &format!("\u{1}{slot}\u{2}"));
+    }
+    let mut word = static_wrapper_word(&masked, shell)?;
+    for (slot, token) in tokens.iter().enumerate() {
+        word = word.replace(&format!("\u{1}{slot}\u{2}"), token);
+    }
+    Some(word)
+}
+
+/// The command template GNU parallel runs for each input item.
+///
+/// parallel joins the template's words with spaces and hands that text to a
+/// shell, so a `|` or `;` inside a quoted template word is live shell syntax.
+/// (xargs execs an argv instead, which is why this is not `scan_xargs_body`.)
+/// The template is therefore pushed as shell source.
+///
+/// What is modelled: the option prefix that
+/// `rules::command::parallel_option_advance` accepts, a template of literal
+/// words, and input items appended to it or substituted for a replacement
+/// string. Everything else is recorded as an unresolved body rather than
+/// skipped: an unknown option, a template word that is not a literal, a
+/// `{= perl =}` expression, a replacement string that lands in code, and
+/// `--pipe` (the input becomes the job's standard input) when the job runs an
+/// interpreter.
+///
+/// With no template the input items are themselves the commands. Literal
+/// `:::` items are analyzed as commands. A commands file (`-a FILE`,
+/// `:::: FILE`) is a local script, as `sh FILE` is, and a pipe into a bare
+/// `parallel` is reported by the pipe-to-interpreter rule.
+fn scan_parallel_body(args: &[String], shell: ShellType, scan: &mut ExecutableSubstitutionScan) {
+    let normalized =
+        |raw: &String| -> String { crate::rules::command::normalize_shell_token(raw, shell) };
+    let separator = args
+        .iter()
+        .position(|raw| is_parallel_source_separator(&normalized(raw)));
+    let template_end = separator.unwrap_or(args.len());
+    let prefix = &args[..template_end];
+
+    let mut index = 0usize;
+    let mut reads_arg_file = false;
+    let mut computed_input = false;
+    // `--pipe`: the input is split into blocks that become each job's standard
+    // input. Nothing is appended to the template or substituted into it.
+    let mut pipe_mode = false;
+    while index < prefix.len() {
+        let option = normalized(&prefix[index]);
+        if matches!(
+            option.as_str(),
+            "--help"
+                | "--version"
+                | "--number-of-cpus"
+                | "--number-of-cores"
+                | "--number-of-sockets"
+                | "--number-of-threads"
+        ) {
+            // Prints and exits; nothing is run.
+            return;
+        }
+        if option == "--" {
+            index += 1;
+            break;
+        }
+        pipe_mode |= matches!(option.as_str(), "--pipe" | "--pipepart");
+        match crate::rules::command::parallel_option_advance(prefix, index, shell) {
+            Ok(Some(advance)) => {
+                let long_arg_file = option
+                    .split_once('=')
+                    .map_or(option.as_str(), |(name, _)| name);
+                let short_arg_file = !option.starts_with("--")
+                    && option[1..].chars().find(|flag| {
+                        !crate::rules::command::PARALLEL_BOOLEAN_SHORT_OPTIONS.contains(flag)
+                    }) == Some('a');
+                if matches!(long_arg_file, "--arg-file" | "--argfile") || short_arg_file {
+                    reads_arg_file = true;
+                    let value = prefix.get(index + advance - 1);
+                    computed_input |=
+                        value.is_some_and(|raw| parallel_input_is_computed(raw, shell));
+                }
+                index += advance;
+            }
+            Ok(None) => break,
+            Err(()) => {
+                record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+                return;
+            }
+        }
+    }
+
+    let template = &prefix[index.min(prefix.len())..];
+    let sources = separator.map_or(&[][..], |at| &args[at..]);
+    // One `:::` group, and nothing else, is the only input whose items are
+    // written in the command itself.
+    let direct_items: Option<&[String]> = (!reads_arg_file
+        && sources
+            .first()
+            .is_some_and(|first| normalized(first) == ":::")
+        && sources.len() > 1
+        && sources.len() - 1 <= MAX_PARALLEL_EXPANDED_ITEMS
+        && sources[1..]
+            .iter()
+            .all(|raw| !is_parallel_source_separator(&normalized(raw))))
+    .then(|| &sources[1..]);
+
+    if template.is_empty() {
+        if let Some(items) = direct_items {
+            // Each item is a command line. One that is not a literal cannot be
+            // read here and is recorded as unresolved.
+            for item in items {
+                push_required_literal_wrapper_body(std::slice::from_ref(item), shell, shell, scan);
+            }
+            return;
+        }
+        // The commands come from a file or from standard input.
+        let mut from_file = false;
+        for raw in sources {
+            match normalized(raw).as_str() {
+                ":::" | ":::+" => from_file = false,
+                "::::" | "::::+" => from_file = true,
+                _ if from_file => computed_input |= parallel_input_is_computed(raw, shell),
+                // `:::` commands that were not expanded above (several groups,
+                // or too many) are commands this scan did not read.
+                _ => computed_input = true,
+            }
+        }
+        if computed_input {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        }
+        return;
+    }
+
+    // A template word that is not a literal is evaluated twice: once by the
+    // calling shell and again by the shell parallel starts, so whatever the
+    // first expansion produced is then read as code.
+    let Some(words) = template
+        .iter()
+        .map(|raw| parallel_static_word(raw, shell))
+        .collect::<Option<Vec<String>>>()
+    else {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    };
+    if words.iter().any(|word| word.contains("{=")) {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    let mut replacements: Vec<String> = PARALLEL_REPLACEMENTS
+        .iter()
+        .filter(|replacement| words.iter().any(|word| word.contains(**replacement)))
+        .map(|replacement| (*replacement).to_string())
+        .collect();
+    for word in &words {
+        for positional in parallel_positional_replacements(word) {
+            if !replacements.contains(&positional) {
+                replacements.push(positional);
+            }
+        }
+    }
+    let source = words.join(" ");
+    if source.trim().is_empty() {
+        return;
+    }
+
+    if pipe_mode {
+        // A job that runs an interpreter executes its standard input, and that
+        // input is not readable here.
+        if crate::rules::command::source_runs_interpreter(&source, shell) {
+            record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+            return;
+        }
+        scan.bodies
+            .push(ExecutableBody::without_origin(source, shell));
+        return;
+    }
+
+    // Items written in the command are substituted, so each job is analyzed
+    // as the command line parallel would run.
+    let only_default_replacement = replacements.iter().all(|replacement| replacement == "{}");
+    if let Some(items) = direct_items.filter(|_| only_default_replacement) {
+        for item in items {
+            let job = if replacements.is_empty() {
+                format!("{source} {item}")
+            } else {
+                source.replace("{}", item)
+            };
+            scan.bodies.push(ExecutableBody::without_origin(job, shell));
+        }
+        return;
+    }
+
+    // The items are not known here. One substituted into a command name, or
+    // into code a child interpreter runs, is input data executed as code.
+    let mut canonical = source.clone();
+    for replacement in &replacements {
+        if replacement != "{}" {
+            canonical = canonical.replace(replacement.as_str(), "{}");
+        }
+    }
+    if !replacements.is_empty() && parallel_item_reaches_code(&canonical, shell) {
+        record_shell_execution_gap(scan, ShellExecutionGap::AmbiguousExecutableBody);
+        return;
+    }
+    scan.bodies
+        .push(ExecutableBody::without_origin(source, shell));
+}
+
+/// Whether an input item substituted for `{}` in `source`, a parallel template
+/// already joined into shell source, lands in a command name or in code. The
+/// template may hold several commands (`gzip {} && rm {}`), so each one is
+/// checked the way an `xargs -I{}` utility is.
+fn parallel_item_reaches_code(source: &str, shell: ShellType) -> bool {
+    crate::tokenize::tokenize(source, shell)
+        .iter()
+        .any(|segment| {
+            let Some(command) = segment.command.as_ref() else {
+                return segment.raw.contains("{}");
+            };
+            let mut utility = Vec::with_capacity(segment.args.len() + 1);
+            utility.push(command.clone());
+            utility.extend(segment.args.iter().cloned());
+            command.contains("{}") || xargs_placeholder_reaches_code(&utility, "{}", shell)
+        })
+}
+
 /// Whether an `xargs -I REPL` input item substituted into `utility` (the
 /// command xargs runs and its arguments) lands in code: the command name, the
 /// `-c` script of a shell, the inline program of another interpreter, the
@@ -13254,6 +13557,9 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
             "xargs" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 scan_xargs_body(&args, shell, scan)
             }
+            "parallel" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
+                scan_parallel_body(&args, shell, scan)
+            }
             "find" if matches!(shell, ShellType::Posix | ShellType::Fish) => {
                 scan_find_exec_bodies(&args, shell, scan)
             }
@@ -13312,6 +13618,8 @@ fn scan_literal_shell_wrappers(raw: &str, shell: ShellType, scan: &mut Executabl
                 | "invoke-expression"
                 | "call"
                 | "start"
+                // GNU parallel's output is its jobs' output.
+                | "parallel"
         ) {
             for body in scan.bodies.iter_mut().skip(replacement_body_start) {
                 body.origin.get_or_insert_with(|| ExecutableBodyOrigin {
